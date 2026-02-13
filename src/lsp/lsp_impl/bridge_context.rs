@@ -43,7 +43,6 @@ pub(crate) struct BridgeRequestContext {
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Like `BridgeRequestContext`
 /// but returns ALL matching server configs for the injection language, enabling
 /// fan-out to multiple downstream servers.
-#[allow(dead_code)] // Used by subtask 6 handlers
 pub(crate) struct MultiBridgeRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
@@ -211,7 +210,6 @@ impl Kakehashi {
     ///
     /// Delegates to the shared preamble, then looks up ALL bridge server configs
     /// for the injection language. Returns `None` if no configs found.
-    #[allow(dead_code)] // Used by subtask 6 handlers
     pub(crate) async fn resolve_bridge_contexts(
         &self,
         lsp_uri: &Uri,
