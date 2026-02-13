@@ -270,6 +270,51 @@ mod tests {
         );
     }
 
+    /// Test that send_hover_request returns Ok(None) when server lacks hover capability.
+    ///
+    /// This validates the capability guard pattern: when a connection exists and is
+    /// Ready but doesn't advertise hover support (server_capabilities not set),
+    /// the request should short-circuit to Ok(None) without attempting to send.
+    #[tokio::test]
+    async fn send_hover_request_returns_none_when_no_hover_capability() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = devnull_config();
+
+        // Insert a Ready connection with no capabilities set (all providers = None)
+        {
+            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            // Don't call set_server_capabilities — all providers will be None
+            pool.connections
+                .lock()
+                .await
+                .insert("test-server".to_string(), handle);
+        }
+
+        let host_uri = test_host_uri("doc");
+        let result = pool
+            .send_hover_request(
+                "test-server",
+                &config,
+                &host_uri,
+                tower_lsp_server::ls_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                "lua",
+                TEST_ULID_LUA_0,
+                0,
+                "print('hello')",
+                UpstreamId::Null,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when server lacks hover capability"
+        );
+    }
+
     /// Test that BridgeResponseContext fields are accessible.
     #[test]
     fn bridge_response_context_exposes_fields() {
