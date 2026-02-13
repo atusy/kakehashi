@@ -432,6 +432,18 @@ impl ConnectionHandle {
         };
         match method {
             "textDocument/diagnostic" => caps.diagnostic_provider.is_some(),
+            "textDocument/hover" => caps.hover_provider.is_some(),
+            "textDocument/completion" => caps.completion_provider.is_some(),
+            "textDocument/definition" => caps.definition_provider.is_some(),
+            "textDocument/typeDefinition" => caps.type_definition_provider.is_some(),
+            "textDocument/declaration" => caps.declaration_provider.is_some(),
+            "textDocument/implementation" => caps.implementation_provider.is_some(),
+            "textDocument/references" => caps.references_provider.is_some(),
+            "textDocument/documentHighlight" => caps.document_highlight_provider.is_some(),
+            "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+            "textDocument/rename" => caps.rename_provider.is_some(),
+            "textDocument/moniker" => caps.moniker_provider.is_some(),
+            "textDocument/inlayHint" => caps.inlay_hint_provider.is_some(),
             _ => false,
         }
     }
