@@ -25,6 +25,7 @@ use super::{Kakehashi, uri_to_url};
 /// Produced by `Kakehashi::resolve_bridge_context`, which handles all the
 /// common preamble steps: URI conversion, document snapshot, language detection,
 /// injection resolution, bridge config lookup, and upstream request ID extraction.
+#[cfg(feature = "experimental")]
 pub(crate) struct BridgeRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
@@ -170,6 +171,7 @@ impl Kakehashi {
     ///
     /// Returns `None` for any early-exit condition (invalid URI, no document,
     /// no language, no injection at position, no bridge config).
+    #[cfg(feature = "experimental")]
     pub(crate) async fn resolve_bridge_context(
         &self,
         lsp_uri: &Uri,

@@ -1,9 +1,12 @@
 //! Document highlight method for Kakehashi.
 
+use std::sync::Arc;
+
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentHighlight, DocumentHighlightParams, MessageType};
 
 use super::super::Kakehashi;
+use super::first_win;
 
 impl Kakehashi {
     pub(crate) async fn document_highlight_impl(
@@ -14,36 +17,55 @@ impl Kakehashi {
         let position = params.text_document_position_params.position;
 
         let Some(ctx) = self
-            .resolve_bridge_context(&lsp_uri, position, "document_highlight")
+            .resolve_bridge_contexts(&lsp_uri, position, "document_highlight")
             .await
         else {
             return Ok(None);
         };
 
-        // Send document highlight request via language server pool
-        let response = self
-            .bridge
-            .pool()
-            .send_document_highlight_request(
-                &ctx.resolved_config.server_name,
-                &ctx.resolved_config.config,
-                &ctx.uri,
-                ctx.position,
-                &ctx.resolved.injection_language,
-                &ctx.resolved.region.region_id,
-                ctx.resolved.region.line_range.start,
-                &ctx.resolved.virtual_content,
-                ctx.upstream_request_id,
-            )
-            .await;
+        // Fan-out document highlight requests to all matching servers
+        let pool = self.bridge.pool_arc();
+        let mut join_set = tokio::task::JoinSet::new();
+        let position = ctx.position;
+        let region_start_line = ctx.resolved.region.line_range.start;
 
-        match response {
-            Ok(highlights) => Ok(highlights),
-            Err(e) => {
+        for config in ctx.configs {
+            let pool = Arc::clone(&pool);
+            let uri = ctx.uri.clone();
+            let injection_language = ctx.resolved.injection_language.clone();
+            let region_id = ctx.resolved.region.region_id.clone();
+            let virtual_content = ctx.resolved.virtual_content.clone();
+            let upstream_id = ctx.upstream_request_id.clone();
+            let server_name = config.server_name.clone();
+            let server_config = Arc::new(config.config);
+
+            join_set.spawn(async move {
+                pool.send_document_highlight_request(
+                    &server_name,
+                    &server_config,
+                    &uri,
+                    position,
+                    &injection_language,
+                    &region_id,
+                    region_start_line,
+                    &virtual_content,
+                    upstream_id,
+                )
+                .await
+            });
+        }
+
+        // Return the first non-empty document highlight response
+        let result =
+            first_win::first_win(&mut join_set, |opt| matches!(opt, Some(v) if !v.is_empty()))
+                .await;
+        match result {
+            Some(highlights) => Ok(highlights),
+            None => {
                 self.client
                     .log_message(
-                        MessageType::ERROR,
-                        format!("Bridge document highlight request failed: {}", e),
+                        MessageType::LOG,
+                        "No document highlight response from any bridge server",
                     )
                     .await;
                 Ok(None)
