@@ -1617,7 +1617,8 @@ mod tests {
             TypeDefinitionProviderCapability,
         };
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut ServerCapabilities)>)> = vec![
+        type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
+        let cases: Vec<CapCase> = vec![
             (
                 "textDocument/hover",
                 Box::new(|c| {
@@ -1719,7 +1720,8 @@ mod tests {
             OneOf, TypeDefinitionProviderCapability,
         };
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut ServerCapabilities)>)> = vec![
+        type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
+        let cases: Vec<CapCase> = vec![
             (
                 "textDocument/hover",
                 Box::new(|c| {
