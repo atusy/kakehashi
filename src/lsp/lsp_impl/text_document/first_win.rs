@@ -28,11 +28,18 @@ pub(super) async fn first_win<T: Send + 'static>(
     is_nonempty: impl Fn(&T) -> bool,
 ) -> Option<T> {
     while let Some(result) = join_set.join_next().await {
-        if let Ok(Ok(value)) = result
-            && is_nonempty(&value)
-        {
-            join_set.abort_all();
-            return Some(value);
+        match result {
+            Err(join_err) => {
+                log::warn!("bridge task panicked: {join_err}");
+            }
+            Ok(Err(io_err)) => {
+                log::debug!("bridge request failed: {io_err}");
+            }
+            Ok(Ok(value)) if is_nonempty(&value) => {
+                join_set.abort_all();
+                return Some(value);
+            }
+            Ok(Ok(_)) => {} // empty result — try next
         }
     }
     None
