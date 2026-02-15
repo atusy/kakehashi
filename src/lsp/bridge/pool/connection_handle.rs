@@ -21,7 +21,10 @@ use std::time::Duration;
 
 use log::warn;
 use tokio::sync::mpsc;
-use tower_lsp_server::ls_types::ServerCapabilities;
+use tower_lsp_server::ls_types::{
+    DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability, OneOf,
+    ServerCapabilities, TypeDefinitionProviderCapability,
+};
 
 use super::connection_action::BridgeError;
 use super::dynamic_capability_registry::DynamicCapabilityRegistry;
@@ -432,18 +435,55 @@ impl ConnectionHandle {
         };
         match method {
             "textDocument/diagnostic" => caps.diagnostic_provider.is_some(),
-            "textDocument/hover" => caps.hover_provider.is_some(),
+            "textDocument/hover" => matches!(
+                caps.hover_provider,
+                Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+            ),
             "textDocument/completion" => caps.completion_provider.is_some(),
-            "textDocument/definition" => caps.definition_provider.is_some(),
-            "textDocument/typeDefinition" => caps.type_definition_provider.is_some(),
-            "textDocument/declaration" => caps.declaration_provider.is_some(),
-            "textDocument/implementation" => caps.implementation_provider.is_some(),
-            "textDocument/references" => caps.references_provider.is_some(),
-            "textDocument/documentHighlight" => caps.document_highlight_provider.is_some(),
+            "textDocument/definition" => {
+                matches!(caps.definition_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+            }
+            "textDocument/typeDefinition" => matches!(
+                caps.type_definition_provider,
+                Some(
+                    TypeDefinitionProviderCapability::Simple(true)
+                        | TypeDefinitionProviderCapability::Options(_)
+                )
+            ),
+            "textDocument/declaration" => matches!(
+                caps.declaration_provider,
+                Some(
+                    DeclarationCapability::Simple(true)
+                        | DeclarationCapability::RegistrationOptions(_)
+                        | DeclarationCapability::Options(_)
+                )
+            ),
+            "textDocument/implementation" => matches!(
+                caps.implementation_provider,
+                Some(
+                    ImplementationProviderCapability::Simple(true)
+                        | ImplementationProviderCapability::Options(_)
+                )
+            ),
+            "textDocument/references" => {
+                matches!(caps.references_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+            }
+            "textDocument/documentHighlight" => {
+                matches!(
+                    caps.document_highlight_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
             "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
-            "textDocument/rename" => caps.rename_provider.is_some(),
-            "textDocument/moniker" => caps.moniker_provider.is_some(),
-            "textDocument/inlayHint" => caps.inlay_hint_provider.is_some(),
+            "textDocument/rename" => {
+                matches!(caps.rename_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+            }
+            "textDocument/moniker" => {
+                matches!(caps.moniker_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+            }
+            "textDocument/inlayHint" => {
+                matches!(caps.inlay_hint_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+            }
             _ => false,
         }
     }
@@ -1691,6 +1731,54 @@ mod tests {
             ..Default::default()
         });
         assert!(handle.has_capability("textDocument/inlayHint"));
+    }
+
+    /// Test has_capability returns false when capabilities explicitly set to false.
+    ///
+    /// LSP spec allows servers to advertise `Some(false)` to explicitly disable
+    /// a capability. The previous `.is_some()` check incorrectly treated this
+    /// as "supported".
+    #[tokio::test]
+    async fn has_capability_returns_false_for_explicitly_disabled() {
+        use tower_lsp_server::ls_types::{
+            DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            TypeDefinitionProviderCapability,
+        };
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            hover_provider: Some(HoverProviderCapability::Simple(false)),
+            definition_provider: Some(OneOf::Left(false)),
+            type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(false)),
+            declaration_provider: Some(DeclarationCapability::Simple(false)),
+            implementation_provider: Some(ImplementationProviderCapability::Simple(false)),
+            references_provider: Some(OneOf::Left(false)),
+            document_highlight_provider: Some(OneOf::Left(false)),
+            rename_provider: Some(OneOf::Left(false)),
+            moniker_provider: Some(OneOf::Left(false)),
+            inlay_hint_provider: Some(OneOf::Left(false)),
+            ..Default::default()
+        });
+
+        let methods = [
+            "textDocument/hover",
+            "textDocument/definition",
+            "textDocument/typeDefinition",
+            "textDocument/declaration",
+            "textDocument/implementation",
+            "textDocument/references",
+            "textDocument/documentHighlight",
+            "textDocument/rename",
+            "textDocument/moniker",
+            "textDocument/inlayHint",
+        ];
+        for method in methods {
+            assert!(
+                !handle.has_capability(method),
+                "has_capability({}) should return false when explicitly disabled with Simple(false)/Left(false)",
+                method
+            );
+        }
     }
 
     /// Test has_capability returns false for each method when the provider is NOT set.
