@@ -1576,7 +1576,7 @@ mod tests {
         // which injected languages need auto-installation (parsers not loaded).
         //
         // The function should:
-        // 1. Get injected languages from the document using get_injected_languages()
+        // 1. Get injected languages from resolve_injection_data()
         // 2. For each language, call ensure_language_loaded() to check if parser exists
         // 3. If parser is NOT loaded AND autoInstall is enabled, trigger maybe_auto_install_language()
         // 4. Skip languages that are already loaded or already being installed
@@ -1605,9 +1605,10 @@ mod tests {
         // This verifies the core logic: if ensure_language_loaded().success is false,
         // the language should be a candidate for auto-installation.
 
-        // The check_injected_languages_auto_install method will use this pattern:
-        // 1. let languages = self.get_injected_languages(uri);
-        // 2. for lang in languages {
+        // The check_injected_languages_auto_install method uses this pattern:
+        // 1. let injections = self.resolve_injection_data(uri);
+        // 2. let languages = derive unique set from injections;
+        // 3. for lang in languages {
         //        let load_result = self.language.ensure_language_loaded(&lang);
         //        if !load_result.success {
         //            self.maybe_auto_install_language(&lang, uri, text).await;
