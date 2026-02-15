@@ -683,57 +683,68 @@ impl Kakehashi {
         }
     }
 
-    /// Forward didChange notifications to opened virtual documents in bridges.
+    /// Resolve all injection regions for a document into (language, region_id, content) tuples.
     ///
-    /// This method collects all injection regions from the parsed document and
-    /// forwards didChange notifications to downstream language servers for any
-    /// virtual documents that have been opened (via didOpen during hover/completion).
+    /// This method:
+    /// 1. Gets the host language and its injection query
+    /// 2. Extracts the parse tree (minimal lock duration on document store)
+    /// 3. Collects all injection regions via `collect_all_injections`
+    /// 4. Calculates stable region IDs via `RegionIdTracker` (ADR-0019)
     ///
-    /// Called after parse_document() in did_change() to propagate host document
-    /// changes to downstream language servers.
-    async fn forward_didchange_to_bridges(&self, uri: &Url, text: &str) {
+    /// Returns an empty Vec if no injections are found (no language, no query,
+    /// no tree, or no injection regions).
+    ///
+    /// # Lock Safety
+    /// The document store lock is held only to clone the tree and text, then
+    /// released before the tree traversal. No DashMap deadlock risk.
+    fn resolve_injection_data(&self, uri: &Url) -> Vec<(String, String, String)> {
         // Get the host language for this document
         let host_language = match self.get_language_for_document(uri) {
             Some(lang) => lang,
-            None => return, // No language detected, nothing to forward
+            None => return Vec::new(),
         };
 
         // Get the injection query for this language
         let injection_query = match self.language.get_injection_query(&host_language) {
             Some(q) => q,
-            None => return, // No injection query = no injections
+            None => return Vec::new(),
         };
 
-        // Extract tree from document with minimal lock duration
-        // IMPORTANT: Clone the tree to release document lock immediately
-        let tree = {
+        // Extract tree and text from document with minimal lock duration
+        // IMPORTANT: Clone both to release document lock immediately
+        let (tree, text) = {
             let doc = match self.documents.get(uri) {
                 Some(d) => d,
-                None => return, // Document not found
+                None => return Vec::new(),
             };
 
-            match doc.tree() {
+            let tree = match doc.tree() {
                 Some(t) => t.clone(),
-                None => return, // No parse tree
-            }
+                None => return Vec::new(),
+            };
+            let text = doc.text().to_string();
+            (tree, text)
             // Document lock released here when `doc` guard drops
         };
 
         // Collect all injection regions (no locks held)
-        let regions =
-            match collect_all_injections(&tree.root_node(), text, Some(injection_query.as_ref())) {
-                Some(r) => r,
-                None => return, // No injections
-            };
+        let regions = match collect_all_injections(
+            &tree.root_node(),
+            &text,
+            Some(injection_query.as_ref()),
+        ) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
 
         if regions.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Build (language, region_id, content) tuples for each injection
         // ADR-0019: Use RegionIdTracker with position-based keys
         // No document lock held here - safe to access region_id_tracker
-        let injections: Vec<(String, String, String)> = regions
+        regions
             .iter()
             .map(|region| {
                 let region_id = InjectionResolver::calculate_region_id(
@@ -748,7 +759,22 @@ impl Kakehashi {
                     content.to_string(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    /// Forward didChange notifications to opened virtual documents in bridges.
+    ///
+    /// This method collects all injection regions from the parsed document and
+    /// forwards didChange notifications to downstream language servers for any
+    /// virtual documents that have been opened (via didOpen during hover/completion).
+    ///
+    /// Called after parse_document() in did_change() to propagate host document
+    /// changes to downstream language servers.
+    async fn forward_didchange_to_bridges(&self, uri: &Url) {
+        let injections = self.resolve_injection_data(uri);
+        if injections.is_empty() {
+            return;
+        }
 
         // Forward didChange to opened virtual documents
         self.bridge
@@ -1334,9 +1360,6 @@ impl LanguageServer for Kakehashi {
         // Must be called BEFORE parse_document which updates the injection_map
         self.cache.invalidate_for_edits(&uri, &edits);
 
-        // Clone text before parse_document consumes it (needed for forward_didchange_to_bridges)
-        let text_for_bridge = text.clone();
-
         // Parse the updated document with edit information
         self.parse_document(uri.clone(), text, language_id.as_deref(), edits)
             .await;
@@ -1351,8 +1374,7 @@ impl LanguageServer for Kakehashi {
         // tokens won't be returned for mismatched result_ids.
 
         // Forward didChange to opened virtual documents in bridge
-        self.forward_didchange_to_bridges(&uri, &text_for_bridge)
-            .await;
+        self.forward_didchange_to_bridges(&uri).await;
 
         // ADR-0019: Close invalidated virtual documents.
         // Send didClose notifications to downstream LSs for orphaned docs.
