@@ -52,9 +52,7 @@ use tokio::sync::Mutex;
 
 use super::text_sync::apply_content_changes_with_edits;
 
-use super::auto_install::{
-    AutoInstallManager, InstallEvent, InstallingLanguages, get_injected_languages,
-};
+use super::auto_install::{AutoInstallManager, InstallEvent, InstallingLanguages};
 use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
@@ -782,27 +780,31 @@ impl Kakehashi {
             .await;
     }
 
-    /// Process injected languages: auto-install missing parsers and spawn bridge servers.
+    /// Process injected languages: auto-install missing parsers and eagerly open virtual documents.
     ///
-    /// This computes the injected language set once and passes it to both:
+    /// This resolves injection data once and uses it for both:
     /// 1. Auto-install check for missing parsers
-    /// 2. Eager bridge server spawning for ready servers
+    /// 2. Eager server spawn + didOpen for virtual documents
     ///
     /// This must be called AFTER parse_document so we have access to the AST.
     async fn process_injected_languages(&self, uri: &Url) {
-        // Get unique injected languages from the document (computed once)
-        let languages = get_injected_languages(uri, &self.language, &self.documents);
+        // Resolve all injection regions (computed once)
+        let injections = self.resolve_injection_data(uri);
 
-        if languages.is_empty() {
+        if injections.is_empty() {
             return;
         }
+
+        // Derive unique language set for auto-install
+        let languages: HashSet<String> =
+            injections.iter().map(|(lang, _, _)| lang.clone()).collect();
 
         // Check for missing parsers and trigger auto-install
         self.check_injected_languages_auto_install(uri, &languages)
             .await;
 
-        // Eagerly spawn bridge servers for detected injection languages
-        self.eager_spawn_bridge_servers(uri, languages).await;
+        // Eagerly spawn bridge servers and open virtual documents
+        self.eager_spawn_bridge_servers(uri, injections);
     }
 
     /// Check injected languages and handle missing parsers.
@@ -861,12 +863,12 @@ impl Kakehashi {
         }
     }
 
-    /// Eagerly spawn bridge servers for detected injection languages.
+    /// Eagerly spawn bridge servers and open virtual documents for detected injections.
     ///
-    /// This warms up language servers (spawn + handshake) in the background for
-    /// any injection regions found in the document. The servers will be ready
-    /// to handle requests (hover, completion, etc.) without first-request latency.
-    async fn eager_spawn_bridge_servers(&self, uri: &Url, languages: HashSet<String>) {
+    /// This warms up language servers (spawn + handshake + didOpen) in the background
+    /// for injection regions found in the document. Downstream servers receive
+    /// document content immediately, enabling faster diagnostic responses.
+    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<(String, String, String)>) {
         // Get the host language for this document
         let Some(host_language) = self.get_language_for_document(uri) else {
             return;
@@ -875,10 +877,9 @@ impl Kakehashi {
         // Get current settings for server config lookup
         let settings = self.settings_manager.load_settings();
 
-        // Spawn servers for each detected injection language
+        // Spawn servers and open virtual documents for each detected injection
         self.bridge
-            .eager_spawn_servers(&settings, &host_language, languages)
-            .await;
+            .eager_spawn_and_open_documents(&settings, &host_language, uri, injections);
     }
 
     /// Schedule a debounced diagnostic for a document (ADR-0020 Phase 3).

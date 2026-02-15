@@ -575,6 +575,7 @@ impl LanguageServerPool {
     /// # Arguments
     /// * `server_name` - The server name from config (e.g., "lua-ls", "pyright")
     /// * `server_config` - The server configuration containing command
+    #[cfg(test)]
     pub(crate) async fn ensure_server_ready(
         &self,
         server_name: &str,

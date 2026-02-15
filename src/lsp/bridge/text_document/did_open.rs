@@ -4,7 +4,10 @@
 //! language servers when injection regions are detected during `did_open`
 //! or `did_change` processing.
 
-use super::super::pool::LanguageServerPool;
+use std::time::Duration;
+
+use super::super::pool::{ConnectionHandleSender, INIT_TIMEOUT_SECS, LanguageServerPool};
+use super::super::protocol::VirtualDocumentUri;
 
 impl LanguageServerPool {
     /// Eagerly open virtual documents on a downstream server.
@@ -32,7 +35,46 @@ impl LanguageServerPool {
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
         injections: Vec<(String, String, String)>,
     ) {
-        todo!("Subtask 4: implement eager_open_virtual_documents")
+        // Wait for the server to be ready (handshake complete)
+        let handle = match self
+            .get_or_create_connection_wait_ready(
+                server_name,
+                server_config,
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Eager open: server {} not ready, skipping didOpen for {} injections: {}",
+                    server_name,
+                    injections.len(),
+                    e
+                );
+                return;
+            }
+        };
+
+        let mut sender = ConnectionHandleSender(&handle);
+
+        for (language, region_id, content) in &injections {
+            let virtual_uri = VirtualDocumentUri::new(host_uri_lsp, language, region_id);
+
+            if let Err(e) = self
+                .ensure_document_opened(&mut sender, host_uri, &virtual_uri, content, server_name)
+                .await
+            {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Eager open: failed to open {} on {}: {}",
+                    virtual_uri.to_uri_string(),
+                    server_name,
+                    e
+                );
+            }
+        }
     }
 }
 

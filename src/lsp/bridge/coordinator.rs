@@ -353,49 +353,88 @@ impl BridgeCoordinator {
     }
 
     // ========================================
-    // Eager spawn (warmup)
+    // Eager spawn + open (warmup with document content)
     // ========================================
 
-    /// Eagerly spawn language servers for detected injection languages.
+    /// Eagerly spawn language servers and open virtual documents for detected injections.
     ///
-    /// This method looks up each injection language in the settings, finds the
-    /// corresponding language server config, and spawns the server if not already
-    /// running. The LSP handshake runs in a background task.
+    /// This method:
+    /// 1. Groups injections by server name using `get_config_for_language`
+    /// 2. Spawns one background task per server group
+    /// 3. Each task waits for server ready, then sends `didOpen` for all injections
     ///
-    /// Call this after parsing a document to warm up servers for code blocks,
-    /// eliminating first-request latency for hover, completion, etc.
+    /// This replaces the old `eager_spawn_servers` which only did handshakes.
+    /// By also sending `didOpen`, downstream servers can start analyzing immediately,
+    /// resulting in faster diagnostic responses.
     ///
     /// # Arguments
     /// * `settings` - Current workspace settings
     /// * `host_language` - Language of the host document (e.g., "markdown")
-    /// * `injection_languages` - Set of detected injection languages (e.g., {"lua", "python"})
-    pub(crate) async fn eager_spawn_servers(
+    /// * `host_uri` - URI of the host document
+    /// * `injections` - List of (language, region_id, content) tuples for all injection regions
+    pub(crate) fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
         host_language: &str,
-        injection_languages: impl IntoIterator<Item = impl AsRef<str>>,
+        host_uri: &Url,
+        injections: Vec<(String, String, String)>,
     ) {
-        for lang in injection_languages {
-            let lang = lang.as_ref();
-
-            // Look up server config for this injection language
-            if let Some(resolved) = self.get_config_for_language(settings, host_language, lang) {
-                log::debug!(
+        // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
+        let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
+            Ok(uri) => uri,
+            Err(e) => {
+                log::warn!(
                     target: "kakehashi::bridge",
-                    "Warming up {} server for {} injection",
-                    resolved.server_name,
-                    lang
+                    "Failed to convert host URI for eager open, skipping: {}",
+                    e
                 );
-
-                // Fire-and-forget spawn - handshake runs in background
-                let pool = self.pool_arc();
-                let server_name = resolved.server_name.clone();
-                let config = resolved.config.clone();
-
-                tokio::spawn(async move {
-                    let _ = pool.ensure_server_ready(&server_name, &config).await;
-                });
+                return;
             }
+        };
+
+        // Group injections by server name
+        // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
+        type InjectionTuple = (String, String, String);
+        type ServerGroup = (BridgeServerConfig, Vec<InjectionTuple>);
+        let mut server_groups: std::collections::HashMap<String, ServerGroup> =
+            std::collections::HashMap::new();
+
+        for injection in injections {
+            let (language, _, _) = &injection;
+
+            if let Some(resolved) = self.get_config_for_language(settings, host_language, language)
+            {
+                server_groups
+                    .entry(resolved.server_name.clone())
+                    .or_insert_with(|| (resolved.config.clone(), Vec::new()))
+                    .1
+                    .push(injection);
+            }
+        }
+
+        // Spawn one background task per server group
+        for (server_name, (config, group_injections)) in server_groups {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager open: spawning {} with {} injections",
+                server_name,
+                group_injections.len()
+            );
+
+            let pool = self.pool_arc();
+            let host_uri = host_uri.clone();
+            let host_uri_lsp = host_uri_lsp.clone();
+
+            tokio::spawn(async move {
+                pool.eager_open_virtual_documents(
+                    &server_name,
+                    &config,
+                    &host_uri,
+                    &host_uri_lsp,
+                    group_injections,
+                )
+                .await;
+            });
         }
     }
 }
