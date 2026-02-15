@@ -760,15 +760,15 @@ impl Kakehashi {
             .collect()
     }
 
-    /// Forward didChange notifications to opened virtual documents in bridges.
+    /// Forward didChange and process injected languages using pre-resolved injection data.
     ///
-    /// This method collects all injection regions from the parsed document and
-    /// forwards didChange notifications to downstream language servers for any
-    /// virtual documents that have been opened (via didOpen during hover/completion).
+    /// This resolves injection data **once** and uses it for:
+    /// 1. Forwarding didChange to already-opened virtual documents in bridges
+    /// 2. Auto-install check for missing parsers
+    /// 3. Eager server spawn + didOpen for virtual documents
     ///
-    /// Called after parse_document() in did_change() to propagate host document
-    /// changes to downstream language servers.
-    async fn forward_didchange_to_bridges(&self, uri: &Url) {
+    /// Must be called AFTER parse_document so we have access to the AST.
+    async fn forward_and_process_injections(&self, uri: &Url) {
         let injections = self.resolve_injection_data(uri);
         if injections.is_empty() {
             return;
@@ -778,6 +778,17 @@ impl Kakehashi {
         self.bridge
             .forward_didchange_to_opened_docs(uri, &injections)
             .await;
+
+        // Derive unique language set for auto-install
+        let languages: HashSet<String> =
+            injections.iter().map(|(lang, _, _)| lang.clone()).collect();
+
+        // Check for missing parsers and trigger auto-install
+        self.check_injected_languages_auto_install(uri, &languages)
+            .await;
+
+        // Eagerly spawn bridge servers and open virtual documents
+        self.eager_spawn_bridge_servers(uri, injections);
     }
 
     /// Process injected languages: auto-install missing parsers and eagerly open virtual documents.
@@ -1374,18 +1385,18 @@ impl LanguageServer for Kakehashi {
         // The cache is validated at lookup time via result_id matching, so stale
         // tokens won't be returned for mismatched result_ids.
 
-        // Forward didChange to opened virtual documents in bridge
-        self.forward_didchange_to_bridges(&uri).await;
-
         // ADR-0019: Close invalidated virtual documents.
         // Send didClose notifications to downstream LSs for orphaned docs.
         self.close_invalidated_virtual_docs(&uri, &invalidated_ulids)
             .await;
 
-        // Process injected languages: auto-install missing parsers and spawn bridge servers.
-        // When users add new code blocks, parsers are installed and servers warm up immediately.
-        // This must be called AFTER parse_document so we have access to the updated AST.
-        self.process_injected_languages(&uri).await;
+        // Forward didChange to opened virtual documents + process injected languages.
+        // Injection data is resolved once and reused for:
+        // 1. didChange forwarding to already-opened virtual documents
+        // 2. Auto-install missing parsers
+        // 3. Eager server spawn + didOpen for virtual documents
+        // Must be called AFTER parse_document so we have access to the updated AST.
+        self.forward_and_process_injections(&uri).await;
 
         // ADR-0020 Phase 3: Schedule debounced diagnostic push on didChange.
         // After 500ms of no changes, diagnostics will be collected and published.
