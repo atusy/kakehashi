@@ -1586,158 +1586,79 @@ mod tests {
     }
 
     // ========================================
-    // Position-based Capability Check Tests
+    // Position-based Capability Check Tests (table-driven)
     // ========================================
 
-    /// Test has_capability returns true for hover when hover_provider is set.
+    /// Table-driven test: has_capability returns true for each supported method
+    /// when the corresponding capability is enabled.
+    ///
+    /// Each entry sets exactly one capability field, then asserts has_capability
+    /// returns true for the matching method.
     #[tokio::test]
-    async fn has_capability_returns_true_for_hover() {
-        use tower_lsp_server::ls_types::HoverProviderCapability;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            hover_provider: Some(HoverProviderCapability::Simple(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/hover"));
+    async fn has_capability_returns_true_for_enabled_providers() {
+        use tower_lsp_server::ls_types::{
+            CompletionOptions, DeclarationCapability, HoverProviderCapability,
+            ImplementationProviderCapability, OneOf, SignatureHelpOptions,
+            TypeDefinitionProviderCapability,
+        };
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut ServerCapabilities)>)> = vec![
+            ("textDocument/hover", Box::new(|c| {
+                c.hover_provider = Some(HoverProviderCapability::Simple(true));
+            })),
+            ("textDocument/completion", Box::new(|c| {
+                c.completion_provider = Some(CompletionOptions::default());
+            })),
+            ("textDocument/definition", Box::new(|c| {
+                c.definition_provider = Some(OneOf::Left(true));
+            })),
+            ("textDocument/typeDefinition", Box::new(|c| {
+                c.type_definition_provider = Some(TypeDefinitionProviderCapability::Simple(true));
+            })),
+            ("textDocument/declaration", Box::new(|c| {
+                c.declaration_provider = Some(DeclarationCapability::Simple(true));
+            })),
+            ("textDocument/implementation", Box::new(|c| {
+                c.implementation_provider = Some(ImplementationProviderCapability::Simple(true));
+            })),
+            ("textDocument/references", Box::new(|c| {
+                c.references_provider = Some(OneOf::Left(true));
+            })),
+            ("textDocument/documentHighlight", Box::new(|c| {
+                c.document_highlight_provider = Some(OneOf::Left(true));
+            })),
+            ("textDocument/signatureHelp", Box::new(|c| {
+                c.signature_help_provider = Some(SignatureHelpOptions::default());
+            })),
+            ("textDocument/rename", Box::new(|c| {
+                c.rename_provider = Some(OneOf::Left(true));
+            })),
+            ("textDocument/moniker", Box::new(|c| {
+                c.moniker_provider = Some(OneOf::Left(true));
+            })),
+            ("textDocument/inlayHint", Box::new(|c| {
+                c.inlay_hint_provider = Some(OneOf::Left(true));
+            })),
+        ];
+
+        for (method, set_cap) in &cases {
+            let handle = spawn_sink_handle().await;
+            let mut caps = ServerCapabilities::default();
+            set_cap(&mut caps);
+            handle.set_server_capabilities(caps);
+
+            assert!(
+                handle.has_capability(method),
+                "has_capability({method}) should return true when enabled",
+            );
+        }
     }
 
-    /// Test has_capability returns true for completion when completion_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_completion() {
-        use tower_lsp_server::ls_types::CompletionOptions;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            completion_provider: Some(CompletionOptions::default()),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/completion"));
-    }
-
-    /// Test has_capability returns true for definition when definition_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_definition() {
-        use tower_lsp_server::ls_types::OneOf;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            definition_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/definition"));
-    }
-
-    /// Test has_capability returns true for typeDefinition when type_definition_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_type_definition() {
-        use tower_lsp_server::ls_types::{OneOf, TypeDefinitionProviderCapability};
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/typeDefinition"));
-    }
-
-    /// Test has_capability returns true for declaration when declaration_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_declaration() {
-        use tower_lsp_server::ls_types::DeclarationCapability;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            declaration_provider: Some(DeclarationCapability::Simple(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/declaration"));
-    }
-
-    /// Test has_capability returns true for implementation when implementation_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_implementation() {
-        use tower_lsp_server::ls_types::ImplementationProviderCapability;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/implementation"));
-    }
-
-    /// Test has_capability returns true for references when references_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_references() {
-        use tower_lsp_server::ls_types::OneOf;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            references_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/references"));
-    }
-
-    /// Test has_capability returns true for documentHighlight when provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_document_highlight() {
-        use tower_lsp_server::ls_types::OneOf;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            document_highlight_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/documentHighlight"));
-    }
-
-    /// Test has_capability returns true for signatureHelp when provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_signature_help() {
-        use tower_lsp_server::ls_types::SignatureHelpOptions;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            signature_help_provider: Some(SignatureHelpOptions::default()),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/signatureHelp"));
-    }
-
-    /// Test has_capability returns true for rename when rename_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_rename() {
-        use tower_lsp_server::ls_types::OneOf;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            rename_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/rename"));
-    }
-
-    /// Test has_capability returns true for moniker when moniker_provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_moniker() {
-        use tower_lsp_server::ls_types::OneOf;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            moniker_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/moniker"));
-    }
-
-    /// Test has_capability returns true for inlayHint when provider is set.
-    #[tokio::test]
-    async fn has_capability_returns_true_for_inlay_hint() {
-        use tower_lsp_server::ls_types::OneOf;
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            inlay_hint_provider: Some(OneOf::Left(true)),
-            ..Default::default()
-        });
-        assert!(handle.has_capability("textDocument/inlayHint"));
-    }
-
-    /// Test has_capability returns false when capabilities explicitly set to false.
+    /// Table-driven test: has_capability returns false when capabilities are
+    /// explicitly disabled via `Simple(false)` / `OneOf::Left(false)`.
     ///
     /// LSP spec allows servers to advertise `Some(false)` to explicitly disable
-    /// a capability. The previous `.is_some()` check incorrectly treated this
-    /// as "supported".
+    /// a capability.
     #[tokio::test]
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
@@ -1745,38 +1666,48 @@ mod tests {
             TypeDefinitionProviderCapability,
         };
 
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
-            hover_provider: Some(HoverProviderCapability::Simple(false)),
-            definition_provider: Some(OneOf::Left(false)),
-            type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(false)),
-            declaration_provider: Some(DeclarationCapability::Simple(false)),
-            implementation_provider: Some(ImplementationProviderCapability::Simple(false)),
-            references_provider: Some(OneOf::Left(false)),
-            document_highlight_provider: Some(OneOf::Left(false)),
-            rename_provider: Some(OneOf::Left(false)),
-            moniker_provider: Some(OneOf::Left(false)),
-            inlay_hint_provider: Some(OneOf::Left(false)),
-            ..Default::default()
-        });
-
-        let methods = [
-            "textDocument/hover",
-            "textDocument/definition",
-            "textDocument/typeDefinition",
-            "textDocument/declaration",
-            "textDocument/implementation",
-            "textDocument/references",
-            "textDocument/documentHighlight",
-            "textDocument/rename",
-            "textDocument/moniker",
-            "textDocument/inlayHint",
+        let cases: Vec<(&str, Box<dyn Fn(&mut ServerCapabilities)>)> = vec![
+            ("textDocument/hover", Box::new(|c| {
+                c.hover_provider = Some(HoverProviderCapability::Simple(false));
+            })),
+            ("textDocument/definition", Box::new(|c| {
+                c.definition_provider = Some(OneOf::Left(false));
+            })),
+            ("textDocument/typeDefinition", Box::new(|c| {
+                c.type_definition_provider = Some(TypeDefinitionProviderCapability::Simple(false));
+            })),
+            ("textDocument/declaration", Box::new(|c| {
+                c.declaration_provider = Some(DeclarationCapability::Simple(false));
+            })),
+            ("textDocument/implementation", Box::new(|c| {
+                c.implementation_provider = Some(ImplementationProviderCapability::Simple(false));
+            })),
+            ("textDocument/references", Box::new(|c| {
+                c.references_provider = Some(OneOf::Left(false));
+            })),
+            ("textDocument/documentHighlight", Box::new(|c| {
+                c.document_highlight_provider = Some(OneOf::Left(false));
+            })),
+            ("textDocument/rename", Box::new(|c| {
+                c.rename_provider = Some(OneOf::Left(false));
+            })),
+            ("textDocument/moniker", Box::new(|c| {
+                c.moniker_provider = Some(OneOf::Left(false));
+            })),
+            ("textDocument/inlayHint", Box::new(|c| {
+                c.inlay_hint_provider = Some(OneOf::Left(false));
+            })),
         ];
-        for method in methods {
+
+        for (method, set_cap) in &cases {
+            let handle = spawn_sink_handle().await;
+            let mut caps = ServerCapabilities::default();
+            set_cap(&mut caps);
+            handle.set_server_capabilities(caps);
+
             assert!(
                 !handle.has_capability(method),
-                "has_capability({}) should return false when explicitly disabled with Simple(false)/Left(false)",
-                method
+                "has_capability({method}) should return false when explicitly disabled",
             );
         }
     }
