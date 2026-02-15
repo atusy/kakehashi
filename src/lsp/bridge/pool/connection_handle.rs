@@ -441,7 +441,10 @@ impl ConnectionHandle {
             ),
             "textDocument/completion" => caps.completion_provider.is_some(),
             "textDocument/definition" => {
-                matches!(caps.definition_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+                matches!(
+                    caps.definition_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
             }
             "textDocument/typeDefinition" => matches!(
                 caps.type_definition_provider,
@@ -466,7 +469,10 @@ impl ConnectionHandle {
                 )
             ),
             "textDocument/references" => {
-                matches!(caps.references_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+                matches!(
+                    caps.references_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
             }
             "textDocument/documentHighlight" => {
                 matches!(
@@ -476,13 +482,22 @@ impl ConnectionHandle {
             }
             "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
             "textDocument/rename" => {
-                matches!(caps.rename_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+                matches!(
+                    caps.rename_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
             }
             "textDocument/moniker" => {
-                matches!(caps.moniker_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+                matches!(
+                    caps.moniker_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
             }
             "textDocument/inlayHint" => {
-                matches!(caps.inlay_hint_provider, Some(OneOf::Left(true) | OneOf::Right(_)))
+                matches!(
+                    caps.inlay_hint_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
             }
             _ => false,
         }
@@ -1603,42 +1618,80 @@ mod tests {
         };
 
         let cases: Vec<(&str, Box<dyn Fn(&mut ServerCapabilities)>)> = vec![
-            ("textDocument/hover", Box::new(|c| {
-                c.hover_provider = Some(HoverProviderCapability::Simple(true));
-            })),
-            ("textDocument/completion", Box::new(|c| {
-                c.completion_provider = Some(CompletionOptions::default());
-            })),
-            ("textDocument/definition", Box::new(|c| {
-                c.definition_provider = Some(OneOf::Left(true));
-            })),
-            ("textDocument/typeDefinition", Box::new(|c| {
-                c.type_definition_provider = Some(TypeDefinitionProviderCapability::Simple(true));
-            })),
-            ("textDocument/declaration", Box::new(|c| {
-                c.declaration_provider = Some(DeclarationCapability::Simple(true));
-            })),
-            ("textDocument/implementation", Box::new(|c| {
-                c.implementation_provider = Some(ImplementationProviderCapability::Simple(true));
-            })),
-            ("textDocument/references", Box::new(|c| {
-                c.references_provider = Some(OneOf::Left(true));
-            })),
-            ("textDocument/documentHighlight", Box::new(|c| {
-                c.document_highlight_provider = Some(OneOf::Left(true));
-            })),
-            ("textDocument/signatureHelp", Box::new(|c| {
-                c.signature_help_provider = Some(SignatureHelpOptions::default());
-            })),
-            ("textDocument/rename", Box::new(|c| {
-                c.rename_provider = Some(OneOf::Left(true));
-            })),
-            ("textDocument/moniker", Box::new(|c| {
-                c.moniker_provider = Some(OneOf::Left(true));
-            })),
-            ("textDocument/inlayHint", Box::new(|c| {
-                c.inlay_hint_provider = Some(OneOf::Left(true));
-            })),
+            (
+                "textDocument/hover",
+                Box::new(|c| {
+                    c.hover_provider = Some(HoverProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/completion",
+                Box::new(|c| {
+                    c.completion_provider = Some(CompletionOptions::default());
+                }),
+            ),
+            (
+                "textDocument/definition",
+                Box::new(|c| {
+                    c.definition_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/typeDefinition",
+                Box::new(|c| {
+                    c.type_definition_provider =
+                        Some(TypeDefinitionProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/implementation",
+                Box::new(|c| {
+                    c.implementation_provider =
+                        Some(ImplementationProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/references",
+                Box::new(|c| {
+                    c.references_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/documentHighlight",
+                Box::new(|c| {
+                    c.document_highlight_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/signatureHelp",
+                Box::new(|c| {
+                    c.signature_help_provider = Some(SignatureHelpOptions::default());
+                }),
+            ),
+            (
+                "textDocument/rename",
+                Box::new(|c| {
+                    c.rename_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/moniker",
+                Box::new(|c| {
+                    c.moniker_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/inlayHint",
+                Box::new(|c| {
+                    c.inlay_hint_provider = Some(OneOf::Left(true));
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -1662,41 +1715,73 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
-            DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability, OneOf,
-            TypeDefinitionProviderCapability,
+            DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability,
+            OneOf, TypeDefinitionProviderCapability,
         };
 
         let cases: Vec<(&str, Box<dyn Fn(&mut ServerCapabilities)>)> = vec![
-            ("textDocument/hover", Box::new(|c| {
-                c.hover_provider = Some(HoverProviderCapability::Simple(false));
-            })),
-            ("textDocument/definition", Box::new(|c| {
-                c.definition_provider = Some(OneOf::Left(false));
-            })),
-            ("textDocument/typeDefinition", Box::new(|c| {
-                c.type_definition_provider = Some(TypeDefinitionProviderCapability::Simple(false));
-            })),
-            ("textDocument/declaration", Box::new(|c| {
-                c.declaration_provider = Some(DeclarationCapability::Simple(false));
-            })),
-            ("textDocument/implementation", Box::new(|c| {
-                c.implementation_provider = Some(ImplementationProviderCapability::Simple(false));
-            })),
-            ("textDocument/references", Box::new(|c| {
-                c.references_provider = Some(OneOf::Left(false));
-            })),
-            ("textDocument/documentHighlight", Box::new(|c| {
-                c.document_highlight_provider = Some(OneOf::Left(false));
-            })),
-            ("textDocument/rename", Box::new(|c| {
-                c.rename_provider = Some(OneOf::Left(false));
-            })),
-            ("textDocument/moniker", Box::new(|c| {
-                c.moniker_provider = Some(OneOf::Left(false));
-            })),
-            ("textDocument/inlayHint", Box::new(|c| {
-                c.inlay_hint_provider = Some(OneOf::Left(false));
-            })),
+            (
+                "textDocument/hover",
+                Box::new(|c| {
+                    c.hover_provider = Some(HoverProviderCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/definition",
+                Box::new(|c| {
+                    c.definition_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/typeDefinition",
+                Box::new(|c| {
+                    c.type_definition_provider =
+                        Some(TypeDefinitionProviderCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/implementation",
+                Box::new(|c| {
+                    c.implementation_provider =
+                        Some(ImplementationProviderCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/references",
+                Box::new(|c| {
+                    c.references_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/documentHighlight",
+                Box::new(|c| {
+                    c.document_highlight_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/rename",
+                Box::new(|c| {
+                    c.rename_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/moniker",
+                Box::new(|c| {
+                    c.moniker_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/inlayHint",
+                Box::new(|c| {
+                    c.inlay_hint_provider = Some(OneOf::Left(false));
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
