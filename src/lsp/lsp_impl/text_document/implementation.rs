@@ -1,7 +1,5 @@
 //! Goto implementation method for Kakehashi.
 
-use std::sync::Arc;
-
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp_server::ls_types::{Location, MessageType};
@@ -9,7 +7,7 @@ use tower_lsp_server::ls_types::{Location, MessageType};
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use super::first_win;
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn goto_implementation_impl(
@@ -28,35 +26,22 @@ impl Kakehashi {
 
         // Fan-out implementation requests to all matching servers
         let pool = self.bridge.pool_arc();
-        let mut join_set = tokio::task::JoinSet::new();
         let position = ctx.position;
-        let region_start_line = ctx.resolved.region.line_range.start;
-
-        for config in ctx.configs {
-            let pool = Arc::clone(&pool);
-            let uri = ctx.uri.clone();
-            let injection_language = ctx.resolved.injection_language.clone();
-            let region_id = ctx.resolved.region.region_id.clone();
-            let virtual_content = ctx.resolved.virtual_content.clone();
-            let upstream_id = ctx.upstream_request_id.clone();
-            let server_name = config.server_name.clone();
-            let server_config = Arc::new(config.config);
-
-            join_set.spawn(async move {
-                pool.send_implementation_request(
-                    &server_name,
-                    &server_config,
-                    &uri,
+        let mut join_set = fan_out(&ctx, pool, |t| async move {
+            t.pool
+                .send_implementation_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
                     position,
-                    &injection_language,
-                    &region_id,
-                    region_start_line,
-                    &virtual_content,
-                    upstream_id,
+                    &t.injection_language,
+                    &t.region_id,
+                    t.region_start_line,
+                    &t.virtual_content,
+                    t.upstream_id,
                 )
                 .await
-            });
-        }
+        });
 
         // Return the first non-empty implementation response
         let result =
