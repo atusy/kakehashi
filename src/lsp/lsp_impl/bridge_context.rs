@@ -29,8 +29,6 @@ use super::{Kakehashi, uri_to_url};
 pub(crate) struct BridgeRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
-    /// The cursor position within the document.
-    pub(crate) position: Position,
     /// The resolved injection region with virtual content and region metadata.
     pub(crate) resolved: ResolvedInjection,
     /// The bridge server config (server name + spawn config).
@@ -201,7 +199,6 @@ impl Kakehashi {
 
         Some(BridgeRequestContext {
             uri: preamble.uri,
-            position: preamble.position,
             resolved: preamble.resolved,
             resolved_config,
             upstream_request_id: preamble.upstream_request_id,
