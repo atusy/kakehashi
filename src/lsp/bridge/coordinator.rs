@@ -59,6 +59,17 @@ pub(crate) struct ResolvedServerConfig {
     pub(crate) config: BridgeServerConfig,
 }
 
+/// A batch of eager-open task handles with a generation counter.
+///
+/// The generation counter enables detection of stale pushes: when a concurrent
+/// `supersede` replaces the batch, handles from the previous generation are
+/// aborted instead of being accidentally adopted.
+#[allow(dead_code)] // Used in next commit (GREEN phase)
+struct EagerOpenBatch {
+    generation: u64,
+    handles: Vec<tokio::task::AbortHandle>,
+}
+
 /// Coordinator for bridge connections and region ID tracking.
 ///
 /// Consolidates the `LanguageServerPool` and `RegionIdTracker` into a single
@@ -994,6 +1005,47 @@ mod tests {
             entry.value().len(),
             0,
             "supersede should insert empty placeholder"
+        );
+    }
+
+    /// Test that push_or_abort with a stale generation aborts the handle.
+    ///
+    /// When two supersede calls happen concurrently, the first caller's
+    /// generation becomes stale. Handles pushed with the stale generation
+    /// should be aborted instead of adopted by the newer batch.
+    #[tokio::test]
+    async fn test_push_or_abort_with_stale_generation_aborts_handle() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // First supersede — get gen1
+        let gen1 = coordinator.supersede_eager_open_tasks(&uri);
+
+        // Second supersede — get gen2 (gen1 is now stale)
+        let gen2 = coordinator.supersede_eager_open_tasks(&uri);
+        assert!(gen2 > gen1, "gen2 should be greater than gen1");
+
+        // Push with stale gen1 — should be aborted
+        let stale_task = tokio::spawn(futures::future::pending::<()>());
+        coordinator.push_or_abort_eager_open_handle(&uri, stale_task.abort_handle(), gen1);
+
+        // Push with current gen2 — should be kept
+        let current_task = tokio::spawn(futures::future::pending::<()>());
+        coordinator.push_or_abort_eager_open_handle(&uri, current_task.abort_handle(), gen2);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // Stale generation handle should be aborted
+        assert!(
+            stale_task.is_finished(),
+            "Handle from stale generation should be aborted"
+        );
+
+        // Current generation handle should still be running
+        assert!(
+            !current_task.is_finished(),
+            "Handle from current generation should still be running"
         );
     }
 }
