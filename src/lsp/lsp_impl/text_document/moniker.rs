@@ -1,10 +1,10 @@
 //! Moniker method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::{MessageType, Moniker, MonikerParams};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{Moniker, MonikerParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn moniker_impl(&self, params: MonikerParams) -> Result<Option<Vec<Moniker>>> {
@@ -51,20 +51,6 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        match result {
-            FirstWinResult::Winner(monikers) => Ok(monikers),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(level, "No moniker response from any bridge server")
-                    .await;
-                Ok(None)
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result.handle(&self.client, "moniker", None, Ok).await
     }
 }

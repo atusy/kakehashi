@@ -1,10 +1,10 @@
 //! Signature help method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::{MessageType, SignatureHelp, SignatureHelpParams};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{SignatureHelp, SignatureHelpParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn signature_help_impl(
@@ -49,21 +49,8 @@ impl Kakehashi {
         // Return the first non-null signature help response
         let result = first_win::first_win(&mut join_set, |opt| opt.is_some(), cancel_rx).await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
-
-        match result {
-            FirstWinResult::Winner(signature_help) => Ok(signature_help),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(level, "No signature help response from any bridge server")
-                    .await;
-                Ok(None)
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result
+            .handle(&self.client, "signature help", None, Ok)
+            .await
     }
 }

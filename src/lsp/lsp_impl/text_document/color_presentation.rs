@@ -1,10 +1,10 @@
 //! Color presentation method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::{ColorPresentation, ColorPresentationParams, MessageType};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{ColorPresentation, ColorPresentationParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn color_presentation_impl(
@@ -62,23 +62,8 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        match result {
-            FirstWinResult::Winner(presentations) => Ok(presentations),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(
-                        level,
-                        "No color presentation response from any bridge server",
-                    )
-                    .await;
-                Ok(Vec::new())
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result
+            .handle(&self.client, "color presentation", Vec::new(), Ok)
+            .await
     }
 }

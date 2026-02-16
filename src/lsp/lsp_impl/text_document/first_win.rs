@@ -85,6 +85,43 @@ pub(super) enum FirstWinResult<T> {
     Cancelled,
 }
 
+impl<T> FirstWinResult<T> {
+    /// Handle the common post-dispatch pattern for first-win results.
+    ///
+    /// - `Winner`: calls `on_winner` to transform the value into the handler's return type.
+    /// - `NoWinner`: logs at WARNING (if errors > 0) or LOG (if errors == 0),
+    ///   then returns `Ok(no_result)`.
+    /// - `Cancelled`: returns `Err(Error::request_cancelled())`.
+    pub(super) async fn handle<R>(
+        self,
+        client: &tower_lsp_server::Client,
+        method_name: &str,
+        no_result: R,
+        on_winner: impl FnOnce(T) -> tower_lsp_server::jsonrpc::Result<R>,
+    ) -> tower_lsp_server::jsonrpc::Result<R> {
+        match self {
+            FirstWinResult::Winner(value) => on_winner(value),
+            FirstWinResult::NoWinner { errors } => {
+                let level = if errors > 0 {
+                    tower_lsp_server::ls_types::MessageType::WARNING
+                } else {
+                    tower_lsp_server::ls_types::MessageType::LOG
+                };
+                client
+                    .log_message(
+                        level,
+                        format!("No {method_name} response from any bridge server"),
+                    )
+                    .await;
+                Ok(no_result)
+            }
+            FirstWinResult::Cancelled => {
+                Err(tower_lsp_server::jsonrpc::Error::request_cancelled())
+            }
+        }
+    }
+}
+
 /// Returns the first non-empty successful result from a JoinSet of concurrent bridge requests.
 ///
 /// # Cancel subscription timing
