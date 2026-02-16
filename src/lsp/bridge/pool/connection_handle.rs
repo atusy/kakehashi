@@ -1641,8 +1641,10 @@ mod tests {
     async fn has_capability_returns_true_for_enabled_providers() {
         use tower_lsp_server::ls_types::{
             ColorProviderCapability, ColorProviderOptions, CompletionOptions,
-            DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability,
-            OneOf, SignatureHelpOptions, TypeDefinitionProviderCapability,
+            DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
+            TextDocumentRegistrationOptions, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -1738,6 +1740,48 @@ mod tests {
                 Box::new(|c| {
                     c.color_provider = Some(ColorProviderCapability::ColorProvider(
                         ColorProviderOptions {},
+                    ));
+                }),
+            ),
+            // Declaration — RegistrationOptions variant
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider =
+                        Some(DeclarationCapability::RegistrationOptions(
+                            DeclarationRegistrationOptions {
+                                declaration_options: DeclarationOptions {
+                                    work_done_progress_options: Default::default(),
+                                },
+                                text_document_registration_options:
+                                    TextDocumentRegistrationOptions {
+                                        document_selector: None,
+                                    },
+                                static_registration_options: Default::default(),
+                            },
+                        ));
+                }),
+            ),
+            // Declaration — Options variant
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::Options(
+                        DeclarationOptions {
+                            work_done_progress_options: Default::default(),
+                        },
+                    ));
+                }),
+            ),
+            // DocumentColor — Options variant (StaticTextDocumentColorProviderOptions)
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Options(
+                        StaticTextDocumentColorProviderOptions {
+                            document_selector: None,
+                            id: None,
+                        },
                     ));
                 }),
             ),
