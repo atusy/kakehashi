@@ -43,16 +43,15 @@ use crate::lsp::bridge::protocol::{RequestId, VirtualDocumentUri};
 /// that point the router has already consumed or cleaned up the entry.
 struct RouterCleanupGuard {
     router: Arc<ResponseRouter>,
-    request_id: RequestId,
-    /// When true, Drop will remove the router entry.
-    /// Set to false after wait_for_response completes.
-    armed: bool,
+    /// When `Some`, Drop will remove the router entry for this ID.
+    /// `take()`d after wait_for_response completes to disarm.
+    request_id: Option<RequestId>,
 }
 
 impl Drop for RouterCleanupGuard {
     fn drop(&mut self) {
-        if self.armed {
-            self.router.remove(self.request_id);
+        if let Some(id) = self.request_id {
+            self.router.remove(id);
         }
     }
 }
@@ -144,8 +143,7 @@ impl LanguageServerPool {
         // wait_for_response completes normally (any exit path).
         let mut router_guard = RouterCleanupGuard {
             router: Arc::clone(handle.router()),
-            request_id,
-            armed: true,
+            request_id: Some(request_id),
         };
 
         // Send didOpen notification only if document hasn't been opened yet
@@ -175,7 +173,7 @@ impl LanguageServerPool {
         // After this returns (success, channel-closed, or timeout),
         // the router entry has been consumed or cleaned up internally.
         let response = handle.wait_for_response(request_id, response_rx).await;
-        router_guard.armed = false;
+        router_guard.request_id.take();
 
         // Unregister from the upstream request registry regardless of result
         self.unregister_upstream_request(&upstream_request_id, server_name);
@@ -358,8 +356,7 @@ mod tests {
 
         let guard = RouterCleanupGuard {
             router: Arc::clone(&router),
-            request_id: RequestId::new(1),
-            armed: true,
+            request_id: Some(RequestId::new(1)),
         };
         drop(guard);
 
@@ -379,10 +376,9 @@ mod tests {
 
         let mut guard = RouterCleanupGuard {
             router: Arc::clone(&router),
-            request_id: RequestId::new(1),
-            armed: true,
+            request_id: Some(RequestId::new(1)),
         };
-        guard.armed = false;
+        guard.request_id.take();
         drop(guard);
 
         // The entry should still be present — re-registering should fail (duplicate)
