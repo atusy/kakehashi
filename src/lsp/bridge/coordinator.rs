@@ -914,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_two_pass_processes_both_passes() {
+    async fn test_cleanup_handles_all_cases() {
         let coordinator = BridgeCoordinator::new();
 
         let uri_a = Url::parse("file:///a.md").unwrap();
