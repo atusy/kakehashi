@@ -47,14 +47,18 @@ struct PreambleResult {
 impl Kakehashi {
     /// Subscribe to cancel notifications for an upstream request.
     ///
-    /// Returns `Some((receiver, guard))` on success, `None` if subscription fails
-    /// (e.g., duplicate subscription). The guard ensures automatic unsubscribe on drop.
+    /// Returns `(Some(receiver), Some(guard))` on success, or `(None, None)` if
+    /// subscription fails (e.g., duplicate subscription). The guard ensures
+    /// automatic unsubscribe on drop.
     ///
-    /// Mirrors the pattern used in `diagnostic_impl()`.
+    /// The tuple return type allows callers to destructure directly:
+    /// ```ignore
+    /// let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+    /// ```
     pub(crate) fn subscribe_cancel(
         &self,
         upstream_id: &UpstreamId,
-    ) -> Option<(CancelReceiver, CancelSubscriptionGuard<'_>)> {
+    ) -> (Option<CancelReceiver>, Option<CancelSubscriptionGuard<'_>>) {
         match self
             .bridge
             .cancel_forwarder()
@@ -65,7 +69,7 @@ impl Kakehashi {
                     self.bridge.cancel_forwarder(),
                     upstream_id.clone(),
                 );
-                Some((rx, guard))
+                (Some(rx), Some(guard))
             }
             Err(e) => {
                 log::error!(
@@ -73,7 +77,7 @@ impl Kakehashi {
                      Proceeding without cancel.",
                     e.0
                 );
-                None
+                (None, None)
             }
         }
     }

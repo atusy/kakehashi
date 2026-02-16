@@ -1,8 +1,8 @@
 //! Goto type definition method for Kakehashi.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefinitionResponse};
 use tower_lsp_server::ls_types::Location;
+use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefinitionResponse};
 
 use crate::lsp::bridge::location_link_to_location;
 
@@ -24,10 +24,7 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let (cancel_rx, _cancel_guard) = match self.subscribe_cancel(&ctx.upstream_request_id) {
-            Some((rx, guard)) => (Some(rx), Some(guard)),
-            None => (None, None),
-        };
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
 
         // Fan-out type definition requests to all matching servers
         let pool = self.bridge.pool_arc();
@@ -58,23 +55,18 @@ impl Kakehashi {
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
         result
-            .handle(
-                &self.client,
-                "type definition",
-                None,
-                |value| match value {
-                    Some(links) => {
-                        if self.supports_type_definition_link() {
-                            Ok(Some(GotoTypeDefinitionResponse::Link(links)))
-                        } else {
-                            let locations: Vec<Location> =
-                                links.into_iter().map(location_link_to_location).collect();
-                            Ok(Some(GotoTypeDefinitionResponse::Array(locations)))
-                        }
+            .handle(&self.client, "type definition", None, |value| match value {
+                Some(links) => {
+                    if self.supports_type_definition_link() {
+                        Ok(Some(GotoTypeDefinitionResponse::Link(links)))
+                    } else {
+                        let locations: Vec<Location> =
+                            links.into_iter().map(location_link_to_location).collect();
+                        Ok(Some(GotoTypeDefinitionResponse::Array(locations)))
                     }
-                    None => Ok(None),
-                },
-            )
+                }
+                None => Ok(None),
+            })
             .await
     }
 }

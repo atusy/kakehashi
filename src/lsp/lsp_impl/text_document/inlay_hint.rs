@@ -24,10 +24,7 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let (cancel_rx, _cancel_guard) = match self.subscribe_cancel(&ctx.upstream_request_id) {
-            Some((rx, guard)) => (Some(rx), Some(guard)),
-            None => (None, None),
-        };
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
 
         // Fan-out inlay hint requests to all matching servers
         let pool = self.bridge.pool_arc();
@@ -56,8 +53,6 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        result
-            .handle(&self.client, "inlay hint", None, Ok)
-            .await
+        result.handle(&self.client, "inlay hint", None, Ok).await
     }
 }
