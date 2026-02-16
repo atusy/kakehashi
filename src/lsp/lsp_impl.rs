@@ -772,6 +772,9 @@ impl Kakehashi {
     async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
         let injections = self.resolve_injection_data(uri);
         if injections.is_empty() {
+            // Cancel any previously spawned eager-open tasks for this URI.
+            // Without this, stale tasks could send didOpen for removed injection regions.
+            self.bridge.cancel_eager_open(uri);
             return;
         }
 
