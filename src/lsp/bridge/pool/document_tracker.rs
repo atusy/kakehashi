@@ -93,10 +93,9 @@ impl DocumentTracker {
     /// Returns `true` if this caller won the claim (URI was newly inserted).
     /// Returns `false` if another caller already claimed it.
     ///
-    /// Uses `DashSet::insert()` as an atomic compare-and-swap.
-    /// Also initializes the document version to 1, so that a concurrent
-    /// `didChange` arriving before `register_opened_document` can still
-    /// call `increment_document_version` successfully.
+    /// Initializes the document version BEFORE marking the document as opened
+    /// in the DashSet. This ensures `increment_document_version` never returns
+    /// `None` for a document where `is_document_opened()` returns `true`.
     ///
     /// On send failure, call `unclaim_document()` to roll back.
     pub(super) async fn try_claim_for_open(
@@ -104,34 +103,45 @@ impl DocumentTracker {
         virtual_uri: &VirtualDocumentUri,
         server_name: &str,
     ) -> bool {
-        if !self.opened_documents.insert(virtual_uri.to_uri_string()) {
-            return false;
+        let uri_string = virtual_uri.to_uri_string();
+
+        // Step 1: Check-and-initialize version under Mutex (serializes concurrent claims)
+        {
+            let mut versions = self.document_versions.lock().await;
+            let docs = versions.entry(server_name.to_string()).or_default();
+            if docs.contains_key(&uri_string) {
+                return false; // Already claimed by another caller
+            }
+            docs.insert(uri_string.clone(), 1);
         }
-        // Initialize version immediately so concurrent didChange won't be dropped
-        let mut versions = self.document_versions.lock().await;
-        versions
-            .entry(server_name.to_string())
-            .or_default()
-            .entry(virtual_uri.to_uri_string())
-            .or_insert(1);
+
+        // Step 2: Mark as opened — version is already available for concurrent didChange
+        self.opened_documents.insert(uri_string);
         true
     }
 
     /// Roll back a claim made by `try_claim_for_open()`.
     ///
     /// Called when the didOpen send fails, so the document can be
-    /// claimed again on a future attempt. Also removes the version
-    /// entry initialized by `try_claim_for_open()`.
+    /// claimed again on a future attempt. Removes both the version
+    /// entry and the DashSet entry initialized by `try_claim_for_open()`.
     pub(super) async fn unclaim_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
         server_name: &str,
     ) {
-        self.opened_documents.remove(&virtual_uri.to_uri_string());
-        let mut versions = self.document_versions.lock().await;
-        if let Some(docs) = versions.get_mut(server_name) {
-            docs.remove(&virtual_uri.to_uri_string());
+        let uri_string = virtual_uri.to_uri_string();
+
+        // Remove version first (mirrors claim order)
+        {
+            let mut versions = self.document_versions.lock().await;
+            if let Some(docs) = versions.get_mut(server_name) {
+                docs.remove(&uri_string);
+            }
         }
+
+        // Then remove from opened set
+        self.opened_documents.remove(&uri_string);
     }
 
     /// Register a document as successfully opened.
