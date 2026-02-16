@@ -469,10 +469,16 @@ impl BridgeCoordinator {
     /// did_change events), this method aborts the previous batch before storing
     /// the new handles. This prevents didOpen spam from overlapping batches.
     ///
+    /// Also performs opportunistic cleanup of finished tasks to prevent memory leaks.
+    ///
     /// # Arguments
     /// * `uri` - The host document URI
     /// * `handles` - AbortHandles for the new batch of tasks (one per server group)
     fn register_eager_open_tasks(&self, uri: &Url, handles: Vec<tokio::task::AbortHandle>) {
+        // Opportunistic cleanup: remove finished tasks from all documents
+        // This prevents memory leaks when tasks complete naturally (server ready, didOpen sent)
+        self.cleanup_finished_eager_open_tasks(5);
+
         // Abort previous batch if it exists (superseding behavior)
         if let Some((_, prev_handles)) = self.eager_open_tasks.remove(uri) {
             log::debug!(
@@ -488,6 +494,81 @@ impl BridgeCoordinator {
 
         // Store new batch
         self.eager_open_tasks.insert(uri.clone(), handles);
+    }
+
+    /// Clean up finished eager-open tasks to prevent memory leaks.
+    ///
+    /// When tasks complete naturally (server becomes ready, didOpen succeeds),
+    /// their AbortHandles stay in the map. This method removes finished handles
+    /// and deletes entries where all handles are finished.
+    ///
+    /// Called opportunistically by register_eager_open_tasks() with a limit
+    /// to avoid O(n) scans on every registration.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of document entries to check (0 = unlimited)
+    fn cleanup_finished_eager_open_tasks(&self, limit: usize) {
+        let mut checked = 0;
+        let mut cleaned_docs = 0;
+        let mut removed_handles = 0;
+
+        // Two-pass approach to avoid borrow conflicts:
+        // Pass 1: Collect URIs where all handles are finished (for removal)
+        // Pass 2: For remaining URIs, filter out finished handles in-place
+
+        let mut to_remove = Vec::new();
+
+        // Pass 1: Identify documents to remove entirely
+        for entry in self.eager_open_tasks.iter() {
+            if limit > 0 && checked >= limit {
+                break;
+            }
+            checked += 1;
+
+            let uri = entry.key();
+            let handles = entry.value();
+
+            // If all handles are finished, mark for removal
+            if handles.iter().all(|h| h.is_finished()) {
+                removed_handles += handles.len();
+                to_remove.push(uri.clone());
+            }
+        }
+
+        // Remove documents with all handles finished
+        for uri in &to_remove {
+            self.eager_open_tasks.remove(uri);
+            cleaned_docs += 1;
+        }
+
+        // Pass 2: For remaining documents, filter out finished handles
+        let mut additional_checked = 0;
+        for mut entry in self.eager_open_tasks.iter_mut() {
+            // Skip if we already checked this in pass 1
+            if limit > 0 && checked + additional_checked >= limit {
+                break;
+            }
+            additional_checked += 1;
+
+            let handles = entry.value_mut();
+            let finished_count = handles.iter().filter(|h| h.is_finished()).count();
+
+            if finished_count > 0 && finished_count < handles.len() {
+                // Some but not all handles are finished — filter in-place
+                handles.retain(|h| !h.is_finished());
+                removed_handles += finished_count;
+            }
+        }
+
+        if removed_handles > 0 {
+            log::trace!(
+                target: "kakehashi::bridge",
+                "Cleaned up {} finished eager-open handles across {} documents (checked {})",
+                removed_handles,
+                cleaned_docs,
+                checked + additional_checked
+            );
+        }
     }
 
     /// Cancel all eager-open tasks for a document.
