@@ -630,19 +630,20 @@ impl BridgeCoordinator {
     /// same per-shard write lock, so no task can be inserted-then-cleared
     /// without being aborted — even if called outside a strict shutdown window.
     pub(crate) fn abort_all_eager_open(&self) {
-        let mut count = 0usize;
+        let count = std::sync::atomic::AtomicUsize::new(0);
         self.eager_open_tasks.retain(|_uri, batch| {
             for handle in batch.handles.iter() {
                 handle.abort();
-                count += 1;
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             false // remove entry
         });
-        if count > 0 {
+        let total = count.load(std::sync::atomic::Ordering::Relaxed);
+        if total > 0 {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Aborted {} eager-open tasks during shutdown",
-                count
+                total
             );
         }
     }
