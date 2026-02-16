@@ -69,7 +69,7 @@ impl LanguageServerPool {
 
             // Look up ALL server names that have this virtual doc open.
             // Multiple servers may handle the same language (e.g., emmylua and lua_ls).
-            let server_names = self.get_all_servers_for_virtual_uri(&virtual_uri).await;
+            let server_names = self.get_all_servers_for_virtual_uri(&virtual_uri);
 
             for server_name in server_names {
                 // Check connection state BEFORE incrementing version.

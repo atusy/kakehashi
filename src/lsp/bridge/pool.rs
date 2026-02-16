@@ -415,13 +415,12 @@ impl LanguageServerPool {
     ///
     /// Used by did_change to forward notifications to every server that has
     /// the document open, not just the first one found.
-    pub(super) async fn get_all_servers_for_virtual_uri(
+    pub(super) fn get_all_servers_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
     ) -> Vec<String> {
         self.document_tracker
             .get_all_servers_for_virtual_uri(virtual_uri)
-            .await
     }
 
     /// Register a document as successfully opened (test helper).
