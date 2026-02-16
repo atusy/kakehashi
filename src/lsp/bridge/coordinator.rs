@@ -549,7 +549,7 @@ impl BridgeCoordinator {
         let mut additional_checked = 0;
         for mut entry in self.eager_open_tasks.iter_mut() {
             // Skip if we already checked this in pass 1
-            if limit > 0 && checked + additional_checked >= limit {
+            if limit > 0 && additional_checked >= limit {
                 break;
             }
             additional_checked += 1;
