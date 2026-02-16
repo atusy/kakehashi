@@ -1,6 +1,6 @@
 //! Color presentation method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{ColorPresentation, ColorPresentationParams, MessageType};
 
 use super::super::Kakehashi;
@@ -26,6 +26,8 @@ impl Kakehashi {
         // Convert Color to JSON Value for bridge (shared across all tasks)
         let color_json = serde_json::to_value(color).unwrap_or_default();
 
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
         let mut join_set = fan_out(&ctx, pool.clone(), |t| {
@@ -49,12 +51,10 @@ impl Kakehashi {
         });
 
         // Return the first non-empty color presentation response
-        // Note: no cancel support for colorPresentation (not a text-document-position
-        // request, so the editor doesn't send $/cancelRequest for it)
         let result = first_win::first_win(
             &mut join_set,
             |presentations| !presentations.is_empty(),
-            None,
+            cancel_rx,
         )
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
@@ -75,7 +75,7 @@ impl Kakehashi {
                     .await;
                 Ok(Vec::new())
             }
-            FirstWinResult::Cancelled => Ok(Vec::new()),
+            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
         }
     }
 }
