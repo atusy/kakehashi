@@ -1,13 +1,13 @@
 //! Goto declaration method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::request::{GotoDeclarationParams, GotoDeclarationResponse};
 use tower_lsp_server::ls_types::{Location, MessageType};
 
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use super::first_win::{self, fan_out};
+use super::first_win::{self, FirstWinResult, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn goto_declaration_impl(
@@ -24,10 +24,12 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+
         // Fan-out declaration requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let mut join_set = fan_out(&ctx, pool, |t| async move {
+        let mut join_set = fan_out(&ctx, pool.clone(), |t| async move {
             t.pool
                 .send_declaration_request(
                     &t.server_name,
@@ -44,13 +46,16 @@ impl Kakehashi {
         });
 
         // Return the first non-empty declaration response
-        let result =
-            first_win::first_win(&mut join_set, |opt| matches!(opt, Some(v) if !v.is_empty()))
-                .await
-                .flatten();
+        let result = first_win::first_win(
+            &mut join_set,
+            |opt| matches!(opt, Some(v) if !v.is_empty()),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
         match result {
-            Some(links) => {
+            FirstWinResult::Winner(Some(links)) => {
                 if self.supports_declaration_link() {
                     Ok(Some(GotoDeclarationResponse::Link(links)))
                 } else {
@@ -59,7 +64,7 @@ impl Kakehashi {
                     Ok(Some(GotoDeclarationResponse::Array(locations)))
                 }
             }
-            None => {
+            FirstWinResult::Winner(None) | FirstWinResult::NoWinner { .. } => {
                 self.client
                     .log_message(
                         MessageType::LOG,
@@ -68,6 +73,7 @@ impl Kakehashi {
                     .await;
                 Ok(None)
             }
+            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
         }
     }
 }

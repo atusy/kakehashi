@@ -1,10 +1,10 @@
 //! Find references method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{Location, MessageType, ReferenceParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, fan_out};
+use super::first_win::{self, FirstWinResult, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn references_impl(
@@ -22,10 +22,12 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+
         // Fan-out references requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let mut join_set = fan_out(&ctx, pool, |t| async move {
+        let mut join_set = fan_out(&ctx, pool.clone(), |t| async move {
             t.pool
                 .send_references_request(
                     &t.server_name,
@@ -43,20 +45,28 @@ impl Kakehashi {
         });
 
         // Return the first non-empty references response
-        let result =
-            first_win::first_win(&mut join_set, |opt| matches!(opt, Some(v) if !v.is_empty()))
-                .await;
+        let result = first_win::first_win(
+            &mut join_set,
+            |opt| matches!(opt, Some(v) if !v.is_empty()),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
+
         match result {
-            Some(locations) => Ok(locations),
-            None => {
+            FirstWinResult::Winner(locations) => Ok(locations),
+            FirstWinResult::NoWinner { errors } => {
+                let level = if errors > 0 {
+                    MessageType::WARNING
+                } else {
+                    MessageType::LOG
+                };
                 self.client
-                    .log_message(
-                        MessageType::LOG,
-                        "No references response from any bridge server",
-                    )
+                    .log_message(level, "No references response from any bridge server")
                     .await;
                 Ok(None)
             }
+            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
         }
     }
 }
