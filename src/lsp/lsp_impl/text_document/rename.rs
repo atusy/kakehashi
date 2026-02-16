@@ -19,7 +19,10 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+        let (cancel_rx, _cancel_guard) = match self.subscribe_cancel(&ctx.upstream_request_id) {
+            Some((rx, guard)) => (Some(rx), Some(guard)),
+            None => (None, None),
+        };
 
         // Fan-out rename requests to all matching servers
         let pool = self.bridge.pool_arc();
