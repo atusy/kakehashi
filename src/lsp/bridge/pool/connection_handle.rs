@@ -23,8 +23,7 @@ use log::warn;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-    ImplementationProviderCapability, OneOf, ServerCapabilities,
-    TypeDefinitionProviderCapability,
+    ImplementationProviderCapability, OneOf, ServerCapabilities, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -1642,9 +1641,9 @@ mod tests {
         use tower_lsp_server::ls_types::{
             ColorProviderCapability, ColorProviderOptions, CompletionOptions,
             DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
-            HoverProviderCapability, ImplementationProviderCapability, OneOf,
-            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
-            TextDocumentRegistrationOptions, TypeDefinitionProviderCapability,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf, SignatureHelpOptions,
+            StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
+            TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -1747,30 +1746,27 @@ mod tests {
             (
                 "textDocument/declaration",
                 Box::new(|c| {
-                    c.declaration_provider =
-                        Some(DeclarationCapability::RegistrationOptions(
-                            DeclarationRegistrationOptions {
-                                declaration_options: DeclarationOptions {
-                                    work_done_progress_options: Default::default(),
-                                },
-                                text_document_registration_options:
-                                    TextDocumentRegistrationOptions {
-                                        document_selector: None,
-                                    },
-                                static_registration_options: Default::default(),
+                    c.declaration_provider = Some(DeclarationCapability::RegistrationOptions(
+                        DeclarationRegistrationOptions {
+                            declaration_options: DeclarationOptions {
+                                work_done_progress_options: Default::default(),
                             },
-                        ));
+                            text_document_registration_options: TextDocumentRegistrationOptions {
+                                document_selector: None,
+                            },
+                            static_registration_options: Default::default(),
+                        },
+                    ));
                 }),
             ),
             // Declaration — Options variant
             (
                 "textDocument/declaration",
                 Box::new(|c| {
-                    c.declaration_provider = Some(DeclarationCapability::Options(
-                        DeclarationOptions {
+                    c.declaration_provider =
+                        Some(DeclarationCapability::Options(DeclarationOptions {
                             work_done_progress_options: Default::default(),
-                        },
-                    ));
+                        }));
                 }),
             ),
             // DocumentColor — Options variant (StaticTextDocumentColorProviderOptions)
