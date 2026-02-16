@@ -141,13 +141,15 @@ impl DocumentTracker {
     ///
     /// Called AFTER the didOpen notification has been successfully sent to the
     /// downstream server. Records tracking state:
-    /// - Document version (set to 1, idempotent via `or_insert`)
+    /// - Document version (safety net via `or_insert` — primary initialization
+    ///   happens in `try_claim_for_open()` to close the race window)
     /// - Host-to-virtual mapping (with dedup check for idempotency)
     /// - Opened state (DashSet insert, naturally idempotent)
     ///
-    /// Note: `try_claim_for_open()` already inserted into `opened_documents`.
-    /// The insert here is a no-op but kept for safety (e.g., test helpers
-    /// that call `register_opened_document` directly).
+    /// Note: Both `opened_documents` insert and version `or_insert(1)` are
+    /// safety nets. `try_claim_for_open()` already performs both operations.
+    /// They are kept here for test helpers that call `register_opened_document`
+    /// directly without going through the claim path.
     ///
     /// # Lock Ordering
     ///
