@@ -592,10 +592,17 @@ impl BridgeCoordinator {
         }
     }
 
-    /// Abort all eager-open tasks (called on shutdown).
+    /// Abort all eager-open tasks (called during shutdown).
     ///
     /// Ensures clean shutdown by cancelling all background tasks that may
     /// still be waiting for server readiness.
+    ///
+    /// # Safety Assumption
+    ///
+    /// This method assumes no new tasks will be inserted concurrently.
+    /// It is only safe to call during shutdown when no new `didOpen`/`didChange`
+    /// events are being processed. Tasks inserted between `iter()` and `clear()`
+    /// would be cleared without being aborted.
     pub(crate) fn abort_all_eager_open(&self) {
         let count: usize = self.eager_open_tasks.iter().map(|e| e.value().len()).sum();
         if count > 0 {
