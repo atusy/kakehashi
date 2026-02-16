@@ -1152,6 +1152,9 @@ impl LanguageServer for Kakehashi {
         // Cancel all debounced diagnostic timers (ADR-0020 Phase 3)
         self.debounced_diagnostics.cancel_all();
 
+        // Abort all eager-open tasks to prevent orphaned didOpen during shutdown
+        self.bridge.abort_all_eager_open();
+
         // Cancel the upstream forwarding task for deterministic shutdown.
         // Without this, the task only exits when all senders are dropped.
         self.shutdown_token.cancel();
@@ -1283,6 +1286,9 @@ impl LanguageServer for Kakehashi {
 
         // Cancel any pending debounced diagnostic for this document (ADR-0020 Phase 3)
         self.debounced_diagnostics.cancel(&uri);
+
+        // Cancel any eager-open tasks for this document (prevents orphaned didOpen)
+        self.bridge.cancel_eager_open(&uri);
 
         // Close all virtual documents associated with this host document
         // This sends didClose notifications to downstream language servers

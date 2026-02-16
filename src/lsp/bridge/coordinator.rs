@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use ulid::Ulid;
 use url::Url;
 
@@ -82,6 +83,16 @@ pub(crate) struct BridgeCoordinator {
     /// This is shared with the `RequestIdCapture` middleware via `cancel_forwarder()`.
     /// Handlers can subscribe to cancel notifications using `cancel_forwarder().subscribe()`.
     cancel_forwarder: CancelForwarder,
+    /// Abort handles for eager-open tasks, keyed by host document URI.
+    ///
+    /// Each host URI maps to a Vec of AbortHandles (one per server group spawned
+    /// by eager_spawn_and_open_documents). When a new batch is registered for
+    /// the same URI, the previous batch is aborted (superseding behavior).
+    ///
+    /// This prevents orphaned virtual documents when:
+    /// - Host document is closed while tasks wait for server readiness
+    /// - Rapid did_change events spawn many overlapping batches
+    eager_open_tasks: DashMap<Url, Vec<tokio::task::AbortHandle>>,
 }
 
 impl BridgeCoordinator {
@@ -93,6 +104,7 @@ impl BridgeCoordinator {
             pool,
             region_id_tracker: RegionIdTracker::new(),
             cancel_forwarder,
+            eager_open_tasks: DashMap::new(),
         }
     }
 
@@ -111,6 +123,7 @@ impl BridgeCoordinator {
             pool,
             region_id_tracker: RegionIdTracker::new(),
             cancel_forwarder,
+            eager_open_tasks: DashMap::new(),
         }
     }
 
@@ -412,7 +425,8 @@ impl BridgeCoordinator {
             }
         }
 
-        // Spawn one background task per server group
+        // Spawn one background task per server group and collect abort handles
+        let mut abort_handles = Vec::with_capacity(server_groups.len());
         for (server_name, (config, group_injections)) in server_groups {
             log::debug!(
                 target: "kakehashi::bridge",
@@ -425,7 +439,7 @@ impl BridgeCoordinator {
             let host_uri = host_uri.clone();
             let host_uri_lsp = host_uri_lsp.clone();
 
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 pool.eager_open_virtual_documents(
                     &server_name,
                     &config,
@@ -435,7 +449,89 @@ impl BridgeCoordinator {
                 )
                 .await;
             });
+
+            abort_handles.push(task.abort_handle());
         }
+
+        // Register the abort handles for cancellation (supersedes previous batch)
+        if !abort_handles.is_empty() {
+            self.register_eager_open_tasks(host_uri, abort_handles);
+        }
+    }
+
+    // ========================================
+    // Eager-open task cancellation
+    // ========================================
+
+    /// Register abort handles for eager-open tasks, superseding any previous batch.
+    ///
+    /// When a new batch of eager-open tasks is spawned for a URI (e.g., on rapid
+    /// did_change events), this method aborts the previous batch before storing
+    /// the new handles. This prevents didOpen spam from overlapping batches.
+    ///
+    /// # Arguments
+    /// * `uri` - The host document URI
+    /// * `handles` - AbortHandles for the new batch of tasks (one per server group)
+    fn register_eager_open_tasks(&self, uri: &Url, handles: Vec<tokio::task::AbortHandle>) {
+        // Abort previous batch if it exists (superseding behavior)
+        if let Some((_, prev_handles)) = self.eager_open_tasks.remove(uri) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Aborting {} previous eager-open tasks for {} (superseded by new batch)",
+                prev_handles.len(),
+                uri
+            );
+            for handle in prev_handles {
+                handle.abort();
+            }
+        }
+
+        // Store new batch
+        self.eager_open_tasks.insert(uri.clone(), handles);
+    }
+
+    /// Cancel all eager-open tasks for a document.
+    ///
+    /// Called on didClose to prevent orphaned virtual documents when tasks
+    /// are still waiting for server readiness.
+    ///
+    /// # Arguments
+    /// * `uri` - The host document URI
+    pub(crate) fn cancel_eager_open(&self, uri: &Url) {
+        if let Some((_, handles)) = self.eager_open_tasks.remove(uri) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Cancelling {} eager-open tasks for {}",
+                handles.len(),
+                uri
+            );
+            for handle in handles {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Abort all eager-open tasks (called on shutdown).
+    ///
+    /// Ensures clean shutdown by cancelling all background tasks that may
+    /// still be waiting for server readiness.
+    pub(crate) fn abort_all_eager_open(&self) {
+        let count: usize = self.eager_open_tasks.iter().map(|e| e.value().len()).sum();
+        if count > 0 {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Aborting {} eager-open tasks across {} documents",
+                count,
+                self.eager_open_tasks.len()
+            );
+        }
+
+        for entry in self.eager_open_tasks.iter() {
+            for handle in entry.value().iter() {
+                handle.abort();
+            }
+        }
+        self.eager_open_tasks.clear();
     }
 }
 
@@ -450,6 +546,11 @@ impl std::fmt::Debug for BridgeCoordinator {
         f.debug_struct("BridgeCoordinator")
             .field("pool", &"LanguageServerPool")
             .field("region_id_tracker", &"RegionIdTracker")
+            .field("cancel_forwarder", &"CancelForwarder")
+            .field(
+                "eager_open_tasks",
+                &format!("{} entries", self.eager_open_tasks.len()),
+            )
             .finish()
     }
 }
