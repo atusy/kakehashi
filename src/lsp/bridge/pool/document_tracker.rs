@@ -77,13 +77,10 @@ impl DocumentTracker {
         }
     }
 
-    /// Check if a document has had didOpen ACTUALLY sent to downstream (ADR-0015).
+    /// Check if a virtual document is claimed or opened on a downstream server.
     ///
-    /// This is a fast, synchronous check used by request handlers to ensure
-    /// they don't send requests before didOpen has been sent.
-    ///
-    /// Returns true if `register_opened_document()` has been called for this document.
-    /// Returns false if the document hasn't been opened yet.
+    /// Fast, synchronous check used by request handlers and didChange
+    /// forwarding to gate operations on documents not yet known downstream.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         self.opened_documents.contains(&virtual_uri.to_uri_string())
     }
