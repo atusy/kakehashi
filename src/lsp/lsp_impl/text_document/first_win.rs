@@ -115,9 +115,7 @@ impl<T> FirstWinResult<T> {
                     .await;
                 Ok(no_result)
             }
-            FirstWinResult::Cancelled => {
-                Err(tower_lsp_server::jsonrpc::Error::request_cancelled())
-            }
+            FirstWinResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
 }
@@ -394,6 +392,35 @@ mod tests {
             assert_no_winner(result),
             2,
             "both panics should be counted as errors"
+        );
+    }
+
+    /// Empty JoinSet without cancel → returns NoWinner with zero errors.
+    #[tokio::test]
+    async fn first_win_returns_no_winner_for_empty_join_set() {
+        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+
+        let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
+
+        assert_eq!(
+            assert_no_winner(result),
+            0,
+            "empty JoinSet should produce NoWinner with zero errors"
+        );
+    }
+
+    /// Empty JoinSet with cancel_rx → returns NoWinner (not Cancelled).
+    #[tokio::test]
+    async fn first_win_returns_no_winner_for_empty_join_set_with_cancel() {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+
+        let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
+
+        assert_eq!(
+            assert_no_winner(result),
+            0,
+            "empty JoinSet with cancel should produce NoWinner with zero errors"
         );
     }
 
