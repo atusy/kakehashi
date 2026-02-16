@@ -500,6 +500,55 @@ mod tests {
         );
     }
 
+    /// Test that version is available immediately after try_claim_for_open.
+    ///
+    /// This prevents the race condition where a concurrent didChange arrives
+    /// between claim and register_opened_document — the version must be
+    /// initialized at claim time so increment_document_version returns Some.
+    #[tokio::test]
+    async fn version_available_immediately_after_claim() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Claim the document (should initialize version to 1)
+        tracker.try_claim_for_open(&virtual_uri, "lua").await;
+
+        // Version should be available immediately — no need for register_opened_document
+        let version = tracker
+            .increment_document_version(&virtual_uri, "lua")
+            .await;
+        assert_eq!(
+            version,
+            Some(2),
+            "Version should be available immediately after claim (1 → 2)"
+        );
+    }
+
+    /// Test that unclaim_document removes the version entry.
+    ///
+    /// When a didOpen send fails and we unclaim, the version entry must also
+    /// be cleaned up so that increment_document_version returns None.
+    #[tokio::test]
+    async fn unclaim_removes_version_entry() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Claim (initializes version) then unclaim (should remove version)
+        tracker.try_claim_for_open(&virtual_uri, "lua").await;
+        tracker.unclaim_document(&virtual_uri, "lua").await;
+
+        // Version should no longer exist
+        let version = tracker
+            .increment_document_version(&virtual_uri, "lua")
+            .await;
+        assert!(
+            version.is_none(),
+            "Version should be removed after unclaim"
+        );
+    }
+
     // ========================================
     // increment_document_version tests
     // ========================================
