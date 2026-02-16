@@ -28,7 +28,7 @@ impl Kakehashi {
 
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
-        let mut join_set = fan_out(&ctx, pool, |t| {
+        let mut join_set = fan_out(&ctx, pool.clone(), |t| {
             let color_json = color_json.clone();
             async move {
                 t.pool
@@ -57,6 +57,7 @@ impl Kakehashi {
             None,
         )
         .await;
+        pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
         match result {
             FirstWinResult::Winner(presentations) => Ok(presentations),
