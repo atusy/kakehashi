@@ -425,8 +425,17 @@ impl BridgeCoordinator {
             }
         }
 
-        // Spawn one background task per server group and collect abort handles
-        let mut abort_handles = Vec::with_capacity(server_groups.len());
+        // If no servers match, cancel any previous batch to prevent stale didOpen
+        if server_groups.is_empty() {
+            self.cancel_eager_open(host_uri);
+            return;
+        }
+
+        // Supersede previous batch: abort + insert empty placeholder BEFORE spawning.
+        // This closes the race window between spawn and registration.
+        self.supersede_eager_open_tasks(host_uri);
+
+        // Spawn one task per server group, registering each handle immediately
         for (server_name, (config, group_injections)) in server_groups {
             log::debug!(
                 target: "kakehashi::bridge",
@@ -436,30 +445,23 @@ impl BridgeCoordinator {
             );
 
             let pool = self.pool_arc();
-            let host_uri = host_uri.clone();
+            let host_uri_owned = host_uri.clone();
             let host_uri_lsp = host_uri_lsp.clone();
 
             let task = tokio::spawn(async move {
                 pool.eager_open_virtual_documents(
                     &server_name,
                     &config,
-                    &host_uri,
+                    &host_uri_owned,
                     &host_uri_lsp,
                     group_injections,
                 )
                 .await;
             });
 
-            abort_handles.push(task.abort_handle());
-        }
-
-        // Register the abort handles for cancellation (supersedes previous batch).
-        // Even when no new tasks were spawned, cancel any previous batch to prevent
-        // stale didOpen from outdated injection regions.
-        if abort_handles.is_empty() {
-            self.cancel_eager_open(host_uri);
-        } else {
-            self.register_eager_open_tasks(host_uri, abort_handles);
+            // Register immediately — if concurrent cancel removed the entry,
+            // the handle is aborted instead of leaked.
+            self.push_or_abort_eager_open_handle(host_uri, task.abort_handle());
         }
     }
 
@@ -467,23 +469,19 @@ impl BridgeCoordinator {
     // Eager-open task cancellation
     // ========================================
 
-    /// Register abort handles for eager-open tasks, superseding any previous batch.
+    /// Supersede previous eager-open tasks for a URI.
     ///
-    /// When a new batch of eager-open tasks is spawned for a URI (e.g., on rapid
-    /// did_change events), this method aborts the previous batch before storing
-    /// the new handles. This prevents didOpen spam from overlapping batches.
-    ///
-    /// Also performs opportunistic cleanup of finished tasks to prevent memory leaks.
+    /// Performs cleanup, aborts any previous batch, and inserts an empty placeholder
+    /// entry. Must be called BEFORE spawning new tasks to close the race window
+    /// between spawn and handle registration.
     ///
     /// # Arguments
     /// * `uri` - The host document URI
-    /// * `handles` - AbortHandles for the new batch of tasks (one per server group)
-    fn register_eager_open_tasks(&self, uri: &Url, handles: Vec<tokio::task::AbortHandle>) {
+    fn supersede_eager_open_tasks(&self, uri: &Url) {
         // Opportunistic cleanup: remove finished tasks from all documents
-        // This prevents memory leaks when tasks complete naturally (server ready, didOpen sent)
         self.cleanup_finished_eager_open_tasks();
 
-        // Abort previous batch if it exists (superseding behavior)
+        // Abort previous batch if it exists
         if let Some((_, prev_handles)) = self.eager_open_tasks.remove(uri) {
             log::debug!(
                 target: "kakehashi::bridge",
@@ -496,8 +494,35 @@ impl BridgeCoordinator {
             }
         }
 
-        // Store new batch
-        self.eager_open_tasks.insert(uri.clone(), handles);
+        // Insert empty placeholder — concurrent cancel_eager_open will remove this,
+        // causing subsequent push_or_abort calls to abort their handles.
+        self.eager_open_tasks.insert(uri.clone(), Vec::new());
+    }
+
+    /// Push an abort handle into an existing entry, or abort it if the entry was removed.
+    ///
+    /// Called immediately after each `tokio::spawn` to register the handle. If a
+    /// concurrent `cancel_eager_open` removed the entry between `supersede` and this
+    /// call, the handle is aborted to prevent stale `didOpen` from being sent.
+    ///
+    /// # Arguments
+    /// * `uri` - The host document URI
+    /// * `handle` - The AbortHandle to register
+    fn push_or_abort_eager_open_handle(&self, uri: &Url, handle: tokio::task::AbortHandle) {
+        match self.eager_open_tasks.get_mut(uri) {
+            Some(mut entry) => {
+                entry.value_mut().push(handle);
+            }
+            None => {
+                // Entry was removed by concurrent cancel — abort this task
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Aborting eager-open handle for {} (entry removed by concurrent cancel)",
+                    uri
+                );
+                handle.abort();
+            }
+        }
     }
 
     /// Clean up finished eager-open tasks to prevent memory leaks.
@@ -506,8 +531,7 @@ impl BridgeCoordinator {
     /// their AbortHandles stay in the map. This method removes finished handles
     /// and deletes entries where all handles are finished.
     ///
-    /// Called opportunistically by register_eager_open_tasks() with a limit
-    /// to avoid O(n) scans on every registration.
+    /// Called opportunistically by supersede_eager_open_tasks() on each batch.
     ///
     /// # Arguments
     /// * `limit` - Maximum number of document entries to check (0 = unlimited)
@@ -824,8 +848,8 @@ mod tests {
         let task2 = tokio::spawn(futures::future::pending::<()>());
         let handles = vec![task1.abort_handle(), task2.abort_handle()];
 
-        // Register handles for this URI
-        coordinator.register_eager_open_tasks(&uri, handles);
+        // Insert handles directly for this URI
+        coordinator.eager_open_tasks.insert(uri.clone(), handles);
 
         // Cancel all tasks for this URI
         coordinator.cancel_eager_open(&uri);
@@ -852,15 +876,18 @@ mod tests {
         let coordinator = BridgeCoordinator::new();
         let uri = Url::parse("file:///test.md").unwrap();
 
-        // First batch of tasks
+        // First batch: insert a running task directly
         let task1 = tokio::spawn(futures::future::pending::<()>());
-        let handle1 = task1.abort_handle();
-        coordinator.register_eager_open_tasks(&uri, vec![handle1]);
+        coordinator
+            .eager_open_tasks
+            .insert(uri.clone(), vec![task1.abort_handle()]);
 
-        // Second batch — should abort the first batch
+        // Second batch — supersede should abort the first batch and insert placeholder
+        coordinator.supersede_eager_open_tasks(&uri);
+
+        // Push a new task into the placeholder
         let task2 = tokio::spawn(futures::future::pending::<()>());
-        let _handle2 = task2.abort_handle();
-        coordinator.register_eager_open_tasks(&uri, vec![_handle2]);
+        coordinator.push_or_abort_eager_open_handle(&uri, task2.abort_handle());
 
         // Give tokio a chance to process the abort
         tokio::task::yield_now().await;
@@ -868,7 +895,7 @@ mod tests {
         // First batch should be aborted
         assert!(
             task1.is_finished(),
-            "first batch should be aborted on re-register"
+            "first batch should be aborted on supersede"
         );
         // Second batch should still be running
         assert!(!task2.is_finished(), "second batch should still be running");
@@ -921,27 +948,27 @@ mod tests {
         let uri_b = Url::parse("file:///b.md").unwrap();
         let uri_c = Url::parse("file:///c.md").unwrap();
 
-        // URI_A: 2 tasks that complete immediately (all finished → pass 1 removes)
+        // URI_A: 2 tasks that complete immediately (all finished → should be removed)
         let finished_a1 = tokio::spawn(async {});
         let finished_a2 = tokio::spawn(async {});
-        coordinator.register_eager_open_tasks(
-            &uri_a,
+        coordinator.eager_open_tasks.insert(
+            uri_a.clone(),
             vec![finished_a1.abort_handle(), finished_a2.abort_handle()],
         );
 
-        // URI_B: 1 finished task + 1 running task (mixed → pass 2 should filter)
+        // URI_B: 1 finished task + 1 running task (mixed → should filter out finished)
         let finished_b = tokio::spawn(async {});
         let running_b = tokio::spawn(futures::future::pending::<()>());
-        coordinator.register_eager_open_tasks(
-            &uri_b,
+        coordinator.eager_open_tasks.insert(
+            uri_b.clone(),
             vec![finished_b.abort_handle(), running_b.abort_handle()],
         );
 
         // URI_C: 2 running tasks (all running → no cleanup needed)
         let running_c1 = tokio::spawn(futures::future::pending::<()>());
         let running_c2 = tokio::spawn(futures::future::pending::<()>());
-        coordinator.register_eager_open_tasks(
-            &uri_c,
+        coordinator.eager_open_tasks.insert(
+            uri_c.clone(),
             vec![running_c1.abort_handle(), running_c2.abort_handle()],
         );
 
@@ -962,7 +989,7 @@ mod tests {
         assert_eq!(
             uri_b_handles.value().len(),
             1,
-            "URI_B should have 1 handle after pass 2 filters out the finished one"
+            "URI_B should have 1 handle after cleanup filters out the finished one"
         );
 
         // URI_C: should still have 2 handles (all running)
