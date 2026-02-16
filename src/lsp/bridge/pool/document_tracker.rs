@@ -8,35 +8,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// Decision result for document open handling.
-///
-/// This enum represents the two possible outcomes when determining
-/// whether to send a didOpen notification for a virtual document.
-///
-/// The decision is based solely on `opened_documents` (a synchronous check).
-/// No state is mutated during the decision — all mutations happen in
-/// `register_opened_document()` after the send succeeds.
-///
-/// # State Machine
-///
-/// ```text
-/// opened_documents contains URI? | Decision
-/// -------------------------------|------------
-/// No                             | SendDidOpen
-/// Yes                            | AlreadyOpened
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DocumentOpenDecision {
-    /// Document has not been opened yet - send didOpen notification.
-    ///
-    /// The caller should send didOpen and then call `register_opened_document()`
-    /// to record the successful open.
-    SendDidOpen,
-
-    /// Document was already opened - skip didOpen (no-op).
-    AlreadyOpened,
-}
-
 use log::warn;
 use tokio::sync::Mutex;
 use url::Url;
@@ -130,26 +101,46 @@ impl DocumentTracker {
         }
     }
 
-    /// Determine the action to take for document opening.
+    /// Atomically claim a virtual document URI for opening.
     ///
-    /// This is a **pure, side-effect-free** check. No state is mutated.
-    /// The caller should:
-    /// 1. Check the decision
-    /// 2. If `SendDidOpen`: send the notification, then call `register_opened_document()`
-    /// 3. If `AlreadyOpened`: skip (no-op)
+    /// Returns `true` if this caller won the claim (URI was newly inserted).
+    /// Returns `false` if another caller already claimed it.
     ///
-    /// Because no state is claimed/reserved, two concurrent calls for the same
-    /// virtual document may both return `SendDidOpen`. This is acceptable — the
-    /// downstream server handles duplicate didOpen gracefully, and
-    /// `register_opened_document()` is idempotent.
-    pub(super) fn document_open_decision(
-        &self,
-        virtual_uri: &VirtualDocumentUri,
-    ) -> DocumentOpenDecision {
-        if self.is_document_opened(virtual_uri) {
-            DocumentOpenDecision::AlreadyOpened
-        } else {
-            DocumentOpenDecision::SendDidOpen
+    /// This replaces the old `document_open_decision()` TOCTOU pattern:
+    /// `HashSet::insert()` is both the check and the mutation in one step.
+    ///
+    /// On send failure, call `unclaim_document()` to roll back.
+    pub(super) fn try_claim_for_open(&self, virtual_uri: &VirtualDocumentUri) -> bool {
+        let uri_string = virtual_uri.to_uri_string();
+        match self.opened_documents.write() {
+            Ok(mut opened) => opened.insert(uri_string),
+            Err(poisoned) => {
+                warn!(
+                    target: "kakehashi::lock_recovery",
+                    "Recovered from poisoned opened_documents lock in try_claim_for_open()"
+                );
+                poisoned.into_inner().insert(uri_string)
+            }
+        }
+    }
+
+    /// Roll back a claim made by `try_claim_for_open()`.
+    ///
+    /// Called when the didOpen send fails, so the document can be
+    /// claimed again on a future attempt.
+    pub(super) fn unclaim_document(&self, virtual_uri: &VirtualDocumentUri) {
+        let uri_string = virtual_uri.to_uri_string();
+        match self.opened_documents.write() {
+            Ok(mut opened) => {
+                opened.remove(&uri_string);
+            }
+            Err(poisoned) => {
+                warn!(
+                    target: "kakehashi::lock_recovery",
+                    "Recovered from poisoned opened_documents lock in unclaim_document()"
+                );
+                poisoned.into_inner().remove(&uri_string);
+            }
         }
     }
 
@@ -565,64 +556,6 @@ mod tests {
             tracker.try_claim_for_open(&virtual_uri),
             "Should be able to reclaim after unclaim"
         );
-    }
-
-    // ========================================
-    // DocumentOpenDecision unit tests
-    // ========================================
-
-    /// Test that document_open_decision returns SendDidOpen for new document.
-    #[test]
-    fn document_open_decision_returns_send_didopen_for_new_document() {
-        let tracker = DocumentTracker::new();
-        let host_uri = Url::parse("file:///test/doc.md").unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-
-        let decision = tracker.document_open_decision(&virtual_uri);
-
-        assert_eq!(
-            decision,
-            DocumentOpenDecision::SendDidOpen,
-            "New document should return SendDidOpen"
-        );
-    }
-
-    /// Test that document_open_decision returns AlreadyOpened after registration.
-    #[tokio::test]
-    async fn document_open_decision_returns_already_opened_after_registration() {
-        let tracker = DocumentTracker::new();
-        let host_uri = Url::parse("file:///test/doc.md").unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-
-        tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
-            .await;
-
-        let decision = tracker.document_open_decision(&virtual_uri);
-
-        assert_eq!(
-            decision,
-            DocumentOpenDecision::AlreadyOpened,
-            "Registered document should return AlreadyOpened"
-        );
-    }
-
-    /// Test document_open_decision is side-effect-free.
-    ///
-    /// Calling it multiple times should always return SendDidOpen for
-    /// a new document — no state is mutated by the decision itself.
-    #[test]
-    fn document_open_decision_is_side_effect_free() {
-        let tracker = DocumentTracker::new();
-        let host_uri = Url::parse("file:///test/doc.md").unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-
-        // Multiple calls should all return SendDidOpen (no state mutation)
-        let decision1 = tracker.document_open_decision(&virtual_uri);
-        let decision2 = tracker.document_open_decision(&virtual_uri);
-
-        assert_eq!(decision1, DocumentOpenDecision::SendDidOpen);
-        assert_eq!(decision2, DocumentOpenDecision::SendDidOpen);
     }
 
     // ========================================

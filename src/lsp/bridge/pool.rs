@@ -38,7 +38,6 @@ use handshake::perform_lsp_handshake;
 
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
 pub(crate) use connection_state::ConnectionState;
-use document_tracker::DocumentOpenDecision;
 use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
@@ -457,11 +456,15 @@ impl LanguageServerPool {
     /// * `virtual_content` - Content for the didOpen notification
     /// * `server_name` - Server name for document tracking
     ///
-    /// # Decision Logic
+    /// # Atomic Claim Pattern
     ///
-    /// Uses `DocumentOpenDecision` (side-effect-free) to determine action:
-    /// - `SendDidOpen`: Send didOpen, then register all tracking state
-    /// - `AlreadyOpened`: Skip (no-op), document was already opened
+    /// Uses `try_claim_for_open()` as an atomic compare-and-swap:
+    /// - First caller claims the URI (returns true) and sends didOpen
+    /// - Concurrent callers see the claim and skip (returns false)
+    /// - On send failure, the claim is rolled back via `unclaim_document()`
+    ///
+    /// This prevents duplicate didOpen sends that occurred with the old
+    /// `document_open_decision()` TOCTOU pattern.
     ///
     /// # MessageSender Trait (ADR-0015)
     ///
@@ -476,18 +479,18 @@ impl LanguageServerPool {
         virtual_content: &str,
         server_name: &str,
     ) -> io::Result<()> {
-        match self.document_tracker.document_open_decision(virtual_uri) {
-            DocumentOpenDecision::SendDidOpen => {
-                let did_open = build_didopen_notification(virtual_uri, virtual_content);
-                sender.send_notification(did_open).await?;
-                // Register AFTER successful send — no state to roll back on failure
-                self.document_tracker
-                    .register_opened_document(host_uri, virtual_uri, server_name)
-                    .await;
-                Ok(())
-            }
-            DocumentOpenDecision::AlreadyOpened => Ok(()),
+        if !self.document_tracker.try_claim_for_open(virtual_uri) {
+            return Ok(()); // Already claimed by another caller
         }
+        let did_open = build_didopen_notification(virtual_uri, virtual_content);
+        if let Err(e) = sender.send_notification(did_open).await {
+            self.document_tracker.unclaim_document(virtual_uri);
+            return Err(e);
+        }
+        self.document_tracker
+            .register_opened_document(host_uri, virtual_uri, server_name)
+            .await;
+        Ok(())
     }
 
     /// Increment the version of a virtual document and return the new version.
@@ -1800,11 +1803,11 @@ mod tests {
     // ========================================
     // ensure_document_opened tests
     // ========================================
-    // Decision logic unit tests (DocumentOpenDecision) live in document_tracker.rs.
+    // Atomic claim logic tests (try_claim_for_open) live in document_tracker.rs.
     // These integration tests verify ensure_document_opened I/O behavior:
     // - Writing didOpen notification to downstream
     // - Post-condition: document marked as opened
-    // Note: Cleanup on error is now the caller's responsibility.
+    // - Rollback on send failure
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
     ///
