@@ -6,10 +6,11 @@
 //! - Host-to-virtual mappings (for didClose propagation)
 //! - Opened state (for LSP spec compliance - ADR-0015)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use log::warn;
+use dashmap::DashSet;
 use tokio::sync::Mutex;
+
 use url::Url;
 
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
@@ -49,8 +50,8 @@ pub(crate) struct OpenedVirtualDoc {
 /// 1. `document_versions` first
 /// 2. `host_to_virtual` second (while holding #1)
 ///
-/// The `opened_documents` lock (std::sync::RwLock) can be acquired
-/// independently of async locks for fast, synchronous read checks.
+/// `opened_documents` is a `DashSet` with internal sharded locking —
+/// no external lock ordering concerns.
 pub(crate) struct DocumentTracker {
     /// Map of server_name -> (virtual document URI -> version).
     ///
@@ -62,8 +63,8 @@ pub(crate) struct DocumentTracker {
     /// Each OpenedVirtualDoc stores its server_name for reverse lookup during didClose.
     host_to_virtual: Mutex<HashMap<Url, Vec<OpenedVirtualDoc>>>,
     /// Tracks documents that have had didOpen ACTUALLY sent to downstream.
-    /// Uses std::sync::RwLock for fast, synchronous read checks (ADR-0015).
-    opened_documents: std::sync::RwLock<HashSet<String>>,
+    /// Uses DashSet for lock-free concurrent reads and atomic insert (ADR-0015).
+    opened_documents: DashSet<String>,
 }
 
 impl DocumentTracker {
@@ -75,7 +76,7 @@ impl DocumentTracker {
         Self {
             document_versions: Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
-            opened_documents: std::sync::RwLock::new(HashSet::new()),
+            opened_documents: DashSet::new(),
         }
     }
 
@@ -87,18 +88,7 @@ impl DocumentTracker {
     /// Returns true if `register_opened_document()` has been called for this document.
     /// Returns false if the document hasn't been opened yet.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
-        let uri_string = virtual_uri.to_uri_string();
-
-        match self.opened_documents.read() {
-            Ok(opened) => opened.contains(&uri_string),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned opened_documents lock in is_document_opened()"
-                );
-                poisoned.into_inner().contains(&uri_string)
-            }
-        }
+        self.opened_documents.contains(&virtual_uri.to_uri_string())
     }
 
     /// Atomically claim a virtual document URI for opening.
@@ -106,22 +96,11 @@ impl DocumentTracker {
     /// Returns `true` if this caller won the claim (URI was newly inserted).
     /// Returns `false` if another caller already claimed it.
     ///
-    /// This replaces the old `document_open_decision()` TOCTOU pattern:
-    /// `HashSet::insert()` is both the check and the mutation in one step.
+    /// Uses `DashSet::insert()` as an atomic compare-and-swap.
     ///
     /// On send failure, call `unclaim_document()` to roll back.
     pub(super) fn try_claim_for_open(&self, virtual_uri: &VirtualDocumentUri) -> bool {
-        let uri_string = virtual_uri.to_uri_string();
-        match self.opened_documents.write() {
-            Ok(mut opened) => opened.insert(uri_string),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned opened_documents lock in try_claim_for_open()"
-                );
-                poisoned.into_inner().insert(uri_string)
-            }
-        }
+        self.opened_documents.insert(virtual_uri.to_uri_string())
     }
 
     /// Roll back a claim made by `try_claim_for_open()`.
@@ -129,34 +108,20 @@ impl DocumentTracker {
     /// Called when the didOpen send fails, so the document can be
     /// claimed again on a future attempt.
     pub(super) fn unclaim_document(&self, virtual_uri: &VirtualDocumentUri) {
-        let uri_string = virtual_uri.to_uri_string();
-        match self.opened_documents.write() {
-            Ok(mut opened) => {
-                opened.remove(&uri_string);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned opened_documents lock in unclaim_document()"
-                );
-                poisoned.into_inner().remove(&uri_string);
-            }
-        }
+        self.opened_documents.remove(&virtual_uri.to_uri_string());
     }
 
     /// Register a document as successfully opened.
     ///
     /// Called AFTER the didOpen notification has been successfully sent to the
-    /// downstream server. Records all tracking state atomically:
+    /// downstream server. Records tracking state:
     /// - Document version (set to 1, idempotent via `or_insert`)
     /// - Host-to-virtual mapping (with dedup check for idempotency)
-    /// - Opened state (HashSet insert, naturally idempotent)
+    /// - Opened state (DashSet insert, naturally idempotent)
     ///
-    /// # Idempotency
-    ///
-    /// This method is safe to call multiple times for the same document.
-    /// This is important because concurrent requests may both get `SendDidOpen`
-    /// from `document_open_decision()` and both call this method after sending.
+    /// Note: `try_claim_for_open()` already inserted into `opened_documents`.
+    /// The insert here is a no-op but kept for safety (e.g., test helpers
+    /// that call `register_opened_document` directly).
     ///
     /// # Lock Ordering
     ///
@@ -189,22 +154,10 @@ impl DocumentTracker {
                 server_name: server_name.to_string(),
             });
         }
-        drop(host_map);
-        drop(versions);
 
-        // Mark as opened (uses std::sync::RwLock, independent of async locks)
-        match self.opened_documents.write() {
-            Ok(mut opened) => {
-                opened.insert(virtual_uri.to_uri_string());
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned opened_documents lock in register_opened_document()"
-                );
-                poisoned.into_inner().insert(virtual_uri.to_uri_string());
-            }
-        }
+        // Idempotent insert into DashSet (already inserted by try_claim_for_open
+        // in production; needed for test helpers that call this directly)
+        self.opened_documents.insert(uri_string);
     }
 
     /// Increment the version of a virtual document and return the new version.
@@ -258,18 +211,7 @@ impl DocumentTracker {
             docs.remove(&uri_string);
         }
 
-        match self.opened_documents.write() {
-            Ok(mut opened) => {
-                opened.remove(&uri_string);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned opened_documents lock in untrack_document()"
-                );
-                poisoned.into_inner().remove(&uri_string);
-            }
-        }
+        self.opened_documents.remove(&uri_string);
     }
 
     /// Remove and return all virtual documents for a host URI.
