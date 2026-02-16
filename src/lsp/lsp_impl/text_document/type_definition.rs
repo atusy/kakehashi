@@ -64,10 +64,16 @@ impl Kakehashi {
                     Ok(Some(GotoTypeDefinitionResponse::Array(locations)))
                 }
             }
-            FirstWinResult::Winner(None) | FirstWinResult::NoWinner { .. } => {
+            FirstWinResult::Winner(None) => Ok(None),
+            FirstWinResult::NoWinner { errors } => {
+                let level = if errors > 0 {
+                    MessageType::WARNING
+                } else {
+                    MessageType::LOG
+                };
                 self.client
                     .log_message(
-                        MessageType::LOG,
+                        level,
                         "No type definition response from any bridge server",
                     )
                     .await;
