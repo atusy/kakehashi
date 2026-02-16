@@ -943,4 +943,65 @@ mod tests {
             "quarto should inherit wildcard's empty filter"
         );
     }
+
+    #[tokio::test]
+    async fn test_cleanup_two_pass_processes_both_passes() {
+        let coordinator = BridgeCoordinator::new();
+
+        let uri_a = Url::parse("file:///a.md").unwrap();
+        let uri_b = Url::parse("file:///b.md").unwrap();
+        let uri_c = Url::parse("file:///c.md").unwrap();
+
+        // URI_A: 2 tasks that complete immediately (all finished → pass 1 removes)
+        let finished_a1 = tokio::spawn(async {});
+        let finished_a2 = tokio::spawn(async {});
+        coordinator.register_eager_open_tasks(
+            &uri_a,
+            vec![finished_a1.abort_handle(), finished_a2.abort_handle()],
+        );
+
+        // URI_B: 1 finished task + 1 running task (mixed → pass 2 should filter)
+        let finished_b = tokio::spawn(async {});
+        let running_b = tokio::spawn(futures::future::pending::<()>());
+        coordinator.register_eager_open_tasks(
+            &uri_b,
+            vec![finished_b.abort_handle(), running_b.abort_handle()],
+        );
+
+        // URI_C: 2 running tasks (all running → no cleanup needed)
+        let running_c1 = tokio::spawn(futures::future::pending::<()>());
+        let running_c2 = tokio::spawn(futures::future::pending::<()>());
+        coordinator.register_eager_open_tasks(
+            &uri_c,
+            vec![running_c1.abort_handle(), running_c2.abort_handle()],
+        );
+
+        // Let finished tasks complete
+        tokio::task::yield_now().await;
+
+        // Limit=3 should allow checking all 3 URIs across both passes
+        coordinator.cleanup_finished_eager_open_tasks(3);
+
+        // Pass 1: URI_A should be removed entirely (all finished)
+        assert!(
+            coordinator.eager_open_tasks.get(&uri_a).is_none(),
+            "URI_A should be removed (all handles finished)"
+        );
+
+        // Pass 2: URI_B should have only 1 handle remaining (the running one)
+        let uri_b_handles = coordinator.eager_open_tasks.get(&uri_b).unwrap();
+        assert_eq!(
+            uri_b_handles.value().len(),
+            1,
+            "URI_B should have 1 handle after pass 2 filters out the finished one"
+        );
+
+        // URI_C: should still have 2 handles (all running)
+        let uri_c_handles = coordinator.eager_open_tasks.get(&uri_c).unwrap();
+        assert_eq!(
+            uri_c_handles.value().len(),
+            2,
+            "URI_C should still have 2 handles (all running)"
+        );
+    }
 }
