@@ -13,6 +13,7 @@ mod definition;
 mod diagnostic;
 mod did_change;
 mod did_close;
+mod did_open;
 #[cfg(feature = "experimental")]
 mod document_color;
 mod document_highlight;

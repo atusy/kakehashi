@@ -10,41 +10,31 @@ use std::collections::{HashMap, HashSet};
 
 /// Decision result for document open handling.
 ///
-/// This enum represents the three possible outcomes when determining
+/// This enum represents the two possible outcomes when determining
 /// whether to send a didOpen notification for a virtual document.
-/// Extracted to enable pure unit testing of the decision logic.
+///
+/// The decision is based solely on `opened_documents` (a synchronous check).
+/// No state is mutated during the decision — all mutations happen in
+/// `register_opened_document()` after the send succeeds.
 ///
 /// # State Machine
 ///
 /// ```text
-/// Document State          | should_send_didopen | is_document_opened | Decision
-/// ------------------------|---------------------|--------------------|-----------
-/// Never seen              | true                | N/A                | SendDidOpen
-/// Opened (didOpen sent)   | false               | true               | AlreadyOpened
-/// Pending (race condition)| false               | false              | PendingError
+/// opened_documents contains URI? | Decision
+/// -------------------------------|------------
+/// No                             | SendDidOpen
+/// Yes                            | AlreadyOpened
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocumentOpenDecision {
     /// Document has not been opened yet - send didOpen notification.
     ///
-    /// This occurs when `should_send_didopen()` returns true, meaning
-    /// the document was not previously registered for this session.
+    /// The caller should send didOpen and then call `register_opened_document()`
+    /// to record the successful open.
     SendDidOpen,
 
     /// Document was already opened - skip didOpen (no-op).
-    ///
-    /// This occurs when `should_send_didopen()` returns false (document
-    /// is registered) AND `is_document_opened()` returns true (didOpen
-    /// was successfully sent previously).
     AlreadyOpened,
-
-    /// Race condition: another request is opening this document.
-    ///
-    /// This occurs when `should_send_didopen()` returns false (document
-    /// is registered by another request) AND `is_document_opened()` returns
-    /// false (didOpen hasn't been sent yet). The caller should fail fast
-    /// with an error to avoid duplicate didOpen notifications.
-    PendingError,
 }
 
 use log::warn;
@@ -109,7 +99,7 @@ impl DocumentTracker {
     /// Create a new DocumentTracker with empty state.
     ///
     /// All tracking maps start empty. Documents are registered via
-    /// `should_send_didopen()` and marked as opened via `mark_document_opened()`.
+    /// `register_opened_document()` after a successful didOpen send.
     pub(crate) fn new() -> Self {
         Self {
             document_versions: Mutex::new(HashMap::new()),
@@ -118,85 +108,12 @@ impl DocumentTracker {
         }
     }
 
-    /// Check if document is opened and mark it as opened atomically.
-    ///
-    /// Returns true if the document was NOT previously opened (i.e., didOpen should be sent).
-    /// Returns false if the document was already opened (i.e., skip didOpen).
-    ///
-    /// When returning true, also records the mapping from host_uri to the virtual document
-    /// in host_to_virtual. This mapping is used for didClose propagation when the host
-    /// document is closed.
-    ///
-    /// # Arguments
-    ///
-    /// * `host_uri` - The host document URI (e.g., markdown file)
-    /// * `virtual_uri` - The virtual document URI (contains language for file extension)
-    /// * `server_name` - The server name for HashMap key (enables process sharing)
-    ///
-    /// # Lock Ordering
-    ///
-    /// Acquires `document_versions` first, then `host_to_virtual` (only when inserting).
-    /// This order must be consistent to prevent deadlocks.
-    pub(super) async fn should_send_didopen(
-        &self,
-        host_uri: &Url,
-        virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
-    ) -> bool {
-        use std::collections::hash_map::Entry;
-
-        let uri_string = virtual_uri.to_uri_string();
-
-        let mut versions = self.document_versions.lock().await;
-        let docs = versions.entry(server_name.to_string()).or_default();
-
-        if let Entry::Vacant(e) = docs.entry(uri_string) {
-            e.insert(1);
-
-            // Record the host -> virtual mapping for didClose propagation
-            let mut host_map = self.host_to_virtual.lock().await;
-            host_map
-                .entry(host_uri.clone())
-                .or_default()
-                .push(OpenedVirtualDoc {
-                    virtual_uri: virtual_uri.clone(),
-                    server_name: server_name.to_string(),
-                });
-
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mark a document as having had didOpen sent to downstream (ADR-0015).
-    ///
-    /// This should be called AFTER the didOpen notification has been successfully
-    /// written to the downstream server. Request handlers check `is_document_opened()`
-    /// before sending requests to ensure LSP spec compliance.
-    pub(super) fn mark_document_opened(&self, virtual_uri: &VirtualDocumentUri) {
-        let uri_string = virtual_uri.to_uri_string();
-
-        match self.opened_documents.write() {
-            Ok(mut opened) => {
-                opened.insert(uri_string);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned opened_documents lock in mark_document_opened()"
-                );
-                poisoned.into_inner().insert(uri_string);
-            }
-        }
-    }
-
     /// Check if a document has had didOpen ACTUALLY sent to downstream (ADR-0015).
     ///
     /// This is a fast, synchronous check used by request handlers to ensure
     /// they don't send requests before didOpen has been sent.
     ///
-    /// Returns true if `mark_document_opened()` has been called for this document.
+    /// Returns true if `register_opened_document()` has been called for this document.
     /// Returns false if the document hasn't been opened yet.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         let uri_string = virtual_uri.to_uri_string();
@@ -215,45 +132,87 @@ impl DocumentTracker {
 
     /// Determine the action to take for document opening.
     ///
-    /// This is the pure decision logic extracted from `ensure_document_opened`.
-    /// It determines whether to send didOpen, skip, or return an error based
-    /// on the current document state.
+    /// This is a **pure, side-effect-free** check. No state is mutated.
+    /// The caller should:
+    /// 1. Check the decision
+    /// 2. If `SendDidOpen`: send the notification, then call `register_opened_document()`
+    /// 3. If `AlreadyOpened`: skip (no-op)
     ///
-    /// # Arguments
+    /// Because no state is claimed/reserved, two concurrent calls for the same
+    /// virtual document may both return `SendDidOpen`. This is acceptable — the
+    /// downstream server handles duplicate didOpen gracefully, and
+    /// `register_opened_document()` is idempotent.
+    pub(super) fn document_open_decision(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+    ) -> DocumentOpenDecision {
+        if self.is_document_opened(virtual_uri) {
+            DocumentOpenDecision::AlreadyOpened
+        } else {
+            DocumentOpenDecision::SendDidOpen
+        }
+    }
+
+    /// Register a document as successfully opened.
     ///
-    /// * `host_uri` - The host document URI (e.g., markdown file)
-    /// * `virtual_uri` - The virtual document URI (contains language for file extension)
-    /// * `server_name` - The server name for HashMap key (enables process sharing)
+    /// Called AFTER the didOpen notification has been successfully sent to the
+    /// downstream server. Records all tracking state atomically:
+    /// - Document version (set to 1, idempotent via `or_insert`)
+    /// - Host-to-virtual mapping (with dedup check for idempotency)
+    /// - Opened state (HashSet insert, naturally idempotent)
     ///
-    /// # Returns
+    /// # Idempotency
     ///
-    /// - `SendDidOpen`: Document not registered - should send didOpen
-    /// - `AlreadyOpened`: Document already opened - skip (no-op)
-    /// - `PendingError`: Race condition - another request is opening this document
+    /// This method is safe to call multiple times for the same document.
+    /// This is important because concurrent requests may both get `SendDidOpen`
+    /// from `document_open_decision()` and both call this method after sending.
     ///
-    /// # Side Effects
+    /// # Lock Ordering
     ///
-    /// When returning `SendDidOpen`, this method also:
-    /// - Registers the document version (sets to 1)
-    /// - Records the host-to-virtual mapping for didClose propagation
-    ///
-    /// The caller MUST call `mark_document_opened()` after successfully
-    /// sending the didOpen notification.
-    pub(super) async fn document_open_decision(
+    /// Acquires `document_versions` first, then `host_to_virtual`.
+    /// This order must be consistent to prevent deadlocks.
+    pub(super) async fn register_opened_document(
         &self,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
         server_name: &str,
-    ) -> DocumentOpenDecision {
-        if self
-            .should_send_didopen(host_uri, virtual_uri, server_name)
-            .await
+    ) {
+        let uri_string = virtual_uri.to_uri_string();
+
+        // Lock ordering: document_versions first, host_to_virtual second
+        let mut versions = self.document_versions.lock().await;
+        versions
+            .entry(server_name.to_string())
+            .or_default()
+            .entry(uri_string.clone())
+            .or_insert(1);
+
+        let mut host_map = self.host_to_virtual.lock().await;
+        let docs = host_map.entry(host_uri.clone()).or_default();
+        if !docs
+            .iter()
+            .any(|d| d.virtual_uri.to_uri_string() == uri_string)
         {
-            DocumentOpenDecision::SendDidOpen
-        } else if self.is_document_opened(virtual_uri) {
-            DocumentOpenDecision::AlreadyOpened
-        } else {
-            DocumentOpenDecision::PendingError
+            docs.push(OpenedVirtualDoc {
+                virtual_uri: virtual_uri.clone(),
+                server_name: server_name.to_string(),
+            });
+        }
+        drop(host_map);
+        drop(versions);
+
+        // Mark as opened (uses std::sync::RwLock, independent of async locks)
+        match self.opened_documents.write() {
+            Ok(mut opened) => {
+                opened.insert(virtual_uri.to_uri_string());
+            }
+            Err(poisoned) => {
+                warn!(
+                    target: "kakehashi::lock_recovery",
+                    "Recovered from poisoned opened_documents lock in register_opened_document()"
+                );
+                poisoned.into_inner().insert(virtual_uri.to_uri_string());
+            }
         }
     }
 
@@ -439,24 +398,19 @@ mod tests {
     }
 
     // ========================================
-    // should_send_didopen tests
+    // register_opened_document tests
     // ========================================
 
-    /// Test that should_send_didopen records host to virtual mapping.
-    ///
-    /// When should_send_didopen returns true (meaning didOpen should be sent),
-    /// it should also record the mapping from host URI to the opened virtual document.
+    /// Test that register_opened_document records host to virtual mapping.
     #[tokio::test]
-    async fn should_send_didopen_records_host_to_virtual_mapping() {
+    async fn register_opened_document_records_host_to_virtual_mapping() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
 
-        // First call should return true (document not opened yet)
-        let result = tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        assert!(result, "First call should return true");
 
         // Verify the host_to_virtual mapping was recorded
         let host_map = tracker.host_to_virtual.lock().await;
@@ -469,30 +423,22 @@ mod tests {
         assert_eq!(virtual_docs[0].server_name, "lua");
     }
 
-    /// Test that should_send_didopen records multiple virtual docs for same host.
-    ///
-    /// A markdown file may have multiple Lua code blocks, each creating a separate
-    /// virtual document. All should be tracked under the same host URI.
+    /// Test that register_opened_document records multiple virtual docs for same host.
     #[tokio::test]
-    async fn should_send_didopen_records_multiple_virtual_docs_for_same_host() {
+    async fn register_opened_document_records_multiple_virtual_docs() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
 
-        // Open first Lua block
         let virtual_uri_0 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
-        let result = tracker
-            .should_send_didopen(&host_uri, &virtual_uri_0, "lua")
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri_0, "lua")
             .await;
-        assert!(result, "First Lua block should return true");
 
-        // Open second Lua block
         let virtual_uri_1 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-1");
-        let result = tracker
-            .should_send_didopen(&host_uri, &virtual_uri_1, "lua")
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri_1, "lua")
             .await;
-        assert!(result, "Second Lua block should return true");
 
-        // Verify both are tracked under the same host
         let host_map = tracker.host_to_virtual.lock().await;
         let virtual_docs = host_map
             .get(&host_uri)
@@ -502,27 +448,23 @@ mod tests {
         assert_eq!(virtual_docs[1].virtual_uri.region_id(), "lua-1");
     }
 
-    /// Test that should_send_didopen does not duplicate mapping on second call.
+    /// Test that register_opened_document is idempotent.
     ///
-    /// When should_send_didopen returns false (document already opened),
-    /// it should NOT add a duplicate entry to host_to_virtual.
+    /// Calling it twice for the same document should not create duplicate
+    /// entries in host_to_virtual or reset the version counter.
     #[tokio::test]
-    async fn should_send_didopen_does_not_duplicate_mapping() {
+    async fn register_opened_document_is_idempotent() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
 
-        // First call - should return true and record mapping
-        let result = tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+        // Register twice
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        assert!(result, "First call should return true");
-
-        // Second call for same virtual doc - should return false
-        let result = tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        assert!(!result, "Second call should return false");
 
         // Verify only one entry exists (no duplicate)
         let host_map = tracker.host_to_virtual.lock().await;
@@ -536,27 +478,25 @@ mod tests {
         );
     }
 
-    /// Test that should_send_didopen does NOT mark document as opened.
-    ///
-    /// should_send_didopen only reserves the document version for tracking.
-    /// The actual "opened" state should only be set by mark_document_opened
-    /// which is called AFTER didOpen is sent to downstream.
+    /// Test that register_opened_document marks the document as opened.
     #[tokio::test]
-    async fn should_send_didopen_does_not_mark_as_opened() {
+    async fn register_opened_document_marks_as_opened() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Call should_send_didopen - this reserves the version but doesn't mark as opened
-        let should_open = tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
-            .await;
-        assert!(should_open, "First call should return true");
-
-        // is_document_opened should still return false
         assert!(
             !tracker.is_document_opened(&virtual_uri),
-            "is_document_opened should return false even after should_send_didopen"
+            "Should not be opened before registration"
+        );
+
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .await;
+
+        assert!(
+            tracker.is_document_opened(&virtual_uri),
+            "Should be opened after registration"
         );
     }
 
@@ -564,60 +504,31 @@ mod tests {
     // is_document_opened tests
     // ========================================
 
-    /// Test that is_document_opened returns false before mark_document_opened is called.
-    ///
-    /// This is part of the fix for LSP spec violation where requests were sent
-    /// before didOpen. The is_document_opened() method checks whether didOpen
-    /// has ACTUALLY been sent to the downstream server (not just marked for sending).
-    #[tokio::test]
-    async fn is_document_opened_returns_false_before_marked() {
+    /// Test that is_document_opened returns false before registration.
+    #[test]
+    fn is_document_opened_returns_false_before_registered() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Before marking, should return false
         assert!(
             !tracker.is_document_opened(&virtual_uri),
-            "is_document_opened should return false before mark_document_opened"
-        );
-    }
-
-    /// Test that is_document_opened returns true after mark_document_opened is called.
-    #[tokio::test]
-    async fn is_document_opened_returns_true_after_marked() {
-        let tracker = DocumentTracker::new();
-        let host_uri = Url::parse("file:///test/doc.md").unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-
-        // Mark the document as opened
-        tracker.mark_document_opened(&virtual_uri);
-
-        // After marking, should return true
-        assert!(
-            tracker.is_document_opened(&virtual_uri),
-            "is_document_opened should return true after mark_document_opened"
+            "is_document_opened should return false before registration"
         );
     }
 
     // ========================================
     // DocumentOpenDecision unit tests
     // ========================================
-    // These tests verify the pure decision logic without I/O.
-    // Migrated from pool.rs integration tests.
 
     /// Test that document_open_decision returns SendDidOpen for new document.
-    ///
-    /// Happy path: Document not registered → SendDidOpen
-    /// No I/O required - pure decision logic.
-    #[tokio::test]
-    async fn document_open_decision_returns_send_didopen_for_new_document() {
+    #[test]
+    fn document_open_decision_returns_send_didopen_for_new_document() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        let decision = tracker
-            .document_open_decision(&host_uri, &virtual_uri, "lua")
-            .await;
+        let decision = tracker.document_open_decision(&virtual_uri);
 
         assert_eq!(
             decision,
@@ -626,103 +537,42 @@ mod tests {
         );
     }
 
-    /// Test that document_open_decision returns AlreadyOpened for opened document.
-    ///
-    /// Already opened path: Document registered AND marked as opened → AlreadyOpened
-    /// No I/O required - pure decision logic.
+    /// Test that document_open_decision returns AlreadyOpened after registration.
     #[tokio::test]
-    async fn document_open_decision_returns_already_opened_for_opened_document() {
+    async fn document_open_decision_returns_already_opened_after_registration() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Simulate successful didOpen flow: register then mark opened
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        tracker.mark_document_opened(&virtual_uri);
 
-        let decision = tracker
-            .document_open_decision(&host_uri, &virtual_uri, "lua")
-            .await;
+        let decision = tracker.document_open_decision(&virtual_uri);
 
         assert_eq!(
             decision,
             DocumentOpenDecision::AlreadyOpened,
-            "Already opened document should return AlreadyOpened"
+            "Registered document should return AlreadyOpened"
         );
     }
 
-    /// Test that document_open_decision returns PendingError for pending document.
+    /// Test document_open_decision is side-effect-free.
     ///
-    /// Race condition: Document registered (by another request) but NOT marked → PendingError
-    /// This happens when concurrent requests race to open the same document.
-    /// No I/O required - pure decision logic.
-    #[tokio::test]
-    async fn document_open_decision_returns_pending_error_for_pending_document() {
+    /// Calling it multiple times should always return SendDidOpen for
+    /// a new document — no state is mutated by the decision itself.
+    #[test]
+    fn document_open_decision_is_side_effect_free() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Simulate race condition: another request registered but hasn't finished didOpen
-        tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
-            .await;
-        // Deliberately do NOT call mark_document_opened
+        // Multiple calls should all return SendDidOpen (no state mutation)
+        let decision1 = tracker.document_open_decision(&virtual_uri);
+        let decision2 = tracker.document_open_decision(&virtual_uri);
 
-        let decision = tracker
-            .document_open_decision(&host_uri, &virtual_uri, "lua")
-            .await;
-
-        assert_eq!(
-            decision,
-            DocumentOpenDecision::PendingError,
-            "Pending document should return PendingError"
-        );
-    }
-
-    /// Test DocumentOpenDecision state transitions.
-    ///
-    /// Verifies the full state machine:
-    /// 1. New document → SendDidOpen
-    /// 2. After registration (not marked) → PendingError
-    /// 3. After marking opened → AlreadyOpened
-    #[tokio::test]
-    async fn document_open_decision_state_transitions() {
-        let tracker = DocumentTracker::new();
-        let host_uri = Url::parse("file:///test/doc.md").unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-
-        // State 1: New document
-        let decision = tracker
-            .document_open_decision(&host_uri, &virtual_uri, "lua")
-            .await;
-        assert_eq!(decision, DocumentOpenDecision::SendDidOpen);
-
-        // Note: document_open_decision with SendDidOpen has side effect of registering
-        // So subsequent calls see the document as registered but not opened
-
-        // State 2: Registered but not opened (simulates race condition for OTHER callers)
-        // Since first call already registered, subsequent call sees PendingError
-        let decision = tracker
-            .document_open_decision(&host_uri, &virtual_uri, "lua")
-            .await;
-        assert_eq!(
-            decision,
-            DocumentOpenDecision::PendingError,
-            "After first SendDidOpen, subsequent calls should see PendingError until marked"
-        );
-
-        // State 3: After marking opened
-        tracker.mark_document_opened(&virtual_uri);
-        let decision = tracker
-            .document_open_decision(&host_uri, &virtual_uri, "lua")
-            .await;
-        assert_eq!(
-            decision,
-            DocumentOpenDecision::AlreadyOpened,
-            "After marking, should return AlreadyOpened"
-        );
+        assert_eq!(decision1, DocumentOpenDecision::SendDidOpen);
+        assert_eq!(decision2, DocumentOpenDecision::SendDidOpen);
     }
 
     // ========================================
@@ -736,7 +586,7 @@ mod tests {
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Document was never opened via should_send_didopen
+        // Document was never registered via register_opened_document
         let version = tracker
             .increment_document_version(&virtual_uri, "lua")
             .await;
@@ -755,7 +605,7 @@ mod tests {
 
         // Open the document (sets version to 1)
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
         // First increment: 1 -> 2
@@ -784,7 +634,7 @@ mod tests {
 
         // Open the document
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
         // Verify version exists
@@ -816,11 +666,10 @@ mod tests {
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Open and mark as opened
+        // Register as opened (sets version + host mapping + opened state)
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        tracker.mark_document_opened(&virtual_uri);
         assert!(
             tracker.is_document_opened(&virtual_uri),
             "Document should be opened before untrack"
@@ -848,7 +697,7 @@ mod tests {
 
         // Open the document (adds to host_to_virtual)
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
         // Untrack the document
@@ -872,16 +721,16 @@ mod tests {
         let tracker = DocumentTracker::new();
         let host_uri = test_host_uri("phase3_take");
 
-        // Register some virtual docs using should_send_didopen
+        // Register some virtual docs
         let virtual_uri_1 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let virtual_uri_2 =
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
 
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_1, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_1, "lua")
             .await;
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_2, "python")
+            .register_opened_document(&host_uri, &virtual_uri_2, "python")
             .await;
 
         // Parse the ULIDs for matching
@@ -924,7 +773,7 @@ mod tests {
         // Register a virtual doc
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
         // Try to take a different ULID
@@ -962,7 +811,7 @@ mod tests {
         // Register a virtual doc
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
         // Take with empty ULID list (fast path)
@@ -988,13 +837,13 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
 
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_1, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_1, "lua")
             .await;
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_2, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_2, "lua")
             .await;
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_3, "python")
+            .register_opened_document(&host_uri, &virtual_uri_3, "python")
             .await;
 
         // Take both Lua ULIDs
@@ -1031,7 +880,7 @@ mod tests {
 
         // Open the document with server_name "lua"
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
         // Lookup should return the server_name
@@ -1064,14 +913,14 @@ mod tests {
         let virtual_uri_ts =
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", TEST_ULID_LUA_0);
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_ts, "tsgo")
+            .register_opened_document(&host_uri, &virtual_uri_ts, "tsgo")
             .await;
 
         // Open a tsx document with server_name "tsgo"
         let virtual_uri_tsx =
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescriptreact", TEST_ULID_LUA_1);
         tracker
-            .should_send_didopen(&host_uri, &virtual_uri_tsx, "tsgo")
+            .register_opened_document(&host_uri, &virtual_uri_tsx, "tsgo")
             .await;
 
         // Both should return "tsgo" as server_name

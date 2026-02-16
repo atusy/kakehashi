@@ -1,6 +1,6 @@
-//! Shared test utilities for pool module tests.
+//! Shared test utilities for pool and bridge module tests.
 //!
-//! This module provides common test helpers used across pool submodule tests.
+//! This module provides common test helpers used across pool and bridge submodule tests.
 //! Helpers avoid duplication and ensure consistent test setup.
 //!
 //! Import from submodule tests via `use crate::lsp::bridge::pool::test_helpers::*;`
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use url::Url;
 
 // Re-export types needed by tests
-pub(super) use crate::config::settings::BridgeServerConfig;
+pub(in crate::lsp::bridge) use crate::config::settings::BridgeServerConfig;
 
 use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
 use crate::lsp::bridge::connection::AsyncBridgeConnection;
@@ -18,9 +18,9 @@ use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState};
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
 // Using realistic ULIDs ensures tests reflect actual runtime behavior.
-pub(super) const TEST_ULID_LUA_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFR";
-pub(super) const TEST_ULID_LUA_1: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFS";
-pub(super) const TEST_ULID_PYTHON_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFT";
+pub(in crate::lsp::bridge) const TEST_ULID_LUA_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFR";
+pub(in crate::lsp::bridge) const TEST_ULID_LUA_1: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFS";
+pub(in crate::lsp::bridge) const TEST_ULID_PYTHON_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFT";
 
 /// Check if lua-language-server is available. Returns false and logs skip message if not.
 ///
@@ -28,7 +28,7 @@ pub(super) const TEST_ULID_PYTHON_0: &str = "01JPMQ8ZYYQA1W3AVPW4JDRZFT";
 /// ```ignore
 /// if !lua_ls_available() { return; }
 /// ```
-pub(super) fn lua_ls_available() -> bool {
+pub(in crate::lsp::bridge) fn lua_ls_available() -> bool {
     if std::process::Command::new("lua-language-server")
         .arg("--version")
         .output()
@@ -42,7 +42,7 @@ pub(super) fn lua_ls_available() -> bool {
 }
 
 /// Create a BridgeServerConfig for lua-language-server.
-pub(super) fn lua_ls_config() -> BridgeServerConfig {
+pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
     BridgeServerConfig {
         cmd: vec!["lua-language-server".to_string()],
         languages: vec!["lua".to_string()],
@@ -53,12 +53,12 @@ pub(super) fn lua_ls_config() -> BridgeServerConfig {
 
 /// Create a BridgeServerConfig for a mock server that discards input.
 /// Useful for testing timeout behavior or when no response is expected.
-pub(super) fn devnull_config() -> BridgeServerConfig {
+pub(in crate::lsp::bridge) fn devnull_config() -> BridgeServerConfig {
     devnull_config_for_language("lua")
 }
 
 /// Create a BridgeServerConfig for a mock server with a specific language.
-pub(super) fn devnull_config_for_language(language: &str) -> BridgeServerConfig {
+pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> BridgeServerConfig {
     BridgeServerConfig {
         cmd: vec![
             "sh".to_string(),
@@ -72,12 +72,12 @@ pub(super) fn devnull_config_for_language(language: &str) -> BridgeServerConfig 
 }
 
 /// Helper function to convert url::Url to tower_lsp_server::ls_types::Uri for tests.
-pub(super) fn url_to_uri(url: &Url) -> tower_lsp_server::ls_types::Uri {
+pub(in crate::lsp::bridge) fn url_to_uri(url: &Url) -> tower_lsp_server::ls_types::Uri {
     crate::lsp::lsp_impl::url_to_uri(url).expect("test URL should convert to URI")
 }
 
 /// Create a test host URI with the given name.
-pub(super) fn test_host_uri(name: &str) -> Url {
+pub(in crate::lsp::bridge) fn test_host_uri(name: &str) -> Url {
     Url::parse(&format!("file:///test/{}.md", name)).unwrap()
 }
 

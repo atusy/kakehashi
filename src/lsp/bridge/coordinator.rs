@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use ulid::Ulid;
 use url::Url;
 
@@ -82,6 +83,16 @@ pub(crate) struct BridgeCoordinator {
     /// This is shared with the `RequestIdCapture` middleware via `cancel_forwarder()`.
     /// Handlers can subscribe to cancel notifications using `cancel_forwarder().subscribe()`.
     cancel_forwarder: CancelForwarder,
+    /// Abort handles for eager-open tasks, keyed by host document URI.
+    ///
+    /// Each host URI maps to a Vec of AbortHandles (one per server group spawned
+    /// by eager_spawn_and_open_documents). When a new batch is registered for
+    /// the same URI, the previous batch is aborted (superseding behavior).
+    ///
+    /// This prevents orphaned virtual documents when:
+    /// - Host document is closed while tasks wait for server readiness
+    /// - Rapid did_change events spawn many overlapping batches
+    eager_open_tasks: DashMap<Url, Vec<tokio::task::AbortHandle>>,
 }
 
 impl BridgeCoordinator {
@@ -93,6 +104,7 @@ impl BridgeCoordinator {
             pool,
             region_id_tracker: RegionIdTracker::new(),
             cancel_forwarder,
+            eager_open_tasks: DashMap::new(),
         }
     }
 
@@ -111,6 +123,7 @@ impl BridgeCoordinator {
             pool,
             region_id_tracker: RegionIdTracker::new(),
             cancel_forwarder,
+            eager_open_tasks: DashMap::new(),
         }
     }
 
@@ -353,50 +366,257 @@ impl BridgeCoordinator {
     }
 
     // ========================================
-    // Eager spawn (warmup)
+    // Eager spawn + open (warmup with document content)
     // ========================================
 
-    /// Eagerly spawn language servers for detected injection languages.
+    /// Eagerly spawn language servers and open virtual documents for detected injections.
     ///
-    /// This method looks up each injection language in the settings, finds the
-    /// corresponding language server config, and spawns the server if not already
-    /// running. The LSP handshake runs in a background task.
+    /// This method:
+    /// 1. Groups injections by server name using `get_config_for_language`
+    /// 2. Spawns one background task per server group
+    /// 3. Each task waits for server ready, then sends `didOpen` for all injections
     ///
-    /// Call this after parsing a document to warm up servers for code blocks,
-    /// eliminating first-request latency for hover, completion, etc.
+    /// This replaces the old `eager_spawn_servers` which only did handshakes.
+    /// By also sending `didOpen`, downstream servers can start analyzing immediately,
+    /// resulting in faster diagnostic responses.
     ///
     /// # Arguments
     /// * `settings` - Current workspace settings
     /// * `host_language` - Language of the host document (e.g., "markdown")
-    /// * `injection_languages` - Set of detected injection languages (e.g., {"lua", "python"})
-    pub(crate) async fn eager_spawn_servers(
+    /// * `host_uri` - URI of the host document
+    /// * `injections` - List of (language, region_id, content) tuples for all injection regions
+    pub(crate) fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
         host_language: &str,
-        injection_languages: impl IntoIterator<Item = impl AsRef<str>>,
+        host_uri: &Url,
+        injections: Vec<(String, String, String)>,
     ) {
-        for lang in injection_languages {
-            let lang = lang.as_ref();
-
-            // Look up server config for this injection language
-            if let Some(resolved) = self.get_config_for_language(settings, host_language, lang) {
-                log::debug!(
+        // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
+        let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
+            Ok(uri) => uri,
+            Err(e) => {
+                log::warn!(
                     target: "kakehashi::bridge",
-                    "Warming up {} server for {} injection",
-                    resolved.server_name,
-                    lang
+                    "Failed to convert host URI for eager open, skipping: {}",
+                    e
                 );
+                return;
+            }
+        };
 
-                // Fire-and-forget spawn - handshake runs in background
-                let pool = self.pool_arc();
-                let server_name = resolved.server_name.clone();
-                let config = resolved.config.clone();
+        // Group injections by server name
+        // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
+        type InjectionTuple = (String, String, String);
+        type ServerGroup = (BridgeServerConfig, Vec<InjectionTuple>);
+        let mut server_groups: std::collections::HashMap<String, ServerGroup> =
+            std::collections::HashMap::new();
 
-                tokio::spawn(async move {
-                    let _ = pool.ensure_server_ready(&server_name, &config).await;
-                });
+        for injection in injections {
+            let (language, _, _) = &injection;
+
+            if let Some(resolved) = self.get_config_for_language(settings, host_language, language)
+            {
+                server_groups
+                    .entry(resolved.server_name.clone())
+                    .or_insert_with(|| (resolved.config.clone(), Vec::new()))
+                    .1
+                    .push(injection);
             }
         }
+
+        // Spawn one background task per server group and collect abort handles
+        let mut abort_handles = Vec::with_capacity(server_groups.len());
+        for (server_name, (config, group_injections)) in server_groups {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager open: spawning {} with {} injections",
+                server_name,
+                group_injections.len()
+            );
+
+            let pool = self.pool_arc();
+            let host_uri = host_uri.clone();
+            let host_uri_lsp = host_uri_lsp.clone();
+
+            let task = tokio::spawn(async move {
+                pool.eager_open_virtual_documents(
+                    &server_name,
+                    &config,
+                    &host_uri,
+                    &host_uri_lsp,
+                    group_injections,
+                )
+                .await;
+            });
+
+            abort_handles.push(task.abort_handle());
+        }
+
+        // Register the abort handles for cancellation (supersedes previous batch).
+        // Even when no new tasks were spawned, cancel any previous batch to prevent
+        // stale didOpen from outdated injection regions.
+        if abort_handles.is_empty() {
+            self.cancel_eager_open(host_uri);
+        } else {
+            self.register_eager_open_tasks(host_uri, abort_handles);
+        }
+    }
+
+    // ========================================
+    // Eager-open task cancellation
+    // ========================================
+
+    /// Register abort handles for eager-open tasks, superseding any previous batch.
+    ///
+    /// When a new batch of eager-open tasks is spawned for a URI (e.g., on rapid
+    /// did_change events), this method aborts the previous batch before storing
+    /// the new handles. This prevents didOpen spam from overlapping batches.
+    ///
+    /// Also performs opportunistic cleanup of finished tasks to prevent memory leaks.
+    ///
+    /// # Arguments
+    /// * `uri` - The host document URI
+    /// * `handles` - AbortHandles for the new batch of tasks (one per server group)
+    fn register_eager_open_tasks(&self, uri: &Url, handles: Vec<tokio::task::AbortHandle>) {
+        // Opportunistic cleanup: remove finished tasks from all documents
+        // This prevents memory leaks when tasks complete naturally (server ready, didOpen sent)
+        self.cleanup_finished_eager_open_tasks(5);
+
+        // Abort previous batch if it exists (superseding behavior)
+        if let Some((_, prev_handles)) = self.eager_open_tasks.remove(uri) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Aborting {} previous eager-open tasks for {} (superseded by new batch)",
+                prev_handles.len(),
+                uri
+            );
+            for handle in prev_handles {
+                handle.abort();
+            }
+        }
+
+        // Store new batch
+        self.eager_open_tasks.insert(uri.clone(), handles);
+    }
+
+    /// Clean up finished eager-open tasks to prevent memory leaks.
+    ///
+    /// When tasks complete naturally (server becomes ready, didOpen succeeds),
+    /// their AbortHandles stay in the map. This method removes finished handles
+    /// and deletes entries where all handles are finished.
+    ///
+    /// Called opportunistically by register_eager_open_tasks() with a limit
+    /// to avoid O(n) scans on every registration.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of document entries to check (0 = unlimited)
+    fn cleanup_finished_eager_open_tasks(&self, limit: usize) {
+        let mut checked = 0;
+        let mut cleaned_docs = 0;
+        let mut removed_handles = 0;
+
+        // Two-pass approach to avoid borrow conflicts:
+        // Pass 1: Collect URIs where all handles are finished (for removal)
+        // Pass 2: For remaining URIs, filter out finished handles in-place
+
+        let mut to_remove = Vec::new();
+
+        // Pass 1: Identify documents to remove entirely
+        for entry in self.eager_open_tasks.iter() {
+            if limit > 0 && checked >= limit {
+                break;
+            }
+            checked += 1;
+
+            let uri = entry.key();
+            let handles = entry.value();
+
+            // If all handles are finished, mark for removal
+            if handles.iter().all(|h| h.is_finished()) {
+                removed_handles += handles.len();
+                to_remove.push(uri.clone());
+            }
+        }
+
+        // Remove documents with all handles finished
+        for uri in &to_remove {
+            self.eager_open_tasks.remove(uri);
+            cleaned_docs += 1;
+        }
+
+        // Pass 2: For remaining documents, filter out finished handles
+        let mut additional_checked = 0;
+        for mut entry in self.eager_open_tasks.iter_mut() {
+            // Skip if we already checked this in pass 1
+            if limit > 0 && additional_checked >= limit {
+                break;
+            }
+            additional_checked += 1;
+
+            let handles = entry.value_mut();
+            let finished_count = handles.iter().filter(|h| h.is_finished()).count();
+
+            if finished_count > 0 && finished_count < handles.len() {
+                // Some but not all handles are finished — filter in-place
+                handles.retain(|h| !h.is_finished());
+                removed_handles += finished_count;
+            }
+        }
+
+        if removed_handles > 0 {
+            log::trace!(
+                target: "kakehashi::bridge",
+                "Cleaned up {} finished eager-open handles across {} documents (checked {})",
+                removed_handles,
+                cleaned_docs,
+                checked + additional_checked
+            );
+        }
+    }
+
+    /// Cancel all eager-open tasks for a document.
+    ///
+    /// Called on didClose to prevent orphaned virtual documents when tasks
+    /// are still waiting for server readiness.
+    ///
+    /// # Arguments
+    /// * `uri` - The host document URI
+    pub(crate) fn cancel_eager_open(&self, uri: &Url) {
+        if let Some((_, handles)) = self.eager_open_tasks.remove(uri) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Cancelling {} eager-open tasks for {}",
+                handles.len(),
+                uri
+            );
+            for handle in handles {
+                handle.abort();
+            }
+        }
+    }
+
+    /// Abort all eager-open tasks (called on shutdown).
+    ///
+    /// Ensures clean shutdown by cancelling all background tasks that may
+    /// still be waiting for server readiness.
+    pub(crate) fn abort_all_eager_open(&self) {
+        let count: usize = self.eager_open_tasks.iter().map(|e| e.value().len()).sum();
+        if count > 0 {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Aborting {} eager-open tasks across {} documents",
+                count,
+                self.eager_open_tasks.len()
+            );
+        }
+
+        for entry in self.eager_open_tasks.iter() {
+            for handle in entry.value().iter() {
+                handle.abort();
+            }
+        }
+        self.eager_open_tasks.clear();
     }
 }
 
@@ -411,6 +631,11 @@ impl std::fmt::Debug for BridgeCoordinator {
         f.debug_struct("BridgeCoordinator")
             .field("pool", &"LanguageServerPool")
             .field("region_id_tracker", &"RegionIdTracker")
+            .field("cancel_forwarder", &"CancelForwarder")
+            .field(
+                "eager_open_tasks",
+                &format!("{} entries", self.eager_open_tasks.len()),
+            )
             .finish()
     }
 }
@@ -620,6 +845,66 @@ mod tests {
         assert_eq!(result[0].server_name, "rust-analyzer");
     }
 
+    #[tokio::test]
+    async fn test_cancel_eager_open_aborts_tracked_tasks() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // Spawn tasks that will never complete on their own
+        let task1 = tokio::spawn(futures::future::pending::<()>());
+        let task2 = tokio::spawn(futures::future::pending::<()>());
+        let handles = vec![task1.abort_handle(), task2.abort_handle()];
+
+        // Register handles for this URI
+        coordinator.register_eager_open_tasks(&uri, handles);
+
+        // Cancel all tasks for this URI
+        coordinator.cancel_eager_open(&uri);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // Verify tasks are finished (aborted)
+        assert!(task1.is_finished(), "task1 should be aborted");
+        assert!(task2.is_finished(), "task2 should be aborted");
+    }
+
+    #[test]
+    fn test_cancel_eager_open_noop_for_unknown_uri() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///unknown.md").unwrap();
+
+        // Should not panic or error when cancelling for an unknown URI
+        coordinator.cancel_eager_open(&uri);
+    }
+
+    #[tokio::test]
+    async fn test_register_supersedes_previous_tasks() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // First batch of tasks
+        let task1 = tokio::spawn(futures::future::pending::<()>());
+        let handle1 = task1.abort_handle();
+        coordinator.register_eager_open_tasks(&uri, vec![handle1]);
+
+        // Second batch — should abort the first batch
+        let task2 = tokio::spawn(futures::future::pending::<()>());
+        let _handle2 = task2.abort_handle();
+        coordinator.register_eager_open_tasks(&uri, vec![_handle2]);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // First batch should be aborted
+        assert!(
+            task1.is_finished(),
+            "first batch should be aborted on re-register"
+        );
+        // Second batch should still be running
+        assert!(!task2.is_finished(), "second batch should still be running");
+    }
+
     #[test]
     fn test_get_config_uses_wildcard_for_undefined_host() {
         let coordinator = BridgeCoordinator::new();
@@ -656,6 +941,67 @@ mod tests {
         assert!(
             result.is_none(),
             "quarto should inherit wildcard's empty filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_two_pass_processes_both_passes() {
+        let coordinator = BridgeCoordinator::new();
+
+        let uri_a = Url::parse("file:///a.md").unwrap();
+        let uri_b = Url::parse("file:///b.md").unwrap();
+        let uri_c = Url::parse("file:///c.md").unwrap();
+
+        // URI_A: 2 tasks that complete immediately (all finished → pass 1 removes)
+        let finished_a1 = tokio::spawn(async {});
+        let finished_a2 = tokio::spawn(async {});
+        coordinator.register_eager_open_tasks(
+            &uri_a,
+            vec![finished_a1.abort_handle(), finished_a2.abort_handle()],
+        );
+
+        // URI_B: 1 finished task + 1 running task (mixed → pass 2 should filter)
+        let finished_b = tokio::spawn(async {});
+        let running_b = tokio::spawn(futures::future::pending::<()>());
+        coordinator.register_eager_open_tasks(
+            &uri_b,
+            vec![finished_b.abort_handle(), running_b.abort_handle()],
+        );
+
+        // URI_C: 2 running tasks (all running → no cleanup needed)
+        let running_c1 = tokio::spawn(futures::future::pending::<()>());
+        let running_c2 = tokio::spawn(futures::future::pending::<()>());
+        coordinator.register_eager_open_tasks(
+            &uri_c,
+            vec![running_c1.abort_handle(), running_c2.abort_handle()],
+        );
+
+        // Let finished tasks complete
+        tokio::task::yield_now().await;
+
+        // Limit=3 should allow checking all 3 URIs across both passes
+        coordinator.cleanup_finished_eager_open_tasks(3);
+
+        // Pass 1: URI_A should be removed entirely (all finished)
+        assert!(
+            coordinator.eager_open_tasks.get(&uri_a).is_none(),
+            "URI_A should be removed (all handles finished)"
+        );
+
+        // Pass 2: URI_B should have only 1 handle remaining (the running one)
+        let uri_b_handles = coordinator.eager_open_tasks.get(&uri_b).unwrap();
+        assert_eq!(
+            uri_b_handles.value().len(),
+            1,
+            "URI_B should have 1 handle after pass 2 filters out the finished one"
+        );
+
+        // URI_C: should still have 2 handles (all running)
+        let uri_c_handles = coordinator.eager_open_tasks.get(&uri_c).unwrap();
+        assert_eq!(
+            uri_c_handles.value().len(),
+            2,
+            "URI_C should still have 2 handles (all running)"
         );
     }
 }
