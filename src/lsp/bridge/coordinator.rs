@@ -1110,4 +1110,48 @@ mod tests {
             "Handle from current generation should still be running"
         );
     }
+
+    #[tokio::test]
+    async fn test_abort_all_eager_open_aborts_all_tasks() {
+        let coordinator = BridgeCoordinator::new();
+        let uri1 = Url::parse("file:///a.md").unwrap();
+        let uri2 = Url::parse("file:///b.md").unwrap();
+
+        // Spawn tasks for two different URIs
+        let task1 = tokio::spawn(futures::future::pending::<()>());
+        let task2 = tokio::spawn(futures::future::pending::<()>());
+
+        coordinator.eager_open_tasks.insert(
+            uri1,
+            EagerOpenBatch {
+                generation: 0,
+                handles: vec![task1.abort_handle()],
+            },
+        );
+        coordinator.eager_open_tasks.insert(
+            uri2,
+            EagerOpenBatch {
+                generation: 0,
+                handles: vec![task2.abort_handle()],
+            },
+        );
+
+        coordinator.abort_all_eager_open();
+        tokio::task::yield_now().await;
+
+        assert!(task1.is_finished(), "task1 should be aborted");
+        assert!(task2.is_finished(), "task2 should be aborted");
+        assert!(
+            coordinator.eager_open_tasks.is_empty(),
+            "All entries should be removed"
+        );
+    }
+
+    #[test]
+    fn test_abort_all_eager_open_noop_when_empty() {
+        let coordinator = BridgeCoordinator::new();
+        // Should not panic
+        coordinator.abort_all_eager_open();
+        assert!(coordinator.eager_open_tasks.is_empty());
+    }
 }
