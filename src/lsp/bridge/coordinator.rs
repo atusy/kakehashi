@@ -532,9 +532,6 @@ impl BridgeCoordinator {
     /// and deletes entries where all handles are finished.
     ///
     /// Called opportunistically by supersede_eager_open_tasks() on each batch.
-    ///
-    /// # Arguments
-    /// * `limit` - Maximum number of document entries to check (0 = unlimited)
     fn cleanup_finished_eager_open_tasks(&self) {
         let mut removed_handles = 0;
         let mut to_remove = Vec::new();
