@@ -540,23 +540,11 @@ impl LanguageServerPool {
         .await
     }
 
-    /// Eagerly ensure a server is spawned and its handshake is in progress.
+    /// Test helper: eagerly spawn a server and wait for connection.
     ///
-    /// This method spawns the language server process and starts the LSP handshake
-    /// in a background task, but does NOT:
-    /// - Wait for the handshake to complete
-    /// - Send didOpen notifications
-    /// - Block on any response
-    ///
-    /// Use this to warm up language servers proactively when injections are detected,
-    /// eliminating first-request latency for downstream LSP features.
-    ///
-    /// This method is idempotent - calling it multiple times for the same server
-    /// will only spawn the server once.
-    ///
-    /// # Arguments
-    /// * `server_name` - The server name from config (e.g., "lua-ls", "pyright")
-    /// * `server_config` - The server configuration containing command
+    /// Wraps `get_or_create_connection_with_timeout` with fire-and-forget
+    /// semantics. Production code uses `get_or_create_connection_wait_ready`
+    /// directly via `eager_open_virtual_documents` instead.
     #[cfg(test)]
     pub(crate) async fn ensure_server_ready(
         &self,
