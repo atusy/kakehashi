@@ -25,6 +25,20 @@ use crate::lsp::request_id::CancelForwarder;
 
 use super::LanguageServerPool;
 
+/// An injection region resolved from a host document.
+///
+/// Represents a single code block embedded in a host document (e.g., a Lua
+/// code fence in a markdown file) along with its stable region ID (ADR-0019).
+#[derive(Debug, Clone)]
+pub(crate) struct InjectionRegion {
+    /// The injection language (e.g., "lua", "python", "rust")
+    pub(crate) language: String,
+    /// Stable ULID-based region ID (ADR-0019)
+    pub(crate) region_id: String,
+    /// The text content of the injection region
+    pub(crate) content: String,
+}
+
 /// Resolved server configuration with server name.
 ///
 /// Wraps `BridgeServerConfig` with the server name from the config key.
@@ -358,7 +372,7 @@ impl BridgeCoordinator {
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         uri: &Url,
-        injections: &[(String, String, String)],
+        injections: &[InjectionRegion],
     ) {
         self.pool
             .forward_didchange_to_opened_docs(uri, injections)
@@ -384,13 +398,13 @@ impl BridgeCoordinator {
     /// * `settings` - Current workspace settings
     /// * `host_language` - Language of the host document (e.g., "markdown")
     /// * `host_uri` - URI of the host document
-    /// * `injections` - List of (language, region_id, content) tuples for all injection regions
+    /// * `injections` - All injection regions detected in the host document
     pub(crate) fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
         host_language: &str,
         host_uri: &Url,
-        injections: Vec<(String, String, String)>,
+        injections: Vec<InjectionRegion>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -407,15 +421,13 @@ impl BridgeCoordinator {
 
         // Group injections by server name
         // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
-        type InjectionTuple = (String, String, String);
-        type ServerGroup = (BridgeServerConfig, Vec<InjectionTuple>);
+        type ServerGroup = (BridgeServerConfig, Vec<InjectionRegion>);
         let mut server_groups: std::collections::HashMap<String, ServerGroup> =
             std::collections::HashMap::new();
 
         for injection in injections {
-            let (language, _, _) = &injection;
-
-            if let Some(resolved) = self.get_config_for_language(settings, host_language, language)
+            if let Some(resolved) =
+                self.get_config_for_language(settings, host_language, &injection.language)
             {
                 server_groups
                     .entry(resolved.server_name.clone())

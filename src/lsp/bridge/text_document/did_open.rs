@@ -22,7 +22,7 @@ impl LanguageServerPool {
     /// * `server_config` - The server configuration (for spawning if needed)
     /// * `host_uri` - The host document URI (e.g., markdown file)
     /// * `host_uri_lsp` - The host URI in `ls_types::Uri` format
-    /// * `injections` - List of (language, region_id, content) tuples
+    /// * `injections` - All injection regions to open on this server
     ///
     /// # Error Handling
     /// Errors are logged at debug level and never propagated. This method is
@@ -33,7 +33,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         host_uri: &url::Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
-        injections: Vec<(String, String, String)>,
+        injections: Vec<crate::lsp::bridge::coordinator::InjectionRegion>,
     ) {
         // Wait for the server to be ready (handshake complete)
         let handle = match self
@@ -59,11 +59,18 @@ impl LanguageServerPool {
 
         let mut sender = ConnectionHandleSender(&handle);
 
-        for (language, region_id, content) in &injections {
-            let virtual_uri = VirtualDocumentUri::new(host_uri_lsp, language, region_id);
+        for injection in &injections {
+            let virtual_uri =
+                VirtualDocumentUri::new(host_uri_lsp, &injection.language, &injection.region_id);
 
             if let Err(e) = self
-                .ensure_document_opened(&mut sender, host_uri, &virtual_uri, content, server_name)
+                .ensure_document_opened(
+                    &mut sender,
+                    host_uri,
+                    &virtual_uri,
+                    &injection.content,
+                    server_name,
+                )
                 .await
             {
                 log::debug!(
@@ -101,17 +108,18 @@ mod tests {
         let host_uri = test_host_uri("eager_open");
         let host_uri_lsp = url_to_uri(&host_uri);
 
+        use super::super::super::coordinator::InjectionRegion;
         let injections = vec![
-            (
-                "lua".to_string(),
-                TEST_ULID_LUA_0.to_string(),
-                "print('hello')".to_string(),
-            ),
-            (
-                "lua".to_string(),
-                TEST_ULID_LUA_1.to_string(),
-                "print('world')".to_string(),
-            ),
+            InjectionRegion {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_0.to_string(),
+                content: "print('hello')".to_string(),
+            },
+            InjectionRegion {
+                language: "lua".to_string(),
+                region_id: TEST_ULID_LUA_1.to_string(),
+                content: "print('world')".to_string(),
+            },
         ];
 
         pool.eager_open_virtual_documents(
@@ -154,11 +162,12 @@ mod tests {
         let host_uri = test_host_uri("idempotent");
         let host_uri_lsp = url_to_uri(&host_uri);
 
-        let injections = vec![(
-            "lua".to_string(),
-            TEST_ULID_LUA_0.to_string(),
-            "print('hello')".to_string(),
-        )];
+        use super::super::super::coordinator::InjectionRegion;
+        let injections = vec![InjectionRegion {
+            language: "lua".to_string(),
+            region_id: TEST_ULID_LUA_0.to_string(),
+            content: "print('hello')".to_string(),
+        }];
 
         // First call - should open the document
         pool.eager_open_virtual_documents(

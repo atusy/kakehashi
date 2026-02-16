@@ -13,7 +13,7 @@
 
 mod actor;
 mod connection;
-mod coordinator;
+pub(crate) mod coordinator;
 mod pool;
 mod protocol;
 mod text_document;

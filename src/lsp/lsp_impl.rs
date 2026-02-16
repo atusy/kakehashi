@@ -45,6 +45,7 @@ use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::region_id_tracker::EditInfo;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
+use crate::lsp::bridge::coordinator::InjectionRegion;
 use crate::lsp::client::{ClientNotifier, check_semantic_tokens_refresh_support};
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::{SettingsSource, load_settings};
@@ -681,7 +682,7 @@ impl Kakehashi {
         }
     }
 
-    /// Resolve all injection regions for a document into (language, region_id, content) tuples.
+    /// Resolve all injection regions for a document.
     ///
     /// This method:
     /// 1. Gets the host language and its injection query
@@ -695,7 +696,7 @@ impl Kakehashi {
     /// # Lock Safety
     /// The document store lock is held only to clone the tree and text, then
     /// released before the tree traversal. No DashMap deadlock risk.
-    fn resolve_injection_data(&self, uri: &Url) -> Vec<(String, String, String)> {
+    fn resolve_injection_data(&self, uri: &Url) -> Vec<InjectionRegion> {
         // Get the host language for this document
         let host_language = match self.get_language_for_document(uri) {
             Some(lang) => lang,
@@ -739,7 +740,7 @@ impl Kakehashi {
             return Vec::new();
         }
 
-        // Build (language, region_id, content) tuples for each injection
+        // Build InjectionRegion for each injection
         // ADR-0019: Use RegionIdTracker with position-based keys
         // No document lock held here - safe to access region_id_tracker
         regions
@@ -751,11 +752,11 @@ impl Kakehashi {
                     region,
                 );
                 let content = &text[region.content_node.byte_range()];
-                (
-                    region.language.clone(),
-                    region_id.to_string(),
-                    content.to_string(),
-                )
+                InjectionRegion {
+                    language: region.language.clone(),
+                    region_id: region_id.to_string(),
+                    content: content.to_string(),
+                }
             })
             .collect()
     }
@@ -787,7 +788,7 @@ impl Kakehashi {
 
         // Derive unique language set for auto-install
         let languages: HashSet<String> =
-            injections.iter().map(|(lang, _, _)| lang.clone()).collect();
+            injections.iter().map(|inj| inj.language.clone()).collect();
 
         // Check for missing parsers and trigger auto-install
         self.check_injected_languages_auto_install(uri, &languages)
@@ -858,7 +859,7 @@ impl Kakehashi {
     /// This warms up language servers (spawn + handshake + didOpen) in the background
     /// for injection regions found in the document. Downstream servers receive
     /// document content immediately, enabling faster diagnostic responses.
-    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<(String, String, String)>) {
+    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<InjectionRegion>) {
         // Get the host language for this document
         let Some(host_language) = self.get_language_for_document(uri) else {
             return;
