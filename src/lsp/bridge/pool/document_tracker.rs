@@ -44,14 +44,11 @@ pub(crate) struct OpenedVirtualDoc {
 /// process sharing for related languages (e.g., ts and tsx sharing one tsgo server).
 /// VirtualDocumentUri still uses `injection_language` for URI construction (file extension).
 ///
-/// # Lock Ordering Contract
+/// # Lock Strategy
 ///
-/// When acquiring multiple locks, the order must be:
-/// 1. `document_versions` first
-/// 2. `host_to_virtual` second (while holding #1)
-///
-/// `opened_documents` is a `DashSet` with internal sharded locking —
-/// no external lock ordering concerns.
+/// Each Mutex (`document_versions`, `host_to_virtual`) is acquired and released
+/// independently — never held simultaneously. The DashSet `opened_documents`
+/// provides lock-free concurrent reads with internal sharded locking.
 pub(crate) struct DocumentTracker {
     /// Map of server_name -> (virtual document URI -> version).
     ///
@@ -151,10 +148,9 @@ impl DocumentTracker {
     /// They are kept here for test helpers that call `register_opened_document`
     /// directly without going through the claim path.
     ///
-    /// # Lock Ordering
-    ///
-    /// Acquires `document_versions` first, then `host_to_virtual`.
-    /// This order must be consistent to prevent deadlocks.
+    /// Each lock is acquired and released independently — the DashSet claim
+    /// prevents concurrent registration of the same document, so atomic
+    /// multi-lock acquisition is not needed.
     pub(super) async fn register_opened_document(
         &self,
         host_uri: &Url,
@@ -163,24 +159,29 @@ impl DocumentTracker {
     ) {
         let uri_string = virtual_uri.to_uri_string();
 
-        // Lock ordering: document_versions first, host_to_virtual second
-        let mut versions = self.document_versions.lock().await;
-        versions
-            .entry(server_name.to_string())
-            .or_default()
-            .entry(uri_string.clone())
-            .or_insert(1);
-
-        let mut host_map = self.host_to_virtual.lock().await;
-        let docs = host_map.entry(host_uri.clone()).or_default();
-        if !docs
-            .iter()
-            .any(|d| d.virtual_uri.to_uri_string() == uri_string)
+        // Step 1: Update versions (release lock after block)
         {
-            docs.push(OpenedVirtualDoc {
-                virtual_uri: virtual_uri.clone(),
-                server_name: server_name.to_string(),
-            });
+            let mut versions = self.document_versions.lock().await;
+            versions
+                .entry(server_name.to_string())
+                .or_default()
+                .entry(uri_string.clone())
+                .or_insert(1);
+        }
+
+        // Step 2: Update host_to_virtual (separate lock scope)
+        {
+            let mut host_map = self.host_to_virtual.lock().await;
+            let docs = host_map.entry(host_uri.clone()).or_default();
+            if !docs
+                .iter()
+                .any(|d| d.virtual_uri.to_uri_string() == uri_string)
+            {
+                docs.push(OpenedVirtualDoc {
+                    virtual_uri: virtual_uri.clone(),
+                    server_name: server_name.to_string(),
+                });
+            }
         }
 
         // Idempotent insert into DashSet (already inserted by try_claim_for_open
