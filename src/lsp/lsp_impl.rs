@@ -45,6 +45,7 @@ use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::region_id_tracker::EditInfo;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
+use crate::lsp::bridge::coordinator::InjectionRegion;
 use crate::lsp::client::{ClientNotifier, check_semantic_tokens_refresh_support};
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::{SettingsSource, load_settings};
@@ -52,9 +53,7 @@ use tokio::sync::Mutex;
 
 use super::text_sync::apply_content_changes_with_edits;
 
-use super::auto_install::{
-    AutoInstallManager, InstallEvent, InstallingLanguages, get_injected_languages,
-};
+use super::auto_install::{AutoInstallManager, InstallEvent, InstallingLanguages};
 use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
@@ -683,57 +682,68 @@ impl Kakehashi {
         }
     }
 
-    /// Forward didChange notifications to opened virtual documents in bridges.
+    /// Resolve all injection regions for a document.
     ///
-    /// This method collects all injection regions from the parsed document and
-    /// forwards didChange notifications to downstream language servers for any
-    /// virtual documents that have been opened (via didOpen during hover/completion).
+    /// This method:
+    /// 1. Gets the host language and its injection query
+    /// 2. Extracts the parse tree (minimal lock duration on document store)
+    /// 3. Collects all injection regions via `collect_all_injections`
+    /// 4. Calculates stable region IDs via `RegionIdTracker` (ADR-0019)
     ///
-    /// Called after parse_document() in did_change() to propagate host document
-    /// changes to downstream language servers.
-    async fn forward_didchange_to_bridges(&self, uri: &Url, text: &str) {
+    /// Returns an empty Vec if no injections are found (no language, no query,
+    /// no tree, or no injection regions).
+    ///
+    /// # Lock Safety
+    /// The document store lock is held only to clone the tree and text, then
+    /// released before the tree traversal. No DashMap deadlock risk.
+    fn resolve_injection_data(&self, uri: &Url) -> Vec<InjectionRegion> {
         // Get the host language for this document
         let host_language = match self.get_language_for_document(uri) {
             Some(lang) => lang,
-            None => return, // No language detected, nothing to forward
+            None => return Vec::new(),
         };
 
         // Get the injection query for this language
         let injection_query = match self.language.get_injection_query(&host_language) {
             Some(q) => q,
-            None => return, // No injection query = no injections
+            None => return Vec::new(),
         };
 
-        // Extract tree from document with minimal lock duration
-        // IMPORTANT: Clone the tree to release document lock immediately
-        let tree = {
+        // Extract tree and text from document with minimal lock duration
+        // IMPORTANT: Clone both to release document lock immediately
+        let (tree, text) = {
             let doc = match self.documents.get(uri) {
                 Some(d) => d,
-                None => return, // Document not found
+                None => return Vec::new(),
             };
 
-            match doc.tree() {
+            let tree = match doc.tree() {
                 Some(t) => t.clone(),
-                None => return, // No parse tree
-            }
+                None => return Vec::new(),
+            };
+            let text = doc.text().to_string();
+            (tree, text)
             // Document lock released here when `doc` guard drops
         };
 
         // Collect all injection regions (no locks held)
-        let regions =
-            match collect_all_injections(&tree.root_node(), text, Some(injection_query.as_ref())) {
-                Some(r) => r,
-                None => return, // No injections
-            };
+        let regions = match collect_all_injections(
+            &tree.root_node(),
+            &text,
+            Some(injection_query.as_ref()),
+        ) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
 
         if regions.is_empty() {
-            return;
+            return Vec::new();
         }
 
-        // Build (language, region_id, content) tuples for each injection
+        // Build InjectionRegion for each injection
         // ADR-0019: Use RegionIdTracker with position-based keys
         // No document lock held here - safe to access region_id_tracker
-        let injections: Vec<(String, String, String)> = regions
+        regions
             .iter()
             .map(|region| {
                 let region_id = InjectionResolver::calculate_region_id(
@@ -742,41 +752,50 @@ impl Kakehashi {
                     region,
                 );
                 let content = &text[region.content_node.byte_range()];
-                (
-                    region.language.clone(),
-                    region_id.to_string(),
-                    content.to_string(),
-                )
+                InjectionRegion {
+                    language: region.language.clone(),
+                    region_id: region_id.to_string(),
+                    content: content.to_string(),
+                }
             })
-            .collect();
-
-        // Forward didChange to opened virtual documents
-        self.bridge
-            .forward_didchange_to_opened_docs(uri, &injections)
-            .await;
+            .collect()
     }
 
-    /// Process injected languages: auto-install missing parsers and spawn bridge servers.
+    /// Process injected languages: resolve injection data, optionally forward didChange,
+    /// auto-install missing parsers, and eagerly open virtual documents.
     ///
-    /// This computes the injected language set once and passes it to both:
-    /// 1. Auto-install check for missing parsers
-    /// 2. Eager bridge server spawning for ready servers
+    /// This resolves injection data **once** and uses it for:
+    /// 1. Forwarding didChange to already-opened virtual documents (when `forward_did_change` is true)
+    /// 2. Auto-install check for missing parsers
+    /// 3. Eager server spawn + didOpen for virtual documents
     ///
-    /// This must be called AFTER parse_document so we have access to the AST.
-    async fn process_injected_languages(&self, uri: &Url) {
-        // Get unique injected languages from the document (computed once)
-        let languages = get_injected_languages(uri, &self.language, &self.documents);
-
-        if languages.is_empty() {
+    /// Must be called AFTER parse_document so we have access to the AST.
+    async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
+        let injections = self.resolve_injection_data(uri);
+        if injections.is_empty() {
+            // Cancel any previously spawned eager-open tasks for this URI.
+            // Without this, stale tasks could send didOpen for removed injection regions.
+            self.bridge.cancel_eager_open(uri);
             return;
         }
+
+        if forward_did_change {
+            // Forward didChange to opened virtual documents
+            self.bridge
+                .forward_didchange_to_opened_docs(uri, &injections)
+                .await;
+        }
+
+        // Derive unique language set for auto-install
+        let languages: HashSet<String> =
+            injections.iter().map(|inj| inj.language.clone()).collect();
 
         // Check for missing parsers and trigger auto-install
         self.check_injected_languages_auto_install(uri, &languages)
             .await;
 
-        // Eagerly spawn bridge servers for detected injection languages
-        self.eager_spawn_bridge_servers(uri, languages).await;
+        // Eagerly spawn bridge servers and open virtual documents
+        self.eager_spawn_bridge_servers(uri, injections);
     }
 
     /// Check injected languages and handle missing parsers.
@@ -835,12 +854,12 @@ impl Kakehashi {
         }
     }
 
-    /// Eagerly spawn bridge servers for detected injection languages.
+    /// Eagerly spawn bridge servers and open virtual documents for detected injections.
     ///
-    /// This warms up language servers (spawn + handshake) in the background for
-    /// any injection regions found in the document. The servers will be ready
-    /// to handle requests (hover, completion, etc.) without first-request latency.
-    async fn eager_spawn_bridge_servers(&self, uri: &Url, languages: HashSet<String>) {
+    /// This warms up language servers (spawn + handshake + didOpen) in the background
+    /// for injection regions found in the document. Downstream servers receive
+    /// document content immediately, enabling faster diagnostic responses.
+    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<InjectionRegion>) {
         // Get the host language for this document
         let Some(host_language) = self.get_language_for_document(uri) else {
             return;
@@ -849,10 +868,9 @@ impl Kakehashi {
         // Get current settings for server config lookup
         let settings = self.settings_manager.load_settings();
 
-        // Spawn servers for each detected injection language
+        // Spawn servers and open virtual documents for each detected injection
         self.bridge
-            .eager_spawn_servers(&settings, &host_language, languages)
-            .await;
+            .eager_spawn_and_open_documents(&settings, &host_language, uri, injections);
     }
 
     /// Schedule a debounced diagnostic for a document (ADR-0020 Phase 3).
@@ -1138,6 +1156,9 @@ impl LanguageServer for Kakehashi {
         // Cancel all debounced diagnostic timers (ADR-0020 Phase 3)
         self.debounced_diagnostics.cancel_all();
 
+        // Abort all eager-open tasks to prevent orphaned didOpen during shutdown
+        self.bridge.abort_all_eager_open();
+
         // Cancel the upstream forwarding task for deterministic shutdown.
         // Without this, the task only exits when all senders are dropped.
         self.shutdown_token.cancel();
@@ -1230,7 +1251,7 @@ impl LanguageServer for Kakehashi {
 
         // Process injected languages: auto-install missing parsers and spawn bridge servers.
         // This must be called AFTER parse_document so we have access to the AST.
-        self.process_injected_languages(&uri).await;
+        self.process_injections(&uri, false).await;
 
         // ADR-0020 Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
@@ -1269,6 +1290,9 @@ impl LanguageServer for Kakehashi {
 
         // Cancel any pending debounced diagnostic for this document (ADR-0020 Phase 3)
         self.debounced_diagnostics.cancel(&uri);
+
+        // Cancel any eager-open tasks for this document (prevents orphaned didOpen)
+        self.bridge.cancel_eager_open(&uri);
 
         // Close all virtual documents associated with this host document
         // This sends didClose notifications to downstream language servers
@@ -1334,9 +1358,6 @@ impl LanguageServer for Kakehashi {
         // Must be called BEFORE parse_document which updates the injection_map
         self.cache.invalidate_for_edits(&uri, &edits);
 
-        // Clone text before parse_document consumes it (needed for forward_didchange_to_bridges)
-        let text_for_bridge = text.clone();
-
         // Parse the updated document with edit information
         self.parse_document(uri.clone(), text, language_id.as_deref(), edits)
             .await;
@@ -1350,19 +1371,18 @@ impl LanguageServer for Kakehashi {
         // The cache is validated at lookup time via result_id matching, so stale
         // tokens won't be returned for mismatched result_ids.
 
-        // Forward didChange to opened virtual documents in bridge
-        self.forward_didchange_to_bridges(&uri, &text_for_bridge)
-            .await;
-
         // ADR-0019: Close invalidated virtual documents.
         // Send didClose notifications to downstream LSs for orphaned docs.
         self.close_invalidated_virtual_docs(&uri, &invalidated_ulids)
             .await;
 
-        // Process injected languages: auto-install missing parsers and spawn bridge servers.
-        // When users add new code blocks, parsers are installed and servers warm up immediately.
-        // This must be called AFTER parse_document so we have access to the updated AST.
-        self.process_injected_languages(&uri).await;
+        // Forward didChange to opened virtual documents + process injected languages.
+        // Injection data is resolved once and reused for:
+        // 1. didChange forwarding to already-opened virtual documents
+        // 2. Auto-install missing parsers
+        // 3. Eager server spawn + didOpen for virtual documents
+        // Must be called AFTER parse_document so we have access to the updated AST.
+        self.process_injections(&uri, true).await;
 
         // ADR-0020 Phase 3: Schedule debounced diagnostic push on didChange.
         // After 500ms of no changes, diagnostics will be collected and published.
@@ -1553,7 +1573,7 @@ mod tests {
         // which injected languages need auto-installation (parsers not loaded).
         //
         // The function should:
-        // 1. Get injected languages from the document using get_injected_languages()
+        // 1. Get injected languages from resolve_injection_data()
         // 2. For each language, call ensure_language_loaded() to check if parser exists
         // 3. If parser is NOT loaded AND autoInstall is enabled, trigger maybe_auto_install_language()
         // 4. Skip languages that are already loaded or already being installed
@@ -1582,9 +1602,10 @@ mod tests {
         // This verifies the core logic: if ensure_language_loaded().success is false,
         // the language should be a candidate for auto-installation.
 
-        // The check_injected_languages_auto_install method will use this pattern:
-        // 1. let languages = self.get_injected_languages(uri);
-        // 2. for lang in languages {
+        // The check_injected_languages_auto_install method uses this pattern:
+        // 1. let injections = self.resolve_injection_data(uri);
+        // 2. let languages = derive unique set from injections;
+        // 3. for lang in languages {
         //        let load_result = self.language.ensure_language_loaded(&lang);
         //        if !load_result.success {
         //            self.maybe_auto_install_language(&lang, uri, text).await;

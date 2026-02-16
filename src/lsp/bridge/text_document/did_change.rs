@@ -33,14 +33,14 @@ impl LanguageServerPool {
     ///
     /// # Arguments
     /// * `host_uri` - The host document URI
-    /// * `injections` - List of (language, region_id, content) tuples for all injection regions
+    /// * `injections` - All injection regions in the host document
     ///
     // TODO: Support incremental didChange (TextDocumentSyncKind::Incremental) for better
     // performance with large documents. Currently uses full sync for simplicity.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         host_uri: &Url,
-        injections: &[(String, String, String)], // (language, region_id, content)
+        injections: &[crate::lsp::bridge::coordinator::InjectionRegion],
     ) {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -56,8 +56,9 @@ impl LanguageServerPool {
         };
 
         // For each injection, check if it's actually opened and send didChange
-        for (language, region_id, content) in injections {
-            let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, language, region_id);
+        for injection in injections {
+            let virtual_uri =
+                VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
 
             // Check if this virtual doc has ACTUALLY been opened (didOpen sent to downstream)
             // per ADR-0015. This prevents sending didChange before didOpen.
@@ -99,7 +100,7 @@ impl LanguageServerPool {
                     Self::send_didchange_for_virtual_doc(
                         &handle,
                         &virtual_uri.to_uri_string(),
-                        content,
+                        &injection.content,
                         version,
                     );
                 }
