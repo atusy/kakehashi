@@ -420,10 +420,29 @@ impl ConnectionHandle {
     ///
     /// Dynamic registrations take precedence since they may arrive after initialize.
     ///
-    /// To add a new method, add a match arm mapping the LSP method string to the
-    /// corresponding field in `ServerCapabilities`:
+    /// # Capability check patterns
+    ///
+    /// Static capability fields use two different check patterns depending on the
+    /// LSP type's shape:
+    ///
+    /// - **`is_some()`** — for struct-only types (`completion_provider`, `signature_help_provider`,
+    ///   `diagnostic_provider`). These have no boolean/`false` variant; `Some(…)` always
+    ///   means "supported".
+    ///
+    /// - **`matches!(…)`** — for boolean-or-struct enums (`HoverProviderCapability`,
+    ///   `OneOf<bool, …>`, `ColorProviderCapability`, etc.). These contain a `Simple(false)` /
+    ///   `Left(false)` variant that explicitly disables the capability, so a bare `is_some()`
+    ///   would incorrectly treat `Some(Simple(false))` as supported.
+    ///
+    /// To add a new method, add a match arm using the appropriate pattern for its type:
     /// ```ignore
-    /// "textDocument/hover" => caps.hover_provider.is_some(),
+    /// // Struct-only — no false variant exists
+    /// "textDocument/completion" => caps.completion_provider.is_some(),
+    /// // Boolean-or-struct enum — must reject the false variant
+    /// "textDocument/hover" => matches!(
+    ///     caps.hover_provider,
+    ///     Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+    /// ),
     /// ```
     pub(crate) fn has_capability(&self, method: &str) -> bool {
         // Check dynamic registrations first (may arrive after initialize)

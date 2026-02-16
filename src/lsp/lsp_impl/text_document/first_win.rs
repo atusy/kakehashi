@@ -145,6 +145,11 @@ pub(super) async fn first_win<T: Send + 'static>(
             // wins and the valid result is discarded. This is correct for LSP semantics:
             // the editor has already moved on, so returning a stale result is wasteful.
             biased;
+            // `_` intentionally matches both `Ok(())` (real $/cancelRequest)
+            // and `Err(RecvError)` (sender half dropped). The cancel guard
+            // (held by the caller) always outlives `first_win()`, so in practice
+            // only `Ok` is received here. Matching both avoids a spurious panic
+            // if that invariant ever changes.
             _ = &mut cancel_rx => {
                 // abort_all() cancels in-flight tasks but does NOT clean up
                 // per-connection ResponseRouter entries. Those orphaned entries
