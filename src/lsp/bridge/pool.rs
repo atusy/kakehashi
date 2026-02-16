@@ -479,12 +479,18 @@ impl LanguageServerPool {
         virtual_content: &str,
         server_name: &str,
     ) -> io::Result<()> {
-        if !self.document_tracker.try_claim_for_open(virtual_uri) {
+        if !self
+            .document_tracker
+            .try_claim_for_open(virtual_uri, server_name)
+            .await
+        {
             return Ok(()); // Already claimed by another caller
         }
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
-            self.document_tracker.unclaim_document(virtual_uri);
+            self.document_tracker
+                .unclaim_document(virtual_uri, server_name)
+                .await;
             return Err(e);
         }
         self.document_tracker

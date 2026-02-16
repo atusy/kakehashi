@@ -97,18 +97,44 @@ impl DocumentTracker {
     /// Returns `false` if another caller already claimed it.
     ///
     /// Uses `DashSet::insert()` as an atomic compare-and-swap.
+    /// Also initializes the document version to 1, so that a concurrent
+    /// `didChange` arriving before `register_opened_document` can still
+    /// call `increment_document_version` successfully.
     ///
     /// On send failure, call `unclaim_document()` to roll back.
-    pub(super) fn try_claim_for_open(&self, virtual_uri: &VirtualDocumentUri) -> bool {
-        self.opened_documents.insert(virtual_uri.to_uri_string())
+    pub(super) async fn try_claim_for_open(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        server_name: &str,
+    ) -> bool {
+        if !self.opened_documents.insert(virtual_uri.to_uri_string()) {
+            return false;
+        }
+        // Initialize version immediately so concurrent didChange won't be dropped
+        let mut versions = self.document_versions.lock().await;
+        versions
+            .entry(server_name.to_string())
+            .or_default()
+            .entry(virtual_uri.to_uri_string())
+            .or_insert(1);
+        true
     }
 
     /// Roll back a claim made by `try_claim_for_open()`.
     ///
     /// Called when the didOpen send fails, so the document can be
-    /// claimed again on a future attempt.
-    pub(super) fn unclaim_document(&self, virtual_uri: &VirtualDocumentUri) {
+    /// claimed again on a future attempt. Also removes the version
+    /// entry initialized by `try_claim_for_open()`.
+    pub(super) async fn unclaim_document(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        server_name: &str,
+    ) {
         self.opened_documents.remove(&virtual_uri.to_uri_string());
+        let mut versions = self.document_versions.lock().await;
+        if let Some(docs) = versions.get_mut(server_name) {
+            docs.remove(&virtual_uri.to_uri_string());
+        }
     }
 
     /// Register a document as successfully opened.
@@ -455,47 +481,47 @@ mod tests {
     // ========================================
 
     /// Test that try_claim_for_open returns true for a new document.
-    #[test]
-    fn try_claim_for_open_returns_true_for_new_document() {
+    #[tokio::test]
+    async fn try_claim_for_open_returns_true_for_new_document() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         assert!(
-            tracker.try_claim_for_open(&virtual_uri),
+            tracker.try_claim_for_open(&virtual_uri, "lua").await,
             "First claim should succeed"
         );
     }
 
     /// Test that try_claim_for_open returns false for an already claimed document.
-    #[test]
-    fn try_claim_for_open_returns_false_for_already_claimed() {
+    #[tokio::test]
+    async fn try_claim_for_open_returns_false_for_already_claimed() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // First claim succeeds
-        assert!(tracker.try_claim_for_open(&virtual_uri));
+        assert!(tracker.try_claim_for_open(&virtual_uri, "lua").await);
 
         // Second claim for same URI fails
         assert!(
-            !tracker.try_claim_for_open(&virtual_uri),
+            !tracker.try_claim_for_open(&virtual_uri, "lua").await,
             "Second claim should fail — already claimed"
         );
     }
 
     /// Test that unclaim_document allows reclaim.
-    #[test]
-    fn unclaim_document_allows_reclaim() {
+    #[tokio::test]
+    async fn unclaim_document_allows_reclaim() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Claim, unclaim, then claim again
-        assert!(tracker.try_claim_for_open(&virtual_uri));
-        tracker.unclaim_document(&virtual_uri);
+        assert!(tracker.try_claim_for_open(&virtual_uri, "lua").await);
+        tracker.unclaim_document(&virtual_uri, "lua").await;
         assert!(
-            tracker.try_claim_for_open(&virtual_uri),
+            tracker.try_claim_for_open(&virtual_uri, "lua").await,
             "Should be able to reclaim after unclaim"
         );
     }
@@ -543,10 +569,7 @@ mod tests {
         let version = tracker
             .increment_document_version(&virtual_uri, "lua")
             .await;
-        assert!(
-            version.is_none(),
-            "Version should be removed after unclaim"
-        );
+        assert!(version.is_none(), "Version should be removed after unclaim");
     }
 
     // ========================================
