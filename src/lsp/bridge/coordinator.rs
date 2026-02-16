@@ -543,41 +543,31 @@ impl BridgeCoordinator {
     /// their AbortHandles stay in the map. This method removes finished handles
     /// and deletes entries where all handles are finished.
     ///
+    /// Uses `DashMap::retain` for atomic per-shard cleanup: each entry's handles
+    /// are filtered and the entry is removed (if empty) under the same write lock,
+    /// preventing a concurrent `supersede_eager_open_tasks` from inserting a
+    /// placeholder that gets accidentally deleted.
+    ///
     /// Called opportunistically by supersede_eager_open_tasks() on each batch.
     fn cleanup_finished_eager_open_tasks(&self) {
         let mut removed_handles = 0;
-        let mut to_remove = Vec::new();
-
-        // Single pass: retain only running handles, collect empty entries for removal
-        for mut entry in self.eager_open_tasks.iter_mut() {
-            let before = entry.value().len();
-            entry.value_mut().retain(|h| !h.is_finished());
-            let after = entry.value().len();
-            removed_handles += before - after;
-
-            if after == 0 {
-                to_remove.push(entry.key().clone());
+        let mut cleaned_docs = 0;
+        self.eager_open_tasks.retain(|_uri, handles| {
+            let before = handles.len();
+            handles.retain(|h| !h.is_finished());
+            removed_handles += before - handles.len();
+            if handles.is_empty() {
+                cleaned_docs += 1;
+                false // remove empty entry
+            } else {
+                true // keep entry with remaining handles
             }
-        }
-
-        // Remove entries that became empty (can't remove during iter_mut).
-        //
-        // Race window: a concurrent supersede_eager_open_tasks could insert a new
-        // empty placeholder for the same URI between iter_mut completing and this
-        // remove call, causing us to delete the fresh placeholder. This is benign:
-        // push_or_abort_eager_open_handle handles the missing entry by aborting
-        // the task, and the next didChange re-triggers eager open (self-healing).
-        let cleaned_docs = to_remove.len();
-        for uri in &to_remove {
-            self.eager_open_tasks.remove(uri);
-        }
-
+        });
         if removed_handles > 0 {
             log::trace!(
                 target: "kakehashi::bridge",
-                "Cleaned up {} finished eager-open handles across {} documents ({} entries removed)",
+                "Cleaned up {} finished eager-open handles ({} entries removed)",
                 removed_handles,
-                cleaned_docs,
                 cleaned_docs
             );
         }
@@ -609,29 +599,25 @@ impl BridgeCoordinator {
     /// Ensures clean shutdown by cancelling all background tasks that may
     /// still be waiting for server readiness.
     ///
-    /// # Safety Assumption
-    ///
-    /// This method assumes no new tasks will be inserted concurrently.
-    /// It is only safe to call during shutdown when no new `didOpen`/`didChange`
-    /// events are being processed. Tasks inserted between `iter()` and `clear()`
-    /// would be cleared without being aborted.
+    /// Uses `DashMap::retain` to abort handles and remove entries under the
+    /// same per-shard write lock, so no task can be inserted-then-cleared
+    /// without being aborted — even if called outside a strict shutdown window.
     pub(crate) fn abort_all_eager_open(&self) {
-        let count: usize = self.eager_open_tasks.iter().map(|e| e.value().len()).sum();
+        let mut count = 0usize;
+        self.eager_open_tasks.retain(|_uri, handles| {
+            for handle in handles.iter() {
+                handle.abort();
+                count += 1;
+            }
+            false // remove entry
+        });
         if count > 0 {
             log::debug!(
                 target: "kakehashi::bridge",
-                "Aborting {} eager-open tasks across {} documents",
-                count,
-                self.eager_open_tasks.len()
+                "Aborted {} eager-open tasks during shutdown",
+                count
             );
         }
-
-        for entry in self.eager_open_tasks.iter() {
-            for handle in entry.value().iter() {
-                handle.abort();
-            }
-        }
-        self.eager_open_tasks.clear();
     }
 }
 
