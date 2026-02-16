@@ -141,10 +141,14 @@ impl DocumentTracker {
         self.opened_documents.remove(&uri_string);
     }
 
-    /// Register a document as successfully opened.
+    /// Register a document's host_to_virtual mapping.
     ///
-    /// Called AFTER the didOpen notification has been successfully sent to the
-    /// downstream server. Records tracking state:
+    /// Called BEFORE the didOpen send in `ensure_document_opened`, so that
+    /// `close_host_document` can find the document even if the task is
+    /// aborted after registration. On send failure, the caller rolls back
+    /// via `unregister_virtual_doc()`.
+    ///
+    /// Records tracking state:
     /// - Document version (safety net via `or_insert` — primary initialization
     ///   happens in `try_claim_for_open()` to close the race window)
     /// - Host-to-virtual mapping (with dedup check for idempotency)
@@ -154,10 +158,6 @@ impl DocumentTracker {
     /// safety nets. `try_claim_for_open()` already performs both operations.
     /// They are kept here for test helpers that call `register_opened_document`
     /// directly without going through the claim path.
-    ///
-    /// Each lock is acquired and released independently — the DashSet claim
-    /// prevents concurrent registration of the same document, so atomic
-    /// multi-lock acquisition is not needed.
     pub(super) async fn register_opened_document(
         &self,
         host_uri: &Url,

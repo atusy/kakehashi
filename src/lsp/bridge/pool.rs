@@ -456,15 +456,15 @@ impl LanguageServerPool {
     /// * `virtual_content` - Content for the didOpen notification
     /// * `server_name` - Server name for document tracking
     ///
-    /// # Atomic Claim Pattern
+    /// # Claim-Register-Send Pattern
     ///
     /// Uses `try_claim_for_open()` as an atomic compare-and-swap:
-    /// - First caller claims the URI (returns true) and sends didOpen
+    /// - First caller claims the URI (returns true)
     /// - Concurrent callers see the claim and skip (returns false)
-    /// - On send failure, the claim is rolled back via `unclaim_document()`
-    ///
-    /// This prevents duplicate didOpen sends that occurred with the old
-    /// check-then-act TOCTOU pattern.
+    /// - Registration (host_to_virtual) happens BEFORE send, so
+    ///   `close_host_document` can find the document even if the task
+    ///   is aborted after registration
+    /// - On send failure, both claim and registration are rolled back
     ///
     /// # MessageSender Trait (ADR-0015)
     ///
