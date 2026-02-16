@@ -1907,6 +1907,39 @@ mod tests {
         );
     }
 
+    /// Test that ensure_document_opened rolls back the claim on send failure.
+    ///
+    /// When the channel is closed (BrokenPipe), the claim made by try_claim_for_open
+    /// should be rolled back via unclaim_document, allowing a future retry.
+    #[tokio::test]
+    async fn ensure_document_opened_unclaims_on_send_failure() {
+        use super::super::protocol::VirtualDocumentUri;
+        use tokio::sync::mpsc;
+
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let virtual_content = "print('hello')";
+
+        // Create a channel and drop the receiver to simulate BrokenPipe
+        let (mut sender, rx) = mpsc::channel::<OutboundMessage>(16);
+        drop(rx);
+
+        // Call ensure_document_opened — should fail with BrokenPipe
+        let result = pool
+            .ensure_document_opened(&mut sender, &host_uri, &virtual_uri, virtual_content, "lua")
+            .await;
+
+        assert!(result.is_err(), "Should fail with BrokenPipe");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+
+        // The claim should have been rolled back — document is NOT opened
+        assert!(
+            !pool.is_document_opened(&virtual_uri),
+            "Claim should be rolled back on send failure"
+        );
+    }
+
     // ========================================
     // Connection State Machine Integration Tests
     // ========================================
