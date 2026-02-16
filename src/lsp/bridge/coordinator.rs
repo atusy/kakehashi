@@ -10,7 +10,7 @@
 //! - Provides bridge config lookup with wildcard resolution
 //! - Provides cancel notification support via `CancelForwarder`
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -444,7 +444,7 @@ impl BridgeCoordinator {
         // Group injections by server name
         // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
         type ServerGroup = (BridgeServerConfig, Vec<InjectionRegion>);
-        let mut server_groups: HashMap<String, ServerGroup> = HashMap::new();
+        let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
 
         for injection in injections {
             if let Some(resolved) =
@@ -670,6 +670,8 @@ impl std::fmt::Debug for BridgeCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::config::LanguageSettings;
     use crate::config::settings::BridgeLanguageConfig;
