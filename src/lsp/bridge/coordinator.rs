@@ -659,6 +659,66 @@ mod tests {
         assert_eq!(result[0].server_name, "rust-analyzer");
     }
 
+    #[tokio::test]
+    async fn test_cancel_eager_open_aborts_tracked_tasks() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // Spawn tasks that will never complete on their own
+        let task1 = tokio::spawn(futures::future::pending::<()>());
+        let task2 = tokio::spawn(futures::future::pending::<()>());
+        let handles = vec![task1.abort_handle(), task2.abort_handle()];
+
+        // Register handles for this URI
+        coordinator.register_eager_open_tasks(&uri, handles);
+
+        // Cancel all tasks for this URI
+        coordinator.cancel_eager_open(&uri);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // Verify tasks are finished (aborted)
+        assert!(task1.is_finished(), "task1 should be aborted");
+        assert!(task2.is_finished(), "task2 should be aborted");
+    }
+
+    #[test]
+    fn test_cancel_eager_open_noop_for_unknown_uri() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///unknown.md").unwrap();
+
+        // Should not panic or error when cancelling for an unknown URI
+        coordinator.cancel_eager_open(&uri);
+    }
+
+    #[tokio::test]
+    async fn test_register_supersedes_previous_tasks() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // First batch of tasks
+        let task1 = tokio::spawn(futures::future::pending::<()>());
+        let handle1 = task1.abort_handle();
+        coordinator.register_eager_open_tasks(&uri, vec![handle1]);
+
+        // Second batch — should abort the first batch
+        let task2 = tokio::spawn(futures::future::pending::<()>());
+        let _handle2 = task2.abort_handle();
+        coordinator.register_eager_open_tasks(&uri, vec![_handle2]);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // First batch should be aborted
+        assert!(
+            task1.is_finished(),
+            "first batch should be aborted on re-register"
+        );
+        // Second batch should still be running
+        assert!(!task2.is_finished(), "second batch should still be running");
+    }
+
     #[test]
     fn test_get_config_uses_wildcard_for_undefined_host() {
         let coordinator = BridgeCoordinator::new();
