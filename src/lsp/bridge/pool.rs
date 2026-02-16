@@ -406,7 +406,7 @@ impl LanguageServerPool {
     /// This is a fast, synchronous check used by request handlers to ensure
     /// they don't send requests before didOpen has been sent.
     ///
-    /// Returns true if `mark_document_opened()` has been called for this document.
+    /// Returns true if `register_opened_document()` has been called for this document.
     /// Returns false if the document hasn't been opened yet.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         self.document_tracker.is_document_opened(virtual_uri)
@@ -425,23 +425,26 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Mark a document as having had didOpen sent to downstream (ADR-0015).
+    /// Register a document as successfully opened (test helper).
     ///
-    /// This should be called AFTER the didOpen notification has been successfully
-    /// written to the downstream server. Request handlers check `is_document_opened()`
-    /// before sending requests to ensure LSP spec compliance.
-    ///
-    /// Note: Production code uses `document_tracker.mark_document_opened()` directly
-    /// via `ensure_document_opened()`. This delegation is exposed for test access.
+    /// Delegates to `DocumentTracker::register_opened_document()`.
+    /// This sets version, host-to-virtual mapping, and opened state atomically.
     #[cfg(test)]
-    pub(super) fn mark_document_opened(&self, virtual_uri: &VirtualDocumentUri) {
-        self.document_tracker.mark_document_opened(virtual_uri)
+    pub(super) async fn register_opened_document(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        server_name: &str,
+    ) {
+        self.document_tracker
+            .register_opened_document(host_uri, virtual_uri, server_name)
+            .await
     }
 
     /// Ensure document is opened before sending a request.
     ///
-    /// Sends didOpen if this is the first request for the document.
-    /// Returns error if another request is in the process of opening (race condition).
+    /// Sends didOpen if the document hasn't been opened yet (side-effect-free check).
+    /// On success, registers all tracking state.
     ///
     /// Callers are responsible for cleanup on error (removing router entry and
     /// unregistering from upstream request registry).
@@ -456,10 +459,9 @@ impl LanguageServerPool {
     ///
     /// # Decision Logic
     ///
-    /// Uses `DocumentOpenDecision` to determine action:
-    /// - `SendDidOpen`: Send didOpen notification, mark as opened
+    /// Uses `DocumentOpenDecision` (side-effect-free) to determine action:
+    /// - `SendDidOpen`: Send didOpen, then register all tracking state
     /// - `AlreadyOpened`: Skip (no-op), document was already opened
-    /// - `PendingError`: Race condition, return error
     ///
     /// # MessageSender Trait (ADR-0015)
     ///
@@ -474,21 +476,17 @@ impl LanguageServerPool {
         virtual_content: &str,
         server_name: &str,
     ) -> io::Result<()> {
-        match self
-            .document_tracker
-            .document_open_decision(host_uri, virtual_uri, server_name)
-            .await
-        {
+        match self.document_tracker.document_open_decision(virtual_uri) {
             DocumentOpenDecision::SendDidOpen => {
                 let did_open = build_didopen_notification(virtual_uri, virtual_content);
                 sender.send_notification(did_open).await?;
-                self.document_tracker.mark_document_opened(virtual_uri);
+                // Register AFTER successful send — no state to roll back on failure
+                self.document_tracker
+                    .register_opened_document(host_uri, virtual_uri, server_name)
+                    .await;
                 Ok(())
             }
             DocumentOpenDecision::AlreadyOpened => Ok(()),
-            DocumentOpenDecision::PendingError => Err(io::Error::other(
-                "bridge: document not yet opened (didOpen pending)",
-            )),
         }
     }
 
@@ -507,31 +505,6 @@ impl LanguageServerPool {
     ) -> Option<i32> {
         self.document_tracker
             .increment_document_version(virtual_uri, server_name)
-            .await
-    }
-
-    /// Check if document is opened and mark it as opened atomically.
-    ///
-    /// Returns true if the document was NOT previously opened (i.e., didOpen should be sent).
-    /// Returns false if the document was already opened (i.e., skip didOpen).
-    ///
-    /// This is exposed for tests that need to simulate document opening without
-    /// using the full ensure_document_opened flow.
-    ///
-    /// # Arguments
-    ///
-    /// * `host_uri` - The host document URI
-    /// * `virtual_uri` - The virtual document URI
-    /// * `server_name` - Server name for HashMap key
-    #[cfg(test)]
-    pub(super) async fn should_send_didopen(
-        &self,
-        host_uri: &Url,
-        virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
-    ) -> bool {
-        self.document_tracker
-            .should_send_didopen(host_uri, virtual_uri, server_name)
             .await
     }
 
@@ -1798,12 +1771,9 @@ mod tests {
         let host_uri = Url::parse("file:///project/doc.md").unwrap();
 
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-        let opened = pool
-            .should_send_didopen(&host_uri, &virtual_uri, "lua")
+        // Simulate successful didOpen by registering the document
+        pool.register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        assert!(opened, "First call should open the document");
-        // Also mark as opened (simulating successful didOpen write)
-        pool.mark_document_opened(&virtual_uri);
 
         let handle = create_handle_with_state(ConnectionState::Ready).await;
         pool.connections
@@ -1838,8 +1808,8 @@ mod tests {
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
     ///
-    /// Happy path: Document not in document_versions → should_send_didopen returns true
-    /// → sends didOpen → marks document as opened via mark_document_opened.
+    /// Happy path: Document not opened → document_open_decision returns SendDidOpen
+    /// → sends didOpen → registers tracking state via register_opened_document.
     #[tokio::test]
     async fn ensure_document_opened_sends_didopen_for_new_document() {
         use super::super::protocol::VirtualDocumentUri;
@@ -1888,9 +1858,8 @@ mod tests {
 
     /// Test that ensure_document_opened skips didOpen when document is already opened.
     ///
-    /// Already opened path: Document marked as opened via mark_document_opened
-    /// → should_send_didopen returns false, is_document_opened returns true
-    /// → no didOpen sent, returns Ok(()).
+    /// Already opened path: Document registered via register_opened_document
+    /// → document_open_decision returns AlreadyOpened → no didOpen sent.
     #[tokio::test]
     async fn ensure_document_opened_skips_didopen_for_already_opened_document() {
         use super::super::protocol::VirtualDocumentUri;
@@ -1901,10 +1870,9 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let virtual_content = "print('hello')";
 
-        // Pre-open the document (simulate previous didOpen)
-        pool.should_send_didopen(&host_uri, &virtual_uri, "lua")
+        // Pre-register the document (simulate previous successful didOpen)
+        pool.register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        pool.mark_document_opened(&virtual_uri);
 
         // Verify document is already marked as opened
         assert!(
@@ -1936,74 +1904,6 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "Should NOT have queued any message for already opened document"
-        );
-    }
-
-    /// Test that ensure_document_opened returns error when document is in inconsistent state.
-    ///
-    /// Error path: Another request called should_send_didopen (returned true) but hasn't
-    /// yet called mark_document_opened. Our call sees:
-    /// - should_send_didopen returns false (document_versions entry exists)
-    /// - is_document_opened returns false (not yet marked)
-    /// This is a race condition where didOpen is pending.
-    ///
-    /// Expected behavior: returns error (caller is responsible for cleanup).
-    #[tokio::test]
-    async fn ensure_document_opened_returns_error_for_pending_didopen() {
-        use super::super::protocol::VirtualDocumentUri;
-        use tokio::sync::mpsc;
-
-        let pool = LanguageServerPool::new();
-        let host_uri = Url::parse("file:///test/doc.md").unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
-        let virtual_content = "print('hello')";
-
-        // Simulate another request having called should_send_didopen but NOT mark_document_opened
-        // This puts the document in the "didOpen pending" state
-        pool.should_send_didopen(&host_uri, &virtual_uri, "lua")
-            .await;
-        // Deliberately do NOT call mark_document_opened to simulate pending didOpen
-
-        // Verify the inconsistent state:
-        // - should_send_didopen will return false (document already registered)
-        // - is_document_opened will return false (not yet marked as opened)
-        assert!(
-            !pool
-                .should_send_didopen(&host_uri, &virtual_uri, "lua")
-                .await,
-            "should_send_didopen should return false (already registered)"
-        );
-        assert!(
-            !pool.is_document_opened(&virtual_uri),
-            "Document should NOT be marked as opened"
-        );
-
-        // Create a channel-based sender (same as production code path)
-        let (mut sender, _rx) = mpsc::channel::<OutboundMessage>(16);
-
-        // Call ensure_document_opened - should fail
-        let result = pool
-            .ensure_document_opened(&mut sender, &host_uri, &virtual_uri, virtual_content, "lua")
-            .await;
-
-        // Should return error
-        assert!(
-            result.is_err(),
-            "ensure_document_opened should return error for pending didOpen state"
-        );
-
-        // Verify error message
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("didOpen pending"),
-            "Error message should mention didOpen pending: {}",
-            err
-        );
-
-        // Document should still NOT be marked as opened
-        assert!(
-            !pool.is_document_opened(&virtual_uri),
-            "Document should still NOT be marked as opened after error"
         );
     }
 
@@ -3047,11 +2947,8 @@ mod tests {
 
         // Register the document with server_name="tsgo" (process-sharing scenario)
         // This simulates what happens when a typescript block uses the tsgo server
-        let opened = pool
-            .should_send_didopen(&host_uri, &virtual_uri, "tsgo")
+        pool.register_opened_document(&host_uri, &virtual_uri, "tsgo")
             .await;
-        assert!(opened, "Document should be registered for opening");
-        pool.mark_document_opened(&virtual_uri);
 
         // Insert a connection keyed by "tsgo" (NOT "typescript")
         let handle = create_handle_with_state(ConnectionState::Ready).await;
