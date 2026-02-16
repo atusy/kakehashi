@@ -453,8 +453,12 @@ impl BridgeCoordinator {
             abort_handles.push(task.abort_handle());
         }
 
-        // Register the abort handles for cancellation (supersedes previous batch)
-        if !abort_handles.is_empty() {
+        // Register the abort handles for cancellation (supersedes previous batch).
+        // Even when no new tasks were spawned, cancel any previous batch to prevent
+        // stale didOpen from outdated injection regions.
+        if abort_handles.is_empty() {
+            self.cancel_eager_open(host_uri);
+        } else {
             self.register_eager_open_tasks(host_uri, abort_handles);
         }
     }
