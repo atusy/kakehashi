@@ -875,6 +875,78 @@ mod tests {
     }
 
     // ========================================
+    // unregister_virtual_doc tests
+    // ========================================
+
+    /// Test that unregister_virtual_doc removes the entry from host_to_virtual.
+    ///
+    /// This is the rollback path when register-before-send is used and
+    /// the didOpen send fails. The host_to_virtual entry must be cleaned up.
+    #[tokio::test]
+    async fn unregister_virtual_doc_removes_entry() {
+        let tracker = DocumentTracker::new();
+        let host_uri = test_host_uri("unregister");
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Register then unregister
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .await;
+        tracker.unregister_virtual_doc(&host_uri, &virtual_uri).await;
+
+        // host_to_virtual should be empty for this host
+        let host_map = tracker.host_to_virtual.lock().await;
+        let docs = host_map.get(&host_uri);
+        assert!(
+            docs.is_none() || docs.unwrap().is_empty(),
+            "unregister_virtual_doc should remove the entry from host_to_virtual"
+        );
+    }
+
+    /// Test that unregister_virtual_doc only removes the targeted entry.
+    ///
+    /// Other virtual documents for the same host should remain.
+    #[tokio::test]
+    async fn unregister_virtual_doc_preserves_other_entries() {
+        let tracker = DocumentTracker::new();
+        let host_uri = test_host_uri("unregister_partial");
+        let vuri_0 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let vuri_1 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
+
+        // Register two documents
+        tracker
+            .register_opened_document(&host_uri, &vuri_0, "lua")
+            .await;
+        tracker
+            .register_opened_document(&host_uri, &vuri_1, "lua")
+            .await;
+
+        // Unregister only the first
+        tracker.unregister_virtual_doc(&host_uri, &vuri_0).await;
+
+        // Second should remain
+        let host_map = tracker.host_to_virtual.lock().await;
+        let docs = host_map.get(&host_uri).unwrap();
+        assert_eq!(docs.len(), 1, "Should have exactly one remaining entry");
+        assert_eq!(
+            docs[0].virtual_uri.region_id(),
+            TEST_ULID_LUA_1,
+            "The remaining entry should be the second document"
+        );
+    }
+
+    /// Test that unregister_virtual_doc is a no-op for unknown host.
+    #[tokio::test]
+    async fn unregister_virtual_doc_noop_for_unknown_host() {
+        let tracker = DocumentTracker::new();
+        let host_uri = test_host_uri("unregister_unknown");
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Should not panic
+        tracker.unregister_virtual_doc(&host_uri, &virtual_uri).await;
+    }
+
+    // ========================================
     // get_server_for_virtual_uri tests
     // ========================================
 
