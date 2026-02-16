@@ -1006,4 +1006,82 @@ mod tests {
             coordinator.eager_open_tasks.get(&uri_b).is_some(),
         );
     }
+
+    #[tokio::test]
+    async fn test_push_or_abort_adds_handle_when_entry_exists() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // Pre-insert placeholder (simulates supersede_eager_open_tasks)
+        coordinator.eager_open_tasks.insert(uri.clone(), vec![]);
+
+        // Spawn a task and push its handle
+        let task = tokio::spawn(futures::future::pending::<()>());
+        let handle = task.abort_handle();
+        coordinator.push_or_abort_eager_open_handle(&uri, handle);
+
+        // Entry should now have 1 handle
+        let entry = coordinator.eager_open_tasks.get(&uri).unwrap();
+        assert_eq!(entry.value().len(), 1, "should have 1 handle after push");
+        assert!(!task.is_finished(), "task should still be running");
+    }
+
+    #[tokio::test]
+    async fn test_push_or_abort_aborts_when_entry_removed() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // Do NOT insert a placeholder — simulates concurrent cancel removing the entry
+
+        // Spawn a task and try to push its handle
+        let task = tokio::spawn(futures::future::pending::<()>());
+        let handle = task.abort_handle();
+        coordinator.push_or_abort_eager_open_handle(&uri, handle);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // Task should be aborted since there's no entry to push into
+        assert!(
+            task.is_finished(),
+            "task should be aborted when entry is missing (concurrent cancel)"
+        );
+        // No entry should have been created
+        assert!(
+            coordinator.eager_open_tasks.get(&uri).is_none(),
+            "no entry should be created for a cancelled URI"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supersede_aborts_previous_and_inserts_placeholder() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///test.md").unwrap();
+
+        // Register a running task (simulates previous batch)
+        let previous_task = tokio::spawn(futures::future::pending::<()>());
+        coordinator
+            .eager_open_tasks
+            .insert(uri.clone(), vec![previous_task.abort_handle()]);
+
+        // Supersede — should abort previous and insert empty placeholder
+        coordinator.supersede_eager_open_tasks(&uri);
+
+        // Give tokio a chance to process the abort
+        tokio::task::yield_now().await;
+
+        // Previous task should be aborted
+        assert!(
+            previous_task.is_finished(),
+            "previous task should be aborted on supersede"
+        );
+
+        // Entry should exist with empty handles (placeholder)
+        let entry = coordinator.eager_open_tasks.get(&uri).unwrap();
+        assert_eq!(
+            entry.value().len(),
+            0,
+            "supersede should insert empty placeholder"
+        );
+    }
 }
