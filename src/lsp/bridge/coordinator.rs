@@ -481,7 +481,7 @@ impl BridgeCoordinator {
     fn register_eager_open_tasks(&self, uri: &Url, handles: Vec<tokio::task::AbortHandle>) {
         // Opportunistic cleanup: remove finished tasks from all documents
         // This prevents memory leaks when tasks complete naturally (server ready, didOpen sent)
-        self.cleanup_finished_eager_open_tasks(5);
+        self.cleanup_finished_eager_open_tasks();
 
         // Abort previous batch if it exists (superseding behavior)
         if let Some((_, prev_handles)) = self.eager_open_tasks.remove(uri) {
@@ -511,66 +511,35 @@ impl BridgeCoordinator {
     ///
     /// # Arguments
     /// * `limit` - Maximum number of document entries to check (0 = unlimited)
-    fn cleanup_finished_eager_open_tasks(&self, limit: usize) {
-        let mut checked = 0;
-        let mut cleaned_docs = 0;
+    fn cleanup_finished_eager_open_tasks(&self) {
         let mut removed_handles = 0;
-
-        // Two-pass approach to avoid borrow conflicts:
-        // Pass 1: Collect URIs where all handles are finished (for removal)
-        // Pass 2: For remaining URIs, filter out finished handles in-place
-
         let mut to_remove = Vec::new();
 
-        // Pass 1: Identify documents to remove entirely
-        for entry in self.eager_open_tasks.iter() {
-            if limit > 0 && checked >= limit {
-                break;
-            }
-            checked += 1;
+        // Single pass: retain only running handles, collect empty entries for removal
+        for mut entry in self.eager_open_tasks.iter_mut() {
+            let before = entry.value().len();
+            entry.value_mut().retain(|h| !h.is_finished());
+            let after = entry.value().len();
+            removed_handles += before - after;
 
-            let uri = entry.key();
-            let handles = entry.value();
-
-            // If all handles are finished, mark for removal
-            if handles.iter().all(|h| h.is_finished()) {
-                removed_handles += handles.len();
-                to_remove.push(uri.clone());
+            if after == 0 {
+                to_remove.push(entry.key().clone());
             }
         }
 
-        // Remove documents with all handles finished
+        // Remove entries that became empty (can't remove during iter_mut)
+        let cleaned_docs = to_remove.len();
         for uri in &to_remove {
             self.eager_open_tasks.remove(uri);
-            cleaned_docs += 1;
-        }
-
-        // Pass 2: For remaining documents, filter out finished handles
-        let mut additional_checked = 0;
-        for mut entry in self.eager_open_tasks.iter_mut() {
-            // Skip if we already checked this in pass 1
-            if limit > 0 && additional_checked >= limit {
-                break;
-            }
-            additional_checked += 1;
-
-            let handles = entry.value_mut();
-            let finished_count = handles.iter().filter(|h| h.is_finished()).count();
-
-            if finished_count > 0 && finished_count < handles.len() {
-                // Some but not all handles are finished — filter in-place
-                handles.retain(|h| !h.is_finished());
-                removed_handles += finished_count;
-            }
         }
 
         if removed_handles > 0 {
             log::trace!(
                 target: "kakehashi::bridge",
-                "Cleaned up {} finished eager-open handles across {} documents (checked {})",
+                "Cleaned up {} finished eager-open handles across {} documents ({} entries removed)",
                 removed_handles,
                 cleaned_docs,
-                checked + additional_checked
+                cleaned_docs
             );
         }
     }
@@ -979,16 +948,16 @@ mod tests {
         // Let finished tasks complete
         tokio::task::yield_now().await;
 
-        // Limit=3 should allow checking all 3 URIs across both passes
-        coordinator.cleanup_finished_eager_open_tasks(3);
+        // Single pass cleans all entries
+        coordinator.cleanup_finished_eager_open_tasks();
 
-        // Pass 1: URI_A should be removed entirely (all finished)
+        // URI_A should be removed entirely (all finished)
         assert!(
             coordinator.eager_open_tasks.get(&uri_a).is_none(),
             "URI_A should be removed (all handles finished)"
         );
 
-        // Pass 2: URI_B should have only 1 handle remaining (the running one)
+        // URI_B should have only 1 handle remaining (the running one)
         let uri_b_handles = coordinator.eager_open_tasks.get(&uri_b).unwrap();
         assert_eq!(
             uri_b_handles.value().len(),
@@ -1006,9 +975,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_all_finished_entries_beyond_limit() {
-        // Regression: pass 2 condition `finished_count < handles.len()` skipped
-        // all-finished entries that pass 1 didn't reach due to limit.
+    async fn test_cleanup_all_finished_entries_removed() {
+        // Regression: old two-pass code skipped all-finished entries in pass 2.
         let coordinator = BridgeCoordinator::new();
 
         let uri_a = Url::parse("file:///a.md").unwrap();
@@ -1027,9 +995,8 @@ mod tests {
         // Let tasks complete
         tokio::task::yield_now().await;
 
-        // limit=1 means pass 1 can only check 1 URI
-        // The other all-finished URI should STILL be cleaned up
-        coordinator.cleanup_finished_eager_open_tasks(1);
+        // Single pass should clean up all finished entries
+        coordinator.cleanup_finished_eager_open_tasks();
 
         assert!(
             coordinator.eager_open_tasks.get(&uri_a).is_none()
