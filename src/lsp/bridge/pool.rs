@@ -464,7 +464,7 @@ impl LanguageServerPool {
     /// - On send failure, the claim is rolled back via `unclaim_document()`
     ///
     /// This prevents duplicate didOpen sends that occurred with the old
-    /// `document_open_decision()` TOCTOU pattern.
+    /// check-then-act TOCTOU pattern.
     ///
     /// # MessageSender Trait (ADR-0015)
     ///
@@ -1812,8 +1812,8 @@ mod tests {
 
     /// Test that ensure_document_opened sends didOpen when document is not yet opened.
     ///
-    /// Happy path: Document not opened → document_open_decision returns SendDidOpen
-    /// → sends didOpen → registers tracking state via register_opened_document.
+    /// Happy path: Document not opened → try_claim_for_open succeeds
+    /// → sends didOpen → marks document as opened.
     #[tokio::test]
     async fn ensure_document_opened_sends_didopen_for_new_document() {
         use super::super::protocol::VirtualDocumentUri;
@@ -1862,8 +1862,8 @@ mod tests {
 
     /// Test that ensure_document_opened skips didOpen when document is already opened.
     ///
-    /// Already opened path: Document registered via register_opened_document
-    /// → document_open_decision returns AlreadyOpened → no didOpen sent.
+    /// Already opened path: Document already claimed
+    /// → try_claim_for_open returns false → no didOpen sent.
     #[tokio::test]
     async fn ensure_document_opened_skips_didopen_for_already_opened_document() {
         use super::super::protocol::VirtualDocumentUri;
