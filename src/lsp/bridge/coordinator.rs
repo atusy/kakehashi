@@ -483,32 +483,40 @@ impl BridgeCoordinator {
 
     /// Supersede previous eager-open tasks for a URI.
     ///
-    /// Performs cleanup, aborts any previous batch, and inserts an empty placeholder
-    /// entry. Must be called BEFORE spawning new tasks to close the race window
+    /// Uses `DashMap::entry()` for atomic URI-scoped access: abort previous
+    /// handles and reset to empty placeholder in a single shard lock, or
+    /// insert a new empty entry if none exists.
+    ///
+    /// Must be called BEFORE spawning new tasks to close the race window
     /// between spawn and handle registration.
     ///
     /// # Arguments
     /// * `uri` - The host document URI
     fn supersede_eager_open_tasks(&self, uri: &Url) {
-        // Opportunistic cleanup: remove finished tasks from all documents
-        self.cleanup_finished_eager_open_tasks();
-
-        // Abort previous batch if it exists
-        if let Some((_, prev_handles)) = self.eager_open_tasks.remove(uri) {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Aborting {} previous eager-open tasks for {} (superseded by new batch)",
-                prev_handles.len(),
-                uri
-            );
-            for handle in prev_handles {
-                handle.abort();
+        use dashmap::mapref::entry::Entry;
+        match self.eager_open_tasks.entry(uri.clone()) {
+            Entry::Occupied(mut entry) => {
+                let prev_handles = std::mem::take(entry.get_mut());
+                let mut aborted = 0;
+                for handle in prev_handles {
+                    if !handle.is_finished() {
+                        handle.abort();
+                        aborted += 1;
+                    }
+                }
+                if aborted > 0 {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Aborted {} previous eager-open tasks for {} (superseded by new batch)",
+                        aborted,
+                        uri
+                    );
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Vec::new());
             }
         }
-
-        // Insert empty placeholder — concurrent cancel_eager_open will remove this,
-        // causing subsequent push_or_abort calls to abort their handles.
-        self.eager_open_tasks.insert(uri.clone(), Vec::new());
     }
 
     /// Push an abort handle into an existing entry, or abort it if the entry was removed.
@@ -534,42 +542,6 @@ impl BridgeCoordinator {
                 );
                 handle.abort();
             }
-        }
-    }
-
-    /// Clean up finished eager-open tasks to prevent memory leaks.
-    ///
-    /// When tasks complete naturally (server becomes ready, didOpen succeeds),
-    /// their AbortHandles stay in the map. This method removes finished handles
-    /// and deletes entries where all handles are finished.
-    ///
-    /// Uses `DashMap::retain` for atomic per-shard cleanup: each entry's handles
-    /// are filtered and the entry is removed (if empty) under the same write lock,
-    /// preventing a concurrent `supersede_eager_open_tasks` from inserting a
-    /// placeholder that gets accidentally deleted.
-    ///
-    /// Called opportunistically by supersede_eager_open_tasks() on each batch.
-    fn cleanup_finished_eager_open_tasks(&self) {
-        let mut removed_handles = 0;
-        let mut cleaned_docs = 0;
-        self.eager_open_tasks.retain(|_uri, handles| {
-            let before = handles.len();
-            handles.retain(|h| !h.is_finished());
-            removed_handles += before - handles.len();
-            if handles.is_empty() {
-                cleaned_docs += 1;
-                false // remove empty entry
-            } else {
-                true // keep entry with remaining handles
-            }
-        });
-        if removed_handles > 0 {
-            log::trace!(
-                target: "kakehashi::bridge",
-                "Cleaned up {} finished eager-open handles ({} entries removed)",
-                removed_handles,
-                cleaned_docs
-            );
         }
     }
 
@@ -944,100 +916,6 @@ mod tests {
         assert!(
             result.is_none(),
             "quarto should inherit wildcard's empty filter"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_handles_all_cases() {
-        let coordinator = BridgeCoordinator::new();
-
-        let uri_a = Url::parse("file:///a.md").unwrap();
-        let uri_b = Url::parse("file:///b.md").unwrap();
-        let uri_c = Url::parse("file:///c.md").unwrap();
-
-        // URI_A: 2 tasks that complete immediately (all finished → should be removed)
-        let finished_a1 = tokio::spawn(async {});
-        let finished_a2 = tokio::spawn(async {});
-        coordinator.eager_open_tasks.insert(
-            uri_a.clone(),
-            vec![finished_a1.abort_handle(), finished_a2.abort_handle()],
-        );
-
-        // URI_B: 1 finished task + 1 running task (mixed → should filter out finished)
-        let finished_b = tokio::spawn(async {});
-        let running_b = tokio::spawn(futures::future::pending::<()>());
-        coordinator.eager_open_tasks.insert(
-            uri_b.clone(),
-            vec![finished_b.abort_handle(), running_b.abort_handle()],
-        );
-
-        // URI_C: 2 running tasks (all running → no cleanup needed)
-        let running_c1 = tokio::spawn(futures::future::pending::<()>());
-        let running_c2 = tokio::spawn(futures::future::pending::<()>());
-        coordinator.eager_open_tasks.insert(
-            uri_c.clone(),
-            vec![running_c1.abort_handle(), running_c2.abort_handle()],
-        );
-
-        // Let finished tasks complete
-        tokio::task::yield_now().await;
-
-        // Single pass cleans all entries
-        coordinator.cleanup_finished_eager_open_tasks();
-
-        // URI_A should be removed entirely (all finished)
-        assert!(
-            coordinator.eager_open_tasks.get(&uri_a).is_none(),
-            "URI_A should be removed (all handles finished)"
-        );
-
-        // URI_B should have only 1 handle remaining (the running one)
-        let uri_b_handles = coordinator.eager_open_tasks.get(&uri_b).unwrap();
-        assert_eq!(
-            uri_b_handles.value().len(),
-            1,
-            "URI_B should have 1 handle after cleanup filters out the finished one"
-        );
-
-        // URI_C: should still have 2 handles (all running)
-        let uri_c_handles = coordinator.eager_open_tasks.get(&uri_c).unwrap();
-        assert_eq!(
-            uri_c_handles.value().len(),
-            2,
-            "URI_C should still have 2 handles (all running)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_all_finished_entries_removed() {
-        // Regression: old two-pass code skipped all-finished entries in pass 2.
-        let coordinator = BridgeCoordinator::new();
-
-        let uri_a = Url::parse("file:///a.md").unwrap();
-        let uri_b = Url::parse("file:///b.md").unwrap();
-
-        // Both URIs have all-finished tasks
-        let finished_a = tokio::spawn(async {});
-        let finished_b = tokio::spawn(async {});
-        coordinator
-            .eager_open_tasks
-            .insert(uri_a.clone(), vec![finished_a.abort_handle()]);
-        coordinator
-            .eager_open_tasks
-            .insert(uri_b.clone(), vec![finished_b.abort_handle()]);
-
-        // Let tasks complete
-        tokio::task::yield_now().await;
-
-        // Single pass should clean up all finished entries
-        coordinator.cleanup_finished_eager_open_tasks();
-
-        assert!(
-            coordinator.eager_open_tasks.get(&uri_a).is_none()
-                && coordinator.eager_open_tasks.get(&uri_b).is_none(),
-            "Both all-finished entries should be removed, but got: a={}, b={}",
-            coordinator.eager_open_tasks.get(&uri_a).is_some(),
-            coordinator.eager_open_tasks.get(&uri_b).is_some(),
         );
     }
 
