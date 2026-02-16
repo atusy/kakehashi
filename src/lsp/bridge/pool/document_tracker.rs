@@ -250,6 +250,23 @@ impl DocumentTracker {
         self.opened_documents.remove(&uri_string);
     }
 
+    /// Remove a single virtual document from host_to_virtual tracking.
+    ///
+    /// Used to roll back registration when didOpen send fails after
+    /// register-before-send. Only removes from `host_to_virtual`; the
+    /// caller must also call `unclaim_document()` to roll back the claim.
+    pub(super) async fn unregister_virtual_doc(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+    ) {
+        let uri_string = virtual_uri.to_uri_string();
+        let mut host_map = self.host_to_virtual.lock().await;
+        if let Some(docs) = host_map.get_mut(host_uri) {
+            docs.retain(|d| d.virtual_uri.to_uri_string() != uri_string);
+        }
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.
@@ -892,7 +909,9 @@ mod tests {
         tracker
             .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
-        tracker.unregister_virtual_doc(&host_uri, &virtual_uri).await;
+        tracker
+            .unregister_virtual_doc(&host_uri, &virtual_uri)
+            .await;
 
         // host_to_virtual should be empty for this host
         let host_map = tracker.host_to_virtual.lock().await;
@@ -943,7 +962,9 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Should not panic
-        tracker.unregister_virtual_doc(&host_uri, &virtual_uri).await;
+        tracker
+            .unregister_virtual_doc(&host_uri, &virtual_uri)
+            .await;
     }
 
     // ========================================
