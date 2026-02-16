@@ -4,6 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{MessageType, Moniker, MonikerParams};
 
 use super::super::Kakehashi;
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn moniker_impl(&self, params: MonikerParams) -> Result<Option<Vec<Moniker>>> {
@@ -11,36 +12,42 @@ impl Kakehashi {
         let position = params.text_document_position_params.position;
 
         let Some(ctx) = self
-            .resolve_bridge_context(&lsp_uri, position, "moniker")
+            .resolve_bridge_contexts(&lsp_uri, position, "moniker")
             .await
         else {
             return Ok(None);
         };
 
-        // Send moniker request via language server pool
-        let response = self
-            .bridge
-            .pool()
-            .send_moniker_request(
-                &ctx.resolved_config.server_name,
-                &ctx.resolved_config.config,
-                &ctx.uri,
-                ctx.position,
-                &ctx.resolved.injection_language,
-                &ctx.resolved.region.region_id,
-                ctx.resolved.region.line_range.start,
-                &ctx.resolved.virtual_content,
-                ctx.upstream_request_id,
-            )
-            .await;
+        // Fan-out moniker requests to all matching servers
+        let pool = self.bridge.pool_arc();
+        let position = ctx.position;
+        let mut join_set = fan_out(&ctx, pool, |t| async move {
+            t.pool
+                .send_moniker_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
+                    position,
+                    &t.injection_language,
+                    &t.region_id,
+                    t.region_start_line,
+                    &t.virtual_content,
+                    t.upstream_id,
+                )
+                .await
+        });
 
-        match response {
-            Ok(monikers) => Ok(monikers),
-            Err(e) => {
+        // Return the first non-empty moniker response
+        let result =
+            first_win::first_win(&mut join_set, |opt| matches!(opt, Some(v) if !v.is_empty()))
+                .await;
+        match result {
+            Some(monikers) => Ok(monikers),
+            None => {
                 self.client
                     .log_message(
-                        MessageType::ERROR,
-                        format!("Bridge moniker request failed: {}", e),
+                        MessageType::LOG,
+                        "No moniker response from any bridge server",
                     )
                     .await;
                 Ok(None)

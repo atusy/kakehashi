@@ -39,9 +39,15 @@ impl LanguageServerPool {
         include_declaration: bool,
         upstream_request_id: UpstreamId,
     ) -> io::Result<Option<Vec<Location>>> {
-        self.execute_bridge_request(
+        let handle = self
+            .get_or_create_connection(server_name, server_config)
+            .await?;
+        if !handle.has_capability("textDocument/references") {
+            return Ok(None);
+        }
+        self.execute_bridge_request_with_handle(
+            handle,
             server_name,
-            server_config,
             host_uri,
             injection_language,
             region_id,
