@@ -67,6 +67,8 @@ where
 }
 
 /// Result of [`first_win()`] dispatch.
+#[derive(Debug)]
+#[must_use]
 pub(super) enum FirstWinResult<T> {
     /// A non-empty response was received from a downstream server.
     Winner(T),
