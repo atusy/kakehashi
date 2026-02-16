@@ -1004,4 +1004,39 @@ mod tests {
             "URI_C should still have 2 handles (all running)"
         );
     }
+
+    #[tokio::test]
+    async fn test_cleanup_all_finished_entries_beyond_limit() {
+        // Regression: pass 2 condition `finished_count < handles.len()` skipped
+        // all-finished entries that pass 1 didn't reach due to limit.
+        let coordinator = BridgeCoordinator::new();
+
+        let uri_a = Url::parse("file:///a.md").unwrap();
+        let uri_b = Url::parse("file:///b.md").unwrap();
+
+        // Both URIs have all-finished tasks
+        let finished_a = tokio::spawn(async {});
+        let finished_b = tokio::spawn(async {});
+        coordinator
+            .eager_open_tasks
+            .insert(uri_a.clone(), vec![finished_a.abort_handle()]);
+        coordinator
+            .eager_open_tasks
+            .insert(uri_b.clone(), vec![finished_b.abort_handle()]);
+
+        // Let tasks complete
+        tokio::task::yield_now().await;
+
+        // limit=1 means pass 1 can only check 1 URI
+        // The other all-finished URI should STILL be cleaned up
+        coordinator.cleanup_finished_eager_open_tasks(1);
+
+        assert!(
+            coordinator.eager_open_tasks.get(&uri_a).is_none()
+                && coordinator.eager_open_tasks.get(&uri_b).is_none(),
+            "Both all-finished entries should be removed, but got: a={}, b={}",
+            coordinator.eager_open_tasks.get(&uri_a).is_some(),
+            coordinator.eager_open_tasks.get(&uri_b).is_some(),
+        );
+    }
 }
