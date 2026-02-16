@@ -548,7 +548,13 @@ impl BridgeCoordinator {
             }
         }
 
-        // Remove entries that became empty (can't remove during iter_mut)
+        // Remove entries that became empty (can't remove during iter_mut).
+        //
+        // Race window: a concurrent supersede_eager_open_tasks could insert a new
+        // empty placeholder for the same URI between iter_mut completing and this
+        // remove call, causing us to delete the fresh placeholder. This is benign:
+        // push_or_abort_eager_open_handle handles the missing entry by aborting
+        // the task, and the next didChange re-triggers eager open (self-healing).
         let cleaned_docs = to_remove.len();
         for uri in &to_remove {
             self.eager_open_tasks.remove(uri);
