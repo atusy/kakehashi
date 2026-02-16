@@ -518,6 +518,56 @@ mod tests {
     }
 
     // ========================================
+    // try_claim_for_open / unclaim_document tests
+    // ========================================
+
+    /// Test that try_claim_for_open returns true for a new document.
+    #[test]
+    fn try_claim_for_open_returns_true_for_new_document() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        assert!(
+            tracker.try_claim_for_open(&virtual_uri),
+            "First claim should succeed"
+        );
+    }
+
+    /// Test that try_claim_for_open returns false for an already claimed document.
+    #[test]
+    fn try_claim_for_open_returns_false_for_already_claimed() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // First claim succeeds
+        assert!(tracker.try_claim_for_open(&virtual_uri));
+
+        // Second claim for same URI fails
+        assert!(
+            !tracker.try_claim_for_open(&virtual_uri),
+            "Second claim should fail — already claimed"
+        );
+    }
+
+    /// Test that unclaim_document allows reclaim.
+    #[test]
+    fn unclaim_document_allows_reclaim() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Claim, unclaim, then claim again
+        assert!(tracker.try_claim_for_open(&virtual_uri));
+        tracker.unclaim_document(&virtual_uri);
+        assert!(
+            tracker.try_claim_for_open(&virtual_uri),
+            "Should be able to reclaim after unclaim"
+        );
+    }
+
+    // ========================================
     // DocumentOpenDecision unit tests
     // ========================================
 
