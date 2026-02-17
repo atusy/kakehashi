@@ -16,6 +16,7 @@ use url::Url;
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
 use crate::lsp::get_current_request_id;
+use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 use crate::text::PositionMapper;
 
 use super::{Kakehashi, uri_to_url};
@@ -67,6 +68,40 @@ struct PreambleResult {
 }
 
 impl Kakehashi {
+    /// Subscribe to cancel notifications for an upstream request.
+    ///
+    /// Returns `(Option<CancelReceiver>, Option<CancelSubscriptionGuard>)`.
+    /// Both are `Some` on success; both are `None` if subscription fails
+    /// (e.g., duplicate subscription). The guard ensures automatic unsubscribe on drop.
+    ///
+    /// Mirrors the pattern used in `diagnostic_impl()`.
+    pub(crate) fn subscribe_cancel(
+        &self,
+        upstream_id: &UpstreamId,
+    ) -> (Option<CancelReceiver>, Option<CancelSubscriptionGuard<'_>>) {
+        match self
+            .bridge
+            .cancel_forwarder()
+            .subscribe(upstream_id.clone())
+        {
+            Ok(rx) => {
+                let guard = CancelSubscriptionGuard::new(
+                    self.bridge.cancel_forwarder(),
+                    upstream_id.clone(),
+                );
+                (Some(rx), Some(guard))
+            }
+            Err(e) => {
+                log::error!(
+                    "Cancel subscribe failed for {}: already subscribed. \
+                     Proceeding without cancel.",
+                    e.0
+                );
+                (None, None)
+            }
+        }
+    }
+
     /// Shared preamble for bridge endpoint resolution.
     ///
     /// Handles all steps common to both single-server and multi-server resolution:

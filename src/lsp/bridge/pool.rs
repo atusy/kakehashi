@@ -1143,6 +1143,18 @@ impl LanguageServerPool {
             }
         }
     }
+
+    /// Remove all server entries for the given upstream request ID.
+    ///
+    /// Used after first-win dispatch to clean up stale entries from aborted tasks.
+    /// Idempotent — safe to call even if entries were already removed.
+    pub(crate) fn unregister_all_for_upstream_id(&self, upstream_id: &UpstreamId) {
+        let mut registry = self
+            .upstream_request_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.remove(upstream_id);
+    }
 }
 
 #[cfg(test)]
@@ -3379,6 +3391,36 @@ mod tests {
             successful, 2,
             "should have forwarded cancel to both servers"
         );
+    }
+
+    /// Test that unregister_all_for_upstream_id removes the entire entry at once.
+    #[test]
+    fn unregister_all_for_upstream_id_removes_entire_entry() {
+        let pool = LanguageServerPool::new();
+        let upstream_id = UpstreamId::Number(42);
+
+        pool.register_upstream_request(upstream_id.clone(), "lua-ls");
+        pool.register_upstream_request(upstream_id.clone(), "pyright");
+        pool.unregister_all_for_upstream_id(&upstream_id);
+
+        let registry = pool.upstream_request_registry.lock().unwrap();
+        assert!(
+            registry.get(&upstream_id).is_none(),
+            "entire entry should be removed"
+        );
+    }
+
+    /// Test that unregister_all_for_upstream_id is idempotent (no-op on missing entry).
+    #[test]
+    fn unregister_all_for_upstream_id_is_idempotent() {
+        let pool = LanguageServerPool::new();
+        let upstream_id = UpstreamId::Number(99);
+
+        // Should not panic when called on non-existent entry
+        pool.unregister_all_for_upstream_id(&upstream_id);
+
+        let registry = pool.upstream_request_registry.lock().unwrap();
+        assert!(registry.get(&upstream_id).is_none());
     }
 
     // ============================================================
