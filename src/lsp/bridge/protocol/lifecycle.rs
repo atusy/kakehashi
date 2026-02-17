@@ -14,10 +14,11 @@ use super::request_id::RequestId;
 fn build_bridge_client_capabilities() -> serde_json::Value {
     use tower_lsp_server::ls_types::{
         ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-        DiagnosticClientCapabilities, DocumentLinkClientCapabilities,
-        DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities, GotoCapability,
-        HoverClientCapabilities, InlayHintClientCapabilities, MarkupKind,
-        SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+        DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
+        DocumentLinkClientCapabilities, DocumentSymbolClientCapabilities,
+        DynamicRegistrationClientCapabilities, GotoCapability, HoverClientCapabilities,
+        InlayHintClientCapabilities, MarkupKind, SignatureHelpClientCapabilities,
+        TextDocumentClientCapabilities, WorkspaceClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -86,6 +87,14 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
 
     let capabilities = ClientCapabilities {
         text_document: Some(text_document),
+        workspace: Some(WorkspaceClientCapabilities {
+            workspace_folders: Some(true),
+            configuration: Some(true),
+            diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
@@ -297,6 +306,16 @@ mod tests {
             build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()));
 
         assert_eq!(request["params"]["workspaceFolders"], folders);
+    }
+
+    #[test]
+    fn initialize_request_includes_workspace_capabilities() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let workspace = &request["params"]["capabilities"]["workspace"];
+
+        assert_eq!(workspace["workspaceFolders"], true);
+        assert_eq!(workspace["configuration"], true);
+        assert_eq!(workspace["diagnostics"]["refreshSupport"], true);
     }
 
     #[test]

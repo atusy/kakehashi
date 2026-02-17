@@ -61,5 +61,12 @@ expression: capabilities
       "dynamicRegistration": false,
       "linkSupport": true
     }
+  },
+  "workspace": {
+    "configuration": true,
+    "diagnostics": {
+      "refreshSupport": true
+    },
+    "workspaceFolders": true
   }
 }
