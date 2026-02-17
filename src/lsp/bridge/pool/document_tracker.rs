@@ -122,7 +122,18 @@ impl DocumentTracker {
         }
 
         // Step 2: Mark as opened — version is already available for concurrent didChange
-        *self.opened_documents.entry(uri_string).or_insert(0) += 1;
+        *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
+
+        // Step 3: Update reverse index so get_all_servers_for_virtual_uri works immediately.
+        // This closes the TOCTOU gap between claim and register_opened_document.
+        // register_opened_document will perform an idempotent duplicate-check insert.
+        {
+            let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
+            if !servers.contains(&server_name.to_string()) {
+                servers.push(server_name.to_string());
+            }
+        }
+
         true
     }
 
@@ -595,6 +606,36 @@ mod tests {
         assert!(
             tracker.try_claim_for_open(&virtual_uri, "lua").await,
             "Should be able to reclaim after unclaim"
+        );
+    }
+
+    /// Test that get_all_servers_for_virtual_uri works immediately after try_claim_for_open.
+    ///
+    /// This verifies the reverse index is updated at claim time, closing the
+    /// TOCTOU gap between try_claim_for_open and register_opened_document.
+    #[tokio::test]
+    async fn reverse_index_available_immediately_after_claim() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Before claim: no servers
+        assert!(
+            tracker
+                .get_all_servers_for_virtual_uri(&virtual_uri)
+                .is_empty(),
+            "Should return empty before claim"
+        );
+
+        // Claim the document (should update reverse index)
+        tracker.try_claim_for_open(&virtual_uri, "lua").await;
+
+        // Reverse index should be available immediately — no need for register_opened_document
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        assert_eq!(
+            servers,
+            vec!["lua".to_string()],
+            "Reverse index should be available immediately after claim"
         );
     }
 
