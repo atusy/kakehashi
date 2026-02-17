@@ -93,6 +93,7 @@ impl<T> FirstWinResult<T> {
     /// - `NoWinner`: logs at WARNING (if errors > 0) or LOG (if errors == 0),
     ///   then returns `Ok(no_result)`.
     /// - `Cancelled`: returns `Err(Error::request_cancelled())`.
+    #[must_use]
     pub(super) async fn handle<R>(
         self,
         client: &tower_lsp_server::Client,
