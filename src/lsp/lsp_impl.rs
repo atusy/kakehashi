@@ -261,6 +261,14 @@ impl Kakehashi {
         self.settings_manager.supports_declaration_link()
     }
 
+    /// Check if the client supports hierarchical document symbols (DocumentSymbol[]).
+    ///
+    /// Delegates to SettingsManager for capability checking.
+    fn supports_hierarchical_document_symbol(&self) -> bool {
+        self.settings_manager
+            .supports_hierarchical_document_symbol()
+    }
+
     /// Check if the given search paths include the default data directory.
     fn search_paths_include_default_data_dir(&self, search_paths: &[String]) -> bool {
         self.settings_manager

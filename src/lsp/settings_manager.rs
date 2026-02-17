@@ -171,6 +171,20 @@ impl SettingsManager {
             .unwrap_or(false)
     }
 
+    /// Returns true if client declared textDocument.documentSymbol.hierarchicalDocumentSymbolSupport.
+    /// Returns false if initialize() hasn't been called yet (OnceLock is empty).
+    ///
+    /// Per LSP 3.18, when true the server can return DocumentSymbol[] (hierarchical).
+    /// When false, the server should return SymbolInformation[] (flat).
+    pub(crate) fn supports_hierarchical_document_symbol(&self) -> bool {
+        self.client_capabilities
+            .get()
+            .and_then(|caps| caps.text_document.as_ref())
+            .and_then(|td| td.document_symbol.as_ref())
+            .and_then(|ds| ds.hierarchical_document_symbol_support)
+            .unwrap_or(false)
+    }
+
     /// Check if auto-install is enabled.
     ///
     /// Returns `false` if:
@@ -247,7 +261,8 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use tower_lsp_server::ls_types::{
-        SemanticTokensWorkspaceClientCapabilities, WorkspaceClientCapabilities,
+        DocumentSymbolClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
+        TextDocumentClientCapabilities, WorkspaceClientCapabilities,
     };
 
     #[test]
@@ -376,6 +391,54 @@ mod tests {
         let manager = SettingsManager::new();
         // Should return false (safe default)
         assert!(!manager.supports_semantic_tokens_refresh());
+    }
+
+    #[test]
+    fn test_supports_hierarchical_document_symbol_before_init() {
+        let manager = SettingsManager::new();
+        assert!(!manager.supports_hierarchical_document_symbol());
+    }
+
+    /// Parameterized tests for supports_hierarchical_document_symbol().
+    ///
+    /// Arguments control what's present at each level:
+    /// - `text_document`: Whether text_document field is Some
+    /// - `document_symbol`: Whether document_symbol is Some
+    /// - `hierarchical`: The actual hierarchical_document_symbol_support value
+    /// - `expected`: The expected result
+    #[rstest]
+    #[case::hierarchical_true(true, true, Some(true), true)]
+    #[case::hierarchical_false(true, true, Some(false), false)]
+    #[case::hierarchical_none(true, true, None, false)]
+    #[case::document_symbol_none(true, false, None, false)]
+    #[case::text_document_none(false, false, None, false)]
+    fn test_supports_hierarchical_document_symbol(
+        #[case] text_document: bool,
+        #[case] document_symbol: bool,
+        #[case] hierarchical: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        let manager = SettingsManager::new();
+        let caps = ClientCapabilities {
+            text_document: if text_document {
+                Some(TextDocumentClientCapabilities {
+                    document_symbol: if document_symbol {
+                        Some(DocumentSymbolClientCapabilities {
+                            hierarchical_document_symbol_support: hierarchical,
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        manager.set_capabilities(caps);
+        assert_eq!(manager.supports_hierarchical_document_symbol(), expected);
     }
 
     #[test]

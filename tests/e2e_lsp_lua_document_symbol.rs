@@ -18,6 +18,41 @@ use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
 
+/// Create an LspClient with hierarchicalDocumentSymbolSupport enabled.
+///
+/// The shared `create_lua_configured_client()` sends empty capabilities,
+/// which defaults hierarchicalDocumentSymbolSupport to false. This helper
+/// creates a client that explicitly enables it, so tests can assert on
+/// DocumentSymbol fields (range, selectionRange) rather than the flat
+/// SymbolInformation format (location).
+fn create_lua_client_with_hierarchical_symbol_support() -> LspClient {
+    let mut client = LspClient::new();
+    let _init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "documentSymbol": {
+                        "hierarchicalDocumentSymbolSupport": true
+                    }
+                }
+            },
+            "initializationOptions": {
+                "languageServers": {
+                    "lua-language-server": {
+                        "cmd": ["lua-language-server"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client
+}
+
 /// E2E test: documentSymbolProvider capability is advertised
 #[test]
 fn e2e_document_symbol_capability_advertised() {
@@ -52,9 +87,13 @@ fn e2e_document_symbol_capability_advertised() {
 }
 
 /// E2E test: document symbol request returns symbols with transformed coordinates
+///
+/// Uses a client with hierarchicalDocumentSymbolSupport enabled so the server
+/// returns DocumentSymbol[] (with range/selectionRange fields) rather than the
+/// flat SymbolInformation[] format.
 #[test]
 fn e2e_document_symbol_request_returns_transformed_symbols() {
-    let mut client = create_lua_configured_client();
+    let mut client = create_lua_client_with_hierarchical_symbol_support();
 
     // Open markdown document with Lua code block containing functions
     // The code block starts at line 2 (0-indexed: after the header and blank line)
