@@ -105,10 +105,12 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
 /// * `request_id` - The JSON-RPC request ID
 /// * `initialization_options` - Server-specific initialization options
 /// * `root_uri` - The workspace root URI (forwarded from upstream client)
+/// * `workspace_folders` - The workspace folders (forwarded from upstream client)
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
     root_uri: Option<String>,
+    workspace_folders: Option<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -117,6 +119,7 @@ pub(crate) fn build_initialize_request(
         "params": {
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "workspaceFolders": workspace_folders,
             "capabilities": build_bridge_client_capabilities(),
             "initializationOptions": initialization_options
         }
@@ -224,20 +227,21 @@ mod tests {
 
     #[test]
     fn initialize_request_has_correct_structure() {
-        let request = build_initialize_request(RequestId::new(1), None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 1);
         assert_eq!(request["method"], "initialize");
         assert!(request["params"]["processId"].as_u64().is_some());
         assert!(request["params"]["rootUri"].is_null());
+        assert!(request["params"]["workspaceFolders"].is_null());
         assert!(request["params"]["capabilities"].is_object());
         assert!(request["params"]["initializationOptions"].is_null());
     }
 
     #[test]
     fn initialize_request_includes_bridge_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
         let capabilities = &request["params"]["capabilities"];
 
         // Should declare linkSupport for goto-family methods
@@ -261,7 +265,8 @@ mod tests {
                 }
             }
         });
-        let request = build_initialize_request(RequestId::new(42), Some(options.clone()), None);
+        let request =
+            build_initialize_request(RequestId::new(42), Some(options.clone()), None, None);
 
         assert_eq!(request["id"], 42);
         assert_eq!(request["params"]["initializationOptions"], options);
@@ -270,16 +275,35 @@ mod tests {
     #[test]
     fn initialize_request_includes_root_uri_when_provided() {
         let root_uri = "file:///home/user/project";
-        let request = build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()));
+        let request =
+            build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()), None);
 
         assert_eq!(request["params"]["rootUri"], root_uri);
     }
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
-        let request = build_initialize_request(RequestId::new(1), None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
 
         assert!(request["params"]["rootUri"].is_null());
+    }
+
+    #[test]
+    fn initialize_request_includes_workspace_folders_when_provided() {
+        let folders = serde_json::json!([
+            { "uri": "file:///home/user/project", "name": "project" }
+        ]);
+        let request =
+            build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()));
+
+        assert_eq!(request["params"]["workspaceFolders"], folders);
+    }
+
+    #[test]
+    fn initialize_request_has_null_workspace_folders_when_not_provided() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+
+        assert!(request["params"]["workspaceFolders"].is_null());
     }
 
     #[test]
