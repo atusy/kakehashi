@@ -1,16 +1,21 @@
 //! Document symbol method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::Result;
+use std::sync::Arc;
+
+use tokio::task::JoinSet;
+use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Location, MessageType,
     SymbolInformation, Uri,
 };
 
+use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
+use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::bridge::UpstreamId;
-use crate::lsp::get_current_request_id;
 
 use super::super::{Kakehashi, uri_to_url};
+use super::first_win::{self, FirstWinResult};
 
 impl Kakehashi {
     pub(crate) async fn document_symbol_impl(
@@ -73,63 +78,192 @@ impl Kakehashi {
         }
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
-        let upstream_request_id = match get_current_request_id() {
-            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => Some(UpstreamId::Number(n)),
-            Some(tower_lsp_server::jsonrpc::Id::String(s)) => Some(UpstreamId::String(s)),
-            None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
-        };
+        let upstream_request_id = super::super::bridge_context::current_upstream_id();
 
-        // Collect document symbols from all injection regions.
-        // The bridge normalizes both DocumentSymbol[] and SymbolInformation[]
-        // responses to Vec<DocumentSymbol>, so we use a single accumulator.
-        let mut all_symbols: Vec<DocumentSymbol> = Vec::new();
+        // Subscribe to cancel notifications so we can abort early on $/cancelRequest.
+        // _cancel_guard ensures automatic unsubscribe when this scope exits.
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
+
+        let pool = self.bridge.pool_arc();
+
+        // Outer JoinSet: one task per injection region, all in parallel
+        let mut outer_join_set: JoinSet<Vec<DocumentSymbol>> = JoinSet::new();
 
         for resolved in all_regions {
-            // Get bridge server config for this language
-            // The bridge filter is checked inside get_bridge_config_for_language
-            let Some(resolved_config) =
-                self.get_bridge_config_for_language(&language_name, &resolved.injection_language)
-            else {
-                continue; // No bridge configured for this language
-            };
-
-            // Send document symbol request via language server pool
-            let response = self
-                .bridge
-                .pool()
-                .send_document_symbol_request(
-                    &resolved_config.server_name,
-                    &resolved_config.config,
-                    &uri,
-                    &resolved.injection_language,
-                    &resolved.region.region_id,
-                    resolved.region.line_range.start,
-                    &resolved.virtual_content,
-                    upstream_request_id.clone(),
-                )
-                .await;
-
-            match response {
-                Ok(Some(symbols)) => {
-                    all_symbols.extend(symbols);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.client
-                        .log_message(
-                            MessageType::ERROR,
-                            format!("Bridge document symbol request failed: {}", e),
-                        )
-                        .await;
-                }
+            // Get ALL bridge server configs for this injection language
+            let configs = self
+                .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
+            if configs.is_empty() {
+                continue;
             }
+
+            // Move owned fields into the spawned task (Arc/Url still need clone)
+            let pool = Arc::clone(&pool);
+            let uri = uri.clone();
+            let upstream_id = upstream_request_id.clone();
+            let injection_language = resolved.injection_language;
+            let region_id = resolved.region.region_id;
+            let region_start_line = resolved.region.line_range.start;
+            let virtual_content = resolved.virtual_content;
+
+            outer_join_set.spawn(async move {
+                race_servers_for_region(
+                    pool,
+                    configs,
+                    uri,
+                    injection_language,
+                    region_id,
+                    region_start_line,
+                    virtual_content,
+                    upstream_id,
+                )
+                .await
+            });
         }
+
+        // Collect results, aborting early if $/cancelRequest arrives.
+        let result = collect_symbols_with_cancel(outer_join_set, cancel_rx).await;
+
+        // Clean up stale upstream registry entries left by aborted inner tasks.
+        // This MUST run on both success and cancel paths — do NOT use `?` above,
+        // or the cancel Err would propagate early and skip this cleanup.
+        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
+
+        let all_symbols = result?;
 
         Ok(format_document_symbol_response(
             all_symbols,
             &lsp_uri,
             self.supports_hierarchical_document_symbol(),
         ))
+    }
+}
+
+/// Collect document symbols from all regions, aborting immediately if cancelled.
+///
+/// Uses `tokio::select!` with biased mode to prioritize cancel handling.
+/// When cancelled:
+/// - Returns `RequestCancelled` error immediately
+/// - Drops the JoinSet, which aborts all spawned outer tasks (cascading to inner tasks)
+///
+/// When all regions complete:
+/// - Returns aggregated symbols from all successful regions
+///
+/// If `cancel_rx` is `None`, cancel handling is disabled (graceful degradation
+/// when subscription failed due to `AlreadySubscribedError`).
+async fn collect_symbols_with_cancel(
+    mut join_set: JoinSet<Vec<DocumentSymbol>>,
+    cancel_rx: Option<crate::lsp::request_id::CancelReceiver>,
+) -> Result<Vec<DocumentSymbol>> {
+    let mut all_symbols: Vec<DocumentSymbol> = Vec::new();
+
+    // Handle None case: no cancel support, just collect results
+    let Some(cancel_rx) = cancel_rx else {
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(symbols) => all_symbols.extend(symbols),
+                Err(join_err) => {
+                    log::warn!("document_symbol region task panicked: {join_err}");
+                }
+            }
+        }
+        return Ok(all_symbols);
+    };
+
+    // Pin the cancel receiver for use in select!
+    tokio::pin!(cancel_rx);
+
+    loop {
+        tokio::select! {
+            // Biased: check cancel first to ensure immediate abort on cancellation
+            biased;
+
+            // Cancel notification received - abort immediately
+            _ = &mut cancel_rx => {
+                log::debug!(
+                    target: "kakehashi::document_symbol",
+                    "documentSymbol request cancelled, aborting {} remaining tasks",
+                    join_set.len()
+                );
+                // JoinSet dropped here, aborting all spawned tasks
+                return Err(Error::request_cancelled());
+            }
+
+            // Next task completed - collect result
+            result = join_set.join_next() => {
+                match result {
+                    Some(Ok(symbols)) => {
+                        all_symbols.extend(symbols);
+                    }
+                    Some(Err(join_err)) => {
+                        log::warn!("document_symbol region task panicked: {join_err}");
+                    }
+                    None => {
+                        // All tasks completed - return aggregated results
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(all_symbols)
+}
+
+/// Race all capable servers for a single injection region, returning the first
+/// non-empty document symbol response.
+///
+/// Uses `first_win()` to take the first server that returns a non-empty result,
+/// aborting the remaining in-flight requests.
+#[allow(clippy::too_many_arguments)]
+async fn race_servers_for_region(
+    pool: Arc<LanguageServerPool>,
+    configs: Vec<crate::lsp::bridge::ResolvedServerConfig>,
+    uri: url::Url,
+    injection_language: String,
+    region_id: String,
+    region_start_line: u32,
+    virtual_content: String,
+    upstream_id: Option<UpstreamId>,
+) -> Vec<DocumentSymbol> {
+    let mut join_set: JoinSet<std::io::Result<Option<Vec<DocumentSymbol>>>> = JoinSet::new();
+
+    for config in configs {
+        let pool = Arc::clone(&pool);
+        let uri = uri.clone();
+        let injection_language = injection_language.clone();
+        let region_id = region_id.clone();
+        let virtual_content = virtual_content.clone();
+        let upstream_id = upstream_id.clone();
+        let server_name = config.server_name.clone();
+        let server_config: Arc<BridgeServerConfig> = config.config;
+
+        join_set.spawn(async move {
+            pool.send_document_symbol_request(
+                &server_name,
+                &server_config,
+                &uri,
+                &injection_language,
+                &region_id,
+                region_start_line,
+                &virtual_content,
+                upstream_id,
+            )
+            .await
+        });
+    }
+
+    // First non-empty response wins; no cancel support at inner level
+    let result = first_win::first_win(
+        &mut join_set,
+        |opt| matches!(opt, Some(v) if !v.is_empty()),
+        None,
+    )
+    .await;
+
+    match result {
+        FirstWinResult::Winner(symbols) => symbols.unwrap_or_default(),
+        FirstWinResult::NoWinner { .. } | FirstWinResult::Cancelled => Vec::new(),
     }
 }
 
