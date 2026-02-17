@@ -68,10 +68,8 @@ expression: capabilities
     }
   },
   "workspace": {
-    "configuration": true,
     "diagnostics": {
       "refreshSupport": true
-    },
-    "workspaceFolders": true
+    }
   }
 }

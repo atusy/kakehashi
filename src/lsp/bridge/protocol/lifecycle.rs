@@ -89,8 +89,6 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
     let capabilities = ClientCapabilities {
         text_document: Some(text_document),
         workspace: Some(WorkspaceClientCapabilities {
-            workspace_folders: Some(true),
-            configuration: Some(true),
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
@@ -335,9 +333,12 @@ mod tests {
         let request = build_initialize_request(RequestId::new(1), None, None, None);
         let workspace = &request["params"]["capabilities"]["workspace"];
 
-        assert_eq!(workspace["workspaceFolders"], true);
-        assert_eq!(workspace["configuration"], true);
+        // Only declare capabilities that the bridge actually handles
         assert_eq!(workspace["diagnostics"]["refreshSupport"], true);
+        // workspaceFolders and configuration are NOT declared because
+        // the bridge doesn't implement the corresponding handlers
+        assert!(workspace.get("workspaceFolders").is_none());
+        assert!(workspace.get("configuration").is_none());
     }
 
     #[test]
