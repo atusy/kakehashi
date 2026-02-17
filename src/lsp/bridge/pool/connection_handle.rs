@@ -519,6 +519,12 @@ impl ConnectionHandle {
                 )
             }
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
+            "textDocument/documentSymbol" => {
+                matches!(
+                    caps.document_symbol_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
             "textDocument/documentColor" | "textDocument/colorPresentation" => matches!(
                 caps.color_provider,
                 Some(
@@ -1733,6 +1739,12 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/documentSymbol",
+                Box::new(|c| {
+                    c.document_symbol_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
                 "textDocument/documentColor",
                 Box::new(|c| {
                     c.color_provider = Some(ColorProviderCapability::Simple(true));
@@ -1880,6 +1892,12 @@ mod tests {
                 "textDocument/inlayHint",
                 Box::new(|c| {
                     c.inlay_hint_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/documentSymbol",
+                Box::new(|c| {
+                    c.document_symbol_provider = Some(OneOf::Left(false));
                 }),
             ),
             (

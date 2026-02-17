@@ -46,7 +46,7 @@ impl LanguageServerPool {
     /// returned DocumentSymbol[] or SymbolInformation[]. SymbolInformation items
     /// are converted to DocumentSymbol with `selection_range = range`.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing document-symbol-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]
@@ -61,9 +61,15 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<DocumentSymbol>>> {
-        self.execute_bridge_request(
+        let handle = self
+            .get_or_create_connection(server_name, server_config)
+            .await?;
+        if !handle.has_capability("textDocument/documentSymbol") {
+            return Ok(None);
+        }
+        self.execute_bridge_request_with_handle(
+            handle,
             server_name,
-            server_config,
             host_uri,
             injection_language,
             region_id,

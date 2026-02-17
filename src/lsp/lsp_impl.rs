@@ -530,33 +530,10 @@ impl Kakehashi {
         crate::document::get_language_for_document(uri, &self.language, &self.documents)
     }
 
-    /// Get bridge server config for a given injection language from settings.
-    ///
-    /// Convenience wrapper that loads settings and delegates to the bridge coordinator.
-    /// Returns `ResolvedServerConfig` which includes both the server name (for connection
-    /// pooling) and the config (for spawning).
-    ///
-    /// This method stays in Kakehashi for backward compatibility with handlers.
-    ///
-    /// # Arguments
-    /// * `host_language` - The language of the host document (e.g., "markdown")
-    /// * `injection_language` - The injection language to bridge (e.g., "rust", "python")
-    fn get_bridge_config_for_language(
-        &self,
-        host_language: &str,
-        injection_language: &str,
-    ) -> Option<crate::lsp::bridge::ResolvedServerConfig> {
-        let settings = self.settings_manager.load_settings();
-        self.bridge
-            .get_config_for_language(&settings, host_language, injection_language)
-    }
-
     /// Get all bridge server configs for a given injection language from settings.
     ///
-    /// Unlike `get_bridge_config_for_language()` which returns the first match,
-    /// this returns **all** servers configured for the injection language.
-    /// Used by diagnostic fan-out to support multiple servers per language
-    /// (e.g., pyright + ruff both handling Python).
+    /// Returns **all** servers configured for the injection language,
+    /// supporting multiple servers per language (e.g., pyright + ruff both handling Python).
     fn get_all_bridge_configs_for_language(
         &self,
         host_language: &str,

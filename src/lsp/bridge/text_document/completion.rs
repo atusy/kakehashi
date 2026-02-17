@@ -22,7 +22,7 @@ use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based
 impl LanguageServerPool {
     /// Send a completion request and wait for the response.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing completion-specific request building and response
     /// transformation.
     ///

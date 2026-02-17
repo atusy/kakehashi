@@ -70,7 +70,7 @@ fn transform_signature_help_response_to_host(
 impl LanguageServerPool {
     /// Send a signature help request and wait for the response.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing signature-help-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]
