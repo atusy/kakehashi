@@ -978,7 +978,13 @@ impl LanguageServer for Kakehashi {
         #[allow(deprecated)]
         let root_uri_for_bridge: Option<String> = first_folder
             .map(|f| f.uri.to_string())
-            .or_else(|| params.root_uri.as_ref().map(|uri| uri.to_string()));
+            .or_else(|| params.root_uri.as_ref().map(|uri| uri.to_string()))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| Url::from_file_path(p).ok())
+                    .map(|u| u.to_string())
+            });
 
         // Forward root_uri to bridge pool for downstream server initialization
         self.bridge.pool().set_root_uri(root_uri_for_bridge);
