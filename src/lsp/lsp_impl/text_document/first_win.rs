@@ -185,12 +185,12 @@ pub(super) async fn first_win<T: Send + 'static>(
             // the editor has already moved on, so returning a stale result is wasteful.
             biased;
             _ = &mut cancel_rx => {
-                // abort_all() cancels in-flight tasks but does NOT clean up
-                // per-connection ResponseRouter entries. Those orphaned entries
-                // persist until the downstream response arrives (the oneshot send
-                // fails silently) or the connection drops. This is an acceptable
-                // trade-off: cleaning them eagerly would require iterating all
-                // connections, and the silent failure path is already handled.
+                // abort_all() cancels in-flight tasks. Per-connection ResponseRouter
+                // entries are cleaned up by the RouterCleanupGuard in
+                // execute_bridge_request_with_handle (Drop runs on abort).
+                // Pool-level upstream_request_registry entries are cleaned up by
+                // the caller's unregister_all_for_upstream_id() call after this
+                // function returns.
                 join_set.abort_all();
                 return FirstWinResult::Cancelled;
             }
