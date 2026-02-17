@@ -126,6 +126,13 @@ pub(crate) fn build_initialize_request(
     root_uri: Option<String>,
     workspace_folders: Option<serde_json::Value>,
 ) -> serde_json::Value {
+    let root_path = root_uri.as_deref().and_then(|uri| {
+        url::Url::parse(uri)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id.as_i64(),
@@ -133,6 +140,7 @@ pub(crate) fn build_initialize_request(
         "params": {
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "rootPath": root_path,
             "workspaceFolders": workspace_folders,
             "capabilities": build_bridge_client_capabilities(),
             "initializationOptions": initialization_options
@@ -248,6 +256,7 @@ mod tests {
         assert_eq!(request["method"], "initialize");
         assert!(request["params"]["processId"].as_u64().is_some());
         assert!(request["params"]["rootUri"].is_null());
+        assert!(request["params"]["rootPath"].is_null());
         assert!(request["params"]["workspaceFolders"].is_null());
         assert!(request["params"]["capabilities"].is_object());
         assert!(request["params"]["initializationOptions"].is_null());
@@ -336,6 +345,22 @@ mod tests {
         let request = build_initialize_request(RequestId::new(1), None, None, None);
 
         assert!(request["params"]["workspaceFolders"].is_null());
+    }
+
+    #[test]
+    fn initialize_request_includes_root_path_derived_from_root_uri() {
+        let root_uri = "file:///home/user/project";
+        let request =
+            build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()), None);
+
+        assert_eq!(request["params"]["rootPath"], "/home/user/project");
+    }
+
+    #[test]
+    fn initialize_request_has_null_root_path_when_no_root_uri() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+
+        assert!(request["params"]["rootPath"].is_null());
     }
 
     #[test]
