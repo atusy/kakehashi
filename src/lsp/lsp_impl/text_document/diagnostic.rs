@@ -30,8 +30,6 @@ use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
 use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
 use crate::lsp::get_current_request_id;
-use crate::lsp::request_id::CancelSubscriptionGuard;
-
 use super::super::{Kakehashi, uri_to_url};
 
 // ============================================================================
@@ -328,38 +326,10 @@ impl Kakehashi {
             None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
         };
 
-        // Subscribe to cancel notifications for this request
-        // The receiver completes when $/cancelRequest arrives for this ID
-        // AlreadySubscribedError indicates a bug (same request ID subscribed twice)
-        // - proceed without cancel support rather than failing the request
-        //
+        // Subscribe to cancel notifications for this request.
         // The guard ensures unsubscribe is called on all return paths (including early returns).
-        let (cancel_rx, _subscription_guard) = if let Some(ref id) = upstream_request_id {
-            match self
-                .bridge
-                .cancel_forwarder()
-                .subscribe(id.clone())
-            {
-                Ok(rx) => {
-                    let guard = CancelSubscriptionGuard::new(
-                        self.bridge.cancel_forwarder(),
-                        id.clone(),
-                    );
-                    (Some(rx), Some(guard))
-                }
-                Err(e) => {
-                    log::error!(
-                        target: "kakehashi::diagnostic",
-                        "Failed to subscribe to cancel notifications for {}: already subscribed. \
-                         This is a bug - proceeding without cancel support.",
-                        e.0
-                    );
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
+        let (cancel_rx, _subscription_guard) =
+            self.subscribe_cancel(upstream_request_id.as_ref());
 
         // Build request infos using the factored-out method
         let request_infos = self.build_diagnostic_request_infos(&language_name, &all_regions);
