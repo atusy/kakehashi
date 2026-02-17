@@ -978,10 +978,44 @@ impl LanguageServer for Kakehashi {
         #[allow(deprecated)]
         let root_uri_for_bridge: Option<String> = first_folder
             .map(|f| f.uri.to_string())
-            .or_else(|| params.root_uri.as_ref().map(|uri| uri.to_string()));
+            .or_else(|| params.root_uri.as_ref().map(|uri| uri.to_string()))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| Url::from_file_path(p).ok())
+                    .map(|u| u.to_string())
+            });
 
-        // Forward root_uri to bridge pool for downstream server initialization
-        self.bridge.pool().set_root_uri(root_uri_for_bridge);
+        // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
+        self.bridge.pool().set_root_uri(root_uri_for_bridge.clone());
+
+        let workspace_folders_for_bridge = params
+            .workspace_folders
+            .as_ref()
+            .and_then(|f| serde_json::to_value(f).ok())
+            .or_else(|| {
+                root_uri_for_bridge.as_ref().map(|uri| {
+                    let name = Url::parse(uri)
+                        .ok()
+                        .and_then(|url| {
+                            url.to_file_path()
+                                .ok()
+                                .and_then(|path| {
+                                    path.file_name().and_then(|s| s.to_str().map(String::from))
+                                })
+                                .or_else(|| {
+                                    url.path_segments()
+                                        .and_then(|mut seg| seg.next_back().map(|s| s.to_string()))
+                                })
+                        })
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "workspace".to_string());
+                    serde_json::json!([{ "uri": uri, "name": name }])
+                })
+            });
+        self.bridge
+            .pool()
+            .set_workspace_folders(workspace_folders_for_bridge);
 
         // Get root path from workspace folders, deprecated root_uri, or current directory
         let uri_to_path = |uri: &Uri| uri_to_url(uri).ok().and_then(|url| url.to_file_path().ok());

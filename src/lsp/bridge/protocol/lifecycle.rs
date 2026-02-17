@@ -14,10 +14,12 @@ use super::request_id::RequestId;
 fn build_bridge_client_capabilities() -> serde_json::Value {
     use tower_lsp_server::ls_types::{
         ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-        DiagnosticClientCapabilities, DocumentLinkClientCapabilities,
-        DocumentSymbolClientCapabilities, DynamicRegistrationClientCapabilities, GotoCapability,
-        HoverClientCapabilities, InlayHintClientCapabilities, MarkupKind,
+        DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
+        DocumentLinkClientCapabilities, DocumentSymbolClientCapabilities,
+        DynamicRegistrationClientCapabilities, GeneralClientCapabilities, GotoCapability,
+        HoverClientCapabilities, InlayHintClientCapabilities, MarkupKind, PositionEncodingKind,
         SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+        WorkspaceClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -86,6 +88,16 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
 
     let capabilities = ClientCapabilities {
         text_document: Some(text_document),
+        workspace: Some(WorkspaceClientCapabilities {
+            diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            ..Default::default()
+        }),
+        general: Some(GeneralClientCapabilities {
+            position_encodings: Some(vec![PositionEncodingKind::UTF16]),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
@@ -105,11 +117,20 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
 /// * `request_id` - The JSON-RPC request ID
 /// * `initialization_options` - Server-specific initialization options
 /// * `root_uri` - The workspace root URI (forwarded from upstream client)
+/// * `workspace_folders` - The workspace folders (forwarded from upstream client)
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
     root_uri: Option<String>,
+    workspace_folders: Option<serde_json::Value>,
 ) -> serde_json::Value {
+    let root_path = root_uri.as_deref().and_then(|uri| {
+        url::Url::parse(uri)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+    });
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id.as_i64(),
@@ -117,6 +138,8 @@ pub(crate) fn build_initialize_request(
         "params": {
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "rootPath": root_path,
+            "workspaceFolders": workspace_folders,
             "capabilities": build_bridge_client_capabilities(),
             "initializationOptions": initialization_options
         }
@@ -224,20 +247,22 @@ mod tests {
 
     #[test]
     fn initialize_request_has_correct_structure() {
-        let request = build_initialize_request(RequestId::new(1), None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 1);
         assert_eq!(request["method"], "initialize");
         assert!(request["params"]["processId"].as_u64().is_some());
         assert!(request["params"]["rootUri"].is_null());
+        assert!(request["params"]["rootPath"].is_null());
+        assert!(request["params"]["workspaceFolders"].is_null());
         assert!(request["params"]["capabilities"].is_object());
         assert!(request["params"]["initializationOptions"].is_null());
     }
 
     #[test]
     fn initialize_request_includes_bridge_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
         let capabilities = &request["params"]["capabilities"];
 
         // Should declare linkSupport for goto-family methods
@@ -261,7 +286,8 @@ mod tests {
                 }
             }
         });
-        let request = build_initialize_request(RequestId::new(42), Some(options.clone()), None);
+        let request =
+            build_initialize_request(RequestId::new(42), Some(options.clone()), None, None);
 
         assert_eq!(request["id"], 42);
         assert_eq!(request["params"]["initializationOptions"], options);
@@ -270,16 +296,72 @@ mod tests {
     #[test]
     fn initialize_request_includes_root_uri_when_provided() {
         let root_uri = "file:///home/user/project";
-        let request = build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()));
+        let request =
+            build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()), None);
 
         assert_eq!(request["params"]["rootUri"], root_uri);
     }
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
-        let request = build_initialize_request(RequestId::new(1), None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
 
         assert!(request["params"]["rootUri"].is_null());
+    }
+
+    #[test]
+    fn initialize_request_includes_position_encoding() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let general = &request["params"]["capabilities"]["general"];
+
+        assert_eq!(general["positionEncodings"], serde_json::json!(["utf-16"]));
+    }
+
+    #[test]
+    fn initialize_request_includes_workspace_folders_when_provided() {
+        let folders = serde_json::json!([
+            { "uri": "file:///home/user/project", "name": "project" }
+        ]);
+        let request =
+            build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()));
+
+        assert_eq!(request["params"]["workspaceFolders"], folders);
+    }
+
+    #[test]
+    fn initialize_request_includes_workspace_capabilities() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let workspace = &request["params"]["capabilities"]["workspace"];
+
+        // Only declare capabilities that the bridge actually handles
+        assert_eq!(workspace["diagnostics"]["refreshSupport"], true);
+        // workspaceFolders and configuration are NOT declared because
+        // the bridge doesn't implement the corresponding handlers
+        assert!(workspace.get("workspaceFolders").is_none());
+        assert!(workspace.get("configuration").is_none());
+    }
+
+    #[test]
+    fn initialize_request_has_null_workspace_folders_when_not_provided() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+
+        assert!(request["params"]["workspaceFolders"].is_null());
+    }
+
+    #[test]
+    fn initialize_request_includes_root_path_derived_from_root_uri() {
+        let root_uri = "file:///home/user/project";
+        let request =
+            build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()), None);
+
+        assert_eq!(request["params"]["rootPath"], "/home/user/project");
+    }
+
+    #[test]
+    fn initialize_request_has_null_root_path_when_no_root_uri() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+
+        assert!(request["params"]["rootPath"].is_null());
     }
 
     #[test]

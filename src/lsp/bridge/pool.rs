@@ -237,6 +237,11 @@ pub struct LanguageServerPool {
     /// Passed to downstream servers during LSP handshake so they can provide
     /// workspace-aware features (diagnostics, go-to-definition, etc.).
     root_uri: std::sync::Mutex<Option<String>>,
+    /// Workspace folders forwarded from upstream client.
+    ///
+    /// Set via `set_workspace_folders()` after receiving the upstream initialize request.
+    /// Passed to downstream servers during LSP handshake as JSON value.
+    workspace_folders: std::sync::Mutex<Option<serde_json::Value>>,
     /// Sender for forwarding downstream server notifications to the upstream editor.
     ///
     /// Cloned into each reader task so they can signal events like
@@ -279,6 +284,7 @@ impl LanguageServerPool {
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: std::sync::Mutex::new(None),
+            workspace_folders: std::sync::Mutex::new(None),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
         }
@@ -296,6 +302,26 @@ impl LanguageServerPool {
     fn root_uri(&self) -> Option<String> {
         let root_uri = self.root_uri.lock().unwrap_or_else(|e| e.into_inner());
         root_uri.clone()
+    }
+
+    /// Set the workspace folders.
+    ///
+    /// Called during upstream initialize to forward workspace folders to downstream servers.
+    pub(crate) fn set_workspace_folders(&self, folders: Option<serde_json::Value>) {
+        let mut workspace_folders = self
+            .workspace_folders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *workspace_folders = folders;
+    }
+
+    /// Get the workspace folders.
+    fn workspace_folders(&self) -> Option<serde_json::Value> {
+        let workspace_folders = self
+            .workspace_folders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        workspace_folders.clone()
     }
 
     /// Take the upstream notification receiver for forwarding to the editor.
@@ -762,6 +788,7 @@ impl LanguageServerPool {
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
         let root_uri = self.root_uri();
+        let workspace_folders = self.workspace_folders();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let handshake_task = tokio::spawn(async move {
@@ -773,6 +800,7 @@ impl LanguageServerPool {
                     init_response_rx,
                     init_options,
                     root_uri,
+                    workspace_folders,
                 ),
             )
             .await;
