@@ -125,11 +125,11 @@ impl Kakehashi {
             }
         }
 
-        if all_symbols.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(DocumentSymbolResponse::Nested(all_symbols)))
-        }
+        Ok(format_document_symbol_response(
+            all_symbols,
+            &lsp_uri,
+            self.supports_hierarchical_document_symbol(),
+        ))
     }
 }
 
@@ -171,6 +171,32 @@ fn flatten_recursive(
         if let Some(children) = &symbol.children {
             flatten_recursive(children, uri, Some(&symbol.name), result);
         }
+    }
+}
+
+/// Choose the response format based on client capability.
+///
+/// Returns `None` when `symbols` is empty. Otherwise:
+/// - `hierarchical = true` → `DocumentSymbolResponse::Nested` (preserves hierarchy)
+/// - `hierarchical = false` → `DocumentSymbolResponse::Flat` (backwards compatibility)
+///
+/// Per LSP 3.18, when `hierarchicalDocumentSymbolSupport` is true the server
+/// should return `DocumentSymbol[]`; otherwise `SymbolInformation[]`.
+fn format_document_symbol_response(
+    symbols: Vec<DocumentSymbol>,
+    uri: &Uri,
+    hierarchical: bool,
+) -> Option<DocumentSymbolResponse> {
+    if symbols.is_empty() {
+        return None;
+    }
+
+    if hierarchical {
+        Some(DocumentSymbolResponse::Nested(symbols))
+    } else {
+        Some(DocumentSymbolResponse::Flat(flatten_document_symbols(
+            symbols, uri,
+        )))
     }
 }
 
@@ -366,5 +392,99 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].tags.as_ref().unwrap().len(), 1);
         assert_eq!(result[0].deprecated, Some(true));
+    }
+
+    // ==========================================================================
+    // format_document_symbol_response tests
+    // ==========================================================================
+
+    #[test]
+    fn format_empty_symbols_returns_none() {
+        let uri: Uri = "file:///test.md".parse().unwrap();
+        assert!(format_document_symbol_response(vec![], &uri, true).is_none());
+        assert!(format_document_symbol_response(vec![], &uri, false).is_none());
+    }
+
+    #[test]
+    fn format_hierarchical_returns_nested_variant() {
+        let uri: Uri = "file:///test.md".parse().unwrap();
+        let symbol = make_symbol(
+            "myFunc",
+            SymbolKind::FUNCTION,
+            make_range(3, 0, 8, 3),
+            make_range(3, 9, 3, 15),
+            None,
+        );
+
+        let response = format_document_symbol_response(vec![symbol], &uri, true).unwrap();
+
+        match response {
+            DocumentSymbolResponse::Nested(symbols) => {
+                assert_eq!(symbols.len(), 1);
+                assert_eq!(symbols[0].name, "myFunc");
+            }
+            DocumentSymbolResponse::Flat(_) => panic!("Expected Nested variant"),
+        }
+    }
+
+    #[test]
+    fn format_flat_returns_flat_variant() {
+        let uri: Uri = "file:///test.md".parse().unwrap();
+        let symbol = make_symbol(
+            "myFunc",
+            SymbolKind::FUNCTION,
+            make_range(3, 0, 8, 3),
+            make_range(3, 9, 3, 15),
+            None,
+        );
+
+        let response = format_document_symbol_response(vec![symbol], &uri, false).unwrap();
+
+        match response {
+            DocumentSymbolResponse::Flat(infos) => {
+                assert_eq!(infos.len(), 1);
+                assert_eq!(infos[0].name, "myFunc");
+                assert_eq!(infos[0].kind, SymbolKind::FUNCTION);
+                assert_eq!(infos[0].location.uri.as_str(), uri.as_str());
+                assert_eq!(infos[0].location.range.start.line, 3);
+                assert_eq!(infos[0].location.range.end.line, 8);
+                assert!(infos[0].container_name.is_none());
+            }
+            DocumentSymbolResponse::Nested(_) => panic!("Expected Flat variant"),
+        }
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn format_flat_with_children_produces_container_name() {
+        let uri: Uri = "file:///test.md".parse().unwrap();
+
+        let child = make_symbol(
+            "innerFunc",
+            SymbolKind::FUNCTION,
+            make_range(5, 2, 7, 5),
+            make_range(5, 11, 5, 20),
+            None,
+        );
+        let parent = make_symbol(
+            "myModule",
+            SymbolKind::MODULE,
+            make_range(3, 0, 10, 3),
+            make_range(3, 7, 3, 15),
+            Some(vec![child]),
+        );
+
+        let response = format_document_symbol_response(vec![parent], &uri, false).unwrap();
+
+        match response {
+            DocumentSymbolResponse::Flat(infos) => {
+                assert_eq!(infos.len(), 2);
+                assert_eq!(infos[0].name, "myModule");
+                assert!(infos[0].container_name.is_none());
+                assert_eq!(infos[1].name, "innerFunc");
+                assert_eq!(infos[1].container_name.as_deref(), Some("myModule"));
+            }
+            DocumentSymbolResponse::Nested(_) => panic!("Expected Flat variant"),
+        }
     }
 }
