@@ -345,8 +345,7 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, "unused", 3).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", 3).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].range.start.line, 3);
@@ -405,8 +404,7 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, "unused", 5).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", 5).unwrap();
 
         assert_eq!(symbols[0].range.start.line, 5);
         assert_eq!(symbols[0].range.end.line, 15);
@@ -475,8 +473,7 @@ mod tests {
     fn document_symbol_response_with_null_result_returns_none() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", 5);
+        let transformed = transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
 
@@ -484,8 +481,7 @@ mod tests {
     fn document_symbol_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, "unused", 5).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", 5).unwrap();
         assert!(symbols.is_empty());
     }
 
@@ -510,8 +506,7 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, virtual_uri, 7).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, virtual_uri, 7).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "myVariable");
@@ -617,8 +612,7 @@ mod tests {
             "error": { "code": -32600, "message": "Invalid Request" }
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", 5);
+        let transformed = transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
 
@@ -630,8 +624,7 @@ mod tests {
             "result": "not_an_array"
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", 5);
+        let transformed = transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
 
@@ -656,8 +649,7 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, "unused", 10).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", 10).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(
@@ -690,8 +682,7 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, virtual_uri, 0).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, virtual_uri, 0).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].tags.as_ref().unwrap().len(), 1);
