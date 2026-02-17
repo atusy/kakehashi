@@ -30,7 +30,7 @@ pub(super) struct FanOutTask {
     pub(super) region_id: String,
     pub(super) region_start_line: u32,
     pub(super) virtual_content: String,
-    pub(super) upstream_id: UpstreamId,
+    pub(super) upstream_id: Option<UpstreamId>,
 }
 
 /// Spawn one task per matching server, returning a `JoinSet` for `first_win()`.

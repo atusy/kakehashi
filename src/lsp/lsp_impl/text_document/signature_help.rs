@@ -22,7 +22,7 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
 
         // Fan-out signature help requests to all matching servers
         let pool = self.bridge.pool_arc();
@@ -45,7 +45,7 @@ impl Kakehashi {
 
         // Return the first non-null signature help response
         let result = first_win::first_win(&mut join_set, |opt| opt.is_some(), cancel_rx).await;
-        pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
+        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
         result
             .handle(&self.client, "signature help", None, Ok)
             .await
