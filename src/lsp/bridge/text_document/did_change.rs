@@ -60,8 +60,10 @@ impl LanguageServerPool {
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
 
-            // Check if this virtual doc has ACTUALLY been opened (didOpen sent to downstream)
-            // per ADR-0015. This prevents sending didChange before didOpen.
+            // Check if this virtual doc has been claimed or opened on a downstream server.
+            // The claim happens before the actual didOpen send (see try_claim_for_open),
+            // but FIFO ordering via the single-writer loop ensures didChange arrives
+            // after didOpen on the wire.
             if !self.is_document_opened(&virtual_uri) {
                 // Not opened yet - didOpen will be sent on first request
                 continue;
