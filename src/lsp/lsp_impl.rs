@@ -994,9 +994,24 @@ impl LanguageServer for Kakehashi {
             .as_ref()
             .and_then(|f| serde_json::to_value(f).ok())
             .or_else(|| {
-                root_uri_for_bridge
-                    .as_ref()
-                    .map(|uri| serde_json::json!([{ "uri": uri, "name": uri }]))
+                root_uri_for_bridge.as_ref().map(|uri| {
+                    let name = Url::parse(uri)
+                        .ok()
+                        .and_then(|url| {
+                            url.to_file_path()
+                                .ok()
+                                .and_then(|path| {
+                                    path.file_name().and_then(|s| s.to_str().map(String::from))
+                                })
+                                .or_else(|| {
+                                    url.path_segments()
+                                        .and_then(|mut seg| seg.next_back().map(|s| s.to_string()))
+                                })
+                        })
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "workspace".to_string());
+                    serde_json::json!([{ "uri": uri, "name": name }])
+                })
             });
         self.bridge
             .pool()
