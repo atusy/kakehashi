@@ -94,14 +94,14 @@ impl Kakehashi {
                 continue;
             }
 
-            // Clone data into the spawned task
+            // Move owned fields into the spawned task (Arc/Url still need clone)
             let pool = Arc::clone(&pool);
             let uri = uri.clone();
             let upstream_id = upstream_request_id.clone();
-            let injection_language = resolved.injection_language.clone();
-            let region_id = resolved.region.region_id.clone();
+            let injection_language = resolved.injection_language;
+            let region_id = resolved.region.region_id;
             let region_start_line = resolved.region.line_range.start;
-            let virtual_content = resolved.virtual_content.clone();
+            let virtual_content = resolved.virtual_content;
 
             outer_join_set.spawn(async move {
                 race_servers_for_region(
