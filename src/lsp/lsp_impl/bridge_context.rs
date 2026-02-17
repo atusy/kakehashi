@@ -1,8 +1,13 @@
 //! Shared preamble for bridge endpoint implementations.
 //!
 //! All bridge endpoints (definition, type_definition, implementation, declaration,
-//! references) follow the same pattern of resolving injection context before sending
-//! requests. This module extracts that shared preamble into a single method.
+//! references, hover, completion, etc.) follow the same pattern of resolving
+//! injection context before sending requests. This module extracts that shared
+//! preamble into reusable methods.
+//!
+//! Two variants are provided:
+//! - `resolve_bridge_context`: Returns a single server config (backward compat)
+//! - `resolve_bridge_contexts`: Returns ALL matching server configs (fan-out)
 
 use tower_lsp_server::jsonrpc::Id;
 use tower_lsp_server::ls_types::{MessageType, Position, Uri};
@@ -33,34 +38,54 @@ pub(crate) struct BridgeRequestContext {
     pub(crate) upstream_request_id: UpstreamId,
 }
 
+/// All resolved context needed to send bridge requests to multiple servers.
+///
+/// Produced by `Kakehashi::resolve_bridge_contexts`. Like `BridgeRequestContext`
+/// but returns ALL matching server configs for the injection language, enabling
+/// fan-out to multiple downstream servers.
+#[allow(dead_code)] // Used by subtask 6 handlers
+pub(crate) struct MultiBridgeRequestContext {
+    /// The parsed document URL (url::Url).
+    pub(crate) uri: Url,
+    /// The cursor position within the document.
+    pub(crate) position: Position,
+    /// The resolved injection region with virtual content and region metadata.
+    pub(crate) resolved: ResolvedInjection,
+    /// All matching bridge server configs for this injection language.
+    pub(crate) configs: Vec<ResolvedServerConfig>,
+    /// The upstream JSON-RPC request ID for cancel forwarding.
+    pub(crate) upstream_request_id: UpstreamId,
+}
+
+/// Intermediate result from the shared preamble, before server config lookup.
+struct PreambleResult {
+    uri: Url,
+    position: Position,
+    resolved: ResolvedInjection,
+    language_name: String,
+    upstream_request_id: UpstreamId,
+}
+
 impl Kakehashi {
-    /// Resolve injection context for a bridge endpoint request.
+    /// Shared preamble for bridge endpoint resolution.
     ///
-    /// This method encapsulates the shared preamble across all bridge endpoints
-    /// (definition, type_definition, implementation, declaration, references):
-    ///
+    /// Handles all steps common to both single-server and multi-server resolution:
     /// 1. Converts URI from ls_types to url::Url
     /// 2. Logs the method invocation
     /// 3. Gets document snapshot
     /// 4. Detects document language
     /// 5. Gets injection query
     /// 6. Resolves injection region at position
-    /// 7. Looks up bridge server config
-    /// 8. Extracts upstream request ID from task-local storage
+    /// 7. Extracts upstream request ID from task-local storage
     ///
     /// Returns `None` for any early-exit condition (invalid URI, no document,
-    /// no language, no injection at position, no bridge config).
-    ///
-    /// # Arguments
-    /// * `lsp_uri` - The document URI from the LSP params
-    /// * `position` - The cursor position
-    /// * `method_name` - Name for log messages (e.g., "goto_definition", "references")
-    pub(crate) async fn resolve_bridge_context(
+    /// no language, no injection at position).
+    async fn resolve_bridge_preamble(
         &self,
         lsp_uri: &Uri,
         position: Position,
         method_name: &str,
-    ) -> Option<BridgeRequestContext> {
+    ) -> Option<PreambleResult> {
         // Convert ls_types::Uri to url::Url for internal use
         let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!("Invalid URI in {}: {}", method_name, lsp_uri.as_str());
@@ -123,22 +148,6 @@ impl Kakehashi {
             return None;
         };
 
-        // Get bridge server config for this language
-        let Some(resolved_config) =
-            self.get_bridge_config_for_language(&language_name, &resolved.injection_language)
-        else {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!(
-                        "No bridge server configured for language: {} (host: {})",
-                        resolved.injection_language, language_name
-                    ),
-                )
-                .await;
-            return None;
-        };
-
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = match get_current_request_id() {
             Some(Id::Number(n)) => UpstreamId::Number(n),
@@ -147,12 +156,97 @@ impl Kakehashi {
             None | Some(Id::Null) => UpstreamId::Null,
         };
 
-        Some(BridgeRequestContext {
+        Some(PreambleResult {
             uri,
             position,
             resolved,
-            resolved_config,
+            language_name,
             upstream_request_id,
+        })
+    }
+
+    /// Resolve injection context for a bridge endpoint request (single server).
+    ///
+    /// Delegates to the shared preamble, then looks up a single bridge server config.
+    ///
+    /// Returns `None` for any early-exit condition (invalid URI, no document,
+    /// no language, no injection at position, no bridge config).
+    pub(crate) async fn resolve_bridge_context(
+        &self,
+        lsp_uri: &Uri,
+        position: Position,
+        method_name: &str,
+    ) -> Option<BridgeRequestContext> {
+        let preamble = self
+            .resolve_bridge_preamble(lsp_uri, position, method_name)
+            .await?;
+
+        // Get bridge server config for this language (first match)
+        let Some(resolved_config) = self.get_bridge_config_for_language(
+            &preamble.language_name,
+            &preamble.resolved.injection_language,
+        ) else {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "No bridge server configured for language: {} (host: {})",
+                        preamble.resolved.injection_language, preamble.language_name
+                    ),
+                )
+                .await;
+            return None;
+        };
+
+        Some(BridgeRequestContext {
+            uri: preamble.uri,
+            position: preamble.position,
+            resolved: preamble.resolved,
+            resolved_config,
+            upstream_request_id: preamble.upstream_request_id,
+        })
+    }
+
+    /// Resolve injection context for a bridge endpoint request (all matching servers).
+    ///
+    /// Delegates to the shared preamble, then looks up ALL bridge server configs
+    /// for the injection language. Returns `None` if no configs found.
+    #[allow(dead_code)] // Used by subtask 6 handlers
+    pub(crate) async fn resolve_bridge_contexts(
+        &self,
+        lsp_uri: &Uri,
+        position: Position,
+        method_name: &str,
+    ) -> Option<MultiBridgeRequestContext> {
+        let preamble = self
+            .resolve_bridge_preamble(lsp_uri, position, method_name)
+            .await?;
+
+        // Get ALL bridge server configs for this language
+        let configs = self.get_all_bridge_configs_for_language(
+            &preamble.language_name,
+            &preamble.resolved.injection_language,
+        );
+
+        if configs.is_empty() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "No bridge server configured for language: {} (host: {})",
+                        preamble.resolved.injection_language, preamble.language_name
+                    ),
+                )
+                .await;
+            return None;
+        }
+
+        Some(MultiBridgeRequestContext {
+            uri: preamble.uri,
+            position: preamble.position,
+            resolved: preamble.resolved,
+            configs,
+            upstream_request_id: preamble.upstream_request_id,
         })
     }
 }
