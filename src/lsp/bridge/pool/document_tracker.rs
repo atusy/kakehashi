@@ -365,7 +365,8 @@ impl DocumentTracker {
     fn decrement_opened(&self, uri_string: &str) {
         self.opened_documents
             .remove_if_mut(uri_string, |_, count| {
-                *count -= 1;
+                debug_assert!(*count > 0, "double-decrement on opened_documents");
+                *count = count.saturating_sub(1);
                 *count == 0
             });
     }
