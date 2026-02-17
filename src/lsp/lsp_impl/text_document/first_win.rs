@@ -23,7 +23,6 @@ use tokio::task::JoinSet;
 ///
 /// Aborted tasks may leave stale entries in UpstreamRequestRegistry and ResponseRouter.
 /// Both systems handle orphaned entries gracefully (see pool.rs design notes).
-#[allow(dead_code)] // Used by hover (subtask 5) and other handlers (subtasks 6-7)
 pub(super) async fn first_win<T: Send + 'static>(
     join_set: &mut JoinSet<io::Result<T>>,
     is_nonempty: impl Fn(&T) -> bool,
