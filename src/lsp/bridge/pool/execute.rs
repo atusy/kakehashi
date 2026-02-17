@@ -61,8 +61,6 @@ impl Drop for RouterCleanupGuard {
 /// This struct holds the data that response transformers commonly need to
 /// translate coordinates and URIs from virtual document space back to host
 /// document space.
-///
-/// Fields are added incrementally as handlers are migrated.
 pub(crate) struct BridgeResponseContext<'a> {
     /// The virtual document URI string (for matching against response URIs
     /// to determine whether locations point to the same virtual document).
