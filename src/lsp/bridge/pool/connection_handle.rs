@@ -518,6 +518,7 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/documentLink" => caps.document_link_provider.is_some(),
             "textDocument/documentColor" | "textDocument/colorPresentation" => matches!(
                 caps.color_provider,
                 Some(
@@ -1641,9 +1642,9 @@ mod tests {
         use tower_lsp_server::ls_types::{
             ColorProviderCapability, ColorProviderOptions, CompletionOptions,
             DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
-            HoverProviderCapability, ImplementationProviderCapability, OneOf, SignatureHelpOptions,
-            StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
-            TypeDefinitionProviderCapability,
+            DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
+            TextDocumentRegistrationOptions, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -1702,6 +1703,15 @@ mod tests {
                 "textDocument/signatureHelp",
                 Box::new(|c| {
                     c.signature_help_provider = Some(SignatureHelpOptions::default());
+                }),
+            ),
+            (
+                "textDocument/documentLink",
+                Box::new(|c| {
+                    c.document_link_provider = Some(DocumentLinkOptions {
+                        resolve_provider: None,
+                        work_done_progress_options: Default::default(),
+                    });
                 }),
             ),
             (
@@ -1909,6 +1919,7 @@ mod tests {
             "textDocument/references",
             "textDocument/documentHighlight",
             "textDocument/signatureHelp",
+            "textDocument/documentLink",
             "textDocument/rename",
             "textDocument/moniker",
             "textDocument/inlayHint",

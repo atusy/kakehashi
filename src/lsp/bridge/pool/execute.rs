@@ -356,6 +356,45 @@ mod tests {
         );
     }
 
+    /// Test that send_document_link_request returns Ok(None) when server lacks documentLink capability.
+    ///
+    /// Same pattern as send_hover_request_returns_none_when_no_hover_capability:
+    /// a Ready connection with no capabilities set should short-circuit to Ok(None).
+    #[tokio::test]
+    async fn send_document_link_request_returns_none_when_no_capability() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = devnull_config();
+
+        // Insert a Ready connection with no capabilities set (all providers = None)
+        {
+            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            pool.connections
+                .lock()
+                .await
+                .insert("test-server".to_string(), handle);
+        }
+
+        let host_uri = test_host_uri("doc");
+        let result = pool
+            .send_document_link_request(
+                "test-server",
+                &config,
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                0,
+                "print('hello')",
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when server lacks documentLink capability"
+        );
+    }
+
     /// RouterCleanupGuard removes the router entry when dropped while armed.
     #[test]
     fn router_cleanup_guard_removes_entry_when_armed() {
