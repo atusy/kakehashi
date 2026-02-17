@@ -38,6 +38,7 @@ pub(super) struct FanOutTask {
 /// Centralises the per-server clone boilerplate that was previously duplicated
 /// in every fan-out handler. The caller supplies a closure that receives a
 /// [`FanOutTask`] and returns the handler-specific future.
+#[must_use = "the JoinSet must be passed to first_win()"]
 pub(super) fn fan_out<T, F, Fut>(
     ctx: &MultiBridgeRequestContext,
     pool: Arc<LanguageServerPool>,
