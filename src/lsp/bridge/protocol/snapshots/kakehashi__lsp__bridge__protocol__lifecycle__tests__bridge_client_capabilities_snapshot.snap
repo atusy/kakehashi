@@ -3,6 +3,11 @@ source: src/lsp/bridge/protocol/lifecycle.rs
 expression: capabilities
 ---
 {
+  "general": {
+    "positionEncodings": [
+      "utf-16"
+    ]
+  },
   "textDocument": {
     "completion": {
       "completionItem": {

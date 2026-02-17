@@ -16,9 +16,10 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
         ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
         DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
         DocumentLinkClientCapabilities, DocumentSymbolClientCapabilities,
-        DynamicRegistrationClientCapabilities, GotoCapability, HoverClientCapabilities,
-        InlayHintClientCapabilities, MarkupKind, SignatureHelpClientCapabilities,
-        TextDocumentClientCapabilities, WorkspaceClientCapabilities,
+        DynamicRegistrationClientCapabilities, GeneralClientCapabilities, GotoCapability,
+        HoverClientCapabilities, InlayHintClientCapabilities, MarkupKind, PositionEncodingKind,
+        SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
+        WorkspaceClientCapabilities,
     };
 
     let goto_link = Some(GotoCapability {
@@ -93,6 +94,10 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
+            ..Default::default()
+        }),
+        general: Some(GeneralClientCapabilities {
+            position_encodings: Some(vec![PositionEncodingKind::UTF16]),
             ..Default::default()
         }),
         ..Default::default()
@@ -295,6 +300,14 @@ mod tests {
         let request = build_initialize_request(RequestId::new(1), None, None, None);
 
         assert!(request["params"]["rootUri"].is_null());
+    }
+
+    #[test]
+    fn initialize_request_includes_position_encoding() {
+        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let general = &request["params"]["capabilities"]["general"];
+
+        assert_eq!(general["positionEncodings"], serde_json::json!(["utf-16"]));
     }
 
     #[test]
