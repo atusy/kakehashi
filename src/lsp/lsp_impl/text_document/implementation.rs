@@ -1,8 +1,8 @@
 //! Goto implementation method for Kakehashi.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 use tower_lsp_server::ls_types::Location;
+use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
 
 use crate::lsp::bridge::location_link_to_location;
 
@@ -55,23 +55,18 @@ impl Kakehashi {
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
         result
-            .handle(
-                &self.client,
-                "implementation",
-                None,
-                |value| match value {
-                    Some(links) => {
-                        if self.supports_implementation_link() {
-                            Ok(Some(GotoImplementationResponse::Link(links)))
-                        } else {
-                            let locations: Vec<Location> =
-                                links.into_iter().map(location_link_to_location).collect();
-                            Ok(Some(GotoImplementationResponse::Array(locations)))
-                        }
+            .handle(&self.client, "implementation", None, |value| match value {
+                Some(links) => {
+                    if self.supports_implementation_link() {
+                        Ok(Some(GotoImplementationResponse::Link(links)))
+                    } else {
+                        let locations: Vec<Location> =
+                            links.into_iter().map(location_link_to_location).collect();
+                        Ok(Some(GotoImplementationResponse::Array(locations)))
                     }
-                    None => Ok(None),
-                },
-            )
+                }
+                None => Ok(None),
+            })
             .await
     }
 }

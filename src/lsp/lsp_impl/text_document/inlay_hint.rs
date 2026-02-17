@@ -53,8 +53,6 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        result
-            .handle(&self.client, "inlay hint", None, Ok)
-            .await
+        result.handle(&self.client, "inlay hint", None, Ok).await
     }
 }
