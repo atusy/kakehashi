@@ -2,7 +2,7 @@
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, MessageType, SymbolInformation,
+    DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, MessageType,
 };
 
 use crate::language::InjectionResolver;
@@ -78,10 +78,10 @@ impl Kakehashi {
             None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
         };
 
-        // Collect document symbols from all injection regions
-        // We track both formats separately since mixing them isn't meaningful
-        let mut all_document_symbols: Vec<DocumentSymbol> = Vec::new();
-        let mut all_symbol_information: Vec<SymbolInformation> = Vec::new();
+        // Collect document symbols from all injection regions.
+        // The bridge normalizes both DocumentSymbol[] and SymbolInformation[]
+        // responses to Vec<DocumentSymbol>, so we use a single accumulator.
+        let mut all_symbols: Vec<DocumentSymbol> = Vec::new();
 
         for resolved in all_regions {
             // Get bridge server config for this language
@@ -109,11 +109,8 @@ impl Kakehashi {
                 .await;
 
             match response {
-                Ok(Some(DocumentSymbolResponse::Nested(symbols))) => {
-                    all_document_symbols.extend(symbols);
-                }
-                Ok(Some(DocumentSymbolResponse::Flat(symbols))) => {
-                    all_symbol_information.extend(symbols);
+                Ok(Some(symbols)) => {
+                    all_symbols.extend(symbols);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -127,15 +124,10 @@ impl Kakehashi {
             }
         }
 
-        // Return results, preferring DocumentSymbol format if available
-        // If we have any DocumentSymbol results, use Nested format (hierarchical)
-        // Otherwise fall back to Flat format (SymbolInformation) if available
-        if !all_document_symbols.is_empty() {
-            Ok(Some(DocumentSymbolResponse::Nested(all_document_symbols)))
-        } else if !all_symbol_information.is_empty() {
-            Ok(Some(DocumentSymbolResponse::Flat(all_symbol_information)))
-        } else {
+        if all_symbols.is_empty() {
             Ok(None)
+        } else {
+            Ok(Some(DocumentSymbolResponse::Nested(all_symbols)))
         }
     }
 }

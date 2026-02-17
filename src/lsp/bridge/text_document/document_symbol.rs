@@ -10,13 +10,30 @@
 //!
 //! This handler uses `send_request()` to queue requests via the channel-based
 //! writer task, ensuring FIFO ordering with other messages.
+//!
+//! # Normalization
+//!
+//! Both DocumentSymbol[] and SymbolInformation[] responses from downstream servers
+//! are normalized to `Vec<DocumentSymbol>`. This pushes format awareness to the bridge
+//! layer, allowing the lsp_impl handler to work with a single type and decide the
+//! final response format based on client capabilities.
+//!
+//! # Known Limitations
+//!
+//! When downstream servers return `SymbolInformation[]`, each item's
+//! `container_name` is discarded during normalization to `DocumentSymbol`
+//! (which has no equivalent field — it uses `children` for hierarchy instead).
+//! If the response is later flattened back to `SymbolInformation[]` for clients
+//! without hierarchical support, the reconstructed items will have
+//! `container_name: None`. This is a rare path because the bridge declares
+//! `hierarchicalDocumentSymbolSupport: true` to downstream servers.
 
 use std::io;
 
 use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::{DocumentSymbol, DocumentSymbolResponse, SymbolInformation, Uri};
+use tower_lsp_server::ls_types::{DocumentSymbol, SymbolInformation};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
@@ -24,6 +41,10 @@ use super::super::protocol::{RequestId, VirtualDocumentUri, build_whole_document
 
 impl LanguageServerPool {
     /// Send a document symbol request and wait for the response.
+    ///
+    /// Returns `Vec<DocumentSymbol>` regardless of whether the downstream server
+    /// returned DocumentSymbol[] or SymbolInformation[]. SymbolInformation items
+    /// are converted to DocumentSymbol with `selection_range = range`.
     ///
     /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
     /// full lifecycle, providing document-symbol-specific request building and response
@@ -39,7 +60,7 @@ impl LanguageServerPool {
         region_start_line: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
-    ) -> io::Result<Option<DocumentSymbolResponse>> {
+    ) -> io::Result<Option<Vec<DocumentSymbol>>> {
         self.execute_bridge_request(
             server_name,
             server_config,
@@ -54,7 +75,6 @@ impl LanguageServerPool {
                 transform_document_symbol_response_to_host(
                     response,
                     &ctx.virtual_uri_string,
-                    ctx.host_uri_lsp,
                     ctx.region_start_line,
                 )
             },
@@ -76,35 +96,33 @@ fn build_document_symbol_request(
 
 /// Transform a document symbol response from virtual to host document coordinates.
 ///
+/// Both DocumentSymbol[] and SymbolInformation[] responses are normalized to
+/// `Vec<DocumentSymbol>`. This allows the lsp_impl handler to work with a single
+/// type and decide the final response format based on client capabilities.
+///
 /// DocumentSymbol responses can be in two formats per LSP spec:
 /// - DocumentSymbol[] (hierarchical with range, selectionRange, and optional children)
 /// - SymbolInformation[] (flat with location.uri + location.range)
 ///
 /// For DocumentSymbol format:
-/// - range: The full scope of the symbol (e.g., entire function body)
-/// - selectionRange: The identifier/name of the symbol (e.g., function name)
-/// - children: Optional nested symbols (recursively processed)
+/// - range and selectionRange lines are offset by region_start_line
+/// - children are recursively processed
 ///
 /// For SymbolInformation format:
-/// - location.uri: The symbol's document URI (needs transformation if virtual)
-/// - location.range: The symbol's location range (needs transformation)
-///
-/// This function handles three cases for SymbolInformation URIs:
-/// 1. **Real file URI** (not a virtual URI): Preserved as-is with original coordinates
-/// 2. **Same virtual URI as request**: Transformed using request's context
-/// 3. **Different virtual URI** (cross-region): Filtered out from results
+/// - Converted to DocumentSymbol with selection_range = range
+/// - Real file URIs are filtered out (per LSP spec, documentSymbol is for the requested document)
+/// - Cross-region virtual URIs are filtered out
+/// - Same-region virtual URIs are transformed to host coordinates
 ///
 /// # Arguments
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `request_virtual_uri` - The virtual URI from the request
-/// * `host_uri` - The host URI to replace virtual URIs with
 /// * `region_start_line` - The starting line of the injection region in the host document
 fn transform_document_symbol_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
-    host_uri: &Uri,
     region_start_line: u32,
-) -> Option<DocumentSymbolResponse> {
+) -> Option<Vec<DocumentSymbol>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentSymbol: {}", error);
     }
@@ -118,85 +136,112 @@ fn transform_document_symbol_response_to_host(
     let items = result.as_array()?;
 
     if items.is_empty() {
-        // Return empty Nested variant for consistency
-        return Some(DocumentSymbolResponse::Nested(vec![]));
+        return Some(vec![]);
     }
 
     // Detect format by checking only the first element: the LSP spec defines
     // the response as either DocumentSymbol[] OR SymbolInformation[], never mixed.
     // SymbolInformation has "location"; DocumentSymbol has "range" + "selectionRange".
     if items.first().and_then(|i| i.get("location")).is_some() {
-        // SymbolInformation[] format
-        transform_symbol_information_response(
-            result,
-            request_virtual_uri,
-            host_uri,
-            region_start_line,
-        )
+        // SymbolInformation[] format → convert to Vec<DocumentSymbol>
+        transform_symbol_information_response(result, request_virtual_uri, region_start_line)
     } else {
         // DocumentSymbol[] format
         transform_document_symbol_nested_response(result, region_start_line)
     }
 }
 
-/// Transform a SymbolInformation[] response to typed format.
+/// Transform a SymbolInformation[] response into `Vec<DocumentSymbol>`.
 ///
-/// Deserializes into typed structs first, then filters cross-region virtual URIs,
-/// transforms same-region URIs to host, and preserves real file URIs unchanged.
+/// Each SymbolInformation is converted to a DocumentSymbol with:
+/// - `selection_range` = `range` (SymbolInformation has only one range)
+/// - `children` = None
+/// - `detail` = None
+/// - `tags` and `deprecated` propagated from the original
+///
+/// Filtering rules:
+/// - **Real file URI** (not virtual): Filtered out per LSP spec (documentSymbol
+///   returns symbols for the requested document only)
+/// - **Same virtual URI**: Converted and coordinates transformed to host
+/// - **Cross-region virtual URI**: Filtered out
+#[allow(deprecated)]
 fn transform_symbol_information_response(
     result: serde_json::Value,
     request_virtual_uri: &str,
-    host_uri: &Uri,
     region_start_line: u32,
-) -> Option<DocumentSymbolResponse> {
-    let mut symbols: Vec<SymbolInformation> = serde_json::from_value(result).ok()?;
+) -> Option<Vec<DocumentSymbol>> {
+    let symbols: Vec<SymbolInformation> = serde_json::from_value(result).ok()?;
 
-    symbols.retain_mut(|symbol| {
-        let is_virtual = VirtualDocumentUri::is_virtual_uri(symbol.location.uri.as_str());
+    let converted: Vec<DocumentSymbol> = symbols
+        .into_iter()
+        .filter(|symbol| {
+            let uri_str = symbol.location.uri.as_str();
+            let is_virtual = VirtualDocumentUri::is_virtual_uri(uri_str);
 
-        // Case 1: Real file URI → preserve as-is
-        if !is_virtual {
-            return true;
-        }
+            // Real file URI → filter out (not part of the requested document)
+            if !is_virtual {
+                return false;
+            }
 
-        // Case 2: Same virtual URI → transform to host coordinates
-        if symbol.location.uri.as_str() == request_virtual_uri {
-            symbol.location.uri = host_uri.clone();
-            symbol.location.range.start.line = symbol
-                .location
-                .range
-                .start
-                .line
-                .saturating_add(region_start_line);
-            symbol.location.range.end.line = symbol
-                .location
-                .range
-                .end
-                .line
-                .saturating_add(region_start_line);
-            return true;
-        }
+            // Same virtual URI → keep for conversion
+            if uri_str == request_virtual_uri {
+                return true;
+            }
 
-        // Case 3: Different virtual URI (cross-region) → filter out
-        false
-    });
+            // Cross-region virtual URI → filter out
+            false
+        })
+        .map(|symbol| {
+            let range = tower_lsp_server::ls_types::Range {
+                start: tower_lsp_server::ls_types::Position {
+                    line: symbol
+                        .location
+                        .range
+                        .start
+                        .line
+                        .saturating_add(region_start_line),
+                    character: symbol.location.range.start.character,
+                },
+                end: tower_lsp_server::ls_types::Position {
+                    line: symbol
+                        .location
+                        .range
+                        .end
+                        .line
+                        .saturating_add(region_start_line),
+                    character: symbol.location.range.end.character,
+                },
+            };
 
-    Some(DocumentSymbolResponse::Flat(symbols))
+            DocumentSymbol {
+                name: symbol.name,
+                detail: None,
+                kind: symbol.kind,
+                tags: symbol.tags,
+                deprecated: symbol.deprecated,
+                range,
+                selection_range: range,
+                children: None,
+            }
+        })
+        .collect();
+
+    Some(converted)
 }
 
-/// Transform a DocumentSymbol[] response to typed format.
+/// Transform a DocumentSymbol[] response to `Vec<DocumentSymbol>`.
 ///
 /// Deserializes into typed structs first, then recursively transforms range
 /// and selectionRange in all items and their children.
 fn transform_document_symbol_nested_response(
     result: serde_json::Value,
     region_start_line: u32,
-) -> Option<DocumentSymbolResponse> {
+) -> Option<Vec<DocumentSymbol>> {
     let mut symbols: Vec<DocumentSymbol> = serde_json::from_value(result).ok()?;
     for symbol in &mut symbols {
         transform_document_symbol_ranges(symbol, region_start_line);
     }
-    Some(DocumentSymbolResponse::Nested(symbols))
+    Some(symbols)
 }
 
 /// Recursively transform a single DocumentSymbol's ranges from virtual to host coordinates.
@@ -227,11 +272,7 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, region_start_li
 mod tests {
     use super::*;
     use serde_json::json;
-
-    /// A dummy URI for tests where the host URI is not used (nested/early-return paths).
-    fn dummy_uri() -> Uri {
-        "file:///unused".parse().unwrap()
-    }
+    use tower_lsp_server::ls_types::Uri;
 
     // ==========================================================================
     // Document symbol request tests
@@ -304,21 +345,15 @@ mod tests {
             ]
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 3);
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", 3).unwrap();
 
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Nested(symbols) => {
-                assert_eq!(symbols.len(), 1);
-                assert_eq!(symbols[0].range.start.line, 3);
-                assert_eq!(symbols[0].range.end.line, 8);
-                assert_eq!(symbols[0].selection_range.start.line, 3);
-                assert_eq!(symbols[0].selection_range.end.line, 3);
-                assert_eq!(symbols[0].name, "myFunction");
-            }
-            _ => panic!("Expected Nested variant"),
-        }
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].range.start.line, 3);
+        assert_eq!(symbols[0].range.end.line, 8);
+        assert_eq!(symbols[0].selection_range.start.line, 3);
+        assert_eq!(symbols[0].selection_range.end.line, 3);
+        assert_eq!(symbols[0].name, "myFunction");
     }
 
     #[test]
@@ -370,32 +405,29 @@ mod tests {
             ]
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 5);
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", 5).unwrap();
 
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Nested(symbols) => {
-                assert_eq!(symbols[0].range.start.line, 5);
-                assert_eq!(symbols[0].range.end.line, 15);
+        assert_eq!(symbols[0].range.start.line, 5);
+        assert_eq!(symbols[0].range.end.line, 15);
 
-                let children = symbols[0].children.as_ref().unwrap();
-                assert_eq!(children[0].range.start.line, 7);
-                assert_eq!(children[0].range.end.line, 10);
-                assert_eq!(children[0].selection_range.start.line, 7);
+        let children = symbols[0].children.as_ref().unwrap();
+        assert_eq!(children[0].range.start.line, 7);
+        assert_eq!(children[0].range.end.line, 10);
+        assert_eq!(children[0].selection_range.start.line, 7);
 
-                let grandchildren = children[0].children.as_ref().unwrap();
-                assert_eq!(grandchildren[0].range.start.line, 8);
-                assert_eq!(grandchildren[0].range.end.line, 9);
-                assert_eq!(grandchildren[0].selection_range.start.line, 8);
-                assert_eq!(grandchildren[0].name, "deeplyNested");
-            }
-            _ => panic!("Expected Nested variant"),
-        }
+        let grandchildren = children[0].children.as_ref().unwrap();
+        assert_eq!(grandchildren[0].range.start.line, 8);
+        assert_eq!(grandchildren[0].range.end.line, 9);
+        assert_eq!(grandchildren[0].selection_range.start.line, 8);
+        assert_eq!(grandchildren[0].name, "deeplyNested");
     }
 
     #[test]
-    fn document_symbol_response_transforms_symbol_information_location_range() {
+    fn document_symbol_response_filters_out_real_file_uri_symbol_information() {
+        // Per LSP spec, documentSymbol returns symbols for the requested document only.
+        // Real file URIs from downstream servers refer to external files and should
+        // be filtered out when converting SymbolInformation to DocumentSymbol.
         let real_file_uri = "file:///test.lua";
         let response = json!({
             "jsonrpc": "2.0",
@@ -425,31 +457,18 @@ mod tests {
                 }
             ]
         });
-        let host_uri: Uri = "file:///doc.md".parse().unwrap();
-        let transformed = transform_document_symbol_response_to_host(
+        let symbols = transform_document_symbol_response_to_host(
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
-            &host_uri,
             7,
+        )
+        .unwrap();
+
+        // Real file URIs are filtered out per LSP spec
+        assert!(
+            symbols.is_empty(),
+            "Real file URI symbols should be filtered out"
         );
-
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Flat(symbols) => {
-                assert_eq!(symbols.len(), 2);
-                // Real file URI preserved, range NOT transformed
-                assert_eq!(symbols[0].location.uri.as_str(), real_file_uri);
-                assert_eq!(symbols[0].location.range.start.line, 2);
-                assert_eq!(symbols[0].location.range.end.line, 2);
-                assert_eq!(symbols[0].name, "myVariable");
-
-                assert_eq!(symbols[1].location.uri.as_str(), real_file_uri);
-                assert_eq!(symbols[1].location.range.start.line, 5);
-                assert_eq!(symbols[1].location.range.end.line, 10);
-                assert_eq!(symbols[1].name, "myFunction");
-            }
-            _ => panic!("Expected Flat variant"),
-        }
     }
 
     #[test]
@@ -457,29 +476,22 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
 
         let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 5);
+            transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
 
     #[test]
-    fn document_symbol_response_with_empty_array_returns_empty_nested() {
+    fn document_symbol_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 5);
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Nested(symbols) => {
-                assert!(symbols.is_empty());
-            }
-            _ => panic!("Expected Nested variant"),
-        }
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", 5).unwrap();
+        assert!(symbols.is_empty());
     }
 
     #[test]
-    fn document_symbol_response_transforms_symbol_information_location_uri_to_host_uri() {
+    fn document_symbol_response_converts_same_virtual_uri_symbol_information_to_document_symbol() {
         let virtual_uri = "file:///project/kakehashi-virtual-uri-region-0.lua";
-        let host_uri: Uri = "file:///project/doc.md".parse().unwrap();
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -498,19 +510,21 @@ mod tests {
             ]
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, virtual_uri, &host_uri, 7);
+        let symbols =
+            transform_document_symbol_response_to_host(response, virtual_uri, 7).unwrap();
 
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Flat(symbols) => {
-                assert_eq!(symbols.len(), 1);
-                assert_eq!(symbols[0].location.uri.as_str(), host_uri.as_str());
-                assert_eq!(symbols[0].location.range.start.line, 9);
-                assert_eq!(symbols[0].location.range.end.line, 9);
-            }
-            _ => panic!("Expected Flat variant"),
-        }
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "myVariable");
+        // Coordinates transformed: line 2 + 7 = 9
+        assert_eq!(symbols[0].range.start.line, 9);
+        assert_eq!(symbols[0].range.end.line, 9);
+        // selection_range should equal range for converted SymbolInformation
+        assert_eq!(symbols[0].selection_range.start.line, 9);
+        assert_eq!(symbols[0].selection_range.end.line, 9);
+        assert_eq!(symbols[0].selection_range.start.character, 6);
+        assert_eq!(symbols[0].selection_range.end.character, 16);
+        assert!(symbols[0].children.is_none());
+        assert!(symbols[0].detail.is_none());
     }
 
     #[test]
@@ -535,66 +549,20 @@ mod tests {
             ]
         });
 
-        let host_uri: Uri = "file:///doc.md".parse().unwrap();
-        let transformed =
-            transform_document_symbol_response_to_host(response, request_virtual_uri, &host_uri, 5);
+        let symbols =
+            transform_document_symbol_response_to_host(response, request_virtual_uri, 5).unwrap();
 
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Flat(symbols) => {
-                assert!(
-                    symbols.is_empty(),
-                    "Cross-region SymbolInformation should be filtered out"
-                );
-            }
-            _ => panic!("Expected Flat variant"),
-        }
+        assert!(
+            symbols.is_empty(),
+            "Cross-region SymbolInformation should be filtered out"
+        );
     }
 
     #[test]
-    fn document_symbol_response_preserves_real_file_uri_in_symbol_information() {
-        let virtual_uri = "file:///project/kakehashi-virtual-uri-region-0.lua";
-        let real_file_uri = "file:///real/path/module.lua";
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": [
-                {
-                    "name": "externalSymbol",
-                    "kind": 12,
-                    "location": {
-                        "uri": real_file_uri,
-                        "range": {
-                            "start": { "line": 10, "character": 0 },
-                            "end": { "line": 15, "character": 3 }
-                        }
-                    }
-                }
-            ]
-        });
-
-        let host_uri: Uri = "file:///doc.md".parse().unwrap();
-        let transformed =
-            transform_document_symbol_response_to_host(response, virtual_uri, &host_uri, 5);
-
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Flat(symbols) => {
-                assert_eq!(symbols.len(), 1);
-                assert_eq!(symbols[0].location.uri.as_str(), real_file_uri);
-                assert_eq!(symbols[0].location.range.start.line, 10);
-                assert_eq!(symbols[0].location.range.end.line, 15);
-            }
-            _ => panic!("Expected Flat variant"),
-        }
-    }
-
-    #[test]
-    fn document_symbol_response_mixed_symbol_information_filters_only_cross_region() {
+    fn document_symbol_response_mixed_symbol_information_keeps_only_same_region() {
         let request_virtual_uri = "file:///project/kakehashi-virtual-uri-region-0.lua";
         let cross_region_uri = "file:///project/kakehashi-virtual-uri-region-1.lua";
         let real_file_uri = "file:///real/module.lua";
-        let host_uri: Uri = "file:///doc.md".parse().unwrap();
 
         let response = json!({
             "jsonrpc": "2.0",
@@ -627,27 +595,18 @@ mod tests {
             ]
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, request_virtual_uri, &host_uri, 5);
+        let symbols =
+            transform_document_symbol_response_to_host(response, request_virtual_uri, 5).unwrap();
 
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Flat(symbols) => {
-                assert_eq!(
-                    symbols.len(),
-                    2,
-                    "Should have 2 items (cross-region filtered out)"
-                );
-                assert_eq!(symbols[0].name, "localSymbol");
-                assert_eq!(symbols[0].location.uri.as_str(), host_uri.as_str());
-                assert_eq!(symbols[0].location.range.start.line, 5);
-
-                assert_eq!(symbols[1].name, "externalSymbol");
-                assert_eq!(symbols[1].location.uri.as_str(), real_file_uri);
-                assert_eq!(symbols[1].location.range.start.line, 20);
-            }
-            _ => panic!("Expected Flat variant"),
-        }
+        // Only the same-region virtual URI symbol should remain.
+        // Cross-region and real file URIs are both filtered out.
+        assert_eq!(
+            symbols.len(),
+            1,
+            "Should have 1 item (cross-region and real-file filtered out)"
+        );
+        assert_eq!(symbols[0].name, "localSymbol");
+        assert_eq!(symbols[0].range.start.line, 5); // 0 + 5
     }
 
     #[test]
@@ -659,7 +618,7 @@ mod tests {
         });
 
         let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 5);
+            transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
 
@@ -672,7 +631,7 @@ mod tests {
         });
 
         let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 5);
+            transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
 
@@ -697,19 +656,48 @@ mod tests {
             ]
         });
 
-        let transformed =
-            transform_document_symbol_response_to_host(response, "unused", &dummy_uri(), 10);
-        let result = transformed.unwrap();
-        match result {
-            DocumentSymbolResponse::Nested(symbols) => {
-                assert_eq!(symbols.len(), 1);
-                assert_eq!(
-                    symbols[0].range.start.line,
-                    u32::MAX,
-                    "Overflow should saturate at u32::MAX, not panic"
-                );
-            }
-            _ => panic!("Expected Nested variant"),
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", 10).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(
+            symbols[0].range.start.line,
+            u32::MAX,
+            "Overflow should saturate at u32::MAX, not panic"
+        );
+    }
+
+    #[test]
+    fn symbol_information_to_document_symbol_propagates_tags_and_deprecated() {
+        let virtual_uri = "file:///project/kakehashi-virtual-uri-region-0.lua";
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "name": "deprecatedSymbol",
+                    "kind": 13,
+                    "tags": [1],
+                    "deprecated": true,
+                    "location": {
+                        "uri": virtual_uri,
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 10 }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let symbols =
+            transform_document_symbol_response_to_host(response, virtual_uri, 0).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].tags.as_ref().unwrap().len(), 1);
+        #[allow(deprecated)]
+        {
+            assert_eq!(symbols[0].deprecated, Some(true));
         }
     }
 }
