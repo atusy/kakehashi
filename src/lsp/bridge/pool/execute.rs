@@ -105,7 +105,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
@@ -120,15 +120,19 @@ impl LanguageServerPool {
         // This order matters: if a cancel arrives between pool and router registration,
         // the cancel will fail at the router lookup (which is acceptable for best-effort
         // cancel semantics) rather than finding the server but no downstream ID.
-        self.register_upstream_request(upstream_request_id.clone(), server_name);
+        if let Some(ref id) = upstream_request_id {
+            self.register_upstream_request(id.clone(), server_name);
+        }
 
         // Register request with upstream ID mapping for cancel forwarding
         let (request_id, response_rx) =
-            match handle.register_request_with_upstream(Some(upstream_request_id.clone())) {
+            match handle.register_request_with_upstream(upstream_request_id.clone()) {
                 Ok(result) => result,
                 Err(e) => {
                     // Clean up the pool registration on failure
-                    self.unregister_upstream_request(&upstream_request_id, server_name);
+                    if let Some(ref id) = upstream_request_id {
+                        self.unregister_upstream_request(id, server_name);
+                    }
                     return Err(e);
                 }
             };
@@ -156,14 +160,18 @@ impl LanguageServerPool {
             .await
         {
             // router_guard drops here, cleaning up the router entry
-            self.unregister_upstream_request(&upstream_request_id, server_name);
+            if let Some(ref id) = upstream_request_id {
+                self.unregister_upstream_request(id, server_name);
+            }
             return Err(e);
         }
 
         // Queue the request via single-writer loop (ADR-0015)
         if let Err(e) = handle.send_request(request, request_id) {
             // router_guard drops here, cleaning up the router entry
-            self.unregister_upstream_request(&upstream_request_id, server_name);
+            if let Some(ref id) = upstream_request_id {
+                self.unregister_upstream_request(id, server_name);
+            }
             return Err(e.into());
         }
 
@@ -174,7 +182,9 @@ impl LanguageServerPool {
         router_guard.request_id.take();
 
         // Unregister from the upstream request registry regardless of result
-        self.unregister_upstream_request(&upstream_request_id, server_name);
+        if let Some(ref id) = upstream_request_id {
+            self.unregister_upstream_request(id, server_name);
+        }
 
         // Build context and transform response via caller-provided closure
         let context = BridgeResponseContext {
@@ -222,7 +232,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
@@ -284,7 +294,7 @@ mod tests {
                 TEST_ULID_LUA_0,
                 3,
                 "print('hello')",
-                UpstreamId::Number(1),
+                Some(UpstreamId::Number(1)),
                 |_virtual_uri, _request_id| {
                     panic!("build_request should not be called during init");
                 },
@@ -335,7 +345,7 @@ mod tests {
                 TEST_ULID_LUA_0,
                 0,
                 "print('hello')",
-                UpstreamId::Null,
+                None,
             )
             .await;
 

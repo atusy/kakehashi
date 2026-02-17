@@ -41,7 +41,7 @@ impl LanguageServerPool {
         region_start_line: u32,
         virtual_content: &str,
         new_name: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<WorkspaceEdit>> {
         let handle = self
             .get_or_create_connection(server_name, server_config)

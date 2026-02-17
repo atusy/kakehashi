@@ -36,7 +36,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<LocationLink>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config)

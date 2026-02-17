@@ -32,7 +32,7 @@ pub(crate) struct MultiBridgeRequestContext {
     /// All matching bridge server configs for this injection language.
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
-    pub(crate) upstream_request_id: UpstreamId,
+    pub(crate) upstream_request_id: Option<UpstreamId>,
 }
 
 /// Intermediate result from the shared preamble, before server config lookup.
@@ -41,7 +41,7 @@ struct PreambleResult {
     position: Position,
     resolved: ResolvedInjection,
     language_name: String,
-    upstream_request_id: UpstreamId,
+    upstream_request_id: Option<UpstreamId>,
 }
 
 impl Kakehashi {
@@ -57,8 +57,11 @@ impl Kakehashi {
     /// ```
     pub(crate) fn subscribe_cancel(
         &self,
-        upstream_id: &UpstreamId,
+        upstream_id: Option<&UpstreamId>,
     ) -> (Option<CancelReceiver>, Option<CancelSubscriptionGuard<'_>>) {
+        let Some(upstream_id) = upstream_id else {
+            return (None, None);
+        };
         match self
             .bridge
             .cancel_forwarder()
@@ -165,10 +168,9 @@ impl Kakehashi {
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = match get_current_request_id() {
-            Some(Id::Number(n)) => UpstreamId::Number(n),
-            Some(Id::String(s)) => UpstreamId::String(s),
-            // For notifications without ID or null ID, use Null to avoid collision with ID 0
-            None | Some(Id::Null) => UpstreamId::Null,
+            Some(Id::Number(n)) => Some(UpstreamId::Number(n)),
+            Some(Id::String(s)) => Some(UpstreamId::String(s)),
+            None | Some(Id::Null) => None,
         };
 
         Some(PreambleResult {

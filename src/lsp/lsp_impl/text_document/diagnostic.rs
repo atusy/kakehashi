@@ -84,7 +84,7 @@ pub(crate) async fn send_diagnostic_with_timeout(
     pool: &LanguageServerPool,
     info: &DiagnosticRequestInfo,
     uri: &Url,
-    upstream_request_id: UpstreamId,
+    upstream_request_id: Option<UpstreamId>,
     previous_result_id: Option<&str>,
     timeout: Duration,
     log_target: &str,
@@ -155,8 +155,8 @@ pub(crate) async fn fan_out_diagnostic_requests(
                 &pool,
                 &info,
                 &uri,
-                UpstreamId::Null, // No upstream request for background tasks
-                None,             // No previous_result_id
+                None, // No upstream request for background tasks
+                None, // No previous_result_id
                 DIAGNOSTIC_REQUEST_TIMEOUT,
                 log_target,
             )
@@ -321,16 +321,14 @@ impl Kakehashi {
         // 4. Handler returns RequestCancelled error to client
         // 5. Middleware forwards cancel to ALL downstream servers via HashSet registry
         let upstream_request_id = match get_current_request_id() {
-            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => UpstreamId::Number(n),
-            Some(tower_lsp_server::jsonrpc::Id::String(s)) => UpstreamId::String(s),
-            // For notifications without ID or null ID, use Null to avoid collision with ID 0
-            None | Some(tower_lsp_server::jsonrpc::Id::Null) => UpstreamId::Null,
+            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => Some(UpstreamId::Number(n)),
+            Some(tower_lsp_server::jsonrpc::Id::String(s)) => Some(UpstreamId::String(s)),
+            None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
         };
 
         // Subscribe to cancel notifications for this request.
         // The guard ensures unsubscribe is called on all return paths (including early returns).
-        let (cancel_rx, _subscription_guard) =
-            self.subscribe_cancel(&upstream_request_id);
+        let (cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
 
         // Build request infos using the factored-out method
         let request_infos = self.build_diagnostic_request_infos(&language_name, &all_regions);

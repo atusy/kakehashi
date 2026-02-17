@@ -78,7 +78,7 @@ mod tests {
                 "region-0",
                 3, // region_start_line
                 virtual_content,
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
 
@@ -123,7 +123,7 @@ mod tests {
                 "region-0",
                 3, // region_start_line
                 virtual_content,
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
 
@@ -177,7 +177,7 @@ mod tests {
                 "region-0",
                 3, // region_start_line
                 virtual_content,
-                UpstreamId::Number(42), // upstream_request_id (unused)
+                Some(UpstreamId::Number(42)), // upstream_request_id (unused)
             )
             .await;
 
@@ -228,7 +228,7 @@ mod tests {
                 "region-0",
                 3, // region_start_line
                 virtual_content,
-                UpstreamId::Number(123), // upstream_request_id (unused)
+                Some(UpstreamId::Number(123)), // upstream_request_id (unused)
             )
             .await;
 
@@ -269,7 +269,7 @@ mod tests {
                 "region-0",
                 3, // region_start_line
                 virtual_content,
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
 

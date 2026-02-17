@@ -81,19 +81,12 @@ use super::connection::AsyncBridgeConnection;
 /// Per LSP 3.17: "interface CancelParams { id: integer | string; }"
 /// This type ensures we can forward cancel requests for clients using either ID type.
 ///
-/// # Null Variant
-///
-/// The `Null` variant handles cases where the request ID is unavailable (e.g.,
-/// `None` or `Id::Null`). This is distinct from `Number(0)` to avoid collision
-/// with valid ID 0 requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UpstreamId {
     /// Numeric request ID (most common)
     Number(i64),
     /// String request ID (less common but valid per LSP spec)
     String(String),
-    /// Null/missing request ID (edge case, distinct from Number(0))
-    Null,
 }
 
 impl std::fmt::Display for UpstreamId {
@@ -101,7 +94,6 @@ impl std::fmt::Display for UpstreamId {
         match self {
             UpstreamId::Number(n) => write!(f, "{}", n),
             UpstreamId::String(s) => write!(f, "\"{}\"", s),
-            UpstreamId::Null => write!(f, "null"),
         }
     }
 }
@@ -1148,7 +1140,10 @@ impl LanguageServerPool {
     ///
     /// Used after first-win dispatch to clean up stale entries from aborted tasks.
     /// Idempotent — safe to call even if entries were already removed.
-    pub(crate) fn unregister_all_for_upstream_id(&self, upstream_id: &UpstreamId) {
+    pub(crate) fn unregister_all_for_upstream_id(&self, upstream_id: Option<&UpstreamId>) {
+        let Some(upstream_id) = upstream_id else {
+            return;
+        };
         let mut registry = self
             .upstream_request_registry
             .lock()
@@ -1225,7 +1220,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
         assert!(
@@ -1248,7 +1243,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
         assert_eq!(
@@ -1296,7 +1291,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
         assert!(
@@ -1327,7 +1322,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(2), // upstream_request_id
+                Some(UpstreamId::Number(2)), // upstream_request_id
             )
             .await;
         assert!(
@@ -1368,7 +1363,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
 
@@ -1401,7 +1396,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('world')",
-                UpstreamId::Number(2), // upstream_request_id
+                Some(UpstreamId::Number(2)), // upstream_request_id
             )
             .await;
 
@@ -1665,7 +1660,7 @@ mod tests {
                 TEST_ULID_LUA_0,
                 3,
                 "print('hello')",
-                UpstreamId::Number(1),
+                Some(UpstreamId::Number(1)),
             )
             .await;
         assert!(result.is_ok(), "Hover request should succeed");
@@ -1723,7 +1718,7 @@ mod tests {
                 TEST_ULID_LUA_0,
                 3, // region starts at line 3, position is at line 4, so virtual line = 1
                 "print('hello')",
-                UpstreamId::Number(1),
+                Some(UpstreamId::Number(1)),
             )
             .await;
         assert!(result.is_ok(), "First hover request should succeed");
@@ -1741,7 +1736,7 @@ mod tests {
                 TEST_ULID_LUA_1,
                 7, // region starts at line 7, position is at line 8, so virtual line = 1
                 "print('world')",
-                UpstreamId::Number(2),
+                Some(UpstreamId::Number(2)),
             )
             .await;
         assert!(result.is_ok(), "Second hover request should succeed");
@@ -2003,7 +1998,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
         assert!(
@@ -2026,7 +2021,7 @@ mod tests {
                 "region-0",
                 3,
                 "print('hello')",
-                UpstreamId::Number(1), // upstream_request_id
+                Some(UpstreamId::Number(1)), // upstream_request_id
             )
             .await;
         assert_eq!(
@@ -3401,7 +3396,7 @@ mod tests {
 
         pool.register_upstream_request(upstream_id.clone(), "lua-ls");
         pool.register_upstream_request(upstream_id.clone(), "pyright");
-        pool.unregister_all_for_upstream_id(&upstream_id);
+        pool.unregister_all_for_upstream_id(Some(&upstream_id));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert!(
@@ -3417,7 +3412,7 @@ mod tests {
         let upstream_id = UpstreamId::Number(99);
 
         // Should not panic when called on non-existent entry
-        pool.unregister_all_for_upstream_id(&upstream_id);
+        pool.unregister_all_for_upstream_id(Some(&upstream_id));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert!(registry.get(&upstream_id).is_none());

@@ -66,9 +66,13 @@ impl Kakehashi {
     fn subscribe_to_cancel(&self) -> (Option<CancelReceiver>, Option<CancelSubscriptionGuard<'_>>) {
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = match get_current_request_id() {
-            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => UpstreamId::Number(n),
-            Some(tower_lsp_server::jsonrpc::Id::String(s)) => UpstreamId::String(s),
-            None | Some(tower_lsp_server::jsonrpc::Id::Null) => UpstreamId::Null,
+            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => Some(UpstreamId::Number(n)),
+            Some(tower_lsp_server::jsonrpc::Id::String(s)) => Some(UpstreamId::String(s)),
+            None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
+        };
+
+        let Some(upstream_request_id) = upstream_request_id else {
+            return (None, None);
         };
 
         // Subscribe to cancel notifications for this request
@@ -1161,14 +1165,13 @@ mod tests {
         }
 
         // Trigger cancel immediately (simulating $/cancelRequest arrival)
-        // This happens in a separate task to simulate async cancel arrival.
-        // Since there's no task-local request ID in test context, subscribe_to_cancel()
-        // will use UpstreamId::Null - we notify on that ID.
+        // We set a task-local request ID so subscribe_to_cancel() can subscribe,
+        // then notify on the same ID.
         let cancel_forwarder_clone = cancel_forwarder.clone();
         tokio::spawn(async move {
             // Small delay to ensure the request starts processing and subscribes
             sleep(Duration::from_millis(1)).await;
-            cancel_forwarder_clone.notify_cancel(&UpstreamId::Null);
+            cancel_forwarder_clone.notify_cancel(&UpstreamId::Number(999));
         });
 
         let params = SemanticTokensParams {
@@ -1179,8 +1182,14 @@ mod tests {
             partial_result_params: PartialResultParams::default(),
         };
 
-        // Call the public implementation - it will internally subscribe to cancel
-        let result = server.semantic_tokens_full_impl(params).await;
+        // Call the public implementation within a task-local request ID scope
+        // so subscribe_to_cancel() can subscribe to cancel notifications
+        let result = crate::lsp::request_id::CURRENT_REQUEST_ID
+            .scope(
+                Some(tower_lsp_server::jsonrpc::Id::Number(999)),
+                server.semantic_tokens_full_impl(params),
+            )
+            .await;
 
         // Verify we got RequestCancelled error (-32800)
         match result {
@@ -1265,13 +1274,13 @@ mod tests {
         };
 
         // Trigger cancel immediately (simulating $/cancelRequest arrival)
-        // Since there's no task-local request ID in test context, subscribe_to_cancel()
-        // will use UpstreamId::Null - we notify on that ID.
+        // We set a task-local request ID so subscribe_to_cancel() can subscribe,
+        // then notify on the same ID.
         let cancel_forwarder_clone = cancel_forwarder.clone();
         tokio::spawn(async move {
             // Small delay to ensure the request starts processing and subscribes
             sleep(Duration::from_millis(1)).await;
-            cancel_forwarder_clone.notify_cancel(&UpstreamId::Null);
+            cancel_forwarder_clone.notify_cancel(&UpstreamId::Number(999));
         });
 
         let delta_params = SemanticTokensDeltaParams {
@@ -1283,8 +1292,14 @@ mod tests {
             partial_result_params: PartialResultParams::default(),
         };
 
-        // Call the public delta implementation - it will internally subscribe to cancel
-        let result = server.semantic_tokens_full_delta_impl(delta_params).await;
+        // Call the public delta implementation within a task-local request ID scope
+        // so subscribe_to_cancel() can subscribe to cancel notifications
+        let result = crate::lsp::request_id::CURRENT_REQUEST_ID
+            .scope(
+                Some(tower_lsp_server::jsonrpc::Id::Number(999)),
+                server.semantic_tokens_full_delta_impl(delta_params),
+            )
+            .await;
 
         // Verify we got RequestCancelled error (-32800)
         match result {
