@@ -1,13 +1,9 @@
 //! Shared preamble for bridge endpoint implementations.
 //!
 //! All bridge endpoints (definition, type_definition, implementation, declaration,
-//! references, hover, completion, etc.) follow the same pattern of resolving
-//! injection context before sending requests. This module extracts that shared
-//! preamble into reusable methods.
-//!
-//! Two variants are provided:
-//! - `resolve_bridge_context`: Returns a single server config (backward compat)
-//! - `resolve_bridge_contexts`: Returns ALL matching server configs (fan-out)
+//! references, hover, completion, color_presentation, etc.) follow the same pattern
+//! of resolving injection context before sending requests. This module extracts
+//! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
 use tower_lsp_server::jsonrpc::Id;
 use tower_lsp_server::ls_types::{MessageType, Position, Uri};
@@ -21,30 +17,11 @@ use crate::text::PositionMapper;
 
 use super::{Kakehashi, uri_to_url};
 
-/// All resolved context needed to send a bridge request.
-///
-/// Produced by `Kakehashi::resolve_bridge_context`, which handles all the
-/// common preamble steps: URI conversion, document snapshot, language detection,
-/// injection resolution, bridge config lookup, and upstream request ID extraction.
-#[cfg(feature = "experimental")]
-pub(crate) struct BridgeRequestContext {
-    /// The parsed document URL (url::Url).
-    pub(crate) uri: Url,
-    /// The cursor position within the document.
-    pub(crate) position: Position,
-    /// The resolved injection region with virtual content and region metadata.
-    pub(crate) resolved: ResolvedInjection,
-    /// The bridge server config (server name + spawn config).
-    pub(crate) resolved_config: ResolvedServerConfig,
-    /// The upstream JSON-RPC request ID for cancel forwarding.
-    pub(crate) upstream_request_id: UpstreamId,
-}
-
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
-/// Produced by `Kakehashi::resolve_bridge_contexts`. Like `BridgeRequestContext`
-/// but returns ALL matching server configs for the injection language, enabling
-/// fan-out to multiple downstream servers.
+/// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
+/// configs for the injection language, enabling fan-out to multiple downstream
+/// servers via [`fan_out()`](super::text_document::first_win::fan_out).
 pub(crate) struct MultiBridgeRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
@@ -104,7 +81,7 @@ impl Kakehashi {
 
     /// Shared preamble for bridge endpoint resolution.
     ///
-    /// Handles all steps common to both single-server and multi-server resolution:
+    /// Handles all common steps before server config lookup:
     /// 1. Converts URI from ls_types to url::Url
     /// 2. Logs the method invocation
     /// 3. Gets document snapshot
@@ -197,49 +174,6 @@ impl Kakehashi {
             resolved,
             language_name,
             upstream_request_id,
-        })
-    }
-
-    /// Resolve injection context for a bridge endpoint request (single server).
-    ///
-    /// Delegates to the shared preamble, then looks up a single bridge server config.
-    ///
-    /// Returns `None` for any early-exit condition (invalid URI, no document,
-    /// no language, no injection at position, no bridge config).
-    #[cfg(feature = "experimental")]
-    pub(crate) async fn resolve_bridge_context(
-        &self,
-        lsp_uri: &Uri,
-        position: Position,
-        method_name: &str,
-    ) -> Option<BridgeRequestContext> {
-        let preamble = self
-            .resolve_bridge_preamble(lsp_uri, position, method_name)
-            .await?;
-
-        // Get bridge server config for this language (first match)
-        let Some(resolved_config) = self.get_bridge_config_for_language(
-            &preamble.language_name,
-            &preamble.resolved.injection_language,
-        ) else {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!(
-                        "No bridge server configured for language: {} (host: {})",
-                        preamble.resolved.injection_language, preamble.language_name
-                    ),
-                )
-                .await;
-            return None;
-        };
-
-        Some(BridgeRequestContext {
-            uri: preamble.uri,
-            position: preamble.position,
-            resolved: preamble.resolved,
-            resolved_config,
-            upstream_request_id: preamble.upstream_request_id,
         })
     }
 
