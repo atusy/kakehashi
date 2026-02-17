@@ -22,8 +22,9 @@ use std::time::Duration;
 use log::warn;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability, OneOf,
-    ServerCapabilities, TypeDefinitionProviderCapability,
+    ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
+    ImplementationProviderCapability, OneOf, ServerCapabilities,
+    TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -499,6 +500,14 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/documentColor" | "textDocument/colorPresentation" => matches!(
+                caps.color_provider,
+                Some(
+                    ColorProviderCapability::Simple(true)
+                        | ColorProviderCapability::ColorProvider(_)
+                        | ColorProviderCapability::Options(_)
+                )
+            ),
             _ => false,
         }
     }
@@ -1612,9 +1621,11 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_true_for_enabled_providers() {
         use tower_lsp_server::ls_types::{
-            CompletionOptions, DeclarationCapability, HoverProviderCapability,
-            ImplementationProviderCapability, OneOf, SignatureHelpOptions,
-            TypeDefinitionProviderCapability,
+            ColorProviderCapability, ColorProviderOptions, CompletionOptions,
+            DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf,
+            SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
+            TextDocumentRegistrationOptions, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -1693,6 +1704,68 @@ mod tests {
                     c.inlay_hint_provider = Some(OneOf::Left(true));
                 }),
             ),
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/colorPresentation",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::ColorProvider(
+                        ColorProviderOptions {},
+                    ));
+                }),
+            ),
+            // Declaration — RegistrationOptions variant
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider =
+                        Some(DeclarationCapability::RegistrationOptions(
+                            DeclarationRegistrationOptions {
+                                declaration_options: DeclarationOptions {
+                                    work_done_progress_options: Default::default(),
+                                },
+                                text_document_registration_options:
+                                    TextDocumentRegistrationOptions {
+                                        document_selector: None,
+                                    },
+                                static_registration_options: Default::default(),
+                            },
+                        ));
+                }),
+            ),
+            // Declaration — Options variant
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::Options(
+                        DeclarationOptions {
+                            work_done_progress_options: Default::default(),
+                        },
+                    ));
+                }),
+            ),
+            // DocumentColor — Options variant (StaticTextDocumentColorProviderOptions)
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Options(
+                        StaticTextDocumentColorProviderOptions {
+                            document_selector: None,
+                            id: None,
+                        },
+                    ));
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -1716,8 +1789,8 @@ mod tests {
     #[tokio::test]
     async fn has_capability_returns_false_for_explicitly_disabled() {
         use tower_lsp_server::ls_types::{
-            DeclarationCapability, HoverProviderCapability, ImplementationProviderCapability,
-            OneOf, TypeDefinitionProviderCapability,
+            ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
+            ImplementationProviderCapability, OneOf, TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -1784,6 +1857,12 @@ mod tests {
                     c.inlay_hint_provider = Some(OneOf::Left(false));
                 }),
             ),
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Simple(false));
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -1818,6 +1897,8 @@ mod tests {
             "textDocument/rename",
             "textDocument/moniker",
             "textDocument/inlayHint",
+            "textDocument/documentColor",
+            "textDocument/colorPresentation",
         ];
         for method in methods {
             assert!(
