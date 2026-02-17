@@ -1,10 +1,10 @@
 //! Find references method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::{Location, MessageType, ReferenceParams};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{Location, ReferenceParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn references_impl(
@@ -53,20 +53,6 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        match result {
-            FirstWinResult::Winner(locations) => Ok(locations),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(level, "No references response from any bridge server")
-                    .await;
-                Ok(None)
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result.handle(&self.client, "references", None, Ok).await
     }
 }

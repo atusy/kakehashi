@@ -1,13 +1,13 @@
 //! Goto implementation method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
+use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplementationResponse};
-use tower_lsp_server::ls_types::{Location, MessageType};
+use tower_lsp_server::ls_types::Location;
 
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn goto_implementation_impl(
@@ -54,32 +54,24 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        match result {
-            FirstWinResult::Winner(Some(links)) => {
-                if self.supports_implementation_link() {
-                    Ok(Some(GotoImplementationResponse::Link(links)))
-                } else {
-                    let locations: Vec<Location> =
-                        links.into_iter().map(location_link_to_location).collect();
-                    Ok(Some(GotoImplementationResponse::Array(locations)))
-                }
-            }
-            FirstWinResult::Winner(None) => Ok(None),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(
-                        level,
-                        "No implementation response from any bridge server",
-                    )
-                    .await;
-                Ok(None)
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result
+            .handle(
+                &self.client,
+                "implementation",
+                None,
+                |value| match value {
+                    Some(links) => {
+                        if self.supports_implementation_link() {
+                            Ok(Some(GotoImplementationResponse::Link(links)))
+                        } else {
+                            let locations: Vec<Location> =
+                                links.into_iter().map(location_link_to_location).collect();
+                            Ok(Some(GotoImplementationResponse::Array(locations)))
+                        }
+                    }
+                    None => Ok(None),
+                },
+            )
+            .await
     }
 }

@@ -1,10 +1,10 @@
 //! Hover method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::{Hover, HoverParams, MessageType};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{Hover, HoverParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn hover_impl(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -43,20 +43,6 @@ impl Kakehashi {
         // Return the first non-null hover response
         let result = first_win::first_win(&mut join_set, |opt| opt.is_some(), cancel_rx).await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
-        match result {
-            FirstWinResult::Winner(hover) => Ok(hover),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(level, "No hover response from any bridge server")
-                    .await;
-                Ok(None)
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result.handle(&self.client, "hover", None, Ok).await
     }
 }

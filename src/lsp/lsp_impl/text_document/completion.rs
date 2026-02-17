@@ -1,10 +1,10 @@
 //! Completion method for Kakehashi.
 
-use tower_lsp_server::jsonrpc::{Error, Result};
-use tower_lsp_server::ls_types::{CompletionParams, CompletionResponse, MessageType};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{CompletionParams, CompletionResponse};
 
 use super::super::Kakehashi;
-use super::first_win::{self, FirstWinResult, fan_out};
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn completion_impl(
@@ -52,20 +52,10 @@ impl Kakehashi {
         .await;
         pool.unregister_all_for_upstream_id(&ctx.upstream_request_id);
 
-        match result {
-            FirstWinResult::Winner(value) => Ok(value.map(CompletionResponse::List)),
-            FirstWinResult::NoWinner { errors } => {
-                let level = if errors > 0 {
-                    MessageType::WARNING
-                } else {
-                    MessageType::LOG
-                };
-                self.client
-                    .log_message(level, "No completion response from any bridge server")
-                    .await;
-                Ok(None)
-            }
-            FirstWinResult::Cancelled => Err(Error::request_cancelled()),
-        }
+        result
+            .handle(&self.client, "completion", None, |v| {
+                Ok(v.map(CompletionResponse::List))
+            })
+            .await
     }
 }
