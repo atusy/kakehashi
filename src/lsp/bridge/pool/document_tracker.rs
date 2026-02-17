@@ -100,7 +100,7 @@ impl DocumentTracker {
     /// Returns `false` if another caller already claimed it.
     ///
     /// Initializes the document version BEFORE marking the document as opened
-    /// in the DashSet. This ensures `increment_document_version` never returns
+    /// in opened_documents. This ensures `increment_document_version` never returns
     /// `None` for a document where `is_document_opened()` returns `true`.
     ///
     /// On send failure, call `unclaim_document()` to roll back.
@@ -130,7 +130,7 @@ impl DocumentTracker {
     ///
     /// Called when the didOpen send fails, so the document can be
     /// claimed again on a future attempt. Removes both the version
-    /// entry and the DashSet entry initialized by `try_claim_for_open()`.
+    /// entry and the opened_documents entry initialized by `try_claim_for_open()`.
     pub(super) async fn unclaim_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -162,7 +162,7 @@ impl DocumentTracker {
     /// - Document version (safety net via `or_insert` — primary initialization
     ///   happens in `try_claim_for_open()` to close the race window)
     /// - Host-to-virtual mapping (with dedup check for idempotency)
-    /// - Opened state (DashSet insert, naturally idempotent)
+    /// - Opened state (reference count increment)
     ///
     /// Note: Both `opened_documents` `or_insert(1)` and version `or_insert(1)` are
     /// safety nets. `try_claim_for_open()` already performs both operations.
