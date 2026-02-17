@@ -17,6 +17,18 @@ use crate::text::PositionMapper;
 
 use super::{Kakehashi, uri_to_url};
 
+/// Extract the upstream request ID from task-local storage.
+///
+/// Converts the tower-lsp `Id` (set by RequestIdCapture middleware) into
+/// our domain `UpstreamId`. Returns `None` for null or missing IDs.
+pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
+    match get_current_request_id() {
+        Some(Id::Number(n)) => Some(UpstreamId::Number(n)),
+        Some(Id::String(s)) => Some(UpstreamId::String(s)),
+        None | Some(Id::Null) => None,
+    }
+}
+
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
@@ -167,11 +179,7 @@ impl Kakehashi {
         };
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
-        let upstream_request_id = match get_current_request_id() {
-            Some(Id::Number(n)) => Some(UpstreamId::Number(n)),
-            Some(Id::String(s)) => Some(UpstreamId::String(s)),
-            None | Some(Id::Null) => None,
-        };
+        let upstream_request_id = current_upstream_id();
 
         Some(PreambleResult {
             uri,
