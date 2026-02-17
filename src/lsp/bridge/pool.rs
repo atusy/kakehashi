@@ -392,13 +392,14 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Check if a document has had didOpen ACTUALLY sent to downstream (ADR-0015).
+    /// Check if a document has been claimed or opened on a downstream server (ADR-0015).
     ///
-    /// This is a fast, synchronous check used by request handlers to ensure
-    /// they don't send requests before didOpen has been sent.
+    /// This is a fast, synchronous check used by request handlers and didChange
+    /// forwarding to gate operations on documents not yet known downstream.
     ///
-    /// Returns true if `register_opened_document()` has been called for this document.
-    /// Returns false if the document hasn't been opened yet.
+    /// Returns true if `try_claim_for_open()` has been called for this document
+    /// (claims happen before the actual didOpen send, with rollback on failure).
+    /// Returns false if the document hasn't been claimed yet.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         self.document_tracker.is_document_opened(virtual_uri)
     }

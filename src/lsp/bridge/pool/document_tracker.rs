@@ -59,7 +59,9 @@ pub(crate) struct DocumentTracker {
     ///
     /// Each OpenedVirtualDoc stores its server_name for reverse lookup during didClose.
     host_to_virtual: Mutex<HashMap<Url, Vec<OpenedVirtualDoc>>>,
-    /// Tracks documents that have had didOpen ACTUALLY sent to downstream.
+    /// Tracks documents claimed for opening on downstream servers.
+    /// Incremented at claim time (`try_claim_for_open`), before the actual didOpen send.
+    /// Rolled back via `unclaim_document` if the send fails.
     /// Reference-counted: multiple servers may open the same virtual URI.
     /// Uses DashMap for lock-free concurrent reads with internal sharded locking (ADR-0015).
     opened_documents: DashMap<String, usize>,
