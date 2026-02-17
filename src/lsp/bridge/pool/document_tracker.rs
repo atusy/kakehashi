@@ -374,13 +374,11 @@ impl DocumentTracker {
     ///
     /// Removes the entry entirely when no servers remain.
     fn remove_from_reverse_index(&self, uri_string: &str, server_name: &str) {
-        if let Some(mut entry) = self.virtual_to_servers.get_mut(uri_string) {
-            entry.retain(|s| s != server_name);
-            if entry.is_empty() {
-                drop(entry);
-                self.virtual_to_servers.remove(uri_string);
-            }
-        }
+        self.virtual_to_servers
+            .remove_if_mut(uri_string, |_, servers| {
+                servers.retain(|s| s != server_name);
+                servers.is_empty()
+            });
     }
 
     /// Find ALL server names that have opened a given virtual document URI.

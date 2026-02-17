@@ -93,7 +93,6 @@ impl<T> FirstWinResult<T> {
     /// - `NoWinner`: logs at WARNING (if errors > 0) or LOG (if errors == 0),
     ///   then returns `Ok(no_result)`.
     /// - `Cancelled`: returns `Err(Error::request_cancelled())`.
-    #[must_use]
     pub(super) async fn handle<R>(
         self,
         client: &tower_lsp_server::Client,
@@ -117,9 +116,7 @@ impl<T> FirstWinResult<T> {
                     .await;
                 Ok(no_result)
             }
-            FirstWinResult::Cancelled => {
-                Err(tower_lsp_server::jsonrpc::Error::request_cancelled())
-            }
+            FirstWinResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
 }
@@ -184,6 +181,11 @@ pub(super) async fn first_win<T: Send + 'static>(
             // wins and the valid result is discarded. This is correct for LSP semantics:
             // the editor has already moved on, so returning a stale result is wasteful.
             biased;
+            // `_` intentionally matches both `Ok(())` (real $/cancelRequest)
+            // and `Err(RecvError)` (sender half dropped). The cancel guard
+            // (held by the caller) always outlives `first_win()`, so in practice
+            // only `Ok` is received here. Matching both avoids a spurious panic
+            // if that invariant ever changes.
             _ = &mut cancel_rx => {
                 // abort_all() cancels in-flight tasks. Per-connection ResponseRouter
                 // entries are cleaned up by the RouterCleanupGuard in
