@@ -22,7 +22,7 @@ use super::super::protocol::{build_position_based_request, transform_location_fo
 impl LanguageServerPool {
     /// Send a references request and wait for the response.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing references-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]

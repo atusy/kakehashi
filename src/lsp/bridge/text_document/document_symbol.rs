@@ -46,7 +46,7 @@ impl LanguageServerPool {
     /// returned DocumentSymbol[] or SymbolInformation[]. SymbolInformation items
     /// are converted to DocumentSymbol with `selection_range = range`.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing document-symbol-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]

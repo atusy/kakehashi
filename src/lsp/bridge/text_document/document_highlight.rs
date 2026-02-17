@@ -22,7 +22,7 @@ use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based
 impl LanguageServerPool {
     /// Send a document highlight request and wait for the response.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing document-highlight-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]

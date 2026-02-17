@@ -22,7 +22,7 @@ use super::super::protocol::{
 impl LanguageServerPool {
     /// Send a declaration request and wait for the response.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing declaration-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]

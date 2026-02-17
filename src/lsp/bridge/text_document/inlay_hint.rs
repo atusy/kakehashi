@@ -26,7 +26,7 @@ use super::super::protocol::{RequestId, VirtualDocumentUri};
 impl LanguageServerPool {
     /// Send an inlay hint request and wait for the response.
     ///
-    /// Delegates to [`execute_bridge_request`](Self::execute_bridge_request) for the
+    /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing inlay-hint-specific request building and response
     /// transformation.
     #[allow(clippy::too_many_arguments)]

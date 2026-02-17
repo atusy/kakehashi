@@ -1,15 +1,11 @@
 //! Shared bridge request lifecycle execution.
 //!
-//! This module provides two generic methods on [`LanguageServerPool`] that
-//! encapsulate the common lifecycle boilerplate shared by all bridge request
-//! handlers (hover, definition, document_link, etc.):
-//!
-//! - `execute_bridge_request`: Full lifecycle including connection lookup
-//! - `execute_bridge_request_with_handle`: Lifecycle with pre-fetched connection handle
+//! This module provides `execute_bridge_request_with_handle` on [`LanguageServerPool`]
+//! that encapsulates the common lifecycle boilerplate shared by all bridge request
+//! handlers (hover, definition, document_link, etc.).
 //!
 //! The lifecycle steps are:
-//! 1. Get or create a connection
-//! 2. Convert host URI to `lsp_types::Uri`
+//! 1. Convert host URI to `lsp_types::Uri`
 //! 3. Build virtual document URI
 //! 4. Register upstream request for cancel forwarding
 //! 5. Register request with router to get oneshot receiver
@@ -27,7 +23,6 @@ use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
-use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::actor::ResponseRouter;
 use crate::lsp::bridge::protocol::{RequestId, VirtualDocumentUri};
 
@@ -76,10 +71,8 @@ pub(crate) struct BridgeResponseContext<'a> {
 impl LanguageServerPool {
     /// Execute a bridge request through the full lifecycle with a pre-fetched connection handle.
     ///
-    /// This method is identical to [`execute_bridge_request`](Self::execute_bridge_request)
-    /// but accepts a pre-fetched `ConnectionHandle` instead of fetching it internally.
-    /// Use this when you've already obtained a handle (e.g., for capability checking)
-    /// to avoid a redundant HashMap lookup.
+    /// Accepts a pre-fetched `ConnectionHandle`, which callers obtain via
+    /// `get_or_create_connection` (typically needed for capability checking).
     ///
     /// # Arguments
     ///
@@ -195,67 +188,6 @@ impl LanguageServerPool {
 
         Ok(transform_response(response?, &context))
     }
-
-    /// Execute a bridge request through the full lifecycle.
-    ///
-    /// This method encapsulates the common lifecycle boilerplate shared by all
-    /// bridge request handlers. It handles connection management, request
-    /// registration, document opening, request sending, response waiting, and
-    /// cleanup — leaving only request building and response transformation to
-    /// the caller.
-    ///
-    /// For handlers that need to pre-fetch the connection (e.g., for capability
-    /// checking), use [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
-    /// instead to avoid a redundant connection lookup.
-    ///
-    /// # Arguments
-    ///
-    /// * `server_name` - The server name from config (e.g., "tsgo", "lua-ls")
-    /// * `server_config` - The server configuration containing command and options
-    /// * `host_uri` - The host document URI
-    /// * `injection_language` - The injection language (e.g., "lua")
-    /// * `region_id` - The unique region ID for this injection
-    /// * `region_start_line` - The starting line of the injection region in the host document
-    /// * `virtual_content` - The content of the virtual document
-    /// * `upstream_request_id` - The original request ID from the upstream client
-    /// * `build_request` - Closure to build the JSON-RPC request from the
-    ///   virtual document URI and allocated request ID
-    /// * `transform_response` - Closure to transform the raw JSON-RPC response into the
-    ///   typed result, given the response context
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn execute_bridge_request<T>(
-        &self,
-        server_name: &str,
-        server_config: &BridgeServerConfig,
-        host_uri: &Url,
-        injection_language: &str,
-        region_id: &str,
-        region_start_line: u32,
-        virtual_content: &str,
-        upstream_request_id: Option<UpstreamId>,
-        build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
-        transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
-    ) -> io::Result<T> {
-        // Get or create connection - state check is atomic with lookup (ADR-0015)
-        let handle = self
-            .get_or_create_connection(server_name, server_config)
-            .await?;
-
-        // Delegate to the handle-based variant
-        self.execute_bridge_request_with_handle(
-            handle,
-            server_name,
-            host_uri,
-            injection_language,
-            region_id,
-            region_start_line,
-            virtual_content,
-            upstream_request_id,
-            build_request,
-            transform_response,
-        )
-        .await
-    }
 }
 
 #[cfg(test)]
@@ -264,52 +196,6 @@ mod tests {
     use crate::lsp::bridge::pool::ConnectionState;
     use crate::lsp::bridge::pool::test_helpers::*;
     use std::sync::Arc;
-
-    /// Test that execute_bridge_request returns error immediately when server is initializing.
-    ///
-    /// This validates the early-return path in the lifecycle: get_or_create_connection
-    /// returns an error for initializing servers, so the closures are never called.
-    #[tokio::test]
-    async fn execute_bridge_request_returns_error_during_init() {
-        let pool = Arc::new(LanguageServerPool::new());
-        let config = devnull_config();
-
-        // Insert a ConnectionHandle with Initializing state
-        {
-            let handle = create_handle_with_state(ConnectionState::Initializing).await;
-            pool.connections
-                .lock()
-                .await
-                .insert("lua".to_string(), handle);
-        }
-
-        let host_uri = test_host_uri("doc");
-
-        let result = pool
-            .execute_bridge_request(
-                "lua",
-                &config,
-                &host_uri,
-                "lua",
-                TEST_ULID_LUA_0,
-                3,
-                "print('hello')",
-                Some(UpstreamId::Number(1)),
-                |_virtual_uri, _request_id| {
-                    panic!("build_request should not be called during init");
-                },
-                |_response, _ctx| -> Option<()> {
-                    panic!("transform_response should not be called during init");
-                },
-            )
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "bridge: downstream server initializing"
-        );
-    }
 
     /// Test that send_hover_request returns Ok(None) when server lacks hover capability.
     ///

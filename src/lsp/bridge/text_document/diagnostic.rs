@@ -36,7 +36,7 @@ impl LanguageServerPool {
     /// than seeing empty results.
     ///
     /// After the wait-for-ready and capability check, delegates to
-    /// [`execute_bridge_request`](Self::execute_bridge_request) for the standard
+    /// [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the standard
     /// lifecycle.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_diagnostic_request(
