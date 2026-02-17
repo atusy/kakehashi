@@ -65,7 +65,7 @@ impl Kakehashi {
     ///
     /// The tuple return type allows callers to destructure directly:
     /// ```ignore
-    /// let (cancel_rx, _cancel_guard) = self.subscribe_cancel(&ctx.upstream_request_id);
+    /// let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
     /// ```
     pub(crate) fn subscribe_cancel(
         &self,
