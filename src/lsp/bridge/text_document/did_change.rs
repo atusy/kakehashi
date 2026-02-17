@@ -60,52 +60,60 @@ impl LanguageServerPool {
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
 
-            // Check if this virtual doc has ACTUALLY been opened (didOpen sent to downstream)
-            // per ADR-0015. This prevents sending didChange before didOpen.
-            if self.is_document_opened(&virtual_uri) {
-                // Look up server_name from tracking (reverse lookup via OpenedVirtualDoc.server_name)
-                // This is required because pool is keyed by server_name, not language.
-                let Some(server_name) = self.get_server_for_virtual_uri(&virtual_uri).await else {
-                    log::warn!(
-                        target: "kakehashi::bridge",
-                        "Could not find server_name for virtual_uri: {}, skipping didChange",
-                        virtual_uri.to_uri_string()
-                    );
+            // Check if this virtual doc has been claimed or opened on a downstream server.
+            // The claim happens before the actual didOpen send (see try_claim_for_open),
+            // but FIFO ordering via the single-writer loop ensures didChange arrives
+            // after didOpen on the wire.
+            if !self.is_document_opened(&virtual_uri) {
+                // Not opened yet - didOpen will be sent on first request
+                continue;
+            }
+
+            // Look up ALL server names that have this virtual doc open.
+            // Multiple servers may handle the same language (e.g., emmylua and lua_ls).
+            let server_names = self.get_all_servers_for_virtual_uri(&virtual_uri);
+
+            for server_name in server_names {
+                // Check connection state BEFORE incrementing version.
+                // Non-Ready servers shouldn't consume version numbers.
+                //
+                // TOCTOU note: The connection state is checked under the `connections`
+                // lock, but the lock is released before `increment_document_version`
+                // acquires a separate lock. A server could transition away from Ready
+                // between these two operations. This is acceptable: worst case is a
+                // wasted version number and a silently-failed send (the channel write
+                // is non-blocking fire-and-forget).
+                let handle = {
+                    let connections = self.connections().await;
+                    let Some(handle) = connections.get(&server_name) else {
+                        continue;
+                    };
+
+                    if handle.state() != ConnectionState::Ready {
+                        continue;
+                    }
+
+                    Arc::clone(handle)
+                };
+
+                // increment_document_version acts as per-server filter:
+                // returns None if this server hasn't registered the doc.
+                let Some(version) = self
+                    .increment_document_version(&virtual_uri, &server_name)
+                    .await
+                else {
                     continue;
                 };
 
-                // Get version and send didChange
-                if let Some(version) = self
-                    .increment_document_version(&virtual_uri, &server_name)
-                    .await
-                {
-                    let handle = {
-                        let connections = self.connections().await;
-                        let Some(handle) = connections.get(&server_name) else {
-                            continue;
-                        };
-
-                        if handle.state() != ConnectionState::Ready {
-                            continue;
-                        }
-
-                        Arc::clone(handle)
-                    };
-
-                    // Send didChange notification via single-writer loop (ADR-0015).
-                    // This is non-blocking and maintains FIFO ordering.
-                    // Unlike the previous tokio::spawn approach, this ensures
-                    // didChange notifications are ordered correctly relative
-                    // to subsequent requests.
-                    Self::send_didchange_for_virtual_doc(
-                        &handle,
-                        &virtual_uri.to_uri_string(),
-                        &injection.content,
-                        version,
-                    );
-                }
+                // Send didChange notification via single-writer loop (ADR-0015).
+                // This is non-blocking and maintains FIFO ordering.
+                Self::send_didchange_for_virtual_doc(
+                    &handle,
+                    &virtual_uri.to_uri_string(),
+                    &injection.content,
+                    version,
+                );
             }
-            // If not opened, skip - didOpen will be sent on first request
         }
     }
 

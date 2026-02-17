@@ -28,15 +28,39 @@ use url::Url;
 
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
 use crate::config::settings::BridgeServerConfig;
+use crate::lsp::bridge::actor::ResponseRouter;
 use crate::lsp::bridge::protocol::{RequestId, VirtualDocumentUri};
+
+/// RAII guard that removes a pending ResponseRouter entry on drop.
+///
+/// When a `first_win()` task is aborted (via `JoinSet::abort_all()`), the
+/// future is dropped at its next `.await` point. Without this guard, the
+/// ResponseRouter entry for the in-flight request would remain until the
+/// downstream server responds (oneshot send fails silently) or the
+/// connection drops (`fail_all()`).
+///
+/// The guard is disarmed after `wait_for_response` completes, because at
+/// that point the router has already consumed or cleaned up the entry.
+struct RouterCleanupGuard {
+    router: Arc<ResponseRouter>,
+    /// When `Some`, Drop will remove the router entry for this ID.
+    /// `take()`d after wait_for_response completes to disarm.
+    request_id: Option<RequestId>,
+}
+
+impl Drop for RouterCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.request_id {
+            self.router.remove(id);
+        }
+    }
+}
 
 /// Context provided to response transformers during bridge request execution.
 ///
 /// This struct holds the data that response transformers commonly need to
 /// translate coordinates and URIs from virtual document space back to host
 /// document space.
-///
-/// Fields are added incrementally as handlers are migrated.
 pub(crate) struct BridgeResponseContext<'a> {
     /// The virtual document URI string (for matching against response URIs
     /// to determine whether locations point to the same virtual document).
@@ -81,7 +105,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
@@ -96,15 +120,19 @@ impl LanguageServerPool {
         // This order matters: if a cancel arrives between pool and router registration,
         // the cancel will fail at the router lookup (which is acceptable for best-effort
         // cancel semantics) rather than finding the server but no downstream ID.
-        self.register_upstream_request(upstream_request_id.clone(), server_name);
+        if let Some(ref id) = upstream_request_id {
+            self.register_upstream_request(id.clone(), server_name);
+        }
 
         // Register request with upstream ID mapping for cancel forwarding
         let (request_id, response_rx) =
-            match handle.register_request_with_upstream(Some(upstream_request_id.clone())) {
+            match handle.register_request_with_upstream(upstream_request_id.clone()) {
                 Ok(result) => result,
                 Err(e) => {
                     // Clean up the pool registration on failure
-                    self.unregister_upstream_request(&upstream_request_id, server_name);
+                    if let Some(ref id) = upstream_request_id {
+                        self.unregister_upstream_request(id, server_name);
+                    }
                     return Err(e);
                 }
             };
@@ -112,10 +140,12 @@ impl LanguageServerPool {
         // Build the request via caller-provided closure
         let request = build_request(&virtual_uri, request_id);
 
-        // Use a closure for cleanup on any failure path
-        let cleanup = || {
-            handle.router().remove(request_id);
-            self.unregister_upstream_request(&upstream_request_id, server_name);
+        // RAII guard: removes the ResponseRouter entry if the task is aborted
+        // (e.g., by JoinSet::abort_all() in first_win). Disarmed after
+        // wait_for_response completes normally (any exit path).
+        let mut router_guard = RouterCleanupGuard {
+            router: Arc::clone(handle.router()),
+            request_id: Some(request_id),
         };
 
         // Send didOpen notification only if document hasn't been opened yet
@@ -129,21 +159,32 @@ impl LanguageServerPool {
             )
             .await
         {
-            cleanup();
+            // router_guard drops here, cleaning up the router entry
+            if let Some(ref id) = upstream_request_id {
+                self.unregister_upstream_request(id, server_name);
+            }
             return Err(e);
         }
 
         // Queue the request via single-writer loop (ADR-0015)
         if let Err(e) = handle.send_request(request, request_id) {
-            cleanup();
+            // router_guard drops here, cleaning up the router entry
+            if let Some(ref id) = upstream_request_id {
+                self.unregister_upstream_request(id, server_name);
+            }
             return Err(e.into());
         }
 
-        // Wait for response via oneshot channel (no Mutex held) with timeout
+        // Wait for response via oneshot channel (no Mutex held) with timeout.
+        // After this returns (success, channel-closed, or timeout),
+        // the router entry has been consumed or cleaned up internally.
         let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.request_id.take();
 
         // Unregister from the upstream request registry regardless of result
-        self.unregister_upstream_request(&upstream_request_id, server_name);
+        if let Some(ref id) = upstream_request_id {
+            self.unregister_upstream_request(id, server_name);
+        }
 
         // Build context and transform response via caller-provided closure
         let context = BridgeResponseContext {
@@ -191,7 +232,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
@@ -253,7 +294,7 @@ mod tests {
                 TEST_ULID_LUA_0,
                 3,
                 "print('hello')",
-                UpstreamId::Number(1),
+                Some(UpstreamId::Number(1)),
                 |_virtual_uri, _request_id| {
                     panic!("build_request should not be called during init");
                 },
@@ -267,6 +308,91 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "bridge: downstream server initializing"
+        );
+    }
+
+    /// Test that send_hover_request returns Ok(None) when server lacks hover capability.
+    ///
+    /// This validates the capability guard pattern: when a connection exists and is
+    /// Ready but doesn't advertise hover support (server_capabilities not set),
+    /// the request should short-circuit to Ok(None) without attempting to send.
+    #[tokio::test]
+    async fn send_hover_request_returns_none_when_no_hover_capability() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = devnull_config();
+
+        // Insert a Ready connection with no capabilities set (all providers = None)
+        {
+            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            // Don't call set_server_capabilities — all providers will be None
+            pool.connections
+                .lock()
+                .await
+                .insert("test-server".to_string(), handle);
+        }
+
+        let host_uri = test_host_uri("doc");
+        let result = pool
+            .send_hover_request(
+                "test-server",
+                &config,
+                &host_uri,
+                tower_lsp_server::ls_types::Position {
+                    line: 0,
+                    character: 0,
+                },
+                "lua",
+                TEST_ULID_LUA_0,
+                0,
+                "print('hello')",
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap().is_none(),
+            "Should return None when server lacks hover capability"
+        );
+    }
+
+    /// RouterCleanupGuard removes the router entry when dropped while armed.
+    #[test]
+    fn router_cleanup_guard_removes_entry_when_armed() {
+        let router = Arc::new(ResponseRouter::new());
+        let rx = router.register(RequestId::new(1)).expect("should register");
+
+        let guard = RouterCleanupGuard {
+            router: Arc::clone(&router),
+            request_id: Some(RequestId::new(1)),
+        };
+        drop(guard);
+
+        // The entry should have been removed — register again should succeed
+        drop(rx); // drop the old receiver first
+        assert!(
+            router.register(RequestId::new(1)).is_some(),
+            "entry should have been removed by the guard"
+        );
+    }
+
+    /// RouterCleanupGuard does NOT remove the router entry when disarmed.
+    #[test]
+    fn router_cleanup_guard_skips_removal_when_disarmed() {
+        let router = Arc::new(ResponseRouter::new());
+        let _rx = router.register(RequestId::new(1)).expect("should register");
+
+        let mut guard = RouterCleanupGuard {
+            router: Arc::clone(&router),
+            request_id: Some(RequestId::new(1)),
+        };
+        guard.request_id.take();
+        drop(guard);
+
+        // The entry should still be present — re-registering should fail (duplicate)
+        assert!(
+            router.register(RequestId::new(1)).is_none(),
+            "entry should still be present since guard was disarmed"
         );
     }
 

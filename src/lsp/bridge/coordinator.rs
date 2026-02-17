@@ -55,8 +55,13 @@ pub(crate) struct InjectionRegion {
 pub(crate) struct ResolvedServerConfig {
     /// The server name from the languageServers config key (e.g., "tsgo", "rust-analyzer")
     pub(crate) server_name: String,
-    /// The server configuration (cmd, languages, initialization_options, etc.)
-    pub(crate) config: BridgeServerConfig,
+    /// The server configuration (cmd, languages, initialization_options, etc.).
+    ///
+    /// Wrapped in `Arc` to avoid cloning large configs during fan-out dispatch.
+    /// Each spawned task gets an `Arc::clone` (atomic increment) instead of a
+    /// deep clone of `Vec<String>` fields. `send_*_request` takes `&BridgeServerConfig`,
+    /// so the `Arc` auto-derefs transparently.
+    pub(crate) config: Arc<BridgeServerConfig>,
 }
 
 /// A batch of eager-open task handles with a generation counter.
@@ -258,7 +263,7 @@ impl BridgeCoordinator {
                 {
                     return Some(ResolvedServerConfig {
                         server_name: server_name.clone(),
-                        config: resolved_config,
+                        config: Arc::new(resolved_config),
                     });
                 }
             }
@@ -311,7 +316,7 @@ impl BridgeCoordinator {
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
-                        config,
+                        config: Arc::new(config),
                     })
             })
             .collect();
@@ -443,7 +448,7 @@ impl BridgeCoordinator {
 
         // Group injections by server name
         // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
-        type ServerGroup = (BridgeServerConfig, Vec<InjectionRegion>);
+        type ServerGroup = (Arc<BridgeServerConfig>, Vec<InjectionRegion>);
         let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
 
         for injection in injections {

@@ -117,7 +117,7 @@ pub(crate) fn resolve_language_server_with_wildcard(
 /// - If neither exists: return None
 ///
 /// The merge creates a new LanguageSettings where specific values override wildcard values.
-/// This is used by get_bridge_config_for_language to look up host language settings.
+/// This is used by bridge config lookup functions to resolve host language settings.
 pub(crate) fn resolve_language_settings_with_wildcard(
     map: &HashMap<String, LanguageSettings>,
     key: &str,

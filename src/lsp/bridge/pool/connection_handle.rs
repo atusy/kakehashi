@@ -21,7 +21,10 @@ use std::time::Duration;
 
 use log::warn;
 use tokio::sync::mpsc;
-use tower_lsp_server::ls_types::ServerCapabilities;
+use tower_lsp_server::ls_types::{
+    ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
+    ImplementationProviderCapability, OneOf, ServerCapabilities, TypeDefinitionProviderCapability,
+};
 
 use super::connection_action::BridgeError;
 use super::dynamic_capability_registry::DynamicCapabilityRegistry;
@@ -416,10 +419,29 @@ impl ConnectionHandle {
     ///
     /// Dynamic registrations take precedence since they may arrive after initialize.
     ///
-    /// To add a new method, add a match arm mapping the LSP method string to the
-    /// corresponding field in `ServerCapabilities`:
+    /// # Capability check patterns
+    ///
+    /// Static capability fields use two different check patterns depending on the
+    /// LSP type's shape:
+    ///
+    /// - **`is_some()`** — for struct-only types (`completion_provider`, `signature_help_provider`,
+    ///   `diagnostic_provider`). These have no boolean/`false` variant; `Some(…)` always
+    ///   means "supported".
+    ///
+    /// - **`matches!(…)`** — for boolean-or-struct enums (`HoverProviderCapability`,
+    ///   `OneOf<bool, …>`, `ColorProviderCapability`, etc.). These contain a `Simple(false)` /
+    ///   `Left(false)` variant that explicitly disables the capability, so a bare `is_some()`
+    ///   would incorrectly treat `Some(Simple(false))` as supported.
+    ///
+    /// To add a new method, add a match arm using the appropriate pattern for its type:
     /// ```ignore
-    /// "textDocument/hover" => caps.hover_provider.is_some(),
+    /// // Struct-only — no false variant exists
+    /// "textDocument/completion" => caps.completion_provider.is_some(),
+    /// // Boolean-or-struct enum — must reject the false variant
+    /// "textDocument/hover" => matches!(
+    ///     caps.hover_provider,
+    ///     Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+    /// ),
     /// ```
     pub(crate) fn has_capability(&self, method: &str) -> bool {
         // Check dynamic registrations first (may arrive after initialize)
@@ -432,6 +454,78 @@ impl ConnectionHandle {
         };
         match method {
             "textDocument/diagnostic" => caps.diagnostic_provider.is_some(),
+            "textDocument/hover" => matches!(
+                caps.hover_provider,
+                Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+            ),
+            "textDocument/completion" => caps.completion_provider.is_some(),
+            "textDocument/definition" => {
+                matches!(
+                    caps.definition_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
+            "textDocument/typeDefinition" => matches!(
+                caps.type_definition_provider,
+                Some(
+                    TypeDefinitionProviderCapability::Simple(true)
+                        | TypeDefinitionProviderCapability::Options(_)
+                )
+            ),
+            "textDocument/declaration" => matches!(
+                caps.declaration_provider,
+                Some(
+                    DeclarationCapability::Simple(true)
+                        | DeclarationCapability::RegistrationOptions(_)
+                        | DeclarationCapability::Options(_)
+                )
+            ),
+            "textDocument/implementation" => matches!(
+                caps.implementation_provider,
+                Some(
+                    ImplementationProviderCapability::Simple(true)
+                        | ImplementationProviderCapability::Options(_)
+                )
+            ),
+            "textDocument/references" => {
+                matches!(
+                    caps.references_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
+            "textDocument/documentHighlight" => {
+                matches!(
+                    caps.document_highlight_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
+            "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+            "textDocument/rename" => {
+                matches!(
+                    caps.rename_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
+            "textDocument/moniker" => {
+                matches!(
+                    caps.moniker_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
+            "textDocument/inlayHint" => {
+                matches!(
+                    caps.inlay_hint_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
+            "textDocument/documentColor" | "textDocument/colorPresentation" => matches!(
+                caps.color_provider,
+                Some(
+                    ColorProviderCapability::Simple(true)
+                        | ColorProviderCapability::ColorProvider(_)
+                        | ColorProviderCapability::Options(_)
+                )
+            ),
             _ => false,
         }
     }
@@ -1531,5 +1625,302 @@ mod tests {
         });
         // This method has no static capability mapping
         assert!(!handle.has_capability("textDocument/someUnknownMethod"));
+    }
+
+    // ========================================
+    // Position-based Capability Check Tests (table-driven)
+    // ========================================
+
+    /// Table-driven test: has_capability returns true for each supported method
+    /// when the corresponding capability is enabled.
+    ///
+    /// Each entry sets exactly one capability field, then asserts has_capability
+    /// returns true for the matching method.
+    #[tokio::test]
+    async fn has_capability_returns_true_for_enabled_providers() {
+        use tower_lsp_server::ls_types::{
+            ColorProviderCapability, ColorProviderOptions, CompletionOptions,
+            DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
+            HoverProviderCapability, ImplementationProviderCapability, OneOf, SignatureHelpOptions,
+            StaticTextDocumentColorProviderOptions, TextDocumentRegistrationOptions,
+            TypeDefinitionProviderCapability,
+        };
+
+        type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
+        let cases: Vec<CapCase> = vec![
+            (
+                "textDocument/hover",
+                Box::new(|c| {
+                    c.hover_provider = Some(HoverProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/completion",
+                Box::new(|c| {
+                    c.completion_provider = Some(CompletionOptions::default());
+                }),
+            ),
+            (
+                "textDocument/definition",
+                Box::new(|c| {
+                    c.definition_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/typeDefinition",
+                Box::new(|c| {
+                    c.type_definition_provider =
+                        Some(TypeDefinitionProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/implementation",
+                Box::new(|c| {
+                    c.implementation_provider =
+                        Some(ImplementationProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/references",
+                Box::new(|c| {
+                    c.references_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/documentHighlight",
+                Box::new(|c| {
+                    c.document_highlight_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/signatureHelp",
+                Box::new(|c| {
+                    c.signature_help_provider = Some(SignatureHelpOptions::default());
+                }),
+            ),
+            (
+                "textDocument/rename",
+                Box::new(|c| {
+                    c.rename_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/moniker",
+                Box::new(|c| {
+                    c.moniker_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/inlayHint",
+                Box::new(|c| {
+                    c.inlay_hint_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/colorPresentation",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Simple(true));
+                }),
+            ),
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::ColorProvider(
+                        ColorProviderOptions {},
+                    ));
+                }),
+            ),
+            // Declaration — RegistrationOptions variant
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::RegistrationOptions(
+                        DeclarationRegistrationOptions {
+                            declaration_options: DeclarationOptions {
+                                work_done_progress_options: Default::default(),
+                            },
+                            text_document_registration_options: TextDocumentRegistrationOptions {
+                                document_selector: None,
+                            },
+                            static_registration_options: Default::default(),
+                        },
+                    ));
+                }),
+            ),
+            // Declaration — Options variant
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider =
+                        Some(DeclarationCapability::Options(DeclarationOptions {
+                            work_done_progress_options: Default::default(),
+                        }));
+                }),
+            ),
+            // DocumentColor — Options variant (StaticTextDocumentColorProviderOptions)
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Options(
+                        StaticTextDocumentColorProviderOptions {
+                            document_selector: None,
+                            id: None,
+                        },
+                    ));
+                }),
+            ),
+        ];
+
+        for (method, set_cap) in &cases {
+            let handle = spawn_sink_handle().await;
+            let mut caps = ServerCapabilities::default();
+            set_cap(&mut caps);
+            handle.set_server_capabilities(caps);
+
+            assert!(
+                handle.has_capability(method),
+                "has_capability({method}) should return true when enabled",
+            );
+        }
+    }
+
+    /// Table-driven test: has_capability returns false when capabilities are
+    /// explicitly disabled via `Simple(false)` / `OneOf::Left(false)`.
+    ///
+    /// LSP spec allows servers to advertise `Some(false)` to explicitly disable
+    /// a capability.
+    #[tokio::test]
+    async fn has_capability_returns_false_for_explicitly_disabled() {
+        use tower_lsp_server::ls_types::{
+            ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
+            ImplementationProviderCapability, OneOf, TypeDefinitionProviderCapability,
+        };
+
+        type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
+        let cases: Vec<CapCase> = vec![
+            (
+                "textDocument/hover",
+                Box::new(|c| {
+                    c.hover_provider = Some(HoverProviderCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/definition",
+                Box::new(|c| {
+                    c.definition_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/typeDefinition",
+                Box::new(|c| {
+                    c.type_definition_provider =
+                        Some(TypeDefinitionProviderCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/declaration",
+                Box::new(|c| {
+                    c.declaration_provider = Some(DeclarationCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/implementation",
+                Box::new(|c| {
+                    c.implementation_provider =
+                        Some(ImplementationProviderCapability::Simple(false));
+                }),
+            ),
+            (
+                "textDocument/references",
+                Box::new(|c| {
+                    c.references_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/documentHighlight",
+                Box::new(|c| {
+                    c.document_highlight_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/rename",
+                Box::new(|c| {
+                    c.rename_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/moniker",
+                Box::new(|c| {
+                    c.moniker_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/inlayHint",
+                Box::new(|c| {
+                    c.inlay_hint_provider = Some(OneOf::Left(false));
+                }),
+            ),
+            (
+                "textDocument/documentColor",
+                Box::new(|c| {
+                    c.color_provider = Some(ColorProviderCapability::Simple(false));
+                }),
+            ),
+        ];
+
+        for (method, set_cap) in &cases {
+            let handle = spawn_sink_handle().await;
+            let mut caps = ServerCapabilities::default();
+            set_cap(&mut caps);
+            handle.set_server_capabilities(caps);
+
+            assert!(
+                !handle.has_capability(method),
+                "has_capability({method}) should return false when explicitly disabled",
+            );
+        }
+    }
+
+    /// Test has_capability returns false for each method when the provider is NOT set.
+    #[tokio::test]
+    async fn has_capability_returns_false_for_unset_providers() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+
+        let methods = [
+            "textDocument/hover",
+            "textDocument/completion",
+            "textDocument/definition",
+            "textDocument/typeDefinition",
+            "textDocument/declaration",
+            "textDocument/implementation",
+            "textDocument/references",
+            "textDocument/documentHighlight",
+            "textDocument/signatureHelp",
+            "textDocument/rename",
+            "textDocument/moniker",
+            "textDocument/inlayHint",
+            "textDocument/documentColor",
+            "textDocument/colorPresentation",
+        ];
+        for method in methods {
+            assert!(
+                !handle.has_capability(method),
+                "has_capability({}) should return false with default capabilities",
+                method
+            );
+        }
     }
 }

@@ -84,11 +84,17 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<SignatureHelp>> {
-        self.execute_bridge_request(
+        let handle = self
+            .get_or_create_connection(server_name, server_config)
+            .await?;
+        if !handle.has_capability("textDocument/signatureHelp") {
+            return Ok(None);
+        }
+        self.execute_bridge_request_with_handle(
+            handle,
             server_name,
-            server_config,
             host_uri,
             injection_language,
             region_id,

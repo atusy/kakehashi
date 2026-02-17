@@ -26,13 +26,11 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
+use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
 use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
 use crate::lsp::get_current_request_id;
-use crate::lsp::request_id::CancelSubscriptionGuard;
-
-use super::super::{Kakehashi, uri_to_url};
 
 // ============================================================================
 // Shared diagnostic utilities (used by both pull and synthetic push diagnostics)
@@ -86,7 +84,7 @@ pub(crate) async fn send_diagnostic_with_timeout(
     pool: &LanguageServerPool,
     info: &DiagnosticRequestInfo,
     uri: &Url,
-    upstream_request_id: UpstreamId,
+    upstream_request_id: Option<UpstreamId>,
     previous_result_id: Option<&str>,
     timeout: Duration,
     log_target: &str,
@@ -157,8 +155,8 @@ pub(crate) async fn fan_out_diagnostic_requests(
                 &pool,
                 &info,
                 &uri,
-                UpstreamId::Null, // No upstream request for background tasks
-                None,             // No previous_result_id
+                None, // No upstream request for background tasks
+                None, // No previous_result_id
                 DIAGNOSTIC_REQUEST_TIMEOUT,
                 log_target,
             )
@@ -227,10 +225,11 @@ impl Kakehashi {
             for resolved_config in configs {
                 let server_name = resolved_config.server_name.clone();
 
-                // Reuse Arc if we've already seen this server, otherwise create new Arc
+                // Reuse Arc if we've already seen this server, otherwise clone the existing Arc.
+                // Since ResolvedServerConfig.config is already Arc-wrapped, this is cheap.
                 let config_arc = config_cache
                     .entry(server_name.clone())
-                    .or_insert_with(|| Arc::new(resolved_config.config.clone()))
+                    .or_insert_with(|| Arc::clone(&resolved_config.config))
                     .clone();
 
                 request_infos.push(DiagnosticRequestInfo {
@@ -322,40 +321,14 @@ impl Kakehashi {
         // 4. Handler returns RequestCancelled error to client
         // 5. Middleware forwards cancel to ALL downstream servers via HashSet registry
         let upstream_request_id = match get_current_request_id() {
-            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => UpstreamId::Number(n),
-            Some(tower_lsp_server::jsonrpc::Id::String(s)) => UpstreamId::String(s),
-            // For notifications without ID or null ID, use Null to avoid collision with ID 0
-            None | Some(tower_lsp_server::jsonrpc::Id::Null) => UpstreamId::Null,
+            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => Some(UpstreamId::Number(n)),
+            Some(tower_lsp_server::jsonrpc::Id::String(s)) => Some(UpstreamId::String(s)),
+            None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
         };
 
-        // Subscribe to cancel notifications for this request
-        // The receiver completes when $/cancelRequest arrives for this ID
-        // AlreadySubscribedError indicates a bug (same request ID subscribed twice)
-        // - proceed without cancel support rather than failing the request
-        //
+        // Subscribe to cancel notifications for this request.
         // The guard ensures unsubscribe is called on all return paths (including early returns).
-        let (cancel_rx, _subscription_guard) = match self
-            .bridge
-            .cancel_forwarder()
-            .subscribe(upstream_request_id.clone())
-        {
-            Ok(rx) => {
-                let guard = CancelSubscriptionGuard::new(
-                    self.bridge.cancel_forwarder(),
-                    upstream_request_id.clone(),
-                );
-                (Some(rx), Some(guard))
-            }
-            Err(e) => {
-                log::error!(
-                    target: "kakehashi::diagnostic",
-                    "Failed to subscribe to cancel notifications for {}: already subscribed. \
-                     This is a bug - proceeding without cancel support.",
-                    e.0
-                );
-                (None, None)
-            }
-        };
+        let (cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
 
         // Build request infos using the factored-out method
         let request_infos = self.build_diagnostic_request_infos(&language_name, &all_regions);

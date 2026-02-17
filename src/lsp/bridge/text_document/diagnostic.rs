@@ -48,7 +48,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
         previous_result_id: Option<&str>,
     ) -> io::Result<Vec<Diagnostic>> {
         // Pre-work: wait for server to become Ready (unlike other handlers that fail fast).

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use dashmap::DashSet;
+use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use url::Url;
@@ -47,7 +47,7 @@ pub(crate) struct OpenedVirtualDoc {
 /// # Lock Strategy
 ///
 /// Each Mutex (`document_versions`, `host_to_virtual`) is acquired and released
-/// independently — never held simultaneously. The DashSet `opened_documents`
+/// independently — never held simultaneously. The DashMap `opened_documents`
 /// provides lock-free concurrent reads with internal sharded locking.
 pub(crate) struct DocumentTracker {
     /// Map of server_name -> (virtual document URI -> version).
@@ -59,9 +59,17 @@ pub(crate) struct DocumentTracker {
     ///
     /// Each OpenedVirtualDoc stores its server_name for reverse lookup during didClose.
     host_to_virtual: Mutex<HashMap<Url, Vec<OpenedVirtualDoc>>>,
-    /// Tracks documents that have had didOpen ACTUALLY sent to downstream.
-    /// Uses DashSet for lock-free concurrent reads and atomic insert (ADR-0015).
-    opened_documents: DashSet<String>,
+    /// Tracks documents claimed for opening on downstream servers.
+    /// Incremented at claim time (`try_claim_for_open`), before the actual didOpen send.
+    /// Rolled back via `unclaim_document` if the send fails.
+    /// Reference-counted: multiple servers may open the same virtual URI.
+    /// Uses DashMap for lock-free concurrent reads with internal sharded locking (ADR-0015).
+    opened_documents: DashMap<String, usize>,
+    /// Reverse index: virtual URI string → server names that have this doc open.
+    ///
+    /// Enables O(1) lookup in `get_all_servers_for_virtual_uri()`, replacing the
+    /// previous O(N×M) scan over `host_to_virtual`.
+    virtual_to_servers: DashMap<String, Vec<String>>,
 }
 
 impl DocumentTracker {
@@ -73,7 +81,8 @@ impl DocumentTracker {
         Self {
             document_versions: Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
-            opened_documents: DashSet::new(),
+            opened_documents: DashMap::new(),
+            virtual_to_servers: DashMap::new(),
         }
     }
 
@@ -82,7 +91,9 @@ impl DocumentTracker {
     /// Fast, synchronous check used by request handlers and didChange
     /// forwarding to gate operations on documents not yet known downstream.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
-        self.opened_documents.contains(&virtual_uri.to_uri_string())
+        self.opened_documents
+            .get(&virtual_uri.to_uri_string())
+            .is_some_and(|count| *count > 0)
     }
 
     /// Atomically claim a virtual document URI for opening.
@@ -91,7 +102,7 @@ impl DocumentTracker {
     /// Returns `false` if another caller already claimed it.
     ///
     /// Initializes the document version BEFORE marking the document as opened
-    /// in the DashSet. This ensures `increment_document_version` never returns
+    /// in opened_documents. This ensures `increment_document_version` never returns
     /// `None` for a document where `is_document_opened()` returns `true`.
     ///
     /// On send failure, call `unclaim_document()` to roll back.
@@ -113,7 +124,18 @@ impl DocumentTracker {
         }
 
         // Step 2: Mark as opened — version is already available for concurrent didChange
-        self.opened_documents.insert(uri_string);
+        *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
+
+        // Step 3: Update reverse index so get_all_servers_for_virtual_uri works immediately.
+        // This closes the TOCTOU gap between claim and register_opened_document.
+        // register_opened_document will perform an idempotent duplicate-check insert.
+        {
+            let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
+            if !servers.contains(&server_name.to_string()) {
+                servers.push(server_name.to_string());
+            }
+        }
+
         true
     }
 
@@ -121,7 +143,7 @@ impl DocumentTracker {
     ///
     /// Called when the didOpen send fails, so the document can be
     /// claimed again on a future attempt. Removes both the version
-    /// entry and the DashSet entry initialized by `try_claim_for_open()`.
+    /// entry and the opened_documents entry initialized by `try_claim_for_open()`.
     pub(super) async fn unclaim_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -137,8 +159,9 @@ impl DocumentTracker {
             }
         }
 
-        // Then remove from opened set
-        self.opened_documents.remove(&uri_string);
+        // Then decrement the opened refcount and clean reverse index
+        self.decrement_opened(&uri_string);
+        self.remove_from_reverse_index(&uri_string, server_name);
     }
 
     /// Register a document's host_to_virtual mapping.
@@ -152,9 +175,9 @@ impl DocumentTracker {
     /// - Document version (safety net via `or_insert` — primary initialization
     ///   happens in `try_claim_for_open()` to close the race window)
     /// - Host-to-virtual mapping (with dedup check for idempotency)
-    /// - Opened state (DashSet insert, naturally idempotent)
+    /// - Opened state (reference count increment)
     ///
-    /// Note: Both `opened_documents` insert and version `or_insert(1)` are
+    /// Note: Both `opened_documents` `or_insert(1)` and version `or_insert(1)` are
     /// safety nets. `try_claim_for_open()` already performs both operations.
     /// They are kept here for test helpers that call `register_opened_document`
     /// directly without going through the claim path.
@@ -180,10 +203,9 @@ impl DocumentTracker {
         {
             let mut host_map = self.host_to_virtual.lock().await;
             let docs = host_map.entry(host_uri.clone()).or_default();
-            if !docs
-                .iter()
-                .any(|d| d.virtual_uri.to_uri_string() == uri_string)
-            {
+            if !docs.iter().any(|d| {
+                d.virtual_uri.to_uri_string() == uri_string && d.server_name == server_name
+            }) {
                 docs.push(OpenedVirtualDoc {
                     virtual_uri: virtual_uri.clone(),
                     server_name: server_name.to_string(),
@@ -191,9 +213,17 @@ impl DocumentTracker {
             }
         }
 
-        // Idempotent insert into DashSet (already inserted by try_claim_for_open
-        // in production; needed for test helpers that call this directly)
-        self.opened_documents.insert(uri_string);
+        // Safety-net insert (already incremented by try_claim_for_open in production;
+        // needed for test helpers that call this directly)
+        self.opened_documents.entry(uri_string.clone()).or_insert(1);
+
+        // Update the reverse index for O(1) get_all_servers_for_virtual_uri lookups
+        {
+            let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
+            if !servers.contains(&server_name.to_string()) {
+                servers.push(server_name.to_string());
+            }
+        }
     }
 
     /// Increment the version of a virtual document and return the new version.
@@ -247,7 +277,8 @@ impl DocumentTracker {
             docs.remove(&uri_string);
         }
 
-        self.opened_documents.remove(&uri_string);
+        self.decrement_opened(&uri_string);
+        self.remove_from_reverse_index(&uri_string, server_name);
     }
 
     /// Remove a single virtual document from host_to_virtual tracking.
@@ -263,7 +294,17 @@ impl DocumentTracker {
         let uri_string = virtual_uri.to_uri_string();
         let mut host_map = self.host_to_virtual.lock().await;
         if let Some(docs) = host_map.get_mut(host_uri) {
+            // Collect server names being removed for reverse index cleanup
+            let removed_servers: Vec<String> = docs
+                .iter()
+                .filter(|d| d.virtual_uri.to_uri_string() == uri_string)
+                .map(|d| d.server_name.clone())
+                .collect();
             docs.retain(|d| d.virtual_uri.to_uri_string() != uri_string);
+            drop(host_map);
+            for server_name in &removed_servers {
+                self.remove_from_reverse_index(&uri_string, server_name);
+            }
         }
     }
 
@@ -272,7 +313,12 @@ impl DocumentTracker {
     /// Used by did_close module for cleanup.
     pub(super) async fn remove_host_virtual_docs(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
         let mut host_map = self.host_to_virtual.lock().await;
-        host_map.remove(host_uri).unwrap_or_default()
+        let docs = host_map.remove(host_uri).unwrap_or_default();
+        drop(host_map);
+        for doc in &docs {
+            self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.server_name);
+        }
+        docs
     }
 
     /// Take virtual documents matching the given ULIDs, removing them from tracking.
@@ -316,42 +362,54 @@ impl DocumentTracker {
                 true // Keep in host_to_virtual
             }
         });
+        drop(host_map);
+
+        // Clean reverse index for each closed doc
+        for doc in &to_close {
+            self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.server_name);
+        }
 
         to_close
     }
 
-    /// Find server_name for a virtual document URI (for didClose routing).
+    /// Decrement the reference count for an opened document URI.
     ///
-    /// Searches all host_to_virtual entries for a matching virtual URI.
-    /// Returns the server_name stored in OpenedVirtualDoc.
+    /// Removes the entry entirely when the count reaches zero.
+    fn decrement_opened(&self, uri_string: &str) {
+        self.opened_documents.remove_if_mut(uri_string, |_, count| {
+            debug_assert!(*count > 0, "double-decrement on opened_documents");
+            *count = count.saturating_sub(1);
+            *count == 0
+        });
+    }
+
+    /// Remove a server from the reverse index for a given virtual URI.
     ///
-    /// # Performance
+    /// Removes the entry entirely when no servers remain.
+    fn remove_from_reverse_index(&self, uri_string: &str, server_name: &str) {
+        self.virtual_to_servers
+            .remove_if_mut(uri_string, |_, servers| {
+                servers.retain(|s| s != server_name);
+                servers.is_empty()
+            });
+    }
+
+    /// Find ALL server names that have opened a given virtual document URI.
     ///
-    /// O(n) where n is total virtual documents. For typical document counts
-    /// (<100), this is acceptable. Consider indexing if perf becomes an issue.
+    /// When multiple servers handle the same language (e.g., emmylua and lua_ls
+    /// both handling Lua), each server opens its own copy of the virtual document.
+    /// This method collects ALL matching server names so that didChange can be
+    /// forwarded to every server, not just the first one found.
     ///
-    /// # Arguments
-    ///
-    /// * `virtual_uri` - The virtual document URI to look up
-    ///
-    /// # Returns
-    ///
-    /// The server_name if found, None if the document is not tracked.
-    pub(crate) async fn get_server_for_virtual_uri(
+    /// O(1) lookup via the `virtual_to_servers` reverse index.
+    pub(super) fn get_all_servers_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
-    ) -> Option<String> {
-        let uri_string = virtual_uri.to_uri_string();
-        let host_map = self.host_to_virtual.lock().await;
-
-        for virtual_docs in host_map.values() {
-            for doc in virtual_docs {
-                if doc.virtual_uri.to_uri_string() == uri_string {
-                    return Some(doc.server_name.clone());
-                }
-            }
-        }
-        None
+    ) -> Vec<String> {
+        self.virtual_to_servers
+            .get(&virtual_uri.to_uri_string())
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
     }
 }
 
@@ -550,6 +608,36 @@ mod tests {
         assert!(
             tracker.try_claim_for_open(&virtual_uri, "lua").await,
             "Should be able to reclaim after unclaim"
+        );
+    }
+
+    /// Test that get_all_servers_for_virtual_uri works immediately after try_claim_for_open.
+    ///
+    /// This verifies the reverse index is updated at claim time, closing the
+    /// TOCTOU gap between try_claim_for_open and register_opened_document.
+    #[tokio::test]
+    async fn reverse_index_available_immediately_after_claim() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Before claim: no servers
+        assert!(
+            tracker
+                .get_all_servers_for_virtual_uri(&virtual_uri)
+                .is_empty(),
+            "Should return empty before claim"
+        );
+
+        // Claim the document (should update reverse index)
+        tracker.try_claim_for_open(&virtual_uri, "lua").await;
+
+        // Reverse index should be available immediately — no need for register_opened_document
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        assert_eq!(
+            servers,
+            vec!["lua".to_string()],
+            "Reverse index should be available immediately after claim"
         );
     }
 
@@ -968,44 +1056,133 @@ mod tests {
     }
 
     // ========================================
-    // get_server_for_virtual_uri tests
+    // get_all_servers_for_virtual_uri tests
     // ========================================
 
-    /// Test that get_server_for_virtual_uri returns the server_name.
+    /// Test that get_all_servers_for_virtual_uri returns multiple servers for the same URI.
+    ///
+    /// When two servers (e.g., emmylua and lua_ls) both open the same virtual doc,
+    /// both server names should be returned.
     #[tokio::test]
-    async fn get_server_for_virtual_uri_returns_server_name() {
+    async fn get_all_servers_returns_multiple_servers_for_same_uri() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Open the document with server_name "lua"
+        // Open the same virtual doc on two different servers
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "emmylua")
+            .await;
+        // Second server gets a different key in document_versions but same virtual_uri.
+        // Two different servers opening the same URI is achieved by calling
+        // register_opened_document with different server_names.
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua_ls")
+            .await;
+
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        assert_eq!(servers.len(), 2, "Should return both servers");
+        assert!(servers.contains(&"emmylua".to_string()));
+        assert!(servers.contains(&"lua_ls".to_string()));
+    }
+
+    /// Test that get_all_servers_for_virtual_uri returns a single server when only one matches.
+    #[tokio::test]
+    async fn get_all_servers_returns_single_server() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
         tracker
             .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
-        // Lookup should return the server_name
-        let server_name = tracker.get_server_for_virtual_uri(&virtual_uri).await;
-        assert_eq!(server_name, Some("lua".to_string()));
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        assert_eq!(servers, vec!["lua".to_string()]);
     }
 
-    /// Test that get_server_for_virtual_uri returns None for unknown document.
+    /// Test that get_all_servers_for_virtual_uri returns empty vec for unknown URI.
     #[tokio::test]
-    async fn get_server_for_virtual_uri_returns_none_for_unknown() {
+    async fn get_all_servers_returns_empty_for_unknown() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Without opening, lookup should return None
-        let server_name = tracker.get_server_for_virtual_uri(&virtual_uri).await;
-        assert_eq!(server_name, None);
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        assert!(servers.is_empty(), "Should return empty for unknown URI");
     }
 
-    /// Test that get_server_for_virtual_uri works with process sharing.
+    /// Test that get_all_servers_for_virtual_uri does not cross-contaminate.
     ///
-    /// When ts and tsx both use "tsgo" as server_name, the reverse lookup
-    /// should return "tsgo" for both languages.
+    /// Different virtual URIs should not leak servers from unrelated documents.
     #[tokio::test]
-    async fn get_server_for_virtual_uri_with_process_sharing() {
+    async fn get_all_servers_does_not_cross_contaminate() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+
+        let virtual_uri_lua =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let virtual_uri_python =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
+
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri_lua, "lua")
+            .await;
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri_python, "python")
+            .await;
+
+        let lua_servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri_lua);
+        let python_servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri_python);
+
+        assert_eq!(lua_servers, vec!["lua".to_string()]);
+        assert_eq!(python_servers, vec!["python".to_string()]);
+    }
+
+    /// Test that untracking one server preserves opened state for another server.
+    ///
+    /// When two servers (e.g., emmylua and lua_ls) both claim the same virtual URI,
+    /// untracking one should NOT remove the document from opened_documents because
+    /// the other server still has it open. This is the core W1 reference-counting fix.
+    #[tokio::test]
+    async fn untrack_one_server_preserves_opened_for_other_server() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Two servers claim the same virtual URI
+        assert!(tracker.try_claim_for_open(&virtual_uri, "emmylua").await);
+        assert!(tracker.try_claim_for_open(&virtual_uri, "lua_ls").await);
+        assert!(
+            tracker.is_document_opened(&virtual_uri),
+            "Document should be opened after two claims"
+        );
+
+        // Untrack one server
+        tracker.untrack_document(&virtual_uri, "emmylua").await;
+
+        // Document should still be opened because lua_ls still has it
+        assert!(
+            tracker.is_document_opened(&virtual_uri),
+            "Document should remain opened while another server still has it"
+        );
+
+        // Untrack the second server
+        tracker.untrack_document(&virtual_uri, "lua_ls").await;
+
+        // Now it should be gone
+        assert!(
+            !tracker.is_document_opened(&virtual_uri),
+            "Document should not be opened after all servers untrack"
+        );
+    }
+
+    /// Test that get_all_servers_for_virtual_uri works with process sharing.
+    ///
+    /// When ts and tsx both use "tsgo" as server_name, the lookup
+    /// should return "tsgo" for each language's virtual URI independently.
+    #[tokio::test]
+    async fn get_all_servers_with_process_sharing() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
 
@@ -1023,14 +1200,14 @@ mod tests {
             .register_opened_document(&host_uri, &virtual_uri_tsx, "tsgo")
             .await;
 
-        // Both should return "tsgo" as server_name
+        // Both should return vec!["tsgo"] — same server, different virtual URIs
         assert_eq!(
-            tracker.get_server_for_virtual_uri(&virtual_uri_ts).await,
-            Some("tsgo".to_string())
+            tracker.get_all_servers_for_virtual_uri(&virtual_uri_ts),
+            vec!["tsgo".to_string()]
         );
         assert_eq!(
-            tracker.get_server_for_virtual_uri(&virtual_uri_tsx).await,
-            Some("tsgo".to_string())
+            tracker.get_all_servers_for_virtual_uri(&virtual_uri_tsx),
+            vec!["tsgo".to_string()]
         );
     }
 }

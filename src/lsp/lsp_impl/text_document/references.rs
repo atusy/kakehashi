@@ -1,9 +1,10 @@
 //! Find references method for Kakehashi.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{Location, MessageType, ReferenceParams};
+use tower_lsp_server::ls_types::{Location, ReferenceParams};
 
 use super::super::Kakehashi;
+use super::first_win::{self, fan_out};
 
 impl Kakehashi {
     pub(crate) async fn references_impl(
@@ -15,41 +16,43 @@ impl Kakehashi {
         let include_declaration = params.context.include_declaration;
 
         let Some(ctx) = self
-            .resolve_bridge_context(&lsp_uri, position, "references")
+            .resolve_bridge_contexts(&lsp_uri, position, "references")
             .await
         else {
             return Ok(None);
         };
 
-        // Send references request via language server pool
-        let response = self
-            .bridge
-            .pool()
-            .send_references_request(
-                &ctx.resolved_config.server_name,
-                &ctx.resolved_config.config,
-                &ctx.uri,
-                ctx.position,
-                &ctx.resolved.injection_language,
-                &ctx.resolved.region.region_id,
-                ctx.resolved.region.line_range.start,
-                &ctx.resolved.virtual_content,
-                include_declaration,
-                ctx.upstream_request_id,
-            )
-            .await;
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
 
-        match response {
-            Ok(locations) => Ok(locations),
-            Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Bridge references request failed: {}", e),
-                    )
-                    .await;
-                Ok(None)
-            }
-        }
+        // Fan-out references requests to all matching servers
+        let pool = self.bridge.pool_arc();
+        let position = ctx.position;
+        let mut join_set = fan_out(&ctx, pool.clone(), |t| async move {
+            t.pool
+                .send_references_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
+                    position,
+                    &t.injection_language,
+                    &t.region_id,
+                    t.region_start_line,
+                    &t.virtual_content,
+                    include_declaration,
+                    t.upstream_id,
+                )
+                .await
+        });
+
+        // Return the first non-empty references response
+        let result = first_win::first_win(
+            &mut join_set,
+            |opt| matches!(opt, Some(v) if !v.is_empty()),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+
+        result.handle(&self.client, "references", None, Ok).await
     }
 }

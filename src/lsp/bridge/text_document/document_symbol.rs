@@ -38,7 +38,7 @@ impl LanguageServerPool {
         region_id: &str,
         region_start_line: u32,
         virtual_content: &str,
-        upstream_request_id: UpstreamId,
+        upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<DocumentSymbolResponse>> {
         self.execute_bridge_request(
             server_name,
