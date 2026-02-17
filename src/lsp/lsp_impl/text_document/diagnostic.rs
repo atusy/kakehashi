@@ -227,10 +227,11 @@ impl Kakehashi {
             for resolved_config in configs {
                 let server_name = resolved_config.server_name.clone();
 
-                // Reuse Arc if we've already seen this server, otherwise create new Arc
+                // Reuse Arc if we've already seen this server, otherwise clone the existing Arc.
+                // Since ResolvedServerConfig.config is already Arc-wrapped, this is cheap.
                 let config_arc = config_cache
                     .entry(server_name.clone())
-                    .or_insert_with(|| Arc::new(resolved_config.config.clone()))
+                    .or_insert_with(|| Arc::clone(&resolved_config.config))
                     .clone();
 
                 request_infos.push(DiagnosticRequestInfo {
