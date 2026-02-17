@@ -411,16 +411,16 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
-    /// Find server_name for a virtual document URI (for reverse lookup).
+    /// Find ALL server names that have opened a given virtual document URI.
     ///
-    /// Used by did_change to look up which server a virtual document was opened on.
-    /// Returns None if the document is not tracked.
-    pub(crate) async fn get_server_for_virtual_uri(
+    /// Used by did_change to forward notifications to every server that has
+    /// the document open, not just the first one found.
+    pub(super) async fn get_all_servers_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
-    ) -> Option<String> {
+    ) -> Vec<String> {
         self.document_tracker
-            .get_server_for_virtual_uri(virtual_uri)
+            .get_all_servers_for_virtual_uri(virtual_uri)
             .await
     }
 
@@ -3379,6 +3379,121 @@ mod tests {
         assert_eq!(
             successful, 2,
             "should have forwarded cancel to both servers"
+        );
+    }
+
+    // ============================================================
+    // forward_didchange multi-server tests
+    // ============================================================
+
+    /// Test that forward_didchange_to_opened_docs sends to ALL servers.
+    ///
+    /// When the same virtual doc is opened on two servers (e.g., emmylua and lua_ls),
+    /// didChange must be forwarded to both. Previously, only the first server found
+    /// by the old get_server_for_virtual_uri received the notification.
+    #[tokio::test]
+    async fn forward_didchange_sends_to_all_servers() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Register the same virtual doc for two servers
+        pool.register_opened_document(&host_uri, &virtual_uri, "emmylua")
+            .await;
+        pool.register_opened_document(&host_uri, &virtual_uri, "lua_ls")
+            .await;
+
+        // Insert Ready connections for both servers
+        {
+            let handle_emmylua = create_handle_with_state(ConnectionState::Ready).await;
+            let handle_lua_ls = create_handle_with_state(ConnectionState::Ready).await;
+            let mut connections = pool.connections.lock().await;
+            connections.insert("emmylua".to_string(), handle_emmylua);
+            connections.insert("lua_ls".to_string(), handle_lua_ls);
+        }
+
+        // Forward didChange
+        let injections = vec![crate::lsp::bridge::coordinator::InjectionRegion {
+            language: "lua".to_string(),
+            region_id: TEST_ULID_LUA_0.to_string(),
+            content: "print('hello')".to_string(),
+        }];
+        pool.forward_didchange_to_opened_docs(&host_uri, &injections)
+            .await;
+
+        // Verify both servers got their versions incremented (1 -> 2)
+        let version_emmylua = pool
+            .increment_document_version(&virtual_uri, "emmylua")
+            .await;
+        let version_lua_ls = pool
+            .increment_document_version(&virtual_uri, "lua_ls")
+            .await;
+
+        // After forward_didchange incremented once (1->2), our manual increment makes it 2->3
+        assert_eq!(
+            version_emmylua,
+            Some(3),
+            "emmylua should have version 3 (opened=1, didChange=2, test-increment=3)"
+        );
+        assert_eq!(
+            version_lua_ls,
+            Some(3),
+            "lua_ls should have version 3 (opened=1, didChange=2, test-increment=3)"
+        );
+    }
+
+    /// Test that forward_didchange skips servers in Initializing state.
+    ///
+    /// Only Ready servers should receive didChange notifications.
+    /// Initializing servers haven't completed handshake yet.
+    #[tokio::test]
+    async fn forward_didchange_skips_initializing_server() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
+        // Register the same virtual doc for two servers
+        pool.register_opened_document(&host_uri, &virtual_uri, "ready_server")
+            .await;
+        pool.register_opened_document(&host_uri, &virtual_uri, "init_server")
+            .await;
+
+        // One Ready, one Initializing
+        {
+            let handle_ready = create_handle_with_state(ConnectionState::Ready).await;
+            let handle_init = create_handle_with_state(ConnectionState::Initializing).await;
+            let mut connections = pool.connections.lock().await;
+            connections.insert("ready_server".to_string(), handle_ready);
+            connections.insert("init_server".to_string(), handle_init);
+        }
+
+        // Forward didChange
+        let injections = vec![crate::lsp::bridge::coordinator::InjectionRegion {
+            language: "lua".to_string(),
+            region_id: TEST_ULID_LUA_0.to_string(),
+            content: "print('hello')".to_string(),
+        }];
+        pool.forward_didchange_to_opened_docs(&host_uri, &injections)
+            .await;
+
+        // ready_server should have been incremented (1->2)
+        let version_ready = pool
+            .increment_document_version(&virtual_uri, "ready_server")
+            .await;
+        assert_eq!(
+            version_ready,
+            Some(3),
+            "ready_server: opened=1, didChange=2, test-increment=3"
+        );
+
+        // init_server should NOT have been incremented (still at 1)
+        let version_init = pool
+            .increment_document_version(&virtual_uri, "init_server")
+            .await;
+        assert_eq!(
+            version_init,
+            Some(2),
+            "init_server: opened=1, no didChange, test-increment=2"
         );
     }
 }

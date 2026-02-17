@@ -182,7 +182,7 @@ impl DocumentTracker {
             let docs = host_map.entry(host_uri.clone()).or_default();
             if !docs
                 .iter()
-                .any(|d| d.virtual_uri.to_uri_string() == uri_string)
+                .any(|d| d.virtual_uri.to_uri_string() == uri_string && d.server_name == server_name)
             {
                 docs.push(OpenedVirtualDoc {
                     virtual_uri: virtual_uri.clone(),
@@ -320,15 +320,22 @@ impl DocumentTracker {
         to_close
     }
 
-    /// Find server_name for a virtual document URI (for didClose routing).
+    /// Find ALL server names that have opened a given virtual document URI.
     ///
-    /// Searches all host_to_virtual entries for a matching virtual URI.
-    /// Returns the server_name stored in OpenedVirtualDoc.
+    /// When multiple servers handle the same language (e.g., emmylua and lua_ls
+    /// both handling Lua), each server opens its own copy of the virtual document.
+    /// This method collects ALL matching server names so that didChange can be
+    /// forwarded to every server, not just the first one found.
     ///
     /// # Performance
     ///
-    /// O(n) where n is total virtual documents. For typical document counts
-    /// (<100), this is acceptable. Consider indexing if perf becomes an issue.
+    /// O(N×M) where N is host documents and M is virtual documents per host.
+    /// Called once per injection per `didChange` notification. The
+    /// `host_to_virtual` lock is held for the entire scan, so contention is
+    /// possible under rapid edits. Each iteration allocates via
+    /// `to_uri_string()`. For typical document counts (<100), this is
+    /// acceptable. If profiling shows contention, consider a reverse index
+    /// (`VirtualDocumentUri -> Vec<server_name>`) keyed by URI string.
     ///
     /// # Arguments
     ///
@@ -336,22 +343,23 @@ impl DocumentTracker {
     ///
     /// # Returns
     ///
-    /// The server_name if found, None if the document is not tracked.
-    pub(crate) async fn get_server_for_virtual_uri(
+    /// A Vec of server names. Empty if the document is not tracked.
+    pub(super) async fn get_all_servers_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
-    ) -> Option<String> {
+    ) -> Vec<String> {
         let uri_string = virtual_uri.to_uri_string();
         let host_map = self.host_to_virtual.lock().await;
 
+        let mut servers = Vec::new();
         for virtual_docs in host_map.values() {
             for doc in virtual_docs {
                 if doc.virtual_uri.to_uri_string() == uri_string {
-                    return Some(doc.server_name.clone());
+                    servers.push(doc.server_name.clone());
                 }
             }
         }
-        None
+        servers
     }
 }
 
@@ -968,44 +976,99 @@ mod tests {
     }
 
     // ========================================
-    // get_server_for_virtual_uri tests
+    // get_all_servers_for_virtual_uri tests
     // ========================================
 
-    /// Test that get_server_for_virtual_uri returns the server_name.
+    /// Test that get_all_servers_for_virtual_uri returns multiple servers for the same URI.
+    ///
+    /// When two servers (e.g., emmylua and lua_ls) both open the same virtual doc,
+    /// both server names should be returned.
     #[tokio::test]
-    async fn get_server_for_virtual_uri_returns_server_name() {
+    async fn get_all_servers_returns_multiple_servers_for_same_uri() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Open the document with server_name "lua"
+        // Open the same virtual doc on two different servers
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "emmylua")
+            .await;
+        // Second server gets a different key in document_versions but same virtual_uri.
+        // Two different servers opening the same URI is achieved by calling
+        // register_opened_document with different server_names.
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, "lua_ls")
+            .await;
+
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri).await;
+        assert_eq!(servers.len(), 2, "Should return both servers");
+        assert!(servers.contains(&"emmylua".to_string()));
+        assert!(servers.contains(&"lua_ls".to_string()));
+    }
+
+    /// Test that get_all_servers_for_virtual_uri returns a single server when only one matches.
+    #[tokio::test]
+    async fn get_all_servers_returns_single_server() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+
         tracker
             .register_opened_document(&host_uri, &virtual_uri, "lua")
             .await;
 
-        // Lookup should return the server_name
-        let server_name = tracker.get_server_for_virtual_uri(&virtual_uri).await;
-        assert_eq!(server_name, Some("lua".to_string()));
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri).await;
+        assert_eq!(servers, vec!["lua".to_string()]);
     }
 
-    /// Test that get_server_for_virtual_uri returns None for unknown document.
+    /// Test that get_all_servers_for_virtual_uri returns empty vec for unknown URI.
     #[tokio::test]
-    async fn get_server_for_virtual_uri_returns_none_for_unknown() {
+    async fn get_all_servers_returns_empty_for_unknown() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        // Without opening, lookup should return None
-        let server_name = tracker.get_server_for_virtual_uri(&virtual_uri).await;
-        assert_eq!(server_name, None);
+        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri).await;
+        assert!(servers.is_empty(), "Should return empty for unknown URI");
     }
 
-    /// Test that get_server_for_virtual_uri works with process sharing.
+    /// Test that get_all_servers_for_virtual_uri does not cross-contaminate.
     ///
-    /// When ts and tsx both use "tsgo" as server_name, the reverse lookup
-    /// should return "tsgo" for both languages.
+    /// Different virtual URIs should not leak servers from unrelated documents.
     #[tokio::test]
-    async fn get_server_for_virtual_uri_with_process_sharing() {
+    async fn get_all_servers_does_not_cross_contaminate() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+
+        let virtual_uri_lua =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let virtual_uri_python =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
+
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri_lua, "lua")
+            .await;
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri_python, "python")
+            .await;
+
+        let lua_servers = tracker
+            .get_all_servers_for_virtual_uri(&virtual_uri_lua)
+            .await;
+        let python_servers = tracker
+            .get_all_servers_for_virtual_uri(&virtual_uri_python)
+            .await;
+
+        assert_eq!(lua_servers, vec!["lua".to_string()]);
+        assert_eq!(python_servers, vec!["python".to_string()]);
+    }
+
+    /// Test that get_all_servers_for_virtual_uri works with process sharing.
+    ///
+    /// When ts and tsx both use "tsgo" as server_name, the lookup
+    /// should return "tsgo" for each language's virtual URI independently.
+    #[tokio::test]
+    async fn get_all_servers_with_process_sharing() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
 
@@ -1023,14 +1086,18 @@ mod tests {
             .register_opened_document(&host_uri, &virtual_uri_tsx, "tsgo")
             .await;
 
-        // Both should return "tsgo" as server_name
+        // Both should return vec!["tsgo"] — same server, different virtual URIs
         assert_eq!(
-            tracker.get_server_for_virtual_uri(&virtual_uri_ts).await,
-            Some("tsgo".to_string())
+            tracker
+                .get_all_servers_for_virtual_uri(&virtual_uri_ts)
+                .await,
+            vec!["tsgo".to_string()]
         );
         assert_eq!(
-            tracker.get_server_for_virtual_uri(&virtual_uri_tsx).await,
-            Some("tsgo".to_string())
+            tracker
+                .get_all_servers_for_virtual_uri(&virtual_uri_tsx)
+                .await,
+            vec!["tsgo".to_string()]
         );
     }
 }
