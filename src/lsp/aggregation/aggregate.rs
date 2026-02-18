@@ -43,7 +43,6 @@ where
 /// Fans out one task per matching server and collects every successful result.
 /// Returns `Done(vec)` when at least one succeeds, `NoResult` when all fail,
 /// or `Cancelled` on cancel notification.
-#[allow(dead_code)] // will be used by diagnostic handler in the next commit
 pub(crate) async fn dispatch_all<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
