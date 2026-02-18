@@ -25,12 +25,66 @@ use crate::lsp::request_id::CancelReceiver;
 ///
 /// Callers MUST call `pool.unregister_all_for_upstream_id()` after this function returns
 /// to clean up stale entries in the UpstreamRequestRegistry left by aborted tasks.
-#[allow(dead_code)] // RED phase: no production caller yet
 pub(crate) async fn collect_all<T: Send + 'static>(
-    _join_set: &mut JoinSet<io::Result<T>>,
-    _cancel_rx: Option<CancelReceiver>,
+    join_set: &mut JoinSet<io::Result<T>>,
+    cancel_rx: Option<CancelReceiver>,
 ) -> FanInResult<Vec<T>> {
-    todo!("collect_all not yet implemented")
+    let mut results: Vec<T> = Vec::new();
+    let mut errors: usize = 0;
+
+    // No cancel support — simple loop
+    let Some(cancel_rx) = cancel_rx else {
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Err(join_err) => {
+                    errors += 1;
+                    log::warn!("bridge task panicked: {join_err}");
+                }
+                Ok(Err(io_err)) => {
+                    errors += 1;
+                    log::warn!("bridge request failed: {io_err}");
+                }
+                Ok(Ok(value)) => results.push(value),
+            }
+        }
+        return if results.is_empty() && errors > 0 {
+            FanInResult::NoResult { errors }
+        } else {
+            FanInResult::Done(results)
+        };
+    };
+
+    // With cancel support — use tokio::select!
+    tokio::pin!(cancel_rx);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancel_rx => {
+                join_set.abort_all();
+                return FanInResult::Cancelled;
+            }
+            result = join_set.join_next() => {
+                match result {
+                    None => break,
+                    Some(Err(join_err)) => {
+                        errors += 1;
+                        log::warn!("bridge task panicked: {join_err}");
+                    }
+                    Some(Ok(Err(io_err))) => {
+                        errors += 1;
+                        log::warn!("bridge request failed: {io_err}");
+                    }
+                    Some(Ok(Ok(value))) => results.push(value),
+                }
+            }
+        }
+    }
+
+    if results.is_empty() && errors > 0 {
+        FanInResult::NoResult { errors }
+    } else {
+        FanInResult::Done(results)
+    }
 }
 
 #[cfg(test)]
