@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "kakehashi"
-version = "0.0.14"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "clap",
