@@ -6,8 +6,7 @@ use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, L
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::fan_in::first_win;
-use crate::lsp::aggregation::fan_out::fan_out;
+use crate::lsp::aggregation::aggregate::dispatch_aggregation;
 
 impl Kakehashi {
     pub(crate) async fn goto_definition_impl(
@@ -29,25 +28,24 @@ impl Kakehashi {
         // Fan-out definition requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let mut join_set = fan_out(&ctx, pool.clone(), |t| async move {
-            t.pool
-                .send_definition_request(
-                    &t.server_name,
-                    &t.server_config,
-                    &t.uri,
-                    position,
-                    &t.injection_language,
-                    &t.region_id,
-                    t.region_start_line,
-                    &t.virtual_content,
-                    t.upstream_id,
-                )
-                .await
-        });
-
-        // Return the first non-empty definition response
-        let result = first_win::first_win(
-            &mut join_set,
+        let result = dispatch_aggregation(
+            &ctx,
+            pool.clone(),
+            |t| async move {
+                t.pool
+                    .send_definition_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        position,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.region_start_line,
+                        &t.virtual_content,
+                        t.upstream_id,
+                    )
+                    .await
+            },
             |opt| matches!(opt, Some(v) if !v.is_empty()),
             cancel_rx,
         )

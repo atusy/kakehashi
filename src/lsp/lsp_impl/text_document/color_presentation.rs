@@ -4,8 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{ColorPresentation, ColorPresentationParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::fan_in::first_win;
-use crate::lsp::aggregation::fan_out::fan_out;
+use crate::lsp::aggregation::aggregate::dispatch_aggregation;
 
 impl Kakehashi {
     pub(crate) async fn color_presentation_impl(
@@ -31,29 +30,28 @@ impl Kakehashi {
 
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
-        let mut join_set = fan_out(&ctx, pool.clone(), |t| {
-            let color_json = color_json.clone();
-            async move {
-                t.pool
-                    .send_color_presentation_request(
-                        &t.server_name,
-                        &t.server_config,
-                        &t.uri,
-                        range,
-                        &color_json,
-                        &t.injection_language,
-                        &t.region_id,
-                        t.region_start_line,
-                        &t.virtual_content,
-                        t.upstream_id,
-                    )
-                    .await
-            }
-        });
-
-        // Return the first non-empty color presentation response
-        let result = first_win::first_win(
-            &mut join_set,
+        let result = dispatch_aggregation(
+            &ctx,
+            pool.clone(),
+            |t| {
+                let color_json = color_json.clone();
+                async move {
+                    t.pool
+                        .send_color_presentation_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &t.uri,
+                            range,
+                            &color_json,
+                            &t.injection_language,
+                            &t.region_id,
+                            t.region_start_line,
+                            &t.virtual_content,
+                            t.upstream_id,
+                        )
+                        .await
+                }
+            },
             |presentations| !presentations.is_empty(),
             cancel_rx,
         )
