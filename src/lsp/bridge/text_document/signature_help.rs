@@ -118,6 +118,7 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use tower_lsp_server::ls_types::Position;
     use url::Url;
 
@@ -269,83 +270,17 @@ mod tests {
         assert_eq!(signature_help.active_parameter, Some(1));
     }
 
-    #[test]
-    fn signature_help_response_null_result_returns_none() {
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": null
-        });
-        let region_start_line = 3;
-
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
-
-        assert!(transformed.is_none(), "Null result should return None");
-    }
-
-    #[test]
-    fn signature_help_response_missing_result_returns_none() {
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 42
-        });
-        let region_start_line = 3;
-
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
-
-        assert!(
-            transformed.is_none(),
-            "Missing result field should return None"
-        );
-    }
-
-    #[test]
-    fn signature_help_response_invalid_format_returns_none() {
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": {
-                "invalid": "format"
-            }
-        });
-        let region_start_line = 3;
-
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
-
-        assert!(
-            transformed.is_none(),
-            "Invalid format should return None rather than panic"
-        );
-    }
-
-    #[test]
-    fn signature_help_response_with_malformed_result_returns_none() {
-        // Result is a string instead of a SignatureHelp object
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_a_signature_help_object"
-        });
-        let region_start_line = 3;
-
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
-
-        assert!(transformed.is_none(), "Malformed result should return None");
-    }
-
-    #[test]
-    fn signature_help_response_error_response_returns_none() {
-        // JSON-RPC error response has no "result" key
-        let response = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-        let region_start_line = 3;
-
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
-
-        assert!(transformed.is_none(), "Error response should return None");
+    #[rstest]
+    #[case::null_result(serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::missing_result(serde_json::json!({"jsonrpc": "2.0", "id": 42}))]
+    #[case::invalid_format(serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": {"invalid": "format"}}))]
+    #[case::malformed_result(serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_signature_help_object"}))]
+    #[case::error_response(serde_json::json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    fn signature_help_response_returns_none_for_invalid_response(
+        #[case] response: serde_json::Value,
+    ) {
+        let transformed = transform_signature_help_response_to_host(response, 3);
+        assert!(transformed.is_none());
     }
 
     #[test]
