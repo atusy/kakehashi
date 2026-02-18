@@ -6,13 +6,12 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, MessageType};
 
-use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
-use crate::lsp::bridge::LanguageServerPool;
-use crate::lsp::bridge::UpstreamId;
+use crate::lsp::aggregation::aggregate::dispatch_aggregation;
+use crate::lsp::aggregation::fan_in::first_win::FirstWinResult;
+use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 use super::super::{Kakehashi, uri_to_url};
-use crate::lsp::aggregation::fan_in::first_win::{self, FirstWinResult};
 
 impl Kakehashi {
     pub(crate) async fn document_link_impl(
@@ -94,27 +93,40 @@ impl Kakehashi {
                 continue;
             }
 
-            // Move owned fields into the spawned task (Arc/Url still need clone)
+            let region_ctx = DocumentRequestContext {
+                uri: uri.clone(),
+                resolved,
+                configs,
+                upstream_request_id: upstream_request_id.clone(),
+            };
             let pool = Arc::clone(&pool);
-            let uri = uri.clone();
-            let upstream_id = upstream_request_id.clone();
-            let injection_language = resolved.injection_language;
-            let region_id = resolved.region.region_id;
-            let region_start_line = resolved.region.line_range.start;
-            let virtual_content = resolved.virtual_content;
 
             outer_join_set.spawn(async move {
-                race_servers_for_region(
+                let result = dispatch_aggregation(
+                    &region_ctx,
                     pool,
-                    configs,
-                    uri,
-                    injection_language,
-                    region_id,
-                    region_start_line,
-                    virtual_content,
-                    upstream_id,
+                    |t| async move {
+                        t.pool
+                            .send_document_link_request(
+                                &t.server_name,
+                                &t.server_config,
+                                &t.uri,
+                                &t.injection_language,
+                                &t.region_id,
+                                t.region_start_line,
+                                &t.virtual_content,
+                                t.upstream_id,
+                            )
+                            .await
+                    },
+                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    None,
                 )
-                .await
+                .await;
+                match result {
+                    FirstWinResult::Winner(links) => links,
+                    FirstWinResult::NoWinner { .. } | FirstWinResult::Cancelled => None,
+                }
             });
         }
 
@@ -141,62 +153,5 @@ impl Kakehashi {
         } else {
             Some(all_links)
         })
-    }
-}
-
-/// Race all capable servers for a single injection region, returning the first
-/// non-empty document link response.
-///
-/// Uses `first_win()` to take the first server that returns a non-empty result,
-/// aborting the remaining in-flight requests.
-#[allow(clippy::too_many_arguments)]
-async fn race_servers_for_region(
-    pool: Arc<LanguageServerPool>,
-    configs: Vec<crate::lsp::bridge::ResolvedServerConfig>,
-    uri: url::Url,
-    injection_language: String,
-    region_id: String,
-    region_start_line: u32,
-    virtual_content: String,
-    upstream_id: Option<UpstreamId>,
-) -> Option<Vec<DocumentLink>> {
-    let mut join_set: JoinSet<std::io::Result<Option<Vec<DocumentLink>>>> = JoinSet::new();
-
-    for config in configs {
-        let pool: Arc<LanguageServerPool> = Arc::clone(&pool);
-        let uri = uri.clone();
-        let injection_language = injection_language.clone();
-        let region_id = region_id.clone();
-        let virtual_content = virtual_content.clone();
-        let upstream_id = upstream_id.clone();
-        let server_name = config.server_name.clone();
-        let server_config: Arc<BridgeServerConfig> = config.config;
-
-        join_set.spawn(async move {
-            pool.send_document_link_request(
-                &server_name,
-                &server_config,
-                &uri,
-                &injection_language,
-                &region_id,
-                region_start_line,
-                &virtual_content,
-                upstream_id,
-            )
-            .await
-        });
-    }
-
-    // First non-empty response wins; no cancel support at inner level
-    let result = first_win::first_win(
-        &mut join_set,
-        |opt| matches!(opt, Some(v) if !v.is_empty()),
-        None,
-    )
-    .await;
-
-    match result {
-        FirstWinResult::Winner(links) => links,
-        FirstWinResult::NoWinner { .. } | FirstWinResult::Cancelled => None,
     }
 }
