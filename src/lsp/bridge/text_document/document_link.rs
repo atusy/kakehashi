@@ -113,6 +113,7 @@ fn transform_document_link_response_to_host(
 mod tests {
     use super::*;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
+    use rstest::rstest;
     use serde_json::json;
 
     // ==========================================================================
@@ -206,10 +207,13 @@ mod tests {
         assert_eq!(links[1].range.end.line, 7);
     }
 
-    #[test]
-    fn document_link_response_with_null_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
+    fn document_link_response_returns_none_for_invalid_response(
+        #[case] response: serde_json::Value,
+    ) {
         let transformed = transform_document_link_response_to_host(response, 5);
         assert!(transformed.is_none());
     }
@@ -273,30 +277,6 @@ mod tests {
         assert_eq!(links[0].range.start.line, 11);
         assert_eq!(links[0].range.end.line, 11);
         assert!(links[0].target.is_none());
-    }
-
-    #[test]
-    fn document_link_response_with_no_result_key_returns_none() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-
-        let transformed = transform_document_link_response_to_host(response, 5);
-        assert!(transformed.is_none());
-    }
-
-    #[test]
-    fn document_link_response_with_malformed_result_returns_none() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_an_array"
-        });
-
-        let transformed = transform_document_link_response_to_host(response, 5);
-        assert!(transformed.is_none());
     }
 
     #[test]
