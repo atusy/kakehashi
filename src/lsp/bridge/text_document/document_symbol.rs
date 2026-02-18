@@ -277,6 +277,7 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, region_start_li
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
     use tower_lsp_server::ls_types::Uri;
 
@@ -475,10 +476,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn document_symbol_response_with_null_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
+    fn document_symbol_response_returns_none_for_invalid_response(
+        #[case] response: serde_json::Value,
+    ) {
         let transformed = transform_document_symbol_response_to_host(response, "unused", 5);
         assert!(transformed.is_none());
     }
@@ -608,30 +612,6 @@ mod tests {
         );
         assert_eq!(symbols[0].name, "localSymbol");
         assert_eq!(symbols[0].range.start.line, 5); // 0 + 5
-    }
-
-    #[test]
-    fn document_symbol_response_with_no_result_key_returns_none() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-
-        let transformed = transform_document_symbol_response_to_host(response, "unused", 5);
-        assert!(transformed.is_none());
-    }
-
-    #[test]
-    fn document_symbol_response_with_malformed_result_returns_none() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_an_array"
-        });
-
-        let transformed = transform_document_symbol_response_to_host(response, "unused", 5);
-        assert!(transformed.is_none());
     }
 
     #[test]
