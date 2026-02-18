@@ -1,0 +1,13 @@
+---
+source: src/lsp/bridge/protocol/lifecycle.rs
+expression: notification
+---
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didClose",
+  "params": {
+    "textDocument": {
+      "uri": "file:///project/test.lua"
+    }
+  }
+}

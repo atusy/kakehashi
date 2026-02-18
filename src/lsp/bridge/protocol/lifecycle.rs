@@ -249,15 +249,9 @@ mod tests {
     fn initialize_request_has_correct_structure() {
         let request = build_initialize_request(RequestId::new(1), None, None, None);
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 1);
-        assert_eq!(request["method"], "initialize");
-        assert!(request["params"]["processId"].as_u64().is_some());
-        assert!(request["params"]["rootUri"].is_null());
-        assert!(request["params"]["rootPath"].is_null());
-        assert!(request["params"]["workspaceFolders"].is_null());
-        assert!(request["params"]["capabilities"].is_object());
-        assert!(request["params"]["initializationOptions"].is_null());
+        insta::assert_json_snapshot!(request, {
+            ".params.processId" => "[PID]",
+        });
     }
 
     #[test]
@@ -368,43 +362,28 @@ mod tests {
     fn initialized_notification_has_correct_structure() {
         let notification = build_initialized_notification();
 
-        assert_eq!(notification["jsonrpc"], "2.0");
-        assert_eq!(notification["method"], "initialized");
-        assert!(notification["params"].is_object());
-        assert!(notification.get("id").is_none());
+        insta::assert_json_snapshot!(notification);
     }
 
     #[test]
     fn shutdown_request_has_correct_structure() {
         let request = build_shutdown_request(RequestId::new(99));
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 99);
-        assert_eq!(request["method"], "shutdown");
-        assert!(request["params"].is_null());
+        insta::assert_json_snapshot!(request);
     }
 
     #[test]
     fn exit_notification_has_correct_structure() {
         let notification = build_exit_notification();
 
-        assert_eq!(notification["jsonrpc"], "2.0");
-        assert_eq!(notification["method"], "exit");
-        assert!(notification["params"].is_null());
-        assert!(notification.get("id").is_none());
+        insta::assert_json_snapshot!(notification);
     }
 
     #[test]
     fn didclose_notification_has_correct_structure() {
         let notification = build_didclose_notification("file:///project/test.lua");
 
-        assert_eq!(notification["jsonrpc"], "2.0");
-        assert_eq!(notification["method"], "textDocument/didClose");
-        assert_eq!(
-            notification["params"]["textDocument"]["uri"],
-            "file:///project/test.lua"
-        );
-        assert!(notification.get("id").is_none());
+        insta::assert_json_snapshot!(notification);
     }
 
     #[test]

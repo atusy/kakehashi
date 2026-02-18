@@ -1,0 +1,9 @@
+---
+source: src/lsp/bridge/protocol/lifecycle.rs
+expression: notification
+---
+{
+  "jsonrpc": "2.0",
+  "method": "exit",
+  "params": null
+}

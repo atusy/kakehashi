@@ -57,7 +57,7 @@ tree-sitter-md = "0.5"
 tree-sitter-yaml = "0.7"
 streaming-iterator = "0.1"
 filetime = "0.2"
-insta = { version = "1", features = ["json"] }
+insta = { version = "1", features = ["json", "redactions"] }
 serial_test = "3"
 rstest = "0.26"
 
