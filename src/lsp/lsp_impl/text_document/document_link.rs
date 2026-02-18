@@ -104,7 +104,7 @@ impl Kakehashi {
             outer_join_set.spawn(async move {
                 let result = dispatch_first_win(
                     &region_ctx,
-                    pool,
+                    pool.clone(),
                     |t| async move {
                         t.pool
                             .send_document_link_request(
@@ -123,6 +123,7 @@ impl Kakehashi {
                     None,
                 )
                 .await;
+                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
                 match result {
                     FanInResult::Done(links) => links,
                     FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
@@ -141,11 +142,6 @@ impl Kakehashi {
             },
         )
         .await;
-
-        // Clean up stale upstream registry entries left by aborted inner tasks.
-        // This MUST run on both success and cancel paths — do NOT use `?` above,
-        // or the cancel Err would propagate early and skip this cleanup.
-        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         let all_links = all_links?;
         Ok(if all_links.is_empty() {
