@@ -1,7 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 
 use regex::Regex;
 use tree_sitter::{Query, QueryCapture, QueryMatch};
+
+/// Cache for compiled regexes converted from Lua patterns.
+/// Avoids recompiling the same pattern on every invocation during
+/// semantic token highlighting of large files.
+static LUA_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Option<Regex>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Check if a capture passes all predicates returned by
 /// [`Query::general_predicates`] for the capture's pattern.
@@ -88,40 +95,73 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
         return true; // No pattern arg, pass through
     };
 
-    let Ok(parsed_pattern) = lua_pattern::parse(pattern_str) else {
-        log::info!(
-            target: "kakehashi::query",
-            "Invalid lua-pattern: {}",
-            pattern_str
-        );
-        return true; // Parse error, pass through
+    let re = get_or_compile_lua_regex(pattern_str);
+    match re {
+        Some(re) => re.is_match(node_text),
+        None => true, // Compilation failed, pass through (permissive)
+    }
+}
+
+/// Get a cached compiled regex for a Lua pattern, or compile and cache it.
+/// Returns `None` if the pattern cannot be compiled (parse/convert/compile error).
+fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Regex> {
+    let mut cache = match LUA_REGEX_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!(
+                target: "kakehashi::query",
+                "Recovered from poisoned lua regex cache lock"
+            );
+            poisoned.into_inner()
+        }
+    };
+
+    if let Some(cached) = cache.get(pattern_str) {
+        return cached.clone();
+    }
+
+    let result = compile_lua_regex(pattern_str);
+    cache.insert(pattern_str.to_string(), result.clone());
+    result
+}
+
+/// Compile a Lua pattern string into a Regex. Returns None on any error.
+fn compile_lua_regex(pattern_str: &str) -> Option<Regex> {
+    let parsed_pattern = match lua_pattern::parse(pattern_str) {
+        Ok(p) => p,
+        Err(_) => {
+            log::info!(
+                target: "kakehashi::query",
+                "Invalid lua-pattern: {}",
+                pattern_str
+            );
+            return None;
+        }
     };
 
     let regex_str = match lua_pattern::try_to_regex(&parsed_pattern, false, false) {
-        Ok(regex_str) => regex_str,
+        Ok(s) => s,
         Err(err) => {
             log::info!(
                 target: "kakehashi::query",
                 "Failed to convert lua-pattern to regex: {} ({err:?})",
                 pattern_str
             );
-            return true; // Conversion error, pass through
+            return None;
         }
     };
 
-    let re = match Regex::new(&regex_str) {
-        Ok(re) => re,
+    match Regex::new(&regex_str) {
+        Ok(re) => Some(re),
         Err(err) => {
             log::info!(
                 target: "kakehashi::query",
                 "Failed to compile regex from lua-pattern: {} ({err:?})",
                 regex_str
             );
-            return true; // Regex compile error, pass through
+            None
         }
-    };
-
-    re.is_match(node_text)
+    }
 }
 
 /// Check contains? predicate - returns true if ALL string args are substrings of node_text.
