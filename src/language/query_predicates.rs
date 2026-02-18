@@ -42,6 +42,11 @@ pub(crate) fn check_predicate(
                     return false;
                 }
             }
+            "contains?" => {
+                if !check_contains(&predicate.args[1..], node_text) {
+                    return false;
+                }
+            }
             _ => {}
         }
     }
@@ -89,6 +94,19 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
     };
 
     re.is_match(node_text)
+}
+
+/// Check contains? predicate - returns true if ALL string args are substrings of node_text.
+///
+/// Non-string args (captures) are skipped permissively — they don't affect the result.
+/// Zero string args yields true (vacuous truth via `Iterator::all`).
+fn check_contains(args: &[tree_sitter::QueryPredicateArg], node_text: &str) -> bool {
+    args.iter().all(|arg| {
+        let tree_sitter::QueryPredicateArg::String(s) = arg else {
+            return true; // Skip non-string args (permissive)
+        };
+        node_text.contains(s.as_ref())
+    })
 }
 
 pub fn filter_captures<'a>(
