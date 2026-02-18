@@ -1,11 +1,12 @@
 use regex::Regex;
 use tree_sitter::{Query, QueryCapture, QueryMatch};
 
-/// Check if a capture passes all general predicates (e.g., `#lua-match?`).
+/// Check if a capture passes all predicates returned by
+/// [`Query::general_predicates`] for the capture's pattern.
 ///
-/// Tree-sitter handles built-in predicates (`#eq?`, `#match?`, `#any-of?`) at the
-/// cursor level, but Neovim-specific predicates like `#lua-match?` are "general
-/// predicates" that require explicit evaluation.
+/// This covers Neovim-specific predicates like `#lua-match?` that tree-sitter
+/// exposes as "general" rather than handling as built-in text predicates
+/// (`#eq?`, `#match?`, `#any-of?`) at the cursor level.
 pub(crate) fn check_predicate(
     query: &Query,
     match_: &QueryMatch,
