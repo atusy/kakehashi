@@ -8,18 +8,18 @@ use tokio::task::JoinSet;
 
 use crate::lsp::request_id::CancelReceiver;
 
-/// Result of [`first_win()`] dispatch.
+/// Result of fan-in dispatch (used by both first-win and collect-all strategies).
 #[derive(Debug)]
 #[must_use]
-pub(crate) enum FirstWinResult<T> {
-    /// A non-empty response was received from a downstream server.
-    Winner(T),
-    /// All tasks completed without producing a non-empty response.
+pub(crate) enum FanInResult<T> {
+    /// A result was produced by the dispatch.
+    Done(T),
+    /// All tasks completed without producing a result.
     ///
     /// `errors` counts tasks that failed with panics (`JoinError`) or I/O errors.
     /// Handlers use this to choose log severity: `WARNING` when `errors > 0`
     /// (real failures), `LOG` when `errors == 0` (all servers returned empty — normal).
-    NoWinner {
+    NoResult {
         /// Number of tasks that failed with errors (panics or IO errors).
         errors: usize,
     },
@@ -27,11 +27,11 @@ pub(crate) enum FirstWinResult<T> {
     Cancelled,
 }
 
-impl<T> FirstWinResult<T> {
+impl<T> FanInResult<T> {
     /// Handle the common post-dispatch pattern for first-win results.
     ///
-    /// - `Winner`: calls `on_winner` to transform the value into the handler's return type.
-    /// - `NoWinner`: logs at WARNING (if errors > 0) or LOG (if errors == 0),
+    /// - `Done`: calls `on_done` to transform the value into the handler's return type.
+    /// - `NoResult`: logs at WARNING (if errors > 0) or LOG (if errors == 0),
     ///   then returns `Ok(no_result)`.
     /// - `Cancelled`: returns `Err(Error::request_cancelled())`.
     pub(crate) async fn handle<R>(
@@ -39,11 +39,11 @@ impl<T> FirstWinResult<T> {
         client: &tower_lsp_server::Client,
         method_name: &str,
         no_result: R,
-        on_winner: impl FnOnce(T) -> tower_lsp_server::jsonrpc::Result<R>,
+        on_done: impl FnOnce(T) -> tower_lsp_server::jsonrpc::Result<R>,
     ) -> tower_lsp_server::jsonrpc::Result<R> {
         match self {
-            FirstWinResult::Winner(value) => on_winner(value),
-            FirstWinResult::NoWinner { errors } => {
+            FanInResult::Done(value) => on_done(value),
+            FanInResult::NoResult { errors } => {
                 let level = if errors > 0 {
                     tower_lsp_server::ls_types::MessageType::WARNING
                 } else {
@@ -57,7 +57,7 @@ impl<T> FirstWinResult<T> {
                     .await;
                 Ok(no_result)
             }
-            FirstWinResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
 }
@@ -77,7 +77,7 @@ impl<T> FirstWinResult<T> {
 /// - The response passes the `is_nonempty` predicate
 ///
 /// On success, aborts remaining in-flight tasks and returns the winning value.
-/// Returns `NoWinner` if all tasks fail, error, or produce empty results.
+/// Returns `NoResult` if all tasks fail, error, or produce empty results.
 /// Returns `Cancelled` if a cancel notification arrives before a winner is found.
 ///
 /// # Abort semantics
@@ -88,7 +88,7 @@ pub(crate) async fn first_win<T: Send + 'static>(
     join_set: &mut JoinSet<io::Result<T>>,
     is_nonempty: impl Fn(&T) -> bool,
     cancel_rx: Option<CancelReceiver>,
-) -> FirstWinResult<T> {
+) -> FanInResult<T> {
     let mut errors: usize = 0;
 
     // No cancel support — simple loop
@@ -105,12 +105,12 @@ pub(crate) async fn first_win<T: Send + 'static>(
                 }
                 Ok(Ok(value)) if is_nonempty(&value) => {
                     join_set.abort_all();
-                    return FirstWinResult::Winner(value);
+                    return FanInResult::Done(value);
                 }
                 Ok(Ok(_)) => {} // empty — try next
             }
         }
-        return FirstWinResult::NoWinner { errors };
+        return FanInResult::NoResult { errors };
     };
 
     // With cancel support — use tokio::select!
@@ -120,11 +120,11 @@ pub(crate) async fn first_win<T: Send + 'static>(
             biased;
             _ = &mut cancel_rx => {
                 join_set.abort_all();
-                return FirstWinResult::Cancelled;
+                return FanInResult::Cancelled;
             }
             result = join_set.join_next() => {
                 match result {
-                    None => return FirstWinResult::NoWinner { errors },
+                    None => return FanInResult::NoResult { errors },
                     Some(Err(join_err)) => {
                         errors += 1;
                         log::warn!("bridge task panicked: {join_err}");
@@ -135,7 +135,7 @@ pub(crate) async fn first_win<T: Send + 'static>(
                     }
                     Some(Ok(Ok(value))) if is_nonempty(&value) => {
                         join_set.abort_all();
-                        return FirstWinResult::Winner(value);
+                        return FanInResult::Done(value);
                     }
                     Some(Ok(Ok(_))) => {} // empty — try next
                 }
@@ -148,29 +148,29 @@ pub(crate) async fn first_win<T: Send + 'static>(
 mod tests {
     use super::*;
 
-    fn assert_winner<T: std::fmt::Debug>(result: FirstWinResult<T>) -> T {
+    fn assert_done<T: std::fmt::Debug>(result: FanInResult<T>) -> T {
         match result {
-            FirstWinResult::Winner(v) => v,
-            FirstWinResult::NoWinner { errors } => {
-                panic!("expected Winner, got NoWinner {{ errors: {errors} }}")
+            FanInResult::Done(v) => v,
+            FanInResult::NoResult { errors } => {
+                panic!("expected Done, got NoResult {{ errors: {errors} }}")
             }
-            FirstWinResult::Cancelled => panic!("expected Winner, got Cancelled"),
+            FanInResult::Cancelled => panic!("expected Done, got Cancelled"),
         }
     }
 
-    fn assert_no_winner<T: std::fmt::Debug>(result: FirstWinResult<T>) -> usize {
+    fn assert_no_result<T: std::fmt::Debug>(result: FanInResult<T>) -> usize {
         match result {
-            FirstWinResult::NoWinner { errors } => errors,
-            FirstWinResult::Winner(v) => panic!("expected NoWinner, got Winner({v:?})"),
-            FirstWinResult::Cancelled => panic!("expected NoWinner, got Cancelled"),
+            FanInResult::NoResult { errors } => errors,
+            FanInResult::Done(v) => panic!("expected NoResult, got Done({v:?})"),
+            FanInResult::Cancelled => panic!("expected NoResult, got Cancelled"),
         }
     }
 
-    fn assert_cancelled<T: std::fmt::Debug>(result: FirstWinResult<T>) {
+    fn assert_cancelled<T: std::fmt::Debug>(result: FanInResult<T>) {
         match result {
-            FirstWinResult::Cancelled => {}
-            FirstWinResult::Winner(v) => panic!("expected Cancelled, got Winner({v:?})"),
-            FirstWinResult::NoWinner { .. } => panic!("expected Cancelled, got NoWinner"),
+            FanInResult::Cancelled => {}
+            FanInResult::Done(v) => panic!("expected Cancelled, got Done({v:?})"),
+            FanInResult::NoResult { .. } => panic!("expected Cancelled, got NoResult"),
         }
     }
 
@@ -183,11 +183,11 @@ mod tests {
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
-        assert_eq!(assert_winner(result), Some(42));
+        assert_eq!(assert_done(result), Some(42));
     }
 
     #[tokio::test]
-    async fn first_win_returns_no_winner_when_all_fail() {
+    async fn first_win_returns_no_result_when_all_fail() {
         let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
         join_set.spawn(async { Err(io::Error::other("fail 1")) });
         join_set.spawn(async { Err(io::Error::other("fail 2")) });
@@ -196,14 +196,14 @@ mod tests {
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
         assert_eq!(
-            assert_no_winner(result),
+            assert_no_result(result),
             3,
             "all 3 tasks should be counted as errors"
         );
     }
 
     #[tokio::test]
-    async fn first_win_returns_no_winner_when_all_empty() {
+    async fn first_win_returns_no_result_when_all_empty() {
         let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
         join_set.spawn(async { Ok(None) });
         join_set.spawn(async { Ok(None) });
@@ -211,7 +211,7 @@ mod tests {
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
-        assert_eq!(assert_no_winner(result), 0, "empty results are not errors");
+        assert_eq!(assert_no_result(result), 0, "empty results are not errors");
     }
 
     #[tokio::test]
@@ -223,7 +223,7 @@ mod tests {
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
-        assert_eq!(assert_winner(result), Some(42));
+        assert_eq!(assert_done(result), Some(42));
     }
 
     #[tokio::test]
@@ -239,7 +239,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(assert_winner(result), Some(vec![1]));
+        assert_eq!(assert_done(result), Some(vec![1]));
     }
 
     #[tokio::test]
@@ -266,22 +266,22 @@ mod tests {
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
 
-        assert_eq!(assert_winner(result), Some(42));
+        assert_eq!(assert_done(result), Some(42));
     }
 
     #[tokio::test]
-    async fn first_win_returns_no_winner_with_unused_cancel() {
+    async fn first_win_returns_no_result_with_unused_cancel() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
         join_set.spawn(async { Err(io::Error::other("fail")) });
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
 
-        assert_eq!(assert_no_winner(result), 1);
+        assert_eq!(assert_no_result(result), 1);
     }
 
     #[tokio::test]
-    async fn first_win_returns_no_winner_when_all_tasks_panic() {
+    async fn first_win_returns_no_result_when_all_tasks_panic() {
         let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
         join_set.spawn(async { panic!("task 1 panicked") });
         join_set.spawn(async { panic!("task 2 panicked") });
@@ -289,36 +289,36 @@ mod tests {
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
         assert_eq!(
-            assert_no_winner(result),
+            assert_no_result(result),
             2,
             "both panics should be counted as errors"
         );
     }
 
     #[tokio::test]
-    async fn first_win_returns_no_winner_for_empty_join_set() {
+    async fn first_win_returns_no_result_for_empty_join_set() {
         let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
         assert_eq!(
-            assert_no_winner(result),
+            assert_no_result(result),
             0,
-            "empty JoinSet should produce NoWinner with zero errors"
+            "empty JoinSet should produce NoResult with zero errors"
         );
     }
 
     #[tokio::test]
-    async fn first_win_returns_no_winner_for_empty_join_set_with_cancel() {
+    async fn first_win_returns_no_result_for_empty_join_set_with_cancel() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
 
         assert_eq!(
-            assert_no_winner(result),
+            assert_no_result(result),
             0,
-            "empty JoinSet with cancel should produce NoWinner with zero errors"
+            "empty JoinSet with cancel should produce NoResult with zero errors"
         );
     }
 
@@ -331,6 +331,6 @@ mod tests {
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
-        assert_eq!(assert_winner(result), Some(42));
+        assert_eq!(assert_done(result), Some(42));
     }
 }

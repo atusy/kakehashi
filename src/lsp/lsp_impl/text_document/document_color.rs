@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::{ColorInformation, DocumentColorParams, MessageT
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::aggregate::dispatch_aggregation;
-use crate::lsp::aggregation::fan_in::first_win::FirstWinResult;
+use crate::lsp::aggregation::fan_in::FanInResult;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -124,8 +124,8 @@ impl Kakehashi {
                 )
                 .await;
                 match result {
-                    FirstWinResult::Winner(colors) => colors,
-                    FirstWinResult::NoWinner { .. } | FirstWinResult::Cancelled => Vec::new(),
+                    FanInResult::Done(colors) => colors,
+                    FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
                 }
             });
         }

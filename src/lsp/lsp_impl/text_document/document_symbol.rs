@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::{
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::aggregate::dispatch_aggregation;
-use crate::lsp::aggregation::fan_in::first_win::FirstWinResult;
+use crate::lsp::aggregation::fan_in::FanInResult;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -127,8 +127,8 @@ impl Kakehashi {
                 )
                 .await;
                 match result {
-                    FirstWinResult::Winner(symbols) => symbols.unwrap_or_default(),
-                    FirstWinResult::NoWinner { .. } | FirstWinResult::Cancelled => Vec::new(),
+                    FanInResult::Done(symbols) => symbols.unwrap_or_default(),
+                    FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
                 }
             });
         }

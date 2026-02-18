@@ -11,7 +11,8 @@ use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
-use super::fan_in::first_win::{self, FirstWinResult};
+use super::fan_in::FanInResult;
+use super::fan_in::first_win;
 use super::fan_out::{FanOutTask, fan_out};
 
 /// Server-level aggregation entry point using the first-win strategy.
@@ -24,7 +25,7 @@ pub(crate) async fn dispatch_aggregation<T, F, Fut>(
     f: F,
     is_nonempty: impl Fn(&T) -> bool,
     cancel_rx: Option<CancelReceiver>,
-) -> FirstWinResult<T>
+) -> FanInResult<T>
 where
     T: Send + 'static,
     F: Fn(FanOutTask) -> Fut,
