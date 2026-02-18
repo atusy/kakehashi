@@ -169,6 +169,7 @@ fn transform_range(range: &mut Range, region_start_line: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
     use tower_lsp_server::ls_types::Position;
     use url::Url;
@@ -305,10 +306,12 @@ mod tests {
         assert!(list.items[1].text_edit.is_none());
     }
 
-    #[test]
-    fn completion_response_with_null_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::without_result(json!({"jsonrpc": "2.0", "id": 42}))]
+    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
+    #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
         let transformed = transform_completion_response_to_host(response, 3);
         assert!(transformed.is_none());
     }
@@ -396,17 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_response_without_result_returns_none() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42
-        });
-
-        let transformed = transform_completion_response_to_host(response, 3);
-        assert!(transformed.is_none());
-    }
-
-    #[test]
     fn completion_response_transforms_additional_text_edits() {
         let response = json!({
             "jsonrpc": "2.0",
@@ -437,32 +429,6 @@ mod tests {
         let edits = item.additional_text_edits.as_ref().unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].range.start.line, 5); // 0 + 5 = 5
-    }
-
-    #[test]
-    fn completion_response_with_malformed_result_returns_none() {
-        // Result is a string instead of a CompletionList or CompletionItem array
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_a_completion_response"
-        });
-
-        let transformed = transform_completion_response_to_host(response, 3);
-        assert!(transformed.is_none());
-    }
-
-    #[test]
-    fn completion_response_error_response_returns_none() {
-        // JSON-RPC error response has no "result" key
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-
-        let transformed = transform_completion_response_to_host(response, 3);
-        assert!(transformed.is_none());
     }
 
     #[test]
