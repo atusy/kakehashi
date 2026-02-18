@@ -105,6 +105,7 @@ fn transform_moniker_response_to_host(mut response: serde_json::Value) -> Option
 mod tests {
     use super::*;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
+    use rstest::rstest;
     use serde_json::json;
 
     #[test]
@@ -191,10 +192,11 @@ mod tests {
         assert_eq!(monikers[1].identifier, "package:module:Class.method");
     }
 
-    #[test]
-    fn moniker_response_with_null_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
+    fn moniker_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
         let transformed = transform_moniker_response_to_host(response);
         assert!(transformed.is_none());
     }
@@ -207,31 +209,5 @@ mod tests {
         assert!(transformed.is_some());
         let monikers = transformed.unwrap();
         assert!(monikers.is_empty());
-    }
-
-    #[test]
-    fn moniker_response_with_no_result_key_returns_none() {
-        // JSON-RPC error response has no "result" key
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-
-        let transformed = transform_moniker_response_to_host(response);
-        assert!(transformed.is_none());
-    }
-
-    #[test]
-    fn moniker_response_with_malformed_result_returns_none() {
-        // Result is a string instead of a Moniker array
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_an_array"
-        });
-
-        let transformed = transform_moniker_response_to_host(response);
-        assert!(transformed.is_none());
     }
 }
