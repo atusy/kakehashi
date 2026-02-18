@@ -1,7 +1,7 @@
 use regex::Regex;
 use tree_sitter::{Query, QueryCapture, QueryMatch};
 
-/// Check if a capture passes all general predicates (e.g., `#lua-match?`, `#eq?`).
+/// Check if a capture passes all general predicates (e.g., `#lua-match?`).
 ///
 /// Tree-sitter handles built-in predicates (`#eq?`, `#match?`, `#any-of?`) at the
 /// cursor level, but Neovim-specific predicates like `#lua-match?` are "general

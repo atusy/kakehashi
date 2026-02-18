@@ -3,7 +3,7 @@ use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
 use crate::language::query_predicates::check_predicate;
 use crate::language::region_id_tracker::RegionIdTracker;
 use crate::text::fnv1a_hash;
-use tree_sitter::{Node, Query, QueryCursor, QueryMatch, StreamingIterator, Tree};
+use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingIterator, Tree};
 use ulid::Ulid;
 use url::Url;
 
@@ -132,6 +132,27 @@ pub fn parse_offset_directive_for_pattern(
         return Some(DEFAULT_OFFSET);
     }
     None
+}
+
+/// Iterates over `@injection.content` captures that pass general predicate filtering.
+///
+/// Combines predicate evaluation (e.g., `#lua-match?`) and capture name checking
+/// into a single iterator, eliminating duplication between `collect_all_injections`
+/// and `extract_content_and_language`.
+fn iter_valid_injection_content_captures<'a, 'b>(
+    match_: &'b QueryMatch<'_, 'a>,
+    query: &'b Query,
+    text: &'b str,
+) -> impl Iterator<Item = QueryCapture<'a>> + 'b {
+    match_.captures.iter().copied().filter(move |capture| {
+        if !check_predicate(query, match_, capture, text) {
+            return false;
+        }
+        query
+            .capture_names()
+            .get(capture.index as usize)
+            .is_some_and(|name| *name == "injection.content")
+    })
 }
 
 /// Checks if a node is within the bounds of another node
@@ -355,24 +376,14 @@ pub fn collect_all_injections<'a>(
     let mut injections_map = std::collections::HashMap::new();
 
     while let Some(match_) = matches.next() {
-        // Find @injection.content capture in this match
-        for capture in match_.captures {
-            // Apply predicate filtering (e.g., #lua-match?) before processing
-            if !check_predicate(query, match_, capture, text) {
-                continue;
-            }
-            if let Some(capture_name) = query.capture_names().get(capture.index as usize)
-                && *capture_name == "injection.content"
-            {
-                // Extract the injection language
-                if let Some(language) = extract_injection_language(query, match_, text) {
-                    let key = (capture.node.start_byte(), capture.node.end_byte());
-                    injections_map.entry(key).or_insert(InjectionRegionInfo {
-                        language,
-                        content_node: capture.node,
-                        pattern_index: match_.pattern_index,
-                    });
-                }
+        for capture in iter_valid_injection_content_captures(match_, query, text) {
+            if let Some(language) = extract_injection_language(query, match_, text) {
+                let key = (capture.node.start_byte(), capture.node.end_byte());
+                injections_map.entry(key).or_insert(InjectionRegionInfo {
+                    language,
+                    content_node: capture.node,
+                    pattern_index: match_.pattern_index,
+                });
             }
         }
     }
@@ -471,24 +482,14 @@ fn extract_content_and_language<'a>(
     query: &Query,
     text: &str,
 ) -> Option<(Node<'a>, String, usize)> {
-    // Find @injection.content capture
-    for capture in match_.captures {
-        // Apply predicate filtering (e.g., #lua-match?) before processing
-        if !check_predicate(query, match_, capture, text) {
-            continue;
-        }
-        if let Some(capture_name) = query.capture_names().get(capture.index as usize)
-            && *capture_name == "injection.content"
-        {
-            let content_node = capture.node;
+    for capture in iter_valid_injection_content_captures(match_, query, text) {
+        let content_node = capture.node;
 
-            // Check if our node is within this injection region
-            if is_node_within(node, &content_node) {
-                // Extract the injection language
-                if let Some(language) = extract_injection_language(query, match_, text) {
-                    // Return pattern index along with content node and language
-                    return Some((content_node, language, match_.pattern_index));
-                }
+        // Check if our node is within this injection region
+        if is_node_within(node, &content_node) {
+            // Extract the injection language
+            if let Some(language) = extract_injection_language(query, match_, text) {
+                return Some((content_node, language, match_.pattern_index));
             }
         }
     }
