@@ -27,12 +27,22 @@ pub(crate) fn check_predicate(
         }
 
         let node = capture.node;
-        let node_text = &text[node.start_byte()..node.end_byte()];
+        let Some(node_text) = text.get(node.start_byte()..node.end_byte()) else {
+            continue;
+        };
 
-        if predicate.operator.as_ref() == "lua-match?"
-            && !check_lua_match(predicate.args.get(1), node_text)
-        {
-            return false;
+        match predicate.operator.as_ref() {
+            "lua-match?" => {
+                if !check_lua_match(predicate.args.get(1), node_text) {
+                    return false;
+                }
+            }
+            "not-lua-match?" => {
+                if check_lua_match(predicate.args.get(1), node_text) {
+                    return false;
+                }
+            }
+            _ => {}
         }
     }
 
