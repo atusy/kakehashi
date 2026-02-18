@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{ColorPresentation, ColorPresentationParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::aggregate::dispatch_aggregation;
+use crate::lsp::aggregation::aggregate::dispatch_first_win;
 
 impl Kakehashi {
     pub(crate) async fn color_presentation_impl(
@@ -31,7 +31,7 @@ impl Kakehashi {
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        let result = dispatch_aggregation(
+        let result = dispatch_first_win(
             &ctx.document,
             pool.clone(),
             |t| {

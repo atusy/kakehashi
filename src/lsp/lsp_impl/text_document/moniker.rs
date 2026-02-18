@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Moniker, MonikerParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::aggregate::dispatch_aggregation;
+use crate::lsp::aggregation::aggregate::dispatch_first_win;
 
 impl Kakehashi {
     pub(crate) async fn moniker_impl(&self, params: MonikerParams) -> Result<Option<Vec<Moniker>>> {
@@ -24,7 +24,7 @@ impl Kakehashi {
         // Fan-out moniker requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_aggregation(
+        let result = dispatch_first_win(
             &ctx.document,
             pool.clone(),
             |t| async move {

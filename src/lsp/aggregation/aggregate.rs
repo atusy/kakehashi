@@ -1,10 +1,10 @@
 //! Server-level aggregation dispatch.
 //!
-//! [`dispatch_aggregation()`] combines [`fan_out()`] with the first-win
+//! [`dispatch_first_win()`] combines [`fan_out()`] with the first-win
 //! strategy, giving each handler a single call-site for the common pattern.
 //!
-//! [`dispatch_all()`] combines [`fan_out()`] with the collect-all strategy,
-//! collecting every successful result from all matching servers.
+//! [`dispatch_collect_all()`] combines [`fan_out()`] with the collect-all
+//! strategy, collecting every successful result from all matching servers.
 
 use std::future::Future;
 use std::io;
@@ -22,7 +22,7 @@ use super::fan_out::{FanOutTask, fan_out};
 ///
 /// Fans out one task per matching server and returns the first non-empty
 /// result. Handlers call this instead of `fan_out` + `first_win` directly.
-pub(crate) async fn dispatch_aggregation<T, F, Fut>(
+pub(crate) async fn dispatch_first_win<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
@@ -43,7 +43,7 @@ where
 /// Fans out one task per matching server and collects every successful result.
 /// Returns `Done(vec)` when at least one succeeds, `NoResult` when all fail,
 /// or `Cancelled` on cancel notification.
-pub(crate) async fn dispatch_all<T, F, Fut>(
+pub(crate) async fn dispatch_collect_all<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,

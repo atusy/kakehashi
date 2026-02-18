@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::request::{GotoImplementationParams, GotoImplemen
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::aggregate::dispatch_aggregation;
+use crate::lsp::aggregation::aggregate::dispatch_first_win;
 
 impl Kakehashi {
     pub(crate) async fn goto_implementation_impl(
@@ -30,7 +30,7 @@ impl Kakehashi {
         // Fan-out implementation requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_aggregation(
+        let result = dispatch_first_win(
             &ctx.document,
             pool.clone(),
             |t| async move {

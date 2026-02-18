@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::aggregate::dispatch_aggregation;
+use crate::lsp::aggregation::aggregate::dispatch_first_win;
 
 impl Kakehashi {
     pub(crate) async fn inlay_hint_impl(
@@ -27,7 +27,7 @@ impl Kakehashi {
         // Fan-out inlay hint requests to all matching servers
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        let result = dispatch_aggregation(
+        let result = dispatch_first_win(
             &ctx.document,
             pool.clone(),
             |t| async move {

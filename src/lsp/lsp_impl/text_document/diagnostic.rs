@@ -30,7 +30,7 @@ use url::Url;
 use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::aggregate::dispatch_all;
+use crate::lsp::aggregation::aggregate::dispatch_collect_all;
 use crate::lsp::aggregation::fan_in::FanInResult;
 use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
@@ -317,7 +317,7 @@ impl Kakehashi {
         let pool = self.bridge.pool_arc();
 
         // 2-level aggregation:
-        //   Inner: dispatch_all per region (fans out to all servers for that region)
+        //   Inner: dispatch_collect_all per region (fans out to all servers for that region)
         //   Outer: collect_region_results_with_cancel across regions
         let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
 
@@ -337,7 +337,7 @@ impl Kakehashi {
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let result = dispatch_all(
+                let result = dispatch_collect_all(
                     &region_ctx,
                     pool.clone(),
                     |t| async move {

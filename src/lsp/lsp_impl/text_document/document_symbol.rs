@@ -10,7 +10,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::aggregate::dispatch_aggregation;
+use crate::lsp::aggregation::aggregate::dispatch_first_win;
 use crate::lsp::aggregation::fan_in::FanInResult;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
@@ -105,7 +105,7 @@ impl Kakehashi {
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let result = dispatch_aggregation(
+                let result = dispatch_first_win(
                     &region_ctx,
                     pool,
                     |t| async move {
