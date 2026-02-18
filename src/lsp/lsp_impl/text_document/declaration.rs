@@ -24,13 +24,14 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let (cancel_rx, _cancel_guard) =
+            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
 
         // Fan-out declaration requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
         let result = dispatch_aggregation(
-            &ctx,
+            &ctx.document,
             pool.clone(),
             |t| async move {
                 t.pool
@@ -51,7 +52,7 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
 
         result
             .handle(&self.client, "declaration", None, |value| match value {

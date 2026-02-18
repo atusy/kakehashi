@@ -8,7 +8,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::lsp::bridge::LanguageServerPool;
-use crate::lsp::lsp_impl::bridge_context::MultiBridgeRequestContext;
+use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
 use super::fan_in::first_win::{self, FirstWinResult};
@@ -19,7 +19,7 @@ use super::fan_out::{FanOutTask, fan_out};
 /// Fans out one task per matching server and returns the first non-empty
 /// result. Handlers call this instead of `fan_out` + `first_win` directly.
 pub(crate) async fn dispatch_aggregation<T, F, Fut>(
-    ctx: &MultiBridgeRequestContext,
+    ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
     is_nonempty: impl Fn(&T) -> bool,

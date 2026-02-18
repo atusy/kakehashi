@@ -26,12 +26,13 @@ impl Kakehashi {
         // Convert Color to JSON Value for bridge (shared across all tasks)
         let color_json = serde_json::to_value(color).unwrap_or_default();
 
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let (cancel_rx, _cancel_guard) =
+            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
 
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
         let result = dispatch_aggregation(
-            &ctx,
+            &ctx.document,
             pool.clone(),
             |t| {
                 let color_json = color_json.clone();
@@ -56,7 +57,7 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
 
         result
             .handle(&self.client, "color presentation", Vec::new(), Ok)

@@ -34,17 +34,28 @@ pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
 /// configs for the injection language, enabling fan-out to multiple downstream
 /// servers via [`fan_out()`](crate::lsp::aggregation::fan_out::fan_out).
-pub(crate) struct MultiBridgeRequestContext {
+///
+/// This is the document-level context (no position). Position-based handlers
+/// use [`PositionRequestContext`] which wraps this struct.
+pub(crate) struct DocumentRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
-    /// The cursor position within the document.
-    pub(crate) position: Position,
     /// The resolved injection region with virtual content and region metadata.
     pub(crate) resolved: ResolvedInjection,
     /// All matching bridge server configs for this injection language.
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
+}
+
+/// Document context plus a cursor position.
+///
+/// Used by position-based handlers (definition, hover, completion, etc.).
+pub(crate) struct PositionRequestContext {
+    /// The document-level context.
+    pub(crate) document: DocumentRequestContext,
+    /// The cursor position within the document.
+    pub(crate) position: Position,
 }
 
 /// Intermediate result from the shared preamble, before server config lookup.
@@ -199,7 +210,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         position: Position,
         method_name: &str,
-    ) -> Option<MultiBridgeRequestContext> {
+    ) -> Option<PositionRequestContext> {
         let preamble = self
             .resolve_bridge_preamble(lsp_uri, position, method_name)
             .await?;
@@ -223,12 +234,14 @@ impl Kakehashi {
             return None;
         }
 
-        Some(MultiBridgeRequestContext {
-            uri: preamble.uri,
+        Some(PositionRequestContext {
+            document: DocumentRequestContext {
+                uri: preamble.uri,
+                resolved: preamble.resolved,
+                configs,
+                upstream_request_id: preamble.upstream_request_id,
+            },
             position: preamble.position,
-            resolved: preamble.resolved,
-            configs,
-            upstream_request_id: preamble.upstream_request_id,
         })
     }
 }

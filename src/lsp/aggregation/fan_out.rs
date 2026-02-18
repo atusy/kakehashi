@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::bridge::UpstreamId;
-use crate::lsp::lsp_impl::bridge_context::MultiBridgeRequestContext;
+use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 /// Per-server arguments produced by [`fan_out()`].
 ///
@@ -38,7 +38,7 @@ pub(crate) struct FanOutTask {
 /// [`FanOutTask`] and returns the handler-specific future.
 #[must_use = "the JoinSet must be passed to a collection strategy"]
 pub(crate) fn fan_out<T, F, Fut>(
-    ctx: &MultiBridgeRequestContext,
+    ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
 ) -> JoinSet<io::Result<T>>
