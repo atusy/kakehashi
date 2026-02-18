@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
-use tower_lsp_server::jsonrpc::{Error, Result};
+use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Location, MessageType,
     SymbolInformation, Uri,
@@ -122,7 +122,12 @@ impl Kakehashi {
         }
 
         // Collect results, aborting early if $/cancelRequest arrives.
-        let result = collect_symbols_with_cancel(outer_join_set, cancel_rx).await;
+        let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
+            outer_join_set,
+            cancel_rx,
+            |acc, items: Vec<DocumentSymbol>| acc.extend(items),
+        )
+        .await;
 
         // Clean up stale upstream registry entries left by aborted inner tasks.
         // This MUST run on both success and cancel paths — do NOT use `?` above,
@@ -137,77 +142,6 @@ impl Kakehashi {
             self.supports_hierarchical_document_symbol(),
         ))
     }
-}
-
-/// Collect document symbols from all regions, aborting immediately if cancelled.
-///
-/// Uses `tokio::select!` with biased mode to prioritize cancel handling.
-/// When cancelled:
-/// - Returns `RequestCancelled` error immediately
-/// - Drops the JoinSet, which aborts all spawned outer tasks (cascading to inner tasks)
-///
-/// When all regions complete:
-/// - Returns aggregated symbols from all successful regions
-///
-/// If `cancel_rx` is `None`, cancel handling is disabled (graceful degradation
-/// when subscription failed due to `AlreadySubscribedError`).
-async fn collect_symbols_with_cancel(
-    mut join_set: JoinSet<Vec<DocumentSymbol>>,
-    cancel_rx: Option<crate::lsp::request_id::CancelReceiver>,
-) -> Result<Vec<DocumentSymbol>> {
-    let mut all_symbols: Vec<DocumentSymbol> = Vec::new();
-
-    // Handle None case: no cancel support, just collect results
-    let Some(cancel_rx) = cancel_rx else {
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(symbols) => all_symbols.extend(symbols),
-                Err(join_err) => {
-                    log::warn!("document_symbol region task panicked: {join_err}");
-                }
-            }
-        }
-        return Ok(all_symbols);
-    };
-
-    // Pin the cancel receiver for use in select!
-    tokio::pin!(cancel_rx);
-
-    loop {
-        tokio::select! {
-            // Biased: check cancel first to ensure immediate abort on cancellation
-            biased;
-
-            // Cancel notification received - abort immediately
-            _ = &mut cancel_rx => {
-                log::debug!(
-                    target: "kakehashi::document_symbol",
-                    "documentSymbol request cancelled, aborting {} remaining tasks",
-                    join_set.len()
-                );
-                // JoinSet dropped here, aborting all spawned tasks
-                return Err(Error::request_cancelled());
-            }
-
-            // Next task completed - collect result
-            result = join_set.join_next() => {
-                match result {
-                    Some(Ok(symbols)) => {
-                        all_symbols.extend(symbols);
-                    }
-                    Some(Err(join_err)) => {
-                        log::warn!("document_symbol region task panicked: {join_err}");
-                    }
-                    None => {
-                        // All tasks completed - return aggregated results
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(all_symbols)
 }
 
 /// Race all capable servers for a single injection region, returning the first

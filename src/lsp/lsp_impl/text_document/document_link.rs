@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
-use tower_lsp_server::jsonrpc::{Error, Result};
+use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, MessageType};
 
 use crate::config::settings::BridgeServerConfig;
@@ -119,98 +119,29 @@ impl Kakehashi {
         }
 
         // Collect results, aborting early if $/cancelRequest arrives.
-        let result = collect_links_with_cancel(outer_join_set, cancel_rx).await;
+        let all_links = crate::lsp::aggregation::region::collect_region_results_with_cancel(
+            outer_join_set,
+            cancel_rx,
+            |acc, opt: Option<Vec<DocumentLink>>| {
+                if let Some(items) = opt {
+                    acc.extend(items);
+                }
+            },
+        )
+        .await;
 
         // Clean up stale upstream registry entries left by aborted inner tasks.
         // This MUST run on both success and cancel paths — do NOT use `?` above,
         // or the cancel Err would propagate early and skip this cleanup.
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
-        result
-    }
-}
-
-/// Collect document links from all regions, aborting immediately if cancelled.
-///
-/// Uses `tokio::select!` with biased mode to prioritize cancel handling.
-/// When cancelled:
-/// - Returns `RequestCancelled` error immediately
-/// - Drops the JoinSet, which aborts all spawned outer tasks (cascading to inner tasks)
-///
-/// When all regions complete:
-/// - Returns aggregated links from all successful regions, or `None` if empty
-///
-/// If `cancel_rx` is `None`, cancel handling is disabled (graceful degradation
-/// when subscription failed due to `AlreadySubscribedError`).
-async fn collect_links_with_cancel(
-    mut join_set: JoinSet<Option<Vec<DocumentLink>>>,
-    cancel_rx: Option<crate::lsp::request_id::CancelReceiver>,
-) -> Result<Option<Vec<DocumentLink>>> {
-    let mut all_links: Vec<DocumentLink> = Vec::new();
-
-    // Handle None case: no cancel support, just collect results
-    let Some(cancel_rx) = cancel_rx else {
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Some(links)) => all_links.extend(links),
-                Ok(None) => {}
-                Err(join_err) => {
-                    log::warn!("document_link region task panicked: {join_err}");
-                }
-            }
-        }
-        return Ok(if all_links.is_empty() {
+        let all_links = all_links?;
+        Ok(if all_links.is_empty() {
             None
         } else {
             Some(all_links)
-        });
-    };
-
-    // Pin the cancel receiver for use in select!
-    tokio::pin!(cancel_rx);
-
-    loop {
-        tokio::select! {
-            // Biased: check cancel first to ensure immediate abort on cancellation
-            biased;
-
-            // Cancel notification received - abort immediately
-            _ = &mut cancel_rx => {
-                log::debug!(
-                    target: "kakehashi::document_link",
-                    "documentLink request cancelled, aborting {} remaining tasks",
-                    join_set.len()
-                );
-                // JoinSet dropped here, aborting all spawned tasks
-                return Err(Error::request_cancelled());
-            }
-
-            // Next task completed - collect result
-            result = join_set.join_next() => {
-                match result {
-                    Some(Ok(Some(links))) => {
-                        all_links.extend(links);
-                    }
-                    Some(Ok(None)) => {
-                        // Region returned no links - continue with others
-                    }
-                    Some(Err(join_err)) => {
-                        log::warn!("document_link region task panicked: {join_err}");
-                    }
-                    None => {
-                        // All tasks completed - return aggregated results
-                        break;
-                    }
-                }
-            }
-        }
+        })
     }
-
-    Ok(if all_links.is_empty() {
-        None
-    } else {
-        Some(all_links)
-    })
 }
 
 /// Race all capable servers for a single injection region, returning the first

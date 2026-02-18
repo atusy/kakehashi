@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tower_lsp_server::jsonrpc::{Error, Result};
+use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     FullDocumentDiagnosticReport, MessageType, RelatedFullDocumentDiagnosticReport,
@@ -360,100 +360,22 @@ impl Kakehashi {
             });
         }
 
-        // Collect results from all regions, aggregating diagnostics
-        // Note: Deduplication by (range, message, severity) is not implemented yet.
-        // Per ADR-0020, this would be needed if downstream servers report overlapping
-        // diagnostics. Currently each region is isolated so duplicates are unlikely.
-        // TODO: Add deduplication when overlapping diagnostics are observed in practice.
-        //
-        // Cleanup: _subscription_guard is dropped here, calling unsubscribe automatically.
-        // This ensures cleanup happens on all paths including early returns and panics.
-        collect_diagnostics_with_cancel(join_set, cancel_rx).await
-    }
-}
-
-/// Collect diagnostics from all regions, aborting immediately if cancelled.
-///
-/// Uses `tokio::select!` with biased mode to prioritize cancel handling.
-/// When cancelled:
-/// - Returns `RequestCancelled` error immediately
-/// - Drops the JoinSet, which aborts all spawned tasks
-///
-/// When all regions complete:
-/// - Returns aggregated diagnostics from all successful regions
-///
-/// If `cancel_rx` is `None`, cancel handling is disabled (graceful degradation
-/// when subscription failed due to `AlreadySubscribedError`).
-async fn collect_diagnostics_with_cancel(
-    mut join_set: tokio::task::JoinSet<Option<Vec<Diagnostic>>>,
-    cancel_rx: Option<crate::lsp::request_id::CancelReceiver>,
-) -> Result<DocumentDiagnosticReportResult> {
-    let mut all_diagnostics: Vec<Diagnostic> = Vec::new();
-
-    // Handle None case: no cancel support, just collect results
-    let Some(cancel_rx) = cancel_rx else {
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Some(diagnostics)) => all_diagnostics.extend(diagnostics),
-                Ok(None) => {}
-                Err(e) => {
-                    log::error!(
-                        target: "kakehashi::diagnostic",
-                        "Diagnostic task panicked: {}",
-                        e
-                    );
+        // Collect results from all regions, aborting early if $/cancelRequest arrives.
+        let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
+            join_set,
+            cancel_rx,
+            |acc: &mut Vec<Diagnostic>, items| {
+                if let Some(diagnostics) = items {
+                    acc.extend(diagnostics);
                 }
-            }
-        }
-        return Ok(make_diagnostic_report(all_diagnostics));
-    };
+            },
+        )
+        .await;
 
-    // Pin the cancel receiver for use in select!
-    tokio::pin!(cancel_rx);
+        let all_diagnostics = result?;
 
-    loop {
-        tokio::select! {
-            // Biased: check cancel first to ensure immediate abort on cancellation
-            biased;
-
-            // Cancel notification received - abort immediately
-            _ = &mut cancel_rx => {
-                log::debug!(
-                    target: "kakehashi::diagnostic",
-                    "Diagnostic request cancelled, aborting {} remaining tasks",
-                    join_set.len()
-                );
-                // JoinSet dropped here, aborting all spawned tasks
-                return Err(Error::request_cancelled());
-            }
-
-            // Next task completed - collect result
-            result = join_set.join_next() => {
-                match result {
-                    Some(Ok(Some(diagnostics))) => {
-                        all_diagnostics.extend(diagnostics);
-                    }
-                    Some(Ok(None)) => {
-                        // Region returned no diagnostics or failed - continue with others
-                    }
-                    Some(Err(e)) => {
-                        // Task panicked - log and continue
-                        log::error!(
-                            target: "kakehashi::diagnostic",
-                            "Diagnostic task panicked: {}",
-                            e
-                        );
-                    }
-                    None => {
-                        // All tasks completed - return aggregated results
-                        break;
-                    }
-                }
-            }
-        }
+        Ok(make_diagnostic_report(all_diagnostics))
     }
-
-    Ok(make_diagnostic_report(all_diagnostics))
 }
 
 /// Create a full diagnostic report from aggregated diagnostics.

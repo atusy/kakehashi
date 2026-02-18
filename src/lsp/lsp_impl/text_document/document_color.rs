@@ -118,7 +118,12 @@ impl Kakehashi {
         }
 
         // Collect results, aborting early if $/cancelRequest arrives.
-        let result = collect_colors_with_cancel(outer_join_set, cancel_rx).await;
+        let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
+            outer_join_set,
+            cancel_rx,
+            |acc, items: Vec<ColorInformation>| acc.extend(items),
+        )
+        .await;
 
         // Clean up stale upstream registry entries left by aborted inner tasks.
         // This MUST run on both success and cancel paths — do NOT use `?` above,
@@ -127,77 +132,6 @@ impl Kakehashi {
 
         result
     }
-}
-
-/// Collect document colors from all regions, aborting immediately if cancelled.
-///
-/// Uses `tokio::select!` with biased mode to prioritize cancel handling.
-/// When cancelled:
-/// - Returns `RequestCancelled` error immediately
-/// - Drops the JoinSet, which aborts all spawned outer tasks (cascading to inner tasks)
-///
-/// When all regions complete:
-/// - Returns aggregated colors from all successful regions, or empty Vec if no colors
-///
-/// If `cancel_rx` is `None`, cancel handling is disabled (graceful degradation
-/// when subscription failed due to `AlreadySubscribedError`).
-async fn collect_colors_with_cancel(
-    mut join_set: JoinSet<Vec<ColorInformation>>,
-    cancel_rx: Option<crate::lsp::request_id::CancelReceiver>,
-) -> Result<Vec<ColorInformation>> {
-    let mut all_colors: Vec<ColorInformation> = Vec::new();
-
-    // Handle None case: no cancel support, just collect results
-    let Some(cancel_rx) = cancel_rx else {
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(colors) => all_colors.extend(colors),
-                Err(join_err) => {
-                    log::warn!("document_color region task panicked: {join_err}");
-                }
-            }
-        }
-        return Ok(all_colors);
-    };
-
-    // Pin the cancel receiver for use in select!
-    tokio::pin!(cancel_rx);
-
-    loop {
-        tokio::select! {
-            // Biased: check cancel first to ensure immediate abort on cancellation
-            biased;
-
-            // Cancel notification received - abort immediately
-            _ = &mut cancel_rx => {
-                log::debug!(
-                    target: "kakehashi::document_color",
-                    "documentColor request cancelled, aborting {} remaining tasks",
-                    join_set.len()
-                );
-                // JoinSet dropped here, aborting all spawned tasks
-                return Err(tower_lsp_server::jsonrpc::Error::request_cancelled());
-            }
-
-            // Next task completed - collect result
-            result = join_set.join_next() => {
-                match result {
-                    Some(Ok(colors)) => {
-                        all_colors.extend(colors);
-                    }
-                    Some(Err(join_err)) => {
-                        log::warn!("document_color region task panicked: {join_err}");
-                    }
-                    None => {
-                        // All tasks completed - return aggregated results
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(all_colors)
 }
 
 /// Race all capable servers for a single injection region, returning the first
