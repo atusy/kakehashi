@@ -107,7 +107,7 @@ impl Kakehashi {
             outer_join_set.spawn(async move {
                 let result = dispatch_first_win(
                     &region_ctx,
-                    pool,
+                    pool.clone(),
                     |t| async move {
                         t.pool
                             .send_document_symbol_request(
@@ -126,6 +126,7 @@ impl Kakehashi {
                     None,
                 )
                 .await;
+                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
                 match result {
                     FanInResult::Done(symbols) => symbols.unwrap_or_default(),
                     FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
@@ -140,11 +141,6 @@ impl Kakehashi {
             |acc, items: Vec<DocumentSymbol>| acc.extend(items),
         )
         .await;
-
-        // Clean up stale upstream registry entries left by aborted inner tasks.
-        // This MUST run on both success and cancel paths — do NOT use `?` above,
-        // or the cancel Err would propagate early and skip this cleanup.
-        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         let all_symbols = result?;
 
