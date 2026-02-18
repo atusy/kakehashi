@@ -47,6 +47,16 @@ pub(crate) fn check_predicate(
                     return false;
                 }
             }
+            "has-parent?" => {
+                if !check_has_parent(&predicate.args[1..], node) {
+                    return false;
+                }
+            }
+            "not-has-parent?" => {
+                if check_has_parent(&predicate.args[1..], node) {
+                    return false;
+                }
+            }
             _ => {}
         }
     }
@@ -106,6 +116,20 @@ fn check_contains(args: &[tree_sitter::QueryPredicateArg], node_text: &str) -> b
             return true; // Skip non-string args (permissive)
         };
         node_text.contains(s.as_ref())
+    })
+}
+
+/// Check has-parent? predicate - returns true if direct parent's kind matches ANY string arg
+fn check_has_parent(args: &[tree_sitter::QueryPredicateArg], node: tree_sitter::Node) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let parent_kind = parent.kind();
+    args.iter().any(|arg| {
+        let tree_sitter::QueryPredicateArg::String(s) = arg else {
+            return false;
+        };
+        parent_kind == s.as_ref()
     })
 }
 
