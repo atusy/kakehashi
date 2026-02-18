@@ -1,7 +1,17 @@
 use regex::Regex;
 use tree_sitter::{Query, QueryCapture, QueryMatch};
 
-fn check_predicate(query: &Query, match_: &QueryMatch, capture: &QueryCapture, text: &str) -> bool {
+/// Check if a capture passes all general predicates (e.g., `#lua-match?`, `#eq?`).
+///
+/// Tree-sitter handles built-in predicates (`#eq?`, `#match?`, `#any-of?`) at the
+/// cursor level, but Neovim-specific predicates like `#lua-match?` are "general
+/// predicates" that require explicit evaluation.
+pub(crate) fn check_predicate(
+    query: &Query,
+    match_: &QueryMatch,
+    capture: &QueryCapture,
+    text: &str,
+) -> bool {
     let general_predicates = query.general_predicates(match_.pattern_index);
 
     for predicate in general_predicates {
@@ -148,17 +158,4 @@ pub fn filter_captures<'a>(
         .filter(|capture| check_predicate(query, match_, capture, text))
         .cloned()
         .collect()
-}
-
-/// Check if a capture passes all general predicates (e.g., `#lua-match?`).
-///
-/// Unlike `filter_captures`, this works with any `QueryMatch` lifetime combination,
-/// making it compatible with `StreamingIterator`-based match iteration.
-pub fn capture_passes_predicates(
-    query: &Query,
-    match_: &QueryMatch,
-    capture: &QueryCapture,
-    text: &str,
-) -> bool {
-    check_predicate(query, match_, capture, text)
 }
