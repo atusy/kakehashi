@@ -92,160 +92,66 @@ fn normalize_syntax_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // Token detection tests (for code fence identifiers)
 
-    #[test]
-    fn test_detect_token_py() {
-        assert_eq!(detect_from_token("py"), Some("python".to_string()));
+    #[rstest]
+    #[case::py("py", Some("python"))]
+    #[case::js("js", Some("javascript"))]
+    #[case::bash("bash", Some("bash"))]
+    #[case::rust("rust", Some("rust"))]
+    #[case::unknown("unknown_language_xyz", None)]
+    fn test_detect_from_token(#[case] token: &str, #[case] expected: Option<&str>) {
+        assert_eq!(detect_from_token(token), expected.map(String::from));
     }
 
-    #[test]
-    fn test_detect_token_js() {
-        assert_eq!(detect_from_token("js"), Some("javascript".to_string()));
-    }
+    // Shebang / first-line detection tests
 
-    #[test]
-    fn test_detect_token_bash() {
-        assert_eq!(detect_from_token("bash"), Some("bash".to_string()));
-    }
-
-    #[test]
-    fn test_detect_token_rust() {
-        assert_eq!(detect_from_token("rust"), Some("rust".to_string()));
-    }
-
-    #[test]
-    fn test_detect_token_unknown() {
-        assert_eq!(detect_from_token("unknown_language_xyz"), None);
-    }
-
-    // Shebang detection tests
-
-    #[test]
-    fn test_detect_shebang_python() {
-        let content = "#!/usr/bin/env python\nprint('hello')";
-        assert_eq!(detect_from_first_line(content), Some("python".to_string()));
-    }
-
-    #[test]
-    fn test_detect_shebang_python3() {
-        let content = "#!/usr/bin/env python3\nprint('hello')";
-        assert_eq!(detect_from_first_line(content), Some("python".to_string()));
-    }
-
-    #[test]
-    fn test_detect_shebang_bash() {
-        let content = "#!/bin/bash\necho hello";
-        assert_eq!(detect_from_first_line(content), Some("bash".to_string()));
-    }
-
-    #[test]
-    fn test_detect_shebang_sh() {
-        let content = "#!/bin/sh\necho hello";
-        assert_eq!(detect_from_first_line(content), Some("bash".to_string()));
-    }
-
-    #[test]
-    fn test_detect_shebang_node() {
-        let content = "#!/usr/bin/env node\nconsole.log('hello')";
-        assert_eq!(
-            detect_from_first_line(content),
-            Some("javascript".to_string())
-        );
-    }
-
-    #[test]
-    fn test_detect_shebang_ruby() {
-        let content = "#!/usr/bin/env ruby\nputs 'hello'";
-        assert_eq!(detect_from_first_line(content), Some("ruby".to_string()));
-    }
-
-    #[test]
-    fn test_detect_shebang_perl() {
-        let content = "#!/usr/bin/perl\nprint 'hello';";
-        assert_eq!(detect_from_first_line(content), Some("perl".to_string()));
-    }
-
-    #[test]
-    fn test_detect_no_shebang() {
-        assert_eq!(detect_from_first_line("print('hello')"), None);
-        assert_eq!(detect_from_first_line(""), None);
+    #[rstest]
+    #[case::shebang_python("#!/usr/bin/env python\nprint('hello')", Some("python"))]
+    #[case::shebang_python3("#!/usr/bin/env python3\nprint('hello')", Some("python"))]
+    #[case::shebang_bash("#!/bin/bash\necho hello", Some("bash"))]
+    #[case::shebang_sh("#!/bin/sh\necho hello", Some("bash"))]
+    #[case::shebang_node("#!/usr/bin/env node\nconsole.log('hello')", Some("javascript"))]
+    #[case::shebang_ruby("#!/usr/bin/env ruby\nputs 'hello'", Some("ruby"))]
+    #[case::shebang_perl("#!/usr/bin/perl\nprint 'hello';", Some("perl"))]
+    #[case::no_shebang_code("print('hello')", None)]
+    #[case::no_shebang_empty("", None)]
+    fn test_detect_from_first_line(#[case] content: &str, #[case] expected: Option<&str>) {
+        assert_eq!(detect_from_first_line(content), expected.map(String::from));
     }
 
     // Token extraction from path tests
 
-    #[test]
-    fn test_extract_token_with_extension() {
-        // Files with extension return the extension
-        assert_eq!(extract_token_from_path("/path/to/file.rs"), Some("rs"));
-        assert_eq!(extract_token_from_path("/path/to/script.py"), Some("py"));
-        assert_eq!(extract_token_from_path("/path/to/app.js"), Some("js"));
-    }
-
-    #[test]
-    fn test_extract_token_without_extension() {
-        // Files without extension return the basename
-        assert_eq!(
-            extract_token_from_path("/path/to/Makefile"),
-            Some("Makefile")
-        );
-        assert_eq!(
-            extract_token_from_path("/path/to/Dockerfile"),
-            Some("Dockerfile")
-        );
-        assert_eq!(extract_token_from_path("/path/to/Gemfile"), Some("Gemfile"));
-    }
-
-    #[test]
-    fn test_extract_token_hidden_file() {
-        // Hidden files without extension return the basename
-        assert_eq!(extract_token_from_path("/home/.bashrc"), Some(".bashrc"));
-        assert_eq!(
-            extract_token_from_path("/home/.gitignore"),
-            Some(".gitignore")
-        );
-    }
-
-    #[test]
-    fn test_extract_token_unknown_file() {
-        // Unknown file still extracts basename
-        assert_eq!(
-            extract_token_from_path("/path/to/random_file"),
-            Some("random_file")
-        );
+    #[rstest]
+    #[case::extension_rs("/path/to/file.rs", Some("rs"))]
+    #[case::extension_py("/path/to/script.py", Some("py"))]
+    #[case::extension_js("/path/to/app.js", Some("js"))]
+    #[case::basename_makefile("/path/to/Makefile", Some("Makefile"))]
+    #[case::basename_dockerfile("/path/to/Dockerfile", Some("Dockerfile"))]
+    #[case::basename_gemfile("/path/to/Gemfile", Some("Gemfile"))]
+    #[case::hidden_bashrc("/home/.bashrc", Some(".bashrc"))]
+    #[case::hidden_gitignore("/home/.gitignore", Some(".gitignore"))]
+    #[case::unknown_file("/path/to/random_file", Some("random_file"))]
+    fn test_extract_token(#[case] path: &str, #[case] expected: Option<&str>) {
+        assert_eq!(extract_token_from_path(path), expected);
     }
 
     // Combined token extraction + detection tests (integration)
 
-    #[test]
-    fn test_path_to_token_to_language_rust() {
-        let token = extract_token_from_path("/path/to/main.rs").unwrap();
-        assert_eq!(detect_from_token(token), Some("rust".to_string()));
-    }
-
-    #[test]
-    fn test_path_to_token_to_language_python() {
-        let token = extract_token_from_path("/path/to/script.py").unwrap();
-        assert_eq!(detect_from_token(token), Some("python".to_string()));
-    }
-
-    #[test]
-    fn test_path_to_token_to_language_makefile() {
-        let token = extract_token_from_path("/path/to/Makefile").unwrap();
-        assert_eq!(detect_from_token(token), Some("make".to_string()));
-    }
-
-    #[test]
-    fn test_path_to_token_to_language_gemfile() {
-        let token = extract_token_from_path("/path/to/Gemfile").unwrap();
-        // Gemfile is recognized as Ruby
-        assert!(detect_from_token(token).is_some());
-    }
-
-    #[test]
-    fn test_path_to_token_to_language_bashrc() {
-        let token = extract_token_from_path("/home/.bashrc").unwrap();
-        assert_eq!(detect_from_token(token), Some("bash".to_string()));
+    #[rstest]
+    #[case::rust("/path/to/main.rs", Some("rust"))]
+    #[case::python("/path/to/script.py", Some("python"))]
+    #[case::makefile("/path/to/Makefile", Some("make"))]
+    #[case::gemfile("/path/to/Gemfile", Some("ruby"))]
+    #[case::bashrc("/home/.bashrc", Some("bash"))]
+    fn test_path_to_token_to_language(#[case] path: &str, #[case] expected: Option<&str>) {
+        let token = extract_token_from_path(path).unwrap();
+        let result = detect_from_token(token);
+        match expected {
+            Some(lang) => assert_eq!(result, Some(lang.to_string())),
+            None => assert!(result.is_none()),
+        }
     }
 }
