@@ -1,5 +1,6 @@
 use crate::language::LanguageCoordinator;
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
+use crate::language::query_predicates::capture_passes_predicates;
 use crate::language::region_id_tracker::RegionIdTracker;
 use crate::text::fnv1a_hash;
 use tree_sitter::{Node, Query, QueryCursor, QueryMatch, StreamingIterator, Tree};
@@ -356,6 +357,10 @@ pub fn collect_all_injections<'a>(
     while let Some(match_) = matches.next() {
         // Find @injection.content capture in this match
         for capture in match_.captures {
+            // Apply predicate filtering (e.g., #lua-match?) before processing
+            if !capture_passes_predicates(query, match_, capture, text) {
+                continue;
+            }
             if let Some(capture_name) = query.capture_names().get(capture.index as usize)
                 && *capture_name == "injection.content"
             {
@@ -468,6 +473,10 @@ fn extract_content_and_language<'a>(
 ) -> Option<(Node<'a>, String, usize)> {
     // Find @injection.content capture
     for capture in match_.captures {
+        // Apply predicate filtering (e.g., #lua-match?) before processing
+        if !capture_passes_predicates(query, match_, capture, text) {
+            continue;
+        }
         if let Some(capture_name) = query.capture_names().get(capture.index as usize)
             && *capture_name == "injection.content"
         {

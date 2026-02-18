@@ -149,3 +149,16 @@ pub fn filter_captures<'a>(
         .cloned()
         .collect()
 }
+
+/// Check if a capture passes all general predicates (e.g., `#lua-match?`).
+///
+/// Unlike `filter_captures`, this works with any `QueryMatch` lifetime combination,
+/// making it compatible with `StreamingIterator`-based match iteration.
+pub fn capture_passes_predicates(
+    query: &Query,
+    match_: &QueryMatch,
+    capture: &QueryCapture,
+    text: &str,
+) -> bool {
+    check_predicate(query, match_, capture, text)
+}
