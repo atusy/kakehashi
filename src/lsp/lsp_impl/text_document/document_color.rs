@@ -132,13 +132,11 @@ impl Kakehashi {
         }
 
         // Collect results, aborting early if $/cancelRequest arrives.
-        let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
+        crate::lsp::aggregation::region::collect_region_results_with_cancel(
             outer_join_set,
             cancel_rx,
             |acc, items: Vec<ColorInformation>| acc.extend(items),
         )
-        .await;
-
-        result
+        .await
     }
 }
