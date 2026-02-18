@@ -1517,4 +1517,52 @@ mod tests {
             "Should not find injection outside regions"
         );
     }
+
+    #[test]
+    fn test_collect_all_injections_respects_lua_match_predicate() {
+        // Regression test: #lua-match? is a general predicate (not built-in to tree-sitter).
+        // collect_all_injections must apply predicate filtering so that injection rules
+        // guarded by #lua-match? only match when the predicate actually passes.
+        //
+        // Without filtering, a rule like:
+        //   (string content: _ @injection.content (#lua-match? @injection.content "^;") (#set! injection.language "query"))
+        // would match ALL strings, not just those starting with ";".
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "hello"; let b = "; query"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Injection query with #lua-match? predicate:
+        // Only strings starting with ";" should be injected as "query"
+        let query_str = r#"
+            ((string_literal
+                (string_content) @injection.content)
+              (#lua-match? @injection.content "^;")
+              (#set! injection.language "query"))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let injections =
+            collect_all_injections(&root, text, Some(&query)).expect("Should return Some");
+
+        // Only "; query" should match, not "hello"
+        assert_eq!(
+            injections.len(),
+            1,
+            "Only strings matching #lua-match? should be injected, got: {:?}",
+            injections
+                .iter()
+                .map(|i| &text[i.content_node.start_byte()..i.content_node.end_byte()])
+                .collect::<Vec<_>>()
+        );
+        let content =
+            &text[injections[0].content_node.start_byte()..injections[0].content_node.end_byte()];
+        assert!(
+            content.starts_with(';'),
+            "Injected content should start with ';', got: {:?}",
+            content
+        );
+    }
 }
