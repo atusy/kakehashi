@@ -69,7 +69,13 @@ pub(crate) fn check_predicate(
                     return false;
                 }
             }
-            _ => {}
+            unknown => {
+                log::debug!(
+                    target: "kakehashi::query",
+                    "Unrecognized general predicate: #{}",
+                    unknown
+                );
+            }
         }
     }
 
