@@ -8,6 +8,7 @@ mod settings_manager;
 mod synthetic_diagnostics;
 mod text_sync;
 
+mod aggregation;
 mod lsp_impl;
 mod progress;
 mod request_id;
