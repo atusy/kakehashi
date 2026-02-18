@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use regex::Regex;
 use tree_sitter::{Query, QueryCapture, QueryMatch};
 
@@ -54,6 +56,16 @@ pub(crate) fn check_predicate(
             }
             "not-has-parent?" => {
                 if check_has_parent(&predicate.args[1..], node) {
+                    return false;
+                }
+            }
+            "has-ancestor?" => {
+                if !check_has_ancestor(&predicate.args[1..], node) {
+                    return false;
+                }
+            }
+            "not-has-ancestor?" => {
+                if check_has_ancestor(&predicate.args[1..], node) {
                     return false;
                 }
             }
@@ -131,6 +143,26 @@ fn check_has_parent(args: &[tree_sitter::QueryPredicateArg], node: tree_sitter::
         };
         parent_kind == s.as_ref()
     })
+}
+
+/// Check has-ancestor? predicate - walks parent chain, true if any ancestor's kind matches any arg
+fn check_has_ancestor(args: &[tree_sitter::QueryPredicateArg], node: tree_sitter::Node) -> bool {
+    let kind_args: HashSet<&str> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            tree_sitter::QueryPredicateArg::String(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if kind_args.contains(ancestor.kind()) {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
 }
 
 pub fn filter_captures<'a>(
