@@ -5,8 +5,9 @@ use tree_sitter::{Query, QueryCapture, QueryMatch};
 /// [`Query::general_predicates`] for the capture's pattern.
 ///
 /// This covers Neovim-specific predicates like `#lua-match?` that tree-sitter
-/// exposes as "general" rather than handling as built-in text predicates
-/// (`#eq?`, `#match?`, `#any-of?`) at the cursor level.
+/// does not handle as built-in text predicates. Built-in predicates (`#eq?`,
+/// `#match?`, `#any-of?`, etc.) are auto-applied by `QueryCursor::matches()`
+/// in tree-sitter 0.26+ and never appear in `general_predicates()`.
 pub(crate) fn check_predicate(
     query: &Query,
     match_: &QueryMatch,
@@ -28,32 +29,10 @@ pub(crate) fn check_predicate(
         let node = capture.node;
         let node_text = &text[node.start_byte()..node.end_byte()];
 
-        match predicate.operator.as_ref() {
-            "lua-match?" => {
-                if !check_lua_match(predicate.args.get(1), node_text) {
-                    return false;
-                }
-            }
-            "match?" => {
-                if let Some(tree_sitter::QueryPredicateArg::String(pattern_str)) =
-                    predicate.args.get(1)
-                    && let Ok(re) = Regex::new(pattern_str)
-                    && !re.is_match(node_text)
-                {
-                    return false;
-                }
-            }
-            "eq?" => {
-                if !check_eq(predicate.args.get(1), node_text, match_, text) {
-                    return false;
-                }
-            }
-            "not-eq?" => {
-                if !check_not_eq(predicate.args.get(1), node_text, match_, text) {
-                    return false;
-                }
-            }
-            _ => {}
+        if predicate.operator.as_ref() == "lua-match?"
+            && !check_lua_match(predicate.args.get(1), node_text)
+        {
+            return false;
         }
     }
 
@@ -100,52 +79,6 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
     };
 
     re.is_match(node_text)
-}
-
-/// Check eq? predicate - returns true if values are equal
-fn check_eq(
-    arg: Option<&tree_sitter::QueryPredicateArg>,
-    node_text: &str,
-    match_: &QueryMatch,
-    text: &str,
-) -> bool {
-    let Some(value_arg) = arg else {
-        return true; // No arg, pass through
-    };
-
-    get_predicate_arg_text(value_arg, match_, text).is_none_or(|other_text| node_text == other_text)
-}
-
-/// Check not-eq? predicate - returns true if values are not equal
-fn check_not_eq(
-    arg: Option<&tree_sitter::QueryPredicateArg>,
-    node_text: &str,
-    match_: &QueryMatch,
-    text: &str,
-) -> bool {
-    let Some(value_arg) = arg else {
-        return true; // No arg, pass through
-    };
-
-    get_predicate_arg_text(value_arg, match_, text) != Some(node_text)
-}
-
-fn get_predicate_arg_text<'a>(
-    arg: &'a tree_sitter::QueryPredicateArg,
-    match_: &'a QueryMatch,
-    text: &'a str,
-) -> Option<&'a str> {
-    match arg {
-        tree_sitter::QueryPredicateArg::String(value_str) => Some(value_str.as_ref()),
-        tree_sitter::QueryPredicateArg::Capture(other_capture_id) => {
-            let other_capture = match_
-                .captures
-                .iter()
-                .find(|c| c.index == *other_capture_id)?;
-            let other_node = other_capture.node;
-            Some(&text[other_node.start_byte()..other_node.end_byte()])
-        }
-    }
 }
 
 pub fn filter_captures<'a>(
