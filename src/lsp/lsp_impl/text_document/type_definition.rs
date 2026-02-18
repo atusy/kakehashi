@@ -7,7 +7,8 @@ use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefi
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use super::first_win::{self, fan_out};
+use crate::lsp::aggregation::fan_in::first_win;
+use crate::lsp::aggregation::fan_out::fan_out;
 
 impl Kakehashi {
     pub(crate) async fn goto_type_definition_impl(

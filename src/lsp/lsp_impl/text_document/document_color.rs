@@ -12,7 +12,7 @@ use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::bridge::UpstreamId;
 
 use super::super::{Kakehashi, uri_to_url};
-use super::first_win;
+use crate::lsp::aggregation::fan_in::first_win;
 
 impl Kakehashi {
     pub(crate) async fn document_color_impl(

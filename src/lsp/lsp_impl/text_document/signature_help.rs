@@ -4,7 +4,8 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{SignatureHelp, SignatureHelpParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, fan_out};
+use crate::lsp::aggregation::fan_in::first_win;
+use crate::lsp::aggregation::fan_out::fan_out;
 
 impl Kakehashi {
     pub(crate) async fn signature_help_impl(
