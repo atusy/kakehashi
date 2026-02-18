@@ -256,3 +256,50 @@ fn test_not_lua_match_predicate() {
     assert!(results.contains(&"main".to_string()));
     assert!(!results.contains(&"test_fn".to_string()));
 }
+
+#[test]
+fn test_contains_predicate() {
+    let source_code = r#"
+        fn foobar() {}
+        fn foo() {}
+        fn bar() {}
+    "#;
+
+    // contains? with single arg: "oo" must be a substring
+    let query_str = r#"((identifier) @name (#contains? @name "oo"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(results.contains(&"foobar".to_string()));
+    assert!(results.contains(&"foo".to_string()));
+    assert!(!results.contains(&"bar".to_string()));
+}
+
+#[test]
+fn test_contains_predicate_multiple_args() {
+    let source_code = r#"
+        fn foobar() {}
+        fn foo() {}
+        fn bar() {}
+    "#;
+
+    // contains? with multiple args: ALL must be substrings (AND semantics)
+    let query_str = r#"((identifier) @name (#contains? @name "foo" "bar"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(results.contains(&"foobar".to_string()));
+    assert!(!results.contains(&"foo".to_string())); // "foo" doesn't contain "bar"
+    assert!(!results.contains(&"bar".to_string())); // "bar" doesn't contain "foo"
+}
+
+#[test]
+fn test_contains_predicate_no_args() {
+    let source_code = r#"
+        fn foobar() {}
+    "#;
+
+    // contains? with no string args beyond the capture: vacuous truth, all match
+    let query_str = r#"((identifier) @name (#contains? @name))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(results.contains(&"foobar".to_string()));
+}
