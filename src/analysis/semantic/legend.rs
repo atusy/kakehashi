@@ -129,6 +129,7 @@ pub(super) fn map_capture_to_token_type_and_modifiers(capture_name: &str) -> Opt
 mod tests {
     use super::*;
     use crate::config::QueryTypeMappings;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     #[test]
@@ -205,114 +206,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_capture_mapping_returns_none_for_unknown_types() {
-        // Unknown types (not in LEGEND_TYPES) should return None
-        // This prevents unknown captures from being added to all_tokens
+    #[rstest]
+    #[case::unknown_spell("spell", None)]
+    #[case::unknown_nospell("nospell", None)]
+    #[case::unknown_conceal("conceal", None)]
+    #[case::unknown_markup("markup", None)]
+    #[case::unknown_other("unknown", None)]
+    #[case::known_comment("comment", Some("comment"))]
+    #[case::known_keyword("keyword", Some("keyword"))]
+    #[case::known_variable_with_modifier("variable.readonly", Some("variable.readonly"))]
+    fn apply_capture_mapping_known_and_unknown_types(
+        #[case] capture_name: &str,
+        #[case] expected: Option<&str>,
+    ) {
         assert_eq!(
-            apply_capture_mapping("spell", None, None),
-            None,
-            "'spell' is a tree-sitter hint for spellcheck regions"
-        );
-        assert_eq!(
-            apply_capture_mapping("nospell", None, None),
-            None,
-            "'nospell' is a tree-sitter hint for no-spellcheck regions"
-        );
-        assert_eq!(
-            apply_capture_mapping("conceal", None, None),
-            None,
-            "'conceal' is a tree-sitter hint for concealable text"
-        );
-        assert_eq!(
-            apply_capture_mapping("markup", None, None),
-            None,
-            "'markup' is not in LEGEND_TYPES"
-        );
-        assert_eq!(
-            apply_capture_mapping("unknown", None, None),
-            None,
-            "'unknown' is not in LEGEND_TYPES"
-        );
-
-        // Known types should return Some
-        assert_eq!(
-            apply_capture_mapping("comment", None, None),
-            Some("comment".to_string()),
-            "'comment' is in LEGEND_TYPES"
-        );
-        assert_eq!(
-            apply_capture_mapping("keyword", None, None),
-            Some("keyword".to_string()),
-            "'keyword' is in LEGEND_TYPES"
-        );
-        assert_eq!(
-            apply_capture_mapping("variable.readonly", None, None),
-            Some("variable.readonly".to_string()),
-            "'variable' base type is in LEGEND_TYPES"
+            apply_capture_mapping(capture_name, None, None),
+            expected.map(String::from),
         );
     }
 
-    #[test]
-    fn test_map_capture_to_token_type_and_modifiers() {
-        // Test basic token types without modifiers
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("comment"),
-            Some((0, 0))
-        );
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("keyword"),
-            Some((1, 0))
-        );
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("function"),
-            Some((14, 0))
-        );
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("variable"),
-            Some((17, 0))
-        );
-
-        // Unknown types return None - they should not produce semantic tokens
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("unknown"),
-            None,
-            "'unknown' is not in LEGEND_TYPES"
-        );
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("spell"),
-            None,
-            "'spell' is a tree-sitter hint, not a semantic token type"
-        );
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers("markup"),
-            None,
-            "'markup' is not in LEGEND_TYPES"
-        );
-        assert_eq!(
-            map_capture_to_token_type_and_modifiers(""),
-            None,
-            "empty string should return None"
-        );
-
-        // Test with single modifier
-        let (_, modifiers) = map_capture_to_token_type_and_modifiers("variable.readonly").unwrap();
-        assert_eq!(modifiers & (1 << 2), 1 << 2); // readonly is at index 2
-
-        let (_, modifiers) = map_capture_to_token_type_and_modifiers("function.async").unwrap();
-        assert_eq!(modifiers & (1 << 6), 1 << 6); // async is at index 6
-
-        // Test with multiple modifiers
-        let (token_type, modifiers) =
-            map_capture_to_token_type_and_modifiers("variable.readonly.defaultLibrary").unwrap();
-        assert_eq!(token_type, 17); // variable
-        assert_eq!(modifiers & (1 << 2), 1 << 2); // readonly
-        assert_eq!(modifiers & (1 << 9), 1 << 9); // defaultLibrary
-
-        // Test unknown modifiers are ignored
-        let (token_type, modifiers) =
-            map_capture_to_token_type_and_modifiers("function.unknownModifier.async").unwrap();
-        assert_eq!(token_type, 14); // function
-        assert_eq!(modifiers & (1 << 6), 1 << 6); // async should still be set
+    #[rstest]
+    #[case::comment("comment", Some((0, 0)))]
+    #[case::keyword("keyword", Some((1, 0)))]
+    #[case::function("function", Some((14, 0)))]
+    #[case::variable("variable", Some((17, 0)))]
+    #[case::unknown("unknown", None)]
+    #[case::spell("spell", None)]
+    #[case::markup("markup", None)]
+    #[case::empty("", None)]
+    #[case::variable_readonly("variable.readonly", Some((17, 1 << 2)))]
+    #[case::function_async("function.async", Some((14, 1 << 6)))]
+    #[case::variable_readonly_default_library("variable.readonly.defaultLibrary", Some((17, (1 << 2) | (1 << 9))))]
+    #[case::function_unknown_modifier_async("function.unknownModifier.async", Some((14, 1 << 6)))]
+    fn test_map_capture_to_token_type_and_modifiers(
+        #[case] capture_name: &str,
+        #[case] expected: Option<(u32, u32)>,
+    ) {
+        let result = map_capture_to_token_type_and_modifiers(capture_name);
+        match expected {
+            None => assert_eq!(result, None),
+            Some((expected_type, expected_modifiers)) => {
+                let (token_type, modifiers) = result.unwrap();
+                assert_eq!(token_type, expected_type);
+                assert_eq!(modifiers, expected_modifiers);
+            }
+        }
     }
 }
