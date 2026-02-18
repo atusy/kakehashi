@@ -33,7 +33,7 @@ pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
 /// configs for the injection language, enabling fan-out to multiple downstream
-/// servers via [`fan_out()`](crate::lsp::aggregation::fan_out::fan_out).
+/// servers via [`fan_out()`](crate::lsp::aggregation::server::fan_out::fan_out).
 ///
 /// This is the document-level context (no position). Position-based handlers
 /// use [`PositionRequestContext`] which wraps this struct.

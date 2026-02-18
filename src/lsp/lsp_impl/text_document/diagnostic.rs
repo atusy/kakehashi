@@ -30,8 +30,8 @@ use url::Url;
 use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::aggregate::dispatch_collect_all;
-use crate::lsp::aggregation::fan_in::FanInResult;
+use crate::lsp::aggregation::server::FanInResult;
+use crate::lsp::aggregation::server::dispatch_collect_all;
 use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 

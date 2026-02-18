@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentHighlight, DocumentHighlightParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::aggregate::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_first_win;
 
 impl Kakehashi {
     pub(crate) async fn document_highlight_impl(

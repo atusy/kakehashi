@@ -10,8 +10,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::aggregate::dispatch_first_win;
-use crate::lsp::aggregation::fan_in::FanInResult;
+use crate::lsp::aggregation::server::FanInResult;
+use crate::lsp::aggregation::server::dispatch_first_win;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 use super::super::{Kakehashi, uri_to_url};
