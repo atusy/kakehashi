@@ -1,6 +1,30 @@
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
+/// Helper to collect capture texts from a query using filter_captures
+fn collect_filtered_captures(source_code: &str, query_str: &str) -> Vec<String> {
+    let mut parser = Parser::new();
+    let language = tree_sitter_rust::LANGUAGE.into();
+    parser.set_language(&language).unwrap();
+
+    let tree = parser.parse(source_code, None).unwrap();
+    let root_node = tree.root_node();
+
+    let query = Query::new(&language, query_str).unwrap();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root_node, source_code.as_bytes());
+
+    let mut results = Vec::new();
+    while let Some(match_) = matches.next() {
+        let filtered = kakehashi::language::filter_captures(&query, match_, source_code);
+        for capture in filtered {
+            let text = &source_code[capture.node.start_byte()..capture.node.end_byte()];
+            results.push(text.to_string());
+        }
+    }
+    results
+}
+
 #[test]
 fn test_lua_match_predicates() {
     // Initialize parser with a simple language (using Rust for this test)
@@ -216,4 +240,19 @@ fn test_lua_match_quantifiers() {
     assert!(found_any.contains(&"ab".to_string()));
     assert!(found_any.contains(&"abc".to_string()));
     assert!(found_any.contains(&"abcd".to_string()));
+}
+
+#[test]
+fn test_not_lua_match_predicate() {
+    let source_code = r#"
+        fn test_fn() {}
+        fn main() {}
+    "#;
+
+    // not-lua-match? should exclude identifiers matching "^test"
+    let query_str = r#"((identifier) @name (#not-lua-match? @name "^test"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(results.contains(&"main".to_string()));
+    assert!(!results.contains(&"test_fn".to_string()));
 }
