@@ -15,9 +15,8 @@ impl Kakehashi {
         let range = params.range;
         let color = params.color;
 
-        // Use resolve_bridge_contexts() for fan-out to ALL matching servers
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, range.start, "colorPresentation")
+            .resolve_bridge_contexts_for_range(&lsp_uri, range, "colorPresentation")
             .await
         else {
             return Ok(Vec::new());
@@ -31,6 +30,7 @@ impl Kakehashi {
 
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
+        let range = ctx.range;
         let result = dispatch_aggregation(
             &ctx.document,
             pool.clone(),

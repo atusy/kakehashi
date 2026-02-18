@@ -14,11 +14,8 @@ impl Kakehashi {
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
-        // Use range.start position to find the injection region
-        // Note: This is a simplification - for range spanning multiple regions,
-        // we'd need to aggregate results from all regions. For now, we use start position.
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, range.start, "inlay_hint")
+            .resolve_bridge_contexts_for_range(&lsp_uri, range, "inlay_hint")
             .await
         else {
             return Ok(None);
@@ -29,6 +26,7 @@ impl Kakehashi {
 
         // Fan-out inlay hint requests to all matching servers
         let pool = self.bridge.pool_arc();
+        let range = ctx.range;
         let result = dispatch_aggregation(
             &ctx.document,
             pool.clone(),
