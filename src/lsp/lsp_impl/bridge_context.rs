@@ -33,7 +33,7 @@ pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
 /// configs for the injection language, enabling fan-out to multiple downstream
-/// servers via [`fan_out()`](super::text_document::first_win::fan_out).
+/// servers via [`fan_out()`](crate::lsp::aggregation::fan_out::fan_out).
 pub(crate) struct MultiBridgeRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
