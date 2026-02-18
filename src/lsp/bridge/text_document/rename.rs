@@ -271,6 +271,7 @@ fn transform_text_document_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
     // ==========================================================================
@@ -349,31 +350,16 @@ mod tests {
         VirtualDocumentUri::new(&host_uri, "lua", "region-0").to_uri_string()
     }
 
-    #[test]
-    fn workspace_edit_with_null_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::without_result(json!({"jsonrpc": "2.0", "id": 42}))]
+    fn workspace_edit_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
         let result = transform_workspace_edit_response_to_host(
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
             5,
         );
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn workspace_edit_without_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42 });
-
-        let result = transform_workspace_edit_response_to_host(
-            response,
-            &make_virtual_uri_string(),
-            &make_host_uri(),
-            5,
-        );
-
         assert!(result.is_none());
     }
 
