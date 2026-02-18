@@ -6,7 +6,7 @@
 //! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
 use tower_lsp_server::jsonrpc::Id;
-use tower_lsp_server::ls_types::{MessageType, Position, Uri};
+use tower_lsp_server::ls_types::{MessageType, Position, Range, Uri};
 use url::Url;
 
 use crate::language::injection::ResolvedInjection;
@@ -33,18 +33,39 @@ pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
 ///
 /// Produced by `Kakehashi::resolve_bridge_contexts`. Returns ALL matching server
 /// configs for the injection language, enabling fan-out to multiple downstream
-/// servers via [`fan_out()`](super::text_document::first_win::fan_out).
-pub(crate) struct MultiBridgeRequestContext {
+/// servers via [`fan_out()`](crate::lsp::aggregation::server::fan_out::fan_out).
+///
+/// This is the document-level context (no position). Position-based handlers
+/// use [`PositionRequestContext`] which wraps this struct.
+pub(crate) struct DocumentRequestContext {
     /// The parsed document URL (url::Url).
     pub(crate) uri: Url,
-    /// The cursor position within the document.
-    pub(crate) position: Position,
     /// The resolved injection region with virtual content and region metadata.
     pub(crate) resolved: ResolvedInjection,
     /// All matching bridge server configs for this injection language.
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
+}
+
+/// Document context plus a cursor position.
+///
+/// Used by position-based handlers (definition, hover, completion, etc.).
+pub(crate) struct PositionRequestContext {
+    /// The document-level context.
+    pub(crate) document: DocumentRequestContext,
+    /// The cursor position within the document.
+    pub(crate) position: Position,
+}
+
+/// Document context plus a range.
+///
+/// Used by range-based handlers (inlay_hint, color_presentation).
+pub(crate) struct RangeRequestContext {
+    /// The document-level context.
+    pub(crate) document: DocumentRequestContext,
+    /// The range within the document.
+    pub(crate) range: Range,
 }
 
 /// Intermediate result from the shared preamble, before server config lookup.
@@ -190,21 +211,14 @@ impl Kakehashi {
         })
     }
 
-    /// Resolve injection context for a bridge endpoint request (all matching servers).
+    /// Convert a preamble result into a `DocumentRequestContext` by looking up
+    /// bridge server configs for the injection language.
     ///
-    /// Delegates to the shared preamble, then looks up ALL bridge server configs
-    /// for the injection language. Returns `None` if no configs found.
-    pub(crate) async fn resolve_bridge_contexts(
+    /// Returns `None` if no configs are found.
+    async fn preamble_to_document_context(
         &self,
-        lsp_uri: &Uri,
-        position: Position,
-        method_name: &str,
-    ) -> Option<MultiBridgeRequestContext> {
-        let preamble = self
-            .resolve_bridge_preamble(lsp_uri, position, method_name)
-            .await?;
-
-        // Get ALL bridge server configs for this language
+        preamble: PreambleResult,
+    ) -> Option<DocumentRequestContext> {
         let configs = self.get_all_bridge_configs_for_language(
             &preamble.language_name,
             &preamble.resolved.injection_language,
@@ -223,12 +237,48 @@ impl Kakehashi {
             return None;
         }
 
-        Some(MultiBridgeRequestContext {
+        Some(DocumentRequestContext {
             uri: preamble.uri,
-            position: preamble.position,
             resolved: preamble.resolved,
             configs,
             upstream_request_id: preamble.upstream_request_id,
         })
+    }
+
+    /// Resolve injection context for a bridge endpoint request (all matching servers).
+    ///
+    /// Delegates to the shared preamble, then looks up ALL bridge server configs
+    /// for the injection language. Returns `None` if no configs found.
+    pub(crate) async fn resolve_bridge_contexts(
+        &self,
+        lsp_uri: &Uri,
+        position: Position,
+        method_name: &str,
+    ) -> Option<PositionRequestContext> {
+        let preamble = self
+            .resolve_bridge_preamble(lsp_uri, position, method_name)
+            .await?;
+        let position = preamble.position;
+        let document = self.preamble_to_document_context(preamble).await?;
+
+        Some(PositionRequestContext { document, position })
+    }
+
+    /// Resolve injection context for a range-based bridge endpoint request.
+    ///
+    /// Uses `range.start` to find the injection region, then returns a
+    /// [`RangeRequestContext`] with the full range for the handler to use.
+    pub(crate) async fn resolve_bridge_contexts_for_range(
+        &self,
+        lsp_uri: &Uri,
+        range: Range,
+        method_name: &str,
+    ) -> Option<RangeRequestContext> {
+        let preamble = self
+            .resolve_bridge_preamble(lsp_uri, range.start, method_name)
+            .await?;
+        let document = self.preamble_to_document_context(preamble).await?;
+
+        Some(RangeRequestContext { document, range })
     }
 }

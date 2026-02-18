@@ -19,7 +19,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tower_lsp_server::jsonrpc::{Error, Result};
+use tokio::task::JoinSet;
+use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     FullDocumentDiagnosticReport, MessageType, RelatedFullDocumentDiagnosticReport,
@@ -29,8 +30,10 @@ use url::Url;
 use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::BridgeServerConfig;
 use crate::language::InjectionResolver;
+use crate::lsp::aggregation::server::FanInResult;
+use crate::lsp::aggregation::server::dispatch_collect_all;
 use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
-use crate::lsp::get_current_request_id;
+use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 // ============================================================================
 // Shared diagnostic utilities (used by both pull and synthetic push diagnostics)
@@ -187,9 +190,6 @@ pub(crate) async fn fan_out_diagnostic_requests(
 // Pull diagnostics implementation (textDocument/diagnostic)
 // ============================================================================
 
-/// Logging target for pull diagnostics.
-const LOG_TARGET: &str = "kakehashi::diagnostic";
-
 impl Kakehashi {
     /// Build DiagnosticRequestInfo for all injection regions that have bridge configs.
     ///
@@ -308,152 +308,87 @@ impl Kakehashi {
         }
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
-        //
-        // Note: All parallel diagnostic requests for different injection regions share the
-        // same upstream_request_id. This is intentional - when the client cancels a diagnostic
-        // request, the handler returns RequestCancelled immediately and drops the JoinSet,
-        // which aborts all spawned downstream tasks.
-        //
-        // Cancel handling flow:
-        // 1. Client sends $/cancelRequest with request ID
-        // 2. RequestIdCapture middleware notifies our cancel_rx via CancelForwarder
-        // 3. tokio::select! triggers cancel branch, drops JoinSet (aborts all tasks)
-        // 4. Handler returns RequestCancelled error to client
-        // 5. Middleware forwards cancel to ALL downstream servers via HashSet registry
-        let upstream_request_id = match get_current_request_id() {
-            Some(tower_lsp_server::jsonrpc::Id::Number(n)) => Some(UpstreamId::Number(n)),
-            Some(tower_lsp_server::jsonrpc::Id::String(s)) => Some(UpstreamId::String(s)),
-            None | Some(tower_lsp_server::jsonrpc::Id::Null) => None,
-        };
+        let upstream_request_id = super::super::bridge_context::current_upstream_id();
 
         // Subscribe to cancel notifications for this request.
         // The guard ensures unsubscribe is called on all return paths (including early returns).
-        let (cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
 
-        // Build request infos using the factored-out method
-        let request_infos = self.build_diagnostic_request_infos(&language_name, &all_regions);
-
-        if request_infos.is_empty() {
-            return Ok(empty_diagnostic_report());
-        }
-
-        // Fan-out diagnostic requests to all regions in parallel using JoinSet
         let pool = self.bridge.pool_arc();
-        let mut join_set = tokio::task::JoinSet::new();
 
-        for info in request_infos {
+        // 2-level aggregation:
+        //   Inner: dispatch_collect_all per region (fans out to all servers for that region)
+        //   Outer: collect_region_results_with_cancel across regions
+        let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
+
+        for resolved in all_regions {
+            let configs = self
+                .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
+            if configs.is_empty() {
+                continue;
+            }
+
+            let region_ctx = DocumentRequestContext {
+                uri: uri.clone(),
+                resolved,
+                configs,
+                upstream_request_id: upstream_request_id.clone(),
+            };
             let pool = Arc::clone(&pool);
-            let uri = uri.clone();
-            let upstream_id = upstream_request_id.clone();
 
-            join_set.spawn(async move {
-                send_diagnostic_with_timeout(
-                    &pool,
-                    &info,
-                    &uri,
-                    upstream_id,
-                    None, // No previous_result_id for multi-region
-                    DIAGNOSTIC_REQUEST_TIMEOUT,
-                    LOG_TARGET,
+            outer_join_set.spawn(async move {
+                let result = dispatch_collect_all(
+                    &region_ctx,
+                    pool.clone(),
+                    |t| async move {
+                        let rid = t.region_id.clone();
+                        tokio::time::timeout(
+                            DIAGNOSTIC_REQUEST_TIMEOUT,
+                            t.pool.send_diagnostic_request(
+                                &t.server_name,
+                                &t.server_config,
+                                &t.uri,
+                                &t.injection_language,
+                                &t.region_id,
+                                t.region_start_line,
+                                &t.virtual_content,
+                                t.upstream_id,
+                                None, // No previous_result_id
+                            ),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(std::io::Error::other(format!(
+                                "diagnostic request timed out for region {rid}"
+                            )))
+                        })
+                    },
+                    None, // cancel handled at outer level
                 )
-                .await
+                .await;
+
+                // Clean up stale upstream registry entries from inner fan_out
+                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
+
+                match result {
+                    FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
+                    FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
+                }
             });
         }
 
-        // Collect results from all regions, aggregating diagnostics
-        // Note: Deduplication by (range, message, severity) is not implemented yet.
-        // Per ADR-0020, this would be needed if downstream servers report overlapping
-        // diagnostics. Currently each region is isolated so duplicates are unlikely.
-        // TODO: Add deduplication when overlapping diagnostics are observed in practice.
-        //
-        // Cleanup: _subscription_guard is dropped here, calling unsubscribe automatically.
-        // This ensures cleanup happens on all paths including early returns and panics.
-        collect_diagnostics_with_cancel(join_set, cancel_rx).await
+        // Collect results from all regions, aborting early if $/cancelRequest arrives.
+        let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
+            outer_join_set,
+            cancel_rx,
+            |acc, items: Vec<Diagnostic>| acc.extend(items),
+        )
+        .await;
+
+        let all_diagnostics = result?;
+
+        Ok(make_diagnostic_report(all_diagnostics))
     }
-}
-
-/// Collect diagnostics from all regions, aborting immediately if cancelled.
-///
-/// Uses `tokio::select!` with biased mode to prioritize cancel handling.
-/// When cancelled:
-/// - Returns `RequestCancelled` error immediately
-/// - Drops the JoinSet, which aborts all spawned tasks
-///
-/// When all regions complete:
-/// - Returns aggregated diagnostics from all successful regions
-///
-/// If `cancel_rx` is `None`, cancel handling is disabled (graceful degradation
-/// when subscription failed due to `AlreadySubscribedError`).
-async fn collect_diagnostics_with_cancel(
-    mut join_set: tokio::task::JoinSet<Option<Vec<Diagnostic>>>,
-    cancel_rx: Option<crate::lsp::request_id::CancelReceiver>,
-) -> Result<DocumentDiagnosticReportResult> {
-    let mut all_diagnostics: Vec<Diagnostic> = Vec::new();
-
-    // Handle None case: no cancel support, just collect results
-    let Some(cancel_rx) = cancel_rx else {
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Some(diagnostics)) => all_diagnostics.extend(diagnostics),
-                Ok(None) => {}
-                Err(e) => {
-                    log::error!(
-                        target: "kakehashi::diagnostic",
-                        "Diagnostic task panicked: {}",
-                        e
-                    );
-                }
-            }
-        }
-        return Ok(make_diagnostic_report(all_diagnostics));
-    };
-
-    // Pin the cancel receiver for use in select!
-    tokio::pin!(cancel_rx);
-
-    loop {
-        tokio::select! {
-            // Biased: check cancel first to ensure immediate abort on cancellation
-            biased;
-
-            // Cancel notification received - abort immediately
-            _ = &mut cancel_rx => {
-                log::debug!(
-                    target: "kakehashi::diagnostic",
-                    "Diagnostic request cancelled, aborting {} remaining tasks",
-                    join_set.len()
-                );
-                // JoinSet dropped here, aborting all spawned tasks
-                return Err(Error::request_cancelled());
-            }
-
-            // Next task completed - collect result
-            result = join_set.join_next() => {
-                match result {
-                    Some(Ok(Some(diagnostics))) => {
-                        all_diagnostics.extend(diagnostics);
-                    }
-                    Some(Ok(None)) => {
-                        // Region returned no diagnostics or failed - continue with others
-                    }
-                    Some(Err(e)) => {
-                        // Task panicked - log and continue
-                        log::error!(
-                            target: "kakehashi::diagnostic",
-                            "Diagnostic task panicked: {}",
-                            e
-                        );
-                    }
-                    None => {
-                        // All tasks completed - return aggregated results
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(make_diagnostic_report(all_diagnostics))
 }
 
 /// Create a full diagnostic report from aggregated diagnostics.

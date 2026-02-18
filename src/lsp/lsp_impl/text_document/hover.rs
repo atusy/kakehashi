@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Hover, HoverParams};
 
 use super::super::Kakehashi;
-use super::first_win::{self, fan_out};
+use crate::lsp::aggregation::server::dispatch_first_win;
 
 impl Kakehashi {
     pub(crate) async fn hover_impl(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -19,30 +19,35 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let (cancel_rx, _cancel_guard) =
+            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
 
         // Fan-out hover requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let mut join_set = fan_out(&ctx, pool.clone(), |t| async move {
-            t.pool
-                .send_hover_request(
-                    &t.server_name,
-                    &t.server_config,
-                    &t.uri,
-                    position,
-                    &t.injection_language,
-                    &t.region_id,
-                    t.region_start_line,
-                    &t.virtual_content,
-                    t.upstream_id,
-                )
-                .await
-        });
-
-        // Return the first non-null hover response
-        let result = first_win::first_win(&mut join_set, |opt| opt.is_some(), cancel_rx).await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        let result = dispatch_first_win(
+            &ctx.document,
+            pool.clone(),
+            |t| async move {
+                t.pool
+                    .send_hover_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        position,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.region_start_line,
+                        &t.virtual_content,
+                        t.upstream_id,
+                    )
+                    .await
+            },
+            |opt| opt.is_some(),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
         result.handle(&self.client, "hover", None, Ok).await
     }
 }
