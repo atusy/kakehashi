@@ -180,6 +180,7 @@ fn transform_color_presentation_response_to_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
     // ==========================================================================
@@ -481,10 +482,13 @@ mod tests {
         assert_eq!(presentations[2].label, "hsl(0, 100%, 50%)");
     }
 
-    #[test]
-    fn color_presentation_response_with_null_result_returns_empty() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
+    fn color_presentation_response_returns_empty_for_invalid_response(
+        #[case] response: serde_json::Value,
+    ) {
         let presentations = transform_color_presentation_response_to_host(response, 5);
         assert!(presentations.is_empty());
     }
@@ -492,30 +496,6 @@ mod tests {
     #[test]
     fn color_presentation_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
-
-        let presentations = transform_color_presentation_response_to_host(response, 5);
-        assert!(presentations.is_empty());
-    }
-
-    #[test]
-    fn color_presentation_response_with_no_result_key_returns_empty() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-
-        let presentations = transform_color_presentation_response_to_host(response, 5);
-        assert!(presentations.is_empty());
-    }
-
-    #[test]
-    fn color_presentation_response_with_malformed_result_returns_empty() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_an_array"
-        });
 
         let presentations = transform_color_presentation_response_to_host(response, 5);
         assert!(presentations.is_empty());
