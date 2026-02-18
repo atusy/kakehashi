@@ -303,3 +303,35 @@ fn test_contains_predicate_no_args() {
 
     assert!(results.contains(&"foobar".to_string()));
 }
+
+#[test]
+fn test_has_parent_predicate() {
+    let source_code = r#"
+        fn main() {
+            let x = 1;
+        }
+    "#;
+
+    // In Rust AST, the identifier "x" inside `let x = 1` has parent `let_declaration`
+    // while "main" has parent `function_item`
+    let query_str = r#"((identifier) @name (#has-parent? @name "let_declaration"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(results.contains(&"x".to_string()));
+    assert!(!results.contains(&"main".to_string()));
+}
+
+#[test]
+fn test_not_has_parent_predicate() {
+    let source_code = r#"
+        fn main() {
+            let x = 1;
+        }
+    "#;
+
+    let query_str = r#"((identifier) @name (#not-has-parent? @name "let_declaration"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(!results.contains(&"x".to_string()));
+    assert!(results.contains(&"main".to_string()));
+}
