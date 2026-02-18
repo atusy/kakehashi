@@ -335,3 +335,52 @@ fn test_not_has_parent_predicate() {
     assert!(!results.contains(&"x".to_string()));
     assert!(results.contains(&"main".to_string()));
 }
+
+#[test]
+fn test_has_ancestor_predicate() {
+    let source_code = r#"
+        fn main() {
+            let x = 1;
+        }
+    "#;
+
+    // "x" is inside a function_item (via function_item > block > let_declaration > identifier)
+    let query_str = r#"((identifier) @name (#has-ancestor? @name "function_item"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    // Both "main" and "x" are descendants of function_item
+    // "main" is a direct child of function_item
+    assert!(results.contains(&"main".to_string()));
+    assert!(results.contains(&"x".to_string()));
+}
+
+#[test]
+fn test_has_ancestor_predicate_specific() {
+    let source_code = r#"
+        fn main() {
+            let x = 1;
+        }
+    "#;
+
+    // Only "x" has a let_declaration ancestor (not "main")
+    let query_str = r#"((identifier) @name (#has-ancestor? @name "let_declaration"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(results.contains(&"x".to_string()));
+    assert!(!results.contains(&"main".to_string()));
+}
+
+#[test]
+fn test_not_has_ancestor_predicate() {
+    let source_code = r#"
+        fn main() {
+            let x = 1;
+        }
+    "#;
+
+    let query_str = r#"((identifier) @name (#not-has-ancestor? @name "let_declaration"))"#;
+    let results = collect_filtered_captures(source_code, query_str);
+
+    assert!(!results.contains(&"x".to_string()));
+    assert!(results.contains(&"main".to_string()));
+}
