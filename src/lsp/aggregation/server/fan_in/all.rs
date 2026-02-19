@@ -95,45 +95,7 @@ mod tests {
     use std::io;
 
     use super::*;
-
-    fn assert_done<T: std::fmt::Debug>(result: FanInResult<T>) -> T {
-        match result {
-            FanInResult::Done(v) => v,
-            FanInResult::NoResult { errors } => {
-                panic!("expected Done, got NoResult {{ errors: {errors} }}")
-            }
-            FanInResult::Cancelled => panic!("expected Done, got Cancelled"),
-        }
-    }
-
-    fn assert_no_result<T: std::fmt::Debug>(result: FanInResult<T>) -> usize {
-        match result {
-            FanInResult::NoResult { errors } => errors,
-            FanInResult::Done(v) => panic!("expected NoResult, got Done({v:?})"),
-            FanInResult::Cancelled => panic!("expected NoResult, got Cancelled"),
-        }
-    }
-
-    fn assert_cancelled<T: std::fmt::Debug>(result: FanInResult<T>) {
-        match result {
-            FanInResult::Cancelled => {}
-            FanInResult::Done(v) => panic!("expected Cancelled, got Done({v:?})"),
-            FanInResult::NoResult { .. } => panic!("expected Cancelled, got NoResult"),
-        }
-    }
-
-    /// Helper to spawn a TaggedResult task with a default server name.
-    fn spawn_tagged<T: Send + 'static>(
-        join_set: &mut JoinSet<TaggedResult<T>>,
-        value: io::Result<T>,
-    ) {
-        join_set.spawn(async move {
-            TaggedResult {
-                server_name: "test_server".to_string(),
-                value,
-            }
-        });
-    }
+    use crate::lsp::aggregation::server::fan_in::test_helpers::*;
 
     #[tokio::test]
     async fn collect_all_returns_all_successful_results() {
