@@ -62,7 +62,9 @@ pub(crate) async fn collect_all<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     priorities: &[String],
     cancel_rx: Option<CancelReceiver>,
+    log_target: Option<&str>,
 ) -> FanInResult<Vec<T>> {
+    let log_target = log_target.unwrap_or(module_path!());
     let mut results: Vec<(String, T)> = Vec::new();
     let mut errors: usize = 0;
 
@@ -84,12 +86,12 @@ pub(crate) async fn collect_all<T: Send + 'static>(
                     None => break,
                     Some(Err(join_err)) => {
                         errors += 1;
-                        log::warn!("bridge task panicked: {join_err}");
+                        log::warn!(target: log_target, "bridge task panicked: {join_err}");
                     }
                     Some(Ok(tagged)) => match tagged.value {
                         Err(io_err) => {
                             errors += 1;
-                            log::warn!("bridge request failed ({}): {io_err}", tagged.server_name);
+                            log::warn!(target: log_target, "bridge request failed ({}): {io_err}", tagged.server_name);
                         }
                         Ok(value) => results.push((tagged.server_name, value)),
                     },
@@ -119,7 +121,7 @@ mod tests {
         spawn_tagged(&mut join_set, Ok(2));
         spawn_tagged(&mut join_set, Ok(3));
 
-        let result = collect_all(&mut join_set, &[], None).await;
+        let result = collect_all(&mut join_set, &[], None, None).await;
         let mut values = assert_done(result);
         values.sort();
         assert_eq!(values, vec![1, 2, 3]);
@@ -132,7 +134,7 @@ mod tests {
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 3")));
 
-        let result = collect_all(&mut join_set, &[], None).await;
+        let result = collect_all(&mut join_set, &[], None, None).await;
         assert_eq!(
             assert_no_result(result),
             3,
@@ -147,7 +149,7 @@ mod tests {
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 1")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
 
-        let result = collect_all(&mut join_set, &[], None).await;
+        let result = collect_all(&mut join_set, &[], None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![42]);
     }
@@ -156,7 +158,7 @@ mod tests {
     async fn collect_all_returns_done_empty_for_empty_join_set() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
 
-        let result = collect_all(&mut join_set, &[], None).await;
+        let result = collect_all(&mut join_set, &[], None, None).await;
         let values = assert_done(result);
         assert!(
             values.is_empty(),
@@ -178,7 +180,7 @@ mod tests {
 
         tx.send(()).unwrap();
 
-        let result = collect_all(&mut join_set, &[], Some(rx)).await;
+        let result = collect_all(&mut join_set, &[], Some(rx), None).await;
         assert_cancelled(result);
     }
 
@@ -188,7 +190,7 @@ mod tests {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged(&mut join_set, Ok(42));
 
-        let result = collect_all(&mut join_set, &[], Some(rx)).await;
+        let result = collect_all(&mut join_set, &[], Some(rx), None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![42]);
     }
@@ -205,7 +207,7 @@ mod tests {
             "server_b".to_string(),
             "server_c".to_string(),
         ];
-        let result = collect_all(&mut join_set, &priorities, None).await;
+        let result = collect_all(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![1, 2, 3]);
     }
@@ -219,7 +221,7 @@ mod tests {
 
         // Only server_a and server_b are prioritized; server_x is unlisted
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = collect_all(&mut join_set, &priorities, None).await;
+        let result = collect_all(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         // Prioritized servers first in order, then unlisted
         assert_eq!(&values[..2], &[1, 2]);
@@ -235,7 +237,7 @@ mod tests {
 
         // server_a is prioritized but fails; server_b succeeds; server_x is unlisted
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = collect_all(&mut join_set, &priorities, None).await;
+        let result = collect_all(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         // server_b (prioritized, succeeded) first, then server_x (unlisted)
         assert_eq!(values, vec![2, 99]);
@@ -248,7 +250,7 @@ mod tests {
 
         // server_a is in priorities but has no task in the JoinSet
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = collect_all(&mut join_set, &priorities, None).await;
+        let result = collect_all(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![2]);
     }

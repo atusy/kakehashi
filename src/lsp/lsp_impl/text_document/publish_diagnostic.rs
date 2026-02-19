@@ -197,7 +197,10 @@ pub(crate) async fn collect_push_diagnostics(
     let mut join_set = JoinSet::new();
     for region_ctx in region_contexts {
         let pool = Arc::clone(pool);
-        join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
+        let log_target = log_target.to_owned();
+        join_set.spawn(async move {
+            collect_region_diagnostics(&region_ctx, pool, Some(&log_target)).await
+        });
     }
 
     let mut all_diagnostics = Vec::new();

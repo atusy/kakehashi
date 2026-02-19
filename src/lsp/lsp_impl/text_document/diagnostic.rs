@@ -55,6 +55,7 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) async fn collect_region_diagnostics(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
+    log_target: Option<&str>,
 ) -> Vec<Diagnostic> {
     let result = dispatch_collect_all(
         ctx,
@@ -83,6 +84,7 @@ pub(crate) async fn collect_region_diagnostics(
             })
         },
         None, // cancel handled at outer level (pull) or not needed (push)
+        log_target,
     )
     .await;
 
@@ -272,6 +274,7 @@ async fn dispatch_collect_all_diagnostics(
         pool,
         send_diagnostic_fan_out_request,
         None, // cancel handled at outer level
+        None, // no custom log_target
     )
     .await;
 
