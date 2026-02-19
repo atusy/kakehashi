@@ -18,6 +18,19 @@ pub enum WorkspaceType {
     Generic,
 }
 
+/// Aggregation strategy for combining results from multiple bridge servers.
+///
+/// - `Preferred`: Use the first non-empty response (priority-ordered).
+///   This is the default for most LSP methods.
+/// - `All`: Collect and merge responses from all servers.
+///   This is the default for `textDocument/diagnostic`.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AggregationStrategy {
+    Preferred,
+    All,
+}
+
 /// Per-method aggregation configuration.
 ///
 /// Controls how results from multiple bridge servers are aggregated for a
@@ -29,6 +42,9 @@ pub(crate) struct AggregationConfig {
     /// Server names in priority order (highest first). Empty = pure first-win behavior.
     #[serde(default)]
     pub(crate) priorities: Vec<String>,
+    /// Aggregation strategy override. `None` = use handler default.
+    #[serde(default)]
+    pub(crate) strategy: Option<AggregationStrategy>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -1340,12 +1356,14 @@ kind = "injections""#;
                     "textDocument/completion".to_string(),
                     AggregationConfig {
                         priorities: vec!["server_a".to_string()],
+                        ..Default::default()
                     },
                 ),
                 (
                     WILDCARD_KEY.to_string(),
                     AggregationConfig {
                         priorities: vec!["server_b".to_string()],
+                        ..Default::default()
                     },
                 ),
             ])),
@@ -1364,6 +1382,7 @@ kind = "injections""#;
                 WILDCARD_KEY.to_string(),
                 AggregationConfig {
                     priorities: vec!["server_b".to_string()],
+                    ..Default::default()
                 },
             )])),
         };

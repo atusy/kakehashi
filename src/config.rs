@@ -2964,6 +2964,7 @@ mod tests {
                     "_".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["server_a".to_string()],
+                        ..Default::default()
                     },
                 )])),
             },
@@ -3025,6 +3026,7 @@ mod tests {
                     "_".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["pyright".to_string()],
+                        ..Default::default()
                     },
                 )])),
             },
@@ -3088,12 +3090,14 @@ mod tests {
                         "_".to_string(),
                         settings::AggregationConfig {
                             priorities: vec!["base_default".to_string()],
+                            ..Default::default()
                         },
                     ),
                     (
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
                             priorities: vec!["base_hover".to_string()],
+                            ..Default::default()
                         },
                     ),
                 ])),
@@ -3109,6 +3113,7 @@ mod tests {
                     "textDocument/hover".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["overlay_hover".to_string()],
+                        ..Default::default()
                     },
                 )])),
             },
