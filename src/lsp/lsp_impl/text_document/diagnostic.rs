@@ -188,6 +188,60 @@ pub(crate) async fn fan_out_diagnostic_requests(
 }
 
 // ============================================================================
+// Shared per-region diagnostic collection (used by pull and push diagnostics)
+// ============================================================================
+
+/// Collect diagnostics for a single injection region using priority-aware aggregation.
+///
+/// Wraps `dispatch_collect_all` with the standard timeout closure and
+/// `unregister_all_for_upstream_id` cleanup. Used by:
+/// - `diagnostic_impl` (pull diagnostics, per-region inner task)
+/// - `spawn_synthetic_diagnostic_task` (immediate push on didSave/didOpen)
+/// - `execute_debounced_diagnostic` (debounced push on didChange)
+pub(crate) async fn collect_region_diagnostics(
+    ctx: &DocumentRequestContext,
+    pool: Arc<LanguageServerPool>,
+) -> Vec<Diagnostic> {
+    let result = dispatch_collect_all(
+        ctx,
+        pool.clone(),
+        |t| async move {
+            let rid = t.region_id.clone();
+            tokio::time::timeout(
+                DIAGNOSTIC_REQUEST_TIMEOUT,
+                t.pool.send_diagnostic_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
+                    &t.injection_language,
+                    &t.region_id,
+                    t.region_start_line,
+                    &t.virtual_content,
+                    t.upstream_id,
+                    None, // No previous_result_id
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::other(format!(
+                    "diagnostic request timed out for region {rid}"
+                )))
+            })
+        },
+        None, // cancel handled at outer level (pull) or not needed (push)
+    )
+    .await;
+
+    // Clean up stale upstream registry entries from inner fan_out
+    pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+
+    match result {
+        FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
+    }
+}
+
+// ============================================================================
 // Pull diagnostics implementation (textDocument/diagnostic)
 // ============================================================================
 
