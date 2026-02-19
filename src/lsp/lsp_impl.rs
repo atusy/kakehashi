@@ -562,7 +562,9 @@ impl Kakehashi {
     /// Get the language for a document using the full detection chain.
     ///
     /// Uses LanguageCoordinator::detect_language() which implements
-    /// the fallback chain: languageId → alias → shebang → extension (ADR-0005).
+    /// the fallback chain (ADR-0005): languageId → heuristics
+    /// (token, path-derived token, first-line content) with alias
+    /// resolution at each step.
     ///
     /// This ensures aliases are resolved (e.g., "rmd" → "markdown") even when
     /// the document is accessed before didOpen fully completes (race condition).
