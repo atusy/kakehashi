@@ -46,6 +46,10 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
+    /// Server names in priority order for aggregation.
+    /// Resolved from the bridge language config's aggregation settings.
+    /// Empty means pure first-win behavior (no priority ordering).
+    pub(crate) priorities: Vec<String>,
 }
 
 /// Document context plus a cursor position.
@@ -242,6 +246,7 @@ impl Kakehashi {
             resolved: preamble.resolved,
             configs,
             upstream_request_id: preamble.upstream_request_id,
+            priorities: Vec::new(), // TODO: wire from aggregation config in Step 4b
         })
     }
 

@@ -6,7 +6,7 @@ use tower_lsp_server::ls_types::{GotoDefinitionParams, GotoDefinitionResponse, L
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn goto_definition_impl(
@@ -29,7 +29,7 @@ impl Kakehashi {
         // Fan-out definition requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| async move {

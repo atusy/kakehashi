@@ -1,11 +1,13 @@
 //! Server-level aggregation dispatch.
 //!
-//! [`dispatch_first_win()`] combines [`fan_out()`] with the first-win
+//! [`dispatch_preferred()`] combines [`fan_out()`] with the preferred
 //! strategy, giving each handler a single call-site for the common pattern.
+//! When `ctx.priorities` is empty, it degrades to pure first-win behavior.
 //!
 //! [`dispatch_collect_all()`] combines [`fan_out()`] with the collect-all
 //! strategy, collecting every successful result from all matching servers.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
@@ -15,14 +17,17 @@ use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
 use super::fan_in::FanInResult;
-use super::fan_in::{all, first_win};
+use super::fan_in::{all, preferred};
 use super::fan_out::{FanOutTask, fan_out};
 
-/// Server-level aggregation entry point using the first-win strategy.
+/// Server-level aggregation entry point using the preferred strategy.
 ///
-/// Fans out one task per matching server and returns the first non-empty
-/// result. Handlers call this instead of `fan_out` + `first_win` directly.
-pub(crate) async fn dispatch_first_win<T, F, Fut>(
+/// Fans out one task per matching server and returns the highest-priority
+/// non-empty result. When `ctx.priorities` is empty, degrades to first-win.
+///
+/// Pre-filters `ctx.priorities` against `ctx.configs` to ensure only
+/// configured server names are passed to the preferred algorithm.
+pub(crate) async fn dispatch_preferred<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
@@ -34,8 +39,17 @@ where
     F: Fn(FanOutTask) -> Fut,
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
+    // Pre-filter priorities: keep only server names that exist in ctx.configs.
+    let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
+    let effective_priorities: Vec<String> = ctx
+        .priorities
+        .iter()
+        .filter(|name| configured.contains(name.as_str()))
+        .cloned()
+        .collect();
+
     let mut join_set = fan_out(ctx, pool, f);
-    first_win::first_win(&mut join_set, is_nonempty, cancel_rx).await
+    preferred::preferred(&mut join_set, is_nonempty, &effective_priorities, cancel_rx).await
 }
 
 /// Server-level aggregation entry point using the collect-all strategy.

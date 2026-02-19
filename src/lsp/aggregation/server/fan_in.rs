@@ -1,7 +1,8 @@
 pub(crate) mod all;
-pub(crate) mod first_win;
+pub(crate) mod preferred;
+pub(crate) mod result;
 
-pub(crate) use first_win::FanInResult;
+pub(crate) use result::FanInResult;
 
 #[cfg(test)]
 pub(super) mod test_helpers {
