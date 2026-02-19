@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn split_same_position_same_depth_latest_pattern_wins() {
-        // Two tokens at same position, same depth, same node_depth.
+        // Two tokens at the same position and depth.
         // Higher pattern_index wins — no split needed.
         let tokens = vec![
             make_token(0, 0, 5, "variable", 0, 0),
