@@ -25,6 +25,33 @@ fn is_in_exclusion_range(node: &Node, ranges: &[(usize, usize)]) -> bool {
     })
 }
 
+/// Extract the `#set! priority N` value for a pattern, defaulting to 100.
+///
+/// Only pattern-level settings (where `capture_id` is `None`) are considered.
+/// Per-capture priority (`capture_id: Some(_)`) is ignored — no shipped queries use it.
+fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
+    const DEFAULT_PRIORITY: u32 = 100;
+
+    for prop in query.property_settings(pattern_index) {
+        if prop.key.as_ref() == "priority"
+            && prop.capture_id.is_none()
+            && let Some(ref value) = prop.value
+        {
+            match value.parse::<u32>() {
+                Ok(n) => return n,
+                Err(_) => {
+                    log::warn!(
+                        target: "kakehashi::semantic",
+                        "Invalid #set! priority value {:?} in pattern {}, using default {}",
+                        value, pattern_index, DEFAULT_PRIORITY
+                    );
+                }
+            }
+        }
+    }
+    DEFAULT_PRIORITY
+}
+
 /// Represents a token before delta encoding with all position information.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RawToken {
@@ -42,6 +69,9 @@ pub(crate) struct RawToken {
     /// Within a single query, later patterns (higher index) are more specific
     /// and should override earlier ones at the same position and depth.
     pub pattern_index: usize,
+    /// Priority from `#set! priority N` directive (default 100).
+    /// Higher values win during overlap resolution.
+    pub priority: u32,
 }
 
 /// Represents the line/column boundaries of an injection region in the host document.
@@ -193,6 +223,7 @@ pub(super) fn collect_host_tokens(
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
     while let Some(m) = matches.next() {
+        let priority = parse_priority_for_pattern(query, m.pattern_index);
         let filtered_captures = crate::language::filter_captures(query, m, text);
 
         for c in filtered_captures {
@@ -246,6 +277,7 @@ pub(super) fn collect_host_tokens(
                     mapped_name,
                     depth,
                     pattern_index: m.pattern_index,
+                    priority,
                 });
             } else if supports_multiline {
                 // Multiline token with client support: emit a single token spanning multiple lines.
@@ -306,6 +338,7 @@ pub(super) fn collect_host_tokens(
                     mapped_name,
                     depth,
                     pattern_index: m.pattern_index,
+                    priority,
                 });
             } else {
                 // Multiline token without client support: split into per-line tokens
@@ -334,6 +367,7 @@ pub(super) fn collect_host_tokens(
                             mapped_name: mapped_name.clone(),
                             depth,
                             pattern_index: m.pattern_index,
+                            priority,
                         });
                     }
                 }
