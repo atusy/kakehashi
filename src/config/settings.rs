@@ -1409,6 +1409,34 @@ kind = "injections""#;
     }
 
     #[test]
+    fn should_parse_aggregation_strategy_preferred() {
+        let json = r#"{ "strategy": "preferred" }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));
+    }
+
+    #[test]
+    fn should_parse_aggregation_strategy_all() {
+        let json = r#"{ "strategy": "all" }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.strategy, Some(AggregationStrategy::All));
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_without_strategy() {
+        let json = r#"{}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.strategy, None);
+    }
+
+    #[test]
+    fn should_parse_aggregation_strategy_from_toml() {
+        let toml_str = r#"strategy = "preferred""#;
+        let config: AggregationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));
+    }
+
+    #[test]
     fn should_parse_language_config_with_aliases() {
         // aliases allows mapping multiple languageId values to one parser
         // Example: markdown parser handles rmd, qmd, mdx files
