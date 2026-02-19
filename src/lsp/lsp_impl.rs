@@ -411,13 +411,22 @@ impl Kakehashi {
                 value
             }
             Ok(Err(join_error)) => {
-                log::error!(
-                    "Parse task panicked for language '{}' on document {}: {}",
-                    language_name,
-                    uri,
-                    join_error
-                );
-                // Parser is lost in the panicked task
+                if join_error.is_panic() {
+                    log::error!(
+                        "Parse task panicked for language '{}' on document {}: {}",
+                        language_name,
+                        uri,
+                        join_error
+                    );
+                } else {
+                    log::warn!(
+                        "Parse task was cancelled for language '{}' on document {}: {}",
+                        language_name,
+                        uri,
+                        join_error
+                    );
+                }
+                // Parser is lost in the task (panicked or cancelled)
                 None
             }
             Err(_timeout) => {
