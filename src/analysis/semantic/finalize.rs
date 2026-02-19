@@ -84,7 +84,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
 ///
 /// For each line, collects breakpoints (start/end columns of all tokens),
 /// then for each interval picks the highest-priority token as the winner.
-/// Priority is determined by `(depth DESC, pattern_index DESC)`.
+/// Priority is determined by `(priority DESC, depth DESC, pattern_index DESC)`.
 ///
 /// This replaces the previous dedup-at-same-position approach, producing
 /// non-overlapping fragments that preserve both parent and child semantics.
