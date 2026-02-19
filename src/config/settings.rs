@@ -1399,6 +1399,69 @@ kind = "injections""#;
     }
 
     #[test]
+    fn should_resolve_strategy_for_specific_method() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/diagnostic".to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::Preferred),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            AggregationStrategy::Preferred,
+        );
+    }
+
+    #[test]
+    fn should_resolve_strategy_falls_back_to_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::All),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_strategy("textDocument/hover", AggregationStrategy::Preferred),
+            AggregationStrategy::All,
+        );
+    }
+
+    #[test]
+    fn should_resolve_strategy_returns_default_when_no_aggregation() {
+        let config = BridgeLanguageConfig::default();
+        assert_eq!(
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            AggregationStrategy::All,
+        );
+    }
+
+    #[test]
+    fn should_resolve_strategy_returns_default_when_strategy_is_none() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/diagnostic".to_string(),
+                AggregationConfig {
+                    priorities: vec!["server_a".to_string()],
+                    strategy: None,
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            AggregationStrategy::All,
+        );
+    }
+
+    #[test]
     fn should_parse_bridge_language_config_with_aggregation() {
         let json = r#"{
             "enabled": true,
