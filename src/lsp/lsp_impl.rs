@@ -526,8 +526,33 @@ impl Kakehashi {
         self.handle_language_events(&events).await;
     }
 
+    /// Get the language for a document using the full detection chain.
+    ///
+    /// Uses LanguageCoordinator::detect_language() which implements
+    /// the fallback chain: languageId → alias → shebang → extension (ADR-0005).
+    ///
+    /// This ensures aliases are resolved (e.g., "rmd" → "markdown") even when
+    /// the document is accessed before didOpen fully completes (race condition).
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
-        crate::document::get_language_for_document(uri, &self.language, &self.documents)
+        let path = uri.path();
+
+        // Get the document's language_id and content if available
+        let (language_id, content) = self
+            .documents
+            .get(uri)
+            .map(|doc| {
+                (
+                    doc.language_id().map(|s| s.to_string()),
+                    doc.text().to_string(),
+                )
+            })
+            .unwrap_or((None, String::new()));
+
+        // ADR-0005: Unified detection chain with alias resolution at each step
+        // Priority: languageId → heuristics (first-line, filename) → extension
+        // Host document: token=None (no code fence identifier)
+        self.language
+            .detect_language(path, &content, None, language_id.as_deref())
     }
 
     /// Get all bridge server configs for a given injection language from settings.
