@@ -29,7 +29,6 @@ fn test_spawn_binary_starts_process() {
 fn test_initialize_returns_capabilities() {
     let mut client = LspClient::new();
 
-    // Send initialize request
     let response = client.send_request(
         "initialize",
         json!({
@@ -39,37 +38,12 @@ fn test_initialize_returns_capabilities() {
         }),
     );
 
-    // Verify response structure
-    assert!(
-        response.get("result").is_some(),
-        "Initialize response should have result: {:?}",
-        response
-    );
+    let capabilities = response
+        .get("result")
+        .and_then(|r| r.get("capabilities"))
+        .expect("InitializeResult should have capabilities");
 
-    let result = response.get("result").unwrap();
-
-    // Verify capabilities exist
-    assert!(
-        result.get("capabilities").is_some(),
-        "InitializeResult should have capabilities: {:?}",
-        result
-    );
-
-    let capabilities = result.get("capabilities").unwrap();
-
-    // Verify some expected capabilities for kakehashi
-    assert!(
-        capabilities.get("textDocumentSync").is_some(),
-        "Server should support textDocumentSync: {:?}",
-        capabilities
-    );
-
-    // kakehashi should support definition (for bridging)
-    assert!(
-        capabilities.get("definitionProvider").is_some(),
-        "Server should support definitionProvider: {:?}",
-        capabilities
-    );
+    insta::assert_json_snapshot!("initialize_capabilities", capabilities);
 }
 
 #[test]
