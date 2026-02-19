@@ -48,6 +48,21 @@ pub struct BridgeLanguageConfig {
     pub aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 
+impl BridgeLanguageConfig {
+    /// Resolve priorities for a specific LSP method.
+    ///
+    /// Falls back to wildcard `"_"` key, then empty slice.
+    pub(crate) fn resolve_priorities(&self, method: &str) -> Vec<String> {
+        let Some(map) = self.aggregation.as_ref() else {
+            return vec![];
+        };
+        map.get(method)
+            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .map(|c| c.priorities.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// Configuration for a bridge language server.
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
@@ -1316,19 +1331,6 @@ kind = "injections""#;
         assert_eq!(config.priorities, vec!["server_a".to_string()]);
     }
 
-    /// Test helper: resolve priorities for a specific LSP method.
-    /// Falls back to wildcard "_" key, then empty slice.
-    /// Will be promoted to BridgeLanguageConfig impl when wired in production.
-    fn resolve_priorities(config: &BridgeLanguageConfig, method: &str) -> Vec<String> {
-        let Some(map) = config.aggregation.as_ref() else {
-            return vec![];
-        };
-        map.get(method)
-            .or_else(|| map.get(WILDCARD_KEY))
-            .map(|c| c.priorities.clone())
-            .unwrap_or_default()
-    }
-
     #[test]
     fn should_resolve_priorities_for_specific_method() {
         let config = BridgeLanguageConfig {
@@ -1349,7 +1351,7 @@ kind = "injections""#;
             ])),
         };
         assert_eq!(
-            resolve_priorities(&config, "textDocument/completion"),
+            config.resolve_priorities("textDocument/completion"),
             &["server_a".to_string()]
         );
     }
@@ -1366,7 +1368,7 @@ kind = "injections""#;
             )])),
         };
         assert_eq!(
-            resolve_priorities(&config, "textDocument/hover"),
+            config.resolve_priorities("textDocument/hover"),
             &["server_b".to_string()]
         );
     }
@@ -1374,7 +1376,7 @@ kind = "injections""#;
     #[test]
     fn should_resolve_priorities_returns_empty_when_no_aggregation() {
         let config = BridgeLanguageConfig::default();
-        assert!(resolve_priorities(&config, "textDocument/hover").is_empty());
+        assert!(config.resolve_priorities("textDocument/hover").is_empty());
     }
 
     #[test]

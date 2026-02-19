@@ -96,12 +96,17 @@ impl Kakehashi {
                 continue;
             }
 
+            let priorities = self.resolve_aggregation_priorities(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/documentSymbol",
+            );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
-                priorities: Vec::new(),
+                priorities,
             };
             let pool = Arc::clone(&pool);
 
