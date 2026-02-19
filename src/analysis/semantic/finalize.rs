@@ -15,8 +15,11 @@ use super::legend::map_capture_to_token_type_and_modifiers;
 use super::token_collector::{InjectionRegion, RawToken};
 
 /// Priority key for token comparison. Higher values win.
-fn token_priority(t: &RawToken) -> (usize, usize) {
-    (t.depth, t.pattern_index)
+///
+/// Comparison order: `priority` (from `#set! priority N`, default 100),
+/// then `depth` (injection depth), then `pattern_index` (later patterns win).
+fn token_priority(t: &RawToken) -> (u32, usize, usize) {
+    (t.priority, t.depth, t.pattern_index)
 }
 
 /// Compute the UTF-16 width of a string.
