@@ -1,0 +1,8 @@
+---
+source: tests/e2e_lsp_lua_diagnostic.rs
+expression: result
+---
+{
+  "items": "[0 items redacted]",
+  "kind": "full"
+}

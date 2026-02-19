@@ -76,7 +76,6 @@ fn e2e_diagnostic_capability_advertised() {
 fn e2e_diagnostic_response_structure_is_valid() {
     let mut client = create_lua_configured_client();
 
-    // Open markdown document with Lua code block
     let markdown_content = r#"# Test Document
 
 ```lua
@@ -98,50 +97,27 @@ local x = 1
         }),
     );
 
-    // Wait for lua-ls to start and be ready
     wait_for_server_ready(&mut client, markdown_uri, 5, 100);
 
-    // Send diagnostic request
     let response = client.send_request(
         "textDocument/diagnostic",
         json!({
-            "textDocument": {
-                "uri": markdown_uri
-            }
+            "textDocument": { "uri": markdown_uri }
         }),
     );
 
-    println!(
-        "Diagnostic response: {}",
-        serde_json::to_string_pretty(&response).unwrap()
-    );
-
-    // The response should be a DocumentDiagnosticReport
     let result = response
         .get("result")
         .expect("Should have result in diagnostic response");
 
-    // Verify it's a "full" report (not "unchanged")
-    assert!(
-        result.get("kind").is_some(),
-        "Result should have 'kind' field"
-    );
-    assert_eq!(
-        result.get("kind").and_then(|k| k.as_str()),
-        Some("full"),
-        "Result should be a 'full' report"
-    );
+    insta::assert_json_snapshot!("diagnostic_response_structure", result, {
+        ".items" => insta::dynamic_redaction(|value, _path| {
+            // Redact items contents (vary by lua-ls timing) but preserve the array type
+            let len = value.as_slice().map(|s| s.len()).unwrap_or(0);
+            format!("[{len} items redacted]")
+        })
+    });
 
-    // Verify the items array exists (response structure is correct)
-    let items = result.get("items").and_then(|i| i.as_array());
-    assert!(items.is_some(), "Result should have 'items' array");
-
-    println!(
-        "E2E: Diagnostic response structure is valid with {} items",
-        items.unwrap().len()
-    );
-
-    // Clean shutdown
     shutdown_client(&mut client);
 }
 
