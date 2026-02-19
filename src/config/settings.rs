@@ -18,6 +18,19 @@ pub enum WorkspaceType {
     Generic,
 }
 
+/// Per-method aggregation configuration.
+///
+/// Controls how results from multiple bridge servers are aggregated for a
+/// specific LSP method. The `priorities` list determines server preference
+/// order — the first server in the list that returns a non-empty result wins.
+/// Empty priorities degrades to first-win (arrival-order) behavior.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+pub struct AggregationConfig {
+    /// Server names in priority order (highest first). Empty = pure first-win behavior.
+    #[serde(default)]
+    pub priorities: Vec<String>,
+}
+
 /// Configuration for a single bridged language within a host filetype.
 ///
 /// Used in the bridge filter map to control whether a specific injection language
@@ -1242,6 +1255,30 @@ kind = "injections""#;
             None,
             "very-local-injections.scm should not match"
         );
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_from_json() {
+        let json = r#"{"priorities": ["server_a", "server_b"]}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.priorities,
+            vec!["server_a".to_string(), "server_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_empty_priorities() {
+        let json = r#"{}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert!(config.priorities.is_empty());
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_from_toml() {
+        let toml_str = r#"priorities = ["server_a"]"#;
+        let config: AggregationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.priorities, vec!["server_a".to_string()]);
     }
 
     #[test]
