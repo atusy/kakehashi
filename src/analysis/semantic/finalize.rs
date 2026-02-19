@@ -614,6 +614,20 @@ mod tests {
         assert_eq!(line1, vec![(2, 3, "string".to_string())]);
     }
 
+    #[test]
+    fn split_higher_pattern_index_beats_deeper_node() {
+        // Simulates Rust `///` doc comments: the anonymous `"/"` node is deeper
+        // in the AST (node_depth=3) than `line_comment` (node_depth=1), but
+        // `@comment` appears later in the query file (pattern_index=10 > 5).
+        // Neovim uses pattern_index to resolve this; node_depth should NOT override it.
+        let tokens = vec![
+            make_token_with_node_depth(0, 0, 3, "operator", 0, 5, 3),  // deeper node, earlier pattern
+            make_token_with_node_depth(0, 0, 3, "comment", 0, 10, 1),  // shallower node, later pattern
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(fragments, vec![(0, 3, "comment".to_string())]);
+    }
+
     // ── injection region exclusion tests ──────────────────────────────
 
     #[test]
