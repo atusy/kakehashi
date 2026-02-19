@@ -4,7 +4,9 @@
 //! servers are preferred over lower-priority ones, with fallback to first-win for
 //! unprioritized servers. When `priorities` is empty, degrades to pure first-win.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use indexmap::IndexMap;
 
 use tokio::task::JoinSet;
 
@@ -17,16 +19,16 @@ use crate::lsp::request_id::CancelReceiver;
 /// Walks the priority list first; if no priority server has a buffered result,
 /// falls back to any unprioritized server.
 fn pick_best_buffered<T>(
-    buffered_wins: &mut HashMap<String, T>,
+    buffered_wins: &mut IndexMap<String, T>,
     priorities: &[String],
 ) -> Option<T> {
     for name in priorities {
-        if let Some(value) = buffered_wins.remove(name.as_str()) {
+        if let Some(value) = buffered_wins.shift_remove(name.as_str()) {
             return Some(value);
         }
     }
     let first_key = buffered_wins.keys().next().cloned();
-    first_key.and_then(|k| buffered_wins.remove(&k))
+    first_key.and_then(|k| buffered_wins.shift_remove(&k))
 }
 
 /// Priority-aware collection of concurrent bridge results.
@@ -54,16 +56,16 @@ pub(crate) async fn preferred<T: Send + 'static>(
     priorities: &[String],
     cancel_rx: Option<CancelReceiver>,
 ) -> FanInResult<T> {
-    let mut buffered_wins: HashMap<String, T> = HashMap::new();
+    let mut buffered_wins: IndexMap<String, T> = IndexMap::new();
     let mut failed_servers: HashSet<String> = HashSet::new();
     let mut errors: usize = 0;
 
     // Helper closure to check if we can make a decision
     let try_decide =
-        |buffered_wins: &mut HashMap<String, T>, failed_servers: &HashSet<String>| -> Option<T> {
+        |buffered_wins: &mut IndexMap<String, T>, failed_servers: &HashSet<String>| -> Option<T> {
             // Walk priority list in order
             for name in priorities {
-                if let Some(value) = buffered_wins.remove(name.as_str()) {
+                if let Some(value) = buffered_wins.shift_remove(name.as_str()) {
                     return Some(value);
                 }
                 if failed_servers.contains(name.as_str()) {
@@ -75,12 +77,12 @@ pub(crate) async fn preferred<T: Send + 'static>(
             // All priority servers exhausted (failed or absent) — check unprioritized buffer
             // Return first buffered win from any unprioritized server
             let first_key = buffered_wins.keys().next().cloned();
-            first_key.and_then(|k| buffered_wins.remove(&k))
+            first_key.and_then(|k| buffered_wins.shift_remove(&k))
         };
 
     let process_result = |tagged: TaggedResult<T>,
                           is_nonempty: &dyn Fn(&T) -> bool,
-                          buffered_wins: &mut HashMap<String, T>,
+                          buffered_wins: &mut IndexMap<String, T>,
                           failed_servers: &mut HashSet<String>,
                           errors: &mut usize| {
         match tagged.value {

@@ -1000,6 +1000,7 @@ dependencies = [
  "env_logger",
  "filetime",
  "futures",
+ "indexmap",
  "insta",
  "libloading",
  "line-index",
