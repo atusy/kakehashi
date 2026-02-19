@@ -101,39 +101,12 @@ pub(crate) async fn preferred<T: Send + 'static>(
         }
     };
 
-    // No cancel support — simple loop
-    let Some(cancel_rx) = cancel_rx else {
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Err(join_err) => {
-                    errors += 1;
-                    log::warn!("bridge task panicked: {join_err}");
-                }
-                Ok(tagged) => {
-                    process_result(
-                        tagged,
-                        &is_nonempty,
-                        &mut buffered_wins,
-                        &mut failed_servers,
-                        &mut errors,
-                    );
-                    if let Some(value) = try_decide(&mut buffered_wins, &failed_servers) {
-                        join_set.abort_all();
-                        return FanInResult::Done(value);
-                    }
-                }
-            }
-        }
-        // JoinSet drained — all remaining priority servers that never responded were panics.
-        // Walk priorities to pick the best buffered result.
-        if let Some(value) = pick_best_buffered(&mut buffered_wins, priorities) {
-            return FanInResult::Done(value);
-        }
-        return FanInResult::NoResult { errors };
-    };
-
-    // With cancel support — use tokio::select!
+    // When no cancel receiver is provided, create one that never fires.
+    // Keeping _tx alive prevents the receiver from resolving.
+    let (_tx, fallback_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancel_rx = cancel_rx.unwrap_or(fallback_rx);
     tokio::pin!(cancel_rx);
+
     loop {
         tokio::select! {
             biased;
