@@ -366,13 +366,14 @@ impl Kakehashi {
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
     /// `tree_sitter::Parser` and must return it along with an optional result.
-    /// This ensures the parser is always returned to the pool (except on timeout,
-    /// where the parser is lost in the still-running blocking task).
+    /// On normal completion, this ensures the parser is returned to the pool.
+    /// The parser is not returned if the blocking task times out (it keeps
+    /// running) or if the task fails or is cancelled and yields a `JoinError`.
     ///
     /// Returns `None` if:
     /// - No parser is available for the language
-    /// - The parse task panicked (JoinError)
-    /// - The parse timed out after `PARSE_TIMEOUT`
+    /// - The parse task panicked or was cancelled (JoinError; parser not returned)
+    /// - The parse timed out after `PARSE_TIMEOUT` (parser not returned)
     /// - The closure returned `None`
     async fn parse_with_pool<T, F>(
         &self,
@@ -393,9 +394,6 @@ impl Kakehashi {
 
         let parser = parser?;
 
-        let language_name_owned = language_name.to_string();
-        let uri_clone = uri.clone();
-
         // Parse in spawn_blocking with timeout to avoid blocking tokio worker thread
         // and prevent infinite hangs on pathological input
         let result = tokio::time::timeout(
@@ -409,14 +407,14 @@ impl Kakehashi {
             Ok(Ok((parser, value))) => {
                 // Return parser to pool (brief lock)
                 let mut pool = self.parser_pool.lock().await;
-                pool.release(language_name_owned, parser);
+                pool.release(language_name.to_string(), parser);
                 value
             }
             Ok(Err(join_error)) => {
                 log::error!(
                     "Parse task panicked for language '{}' on document {}: {}",
-                    language_name_owned,
-                    uri_clone,
+                    language_name,
+                    uri,
                     join_error
                 );
                 // Parser is lost in the panicked task
@@ -426,8 +424,8 @@ impl Kakehashi {
                 log::warn!(
                     "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",
                     PARSE_TIMEOUT,
-                    language_name_owned,
-                    uri_clone,
+                    language_name,
+                    uri,
                     text_len
                 );
                 // Parser is lost in the still-running blocking task
