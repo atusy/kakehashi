@@ -7,6 +7,11 @@ use tree_sitter::{Query, QueryCapture, QueryMatch};
 /// Cache for compiled regexes converted from Lua patterns.
 /// Avoids recompiling the same pattern on every invocation during
 /// semantic token highlighting of large files.
+///
+/// Unbounded by design: patterns originate from static `.scm` query files,
+/// not user input, so the total number of unique entries is bounded by the
+/// finite set of `#lua-match?` / `#not-lua-match?` patterns across all
+/// loaded languages (typically well under 100).
 static LUA_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Option<Regex>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
