@@ -20,6 +20,16 @@ use super::fan_in::FanInResult;
 use super::fan_in::{all, preferred};
 use super::fan_out::{FanOutTask, fan_out};
 
+/// Pre-filter `ctx.priorities` to keep only server names present in `ctx.configs`.
+fn effective_priorities(ctx: &DocumentRequestContext) -> Vec<String> {
+    let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
+    ctx.priorities
+        .iter()
+        .filter(|name| configured.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Server-level aggregation entry point using the preferred strategy.
 ///
 /// Fans out one task per matching server and returns the highest-priority
@@ -39,24 +49,21 @@ where
     F: Fn(FanOutTask) -> Fut,
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
-    // Pre-filter priorities: keep only server names that exist in ctx.configs.
-    let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
-    let effective_priorities: Vec<String> = ctx
-        .priorities
-        .iter()
-        .filter(|name| configured.contains(name.as_str()))
-        .cloned()
-        .collect();
-
+    let priorities = effective_priorities(ctx);
     let mut join_set = fan_out(ctx, pool, f);
-    preferred::preferred(&mut join_set, is_nonempty, &effective_priorities, cancel_rx).await
+    preferred::preferred(&mut join_set, is_nonempty, &priorities, cancel_rx).await
 }
 
 /// Server-level aggregation entry point using the collect-all strategy.
 ///
 /// Fans out one task per matching server and collects every successful result.
+/// When `ctx.priorities` is non-empty, results are ordered by priority, with
+/// unlisted servers appended in insertion order.
 /// Returns `Done(vec)` when at least one succeeds, `NoResult` when all fail,
 /// or `Cancelled` on cancel notification.
+///
+/// Pre-filters `ctx.priorities` against `ctx.configs` to ensure only
+/// configured server names are passed to the collect-all algorithm.
 pub(crate) async fn dispatch_collect_all<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
@@ -68,6 +75,7 @@ where
     F: Fn(FanOutTask) -> Fut,
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
+    let priorities = effective_priorities(ctx);
     let mut join_set = fan_out(ctx, pool, f);
-    all::collect_all(&mut join_set, cancel_rx).await
+    all::collect_all(&mut join_set, &priorities, cancel_rx).await
 }
