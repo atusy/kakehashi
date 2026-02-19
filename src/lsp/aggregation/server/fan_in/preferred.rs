@@ -330,6 +330,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preferred_respects_priority_in_buffered_wins_after_panic_drain() {
+        // server_a (priority 1) panics, server_b (priority 2) and server_c (unprioritized) succeed.
+        // After drain, server_b should win over server_c because it's higher in the priority list.
+        // Without the fix, HashMap iteration order could return server_c instead.
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        join_set.spawn(async {
+            panic!("simulated panic in priority server");
+        });
+        spawn_tagged_named(&mut join_set, "server_b", Ok(Some(2)));
+        spawn_tagged_named(&mut join_set, "server_c", Ok(Some(3)));
+
+        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+
+        // server_b must win — it's in the priority list and server_a (higher priority) panicked
+        assert_eq!(assert_done(result), Some(2));
+    }
+
+    #[tokio::test]
     async fn preferred_treats_unlisted_servers_as_lowest_priority() {
         // server_a is prioritized and fails; server_b is not listed (lowest priority) and succeeds
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
