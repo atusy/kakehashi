@@ -189,6 +189,7 @@ impl VirtualDocumentUri {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use tower_lsp_server::ls_types::Uri;
     use url::Url;
 
@@ -596,22 +597,38 @@ mod tests {
     // is_virtual_uri tests
     // ==========================================================================
 
-    #[test]
-    fn is_virtual_uri_detects_new_format() {
-        // New format: kakehashi-virtual-uri-{region_id}.{ext}
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-01ARZ3NDEK.lua"
-        ));
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/docs/kakehashi-virtual-uri-REGION123.py"
-        ));
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///kakehashi-virtual-uri-01JPMQ8ZYYQA.txt"
-        ));
-        // With special characters in region_id (percent-encoded)
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-region%2F0.lua"
-        ));
+    #[rstest]
+    // Detects valid virtual URIs
+    #[case::new_format_lua("file:///project/kakehashi-virtual-uri-01ARZ3NDEK.lua", true)]
+    #[case::new_format_py("file:///project/docs/kakehashi-virtual-uri-REGION123.py", true)]
+    #[case::new_format_root("file:///kakehashi-virtual-uri-01JPMQ8ZYYQA.txt", true)]
+    #[case::percent_encoded_region("file:///project/kakehashi-virtual-uri-region%2F0.lua", true)]
+    #[case::with_query_string("file:///project/kakehashi-virtual-uri-REGION.lua?query=value", true)]
+    #[case::with_fragment("file:///project/kakehashi-virtual-uri-REGION.lua#section", true)]
+    #[case::with_query_and_fragment(
+        "file:///project/kakehashi-virtual-uri-REGION.lua?query=value#section",
+        true
+    )]
+    #[case::query_with_slash(
+        "file:///project/kakehashi-virtual-uri-REGION.lua?path=/foo/bar",
+        true
+    )]
+    #[case::percent_encoded_slash_in_filename(
+        "file:///project/kakehashi-virtual-uri-region%2Fsubregion.lua",
+        true
+    )]
+    // Rejects real URIs and malformed input
+    #[case::real_lua_file("file:///home/user/project/main.lua", false)]
+    #[case::real_py_file("file:///C:/Users/dev/code.py", false)]
+    #[case::untitled_scheme("untitled:Untitled-1", false)]
+    #[case::kakehashi_in_dir("file:///home/.kakehashi/config.lua", false)]
+    #[case::kakehashi_prefix_no_virtual("file:///project/kakehashi.config.lua", false)]
+    #[case::no_extension("file:///project/kakehashi-virtual-uri-lua", false)]
+    #[case::not_a_url("not a url", false)]
+    #[case::empty_string("", false)]
+    #[case::missing_scheme("://missing-scheme", false)]
+    fn is_virtual_uri(#[case] uri: &str, #[case] expected: bool) {
+        assert_eq!(VirtualDocumentUri::is_virtual_uri(uri), expected);
     }
 
     // ==========================================================================
@@ -685,75 +702,5 @@ mod tests {
             "Fallback URI should be detected as virtual: {}",
             uri_string
         );
-    }
-
-    #[test]
-    fn is_virtual_uri_rejects_real_uris() {
-        // Normal files
-        assert!(!VirtualDocumentUri::is_virtual_uri(
-            "file:///home/user/project/main.lua"
-        ));
-        assert!(!VirtualDocumentUri::is_virtual_uri(
-            "file:///C:/Users/dev/code.py"
-        ));
-        assert!(!VirtualDocumentUri::is_virtual_uri("untitled:Untitled-1"));
-
-        // Real file with .kakehashi in DIRECTORY name (not filename)
-        assert!(!VirtualDocumentUri::is_virtual_uri(
-            "file:///home/.kakehashi/config.lua"
-        ));
-
-        // Real file that starts with "kakehashi" but not "kakehashi-virtual-uri-"
-        assert!(!VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi.config.lua"
-        ));
-
-        // Filename without extension after the prefix is rejected
-        // Valid format: kakehashi-virtual-uri-{region_id}.{ext} requires a dot after the prefix
-        assert!(!VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-lua"
-        ));
-    }
-
-    #[test]
-    fn is_virtual_uri_handles_query_strings_and_fragments() {
-        // URIs with query strings - filename extraction should ignore query
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-REGION.lua?query=value"
-        ));
-
-        // URIs with fragments - filename extraction should ignore fragment
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-REGION.lua#section"
-        ));
-
-        // URIs with both query and fragment
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-REGION.lua?query=value#section"
-        ));
-
-        // Edge case: query string contains a slash - should NOT confuse filename extraction
-        // The rsplit('/') approach would incorrectly extract "bar" as the filename
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-REGION.lua?path=/foo/bar"
-        ));
-    }
-
-    #[test]
-    fn is_virtual_uri_handles_percent_encoded_slashes_in_filename() {
-        // A filename with a percent-encoded slash (%2F) should NOT be split on that "slash"
-        // This tests that we use proper URL parsing, not naive string splitting
-        // kakehashi-virtual-uri-region%2Fsubregion.lua is ONE filename, not a path
-        assert!(VirtualDocumentUri::is_virtual_uri(
-            "file:///project/kakehashi-virtual-uri-region%2Fsubregion.lua"
-        ));
-    }
-
-    #[test]
-    fn is_virtual_uri_handles_malformed_uris_gracefully() {
-        // Non-URL strings should not panic, just return false
-        assert!(!VirtualDocumentUri::is_virtual_uri("not a url"));
-        assert!(!VirtualDocumentUri::is_virtual_uri(""));
-        assert!(!VirtualDocumentUri::is_virtual_uri("://missing-scheme"));
     }
 }

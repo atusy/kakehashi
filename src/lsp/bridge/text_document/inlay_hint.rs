@@ -209,6 +209,7 @@ fn transform_inlay_hint_response_to_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
     // ==========================================================================
@@ -359,17 +360,16 @@ mod tests {
         assert_eq!(hints[1].position.character, 15);
     }
 
-    #[test]
-    fn inlay_hint_response_with_null_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::without_result(json!({"jsonrpc": "2.0", "id": 42}))]
+    fn inlay_hint_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
         let result = transform_inlay_hint_response_to_host(
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
             5,
         );
-
         assert!(result.is_none());
     }
 
@@ -386,20 +386,6 @@ mod tests {
 
         assert!(hints.is_some());
         assert!(hints.unwrap().is_empty());
-    }
-
-    #[test]
-    fn inlay_hint_response_without_result_returns_none() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42 });
-
-        let result = transform_inlay_hint_response_to_host(
-            response,
-            &make_virtual_uri_string(),
-            &make_host_uri(),
-            5,
-        );
-
-        assert!(result.is_none());
     }
 
     #[test]

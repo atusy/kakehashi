@@ -274,6 +274,7 @@ impl WorkspaceSettings {
 mod tests {
     use super::*;
     use crate::config::WILDCARD_KEY;
+    use rstest::rstest;
 
     #[test]
     fn should_distinguish_between_unspecified_and_empty_queries() {
@@ -798,57 +799,22 @@ mod tests {
         assert_eq!(queries[1].kind, Some(QueryKind::Injections));
     }
 
-    #[test]
-    fn should_parse_bridge_server_config_with_workspace_type_cargo() {
-        // Test that BridgeServerConfig can deserialize workspace_type field with value 'cargo'
-        let config_json = r#"{
-            "cmd": ["rust-analyzer"],
-            "languages": ["rust"],
-            "workspaceType": "cargo"
-        }"#;
-
+    #[rstest]
+    #[case::cargo(
+        r#"{"cmd": ["rust-analyzer"], "languages": ["rust"], "workspaceType": "cargo"}"#,
+        Some(WorkspaceType::Cargo)
+    )]
+    #[case::generic(
+        r#"{"cmd": ["pyright-langserver", "--stdio"], "languages": ["python"], "workspaceType": "generic"}"#,
+        Some(WorkspaceType::Generic),
+    )]
+    #[case::defaults_to_none(r#"{"cmd": ["rust-analyzer"], "languages": ["rust"]}"#, None)]
+    fn should_parse_bridge_server_config_workspace_type(
+        #[case] config_json: &str,
+        #[case] expected: Option<WorkspaceType>,
+    ) {
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
-
-        assert_eq!(config.cmd, vec!["rust-analyzer".to_string()]);
-        assert_eq!(config.languages, vec!["rust".to_string()]);
-        assert_eq!(config.workspace_type, Some(WorkspaceType::Cargo));
-    }
-
-    #[test]
-    fn should_parse_bridge_server_config_with_workspace_type_generic() {
-        // Test that BridgeServerConfig can deserialize workspace_type field with value 'generic'
-        let config_json = r#"{
-            "cmd": ["pyright-langserver", "--stdio"],
-            "languages": ["python"],
-            "workspaceType": "generic"
-        }"#;
-
-        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
-
-        assert_eq!(
-            config.cmd,
-            vec!["pyright-langserver".to_string(), "--stdio".to_string()]
-        );
-        assert_eq!(config.languages, vec!["python".to_string()]);
-        assert_eq!(config.workspace_type, Some(WorkspaceType::Generic));
-    }
-
-    #[test]
-    fn should_parse_bridge_server_config_without_workspace_type_defaults_to_none() {
-        // Test that missing workspace_type defaults to None
-        // The caller should treat None as Generic (changed from Cargo in PBI-105)
-        let config_json = r#"{
-            "cmd": ["rust-analyzer"],
-            "languages": ["rust"]
-        }"#;
-
-        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
-
-        assert_eq!(config.cmd, vec!["rust-analyzer".to_string()]);
-        assert!(
-            config.workspace_type.is_none(),
-            "Missing workspace_type should be None"
-        );
+        assert_eq!(config.workspace_type, expected);
     }
 
     #[test]

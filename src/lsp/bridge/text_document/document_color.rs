@@ -118,6 +118,7 @@ fn transform_document_color_response_to_host(
 mod tests {
     use super::*;
     use crate::lsp::bridge::protocol::VirtualDocumentUri;
+    use rstest::rstest;
     use serde_json::json;
 
     // ==========================================================================
@@ -218,10 +219,13 @@ mod tests {
         assert_eq!(colors[1].range.end.line, 7);
     }
 
-    #[test]
-    fn document_color_response_with_null_result_returns_empty() {
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
-
+    #[rstest]
+    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
+    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
+    fn document_color_response_returns_empty_for_invalid_response(
+        #[case] response: serde_json::Value,
+    ) {
         let colors = transform_document_color_response_to_host(response, 5);
         assert!(colors.is_empty());
     }
@@ -262,30 +266,6 @@ mod tests {
         assert_eq!(colors[0].color.green, 0.25);
         assert_eq!(colors[0].color.blue, 0.75);
         assert_eq!(colors[0].color.alpha, 0.9);
-    }
-
-    #[test]
-    fn document_color_response_with_no_result_key_returns_empty() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "error": { "code": -32600, "message": "Invalid Request" }
-        });
-
-        let colors = transform_document_color_response_to_host(response, 5);
-        assert!(colors.is_empty());
-    }
-
-    #[test]
-    fn document_color_response_with_malformed_result_returns_empty() {
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": 42,
-            "result": "not_an_array"
-        });
-
-        let colors = transform_document_color_response_to_host(response, 5);
-        assert!(colors.is_empty());
     }
 
     #[test]

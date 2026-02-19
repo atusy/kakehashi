@@ -1,0 +1,87 @@
+---
+source: src/lsp/bridge/protocol/lifecycle.rs
+expression: request
+---
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "method": "initialize",
+  "params": {
+    "capabilities": {
+      "general": {
+        "positionEncodings": [
+          "utf-16"
+        ]
+      },
+      "textDocument": {
+        "completion": {
+          "completionItem": {
+            "insertReplaceSupport": true,
+            "snippetSupport": true
+          },
+          "dynamicRegistration": false
+        },
+        "declaration": {
+          "dynamicRegistration": false,
+          "linkSupport": true
+        },
+        "definition": {
+          "dynamicRegistration": false,
+          "linkSupport": true
+        },
+        "diagnostic": {
+          "dynamicRegistration": true,
+          "relatedDocumentSupport": true
+        },
+        "documentHighlight": {
+          "dynamicRegistration": false
+        },
+        "documentLink": {
+          "dynamicRegistration": false,
+          "tooltipSupport": true
+        },
+        "documentSymbol": {
+          "dynamicRegistration": false,
+          "hierarchicalDocumentSymbolSupport": true
+        },
+        "hover": {
+          "contentFormat": [
+            "markdown",
+            "plaintext"
+          ],
+          "dynamicRegistration": false
+        },
+        "implementation": {
+          "dynamicRegistration": false,
+          "linkSupport": true
+        },
+        "inlayHint": {
+          "dynamicRegistration": false
+        },
+        "moniker": {
+          "dynamicRegistration": false
+        },
+        "references": {
+          "dynamicRegistration": false
+        },
+        "signatureHelp": {
+          "dynamicRegistration": false
+        },
+        "typeDefinition": {
+          "dynamicRegistration": false,
+          "linkSupport": true
+        }
+      },
+      "workspace": {
+        "diagnostics": {
+          "refreshSupport": true
+        }
+      }
+    },
+    "initializationOptions": null,
+    "processId": "[PID]",
+    "rootPath": null,
+    "rootUri": null,
+    "workspaceFolders": null
+  }
+}
