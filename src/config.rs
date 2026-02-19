@@ -2938,4 +2938,63 @@ mod tests {
             "Default variable.builtin mapping should be inherited"
         );
     }
+
+    #[test]
+    fn test_resolve_bridge_language_with_wildcard_merges_fields() {
+        // Wildcard provides aggregation defaults; specific provides enabled override
+        let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        map.insert(
+            "_".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "_".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["server_a".to_string()],
+                    },
+                )])),
+            },
+        );
+        map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                aggregation: None,
+            },
+        );
+
+        let resolved = resolve_bridge_language_with_wildcard(&map, "python").unwrap();
+        assert_eq!(
+            resolved.enabled,
+            Some(false),
+            "specific enabled overrides wildcard"
+        );
+        assert!(
+            resolved.aggregation.is_some(),
+            "aggregation inherited from wildcard"
+        );
+        assert_eq!(
+            resolved.aggregation.unwrap()["_"].priorities,
+            vec!["server_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_bridge_language_with_wildcard_returns_none_when_absent() {
+        let map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        assert!(resolve_bridge_language_with_wildcard(&map, "python").is_none());
+    }
+
+    #[test]
+    fn test_resolve_bridge_language_with_wildcard_enabled_defaults_to_none() {
+        // When both wildcard and specific omit enabled, it should be None
+        let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        map.insert("_".to_string(), settings::BridgeLanguageConfig::default());
+
+        let resolved = resolve_bridge_language_with_wildcard(&map, "python").unwrap();
+        assert_eq!(
+            resolved.enabled, None,
+            "enabled should be None when inherited wildcard has None"
+        );
+    }
 }

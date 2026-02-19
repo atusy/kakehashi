@@ -1316,6 +1316,67 @@ kind = "injections""#;
         assert_eq!(config.priorities, vec!["server_a".to_string()]);
     }
 
+    /// Test helper: resolve priorities for a specific LSP method.
+    /// Falls back to wildcard "_" key, then empty slice.
+    /// Will be promoted to BridgeLanguageConfig impl when wired in production.
+    fn resolve_priorities(config: &BridgeLanguageConfig, method: &str) -> Vec<String> {
+        let Some(map) = config.aggregation.as_ref() else {
+            return vec![];
+        };
+        map.get(method)
+            .or_else(|| map.get(WILDCARD_KEY))
+            .map(|c| c.priorities.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn should_resolve_priorities_for_specific_method() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    "textDocument/completion".to_string(),
+                    AggregationConfig {
+                        priorities: vec!["server_a".to_string()],
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        priorities: vec!["server_b".to_string()],
+                    },
+                ),
+            ])),
+        };
+        assert_eq!(
+            resolve_priorities(&config, "textDocument/completion"),
+            &["server_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_resolve_priorities_falls_back_to_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    priorities: vec!["server_b".to_string()],
+                },
+            )])),
+        };
+        assert_eq!(
+            resolve_priorities(&config, "textDocument/hover"),
+            &["server_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_resolve_priorities_returns_empty_when_no_aggregation() {
+        let config = BridgeLanguageConfig::default();
+        assert!(resolve_priorities(&config, "textDocument/hover").is_empty());
+    }
+
     #[test]
     fn should_parse_bridge_language_config_with_aggregation() {
         let json = r#"{
