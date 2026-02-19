@@ -12,6 +12,23 @@ use super::FanInResult;
 use crate::lsp::aggregation::server::fan_out::TaggedResult;
 use crate::lsp::request_id::CancelReceiver;
 
+/// Pick the best result from buffered wins, respecting priority order.
+///
+/// Walks the priority list first; if no priority server has a buffered result,
+/// falls back to any unprioritized server.
+fn pick_best_buffered<T>(
+    buffered_wins: &mut HashMap<String, T>,
+    priorities: &[String],
+) -> Option<T> {
+    for name in priorities {
+        if let Some(value) = buffered_wins.remove(name.as_str()) {
+            return Some(value);
+        }
+    }
+    let first_key = buffered_wins.keys().next().cloned();
+    first_key.and_then(|k| buffered_wins.remove(&k))
+}
+
 /// Priority-aware collection of concurrent bridge results.
 ///
 /// Buffers results by server name and walks the priority list after each arrival.
@@ -105,11 +122,10 @@ pub(crate) async fn preferred<T: Send + 'static>(
                 }
             }
         }
-        // JoinSet drained — all remaining priority servers that never responded were panics
-        // Check buffered wins one more time (priority servers may have been skipped due to
-        // pending status, but now all are effectively failed)
-        if let Some(first_key) = buffered_wins.keys().next().cloned() {
-            return FanInResult::Done(buffered_wins.remove(&first_key).unwrap());
+        // JoinSet drained — all remaining priority servers that never responded were panics.
+        // Walk priorities to pick the best buffered result.
+        if let Some(value) = pick_best_buffered(&mut buffered_wins, priorities) {
+            return FanInResult::Done(value);
         }
         return FanInResult::NoResult { errors };
     };
@@ -126,9 +142,9 @@ pub(crate) async fn preferred<T: Send + 'static>(
             result = join_set.join_next() => {
                 match result {
                     None => {
-                        // JoinSet drained
-                        if let Some(first_key) = buffered_wins.keys().next().cloned() {
-                            return FanInResult::Done(buffered_wins.remove(&first_key).unwrap());
+                        // JoinSet drained — walk priorities for best buffered result.
+                        if let Some(value) = pick_best_buffered(&mut buffered_wins, priorities) {
+                            return FanInResult::Done(value);
                         }
                         return FanInResult::NoResult { errors };
                     }
