@@ -42,6 +42,9 @@ pub(crate) struct RawToken {
     /// Within a single query, later patterns (higher index) are more specific
     /// and should override earlier ones at the same position and depth.
     pub pattern_index: usize,
+    /// Priority from `#set! priority N` directive (default 100).
+    /// Higher values win during overlap resolution.
+    pub priority: u32,
 }
 
 /// Represents the line/column boundaries of an injection region in the host document.
@@ -246,6 +249,7 @@ pub(super) fn collect_host_tokens(
                     mapped_name,
                     depth,
                     pattern_index: m.pattern_index,
+                    priority: 100,
                 });
             } else if supports_multiline {
                 // Multiline token with client support: emit a single token spanning multiple lines.
@@ -306,6 +310,7 @@ pub(super) fn collect_host_tokens(
                     mapped_name,
                     depth,
                     pattern_index: m.pattern_index,
+                    priority: 100,
                 });
             } else {
                 // Multiline token without client support: split into per-line tokens
@@ -334,6 +339,7 @@ pub(super) fn collect_host_tokens(
                             mapped_name: mapped_name.clone(),
                             depth,
                             pattern_index: m.pattern_index,
+                            priority: 100,
                         });
                     }
                 }

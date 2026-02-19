@@ -65,6 +65,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
                 mapped_name: token.mapped_name.clone(),
                 depth: token.depth,
                 pattern_index: token.pattern_index,
+                priority: token.priority,
             });
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
@@ -138,6 +139,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                     mapped_name: winner.mapped_name.clone(),
                     depth: winner.depth,
                     pattern_index: winner.pattern_index,
+                    priority: winner.priority,
                 });
             }
         }
@@ -165,7 +167,8 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
             && tokens[write].column + tokens[write].length == tokens[read].column
             && tokens[write].mapped_name == tokens[read].mapped_name
             && tokens[write].depth == tokens[read].depth
-            && tokens[write].pattern_index == tokens[read].pattern_index;
+            && tokens[write].pattern_index == tokens[read].pattern_index
+            && tokens[write].priority == tokens[read].priority;
 
         if can_merge {
             tokens[write].length += tokens[read].length;
@@ -274,7 +277,7 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    /// Helper to create a RawToken for testing
+    /// Helper to create a RawToken for testing (priority defaults to 100)
     fn make_token(
         line: usize,
         column: usize,
@@ -290,6 +293,28 @@ mod tests {
             mapped_name: name.to_string(),
             depth,
             pattern_index,
+            priority: 100,
+        }
+    }
+
+    /// Helper to create a RawToken with explicit priority
+    fn make_token_with_priority(
+        line: usize,
+        column: usize,
+        length: usize,
+        name: &str,
+        depth: usize,
+        pattern_index: usize,
+        priority: u32,
+    ) -> RawToken {
+        RawToken {
+            line,
+            column,
+            length,
+            mapped_name: name.to_string(),
+            depth,
+            pattern_index,
+            priority,
         }
     }
 
@@ -780,6 +805,23 @@ mod tests {
         let tokens = vec![make_token(0, 0, 10, "string", 0, 0)];
         let result = extract_split(tokens, &[]);
         assert_eq!(result, vec![(0, 0, 10)]);
+    }
+
+    #[test]
+    fn split_priority_overrides_pattern_index() {
+        // Token A: "markup.raw.block" at (0,0,10) with depth=0, pattern_index=10, priority=90
+        // Token B: "keyword" at (0,0,10) with depth=0, pattern_index=5, priority=100
+        // priority 100 > 90 should win, despite B having lower pattern_index
+        let tokens = vec![
+            make_token_with_priority(0, 0, 10, "markup.raw.block", 0, 10, 90),
+            make_token_with_priority(0, 0, 10, "keyword", 0, 5, 100),
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![(0, 10, "keyword".to_string())],
+            "priority 100 should beat priority 90, regardless of pattern_index"
+        );
     }
 
     #[test]
