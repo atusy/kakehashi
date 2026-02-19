@@ -55,8 +55,13 @@ where
 /// Server-level aggregation entry point using the collect-all strategy.
 ///
 /// Fans out one task per matching server and collects every successful result.
+/// When `ctx.priorities` is non-empty, results are ordered by priority, with
+/// unlisted servers appended in insertion order.
 /// Returns `Done(vec)` when at least one succeeds, `NoResult` when all fail,
 /// or `Cancelled` on cancel notification.
+///
+/// Pre-filters `ctx.priorities` against `ctx.configs` to ensure only
+/// configured server names are passed to the collect-all algorithm.
 pub(crate) async fn dispatch_collect_all<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
@@ -68,6 +73,14 @@ where
     F: Fn(FanOutTask) -> Fut,
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
+    let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
+    let effective_priorities: Vec<String> = ctx
+        .priorities
+        .iter()
+        .filter(|name| configured.contains(name.as_str()))
+        .cloned()
+        .collect();
+
     let mut join_set = fan_out(ctx, pool, f);
-    all::collect_all(&mut join_set, cancel_rx).await
+    all::collect_all(&mut join_set, &effective_priorities, cancel_rx).await
 }
