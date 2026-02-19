@@ -27,8 +27,7 @@ fn pick_best_buffered<T>(
             return Some(value);
         }
     }
-    let first_key = buffered_wins.keys().next().cloned();
-    first_key.and_then(|k| buffered_wins.shift_remove(&k))
+    buffered_wins.shift_remove_index(0).map(|(_, v)| v)
 }
 
 /// Priority-aware collection of concurrent bridge results.
