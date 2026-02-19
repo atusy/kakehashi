@@ -261,6 +261,38 @@ impl Kakehashi {
         })
     }
 
+    /// Resolve aggregation strategy for a given host language, injection language,
+    /// and LSP method.
+    ///
+    /// Resolution chain:
+    /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
+    /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
+    /// 3. `bridge_config.resolve_strategy(method, default)` → strategy
+    pub(crate) fn resolve_aggregation_strategy(
+        &self,
+        host_language: &str,
+        injection_language: &str,
+        method_name: &str,
+        default: crate::config::settings::AggregationStrategy,
+    ) -> crate::config::settings::AggregationStrategy {
+        let settings = self.settings_manager.load_settings();
+        let Some(lang_settings) = crate::config::resolve_language_settings_with_wildcard(
+            &settings.languages,
+            host_language,
+        ) else {
+            return default;
+        };
+        let Some(bridge_map) = lang_settings.bridge.as_ref() else {
+            return default;
+        };
+        let Some(bridge_config) =
+            crate::config::resolve_bridge_language_with_wildcard(bridge_map, injection_language)
+        else {
+            return default;
+        };
+        bridge_config.resolve_strategy(method_name, default)
+    }
+
     /// Resolve aggregation priorities for a given host language, injection language,
     /// and LSP method.
     ///

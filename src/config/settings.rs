@@ -77,6 +77,23 @@ impl BridgeLanguageConfig {
             .map(|c| c.priorities.clone())
             .unwrap_or_default()
     }
+
+    /// Resolve aggregation strategy for a specific LSP method.
+    ///
+    /// Falls back to wildcard `"_"` key, then `default`.
+    pub(crate) fn resolve_strategy(
+        &self,
+        method: &str,
+        default: AggregationStrategy,
+    ) -> AggregationStrategy {
+        let Some(map) = self.aggregation.as_ref() else {
+            return default;
+        };
+        map.get(method)
+            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .and_then(|c| c.strategy)
+            .unwrap_or(default)
+    }
 }
 
 /// Configuration for a bridge language server.
