@@ -13,6 +13,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
+use tree_sitter::Parser;
 
 use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
@@ -34,9 +35,6 @@ use crate::analysis::{
 use crate::lsp::lsp_impl::bridge_context::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
-
-/// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
-const PARSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reason why a semantic token request was cancelled.
 #[derive(Debug, Clone, Copy)]
@@ -118,65 +116,18 @@ impl Kakehashi {
         let text = doc.text().to_string();
         drop(doc);
 
-        let parser = {
-            let mut pool = self.parser_pool.lock().await;
-            pool.acquire(language_name)
-        };
+        let text_clone = text.clone();
 
-        let parse_result = if let Some(mut parser) = parser {
-            let text_clone = text.clone();
-            let language_name_clone = language_name.to_string();
-            let uri_clone = uri.clone();
-
-            // Parse in spawn_blocking with timeout and panic protection
-            let result = tokio::time::timeout(
-                PARSE_TIMEOUT,
-                tokio::task::spawn_blocking(move || {
-                    let parse_result =
-                        catch_unwind(AssertUnwindSafe(|| parser.parse(&text_clone, None)))
-                            .ok()
-                            .flatten();
-                    (parser, parse_result)
-                }),
-            )
+        // Parse with panic protection via catch_unwind, delegating pool
+        // management to the shared parse_with_pool helper
+        let parse_result: Option<Tree> = self
+            .parse_with_pool(language_name, uri, text.len(), move |mut parser: Parser| {
+                let result = catch_unwind(AssertUnwindSafe(|| parser.parse(&text_clone, None)))
+                    .ok()
+                    .flatten();
+                (parser, result)
+            })
             .await;
-
-            // Handle timeout vs successful completion
-            let result = match result {
-                Ok(join_result) => match join_result {
-                    Ok(result) => Some(result),
-                    Err(e) => {
-                        log::error!(
-                            "Parse task panicked for language '{}' on document {}: {}",
-                            language_name_clone,
-                            uri_clone,
-                            e
-                        );
-                        None
-                    }
-                },
-                Err(_timeout) => {
-                    log::warn!(
-                        "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",
-                        PARSE_TIMEOUT,
-                        language_name_clone,
-                        uri_clone,
-                        text.len()
-                    );
-                    None
-                }
-            };
-
-            if let Some((parser, parse_result)) = result {
-                let mut pool = self.parser_pool.lock().await;
-                pool.release(language_name_clone, parser);
-                parse_result
-            } else {
-                None
-            }
-        } else {
-            None
-        };
 
         if let Some(tree) = parse_result {
             let mut doc_is_current = false;
