@@ -313,6 +313,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preferred_falls_back_when_priority_server_panics() {
+        // A priority server panics (JoinError) — can't be attributed to a name.
+        // The algorithm keeps it as "pending" until the JoinSet drains, then
+        // falls back to the unprioritized server_b's buffered result.
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        join_set.spawn(async {
+            panic!("simulated panic in priority server");
+        });
+        spawn_tagged_named(&mut join_set, "server_b", Ok(Some(42)));
+
+        let priorities = vec!["server_a".to_string()];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+
+        assert_eq!(assert_done(result), Some(42));
+    }
+
+    #[tokio::test]
     async fn preferred_treats_unlisted_servers_as_lowest_priority() {
         // server_a is prioritized and fails; server_b is not listed (lowest priority) and succeeds
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
