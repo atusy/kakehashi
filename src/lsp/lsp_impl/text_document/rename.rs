@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{RenameParams, WorkspaceEdit};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn rename_impl(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
@@ -13,7 +13,7 @@ impl Kakehashi {
         let new_name = params.new_name;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "rename")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/rename")
             .await
         else {
             return Ok(None);
@@ -25,7 +25,7 @@ impl Kakehashi {
         // Fan-out rename requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| {

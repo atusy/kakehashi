@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::request::{GotoDeclarationParams, GotoDeclaration
 use crate::lsp::bridge::location_link_to_location;
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn goto_declaration_impl(
@@ -18,7 +18,7 @@ impl Kakehashi {
         let position = params.text_document_position_params.position;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "goto_declaration")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/declaration")
             .await
         else {
             return Ok(None);
@@ -30,7 +30,7 @@ impl Kakehashi {
         // Fan-out declaration requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| async move {

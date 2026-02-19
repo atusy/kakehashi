@@ -13,19 +13,73 @@ pub(crate) use user::load_user_config;
 /// Used in capture_mappings, languages, and language_servers for fallback values.
 pub(crate) const WILDCARD_KEY: &str = "_";
 
-/// Deep merge two optional bridge HashMaps.
-/// Specific values override wildcard values for the same key.
-fn merge_bridge_maps(
-    wildcard: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
-    specific: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
-) -> Option<HashMap<String, settings::BridgeLanguageConfig>> {
+/// Resolve a bridge language key from a map with wildcard fallback and field-level merging.
+///
+/// Implements ADR-0011 wildcard config inheritance for bridge HashMap:
+/// - If both wildcard ("_") and specific key exist: merge them (specific fields override wildcard)
+/// - If only wildcard exists: return wildcard
+/// - If only specific key exists: return specific key
+/// - If neither exists: return None
+pub(crate) fn resolve_bridge_language_with_wildcard(
+    map: &HashMap<String, settings::BridgeLanguageConfig>,
+    key: &str,
+) -> Option<settings::BridgeLanguageConfig> {
+    let wildcard = map.get(WILDCARD_KEY);
+    let specific = map.get(key);
+
     match (wildcard, specific) {
+        (Some(w), Some(s)) => Some(merge_bridge_language_configs(w, s)),
+        (Some(w), None) => Some(w.clone()),
+        (None, Some(s)) => Some(s.clone()),
         (None, None) => None,
-        (Some(wb), None) => Some(wb.clone()),
-        (None, Some(sb)) => Some(sb.clone()),
-        (Some(wb), Some(sb)) => {
-            let mut merged = wb.clone();
-            merged.extend(sb.clone());
+    }
+}
+
+/// Field-level merge of two BridgeLanguageConfig values.
+/// Overlay fields win when present; base provides defaults.
+fn merge_bridge_language_configs(
+    base: &settings::BridgeLanguageConfig,
+    overlay: &settings::BridgeLanguageConfig,
+) -> settings::BridgeLanguageConfig {
+    settings::BridgeLanguageConfig {
+        enabled: overlay.enabled.or(base.enabled),
+        aggregation: match (&base.aggregation, &overlay.aggregation) {
+            (Some(base_agg), Some(overlay_agg)) => {
+                let mut merged = base_agg.clone();
+                merged.extend(overlay_agg.clone());
+                Some(merged)
+            }
+            (base_agg, overlay_agg) => overlay_agg.clone().or_else(|| base_agg.clone()),
+        },
+    }
+}
+
+/// Deep merge two optional bridge HashMaps.
+///
+/// When both base and overlay exist:
+/// - If overlay is empty (`Some({})`), it completely replaces base (empty-means-clear).
+///   This preserves the "empty map = disable all bridging" contract.
+/// - Otherwise, per-key entries are merged at the field level using
+///   [`merge_bridge_language_configs`].
+fn merge_bridge_maps(
+    base: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
+    overlay: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
+) -> Option<HashMap<String, settings::BridgeLanguageConfig>> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(_), Some(o)) if o.is_empty() => Some(HashMap::new()), // empty-means-clear
+        (Some(b), Some(o)) => {
+            let mut merged = b.clone();
+            for (key, overlay_config) in o {
+                merged
+                    .entry(key.clone())
+                    .and_modify(|base_config| {
+                        *base_config = merge_bridge_language_configs(base_config, overlay_config);
+                    })
+                    .or_insert_with(|| overlay_config.clone());
+            }
             Some(merged)
         }
     }
@@ -1001,7 +1055,13 @@ mod tests {
 
         let mut user_languages = HashMap::new();
         let mut user_bridge = HashMap::new();
-        user_bridge.insert("rust".to_string(), BridgeLanguageConfig { enabled: true });
+        user_bridge.insert(
+            "rust".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
 
         user_languages.insert(
             "python".to_string(),
@@ -1072,7 +1132,7 @@ mod tests {
         // Bridge: inherited from user (project was None)
         assert!(python.bridge.is_some());
         let bridge = python.bridge.as_ref().unwrap();
-        assert!(bridge.get("rust").unwrap().enabled);
+        assert_eq!(bridge.get("rust").unwrap().enabled, Some(true));
     }
 
     #[test]
@@ -1616,7 +1676,10 @@ mod tests {
         let mut wildcard_bridge = HashMap::new();
         wildcard_bridge.insert(
             "rust".to_string(),
-            settings::BridgeLanguageConfig { enabled: true },
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
         );
 
         languages.insert(
@@ -1648,7 +1711,7 @@ mod tests {
         );
         let bridge = resolved.bridge.as_ref().unwrap();
         assert!(
-            bridge.get("rust").is_some_and(|c| c.enabled),
+            bridge.get("rust").is_some_and(|c| c.enabled == Some(true)),
             "Should inherit bridge settings from wildcard"
         );
     }
@@ -1667,7 +1730,10 @@ mod tests {
         let mut wildcard_bridge = HashMap::new();
         wildcard_bridge.insert(
             "_".to_string(),
-            settings::BridgeLanguageConfig { enabled: true },
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
         );
 
         languages.insert(
@@ -1687,7 +1753,10 @@ mod tests {
         let mut python_bridge = HashMap::new();
         python_bridge.insert(
             "javascript".to_string(),
-            settings::BridgeLanguageConfig { enabled: false },
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
         );
 
         languages.insert(
@@ -1720,7 +1789,7 @@ mod tests {
         let js_resolved = resolve_bridge_with_wildcard(bridge, "javascript");
         assert!(js_resolved.is_some(), "Should resolve javascript bridge");
         assert!(
-            !js_resolved.unwrap().enabled,
+            js_resolved.unwrap().enabled == Some(false),
             "Python's javascript bridge should be disabled (override)"
         );
 
@@ -1732,7 +1801,7 @@ mod tests {
             "Python's rust bridge should resolve (inherited from wildcard's bridge._)"
         );
         assert!(
-            rust_resolved.unwrap().enabled,
+            rust_resolved.unwrap().enabled == Some(true),
             "Python's rust bridge should be enabled (from wildcard's bridge._)"
         );
     }
@@ -1749,11 +1818,17 @@ mod tests {
         let mut python_bridge = HashMap::new();
         python_bridge.insert(
             "_".to_string(),
-            settings::BridgeLanguageConfig { enabled: true }, // Python's own default
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }, // Python's own default
         );
         python_bridge.insert(
             "javascript".to_string(),
-            settings::BridgeLanguageConfig { enabled: false }, // Override for JS
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }, // Override for JS
         );
 
         languages.insert(
@@ -1774,7 +1849,7 @@ mod tests {
         let js_resolved = resolve_bridge_with_wildcard(bridge, "javascript");
         assert!(js_resolved.is_some());
         assert!(
-            !js_resolved.unwrap().enabled,
+            js_resolved.unwrap().enabled == Some(false),
             "JavaScript should be disabled"
         );
 
@@ -1782,7 +1857,7 @@ mod tests {
         let rust_resolved = resolve_bridge_with_wildcard(bridge, "rust");
         assert!(rust_resolved.is_some());
         assert!(
-            rust_resolved.unwrap().enabled,
+            rust_resolved.unwrap().enabled == Some(true),
             "Rust should inherit from python.bridge._"
         );
     }
@@ -1804,7 +1879,10 @@ mod tests {
         let mut wildcard_bridge = HashMap::new();
         wildcard_bridge.insert(
             "_".to_string(),
-            settings::BridgeLanguageConfig { enabled: true },
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
         );
 
         languages.insert(
@@ -1837,7 +1915,7 @@ mod tests {
             "Should resolve to wildcard bridge"
         );
         assert!(
-            resolved_bridge.unwrap().enabled,
+            resolved_bridge.unwrap().enabled == Some(true),
             "Nested wildcard resolution: languages._.bridge._ should apply to python.bridge.rust"
         );
     }
@@ -1861,11 +1939,17 @@ mod tests {
         let mut wildcard_bridge = HashMap::new();
         wildcard_bridge.insert(
             "rust".to_string(),
-            settings::BridgeLanguageConfig { enabled: true },
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
         );
         wildcard_bridge.insert(
             "go".to_string(),
-            settings::BridgeLanguageConfig { enabled: true },
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
         );
 
         languages.insert(
@@ -1881,7 +1965,10 @@ mod tests {
         let mut python_bridge = HashMap::new();
         python_bridge.insert(
             "javascript".to_string(),
-            settings::BridgeLanguageConfig { enabled: false },
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
         );
 
         languages.insert(
@@ -1911,19 +1998,21 @@ mod tests {
 
         // rust: inherited from wildcard
         assert!(
-            bridge.get("rust").is_some_and(|c| c.enabled),
+            bridge.get("rust").is_some_and(|c| c.enabled == Some(true)),
             "Python should inherit rust bridge from wildcard (deep merge)"
         );
 
         // go: inherited from wildcard
         assert!(
-            bridge.get("go").is_some_and(|c| c.enabled),
+            bridge.get("go").is_some_and(|c| c.enabled == Some(true)),
             "Python should inherit go bridge from wildcard (deep merge)"
         );
 
         // javascript: python-specific
         assert!(
-            bridge.get("javascript").is_some_and(|c| !c.enabled),
+            bridge
+                .get("javascript")
+                .is_some_and(|c| c.enabled == Some(false)),
             "Python should have its own javascript bridge setting"
         );
     }
@@ -1938,7 +2027,10 @@ mod tests {
         // Wildcard has enabled = true
         bridge.insert(
             "_".to_string(),
-            settings::BridgeLanguageConfig { enabled: true },
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
         );
 
         // Resolve for "javascript" which doesn't exist - should return wildcard
@@ -1946,7 +2038,11 @@ mod tests {
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
-        assert!(resolved.enabled, "Should inherit enabled from wildcard");
+        assert_eq!(
+            resolved.enabled,
+            Some(true),
+            "Should inherit enabled from wildcard"
+        );
     }
 
     #[test]
@@ -2392,7 +2488,13 @@ mod tests {
 
         // Markdown: enable only rust bridging
         let mut markdown_bridge = HashMap::new();
-        markdown_bridge.insert("rust".to_string(), BridgeLanguageConfig { enabled: true });
+        markdown_bridge.insert(
+            "rust".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
         languages.insert(
             "markdown".to_string(),
             LanguageConfig {
@@ -2606,8 +2708,20 @@ mod tests {
 
         // Host markdown with bridge filter: only python and r enabled
         let mut bridge_filter = HashMap::new();
-        bridge_filter.insert("python".to_string(), BridgeLanguageConfig { enabled: true });
-        bridge_filter.insert("r".to_string(), BridgeLanguageConfig { enabled: true });
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        bridge_filter.insert(
+            "r".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
         let markdown_settings = LanguageSettings::with_bridge(None, None, Some(bridge_filter));
 
         // Router should allow python (enabled in filter)
@@ -2835,6 +2949,191 @@ mod tests {
             merged.capture_mappings[WILDCARD_KEY].highlights["variable.builtin"],
             "variable.defaultLibrary",
             "Default variable.builtin mapping should be inherited"
+        );
+    }
+
+    #[test]
+    fn test_resolve_bridge_language_with_wildcard_merges_fields() {
+        // Wildcard provides aggregation defaults; specific provides enabled override
+        let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        map.insert(
+            "_".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "_".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["server_a".to_string()],
+                    },
+                )])),
+            },
+        );
+        map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                aggregation: None,
+            },
+        );
+
+        let resolved = resolve_bridge_language_with_wildcard(&map, "python").unwrap();
+        assert_eq!(
+            resolved.enabled,
+            Some(false),
+            "specific enabled overrides wildcard"
+        );
+        assert!(
+            resolved.aggregation.is_some(),
+            "aggregation inherited from wildcard"
+        );
+        assert_eq!(
+            resolved.aggregation.unwrap()["_"].priorities,
+            vec!["server_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_bridge_language_with_wildcard_returns_none_when_absent() {
+        let map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        assert!(resolve_bridge_language_with_wildcard(&map, "python").is_none());
+    }
+
+    #[test]
+    fn test_resolve_bridge_language_with_wildcard_enabled_defaults_to_none() {
+        // When both wildcard and specific omit enabled, it should be None
+        let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        map.insert("_".to_string(), settings::BridgeLanguageConfig::default());
+
+        let resolved = resolve_bridge_language_with_wildcard(&map, "python").unwrap();
+        assert_eq!(
+            resolved.enabled, None,
+            "enabled should be None when inherited wildcard has None"
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_deep_merges_aggregation() {
+        // Wildcard bridge has python with aggregation defaults
+        // Specific bridge has python with enabled override but no aggregation
+        // After merge, python should have both enabled override AND inherited aggregation
+        let mut wildcard_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        wildcard_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "_".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["pyright".to_string()],
+                    },
+                )])),
+            },
+        );
+
+        let mut specific_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        specific_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                aggregation: None, // no aggregation override
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(wildcard_map), &Some(specific_map)).unwrap();
+        let python = merged.get("python").unwrap();
+        assert_eq!(
+            python.enabled,
+            Some(false),
+            "specific enabled should override"
+        );
+        assert!(
+            python.aggregation.is_some(),
+            "aggregation should be inherited from wildcard"
+        );
+        assert_eq!(
+            python.aggregation.as_ref().unwrap()["_"].priorities,
+            vec!["pyright".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_empty_overlay_clears_base() {
+        // Empty overlay map means "disable all bridging" — should not inherit from base
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let empty_overlay: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(empty_overlay)).unwrap();
+        assert!(merged.is_empty(), "empty overlay should clear base");
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_overlay_aggregation_wins_on_shared_keys() {
+        // Both base and overlay define aggregation for the same method key.
+        // Overlay should win for shared keys; base-only keys are preserved.
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([
+                    (
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["base_default".to_string()],
+                        },
+                    ),
+                    (
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["base_hover".to_string()],
+                        },
+                    ),
+                ])),
+            },
+        );
+
+        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        overlay_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["overlay_hover".to_string()],
+                    },
+                )])),
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
+        let python = merged.get("python").unwrap();
+
+        // enabled: overlay has None, so base's Some(true) wins
+        assert_eq!(python.enabled, Some(true));
+
+        let agg = python.aggregation.as_ref().unwrap();
+
+        // Shared key "textDocument/hover": overlay wins
+        assert_eq!(
+            agg["textDocument/hover"].priorities,
+            vec!["overlay_hover".to_string()],
+            "overlay should win for shared aggregation keys"
+        );
+
+        // Base-only key "_": preserved from base
+        assert_eq!(
+            agg["_"].priorities,
+            vec!["base_default".to_string()],
+            "base-only aggregation keys should be preserved"
         );
     }
 }

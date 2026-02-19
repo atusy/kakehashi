@@ -46,6 +46,10 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
+    /// Server names in priority order for aggregation.
+    /// Resolved from the bridge language config's aggregation settings.
+    /// Empty means pure first-win behavior (no priority ordering).
+    pub(crate) priorities: Vec<String>,
 }
 
 /// Document context plus a cursor position.
@@ -214,10 +218,14 @@ impl Kakehashi {
     /// Convert a preamble result into a `DocumentRequestContext` by looking up
     /// bridge server configs for the injection language.
     ///
+    /// `method_name` is the LSP method (e.g., `"textDocument/definition"`) used
+    /// to resolve per-method aggregation priorities from the bridge language config.
+    ///
     /// Returns `None` if no configs are found.
     async fn preamble_to_document_context(
         &self,
         preamble: PreambleResult,
+        method_name: &str,
     ) -> Option<DocumentRequestContext> {
         let configs = self.get_all_bridge_configs_for_language(
             &preamble.language_name,
@@ -237,12 +245,51 @@ impl Kakehashi {
             return None;
         }
 
+        // Resolve aggregation priorities from the bridge language config.
+        let priorities = self.resolve_aggregation_priorities(
+            &preamble.language_name,
+            &preamble.resolved.injection_language,
+            method_name,
+        );
+
         Some(DocumentRequestContext {
             uri: preamble.uri,
             resolved: preamble.resolved,
             configs,
             upstream_request_id: preamble.upstream_request_id,
+            priorities,
         })
+    }
+
+    /// Resolve aggregation priorities for a given host language, injection language,
+    /// and LSP method.
+    ///
+    /// Resolution chain:
+    /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
+    /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
+    /// 3. `bridge_config.resolve_priorities(method)` → priority list
+    pub(crate) fn resolve_aggregation_priorities(
+        &self,
+        host_language: &str,
+        injection_language: &str,
+        method_name: &str,
+    ) -> Vec<String> {
+        let settings = self.settings_manager.load_settings();
+        let Some(lang_settings) = crate::config::resolve_language_settings_with_wildcard(
+            &settings.languages,
+            host_language,
+        ) else {
+            return Vec::new();
+        };
+        let Some(bridge_map) = lang_settings.bridge.as_ref() else {
+            return Vec::new();
+        };
+        let Some(bridge_config) =
+            crate::config::resolve_bridge_language_with_wildcard(bridge_map, injection_language)
+        else {
+            return Vec::new();
+        };
+        bridge_config.resolve_priorities(method_name)
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
@@ -259,7 +306,9 @@ impl Kakehashi {
             .resolve_bridge_preamble(lsp_uri, position, method_name)
             .await?;
         let position = preamble.position;
-        let document = self.preamble_to_document_context(preamble).await?;
+        let document = self
+            .preamble_to_document_context(preamble, method_name)
+            .await?;
 
         Some(PositionRequestContext { document, position })
     }
@@ -277,7 +326,9 @@ impl Kakehashi {
         let preamble = self
             .resolve_bridge_preamble(lsp_uri, range.start, method_name)
             .await?;
-        let document = self.preamble_to_document_context(preamble).await?;
+        let document = self
+            .preamble_to_document_context(preamble, method_name)
+            .await?;
 
         Some(RangeRequestContext { document, range })
     }

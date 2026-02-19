@@ -18,14 +18,49 @@ pub enum WorkspaceType {
     Generic,
 }
 
+/// Per-method aggregation configuration.
+///
+/// Controls how results from multiple bridge servers are aggregated for a
+/// specific LSP method. The `priorities` list determines server preference
+/// order — the first server in the list that returns a non-empty result wins.
+/// Empty priorities degrades to first-win (arrival-order) behavior.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+pub(crate) struct AggregationConfig {
+    /// Server names in priority order (highest first). Empty = pure first-win behavior.
+    #[serde(default)]
+    pub(crate) priorities: Vec<String>,
+}
+
 /// Configuration for a single bridged language within a host filetype.
 ///
 /// Used in the bridge filter map to control whether a specific injection language
-/// should be bridged. Example: `{ python = { enabled = true } }`.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+/// should be bridged and how results are aggregated.
+/// Example: `{ python = { enabled = true, aggregation = { "_" = { priorities = ["pyright"] } } } }`.
+///
+/// All fields are `Option` to support wildcard inheritance (ADR-0011):
+/// `None` means "inherit from wildcard `_` key".
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
 pub struct BridgeLanguageConfig {
-    /// Whether bridging is enabled for this language
-    pub enabled: bool,
+    /// Whether bridging is enabled for this language.
+    /// `None` = inherit from wildcard (defaults to `true`).
+    pub(crate) enabled: Option<bool>,
+    /// Per-method aggregation config. Key = LSP method name or "_" for default.
+    pub(crate) aggregation: Option<HashMap<String, AggregationConfig>>,
+}
+
+impl BridgeLanguageConfig {
+    /// Resolve priorities for a specific LSP method.
+    ///
+    /// Falls back to wildcard `"_"` key, then empty slice.
+    pub(crate) fn resolve_priorities(&self, method: &str) -> Vec<String> {
+        let Some(map) = self.aggregation.as_ref() else {
+            return vec![];
+        };
+        map.get(method)
+            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .map(|c| c.priorities.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Configuration for a bridge language server.
@@ -200,15 +235,19 @@ impl LanguageSettings {
     /// Returns:
     /// - `true` if `bridge` is `None` (default: bridge all languages)
     /// - `false` if `bridge` is `Some({})` (empty map: bridge nothing)
-    /// - `true` if `bridge` contains the language with `enabled: true`
-    /// - `false` otherwise (language not in map, or `enabled: false`)
+    /// - For non-empty maps: resolves wildcard `_` with specific key, then checks `enabled`
+    ///   - `enabled: None` → defaults to `true` (bridging enabled by default)
+    ///   - `enabled: Some(v)` → uses explicit value
+    ///   - No wildcard and no specific key → `false` (not in map)
     pub fn is_language_bridgeable(&self, injection_language: &str) -> bool {
         match &self.bridge {
             None => true,                         // Default: bridge all configured languages
             Some(map) if map.is_empty() => false, // Empty map: bridge nothing
-            Some(map) => map
-                .get(injection_language)
-                .is_some_and(|config| config.enabled),
+            Some(map) => {
+                let resolved =
+                    crate::config::resolve_bridge_language_with_wildcard(map, injection_language);
+                resolved.map(|c| c.enabled.unwrap_or(true)).unwrap_or(false)
+            }
         }
     }
 }
@@ -835,8 +874,8 @@ mod tests {
         assert!(config.bridge.is_some(), "bridge field should be Some");
         let bridge = config.bridge.unwrap();
         assert_eq!(bridge.len(), 2);
-        assert!(bridge.get("python").unwrap().enabled);
-        assert!(bridge.get("r").unwrap().enabled);
+        assert_eq!(bridge.get("python").unwrap().enabled, Some(true));
+        assert_eq!(bridge.get("r").unwrap().enabled, Some(true));
     }
 
     #[test]
@@ -929,8 +968,20 @@ mod tests {
     fn test_bridge_filter_allows_enabled_languages() {
         // PBI-120: Only languages with enabled: true should be bridgeable
         let mut bridge = HashMap::new();
-        bridge.insert("python".to_string(), BridgeLanguageConfig { enabled: true });
-        bridge.insert("r".to_string(), BridgeLanguageConfig { enabled: true });
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        bridge.insert(
+            "r".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
 
         let settings = LanguageSettings::with_bridge(None, None, Some(bridge));
 
@@ -959,8 +1010,20 @@ mod tests {
     fn test_bridge_filter_disabled_language() {
         // PBI-120: Languages with enabled: false should not be bridgeable
         let mut bridge = HashMap::new();
-        bridge.insert("python".to_string(), BridgeLanguageConfig { enabled: true });
-        bridge.insert("r".to_string(), BridgeLanguageConfig { enabled: false });
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        bridge.insert(
+            "r".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
 
         let settings = LanguageSettings::with_bridge(None, None, Some(bridge));
 
@@ -1052,14 +1115,14 @@ mod tests {
         }"#;
 
         let config: BridgeLanguageConfig = serde_json::from_str(config_json).unwrap();
-        assert!(config.enabled);
+        assert_eq!(config.enabled, Some(true));
 
         // Test disabled
         let config_false_json = r#"{
             "enabled": false
         }"#;
         let config_false: BridgeLanguageConfig = serde_json::from_str(config_false_json).unwrap();
-        assert!(!config_false.enabled);
+        assert_eq!(config_false.enabled, Some(false));
     }
 
     #[test]
@@ -1080,8 +1143,8 @@ mod tests {
         assert!(config.bridge.is_some(), "bridge field should be Some");
         let bridge = config.bridge.unwrap();
         assert_eq!(bridge.len(), 2);
-        assert!(bridge.get("python").unwrap().enabled);
-        assert!(!bridge.get("r").unwrap().enabled);
+        assert_eq!(bridge.get("python").unwrap().enabled, Some(true));
+        assert_eq!(bridge.get("r").unwrap().enabled, Some(false));
     }
 
     // PBI-151: Unified query configuration with QueryItem struct
@@ -1242,6 +1305,107 @@ kind = "injections""#;
             None,
             "very-local-injections.scm should not match"
         );
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_from_json() {
+        let json = r#"{"priorities": ["server_a", "server_b"]}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.priorities,
+            vec!["server_a".to_string(), "server_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_empty_priorities() {
+        let json = r#"{}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert!(config.priorities.is_empty());
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_from_toml() {
+        let toml_str = r#"priorities = ["server_a"]"#;
+        let config: AggregationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.priorities, vec!["server_a".to_string()]);
+    }
+
+    #[test]
+    fn should_resolve_priorities_for_specific_method() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    "textDocument/completion".to_string(),
+                    AggregationConfig {
+                        priorities: vec!["server_a".to_string()],
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        priorities: vec!["server_b".to_string()],
+                    },
+                ),
+            ])),
+        };
+        assert_eq!(
+            config.resolve_priorities("textDocument/completion"),
+            &["server_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_resolve_priorities_falls_back_to_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    priorities: vec!["server_b".to_string()],
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_priorities("textDocument/hover"),
+            &["server_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn should_resolve_priorities_returns_empty_when_no_aggregation() {
+        let config = BridgeLanguageConfig::default();
+        assert!(config.resolve_priorities("textDocument/hover").is_empty());
+    }
+
+    #[test]
+    fn should_parse_bridge_language_config_with_aggregation() {
+        let json = r#"{
+            "enabled": true,
+            "aggregation": {
+                "textDocument/completion": { "priorities": ["server_a"] },
+                "_": { "priorities": ["server_b"] }
+            }
+        }"#;
+        let config: BridgeLanguageConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.enabled, Some(true));
+        let agg = config.aggregation.as_ref().unwrap();
+        assert_eq!(agg.len(), 2);
+        assert_eq!(
+            agg["textDocument/completion"].priorities,
+            vec!["server_a".to_string()]
+        );
+        assert_eq!(agg["_"].priorities, vec!["server_b".to_string()]);
+    }
+
+    #[test]
+    fn should_parse_bridge_language_config_enabled_defaults_to_none() {
+        // When enabled is omitted, it should be None (for wildcard inheritance)
+        let json = r#"{}"#;
+        let config: BridgeLanguageConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.enabled, None);
+        assert!(config.aggregation.is_none());
     }
 
     #[test]

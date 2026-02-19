@@ -333,6 +333,7 @@ impl Kakehashi {
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
+                priorities: Vec::new(),
             };
             let pool = Arc::clone(&pool);
 

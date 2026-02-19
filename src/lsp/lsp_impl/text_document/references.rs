@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Location, ReferenceParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn references_impl(
@@ -16,7 +16,7 @@ impl Kakehashi {
         let include_declaration = params.context.include_declaration;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "references")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/references")
             .await
         else {
             return Ok(None);
@@ -28,7 +28,7 @@ impl Kakehashi {
         // Fan-out references requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| async move {

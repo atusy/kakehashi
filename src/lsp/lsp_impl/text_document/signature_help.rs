@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{SignatureHelp, SignatureHelpParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn signature_help_impl(
@@ -16,7 +16,7 @@ impl Kakehashi {
 
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "signature_help")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/signatureHelp")
             .await
         else {
             return Ok(None);
@@ -28,7 +28,7 @@ impl Kakehashi {
         // Fan-out signature help requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| async move {

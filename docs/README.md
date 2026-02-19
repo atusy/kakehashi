@@ -191,7 +191,12 @@ Configure language servers for bridging LSP requests in injection regions.
     "markdown": {
       "bridge": {
         "rust": { "enabled": true },
-        "python": { "enabled": true }
+        "python": {
+          "enabled": true,
+          "aggregation": {
+            "_": { "priorities": ["pyright"] }
+          }
+        }
       }
     },
     "quarto": {
@@ -210,6 +215,39 @@ Configure language servers for bridging LSP requests in injection regions.
 |-------|-------------|
 | `cmd` | Command and arguments to start the language server |
 | `languages` | Languages this server handles |
+
+**Bridge Language Configuration:**
+
+Each entry in the `bridge` map configures bridging for one injection language:
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Whether bridging is enabled (`true`/`false`). Omit to inherit from the `_` wildcard (defaults to `true`). |
+| `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. |
+
+**Aggregation Configuration:**
+
+When multiple language servers can handle the same injection language, `aggregation` controls which server's response is preferred. Each entry contains:
+
+| Field | Description |
+|-------|-------------|
+| `priorities` | Ordered list of server names. The first server that returns a valid response wins. Empty list falls back to arrival-order (first-win) behavior. |
+
+Example with per-method priorities:
+
+```json
+{
+  "bridge": {
+    "python": {
+      "enabled": true,
+      "aggregation": {
+        "textDocument/completion": { "priorities": ["pyright", "pylsp"] },
+        "_": { "priorities": ["pylsp"] }
+      }
+    }
+  }
+}
+```
 
 **Bridge Filter Semantics:**
 

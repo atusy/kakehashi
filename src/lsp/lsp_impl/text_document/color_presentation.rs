@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{ColorPresentation, ColorPresentationParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn color_presentation_impl(
@@ -16,7 +16,7 @@ impl Kakehashi {
         let color = params.color;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts_for_range(&lsp_uri, range, "colorPresentation")
+            .resolve_bridge_contexts_for_range(&lsp_uri, range, "textDocument/colorPresentation")
             .await
         else {
             return Ok(Vec::new());
@@ -31,7 +31,7 @@ impl Kakehashi {
         // Fan-out color presentation requests to all matching servers
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| {

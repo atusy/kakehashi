@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, MessageType};
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -93,16 +93,22 @@ impl Kakehashi {
                 continue;
             }
 
+            let priorities = self.resolve_aggregation_priorities(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/documentLink",
+            );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
+                priorities,
             };
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let result = dispatch_first_win(
+                let result = dispatch_preferred(
                     &region_ctx,
                     pool.clone(),
                     |t| async move {

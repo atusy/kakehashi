@@ -4,7 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentHighlight, DocumentHighlightParams};
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_first_win;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 impl Kakehashi {
     pub(crate) async fn document_highlight_impl(
@@ -15,7 +15,7 @@ impl Kakehashi {
         let position = params.text_document_position_params.position;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "document_highlight")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/documentHighlight")
             .await
         else {
             return Ok(None);
@@ -27,7 +27,7 @@ impl Kakehashi {
         // Fan-out document highlight requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
-        let result = dispatch_first_win(
+        let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| async move {
