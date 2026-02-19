@@ -2964,6 +2964,7 @@ mod tests {
                     "_".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["server_a".to_string()],
+                        ..Default::default()
                     },
                 )])),
             },
@@ -3025,6 +3026,7 @@ mod tests {
                     "_".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["pyright".to_string()],
+                        ..Default::default()
                     },
                 )])),
             },
@@ -3088,12 +3090,14 @@ mod tests {
                         "_".to_string(),
                         settings::AggregationConfig {
                             priorities: vec!["base_default".to_string()],
+                            ..Default::default()
                         },
                     ),
                     (
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
                             priorities: vec!["base_hover".to_string()],
+                            ..Default::default()
                         },
                     ),
                 ])),
@@ -3109,6 +3113,7 @@ mod tests {
                     "textDocument/hover".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["overlay_hover".to_string()],
+                        ..Default::default()
                     },
                 )])),
             },
@@ -3134,6 +3139,59 @@ mod tests {
             agg["_"].priorities,
             vec!["base_default".to_string()],
             "base-only aggregation keys should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_overlay_aggregation_preserves_strategy_when_atomic() {
+        // When overlay replaces an aggregation entry, the entire entry
+        // (including strategy) is replaced atomically — base's strategy
+        // does NOT leak into overlay's entry.
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "textDocument/diagnostic".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["ruff".to_string()],
+                        strategy: Some(settings::AggregationStrategy::All),
+                    },
+                )])),
+            },
+        );
+
+        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        overlay_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(HashMap::from([(
+                    "textDocument/diagnostic".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["pyright".to_string()],
+                        strategy: Some(settings::AggregationStrategy::Preferred),
+                    },
+                )])),
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
+        let python = merged.get("python").unwrap();
+        let agg = python.aggregation.as_ref().unwrap();
+        let diag = &agg["textDocument/diagnostic"];
+
+        // Overlay wins entirely for the shared key
+        assert_eq!(
+            diag.priorities,
+            vec!["pyright".to_string()],
+            "overlay priorities should win"
+        );
+        assert_eq!(
+            diag.strategy,
+            Some(settings::AggregationStrategy::Preferred),
+            "overlay strategy should win atomically"
         );
     }
 }

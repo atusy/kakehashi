@@ -18,6 +18,19 @@ pub enum WorkspaceType {
     Generic,
 }
 
+/// Aggregation strategy for combining results from multiple bridge servers.
+///
+/// - `Preferred`: Use the first non-empty response (priority-ordered).
+///   This is the default for most LSP methods.
+/// - `All`: Collect and merge responses from all servers.
+///   This is the default for `textDocument/diagnostic`.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AggregationStrategy {
+    Preferred,
+    All,
+}
+
 /// Per-method aggregation configuration.
 ///
 /// Controls how results from multiple bridge servers are aggregated for a
@@ -29,6 +42,9 @@ pub(crate) struct AggregationConfig {
     /// Server names in priority order (highest first). Empty = pure first-win behavior.
     #[serde(default)]
     pub(crate) priorities: Vec<String>,
+    /// Aggregation strategy override. `None` = use handler default.
+    #[serde(default)]
+    pub(crate) strategy: Option<AggregationStrategy>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -60,6 +76,23 @@ impl BridgeLanguageConfig {
             .or_else(|| map.get(crate::config::WILDCARD_KEY))
             .map(|c| c.priorities.clone())
             .unwrap_or_default()
+    }
+
+    /// Resolve aggregation strategy for a specific LSP method.
+    ///
+    /// Falls back to wildcard `"_"` key, then `default`.
+    pub(crate) fn resolve_strategy(
+        &self,
+        method: &str,
+        default: AggregationStrategy,
+    ) -> AggregationStrategy {
+        let Some(map) = self.aggregation.as_ref() else {
+            return default;
+        };
+        map.get(method)
+            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .and_then(|c| c.strategy)
+            .unwrap_or(default)
     }
 }
 
@@ -1340,12 +1373,14 @@ kind = "injections""#;
                     "textDocument/completion".to_string(),
                     AggregationConfig {
                         priorities: vec!["server_a".to_string()],
+                        ..Default::default()
                     },
                 ),
                 (
                     WILDCARD_KEY.to_string(),
                     AggregationConfig {
                         priorities: vec!["server_b".to_string()],
+                        ..Default::default()
                     },
                 ),
             ])),
@@ -1364,6 +1399,7 @@ kind = "injections""#;
                 WILDCARD_KEY.to_string(),
                 AggregationConfig {
                     priorities: vec!["server_b".to_string()],
+                    ..Default::default()
                 },
             )])),
         };
@@ -1377,6 +1413,69 @@ kind = "injections""#;
     fn should_resolve_priorities_returns_empty_when_no_aggregation() {
         let config = BridgeLanguageConfig::default();
         assert!(config.resolve_priorities("textDocument/hover").is_empty());
+    }
+
+    #[test]
+    fn should_resolve_strategy_for_specific_method() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/diagnostic".to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::Preferred),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            AggregationStrategy::Preferred,
+        );
+    }
+
+    #[test]
+    fn should_resolve_strategy_falls_back_to_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::All),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_strategy("textDocument/hover", AggregationStrategy::Preferred),
+            AggregationStrategy::All,
+        );
+    }
+
+    #[test]
+    fn should_resolve_strategy_returns_default_when_no_aggregation() {
+        let config = BridgeLanguageConfig::default();
+        assert_eq!(
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            AggregationStrategy::All,
+        );
+    }
+
+    #[test]
+    fn should_resolve_strategy_returns_default_when_strategy_is_none() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/diagnostic".to_string(),
+                AggregationConfig {
+                    priorities: vec!["server_a".to_string()],
+                    strategy: None,
+                },
+            )])),
+        };
+        assert_eq!(
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            AggregationStrategy::All,
+        );
     }
 
     #[test]
@@ -1406,6 +1505,34 @@ kind = "injections""#;
         let config: BridgeLanguageConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.enabled, None);
         assert!(config.aggregation.is_none());
+    }
+
+    #[test]
+    fn should_parse_aggregation_strategy_preferred() {
+        let json = r#"{ "strategy": "preferred" }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));
+    }
+
+    #[test]
+    fn should_parse_aggregation_strategy_all() {
+        let json = r#"{ "strategy": "all" }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.strategy, Some(AggregationStrategy::All));
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_without_strategy() {
+        let json = r#"{}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.strategy, None);
+    }
+
+    #[test]
+    fn should_parse_aggregation_strategy_from_toml() {
+        let toml_str = r#"strategy = "preferred""#;
+        let config: AggregationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));
     }
 
     #[test]

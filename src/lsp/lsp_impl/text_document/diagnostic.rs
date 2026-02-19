@@ -28,10 +28,11 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::{Kakehashi, uri_to_url};
-use crate::config::settings::BridgeServerConfig;
+use crate::config::settings::{AggregationStrategy, BridgeServerConfig};
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::server::FanInResult;
-use crate::lsp::aggregation::server::dispatch_collect_all;
+use crate::lsp::aggregation::server::{
+    FanInResult, FanOutTask, dispatch_collect_all, dispatch_preferred,
+};
 use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
@@ -317,7 +318,7 @@ impl Kakehashi {
         let pool = self.bridge.pool_arc();
 
         // 2-level aggregation:
-        //   Inner: dispatch_collect_all per region (fans out to all servers for that region)
+        //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect_region_results_with_cancel across regions
         let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
 
@@ -328,6 +329,14 @@ impl Kakehashi {
                 continue;
             }
 
+            // Resolve strategy per-region so different injection languages can use
+            // different strategies (e.g., Python=Preferred, Lua=All in the same host).
+            let strategy = self.resolve_aggregation_strategy(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/diagnostic",
+                AggregationStrategy::All,
+            );
             let priorities = self.resolve_aggregation_priorities(
                 &language_name,
                 &resolved.injection_language,
@@ -343,43 +352,19 @@ impl Kakehashi {
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let result = dispatch_collect_all(
-                    &region_ctx,
-                    pool.clone(),
-                    |t| async move {
-                        let rid = t.region_id.clone();
-                        tokio::time::timeout(
-                            DIAGNOSTIC_REQUEST_TIMEOUT,
-                            t.pool.send_diagnostic_request(
-                                &t.server_name,
-                                &t.server_config,
-                                &t.uri,
-                                &t.injection_language,
-                                &t.region_id,
-                                t.region_start_line,
-                                &t.virtual_content,
-                                t.upstream_id,
-                                None, // No previous_result_id
-                            ),
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(std::io::Error::other(format!(
-                                "diagnostic request timed out for region {rid}"
-                            )))
-                        })
-                    },
-                    None, // cancel handled at outer level
-                )
-                .await;
+                let diagnostics = match strategy {
+                    AggregationStrategy::All => {
+                        dispatch_collect_all_diagnostics(&region_ctx, pool.clone()).await
+                    }
+                    AggregationStrategy::Preferred => {
+                        dispatch_preferred_diagnostics(&region_ctx, pool.clone()).await
+                    }
+                };
 
                 // Clean up stale upstream registry entries from inner fan_out
                 pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
 
-                match result {
-                    FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
-                    FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
-                }
+                diagnostics
             });
         }
 
@@ -394,6 +379,72 @@ impl Kakehashi {
         let all_diagnostics = result?;
 
         Ok(make_diagnostic_report(all_diagnostics))
+    }
+}
+
+/// Send a diagnostic request for a single fan-out task with timeout.
+///
+/// Shared by both collect-all and preferred dispatch strategies.
+async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<Diagnostic>> {
+    let rid = t.region_id.clone();
+    tokio::time::timeout(
+        DIAGNOSTIC_REQUEST_TIMEOUT,
+        t.pool.send_diagnostic_request(
+            &t.server_name,
+            &t.server_config,
+            &t.uri,
+            &t.injection_language,
+            &t.region_id,
+            t.region_start_line,
+            &t.virtual_content,
+            t.upstream_id,
+            None, // No previous_result_id
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::other(format!(
+            "diagnostic request timed out for region {rid}"
+        )))
+    })
+}
+
+/// Dispatch diagnostics using the collect-all strategy (merge results from every server).
+async fn dispatch_collect_all_diagnostics(
+    region_ctx: &DocumentRequestContext,
+    pool: Arc<LanguageServerPool>,
+) -> Vec<Diagnostic> {
+    let result = dispatch_collect_all(
+        region_ctx,
+        pool,
+        send_diagnostic_fan_out_request,
+        None, // cancel handled at outer level
+    )
+    .await;
+
+    match result {
+        FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
+    }
+}
+
+/// Dispatch diagnostics using the preferred strategy (first non-empty response wins).
+async fn dispatch_preferred_diagnostics(
+    region_ctx: &DocumentRequestContext,
+    pool: Arc<LanguageServerPool>,
+) -> Vec<Diagnostic> {
+    let result = dispatch_preferred(
+        region_ctx,
+        pool,
+        send_diagnostic_fan_out_request,
+        |v: &Vec<Diagnostic>| !v.is_empty(),
+        None, // cancel handled at outer level
+    )
+    .await;
+
+    match result {
+        FanInResult::Done(diagnostics) => diagnostics,
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
     }
 }
 
