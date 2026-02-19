@@ -25,10 +25,10 @@ pub enum WorkspaceType {
 /// order — the first server in the list that returns a non-empty result wins.
 /// Empty priorities degrades to first-win (arrival-order) behavior.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
-pub struct AggregationConfig {
+pub(crate) struct AggregationConfig {
     /// Server names in priority order (highest first). Empty = pure first-win behavior.
     #[serde(default)]
-    pub priorities: Vec<String>,
+    pub(crate) priorities: Vec<String>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -43,9 +43,9 @@ pub struct AggregationConfig {
 pub struct BridgeLanguageConfig {
     /// Whether bridging is enabled for this language.
     /// `None` = inherit from wildcard (defaults to `true`).
-    pub enabled: Option<bool>,
+    pub(crate) enabled: Option<bool>,
     /// Per-method aggregation config. Key = LSP method name or "_" for default.
-    pub aggregation: Option<HashMap<String, AggregationConfig>>,
+    pub(crate) aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 
 impl BridgeLanguageConfig {
