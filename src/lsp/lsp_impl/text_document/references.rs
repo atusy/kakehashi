@@ -16,7 +16,7 @@ impl Kakehashi {
         let include_declaration = params.context.include_declaration;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "references")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/references")
             .await
         else {
             return Ok(None);

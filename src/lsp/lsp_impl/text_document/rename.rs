@@ -13,7 +13,7 @@ impl Kakehashi {
         let new_name = params.new_name;
 
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "rename")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/rename")
             .await
         else {
             return Ok(None);

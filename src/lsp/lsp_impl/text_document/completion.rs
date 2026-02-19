@@ -16,7 +16,7 @@ impl Kakehashi {
 
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "completion")
+            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/completion")
             .await
         else {
             return Ok(None);
