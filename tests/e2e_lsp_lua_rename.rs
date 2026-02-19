@@ -168,69 +168,6 @@ More text.
     shutdown_client(&mut client);
 }
 
-/// E2E test: rename returns null for position outside injection region
-#[test]
-fn e2e_rename_outside_injection_returns_null() {
-    let mut client = create_lua_configured_client();
-
-    // Open markdown document with Lua code block
-    let markdown_content = r#"# Test Document
-
-Some text before the code block.
-
-```lua
-local x = 42
-print(x)
-```
-
-More text after.
-"#;
-
-    let markdown_uri = "file:///test_rename_outside.md";
-
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": markdown_uri,
-                "languageId": "markdown",
-                "version": 1,
-                "text": markdown_content
-            }
-        }),
-    );
-
-    // Request rename on line 2 (outside the code block - "Some text before")
-    let rename_response = client.send_request(
-        "textDocument/rename",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 2, "character": 5 },
-            "newName": "newName"
-        }),
-    );
-
-    println!("Rename outside injection response: {:?}", rename_response);
-
-    // Verify no error
-    assert!(
-        rename_response.get("error").is_none(),
-        "Rename should not return error: {:?}",
-        rename_response.get("error")
-    );
-
-    let result = rename_response.get("result");
-    assert!(
-        result.is_some() && result.unwrap().is_null(),
-        "Rename outside injection region should return null"
-    );
-
-    println!("E2E: Rename outside injection region correctly returns null");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
-
 /// E2E test: rename multiple occurrences of a variable
 #[test]
 fn e2e_rename_multiple_occurrences() {

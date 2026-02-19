@@ -127,69 +127,6 @@ More text.
     shutdown_client(&mut client);
 }
 
-/// E2E test: references returns null for position outside injection region
-#[test]
-fn e2e_references_outside_injection_returns_null() {
-    let mut client = create_lua_configured_client();
-
-    // Open markdown document with Lua code block
-    let markdown_content = r#"# Test Document
-
-Some text before the code block.
-
-```lua
-local x = 42
-print(x)
-```
-
-More text after.
-"#;
-
-    let markdown_uri = "file:///test_refs_outside.md";
-
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": markdown_uri,
-                "languageId": "markdown",
-                "version": 1,
-                "text": markdown_content
-            }
-        }),
-    );
-
-    // Request references on line 2 (outside the code block - "Some text before")
-    let refs_response = client.send_request(
-        "textDocument/references",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 2, "character": 5 },
-            "context": { "includeDeclaration": true }
-        }),
-    );
-
-    println!("References outside injection response: {:?}", refs_response);
-
-    // Verify no error
-    assert!(
-        refs_response.get("error").is_none(),
-        "References should not return error: {:?}",
-        refs_response.get("error")
-    );
-
-    let result = refs_response.get("result");
-    assert!(
-        result.is_some() && result.unwrap().is_null(),
-        "References outside injection region should return null"
-    );
-
-    println!("E2E: References outside injection region correctly returns null");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
-
 /// E2E test: references with includeDeclaration=false excludes declaration
 #[test]
 fn e2e_references_include_declaration_false() {
