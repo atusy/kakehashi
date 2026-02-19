@@ -65,7 +65,7 @@ where
         let server_name = config.server_name.clone();
         let task = FanOutTask {
             pool: Arc::clone(&pool),
-            server_name: config.server_name.clone(),
+            server_name: server_name.clone(),
             server_config: Arc::clone(&config.config),
             uri: ctx.uri.clone(),
             injection_language: ctx.resolved.injection_language.clone(),
