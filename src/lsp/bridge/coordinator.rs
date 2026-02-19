@@ -688,7 +688,13 @@ mod tests {
         // Create settings with a markdown host that only allows python bridging
         let mut languages = HashMap::new();
         let mut bridge_filter = HashMap::new();
-        bridge_filter.insert("python".to_string(), BridgeLanguageConfig { enabled: true });
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
         languages.insert(
             "markdown".to_string(),
             LanguageSettings::with_bridge(None, None, Some(bridge_filter)),
@@ -813,7 +819,13 @@ mod tests {
         // Create settings with a markdown host that only allows python bridging
         let mut languages = HashMap::new();
         let mut bridge_filter = HashMap::new();
-        bridge_filter.insert("python".to_string(), BridgeLanguageConfig { enabled: true });
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
         languages.insert(
             "markdown".to_string(),
             LanguageSettings::with_bridge(None, None, Some(bridge_filter)),
