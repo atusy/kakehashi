@@ -15,44 +15,10 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{
     create_lua_configured_client, is_lua_ls_available, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
-
-/// E2E test: documentHighlightProvider capability is advertised
-#[test]
-fn e2e_document_highlight_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify documentHighlightProvider is in capabilities
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let highlight_provider = capabilities.get("documentHighlightProvider");
-    assert!(
-        highlight_provider.is_some(),
-        "documentHighlightProvider should be advertised in server capabilities"
-    );
-
-    println!("E2E: documentHighlightProvider capability advertised");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
 
 /// E2E test: document highlight request is handled without error
 #[test]

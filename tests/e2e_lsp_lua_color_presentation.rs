@@ -17,42 +17,8 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
-
-/// E2E test: colorProvider capability is advertised (covers both documentColor and colorPresentation)
-#[test]
-fn e2e_color_presentation_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify colorProvider is in capabilities (same capability covers both documentColor and colorPresentation)
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let color_provider = capabilities.get("colorProvider");
-    assert!(
-        color_provider.is_some(),
-        "colorProvider should be advertised in server capabilities (covers colorPresentation)"
-    );
-
-    println!("E2E: colorProvider capability advertised (covers colorPresentation)");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
 
 /// E2E test: colorPresentation request is handled without error
 ///

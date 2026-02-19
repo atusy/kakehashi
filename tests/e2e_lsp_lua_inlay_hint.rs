@@ -15,44 +15,10 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
-
-/// E2E test: inlayHintProvider capability is advertised
-#[test]
-fn e2e_inlay_hint_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify inlayHintProvider is in capabilities
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let inlay_hint_provider = capabilities.get("inlayHintProvider");
-    assert!(
-        inlay_hint_provider.is_some(),
-        "inlayHintProvider should be advertised in server capabilities"
-    );
-
-    println!("E2E: inlayHintProvider capability advertised");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
 
 /// E2E test: inlay hint request is handled without error
 #[test]

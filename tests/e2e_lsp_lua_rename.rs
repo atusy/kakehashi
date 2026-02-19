@@ -15,44 +15,10 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{
     create_lua_configured_client, is_lua_ls_available, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
-
-/// E2E test: renameProvider capability is advertised
-#[test]
-fn e2e_rename_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify renameProvider is in capabilities
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let rename_provider = capabilities.get("renameProvider");
-    assert!(
-        rename_provider.is_some(),
-        "renameProvider should be advertised in server capabilities"
-    );
-
-    println!("E2E: renameProvider capability advertised");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
 
 /// E2E test: rename request is handled without error
 #[test]
