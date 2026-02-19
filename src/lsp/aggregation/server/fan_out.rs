@@ -31,17 +31,30 @@ pub(crate) struct FanOutTask {
     pub(crate) upstream_id: Option<UpstreamId>,
 }
 
+/// Result tagged with the originating server name.
+///
+/// Enables priority-aware fan-in strategies by preserving which server
+/// produced each result. The `io::Result` is inside the tag so that
+/// `JoinError` (panic) is the only outer error from the JoinSet.
+pub(crate) struct TaggedResult<T> {
+    pub(crate) server_name: String,
+    pub(crate) value: io::Result<T>,
+}
+
 /// Spawn one task per matching server, returning a `JoinSet` for collection.
 ///
 /// Centralises the per-server clone boilerplate that was previously duplicated
 /// in every fan-out handler. The caller supplies a closure that receives a
 /// [`FanOutTask`] and returns the handler-specific future.
+///
+/// Each task result is wrapped in [`TaggedResult`] so fan-in strategies
+/// can identify which server produced each result.
 #[must_use = "the JoinSet must be passed to a collection strategy"]
 pub(crate) fn fan_out<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
-) -> JoinSet<io::Result<T>>
+) -> JoinSet<TaggedResult<T>>
 where
     T: Send + 'static,
     F: Fn(FanOutTask) -> Fut,
@@ -49,6 +62,7 @@ where
 {
     let mut join_set = JoinSet::new();
     for config in &ctx.configs {
+        let server_name = config.server_name.clone();
         let task = FanOutTask {
             pool: Arc::clone(&pool),
             server_name: config.server_name.clone(),
@@ -60,7 +74,13 @@ where
             virtual_content: ctx.resolved.virtual_content.clone(),
             upstream_id: ctx.upstream_request_id.clone(),
         };
-        join_set.spawn(f(task));
+        let fut = f(task);
+        join_set.spawn(async move {
+            TaggedResult {
+                server_name,
+                value: fut.await,
+            }
+        });
     }
     join_set
 }

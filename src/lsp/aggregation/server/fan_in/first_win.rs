@@ -2,10 +2,9 @@
 //!
 //! [`first_win()`] collects a `JoinSet`, returning the first non-empty success.
 
-use std::io;
-
 use tokio::task::JoinSet;
 
+use crate::lsp::aggregation::server::fan_out::TaggedResult;
 use crate::lsp::request_id::CancelReceiver;
 
 /// Result of fan-in dispatch (used by both first-win and collect-all strategies).
@@ -85,7 +84,7 @@ impl<T> FanInResult<T> {
 /// Callers MUST call `pool.unregister_all_for_upstream_id()` after this function returns
 /// to clean up stale entries in the UpstreamRequestRegistry left by aborted losers.
 pub(crate) async fn first_win<T: Send + 'static>(
-    join_set: &mut JoinSet<io::Result<T>>,
+    join_set: &mut JoinSet<TaggedResult<T>>,
     is_nonempty: impl Fn(&T) -> bool,
     cancel_rx: Option<CancelReceiver>,
 ) -> FanInResult<T> {
@@ -99,15 +98,17 @@ pub(crate) async fn first_win<T: Send + 'static>(
                     errors += 1;
                     log::warn!("bridge task panicked: {join_err}");
                 }
-                Ok(Err(io_err)) => {
-                    errors += 1;
-                    log::warn!("bridge request failed: {io_err}");
-                }
-                Ok(Ok(value)) if is_nonempty(&value) => {
-                    join_set.abort_all();
-                    return FanInResult::Done(value);
-                }
-                Ok(Ok(_)) => {} // empty — try next
+                Ok(tagged) => match tagged.value {
+                    Err(io_err) => {
+                        errors += 1;
+                        log::warn!("bridge request failed ({}): {io_err}", tagged.server_name);
+                    }
+                    Ok(value) if is_nonempty(&value) => {
+                        join_set.abort_all();
+                        return FanInResult::Done(value);
+                    }
+                    Ok(_) => {} // empty — try next
+                },
             }
         }
         return FanInResult::NoResult { errors };
@@ -129,15 +130,17 @@ pub(crate) async fn first_win<T: Send + 'static>(
                         errors += 1;
                         log::warn!("bridge task panicked: {join_err}");
                     }
-                    Some(Ok(Err(io_err))) => {
-                        errors += 1;
-                        log::warn!("bridge request failed: {io_err}");
-                    }
-                    Some(Ok(Ok(value))) if is_nonempty(&value) => {
-                        join_set.abort_all();
-                        return FanInResult::Done(value);
-                    }
-                    Some(Ok(Ok(_))) => {} // empty — try next
+                    Some(Ok(tagged)) => match tagged.value {
+                        Err(io_err) => {
+                            errors += 1;
+                            log::warn!("bridge request failed ({}): {io_err}", tagged.server_name);
+                        }
+                        Ok(value) if is_nonempty(&value) => {
+                            join_set.abort_all();
+                            return FanInResult::Done(value);
+                        }
+                        Ok(_) => {} // empty — try next
+                    },
                 }
             }
         }
@@ -146,6 +149,8 @@ pub(crate) async fn first_win<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
 
     fn assert_done<T: std::fmt::Debug>(result: FanInResult<T>) -> T {
@@ -174,12 +179,25 @@ mod tests {
         }
     }
 
+    /// Helper to spawn a TaggedResult task with a default server name.
+    fn spawn_tagged<T: Send + 'static>(
+        join_set: &mut JoinSet<TaggedResult<T>>,
+        value: io::Result<T>,
+    ) {
+        join_set.spawn(async move {
+            TaggedResult {
+                server_name: "test_server".to_string(),
+                value,
+            }
+        });
+    }
+
     #[tokio::test]
     async fn first_win_returns_first_nonempty_result() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
-        join_set.spawn(async { Err(io::Error::other("fail")) });
-        join_set.spawn(async { Ok(None) });
-        join_set.spawn(async { Ok(Some(42)) });
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail")));
+        spawn_tagged(&mut join_set, Ok(None));
+        spawn_tagged(&mut join_set, Ok(Some(42)));
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
@@ -188,10 +206,10 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_returns_no_result_when_all_fail() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
-        join_set.spawn(async { Err(io::Error::other("fail 1")) });
-        join_set.spawn(async { Err(io::Error::other("fail 2")) });
-        join_set.spawn(async { Err(io::Error::other("fail 3")) });
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail 1")));
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail 3")));
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
@@ -204,10 +222,10 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_returns_no_result_when_all_empty() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
-        join_set.spawn(async { Ok(None) });
-        join_set.spawn(async { Ok(None) });
-        join_set.spawn(async { Ok(None) });
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Ok(None));
+        spawn_tagged(&mut join_set, Ok(None));
+        spawn_tagged(&mut join_set, Ok(None));
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
@@ -216,10 +234,10 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_skips_errors_and_returns_later_success() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
-        join_set.spawn(async { Err(io::Error::other("fail 1")) });
-        join_set.spawn(async { Err(io::Error::other("fail 2")) });
-        join_set.spawn(async { Ok(Some(42)) });
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail 1")));
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
+        spawn_tagged(&mut join_set, Ok(Some(42)));
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
@@ -228,9 +246,9 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_uses_is_nonempty_predicate() {
-        let mut join_set: JoinSet<io::Result<Option<Vec<i32>>>> = JoinSet::new();
-        join_set.spawn(async { Ok(Some(vec![])) });
-        join_set.spawn(async { Ok(Some(vec![1])) });
+        let mut join_set: JoinSet<TaggedResult<Option<Vec<i32>>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Ok(Some(vec![])));
+        spawn_tagged(&mut join_set, Ok(Some(vec![1])));
 
         let result = first_win(
             &mut join_set,
@@ -245,10 +263,13 @@ mod tests {
     #[tokio::test]
     async fn first_win_returns_cancelled_on_cancel() {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         join_set.spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            Ok(Some(42))
+            TaggedResult {
+                server_name: "slow".to_string(),
+                value: Ok(Some(42)),
+            }
         });
 
         tx.send(()).unwrap();
@@ -261,8 +282,8 @@ mod tests {
     #[tokio::test]
     async fn first_win_returns_winner_before_cancel() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
-        join_set.spawn(async { Ok(Some(42)) });
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Ok(Some(42)));
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
 
@@ -272,8 +293,8 @@ mod tests {
     #[tokio::test]
     async fn first_win_returns_no_result_with_unused_cancel() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
-        join_set.spawn(async { Err(io::Error::other("fail")) });
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged(&mut join_set, Err(io::Error::other("fail")));
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
 
@@ -282,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_returns_no_result_when_all_tasks_panic() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         join_set.spawn(async { panic!("task 1 panicked") });
         join_set.spawn(async { panic!("task 2 panicked") });
 
@@ -297,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_returns_no_result_for_empty_join_set() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
 
@@ -311,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn first_win_returns_no_result_for_empty_join_set_with_cancel() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), Some(rx)).await;
 
@@ -324,9 +345,9 @@ mod tests {
 
     #[tokio::test]
     async fn first_win_returns_winner_despite_panics() {
-        let mut join_set: JoinSet<io::Result<Option<i32>>> = JoinSet::new();
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         join_set.spawn(async { panic!("task 1 panicked") });
-        join_set.spawn(async { Ok(Some(42)) });
+        spawn_tagged(&mut join_set, Ok(Some(42)));
         join_set.spawn(async { panic!("task 3 panicked") });
 
         let result = first_win(&mut join_set, |opt| opt.is_some(), None).await;
