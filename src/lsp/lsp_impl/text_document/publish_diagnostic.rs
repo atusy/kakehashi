@@ -187,7 +187,7 @@ pub(crate) async fn collect_push_diagnostics(
     if region_contexts.is_empty() {
         log::debug!(
             target: log_target,
-            "No bridge configs for any injection regions in {}",
+            "No injection regions or bridge configs found in {}",
             uri
         );
         // Return empty to signal caller should clear diagnostics
