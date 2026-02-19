@@ -317,17 +317,6 @@ impl Kakehashi {
 
         let pool = self.bridge.pool_arc();
 
-        // Resolve strategy once — all regions share the same host language config.
-        // Default is All (collect from every server), preserving existing behavior.
-        let strategy = self.resolve_aggregation_strategy(
-            &language_name,
-            // Use first region's injection language for strategy resolution.
-            // In practice, diagnostic regions from the same host share config.
-            &all_regions[0].injection_language,
-            "textDocument/diagnostic",
-            AggregationStrategy::All,
-        );
-
         // 2-level aggregation:
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect_region_results_with_cancel across regions
@@ -340,6 +329,14 @@ impl Kakehashi {
                 continue;
             }
 
+            // Resolve strategy per-region so different injection languages can use
+            // different strategies (e.g., Python=Preferred, Lua=All in the same host).
+            let strategy = self.resolve_aggregation_strategy(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/diagnostic",
+                AggregationStrategy::All,
+            );
             let priorities = self.resolve_aggregation_priorities(
                 &language_name,
                 &resolved.injection_language,
