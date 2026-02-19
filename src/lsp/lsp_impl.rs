@@ -54,6 +54,10 @@ use tokio::sync::Mutex;
 use super::text_sync::apply_content_changes_with_edits;
 
 use super::auto_install::{AutoInstallManager, InstallEvent, InstallingLanguages};
+
+/// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
+/// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
+const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
@@ -357,6 +361,88 @@ impl Kakehashi {
             .await;
     }
 
+    /// Shared parsing orchestration: acquire parser from pool, run parse logic in
+    /// `spawn_blocking` with timeout, release parser back to pool.
+    ///
+    /// The caller provides the actual parse logic via `parse_fn`, which receives a
+    /// `tree_sitter::Parser` and must return it along with an optional result.
+    /// On normal completion, this ensures the parser is returned to the pool.
+    /// The parser is not returned if the blocking task times out (it keeps
+    /// running) or if the task fails or is cancelled and yields a `JoinError`.
+    ///
+    /// Returns `None` if:
+    /// - No parser is available for the language
+    /// - The parse task panicked or was cancelled (JoinError; parser not returned)
+    /// - The parse timed out after `PARSE_TIMEOUT` (parser not returned)
+    /// - The closure returned `None`
+    async fn parse_with_pool<T, F>(
+        &self,
+        language_name: &str,
+        uri: &Url,
+        text_len: usize,
+        parse_fn: F,
+    ) -> Option<T>
+    where
+        F: FnOnce(tree_sitter::Parser) -> (tree_sitter::Parser, Option<T>) + Send + 'static,
+        T: Send + 'static,
+    {
+        // Checkout parser from pool (brief lock)
+        let parser = {
+            let mut pool = self.parser_pool.lock().await;
+            pool.acquire(language_name)
+        };
+
+        let parser = parser?;
+
+        // Parse in spawn_blocking with timeout to avoid blocking tokio worker thread
+        // and prevent infinite hangs on pathological input
+        let result = tokio::time::timeout(
+            PARSE_TIMEOUT,
+            tokio::task::spawn_blocking(move || parse_fn(parser)),
+        )
+        .await;
+
+        // Handle timeout vs successful completion
+        match result {
+            Ok(Ok((parser, value))) => {
+                // Return parser to pool (brief lock)
+                let mut pool = self.parser_pool.lock().await;
+                pool.release(language_name.to_string(), parser);
+                value
+            }
+            Ok(Err(join_error)) => {
+                if join_error.is_panic() {
+                    log::error!(
+                        "Parse task panicked for language '{}' on document {}: {}",
+                        language_name,
+                        uri,
+                        join_error
+                    );
+                } else {
+                    log::warn!(
+                        "Parse task was cancelled for language '{}' on document {}: {}",
+                        language_name,
+                        uri,
+                        join_error
+                    );
+                }
+                // Parser is lost in the task (panicked or cancelled)
+                None
+            }
+            Err(_timeout) => {
+                log::warn!(
+                    "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",
+                    PARSE_TIMEOUT,
+                    language_name,
+                    uri,
+                    text_len
+                );
+                // Parser is lost in the still-running blocking task
+                None
+            }
+        }
+    }
+
     async fn parse_document(
         &self,
         uri: Url,
@@ -394,94 +480,41 @@ impl Kakehashi {
             let load_result = self.language.ensure_language_loaded(&language_name);
             events.extend(load_result.events.clone());
 
-            // Parse the document with crash detection
-            // Narrow critical section: checkout parser → release lock → parse in spawn_blocking → return parser
-            let parsed_tree = {
-                // Checkout parser from pool (brief lock)
-                let parser = {
-                    let mut pool = self.parser_pool.lock().await;
-                    pool.acquire(&language_name)
-                };
-
-                if let Some(mut parser) = parser {
-                    // Get old tree for incremental parsing
-                    // For edits: get edited tree (after tree.edit() applied)
-                    // For full parse: get current tree as-is
-                    let (old_tree, edited_old_tree_for_store) = if !edits.is_empty() {
-                        let edited = self.documents.get_edited_tree(&uri, &edits);
-                        // Clone for storage - we need to keep the edited tree for changed_ranges()
-                        let for_store = edited.clone();
-                        (edited, for_store)
-                    } else {
-                        let tree = self.documents.get(&uri).and_then(|doc| doc.tree().cloned());
-                        (tree, None)
-                    };
-
-                    let language_name_clone = language_name.clone();
-                    let text_clone = text.clone();
-                    let auto_install = self.auto_install.clone();
-
-                    // Parse in spawn_blocking with timeout to avoid blocking tokio worker thread
-                    // and prevent infinite hangs on pathological input
-                    const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-                    let result = tokio::time::timeout(
-                        PARSE_TIMEOUT,
-                        tokio::task::spawn_blocking(move || {
-                            // Record that we're about to parse (for crash detection)
-                            let _ = auto_install.begin_parsing(&language_name_clone);
-
-                            let parse_result = parser.parse(&text_clone, old_tree.as_ref());
-
-                            // Parsing succeeded without crash - clear the state for this language
-                            let _ = auto_install.end_parsing(&language_name_clone);
-
-                            (parser, parse_result)
-                        }),
-                    )
-                    .await;
-
-                    // Handle timeout vs successful completion
-                    let result = match result {
-                        Ok(join_result) => match join_result {
-                            Ok(result) => Some(result),
-                            Err(e) => {
-                                log::error!(
-                                    "Parse task panicked for language '{}' on document {}: {}",
-                                    language_name,
-                                    uri,
-                                    e
-                                );
-                                None
-                            }
-                        },
-                        Err(_timeout) => {
-                            log::warn!(
-                                "Parse timeout after {:?} for language '{}' on document {} ({} bytes)",
-                                PARSE_TIMEOUT,
-                                language_name,
-                                uri,
-                                text.len()
-                            );
-                            // Parser is lost in the still-running blocking task - cannot recover it
-                            // The parser pool will create a new parser on next acquire
-                            None
-                        }
-                    };
-
-                    if let Some((parser, parse_result)) = result {
-                        // Return parser to pool (brief lock)
-                        let mut pool = self.parser_pool.lock().await;
-                        pool.release(language_name.clone(), parser);
-                        // Return both parse result and edited tree for proper changed_ranges support
-                        parse_result.map(|tree| (tree, edited_old_tree_for_store))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+            // Parse the document with crash detection via parse_with_pool
+            // Get old tree for incremental parsing before entering the closure
+            // For edits: get edited tree (after tree.edit() applied)
+            // For full parse: get current tree as-is
+            let (old_tree, edited_old_tree_for_store) = if !edits.is_empty() {
+                let edited = self.documents.get_edited_tree(&uri, &edits);
+                // Clone for storage - we need to keep the edited tree for changed_ranges()
+                let for_store = edited.clone();
+                (edited, for_store)
+            } else {
+                let tree = self.documents.get(&uri).and_then(|doc| doc.tree().cloned());
+                (tree, None)
             };
+
+            let text_clone = text.clone();
+            let auto_install = self.auto_install.clone();
+            let language_name_clone = language_name.clone();
+
+            let parsed_tree = self
+                .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
+                    // Record that we're about to parse (for crash detection)
+                    let _ = auto_install.begin_parsing(&language_name_clone);
+
+                    let parse_result = parser.parse(&text_clone, old_tree.as_ref());
+
+                    // Parsing succeeded without crash - clear the state for this language
+                    let _ = auto_install.end_parsing(&language_name_clone);
+
+                    // Return both parse result and edited tree for proper changed_ranges support
+                    (
+                        parser,
+                        parse_result.map(|tree| (tree, edited_old_tree_for_store)),
+                    )
+                })
+                .await;
 
             // Store the parsed document
             if let Some((tree, edited_old_tree)) = parsed_tree {
@@ -526,8 +559,35 @@ impl Kakehashi {
         self.handle_language_events(&events).await;
     }
 
+    /// Get the language for a document using the full detection chain.
+    ///
+    /// Uses LanguageCoordinator::detect_language() which implements
+    /// the fallback chain (ADR-0005): languageId → heuristics
+    /// (token, path-derived token, first-line content) with alias
+    /// resolution at each step.
+    ///
+    /// This ensures aliases are resolved (e.g., "rmd" → "markdown") even when
+    /// the document is accessed before didOpen fully completes (race condition).
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
-        crate::document::get_language_for_document(uri, &self.language, &self.documents)
+        let path = uri.path();
+
+        // Get the document's language_id and content if available
+        let (language_id, content) = self
+            .documents
+            .get(uri)
+            .map(|doc| {
+                (
+                    doc.language_id().map(|s| s.to_string()),
+                    doc.text().to_string(),
+                )
+            })
+            .unwrap_or((None, String::new()));
+
+        // ADR-0005: Unified detection chain with alias resolution at each step
+        // Priority: languageId → heuristics (first-line, filename) → extension
+        // Host document: token=None (no code fence identifier)
+        self.language
+            .detect_language(path, &content, None, language_id.as_deref())
     }
 
     /// Get all bridge server configs for a given injection language from settings.
