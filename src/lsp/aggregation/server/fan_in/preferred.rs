@@ -272,6 +272,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preferred_handles_cancel_with_non_empty_priorities() {
+        // Cancel arrives while waiting for a higher-priority server to respond.
+        // The cancel path should win regardless of pending priority state.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        join_set.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            TaggedResult {
+                server_name: "server_a".to_string(),
+                value: Ok(Some(1)),
+            }
+        });
+        join_set.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            TaggedResult {
+                server_name: "server_b".to_string(),
+                value: Ok(Some(2)),
+            }
+        });
+
+        tx.send(()).unwrap();
+
+        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, Some(rx)).await;
+
+        assert_cancelled(result);
+    }
+
+    #[tokio::test]
     async fn preferred_returns_no_result_when_all_fail() {
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_a", Err(io::Error::other("fail a")));
