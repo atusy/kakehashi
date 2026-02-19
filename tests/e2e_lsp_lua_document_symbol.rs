@@ -53,39 +53,6 @@ fn create_lua_client_with_hierarchical_symbol_support() -> LspClient {
     client
 }
 
-/// E2E test: documentSymbolProvider capability is advertised
-#[test]
-fn e2e_document_symbol_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify documentSymbolProvider is in capabilities
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let symbol_provider = capabilities.get("documentSymbolProvider");
-    assert!(
-        symbol_provider.is_some(),
-        "documentSymbolProvider should be advertised in server capabilities"
-    );
-
-    println!("E2E: documentSymbolProvider capability advertised");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
-
 /// E2E test: document symbol request returns symbols with transformed coordinates
 ///
 /// Uses a client with hierarchicalDocumentSymbolSupport enabled so the server

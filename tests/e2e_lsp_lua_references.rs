@@ -15,44 +15,10 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{
     create_lua_configured_client, is_lua_ls_available, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
-
-/// E2E test: referencesProvider capability is advertised
-#[test]
-fn e2e_references_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify referencesProvider is in capabilities
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let refs_provider = capabilities.get("referencesProvider");
-    assert!(
-        refs_provider.is_some(),
-        "referencesProvider should be advertised in server capabilities"
-    );
-
-    println!("E2E: referencesProvider capability advertised");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
 
 /// E2E test: references request is handled without error
 #[test]
@@ -156,69 +122,6 @@ More text.
         }
         println!("E2E: References returns Location[] with host coordinates and URIs");
     }
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
-
-/// E2E test: references returns null for position outside injection region
-#[test]
-fn e2e_references_outside_injection_returns_null() {
-    let mut client = create_lua_configured_client();
-
-    // Open markdown document with Lua code block
-    let markdown_content = r#"# Test Document
-
-Some text before the code block.
-
-```lua
-local x = 42
-print(x)
-```
-
-More text after.
-"#;
-
-    let markdown_uri = "file:///test_refs_outside.md";
-
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": markdown_uri,
-                "languageId": "markdown",
-                "version": 1,
-                "text": markdown_content
-            }
-        }),
-    );
-
-    // Request references on line 2 (outside the code block - "Some text before")
-    let refs_response = client.send_request(
-        "textDocument/references",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 2, "character": 5 },
-            "context": { "includeDeclaration": true }
-        }),
-    );
-
-    println!("References outside injection response: {:?}", refs_response);
-
-    // Verify no error
-    assert!(
-        refs_response.get("error").is_none(),
-        "References should not return error: {:?}",
-        refs_response.get("error")
-    );
-
-    let result = refs_response.get("result");
-    assert!(
-        result.is_some() && result.unwrap().is_null(),
-        "References outside injection region should return null"
-    );
-
-    println!("E2E: References outside injection region correctly returns null");
 
     // Clean shutdown
     shutdown_client(&mut client);

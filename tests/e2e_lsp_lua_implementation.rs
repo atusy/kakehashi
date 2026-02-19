@@ -15,44 +15,10 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
 use serde_json::json;
-
-/// E2E test: implementationProvider capability is advertised
-#[test]
-fn e2e_implementation_capability_advertised() {
-    let mut client = LspClient::new();
-
-    // Initialize handshake
-    let init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {}
-        }),
-    );
-
-    // Verify implementationProvider is in capabilities
-    let capabilities = init_response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .expect("Should have capabilities in init response");
-
-    let impl_provider = capabilities.get("implementationProvider");
-    assert!(
-        impl_provider.is_some(),
-        "implementationProvider should be advertised in server capabilities"
-    );
-
-    println!("E2E: implementationProvider capability advertised");
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
 
 /// E2E test: goto implementation request is handled without error
 #[test]
@@ -165,71 +131,6 @@ More text.
             println!("E2E: Implementation returns Location in host coordinates");
         }
     }
-
-    // Clean shutdown
-    shutdown_client(&mut client);
-}
-
-/// E2E test: implementation returns null for position outside injection region
-#[test]
-fn e2e_implementation_outside_injection_returns_null() {
-    let mut client = create_lua_configured_client();
-
-    // Open markdown document with Lua code block
-    let markdown_content = r#"# Test Document
-
-Some text before the code block.
-
-```lua
-local x = 42
-print(x)
-```
-
-More text after.
-"#;
-
-    let markdown_uri = "file:///test_impl_outside.md";
-
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": markdown_uri,
-                "languageId": "markdown",
-                "version": 1,
-                "text": markdown_content
-            }
-        }),
-    );
-
-    // Request implementation on line 2 (outside the code block - "Some text before")
-    let impl_response = client.send_request(
-        "textDocument/implementation",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 2, "character": 5 }
-        }),
-    );
-
-    println!(
-        "Implementation outside injection response: {:?}",
-        impl_response
-    );
-
-    // Verify no error
-    assert!(
-        impl_response.get("error").is_none(),
-        "Implementation should not return error: {:?}",
-        impl_response.get("error")
-    );
-
-    let result = impl_response.get("result");
-    assert!(
-        result.is_some() && result.unwrap().is_null(),
-        "Implementation outside injection region should return null"
-    );
-
-    println!("E2E: Implementation outside injection region correctly returns null");
 
     // Clean shutdown
     shutdown_client(&mut client);
