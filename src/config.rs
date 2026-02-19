@@ -55,18 +55,31 @@ fn merge_bridge_language_configs(
 }
 
 /// Deep merge two optional bridge HashMaps.
-/// Specific values override wildcard values for the same key.
+///
+/// When both base and overlay exist:
+/// - If overlay is empty (`Some({})`), it completely replaces base (empty-means-clear).
+///   This preserves the "empty map = disable all bridging" contract.
+/// - Otherwise, per-key entries are merged at the field level using
+///   [`merge_bridge_language_configs`].
 fn merge_bridge_maps(
-    wildcard: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
-    specific: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
+    base: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
+    overlay: &Option<HashMap<String, settings::BridgeLanguageConfig>>,
 ) -> Option<HashMap<String, settings::BridgeLanguageConfig>> {
-    match (wildcard, specific) {
+    match (base, overlay) {
         (None, None) => None,
-        (Some(wb), None) => Some(wb.clone()),
-        (None, Some(sb)) => Some(sb.clone()),
-        (Some(wb), Some(sb)) => {
-            let mut merged = wb.clone();
-            merged.extend(sb.clone());
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(_), Some(o)) if o.is_empty() => Some(HashMap::new()), // empty-means-clear
+        (Some(b), Some(o)) => {
+            let mut merged = b.clone();
+            for (key, overlay_config) in o {
+                merged
+                    .entry(key.clone())
+                    .and_modify(|base_config| {
+                        *base_config = merge_bridge_language_configs(base_config, overlay_config);
+                    })
+                    .or_insert_with(|| overlay_config.clone());
+            }
             Some(merged)
         }
     }
@@ -2995,6 +3008,132 @@ mod tests {
         assert_eq!(
             resolved.enabled, None,
             "enabled should be None when inherited wildcard has None"
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_deep_merges_aggregation() {
+        // Wildcard bridge has python with aggregation defaults
+        // Specific bridge has python with enabled override but no aggregation
+        // After merge, python should have both enabled override AND inherited aggregation
+        let mut wildcard_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        wildcard_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "_".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["pyright".to_string()],
+                    },
+                )])),
+            },
+        );
+
+        let mut specific_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        specific_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(false),
+                aggregation: None, // no aggregation override
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(wildcard_map), &Some(specific_map)).unwrap();
+        let python = merged.get("python").unwrap();
+        assert_eq!(
+            python.enabled,
+            Some(false),
+            "specific enabled should override"
+        );
+        assert!(
+            python.aggregation.is_some(),
+            "aggregation should be inherited from wildcard"
+        );
+        assert_eq!(
+            python.aggregation.as_ref().unwrap()["_"].priorities,
+            vec!["pyright".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_empty_overlay_clears_base() {
+        // Empty overlay map means "disable all bridging" — should not inherit from base
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let empty_overlay: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(empty_overlay)).unwrap();
+        assert!(merged.is_empty(), "empty overlay should clear base");
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_overlay_aggregation_wins_on_shared_keys() {
+        // Both base and overlay define aggregation for the same method key.
+        // Overlay should win for shared keys; base-only keys are preserved.
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([
+                    (
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["base_default".to_string()],
+                        },
+                    ),
+                    (
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["base_hover".to_string()],
+                        },
+                    ),
+                ])),
+            },
+        );
+
+        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        overlay_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["overlay_hover".to_string()],
+                    },
+                )])),
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
+        let python = merged.get("python").unwrap();
+
+        // enabled: overlay has None, so base's Some(true) wins
+        assert_eq!(python.enabled, Some(true));
+
+        let agg = python.aggregation.as_ref().unwrap();
+
+        // Shared key "textDocument/hover": overlay wins
+        assert_eq!(
+            agg["textDocument/hover"].priorities,
+            vec!["overlay_hover".to_string()],
+            "overlay should win for shared aggregation keys"
+        );
+
+        // Base-only key "_": preserved from base
+        assert_eq!(
+            agg["_"].priorities,
+            vec!["base_default".to_string()],
+            "base-only aggregation keys should be preserved"
         );
     }
 }
