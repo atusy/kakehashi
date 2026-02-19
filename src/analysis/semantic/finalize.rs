@@ -15,8 +15,8 @@ use super::legend::map_capture_to_token_type_and_modifiers;
 use super::token_collector::{InjectionRegion, RawToken};
 
 /// Priority key for token comparison. Higher values win.
-fn token_priority(t: &RawToken) -> (usize, usize, usize) {
-    (t.depth, t.node_depth, t.pattern_index)
+fn token_priority(t: &RawToken) -> (usize, usize) {
+    (t.depth, t.pattern_index)
 }
 
 /// Compute the UTF-16 width of a string.
@@ -65,7 +65,6 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
                 mapped_name: token.mapped_name.clone(),
                 depth: token.depth,
                 pattern_index: token.pattern_index,
-                node_depth: token.node_depth,
             });
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
@@ -81,7 +80,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
 ///
 /// For each line, collects breakpoints (start/end columns of all tokens),
 /// then for each interval picks the highest-priority token as the winner.
-/// Priority is determined by `(depth DESC, node_depth DESC, pattern_index DESC)`.
+/// Priority is determined by `(depth DESC, pattern_index DESC)`.
 ///
 /// This replaces the previous dedup-at-same-position approach, producing
 /// non-overlapping fragments that preserve both parent and child semantics.
@@ -139,7 +138,6 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                     mapped_name: winner.mapped_name.clone(),
                     depth: winner.depth,
                     pattern_index: winner.pattern_index,
-                    node_depth: winner.node_depth,
                 });
             }
         }
@@ -167,7 +165,6 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
             && tokens[write].column + tokens[write].length == tokens[read].column
             && tokens[write].mapped_name == tokens[read].mapped_name
             && tokens[write].depth == tokens[read].depth
-            && tokens[write].node_depth == tokens[read].node_depth
             && tokens[write].pattern_index == tokens[read].pattern_index;
 
         if can_merge {
@@ -286,19 +283,6 @@ mod tests {
         depth: usize,
         pattern_index: usize,
     ) -> RawToken {
-        make_token_with_node_depth(line, column, length, name, depth, pattern_index, 0)
-    }
-
-    /// Helper to create a RawToken with explicit node_depth for testing
-    fn make_token_with_node_depth(
-        line: usize,
-        column: usize,
-        length: usize,
-        name: &str,
-        depth: usize,
-        pattern_index: usize,
-        node_depth: usize,
-    ) -> RawToken {
         RawToken {
             line,
             column,
@@ -306,7 +290,6 @@ mod tests {
             mapped_name: name.to_string(),
             depth,
             pattern_index,
-            node_depth,
         }
     }
 
@@ -449,11 +432,11 @@ mod tests {
 
     #[test]
     fn split_full_containment_parent_splits_into_two() {
-        // Parent [0,10) at node_depth=1, child [3,7) at node_depth=2.
-        // Parent should split into [0,3) and [7,10).
+        // Parent [0,10) at pattern_index=0, child [3,7) at pattern_index=1.
+        // Child's later pattern_index wins; parent should split into [0,3) and [7,10).
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 10, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 3, 4, "variable", 0, 0, 2),
+            make_token(0, 0, 10, "keyword", 0, 0),
+            make_token(0, 3, 4, "variable", 0, 1),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -468,13 +451,13 @@ mod tests {
 
     #[test]
     fn split_multiple_children_three_fragments() {
-        // Parent [0,15) at node_depth=1.
-        // Child A [2,5) at node_depth=2, Child B [8,12) at node_depth=2.
+        // Parent [0,15) at pattern_index=0.
+        // Child A [2,5) at pattern_index=1, Child B [8,12) at pattern_index=1.
         // Expected: parent [0,2), child A [2,5), parent [5,8), child B [8,12), parent [12,15).
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 15, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 2, 3, "variable", 0, 0, 2),
-            make_token_with_node_depth(0, 8, 4, "string", 0, 0, 2),
+            make_token(0, 0, 15, "keyword", 0, 0),
+            make_token(0, 2, 3, "variable", 0, 1),
+            make_token(0, 8, 4, "string", 0, 1),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -491,13 +474,13 @@ mod tests {
 
     #[test]
     fn split_adjacent_children_no_gap() {
-        // Parent [0,10) at node_depth=1.
-        // Child A [0,5) and Child B [5,10) at node_depth=2 — no gap.
+        // Parent [0,10) at pattern_index=0.
+        // Child A [0,5) and Child B [5,10) at pattern_index=1 — no gap.
         // Parent should produce no fragments (entirely covered by children).
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 10, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 0, 5, "variable", 0, 0, 2),
-            make_token_with_node_depth(0, 5, 5, "string", 0, 0, 2),
+            make_token(0, 0, 10, "keyword", 0, 0),
+            make_token(0, 0, 5, "variable", 0, 1),
+            make_token(0, 5, 5, "string", 0, 1),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -508,11 +491,11 @@ mod tests {
 
     #[test]
     fn split_same_position_same_depth_latest_pattern_wins() {
-        // Two tokens at same position, same depth, same node_depth.
+        // Two tokens at the same position and depth.
         // Higher pattern_index wins — no split needed.
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 5, "variable", 0, 0, 1),
-            make_token_with_node_depth(0, 0, 5, "type.builtin", 0, 10, 1),
+            make_token(0, 0, 5, "variable", 0, 0),
+            make_token(0, 0, 5, "type.builtin", 0, 10),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(fragments, vec![(0, 5, "type.builtin".to_string())]);
@@ -523,8 +506,8 @@ mod tests {
         // Two tokens at same position, different injection depth.
         // Higher injection depth wins.
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 5, "string", 0, 0, 1),
-            make_token_with_node_depth(0, 0, 5, "keyword", 1, 0, 1),
+            make_token(0, 0, 5, "string", 0, 0),
+            make_token(0, 0, 5, "keyword", 1, 0),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(fragments, vec![(0, 5, "keyword".to_string())]);
@@ -532,12 +515,12 @@ mod tests {
 
     #[test]
     fn split_three_level_nesting() {
-        // heading [0,20) nd=1, bold [5,15) nd=2, italic [8,12) nd=3.
+        // heading [0,20) pi=0, bold [5,15) pi=1, italic [8,12) pi=2.
         // Expected: heading [0,5), bold [5,8), italic [8,12), bold [12,15), heading [15,20).
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 20, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 5, 10, "variable", 0, 0, 2),
-            make_token_with_node_depth(0, 8, 4, "string", 0, 0, 3),
+            make_token(0, 0, 20, "keyword", 0, 0),
+            make_token(0, 5, 10, "variable", 0, 1),
+            make_token(0, 8, 4, "string", 0, 2),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -554,11 +537,11 @@ mod tests {
 
     #[test]
     fn split_zero_length_fragment_filtered() {
-        // Parent [0,5) at node_depth=1, child [0,5) at node_depth=2.
+        // Parent [0,5) at pattern_index=0, child [0,5) at pattern_index=1.
         // Parent is entirely covered → produces zero-length fragments → filtered.
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 5, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 0, 5, "variable", 0, 0, 2),
+            make_token(0, 0, 5, "keyword", 0, 0),
+            make_token(0, 0, 5, "variable", 0, 1),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(fragments, vec![(0, 5, "variable".to_string())]);
@@ -566,11 +549,11 @@ mod tests {
 
     #[test]
     fn split_partial_overlap_without_containment() {
-        // Token A [0,10) at nd=1, Token B [5,15) at nd=2.
+        // Token A [0,10) at pattern_index=0, Token B [5,15) at pattern_index=1.
         // Expected: A [0,5), B [5,15).
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 10, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 5, 10, "variable", 0, 0, 2),
+            make_token(0, 0, 10, "keyword", 0, 0),
+            make_token(0, 5, 10, "variable", 0, 1),
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -584,13 +567,13 @@ mod tests {
 
     #[test]
     fn split_across_multiple_lines() {
-        // Line 0: parent [0,10) nd=1, child [3,7) nd=2.
-        // Line 1: single token [2,5) nd=1.
+        // Line 0: parent [0,10) pi=0, child [3,7) pi=1.
+        // Line 1: single token [2,5) pi=0.
         // Each line processed independently.
         let tokens = vec![
-            make_token_with_node_depth(0, 0, 10, "keyword", 0, 0, 1),
-            make_token_with_node_depth(0, 3, 4, "variable", 0, 0, 2),
-            make_token_with_node_depth(1, 2, 3, "string", 0, 0, 1),
+            make_token(0, 0, 10, "keyword", 0, 0),
+            make_token(0, 3, 4, "variable", 0, 1),
+            make_token(1, 2, 3, "string", 0, 0),
         ];
         let result = split_overlapping_tokens(tokens);
         let line0: Vec<_> = result
@@ -612,6 +595,20 @@ mod tests {
             ]
         );
         assert_eq!(line1, vec![(2, 3, "string".to_string())]);
+    }
+
+    #[test]
+    fn split_higher_pattern_index_beats_deeper_node() {
+        // Simulates Rust `///` doc comments: the anonymous `"/"` node is deeper
+        // in the AST (node_depth=3) than `line_comment` (node_depth=1), but
+        // `@comment` appears later in the query file (pattern_index=10 > 5).
+        // Neovim uses pattern_index to resolve this; node_depth should NOT override it.
+        let tokens = vec![
+            make_token(0, 0, 3, "operator", 0, 5), // earlier pattern
+            make_token(0, 0, 3, "comment", 0, 10), // later pattern — wins
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(fragments, vec![(0, 3, "comment".to_string())]);
     }
 
     // ── injection region exclusion tests ──────────────────────────────
@@ -670,7 +667,7 @@ mod tests {
         assert!(result.is_some());
     }
 
-    // At same position, the sweep line picks the winner by priority (depth DESC, node_depth DESC, pattern_index DESC).
+    // At same position, the sweep line picks the winner by priority (depth DESC, pattern_index DESC).
     #[rstest]
     #[case::deeper_injection_wins(
         ("string", 0, 0), ("keyword", 1, 0), "keyword"
@@ -787,16 +784,15 @@ mod tests {
 
     #[test]
     fn split_multiline_preserves_metadata() {
-        // Verify that split fragments retain depth, pattern_index, node_depth, mapped_name.
+        // Verify that split fragments retain depth, pattern_index, and mapped_name.
         let lines = &["ab", "cd"];
-        let tokens = vec![make_token_with_node_depth(0, 0, 5, "string", 1, 42, 3)];
+        let tokens = vec![make_token(0, 0, 5, "string", 1, 42)];
         let result = split_multiline_tokens(tokens, lines);
         assert_eq!(result.len(), 2);
         for frag in &result {
             assert_eq!(frag.mapped_name, "string");
             assert_eq!(frag.depth, 1);
             assert_eq!(frag.pattern_index, 42);
-            assert_eq!(frag.node_depth, 3);
         }
         assert_eq!(
             (result[0].line, result[0].column, result[0].length),
