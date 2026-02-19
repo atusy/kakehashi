@@ -276,21 +276,16 @@ impl Kakehashi {
         default: crate::config::settings::AggregationStrategy,
     ) -> crate::config::settings::AggregationStrategy {
         let settings = self.settings_manager.load_settings();
-        let Some(lang_settings) = crate::config::resolve_language_settings_with_wildcard(
-            &settings.languages,
-            host_language,
-        ) else {
-            return default;
-        };
-        let Some(bridge_map) = lang_settings.bridge.as_ref() else {
-            return default;
-        };
-        let Some(bridge_config) =
-            crate::config::resolve_bridge_language_with_wildcard(bridge_map, injection_language)
-        else {
-            return default;
-        };
-        bridge_config.resolve_strategy(method_name, default)
+        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
+            .and_then(|lang_settings| lang_settings.bridge)
+            .and_then(|bridge_map| {
+                crate::config::resolve_bridge_language_with_wildcard(
+                    &bridge_map,
+                    injection_language,
+                )
+            })
+            .map(|bridge_config| bridge_config.resolve_strategy(method_name, default))
+            .unwrap_or(default)
     }
 
     /// Resolve aggregation priorities for a given host language, injection language,
@@ -307,21 +302,16 @@ impl Kakehashi {
         method_name: &str,
     ) -> Vec<String> {
         let settings = self.settings_manager.load_settings();
-        let Some(lang_settings) = crate::config::resolve_language_settings_with_wildcard(
-            &settings.languages,
-            host_language,
-        ) else {
-            return Vec::new();
-        };
-        let Some(bridge_map) = lang_settings.bridge.as_ref() else {
-            return Vec::new();
-        };
-        let Some(bridge_config) =
-            crate::config::resolve_bridge_language_with_wildcard(bridge_map, injection_language)
-        else {
-            return Vec::new();
-        };
-        bridge_config.resolve_priorities(method_name)
+        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
+            .and_then(|lang_settings| lang_settings.bridge)
+            .and_then(|bridge_map| {
+                crate::config::resolve_bridge_language_with_wildcard(
+                    &bridge_map,
+                    injection_language,
+                )
+            })
+            .map(|bridge_config| bridge_config.resolve_priorities(method_name))
+            .unwrap_or_default()
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
