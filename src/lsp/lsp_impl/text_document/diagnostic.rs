@@ -60,29 +60,7 @@ pub(crate) async fn collect_region_diagnostics(
     let result = dispatch_collect_all(
         ctx,
         pool.clone(),
-        |t| async move {
-            let rid = t.region_id.clone();
-            tokio::time::timeout(
-                DIAGNOSTIC_REQUEST_TIMEOUT,
-                t.pool.send_diagnostic_request(
-                    &t.server_name,
-                    &t.server_config,
-                    &t.uri,
-                    &t.injection_language,
-                    &t.region_id,
-                    t.region_start_line,
-                    &t.virtual_content,
-                    t.upstream_id,
-                    None, // No previous_result_id
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(std::io::Error::other(format!(
-                    "diagnostic request timed out for region {rid}"
-                )))
-            })
-        },
+        send_diagnostic_fan_out_request,
         None, // cancel handled at outer level (pull) or not needed (push)
         log_target,
     )
