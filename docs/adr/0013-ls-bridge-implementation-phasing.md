@@ -82,7 +82,7 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 | Component | Phase 3 Addition |
 |-----------|------------------|
 | **Routing** | Fan-out to multiple servers (ADR-0016) |
-| **Aggregation** | merge_all, first_wins, ranked strategies |
+| **Aggregation** | preferred, concatenated, deduplicated, … strategies |
 | **Per-Request Timeout** | Bounds aggregation latency (ADR-0018) |
 | **Backpressure** | Multi-server coordination (ADR-0016) |
 
