@@ -48,10 +48,13 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Collect diagnostics for a single injection region using priority-aware aggregation.
 ///
 /// Wraps `dispatch_collect_all` with the standard timeout closure and
-/// `unregister_all_for_upstream_id` cleanup. Used by:
-/// - `diagnostic_impl` (pull diagnostics, per-region inner task)
-/// - `spawn_synthetic_diagnostic_task` (immediate push on didSave/didOpen)
-/// - `execute_debounced_diagnostic` (debounced push on didChange)
+/// `unregister_all_for_upstream_id` cleanup. Used by push diagnostic
+/// helpers in `publish_diagnostic.rs` (`spawn_synthetic_diagnostic_task`
+/// and `execute_debounced_diagnostic`).
+///
+/// Pull diagnostics (`diagnostic_impl`) use `dispatch_collect_all_diagnostics`
+/// and `dispatch_preferred_diagnostics` directly to support per-region
+/// strategy selection.
 pub(crate) async fn collect_region_diagnostics(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
