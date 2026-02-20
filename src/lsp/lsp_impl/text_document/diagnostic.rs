@@ -47,8 +47,7 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Collect diagnostics for a single injection region using priority-aware aggregation.
 ///
-/// Wraps `dispatch_collect_all` with the standard timeout closure and
-/// `unregister_all_for_upstream_id` cleanup. Used by push diagnostic
+/// Wraps `dispatch_collect_all` with the standard timeout closure. Used by push diagnostic
 /// helpers in `publish_diagnostic.rs` (`spawn_synthetic_diagnostic_task`
 /// and `execute_debounced_diagnostic`).
 ///
@@ -62,15 +61,12 @@ pub(crate) async fn collect_region_diagnostics(
 ) -> Vec<Diagnostic> {
     let result = dispatch_collect_all(
         ctx,
-        pool.clone(),
+        pool,
         send_diagnostic_fan_out_request,
         None, // cancel handled at outer level (pull) or not needed (push)
         log_target,
     )
     .await;
-
-    // Clean up stale upstream registry entries from inner fan_out
-    pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
 
     match result {
         FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
