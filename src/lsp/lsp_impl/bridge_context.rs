@@ -9,6 +9,7 @@ use tower_lsp_server::jsonrpc::Id;
 use tower_lsp_server::ls_types::{MessageType, Position, Range, Uri};
 use url::Url;
 
+use crate::config::settings::AggregationStrategy;
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
 use crate::lsp::get_current_request_id;
@@ -50,6 +51,9 @@ pub(crate) struct DocumentRequestContext {
     /// Resolved from the bridge language config's aggregation settings.
     /// Empty means pure first-win behavior (no priority ordering).
     pub(crate) priorities: Vec<String>,
+    /// Aggregation strategy for this region.
+    /// Resolved from the bridge language config's aggregation settings.
+    pub(crate) strategy: AggregationStrategy,
 }
 
 /// Document context plus a cursor position.
@@ -258,6 +262,7 @@ impl Kakehashi {
             configs,
             upstream_request_id: preamble.upstream_request_id,
             priorities,
+            strategy: AggregationStrategy::Preferred,
         })
     }
 

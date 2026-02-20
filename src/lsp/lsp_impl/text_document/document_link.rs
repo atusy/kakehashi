@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, MessageType};
 
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -104,6 +105,7 @@ impl Kakehashi {
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
                 priorities,
+                strategy: AggregationStrategy::Preferred,
             };
             let pool = Arc::clone(&pool);
 

@@ -35,6 +35,7 @@ use tokio::task::JoinSet;
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
@@ -164,6 +165,7 @@ impl Kakehashi {
                 configs,
                 upstream_request_id: None, // Push diagnostics are synthetic
                 priorities,
+                strategy: AggregationStrategy::Concatenated, // placeholder; Phase 2 replaces with dynamic resolution
             });
         }
 

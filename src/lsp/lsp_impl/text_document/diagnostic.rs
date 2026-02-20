@@ -180,6 +180,7 @@ impl Kakehashi {
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
                 priorities,
+                strategy, // resolved per-region above; used in outer_join_set dispatch
             };
             let pool = Arc::clone(&pool);
 
