@@ -188,19 +188,14 @@ impl Kakehashi {
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let diagnostics = match strategy {
+                match strategy {
                     AggregationStrategy::All => {
                         dispatch_collect_all_diagnostics(&region_ctx, pool.clone()).await
                     }
                     AggregationStrategy::Preferred => {
                         dispatch_preferred_diagnostics(&region_ctx, pool.clone()).await
                     }
-                };
-
-                // Clean up stale upstream registry entries from inner fan_out
-                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
-
-                diagnostics
+                }
             });
         }
 
@@ -211,6 +206,11 @@ impl Kakehashi {
             |acc, items: Vec<Diagnostic>| acc.extend(items),
         )
         .await;
+
+        // Clean up stale upstream registry entries once all region tasks have completed
+        // (or been aborted via JoinSet drop). Must happen after the JoinSet is drained
+        // so cancel forwarding remains intact for all in-flight downstream requests.
+        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         let all_diagnostics = result?;
 
