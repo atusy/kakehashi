@@ -1,4 +1,4 @@
-pub(crate) mod all;
+pub(crate) mod concatenated;
 pub(crate) mod preferred;
 pub(crate) mod result;
 

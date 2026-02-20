@@ -232,7 +232,7 @@ When multiple language servers can handle the same injection language, `aggregat
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered list of server names. The first server that returns a valid response wins. Empty list falls back to arrival-order (first-win) behavior. |
-| `strategy` | `"preferred"` or `"all"`. Default depends on the LSP method: `"all"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"all"` collects and merges responses from all servers. |
+| `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
 
 Example with per-method priorities and strategy:
 
