@@ -15,7 +15,7 @@ mod hover;
 mod implementation;
 mod inlay_hint;
 mod moniker;
-mod publish_diagnostic;
+pub(crate) mod publish_diagnostic;
 mod references;
 mod rename;
 mod selection_range;

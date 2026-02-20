@@ -48,9 +48,8 @@ use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use super::bridge::LanguageServerPool;
-use super::lsp_impl::text_document::diagnostic::{
-    DiagnosticRequestInfo, fan_out_diagnostic_requests,
-};
+use super::lsp_impl::bridge_context::DocumentRequestContext;
+use super::lsp_impl::text_document::publish_diagnostic::collect_push_diagnostics;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
 /// Default debounce duration for `didChange` events (500ms).
@@ -73,8 +72,8 @@ struct DebouncedDiagnosticData {
     lsp_uri: Uri,
     /// LSP client for publishing diagnostics
     client: Client,
-    /// Pre-captured snapshot data (None if document has no injections)
-    snapshot_data: Option<Vec<DiagnosticRequestInfo>>,
+    /// Pre-captured per-region contexts (None if document has no injections)
+    snapshot_data: Option<Vec<DocumentRequestContext>>,
     /// Bridge pool for sending diagnostic requests
     bridge_pool: Arc<LanguageServerPool>,
     /// Reference to synthetic diagnostics manager for task registration
@@ -128,7 +127,7 @@ impl DebouncedDiagnosticsManager {
     /// * `uri` - The document URI (url::Url)
     /// * `lsp_uri` - The document URI (ls_types::Uri)
     /// * `client` - LSP client for publishing
-    /// * `snapshot_data` - Pre-captured diagnostic request info (None if no injections)
+    /// * `snapshot_data` - Pre-captured per-region contexts (None if no injections)
     /// * `bridge_pool` - Pool for downstream server communication
     /// * `synthetic_diagnostics` - Manager for task superseding
     #[allow(clippy::too_many_arguments)]
@@ -137,7 +136,7 @@ impl DebouncedDiagnosticsManager {
         uri: Url,
         lsp_uri: Uri,
         client: Client,
-        snapshot_data: Option<Vec<DiagnosticRequestInfo>>,
+        snapshot_data: Option<Vec<DocumentRequestContext>>,
         bridge_pool: Arc<LanguageServerPool>,
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     ) {
@@ -252,7 +251,10 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     // This task is registered with SyntheticDiagnosticsManager for superseding
     let uri_clone = uri.clone();
     let task = tokio::spawn(async move {
-        let Some(request_infos) = snapshot_data else {
+        let diagnostics =
+            collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
+
+        let Some(diagnostics) = diagnostics else {
             log::debug!(
                 target: LOG_TARGET,
                 "No diagnostics to collect for {} (no snapshot data)",
@@ -260,21 +262,6 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
             );
             return;
         };
-
-        if request_infos.is_empty() {
-            log::debug!(
-                target: LOG_TARGET,
-                "No bridge configs for any injection regions in {}",
-                uri_clone
-            );
-            // Publish empty diagnostics to clear any previous
-            client.publish_diagnostics(lsp_uri, Vec::new(), None).await;
-            return;
-        }
-
-        // Fan-out diagnostic requests (using shared implementation)
-        let diagnostics =
-            fan_out_diagnostic_requests(&bridge_pool, &uri_clone, request_infos, LOG_TARGET).await;
 
         log::debug!(
             target: LOG_TARGET,

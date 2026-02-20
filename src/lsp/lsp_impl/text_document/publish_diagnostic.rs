@@ -12,12 +12,12 @@
 //!       ▼
 //! spawn_synthetic_diagnostic_task()
 //!       │
-//!       ├─► prepare_diagnostic_snapshot() [sync: extract data]
+//!       ├─► prepare_diagnostic_snapshot() [sync: per-region contexts]
 //!       │
 //!       └─► tokio::spawn [async: background task]
 //!               │
 //!               ▼
-//!           fan_out_diagnostic_requests()
+//!           JoinSet { collect_region_diagnostics() per region }
 //!               │
 //!               ▼
 //!           client.publish_diagnostics()
@@ -29,13 +29,18 @@
 //! `SyntheticDiagnosticsManager` to prevent stale diagnostics from
 //! being published. Only the latest task completes.
 
+use std::sync::Arc;
+
+use tokio::task::JoinSet;
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use crate::language::InjectionResolver;
+use crate::lsp::bridge::LanguageServerPool;
+use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 use super::super::Kakehashi;
-use super::diagnostic::{DiagnosticRequestInfo, fan_out_diagnostic_requests};
+use super::diagnostic::collect_region_diagnostics;
 
 /// Logging target for synthetic push diagnostics.
 const LOG_TARGET: &str = "kakehashi::synthetic_diag";
@@ -70,31 +75,12 @@ impl Kakehashi {
         // 2. The superseding logic still works correctly (abort on stale handle is safe)
         // 3. Completing tasks don't need cleanup since they ran to completion
         let task = tokio::spawn(async move {
-            // Collect diagnostics
-            let Some(request_infos) = snapshot_data else {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "No diagnostics to collect for {} (no snapshot data)",
-                    uri_clone
-                );
+            let diagnostics =
+                collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
+
+            let Some(diagnostics) = diagnostics else {
                 return;
             };
-
-            if request_infos.is_empty() {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "No bridge configs for any injection regions in {}",
-                    uri_clone
-                );
-                // Publish empty diagnostics to clear any previous
-                client.publish_diagnostics(lsp_uri, Vec::new(), None).await;
-                return;
-            }
-
-            // Fan-out diagnostic requests (using shared implementation)
-            let diagnostics =
-                fan_out_diagnostic_requests(&bridge_pool, &uri_clone, request_infos, LOG_TARGET)
-                    .await;
 
             log::debug!(
                 target: LOG_TARGET,
@@ -112,10 +98,12 @@ impl Kakehashi {
             .register_task(uri, task.abort_handle());
     }
 
-    /// Prepare diagnostic snapshot data for a background task.
+    /// Prepare per-region diagnostic contexts for a background task.
     ///
     /// This extracts all necessary data synchronously before spawning,
     /// avoiding lifetime issues with `self` references in async tasks.
+    /// Each region gets its own `DocumentRequestContext` with aggregation
+    /// priorities resolved for `"textDocument/publishDiagnostics"`.
     ///
     /// # Returns
     ///
@@ -128,7 +116,7 @@ impl Kakehashi {
     pub(crate) fn prepare_diagnostic_snapshot(
         &self,
         uri: &Url,
-    ) -> Option<Vec<DiagnosticRequestInfo>> {
+    ) -> Option<Vec<DocumentRequestContext>> {
         // Get document snapshot
         let snapshot = {
             let doc = self.documents.get(uri)?;
@@ -155,7 +143,78 @@ impl Kakehashi {
             return Some(Vec::new());
         }
 
-        // Build request infos for background task
-        Some(self.build_diagnostic_request_infos(&language_name, &all_regions))
+        // Build one DocumentRequestContext per region (same structure as diagnostic_impl)
+        let mut contexts = Vec::new();
+        for resolved in all_regions {
+            let configs = self
+                .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
+            if configs.is_empty() {
+                continue;
+            }
+
+            let priorities = self.resolve_aggregation_priorities(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/publishDiagnostics",
+            );
+
+            contexts.push(DocumentRequestContext {
+                uri: uri.clone(),
+                resolved,
+                configs,
+                upstream_request_id: None, // Push diagnostics are synthetic
+                priorities,
+            });
+        }
+
+        Some(contexts)
     }
+}
+
+/// Collect diagnostics from all regions using priority-aware aggregation.
+///
+/// Shared logic for both immediate (didSave/didOpen) and debounced (didChange)
+/// push diagnostics. Returns `None` if there's no snapshot data, or
+/// `Some(diagnostics)` (possibly empty to clear previous diagnostics).
+pub(crate) async fn collect_push_diagnostics(
+    snapshot_data: Option<Vec<DocumentRequestContext>>,
+    pool: &Arc<LanguageServerPool>,
+    uri: &Url,
+    log_target: &'static str,
+) -> Option<Vec<tower_lsp_server::ls_types::Diagnostic>> {
+    let region_contexts = snapshot_data?;
+
+    if region_contexts.is_empty() {
+        log::debug!(
+            target: log_target,
+            "No injection regions or bridge configs found in {}",
+            uri
+        );
+        // Return empty to signal caller should clear diagnostics
+        return Some(Vec::new());
+    }
+
+    let mut join_set = JoinSet::new();
+    for region_ctx in region_contexts {
+        let pool = Arc::clone(pool);
+        join_set.spawn(async move {
+            collect_region_diagnostics(&region_ctx, pool, Some(log_target)).await
+        });
+    }
+
+    let mut all_diagnostics = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(diags) => all_diagnostics.extend(diags),
+            Err(join_err) => {
+                log::warn!(
+                    target: log_target,
+                    "Diagnostic region task panicked: {}",
+                    join_err
+                );
+            }
+        }
+    }
+
+    Some(all_diagnostics)
 }

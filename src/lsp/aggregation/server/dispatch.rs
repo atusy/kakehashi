@@ -69,6 +69,7 @@ pub(crate) async fn dispatch_collect_all<T, F, Fut>(
     pool: Arc<LanguageServerPool>,
     f: F,
     cancel_rx: Option<CancelReceiver>,
+    log_target: Option<&str>,
 ) -> FanInResult<Vec<T>>
 where
     T: Send + 'static,
@@ -77,5 +78,5 @@ where
 {
     let priorities = effective_priorities(ctx);
     let mut join_set = fan_out(ctx, pool, f);
-    all::collect_all(&mut join_set, &priorities, cancel_rx).await
+    all::collect_all(&mut join_set, &priorities, cancel_rx, log_target).await
 }

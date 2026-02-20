@@ -25,166 +25,53 @@ use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     FullDocumentDiagnosticReport, MessageType, RelatedFullDocumentDiagnosticReport,
 };
-use url::Url;
 
 use super::super::{Kakehashi, uri_to_url};
-use crate::config::settings::{AggregationStrategy, BridgeServerConfig};
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, dispatch_collect_all, dispatch_preferred,
 };
-use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 // ============================================================================
-// Shared diagnostic utilities (used by both pull and synthetic push diagnostics)
+// Shared diagnostic utilities (used by both pull and push diagnostics)
 // ============================================================================
 
 /// Per-request timeout for diagnostic fan-out (ADR-0020).
 ///
 /// Used by both pull diagnostics (textDocument/diagnostic) and
 /// synthetic push diagnostics (didSave/didOpen/didChange triggered).
-pub(crate) const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Information needed to send a diagnostic request for one injection region.
+/// Collect diagnostics for a single injection region using priority-aware aggregation.
 ///
-/// This struct captures all the data required to make a single diagnostic request
-/// to a downstream language server. It's used during parallel fan-out where
-/// multiple injection regions are processed concurrently.
+/// Wraps `dispatch_collect_all` with the standard timeout closure. Used by push diagnostic
+/// helpers in `publish_diagnostic.rs` (`spawn_synthetic_diagnostic_task`
+/// and `execute_debounced_diagnostic`).
 ///
-/// Uses Arc for config to avoid cloning large structs for each region - multiple
-/// regions using the same language server share the same config Arc.
-pub(crate) struct DiagnosticRequestInfo {
-    /// Name of the downstream language server (e.g., "lua-language-server")
-    pub(crate) server_name: String,
-    /// Shared reference to the bridge server configuration
-    pub(crate) config: Arc<BridgeServerConfig>,
-    /// Language of the injection region (e.g., "lua", "python")
-    pub(crate) injection_language: String,
-    /// Unique identifier for this injection region within the host document
-    pub(crate) region_id: String,
-    /// Starting line of the injection region in the host document (0-indexed)
-    /// Used to transform diagnostic positions back to host coordinates
-    pub(crate) region_start_line: u32,
-    /// The extracted content of the injection region, formatted as a virtual document
-    /// This is what gets sent to the downstream language server for analysis
-    pub(crate) virtual_content: String,
-}
-
-/// Send a diagnostic request with timeout, returning parsed diagnostics or None on failure.
-///
-/// This is the shared implementation used by both pull and push diagnostics.
-/// It handles timeout, error logging, and response parsing.
-///
-/// # Arguments
-/// * `pool` - The language server pool for sending requests
-/// * `info` - Request info containing server details and region data
-/// * `uri` - The host document URI
-/// * `upstream_request_id` - The upstream request ID for cancel forwarding
-/// * `previous_result_id` - Optional result ID for unchanged detection
-/// * `timeout` - Request timeout duration
-/// * `log_target` - Logging target (e.g., "kakehashi::diagnostic")
-pub(crate) async fn send_diagnostic_with_timeout(
-    pool: &LanguageServerPool,
-    info: &DiagnosticRequestInfo,
-    uri: &Url,
-    upstream_request_id: Option<UpstreamId>,
-    previous_result_id: Option<&str>,
-    timeout: Duration,
-    log_target: &str,
-) -> Option<Vec<Diagnostic>> {
-    let request_future = pool.send_diagnostic_request(
-        &info.server_name,
-        &info.config,
-        uri,
-        &info.injection_language,
-        &info.region_id,
-        info.region_start_line,
-        &info.virtual_content,
-        upstream_request_id,
-        previous_result_id,
-    );
-
-    // Apply timeout per-request (ADR-0020: return partial results on timeout)
-    match tokio::time::timeout(timeout, request_future).await {
-        Ok(Ok(diagnostics)) => Some(diagnostics),
-        Ok(Err(e)) => {
-            log::warn!(
-                target: log_target,
-                "Diagnostic request failed for region {}: {}",
-                info.region_id,
-                e
-            );
-            None
-        }
-        Err(_) => {
-            log::warn!(
-                target: log_target,
-                "Diagnostic request timed out for region {} after {:?}",
-                info.region_id,
-                timeout
-            );
-            None
-        }
-    }
-}
-
-/// Fan-out diagnostic requests to downstream servers.
-///
-/// Spawns parallel requests to all injection regions and aggregates results.
-/// Uses JoinSet for structured concurrency with automatic cleanup on drop.
-///
-/// This is the shared implementation used by both synthetic push diagnostics
-/// (didSave/didOpen triggered) and debounced diagnostics (didChange triggered).
-///
-/// # Arguments
-/// * `pool` - The language server pool for sending requests
-/// * `uri` - The host document URI
-/// * `request_infos` - Request info for each injection region
-/// * `log_target` - Logging target (e.g., "kakehashi::synthetic_diag")
-pub(crate) async fn fan_out_diagnostic_requests(
-    pool: &Arc<LanguageServerPool>,
-    uri: &Url,
-    request_infos: Vec<DiagnosticRequestInfo>,
-    log_target: &'static str,
+/// Pull diagnostics (`diagnostic_impl`) use `dispatch_collect_all_diagnostics`
+/// and `dispatch_preferred_diagnostics` directly to support per-region
+/// strategy selection.
+pub(crate) async fn collect_region_diagnostics(
+    ctx: &DocumentRequestContext,
+    pool: Arc<LanguageServerPool>,
+    log_target: Option<&str>,
 ) -> Vec<Diagnostic> {
-    let mut join_set = tokio::task::JoinSet::new();
+    let result = dispatch_collect_all(
+        ctx,
+        pool,
+        send_diagnostic_fan_out_request,
+        None, // cancel handled at outer level (pull) or not needed (push)
+        log_target,
+    )
+    .await;
 
-    for info in request_infos {
-        let pool = Arc::clone(pool);
-        let uri = uri.clone();
-
-        join_set.spawn(async move {
-            send_diagnostic_with_timeout(
-                &pool,
-                &info,
-                &uri,
-                None, // No upstream request for background tasks
-                None, // No previous_result_id
-                DIAGNOSTIC_REQUEST_TIMEOUT,
-                log_target,
-            )
-            .await
-        });
+    match result {
+        FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
     }
-
-    // Collect results from all regions
-    let mut all_diagnostics: Vec<Diagnostic> = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(Some(diagnostics)) => all_diagnostics.extend(diagnostics),
-            Ok(None) => {}
-            Err(e) => {
-                log::error!(
-                    target: log_target,
-                    "Diagnostic task panicked: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    all_diagnostics
 }
 
 // ============================================================================
@@ -192,61 +79,6 @@ pub(crate) async fn fan_out_diagnostic_requests(
 // ============================================================================
 
 impl Kakehashi {
-    /// Build DiagnosticRequestInfo for all injection regions that have bridge configs.
-    ///
-    /// Groups by server_name to share Arc<BridgeServerConfig> across regions using the same server.
-    ///
-    /// This is `pub(super)` for use by both pull diagnostics and synthetic push diagnostics.
-    pub(super) fn build_diagnostic_request_infos(
-        &self,
-        language_name: &str,
-        all_regions: &[crate::language::injection::ResolvedInjection],
-    ) -> Vec<DiagnosticRequestInfo> {
-        // Pre-allocate with small capacity (typically 1-2 unique servers per document)
-        let mut config_cache: std::collections::HashMap<String, Arc<BridgeServerConfig>> =
-            std::collections::HashMap::with_capacity(2);
-        let mut request_infos: Vec<DiagnosticRequestInfo> = Vec::with_capacity(all_regions.len());
-
-        for resolved in all_regions {
-            // Get ALL bridge server configs for this language (N-server fan-out).
-            // For each region, we emit one DiagnosticRequestInfo per matching server,
-            // enabling diagnostics from multiple servers (e.g., pyright + ruff for Python).
-            let configs = self
-                .get_all_bridge_configs_for_language(language_name, &resolved.injection_language);
-
-            if configs.is_empty() {
-                log::debug!(
-                    target: "kakehashi::diagnostic",
-                    "No bridge config for language {}",
-                    resolved.injection_language
-                );
-                continue;
-            }
-
-            for resolved_config in configs {
-                let server_name = resolved_config.server_name.clone();
-
-                // Reuse Arc if we've already seen this server, otherwise clone the existing Arc.
-                // Since ResolvedServerConfig.config is already Arc-wrapped, this is cheap.
-                let config_arc = config_cache
-                    .entry(server_name.clone())
-                    .or_insert_with(|| Arc::clone(&resolved_config.config))
-                    .clone();
-
-                request_infos.push(DiagnosticRequestInfo {
-                    server_name,
-                    config: config_arc,
-                    injection_language: resolved.injection_language.clone(),
-                    region_id: resolved.region.region_id.clone(),
-                    region_start_line: resolved.region.line_range.start,
-                    virtual_content: resolved.virtual_content.clone(),
-                });
-            }
-        }
-
-        request_infos
-    }
-
     pub(crate) async fn diagnostic_impl(
         &self,
         params: DocumentDiagnosticParams,
@@ -352,19 +184,14 @@ impl Kakehashi {
             let pool = Arc::clone(&pool);
 
             outer_join_set.spawn(async move {
-                let diagnostics = match strategy {
+                match strategy {
                     AggregationStrategy::All => {
                         dispatch_collect_all_diagnostics(&region_ctx, pool.clone()).await
                     }
                     AggregationStrategy::Preferred => {
                         dispatch_preferred_diagnostics(&region_ctx, pool.clone()).await
                     }
-                };
-
-                // Clean up stale upstream registry entries from inner fan_out
-                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
-
-                diagnostics
+                }
             });
         }
 
@@ -375,6 +202,11 @@ impl Kakehashi {
             |acc, items: Vec<Diagnostic>| acc.extend(items),
         )
         .await;
+
+        // Clean up stale upstream registry entries once all region tasks have completed
+        // (or been aborted via JoinSet drop). Must happen after the JoinSet is drained
+        // so cancel forwarding remains intact for all in-flight downstream requests.
+        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         let all_diagnostics = result?;
 
@@ -419,6 +251,7 @@ async fn dispatch_collect_all_diagnostics(
         pool,
         send_diagnostic_fan_out_request,
         None, // cancel handled at outer level
+        None, // no custom log_target
     )
     .await;
 
