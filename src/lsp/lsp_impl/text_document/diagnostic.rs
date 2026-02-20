@@ -45,11 +45,12 @@ use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 /// synthetic push diagnostics (didSave/didOpen/didChange triggered).
 const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Collect diagnostics for a single injection region using priority-aware aggregation.
+/// Collect diagnostics for a single injection region using strategy-aware dispatch.
 ///
-/// Wraps `dispatch_concatenated` with the standard timeout closure. Used by push diagnostic
-/// helpers in `publish_diagnostic.rs` (`spawn_synthetic_diagnostic_task`
-/// and `execute_debounced_diagnostic`).
+/// Dispatches to either `dispatch_concatenated` or `dispatch_preferred` based on
+/// `ctx.strategy`. Used by push diagnostic helpers:
+/// `spawn_synthetic_diagnostic_task` in `publish_diagnostic.rs` and
+/// `execute_debounced_diagnostic` in `debounced_diagnostics.rs`.
 ///
 /// Pull diagnostics (`diagnostic_impl`) use `dispatch_concatenated_diagnostics`
 /// and `dispatch_preferred_diagnostics` directly to support per-region
@@ -57,20 +58,10 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) async fn collect_region_diagnostics(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
-    log_target: Option<&str>,
 ) -> Vec<Diagnostic> {
-    let result = dispatch_concatenated(
-        ctx,
-        pool,
-        send_diagnostic_fan_out_request,
-        None, // cancel handled at outer level (pull) or not needed (push)
-        log_target,
-    )
-    .await;
-
-    match result {
-        FanInResult::Done(vecs) => vecs.into_iter().flatten().collect(),
-        FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
+    match ctx.strategy {
+        AggregationStrategy::Concatenated => dispatch_concatenated_diagnostics(ctx, pool).await,
+        AggregationStrategy::Preferred => dispatch_preferred_diagnostics(ctx, pool).await,
     }
 }
 
@@ -180,6 +171,7 @@ impl Kakehashi {
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
                 priorities,
+                strategy, // resolved per-region above; used in outer_join_set dispatch
             };
             let pool = Arc::clone(&pool);
 

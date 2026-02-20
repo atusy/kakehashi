@@ -35,6 +35,7 @@ use tokio::task::JoinSet;
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
@@ -157,6 +158,12 @@ impl Kakehashi {
                 &resolved.injection_language,
                 "textDocument/publishDiagnostics",
             );
+            let strategy = self.resolve_aggregation_strategy(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/publishDiagnostics",
+                AggregationStrategy::Concatenated,
+            );
 
             contexts.push(DocumentRequestContext {
                 uri: uri.clone(),
@@ -164,6 +171,7 @@ impl Kakehashi {
                 configs,
                 upstream_request_id: None, // Push diagnostics are synthetic
                 priorities,
+                strategy,
             });
         }
 
@@ -197,9 +205,7 @@ pub(crate) async fn collect_push_diagnostics(
     let mut join_set = JoinSet::new();
     for region_ctx in region_contexts {
         let pool = Arc::clone(pool);
-        join_set.spawn(async move {
-            collect_region_diagnostics(&region_ctx, pool, Some(log_target)).await
-        });
+        join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
     }
 
     let mut all_diagnostics = Vec::new();
