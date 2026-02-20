@@ -180,7 +180,7 @@ pub(crate) async fn collect_push_diagnostics(
     snapshot_data: Option<Vec<DocumentRequestContext>>,
     pool: &Arc<LanguageServerPool>,
     uri: &Url,
-    log_target: &str,
+    log_target: &'static str,
 ) -> Option<Vec<tower_lsp_server::ls_types::Diagnostic>> {
     let region_contexts = snapshot_data?;
 
@@ -197,9 +197,8 @@ pub(crate) async fn collect_push_diagnostics(
     let mut join_set = JoinSet::new();
     for region_ctx in region_contexts {
         let pool = Arc::clone(pool);
-        let log_target = log_target.to_owned();
         join_set.spawn(async move {
-            collect_region_diagnostics(&region_ctx, pool, Some(&log_target)).await
+            collect_region_diagnostics(&region_ctx, pool, Some(log_target)).await
         });
     }
 
