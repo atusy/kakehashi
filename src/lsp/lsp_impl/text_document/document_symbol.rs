@@ -132,7 +132,6 @@ impl Kakehashi {
                     None,
                 )
                 .await;
-                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
                 match result {
                     FanInResult::Done(symbols) => symbols.unwrap_or_default(),
                     FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
@@ -147,6 +146,11 @@ impl Kakehashi {
             |acc, items: Vec<DocumentSymbol>| acc.extend(items),
         )
         .await;
+
+        // Clean up stale upstream registry entries once all region tasks have completed
+        // (or been aborted via JoinSet drop). Must happen after the JoinSet is drained
+        // so cancel forwarding remains intact for all in-flight downstream requests.
+        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         let all_symbols = result?;
 
