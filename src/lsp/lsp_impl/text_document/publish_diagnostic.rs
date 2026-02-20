@@ -158,6 +158,12 @@ impl Kakehashi {
                 &resolved.injection_language,
                 "textDocument/publishDiagnostics",
             );
+            let strategy = self.resolve_aggregation_strategy(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/publishDiagnostics",
+                AggregationStrategy::Concatenated,
+            );
 
             contexts.push(DocumentRequestContext {
                 uri: uri.clone(),
@@ -165,7 +171,7 @@ impl Kakehashi {
                 configs,
                 upstream_request_id: None, // Push diagnostics are synthetic
                 priorities,
-                strategy: AggregationStrategy::Concatenated, // placeholder; Phase 2 replaces with dynamic resolution
+                strategy,
             });
         }
 
@@ -199,9 +205,7 @@ pub(crate) async fn collect_push_diagnostics(
     let mut join_set = JoinSet::new();
     for region_ctx in region_contexts {
         let pool = Arc::clone(pool);
-        join_set.spawn(async move {
-            collect_region_diagnostics(&region_ctx, pool, Some(log_target)).await
-        });
+        join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
     }
 
     let mut all_diagnostics = Vec::new();
