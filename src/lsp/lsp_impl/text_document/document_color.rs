@@ -129,7 +129,6 @@ impl Kakehashi {
                     None,
                 )
                 .await;
-                pool.unregister_all_for_upstream_id(region_ctx.upstream_request_id.as_ref());
                 match result {
                     FanInResult::Done(colors) => colors,
                     FanInResult::NoResult { .. } | FanInResult::Cancelled => Vec::new(),
@@ -138,11 +137,18 @@ impl Kakehashi {
         }
 
         // Collect results, aborting early if $/cancelRequest arrives.
-        crate::lsp::aggregation::region::collect_region_results_with_cancel(
+        let result = crate::lsp::aggregation::region::collect_region_results_with_cancel(
             outer_join_set,
             cancel_rx,
             |acc, items: Vec<ColorInformation>| acc.extend(items),
         )
-        .await
+        .await;
+
+        // Clean up stale upstream registry entries once all region tasks have completed
+        // (or been aborted via JoinSet drop). Must happen after the JoinSet is drained
+        // so cancel forwarding remains intact for all in-flight downstream requests.
+        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
+
+        result
     }
 }
