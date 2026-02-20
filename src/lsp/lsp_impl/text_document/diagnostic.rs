@@ -48,8 +48,9 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Collect diagnostics for a single injection region using strategy-aware dispatch.
 ///
 /// Dispatches to either `dispatch_concatenated` or `dispatch_preferred` based on
-/// `ctx.strategy`. Used by push diagnostic helpers in `publish_diagnostic.rs`
-/// (`spawn_synthetic_diagnostic_task` and `execute_debounced_diagnostic`).
+/// `ctx.strategy`. Used by push diagnostic helpers:
+/// `spawn_synthetic_diagnostic_task` in `publish_diagnostic.rs` and
+/// `execute_debounced_diagnostic` in `debounced_diagnostics.rs`.
 ///
 /// Pull diagnostics (`diagnostic_impl`) use `dispatch_concatenated_diagnostics`
 /// and `dispatch_preferred_diagnostics` directly to support per-region

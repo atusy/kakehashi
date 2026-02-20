@@ -52,7 +52,12 @@ pub(crate) struct DocumentRequestContext {
     /// Empty means pure first-win behavior (no priority ordering).
     pub(crate) priorities: Vec<String>,
     /// Aggregation strategy for this region.
-    /// Resolved from the bridge language config's aggregation settings.
+    ///
+    /// For contexts built by [`preamble_to_document_context`] (position-based and
+    /// range-based handlers), this is always [`AggregationStrategy::Preferred`].
+    /// For diagnostic contexts (`textDocument/publishDiagnostics`), this is resolved
+    /// dynamically from the bridge language config's aggregation settings via
+    /// [`Kakehashi::resolve_aggregation_strategy`].
     pub(crate) strategy: AggregationStrategy,
 }
 
