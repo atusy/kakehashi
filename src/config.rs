@@ -3156,7 +3156,7 @@ mod tests {
                     "textDocument/diagnostic".to_string(),
                     settings::AggregationConfig {
                         priorities: vec!["ruff".to_string()],
-                        strategy: Some(settings::AggregationStrategy::All),
+                        strategy: Some(settings::AggregationStrategy::Concatenated),
                     },
                 )])),
             },

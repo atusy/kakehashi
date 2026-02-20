@@ -30,7 +30,7 @@ use super::super::{Kakehashi, uri_to_url};
 use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
-    FanInResult, FanOutTask, dispatch_collect_all, dispatch_preferred,
+    FanInResult, FanOutTask, dispatch_concatenated, dispatch_preferred,
 };
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
@@ -47,11 +47,11 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Collect diagnostics for a single injection region using priority-aware aggregation.
 ///
-/// Wraps `dispatch_collect_all` with the standard timeout closure. Used by push diagnostic
+/// Wraps `dispatch_concatenated` with the standard timeout closure. Used by push diagnostic
 /// helpers in `publish_diagnostic.rs` (`spawn_synthetic_diagnostic_task`
 /// and `execute_debounced_diagnostic`).
 ///
-/// Pull diagnostics (`diagnostic_impl`) use `dispatch_collect_all_diagnostics`
+/// Pull diagnostics (`diagnostic_impl`) use `dispatch_concatenated_diagnostics`
 /// and `dispatch_preferred_diagnostics` directly to support per-region
 /// strategy selection.
 pub(crate) async fn collect_region_diagnostics(
@@ -59,7 +59,7 @@ pub(crate) async fn collect_region_diagnostics(
     pool: Arc<LanguageServerPool>,
     log_target: Option<&str>,
 ) -> Vec<Diagnostic> {
-    let result = dispatch_collect_all(
+    let result = dispatch_concatenated(
         ctx,
         pool,
         send_diagnostic_fan_out_request,
@@ -167,7 +167,7 @@ impl Kakehashi {
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/diagnostic",
-                AggregationStrategy::All,
+                AggregationStrategy::Concatenated,
             );
             let priorities = self.resolve_aggregation_priorities(
                 &language_name,
@@ -185,8 +185,8 @@ impl Kakehashi {
 
             outer_join_set.spawn(async move {
                 match strategy {
-                    AggregationStrategy::All => {
-                        dispatch_collect_all_diagnostics(&region_ctx, pool.clone()).await
+                    AggregationStrategy::Concatenated => {
+                        dispatch_concatenated_diagnostics(&region_ctx, pool.clone()).await
                     }
                     AggregationStrategy::Preferred => {
                         dispatch_preferred_diagnostics(&region_ctx, pool.clone()).await
@@ -208,15 +208,15 @@ impl Kakehashi {
         // so cancel forwarding remains intact for all in-flight downstream requests.
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
-        let all_diagnostics = result?;
+        let concatenated_diagnostics = result?;
 
-        Ok(make_diagnostic_report(all_diagnostics))
+        Ok(make_diagnostic_report(concatenated_diagnostics))
     }
 }
 
 /// Send a diagnostic request for a single fan-out task with timeout.
 ///
-/// Shared by both collect-all and preferred dispatch strategies.
+/// Shared by both concatenated and preferred dispatch strategies.
 async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<Diagnostic>> {
     let rid = t.region_id.clone();
     tokio::time::timeout(
@@ -241,12 +241,12 @@ async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<D
     })
 }
 
-/// Dispatch diagnostics using the collect-all strategy (merge results from every server).
-async fn dispatch_collect_all_diagnostics(
+/// Dispatch diagnostics using the concatenated strategy (merge results from every server).
+async fn dispatch_concatenated_diagnostics(
     region_ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
 ) -> Vec<Diagnostic> {
-    let result = dispatch_collect_all(
+    let result = dispatch_concatenated(
         region_ctx,
         pool,
         send_diagnostic_fan_out_request,

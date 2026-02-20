@@ -22,13 +22,13 @@ pub enum WorkspaceType {
 ///
 /// - `Preferred`: Use the first non-empty response (priority-ordered).
 ///   This is the default for most LSP methods.
-/// - `All`: Collect and merge responses from all servers.
+/// - `Concatenated`: Collect and merge responses from all servers.
 ///   This is the default for `textDocument/diagnostic`.
 #[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum AggregationStrategy {
     Preferred,
-    All,
+    Concatenated,
 }
 
 /// Per-method aggregation configuration.
@@ -1428,7 +1428,7 @@ kind = "injections""#;
             )])),
         };
         assert_eq!(
-            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::Concatenated),
             AggregationStrategy::Preferred,
         );
     }
@@ -1440,14 +1440,14 @@ kind = "injections""#;
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
                 AggregationConfig {
-                    strategy: Some(AggregationStrategy::All),
+                    strategy: Some(AggregationStrategy::Concatenated),
                     ..Default::default()
                 },
             )])),
         };
         assert_eq!(
             config.resolve_strategy("textDocument/hover", AggregationStrategy::Preferred),
-            AggregationStrategy::All,
+            AggregationStrategy::Concatenated,
         );
     }
 
@@ -1455,8 +1455,8 @@ kind = "injections""#;
     fn should_resolve_strategy_returns_default_when_no_aggregation() {
         let config = BridgeLanguageConfig::default();
         assert_eq!(
-            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
-            AggregationStrategy::All,
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::Concatenated),
+            AggregationStrategy::Concatenated,
         );
     }
 
@@ -1473,8 +1473,8 @@ kind = "injections""#;
             )])),
         };
         assert_eq!(
-            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::All),
-            AggregationStrategy::All,
+            config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::Concatenated),
+            AggregationStrategy::Concatenated,
         );
     }
 
@@ -1515,10 +1515,10 @@ kind = "injections""#;
     }
 
     #[test]
-    fn should_parse_aggregation_strategy_all() {
-        let json = r#"{ "strategy": "all" }"#;
+    fn should_parse_aggregation_strategy_concatenated() {
+        let json = r#"{ "strategy": "concatenated" }"#;
         let config: AggregationConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.strategy, Some(AggregationStrategy::All));
+        assert_eq!(config.strategy, Some(AggregationStrategy::Concatenated));
     }
 
     #[test]

@@ -142,9 +142,9 @@ pub struct ResponseError {
 |--------|---------|------|------------------|
 | `hover` | ✅ | ❌ | → pyright only (no aggregation) |
 | `definition` | ✅ | ❌ | → pyright only |
-| `completion` | ✅ | ✅ | → FanOut + merge_all |
+| `completion` | ✅ | ✅ | → FanOut + concatenated |
 | `formatting` | ❌ | ✅ | → ruff only |
-| `codeAction` | ✅ | ✅ | → FanOut + merge_all |
+| `codeAction` | ✅ | ✅ | → FanOut + concatenated |
 | `diagnostics` | ✅ | ✅ | → Both (notification pass-through, no aggregation) |
 
 ### 3. System Architecture
@@ -262,7 +262,7 @@ When initializing multiple downstream servers in parallel, some may succeed whil
 - Failed `initialize` requests trigger circuit breaker for that specific server
 - Requests routed to failed servers receive `REQUEST_FAILED` with circuit breaker message
 - Client sees degraded functionality (e.g., "pyright unavailable") rather than total failure
-- **Fan-out awareness:** If a method is configured for aggregation (e.g., completion merge_all) and one server is in circuit breaker/open or still uninitialized, the router skips it and proceeds with the available servers. The aggregator marks the response as partial in `data` so UX continues instead of blocking on an unhealthy peer.
+- **Fan-out awareness:** If a method is configured for aggregation (e.g., completion concatenated) and one server is in circuit breaker/open or still uninitialized, the router skips it and proceeds with the available servers. The aggregator marks the response as partial in `data` so UX continues instead of blocking on an unhealthy peer.
 
 ### 6. Notification Handling
 
@@ -809,10 +809,10 @@ languages:
         # Only configure methods that need non-default behavior:
         aggregations:
           textDocument/completion:
-            strategy: merge_all      # both LSes return items → merge
+            strategy: concatenated   # both LSes return items → merge
             dedup_key: label
           textDocument/codeAction:
-            strategy: merge_all      # both LSes return actions → merge
+            strategy: concatenated   # both LSes return actions → merge
           # hover, definition: use default (single_by_capability, no config)
 
 languageServers:
@@ -846,7 +846,7 @@ languageServers:
 - **Complexity**: More state to manage (correlations, circuit breakers, aggregators)
 - **Configuration Surface**: Users need to understand aggregation strategies for overlapping capabilities
 - **Aggregation Complexity**: Merging candidate lists (completion, codeAction) requires deduplication logic to handle cases where multiple servers propose similar items. The challenge is in deduplication heuristics - different servers may propose similar-looking candidates with subtle differences (different labels, kinds, or edit details), making it hard to decide what counts as a "duplicate". Note that merging candidate lists is safe since users select one item; conflicts only arise if the bridge were to automatically apply multiple edits simultaneously (which is not the design).
-- **Latency**: Fan-out with `merge_all` waits up to per-server timeouts; partial results may surface instead of complete lists
+- **Latency**: Fan-out with `concatenated` waits up to per-server timeouts; partial results may surface instead of complete lists
 - **Memory**: Tracking pending correlations adds overhead
 
 ### Neutral
@@ -943,7 +943,7 @@ kakehashi (host)
 
 **What Phase 3 adds:**
 - **Routing strategies** (§4): single-by-capability (default) and fan-out
-- **Response aggregation** (§8): merge_all, first_wins, ranked strategies
+- **Response aggregation** (§8): preferred, concatenated, deduplicated, … strategies
   - **Aggregation complexity**: Deduplication heuristics for candidate lists (completion, codeAction)
   - Challenge: Different servers may propose similar items with subtle differences (labels, kinds, edit details)
   - Safe by design: Users select one item from merged list; no conflicting edits applied simultaneously
@@ -979,7 +979,7 @@ kakehashi (host)
   - **Relationship to ADR-0012**: ADR-0008's per-method strategies remain valid for single-LS routing. However, ADR-0012 clarifies multi-LS aspects:
     - **Diagnostics**: ADR-0008 suggested "merge & dedupe"; ADR-0012 specifies "pass-through" (client aggregates)
     - **Initialization window**: ADR-0008 assumes servers are initialized; ADR-0012 adds "request superseding" and "wait-with-timeout" patterns for requests during initialization
-    - **Multi-server merging**: ADR-0012 provides concrete routing strategies (SingleByCapability, FanOut) and aggregation options (merge_all, first_wins, ranked)
+    - **Multi-server merging**: ADR-0012 provides concrete routing strategies (SingleByCapability, FanOut) and aggregation options (preferred, concatenated, deduplicated, …)
 
 - **[ADR-0009](0009-async-bridge-architecture.md)**: Single-LS async architecture **(Superseded)**
   - Established tokio-based async I/O with request ID routing

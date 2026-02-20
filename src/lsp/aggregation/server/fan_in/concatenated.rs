@@ -1,6 +1,6 @@
-//! All-strategy fan-in for concurrent bridge requests.
+//! Concatenated-strategy fan-in for concurrent bridge requests.
 //!
-//! [`collect_all()`] collects all successful results from a `JoinSet<TaggedResult<T>>`,
+//! [`concatenated()`] collects all successful results from a `JoinSet<TaggedResult<T>>`,
 //! returning `FanInResult<Vec<T>>`. When `priorities` is non-empty, results are
 //! ordered by priority, with unlisted servers appended in insertion order.
 
@@ -42,7 +42,7 @@ fn order_by_priority<T>(tagged: Vec<(String, T)>, priorities: &[String]) -> Vec<
 
 /// Collects all successful results from a JoinSet of concurrent bridge requests.
 ///
-/// Unlike [`super::first_win::first_win()`] which short-circuits on the first non-empty
+/// Unlike [`super::preferred::preferred()`] which short-circuits on the first non-empty
 /// result, this waits for **all** tasks and returns every successful value.
 ///
 /// When `priorities` is non-empty, results are ordered by priority (highest first),
@@ -58,7 +58,7 @@ fn order_by_priority<T>(tagged: Vec<(String, T)>, priorities: &[String]) -> Vec<
 ///
 /// Callers MUST call `pool.unregister_all_for_upstream_id()` after this function returns
 /// to clean up stale entries in the UpstreamRequestRegistry left by aborted tasks.
-pub(crate) async fn collect_all<T: Send + 'static>(
+pub(crate) async fn concatenated<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     priorities: &[String],
     cancel_rx: Option<CancelReceiver>,
@@ -115,26 +115,26 @@ mod tests {
     use crate::lsp::aggregation::server::fan_in::test_helpers::*;
 
     #[tokio::test]
-    async fn collect_all_returns_all_successful_results() {
+    async fn concatenated_returns_all_successful_results() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged(&mut join_set, Ok(1));
         spawn_tagged(&mut join_set, Ok(2));
         spawn_tagged(&mut join_set, Ok(3));
 
-        let result = collect_all(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None).await;
         let mut values = assert_done(result);
         values.sort();
         assert_eq!(values, vec![1, 2, 3]);
     }
 
     #[tokio::test]
-    async fn collect_all_returns_no_result_when_all_fail() {
+    async fn concatenated_returns_no_result_when_all_fail() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 1")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 3")));
 
-        let result = collect_all(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None).await;
         assert_eq!(
             assert_no_result(result),
             3,
@@ -143,22 +143,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_all_includes_successes_despite_errors() {
+    async fn concatenated_includes_successes_despite_errors() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged(&mut join_set, Ok(42));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 1")));
         spawn_tagged(&mut join_set, Err(io::Error::other("fail 2")));
 
-        let result = collect_all(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![42]);
     }
 
     #[tokio::test]
-    async fn collect_all_returns_done_empty_for_empty_join_set() {
+    async fn concatenated_returns_done_empty_for_empty_join_set() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
 
-        let result = collect_all(&mut join_set, &[], None, None).await;
+        let result = concatenated(&mut join_set, &[], None, None).await;
         let values = assert_done(result);
         assert!(
             values.is_empty(),
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_all_returns_cancelled_on_cancel() {
+    async fn concatenated_returns_cancelled_on_cancel() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         join_set.spawn(async {
@@ -180,23 +180,23 @@ mod tests {
 
         tx.send(()).unwrap();
 
-        let result = collect_all(&mut join_set, &[], Some(rx), None).await;
+        let result = concatenated(&mut join_set, &[], Some(rx), None).await;
         assert_cancelled(result);
     }
 
     #[tokio::test]
-    async fn collect_all_returns_done_before_cancel() {
+    async fn concatenated_returns_done_before_cancel() {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged(&mut join_set, Ok(42));
 
-        let result = collect_all(&mut join_set, &[], Some(rx), None).await;
+        let result = concatenated(&mut join_set, &[], Some(rx), None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![42]);
     }
 
     #[tokio::test]
-    async fn collect_all_orders_results_by_priority() {
+    async fn concatenated_orders_results_by_priority() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_c", Ok(3));
         spawn_tagged_named(&mut join_set, "server_a", Ok(1));
@@ -207,13 +207,13 @@ mod tests {
             "server_b".to_string(),
             "server_c".to_string(),
         ];
-        let result = collect_all(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![1, 2, 3]);
     }
 
     #[tokio::test]
-    async fn collect_all_appends_unlisted_servers_after_prioritized() {
+    async fn concatenated_appends_unlisted_servers_after_prioritized() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_x", Ok(99));
         spawn_tagged_named(&mut join_set, "server_a", Ok(1));
@@ -221,7 +221,7 @@ mod tests {
 
         // Only server_a and server_b are prioritized; server_x is unlisted
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = collect_all(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         // Prioritized servers first in order, then unlisted
         assert_eq!(&values[..2], &[1, 2]);
@@ -229,7 +229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_all_with_mixed_priorities_and_errors() {
+    async fn concatenated_with_mixed_priorities_and_errors() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_a", Err(io::Error::other("fail")));
         spawn_tagged_named(&mut join_set, "server_b", Ok(2));
@@ -237,20 +237,20 @@ mod tests {
 
         // server_a is prioritized but fails; server_b succeeds; server_x is unlisted
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = collect_all(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         // server_b (prioritized, succeeded) first, then server_x (unlisted)
         assert_eq!(values, vec![2, 99]);
     }
 
     #[tokio::test]
-    async fn collect_all_skips_absent_priority_servers() {
+    async fn concatenated_skips_absent_priority_servers() {
         let mut join_set: JoinSet<TaggedResult<i32>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_b", Ok(2));
 
         // server_a is in priorities but has no task in the JoinSet
         let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = collect_all(&mut join_set, &priorities, None, None).await;
+        let result = concatenated(&mut join_set, &priorities, None, None).await;
         let values = assert_done(result);
         assert_eq!(values, vec![2]);
     }

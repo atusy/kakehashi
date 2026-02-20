@@ -278,10 +278,10 @@ languages:
         # Per-method aggregation config:
         aggregations:
           textDocument/completion:
-            strategy: merge_all      # Safe: candidates, user selects one
+            strategy: concatenated   # Safe: candidates, user selects one
             dedup_key: label
           textDocument/codeAction:
-            strategy: merge_all      # Safe: proposals, user executes one
+            strategy: concatenated   # Safe: proposals, user executes one
           # hover, definition: use default (single_by_capability)
           # formatting, rename: MUST use single_by_capability
 

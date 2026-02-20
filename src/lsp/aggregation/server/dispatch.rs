@@ -4,7 +4,7 @@
 //! strategy, giving each handler a single call-site for the common pattern.
 //! When `ctx.priorities` is empty, it degrades to pure first-win behavior.
 //!
-//! [`dispatch_collect_all()`] combines [`fan_out()`] with the collect-all
+//! [`dispatch_concatenated()`] combines [`fan_out()`] with the concatenated
 //! strategy, collecting every successful result from all matching servers.
 
 use std::collections::HashSet;
@@ -17,7 +17,7 @@ use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
 use super::fan_in::FanInResult;
-use super::fan_in::{all, preferred};
+use super::fan_in::{concatenated, preferred};
 use super::fan_out::{FanOutTask, fan_out};
 
 /// Pre-filter `ctx.priorities` to keep only server names present in `ctx.configs`.
@@ -54,7 +54,7 @@ where
     preferred::preferred(&mut join_set, is_nonempty, &priorities, cancel_rx).await
 }
 
-/// Server-level aggregation entry point using the collect-all strategy.
+/// Server-level aggregation entry point using the concatenated strategy.
 ///
 /// Fans out one task per matching server and collects every successful result.
 /// When `ctx.priorities` is non-empty, results are ordered by priority, with
@@ -63,8 +63,8 @@ where
 /// or `Cancelled` on cancel notification.
 ///
 /// Pre-filters `ctx.priorities` against `ctx.configs` to ensure only
-/// configured server names are passed to the collect-all algorithm.
-pub(crate) async fn dispatch_collect_all<T, F, Fut>(
+/// configured server names are passed to the concatenated algorithm.
+pub(crate) async fn dispatch_concatenated<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
@@ -78,5 +78,5 @@ where
 {
     let priorities = effective_priorities(ctx);
     let mut join_set = fan_out(ctx, pool, f);
-    all::collect_all(&mut join_set, &priorities, cancel_rx, log_target).await
+    concatenated::concatenated(&mut join_set, &priorities, cancel_rx, log_target).await
 }
