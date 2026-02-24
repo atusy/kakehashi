@@ -224,8 +224,12 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_inlay_hint_request(&virtual_uri, host_range, RegionOffset::new(5, 0), RequestId::new(1));
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(5, 0),
+            RequestId::new(1),
+        );
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -295,8 +299,12 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_inlay_hint_request(&virtual_uri, host_range, RegionOffset::new(5, 4), RequestId::new(1));
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(5, 4),
+            RequestId::new(1),
+        );
 
         // Start: virtual line 0 -> character 10 - 4 = 6
         assert_eq!(request["params"]["range"]["start"]["line"], 0);
@@ -325,8 +333,12 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_inlay_hint_request(&virtual_uri, host_range, RegionOffset::new(5, 4), RequestId::new(1));
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(5, 4),
+            RequestId::new(1),
+        );
 
         // Start: virtual line 2 -> character unchanged
         assert_eq!(request["params"]["range"]["start"]["line"], 2);
@@ -355,8 +367,12 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_inlay_hint_request(&virtual_uri, host_range, RegionOffset::new(10, 0), RequestId::new(1));
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(10, 0),
+            RequestId::new(1),
+        );
 
         // saturating_sub: 2 - 10 = 0, 5 - 10 = 0
         assert_eq!(request["params"]["range"]["start"]["line"], 0);
@@ -512,9 +528,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, RegionOffset::new(10, 0))
-                .unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         assert_eq!(hints[0].position.line, 10);
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
@@ -557,9 +577,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, RegionOffset::new(10, 0))
-                .unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
             assert_eq!(parts.len(), 1);
@@ -611,9 +635,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, RegionOffset::new(10, 0))
-                .unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
             assert_eq!(parts.len(), 1, "Cross-region part should be filtered out");
@@ -697,9 +725,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, RegionOffset::new(10, 0))
-                .unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
             assert_eq!(parts.len(), 2);

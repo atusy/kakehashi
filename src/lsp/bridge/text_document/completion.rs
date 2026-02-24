@@ -287,8 +287,10 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -338,8 +340,10 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -383,8 +387,10 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -425,8 +431,10 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -599,8 +607,12 @@ mod tests {
             line: 5,
             character: 14,
         };
-        let request =
-            build_completion_request(&virtual_uri, host_pos, RegionOffset::new(5, 4), test_request_id());
+        let request = build_completion_request(
+            &virtual_uri,
+            host_pos,
+            RegionOffset::new(5, 4),
+            test_request_id(),
+        );
 
         assert_eq!(request["params"]["position"]["line"], 0); // 5 - 5
         assert_eq!(request["params"]["position"]["character"], 10); // 14 - 4
@@ -614,8 +626,12 @@ mod tests {
             line: 7,
             character: 14,
         };
-        let request =
-            build_completion_request(&virtual_uri, host_pos, RegionOffset::new(5, 4), test_request_id());
+        let request = build_completion_request(
+            &virtual_uri,
+            host_pos,
+            RegionOffset::new(5, 4),
+            test_request_id(),
+        );
 
         assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
         assert_eq!(request["params"]["position"]["character"], 14); // unchanged
@@ -640,8 +656,10 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();

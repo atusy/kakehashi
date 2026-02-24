@@ -223,8 +223,12 @@ mod tests {
         };
 
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request =
-            build_hover_request(&virtual_uri, host_position, RegionOffset::new(3, 0), test_request_id());
+        let request = build_hover_request(
+            &virtual_uri,
+            host_position,
+            RegionOffset::new(3, 0),
+            test_request_id(),
+        );
 
         assert_eq!(
             request["params"]["position"]["line"], 0,
@@ -241,8 +245,12 @@ mod tests {
         };
 
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request =
-            build_hover_request(&virtual_uri, host_position, RegionOffset::new(0, 0), test_request_id());
+        let request = build_hover_request(
+            &virtual_uri,
+            host_position,
+            RegionOffset::new(0, 0),
+            test_request_id(),
+        );
 
         assert_eq!(
             request["params"]["position"]["line"], 5,
@@ -299,7 +307,8 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -351,7 +360,8 @@ mod tests {
         });
         let region_start_line = 0;
 
-        let transformed = transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -377,7 +387,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -408,7 +419,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed =
+            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();

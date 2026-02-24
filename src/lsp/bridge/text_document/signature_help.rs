@@ -262,8 +262,10 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed =
-            transform_signature_help_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_signature_help_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
@@ -285,7 +287,8 @@ mod tests {
     fn signature_help_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_signature_help_response_to_host(response, RegionOffset::new(3, 0));
+        let transformed =
+            transform_signature_help_response_to_host(response, RegionOffset::new(3, 0));
         assert!(transformed.is_none());
     }
 
@@ -305,8 +308,10 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed =
-            transform_signature_help_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_signature_help_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
@@ -338,8 +343,10 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed =
-            transform_signature_help_response_to_host(response, RegionOffset::new(region_start_line, 0));
+        let transformed = transform_signature_help_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
