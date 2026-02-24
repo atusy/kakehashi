@@ -14,7 +14,7 @@ use tower_lsp_server::ls_types::{
     DocumentColorParams,
 };
 use tower_lsp_server::ls_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
+    CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
     DiagnosticOptions, DiagnosticServerCapabilities, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
@@ -1169,6 +1169,7 @@ impl LanguageServer for Kakehashi {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 signature_help_provider: Some(SignatureHelpOptions {
@@ -1577,6 +1578,10 @@ impl LanguageServer for Kakehashi {
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         self.completion_impl(params).await
+    }
+
+    async fn completion_resolve(&self, params: CompletionItem) -> Result<CompletionItem> {
+        self.completion_resolve_impl(params).await
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {

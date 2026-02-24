@@ -4,6 +4,7 @@ expression: capabilities
 ---
 {
   "completionProvider": {
+    "resolveProvider": true,
     "triggerCharacters": [
       ".",
       ":"
