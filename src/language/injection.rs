@@ -293,6 +293,11 @@ impl CacheableInjectionRegion {
     /// Create from an InjectionRegionInfo, extracting position data from the node
     pub fn from_region_info(info: &InjectionRegionInfo<'_>, region_id: &str, text: &str) -> Self {
         let node = &info.content_node;
+        debug_assert!(
+            node.start_byte() < node.end_byte(),
+            "from_region_info called with zero-width node at byte {}",
+            node.start_byte(),
+        );
         let content = &text[node.start_byte()..node.end_byte()];
 
         // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
@@ -364,6 +369,9 @@ pub fn collect_all_injections<'a>(
 
     while let Some(match_) = matches.next() {
         for capture in iter_valid_injection_content_captures(match_, query, text) {
+            if capture.node.start_byte() >= capture.node.end_byte() {
+                continue;
+            }
             if let Some(language) = extract_injection_language(query, match_, text) {
                 let key = (capture.node.start_byte(), capture.node.end_byte());
                 injections_map.entry(key).or_insert(InjectionRegionInfo {
