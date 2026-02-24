@@ -37,7 +37,7 @@ use tower_lsp_server::ls_types::{DocumentSymbol, SymbolInformation};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RequestId, VirtualDocumentUri, build_whole_document_request};
+use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request};
 use super::super::protocol::{translate_virtual_position_to_host, translate_virtual_range_to_host};
 
 impl LanguageServerPool {
@@ -58,8 +58,7 @@ impl LanguageServerPool {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<DocumentSymbol>>> {
@@ -75,8 +74,7 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
-            region_start_column,
+            offset,
             virtual_content,
             upstream_request_id,
             build_document_symbol_request,
@@ -84,8 +82,7 @@ impl LanguageServerPool {
                 transform_document_symbol_response_to_host(
                     response,
                     &ctx.virtual_uri_string,
-                    ctx.region_start_line,
-                    ctx.region_start_column,
+                    ctx.offset,
                 )
             },
         )
@@ -132,8 +129,7 @@ fn build_document_symbol_request(
 fn transform_document_symbol_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<DocumentSymbol>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentSymbol: {}", error);
@@ -159,12 +155,11 @@ fn transform_document_symbol_response_to_host(
         transform_symbol_information_response(
             result,
             request_virtual_uri,
-            region_start_line,
-            region_start_column,
+            offset,
         )
     } else {
         // DocumentSymbol[] format
-        transform_document_symbol_nested_response(result, region_start_line, region_start_column)
+        transform_document_symbol_nested_response(result, offset)
     }
 }
 
@@ -185,8 +180,7 @@ fn transform_document_symbol_response_to_host(
 fn transform_symbol_information_response(
     result: serde_json::Value,
     request_virtual_uri: &str,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<DocumentSymbol>> {
     let symbols: Vec<SymbolInformation> = serde_json::from_value(result).ok()?;
 
@@ -212,8 +206,8 @@ fn transform_symbol_information_response(
         .map(|symbol| {
             let mut start = symbol.location.range.start;
             let mut end = symbol.location.range.end;
-            translate_virtual_position_to_host(&mut start, region_start_line, region_start_column);
-            translate_virtual_position_to_host(&mut end, region_start_line, region_start_column);
+            translate_virtual_position_to_host(&mut start, offset);
+            translate_virtual_position_to_host(&mut end, offset);
             let range = tower_lsp_server::ls_types::Range { start, end };
 
             DocumentSymbol {
@@ -238,12 +232,11 @@ fn transform_symbol_information_response(
 /// and selectionRange in all items and their children.
 fn transform_document_symbol_nested_response(
     result: serde_json::Value,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<DocumentSymbol>> {
     let mut symbols: Vec<DocumentSymbol> = serde_json::from_value(result).ok()?;
     for symbol in &mut symbols {
-        transform_document_symbol_ranges(symbol, region_start_line, region_start_column);
+        transform_document_symbol_ranges(symbol, offset);
     }
     Some(symbols)
 }
@@ -253,19 +246,17 @@ fn transform_document_symbol_nested_response(
 /// Uses saturating_add to prevent overflow for large line numbers.
 fn transform_document_symbol_ranges(
     symbol: &mut DocumentSymbol,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) {
-    translate_virtual_range_to_host(&mut symbol.range, region_start_line, region_start_column);
+    translate_virtual_range_to_host(&mut symbol.range, offset);
     translate_virtual_range_to_host(
         &mut symbol.selection_range,
-        region_start_line,
-        region_start_column,
+        offset,
     );
 
     if let Some(children) = &mut symbol.children {
         for child in children {
-            transform_document_symbol_ranges(child, region_start_line, region_start_column);
+            transform_document_symbol_ranges(child, offset);
         }
     }
 }
@@ -348,7 +339,7 @@ mod tests {
             ]
         });
 
-        let symbols = transform_document_symbol_response_to_host(response, "unused", 3, 0).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 3, column: 0 }).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].range.start.line, 3);
@@ -407,7 +398,7 @@ mod tests {
             ]
         });
 
-        let symbols = transform_document_symbol_response_to_host(response, "unused", 5, 0).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 5, column: 0 }).unwrap();
 
         assert_eq!(symbols[0].range.start.line, 5);
         assert_eq!(symbols[0].range.end.line, 15);
@@ -461,8 +452,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
-            7,
-            0,
+            RegionOffset { line: 7, column: 0 },
         )
         .unwrap();
 
@@ -480,7 +470,7 @@ mod tests {
     fn document_symbol_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_symbol_response_to_host(response, "unused", 5, 0);
+        let transformed = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 5, column: 0 });
         assert!(transformed.is_none());
     }
 
@@ -488,7 +478,7 @@ mod tests {
     fn document_symbol_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let symbols = transform_document_symbol_response_to_host(response, "unused", 5, 0).unwrap();
+        let symbols = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 5, column: 0 }).unwrap();
         assert!(symbols.is_empty());
     }
 
@@ -514,7 +504,7 @@ mod tests {
         });
 
         let symbols =
-            transform_document_symbol_response_to_host(response, virtual_uri, 7, 0).unwrap();
+            transform_document_symbol_response_to_host(response, virtual_uri, RegionOffset { line: 7, column: 0 }).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "myVariable");
@@ -553,7 +543,7 @@ mod tests {
         });
 
         let symbols =
-            transform_document_symbol_response_to_host(response, request_virtual_uri, 5, 0)
+            transform_document_symbol_response_to_host(response, request_virtual_uri, RegionOffset { line: 5, column: 0 })
                 .unwrap();
 
         assert!(
@@ -600,7 +590,7 @@ mod tests {
         });
 
         let symbols =
-            transform_document_symbol_response_to_host(response, request_virtual_uri, 5, 0)
+            transform_document_symbol_response_to_host(response, request_virtual_uri, RegionOffset { line: 5, column: 0 })
                 .unwrap();
 
         // Only the same-region virtual URI symbol should remain.
@@ -636,7 +626,7 @@ mod tests {
         });
 
         let symbols =
-            transform_document_symbol_response_to_host(response, "unused", 10, 0).unwrap();
+            transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 10, column: 0 }).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(
@@ -670,7 +660,7 @@ mod tests {
         });
 
         let symbols =
-            transform_document_symbol_response_to_host(response, virtual_uri, 0, 0).unwrap();
+            transform_document_symbol_response_to_host(response, virtual_uri, RegionOffset { line: 0, column: 0 }).unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].tags.as_ref().unwrap().len(), 1);

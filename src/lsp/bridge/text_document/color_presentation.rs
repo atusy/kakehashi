@@ -22,7 +22,7 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    translate_host_range_to_virtual, translate_virtual_range_to_host, RequestId,
+    translate_host_range_to_virtual, translate_virtual_range_to_host, RegionOffset, RequestId,
     VirtualDocumentUri,
 };
 
@@ -42,8 +42,7 @@ impl LanguageServerPool {
         color: &serde_json::Value,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<ColorPresentation>> {
@@ -59,8 +58,7 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
-            region_start_column,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
@@ -68,16 +66,14 @@ impl LanguageServerPool {
                     virtual_uri,
                     host_range,
                     color,
-                    region_start_line,
-                    region_start_column,
+                    offset,
                     request_id,
                 )
             },
             |response, ctx| {
                 transform_color_presentation_response_to_host(
                     response,
-                    ctx.region_start_line,
-                    ctx.region_start_column,
+                    ctx.offset,
                 )
             },
         )
@@ -98,13 +94,12 @@ fn build_color_presentation_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
     color: &serde_json::Value,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     // Translate range from host to virtual coordinates
     let mut virtual_range = host_range;
-    translate_host_range_to_virtual(&mut virtual_range, region_start_line, region_start_column);
+    translate_host_range_to_virtual(&mut virtual_range, offset);
 
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -142,8 +137,7 @@ fn build_color_presentation_request(
 /// * `region_start_column` - The starting column of the injection region in the host document
 fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Vec<ColorPresentation> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/colorPresentation: {}", error);
@@ -167,8 +161,7 @@ fn transform_color_presentation_response_to_host(
         if let Some(text_edit) = &mut presentation.text_edit {
             translate_virtual_range_to_host(
                 &mut text_edit.range,
-                region_start_line,
-                region_start_column,
+                offset,
             );
         }
 
@@ -176,8 +169,7 @@ fn transform_color_presentation_response_to_host(
             for edit in additional_edits.iter_mut() {
                 translate_virtual_range_to_host(
                     &mut edit.range,
-                    region_start_line,
-                    region_start_column,
+                    offset,
                 );
             }
         }
@@ -225,8 +217,7 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            3,
-            0,
+            RegionOffset { line: 3, column: 0 },
             RequestId::new(42),
         );
 
@@ -274,8 +265,7 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            3,
-            0,
+            RegionOffset { line: 3, column: 0 },
             RequestId::new(42),
         );
 
@@ -327,8 +317,7 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            3,
-            0,
+            RegionOffset { line: 3, column: 0 },
             RequestId::new(42),
         );
 
@@ -366,8 +355,7 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            3,
-            5,
+            RegionOffset { line: 3, column: 5 },
             RequestId::new(42),
         );
 
@@ -404,8 +392,7 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            3,
-            5,
+            RegionOffset { line: 3, column: 5 },
             RequestId::new(42),
         );
 
@@ -448,8 +435,7 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            10, // region_start_line > range lines
-            0,
+            RegionOffset { line: 10, column: 0 }, // region_start_line > range lines
             RequestId::new(42),
         );
 
@@ -489,7 +475,7 @@ mod tests {
         let region_start_line = 5;
 
         let presentations =
-            transform_color_presentation_response_to_host(response, region_start_line, 0);
+            transform_color_presentation_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert_eq!(presentations.len(), 1);
         let text_edit = presentations[0].text_edit.as_ref().unwrap();
@@ -534,7 +520,7 @@ mod tests {
         let region_start_line = 3;
 
         let presentations =
-            transform_color_presentation_response_to_host(response, region_start_line, 0);
+            transform_color_presentation_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert_eq!(presentations.len(), 1);
         let text_edit = presentations[0].text_edit.as_ref().unwrap();
@@ -563,7 +549,7 @@ mod tests {
         let region_start_line = 5;
 
         let presentations =
-            transform_color_presentation_response_to_host(response, region_start_line, 0);
+            transform_color_presentation_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert_eq!(presentations.len(), 3);
         assert_eq!(presentations[0].label, "#ff0000");
@@ -578,7 +564,7 @@ mod tests {
     fn color_presentation_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let presentations = transform_color_presentation_response_to_host(response, 5, 0);
+        let presentations = transform_color_presentation_response_to_host(response, RegionOffset { line: 5, column: 0 });
         assert!(presentations.is_empty());
     }
 
@@ -586,7 +572,7 @@ mod tests {
     fn color_presentation_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let presentations = transform_color_presentation_response_to_host(response, 5, 0);
+        let presentations = transform_color_presentation_response_to_host(response, RegionOffset { line: 5, column: 0 });
         assert!(presentations.is_empty());
     }
 }

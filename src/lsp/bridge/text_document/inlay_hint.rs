@@ -23,7 +23,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     translate_host_range_to_virtual, translate_virtual_position_to_host,
-    translate_virtual_range_to_host, RequestId, VirtualDocumentUri,
+    translate_virtual_range_to_host, RegionOffset, RequestId, VirtualDocumentUri,
 };
 
 impl LanguageServerPool {
@@ -41,8 +41,7 @@ impl LanguageServerPool {
         host_range: Range,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<InlayHint>>> {
@@ -58,16 +57,14 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
-            region_start_column,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
                 build_inlay_hint_request(
                     virtual_uri,
                     host_range,
-                    region_start_line,
-                    region_start_column,
+                    offset,
                     request_id,
                 )
             },
@@ -76,8 +73,7 @@ impl LanguageServerPool {
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
-                    ctx.region_start_line,
-                    ctx.region_start_column,
+                    ctx.offset,
                 )
             },
         )
@@ -99,13 +95,12 @@ impl LanguageServerPool {
 fn build_inlay_hint_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     // Translate range from host to virtual coordinates
     let mut virtual_range = host_range;
-    translate_host_range_to_virtual(&mut virtual_range, region_start_line, region_start_column);
+    translate_host_range_to_virtual(&mut virtual_range, offset);
 
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -146,14 +141,12 @@ fn build_inlay_hint_request(
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `region_start_line` - Line offset to add when transforming to host coordinates
-/// * `region_start_column` - Column offset to add on virtual line 0
+/// * `offset` - The region offset for coordinate translation
 fn transform_inlay_hint_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<InlayHint>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/inlayHint: {}", error);
@@ -171,8 +164,7 @@ fn transform_inlay_hint_response_to_host(
         // Transform position to host coordinates
         translate_virtual_position_to_host(
             &mut hint.position,
-            region_start_line,
-            region_start_column,
+            offset,
         );
 
         // Transform textEdits ranges
@@ -180,8 +172,7 @@ fn transform_inlay_hint_response_to_host(
             for edit in text_edits.iter_mut() {
                 translate_virtual_range_to_host(
                     &mut edit.range,
-                    region_start_line,
-                    region_start_column,
+                    offset,
                 );
             }
         }
@@ -205,8 +196,7 @@ fn transform_inlay_hint_response_to_host(
                     location.uri = host_uri.clone();
                     translate_virtual_range_to_host(
                         &mut location.range,
-                        region_start_line,
-                        region_start_column,
+                        offset,
                     );
                     return true;
                 }
@@ -225,6 +215,10 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    fn offset(line: u32, column: u32) -> RegionOffset {
+        RegionOffset { line, column }
+    }
 
     // ==========================================================================
     // Inlay hint request builder tests
@@ -248,7 +242,7 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_inlay_hint_request(&virtual_uri, host_range, 5, 0, RequestId::new(1));
+        let request = build_inlay_hint_request(&virtual_uri, host_range, offset(5, 0), RequestId::new(1));
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -285,8 +279,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            region_start_line,
-            0,
+            offset(region_start_line, 0),
             RequestId::new(42),
         );
 
@@ -319,7 +312,7 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_inlay_hint_request(&virtual_uri, host_range, 5, 4, RequestId::new(1));
+        let request = build_inlay_hint_request(&virtual_uri, host_range, offset(5, 4), RequestId::new(1));
 
         // Start: virtual line 0 -> character 10 - 4 = 6
         assert_eq!(request["params"]["range"]["start"]["line"], 0);
@@ -348,7 +341,7 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_inlay_hint_request(&virtual_uri, host_range, 5, 4, RequestId::new(1));
+        let request = build_inlay_hint_request(&virtual_uri, host_range, offset(5, 4), RequestId::new(1));
 
         // Start: virtual line 2 -> character unchanged
         assert_eq!(request["params"]["range"]["start"]["line"], 2);
@@ -377,7 +370,7 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_inlay_hint_request(&virtual_uri, host_range, 10, 0, RequestId::new(1));
+        let request = build_inlay_hint_request(&virtual_uri, host_range, offset(10, 0), RequestId::new(1));
 
         // saturating_sub: 2 - 10 = 0, 5 - 10 = 0
         assert_eq!(request["params"]["range"]["start"]["line"], 0);
@@ -420,8 +413,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
-            0,
+            offset(5, 0),
         );
 
         let hints = hints.unwrap();
@@ -442,8 +434,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
-            0,
+            offset(5, 0),
         );
         assert!(result.is_none());
     }
@@ -456,8 +447,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
-            0,
+            offset(5, 0),
         );
 
         assert!(hints.is_some());
@@ -495,8 +485,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
-            0,
+            offset(5, 0),
         )
         .unwrap();
 
@@ -537,7 +526,7 @@ mod tests {
             }]
         });
 
-        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10, 0)
+        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, offset(10, 0))
             .unwrap();
 
         assert_eq!(hints[0].position.line, 10);
@@ -581,7 +570,7 @@ mod tests {
             }]
         });
 
-        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10, 0)
+        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, offset(10, 0))
             .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
@@ -634,7 +623,7 @@ mod tests {
             }]
         });
 
-        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10, 0)
+        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, offset(10, 0))
             .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
@@ -672,8 +661,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            region_start_line,
-            0,
+            offset(region_start_line, 0),
         );
 
         assert!(hints.is_some());
@@ -720,7 +708,7 @@ mod tests {
             }]
         });
 
-        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10, 0)
+        let hints = transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, offset(10, 0))
             .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {

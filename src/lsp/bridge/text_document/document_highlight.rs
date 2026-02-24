@@ -18,7 +18,7 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based_request};
+use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request};
 
 impl LanguageServerPool {
     /// Send a document highlight request and wait for the response.
@@ -35,8 +35,7 @@ impl LanguageServerPool {
         host_position: Position,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<DocumentHighlight>>> {
@@ -52,24 +51,21 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
-            region_start_column,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
                 build_document_highlight_request(
                     virtual_uri,
                     host_position,
-                    region_start_line,
-                    region_start_column,
+                    offset,
                     request_id,
                 )
             },
             |response, ctx| {
                 transform_document_highlight_response_to_host(
                     response,
-                    ctx.region_start_line,
-                    ctx.region_start_column,
+                    ctx.offset,
                 )
             },
         )
@@ -84,15 +80,13 @@ impl LanguageServerPool {
 fn build_document_highlight_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
-        region_start_line,
-        region_start_column,
+        offset,
         request_id,
         "textDocument/documentHighlight",
     )
@@ -109,8 +103,7 @@ fn build_document_highlight_request(
 /// * `region_start_column` - The starting column of the injection region on its first host line
 fn transform_document_highlight_response_to_host(
     mut response: serde_json::Value,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<DocumentHighlight>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentHighlight: {}", error);
@@ -128,8 +121,7 @@ fn transform_document_highlight_response_to_host(
     for highlight in &mut highlights {
         translate_virtual_range_to_host(
             &mut highlight.range,
-            region_start_line,
-            region_start_column,
+            offset,
         );
     }
 
@@ -157,7 +149,7 @@ mod tests {
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request =
-            build_document_highlight_request(&virtual_uri, position, 3, 0, RequestId::new(42));
+            build_document_highlight_request(&virtual_uri, position, RegionOffset { line: 3, column: 0 }, RequestId::new(42));
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -187,7 +179,7 @@ mod tests {
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request =
-            build_document_highlight_request(&virtual_uri, position, 3, 0, RequestId::new(42));
+            build_document_highlight_request(&virtual_uri, position, RegionOffset { line: 3, column: 0 }, RequestId::new(42));
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 42);
@@ -227,7 +219,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_document_highlight_response_to_host(response, region_start_line, 0);
+            transform_document_highlight_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
@@ -248,7 +240,7 @@ mod tests {
     fn document_highlight_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_highlight_response_to_host(response, 5, 0);
+        let transformed = transform_document_highlight_response_to_host(response, RegionOffset { line: 5, column: 0 });
         assert!(transformed.is_none());
     }
 
@@ -256,7 +248,7 @@ mod tests {
     fn document_highlight_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed = transform_document_highlight_response_to_host(response, 5, 0);
+        let transformed = transform_document_highlight_response_to_host(response, RegionOffset { line: 5, column: 0 });
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
         assert!(highlights.is_empty());
@@ -281,7 +273,7 @@ mod tests {
         let region_start_line = 10;
 
         let transformed =
-            transform_document_highlight_response_to_host(response, region_start_line, 0);
+            transform_document_highlight_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
@@ -316,7 +308,7 @@ mod tests {
         let region_start_line = 10;
 
         let transformed =
-            transform_document_highlight_response_to_host(response, region_start_line, 0);
+            transform_document_highlight_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();

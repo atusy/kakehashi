@@ -5,6 +5,19 @@
 
 use tower_lsp_server::ls_types::{Position, Range};
 
+/// The starting offset of an injection region in the host document.
+///
+/// Bundles the line and column offset that are always passed together
+/// through the bridge request/response pipeline for coordinate translation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RegionOffset {
+    /// The starting line of the injection region in the host document.
+    pub line: u32,
+    /// The starting column (UTF-16 code units) on the first host line.
+    /// Only applied to virtual line 0.
+    pub column: u32,
+}
+
 // =============================================================================
 // Virtual -> Host (response direction)
 // =============================================================================
@@ -13,28 +26,20 @@ use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// On virtual line 0, adds column offset to character.
 /// Uses saturating arithmetic for race-condition safety.
-pub(crate) fn translate_virtual_position_to_host(
-    pos: &mut Position,
-    region_start_line: u32,
-    region_start_column: u32,
-) {
+pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: RegionOffset) {
     let was_first_line = pos.line == 0;
-    pos.line = pos.line.saturating_add(region_start_line);
+    pos.line = pos.line.saturating_add(offset.line);
     if was_first_line {
-        pos.character = pos.character.saturating_add(region_start_column);
+        pos.character = pos.character.saturating_add(offset.column);
     }
 }
 
 /// Translate a virtual range to host coordinates.
 ///
 /// Applies position translation to both start and end.
-pub(crate) fn translate_virtual_range_to_host(
-    range: &mut Range,
-    region_start_line: u32,
-    region_start_column: u32,
-) {
-    translate_virtual_position_to_host(&mut range.start, region_start_line, region_start_column);
-    translate_virtual_position_to_host(&mut range.end, region_start_line, region_start_column);
+pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: RegionOffset) {
+    translate_virtual_position_to_host(&mut range.start, offset);
+    translate_virtual_position_to_host(&mut range.end, offset);
 }
 
 // =============================================================================
@@ -48,15 +53,11 @@ pub(crate) fn translate_virtual_range_to_host(
 /// stale region data (race condition), the column offset is NOT applied to avoid
 /// compounding the already-invalid result.
 /// Uses saturating arithmetic for race-condition safety.
-pub(crate) fn translate_host_position_to_virtual(
-    pos: &mut Position,
-    region_start_line: u32,
-    region_start_column: u32,
-) {
-    let underflowed = pos.line < region_start_line;
-    pos.line = pos.line.saturating_sub(region_start_line);
+pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: RegionOffset) {
+    let underflowed = pos.line < offset.line;
+    pos.line = pos.line.saturating_sub(offset.line);
     if pos.line == 0 && !underflowed {
-        pos.character = pos.character.saturating_sub(region_start_column);
+        pos.character = pos.character.saturating_sub(offset.column);
     }
 }
 
@@ -67,18 +68,18 @@ pub(crate) fn translate_host_position_to_virtual(
 /// underflows (stale region data) but the end line does not, only the start
 /// will skip column adjustment. This is intentional — each endpoint should
 /// degrade independently rather than coupling their error behavior.
-pub(crate) fn translate_host_range_to_virtual(
-    range: &mut Range,
-    region_start_line: u32,
-    region_start_column: u32,
-) {
-    translate_host_position_to_virtual(&mut range.start, region_start_line, region_start_column);
-    translate_host_position_to_virtual(&mut range.end, region_start_line, region_start_column);
+pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: RegionOffset) {
+    translate_host_position_to_virtual(&mut range.start, offset);
+    translate_host_position_to_virtual(&mut range.end, offset);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offset(line: u32, column: u32) -> RegionOffset {
+        RegionOffset { line, column }
+    }
 
     // ======================================================================
     // translate_virtual_position_to_host
@@ -90,7 +91,7 @@ mod tests {
             line: 0,
             character: 5,
         };
-        translate_virtual_position_to_host(&mut pos, 10, 4);
+        translate_virtual_position_to_host(&mut pos, offset(10, 4));
         assert_eq!(pos.line, 10);
         assert_eq!(pos.character, 9); // 5 + 4
     }
@@ -101,7 +102,7 @@ mod tests {
             line: 2,
             character: 5,
         };
-        translate_virtual_position_to_host(&mut pos, 10, 4);
+        translate_virtual_position_to_host(&mut pos, offset(10, 4));
         assert_eq!(pos.line, 12);
         assert_eq!(pos.character, 5); // unchanged
     }
@@ -112,7 +113,7 @@ mod tests {
             line: 0,
             character: u32::MAX,
         };
-        translate_virtual_position_to_host(&mut pos, 10, 4);
+        translate_virtual_position_to_host(&mut pos, offset(10, 4));
         assert_eq!(pos.character, u32::MAX);
     }
 
@@ -132,7 +133,7 @@ mod tests {
                 character: 8,
             },
         };
-        translate_virtual_range_to_host(&mut range, 5, 3);
+        translate_virtual_range_to_host(&mut range, offset(5, 3));
         assert_eq!(range.start.line, 5);
         assert_eq!(range.start.character, 5); // 2 + 3
         assert_eq!(range.end.line, 5);
@@ -151,7 +152,7 @@ mod tests {
                 character: 8,
             },
         };
-        translate_virtual_range_to_host(&mut range, 5, 3);
+        translate_virtual_range_to_host(&mut range, offset(5, 3));
         assert_eq!(range.start.line, 5);
         assert_eq!(range.start.character, 5); // 2 + 3
         assert_eq!(range.end.line, 6);
@@ -170,7 +171,7 @@ mod tests {
                 character: 8,
             },
         };
-        translate_virtual_range_to_host(&mut range, 5, 3);
+        translate_virtual_range_to_host(&mut range, offset(5, 3));
         assert_eq!(range.start.line, 6);
         assert_eq!(range.start.character, 2); // unchanged
         assert_eq!(range.end.line, 8);
@@ -189,7 +190,7 @@ mod tests {
             line: 10,
             character: 9,
         };
-        translate_host_position_to_virtual(&mut pos, 10, 4);
+        translate_host_position_to_virtual(&mut pos, offset(10, 4));
         assert_eq!(pos.line, 0);
         assert_eq!(pos.character, 5); // 9 - 4
     }
@@ -202,7 +203,7 @@ mod tests {
             line: 12,
             character: 5,
         };
-        translate_host_position_to_virtual(&mut pos, 10, 4);
+        translate_host_position_to_virtual(&mut pos, offset(10, 4));
         assert_eq!(pos.line, 2);
         assert_eq!(pos.character, 5); // unchanged
     }
@@ -213,7 +214,7 @@ mod tests {
             line: 5,
             character: 8,
         };
-        translate_host_position_to_virtual(&mut pos, 10, 4);
+        translate_host_position_to_virtual(&mut pos, offset(10, 4));
         assert_eq!(pos.line, 0);
         // Line underflowed (stale data), so column offset is NOT applied
         assert_eq!(pos.character, 8);
@@ -225,7 +226,7 @@ mod tests {
             line: 10,
             character: 2,
         };
-        translate_host_position_to_virtual(&mut pos, 10, 10);
+        translate_host_position_to_virtual(&mut pos, offset(10, 10));
         assert_eq!(pos.line, 0);
         assert_eq!(pos.character, 0); // saturated
     }
@@ -246,7 +247,7 @@ mod tests {
                 character: 13,
             },
         };
-        translate_host_range_to_virtual(&mut range, 5, 3);
+        translate_host_range_to_virtual(&mut range, offset(5, 3));
         assert_eq!(range.start.line, 0);
         assert_eq!(range.start.character, 4); // 7 - 3
         assert_eq!(range.end.line, 0);
@@ -265,7 +266,7 @@ mod tests {
                 character: 8,
             },
         };
-        translate_host_range_to_virtual(&mut range, 5, 3);
+        translate_host_range_to_virtual(&mut range, offset(5, 3));
         assert_eq!(range.start.line, 0);
         assert_eq!(range.start.character, 4); // 7 - 3
         assert_eq!(range.end.line, 1);
@@ -284,7 +285,7 @@ mod tests {
                 character: 8,
             },
         };
-        translate_host_range_to_virtual(&mut range, 5, 3);
+        translate_host_range_to_virtual(&mut range, offset(5, 3));
         assert_eq!(range.start.line, 1);
         assert_eq!(range.start.character, 2); // unchanged
         assert_eq!(range.end.line, 3);

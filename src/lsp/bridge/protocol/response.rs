@@ -18,7 +18,7 @@
 
 use log::warn;
 
-use super::translation::translate_virtual_range_to_host;
+use super::translation::{RegionOffset, translate_virtual_range_to_host};
 use super::virtual_uri::VirtualDocumentUri;
 use tower_lsp_server::ls_types::{Location, LocationLink, Uri};
 
@@ -47,14 +47,12 @@ use tower_lsp_server::ls_types::{Location, LocationLink, Uri};
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `region_start_line` - Line offset to add when transforming to host coordinates
-/// * `region_start_column` - Column offset to add on virtual line 0
+/// * `offset` - The region offset for coordinate translation
 pub(crate) fn transform_goto_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<LocationLink>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for goto request: {}", error);
@@ -74,8 +72,7 @@ pub(crate) fn transform_goto_response_to_host(
                 location,
                 request_virtual_uri,
                 host_uri,
-                region_start_line,
-                region_start_column,
+                offset,
             )
             .map(|loc| vec![location_to_location_link(loc)]);
         }
@@ -98,8 +95,7 @@ pub(crate) fn transform_goto_response_to_host(
                             link,
                             request_virtual_uri,
                             host_uri,
-                            region_start_line,
-                            region_start_column,
+                            offset,
                         )
                     })
                     .collect();
@@ -117,8 +113,7 @@ pub(crate) fn transform_goto_response_to_host(
                             location,
                             request_virtual_uri,
                             host_uri,
-                            region_start_line,
-                            region_start_column,
+                            offset,
                         )
                         .map(location_to_location_link)
                     })
@@ -172,8 +167,7 @@ pub(crate) fn transform_location_for_goto(
     mut location: Location,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Location> {
     let uri_str = location.uri.as_str();
 
@@ -185,11 +179,7 @@ pub(crate) fn transform_location_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         location.uri = host_uri.clone();
-        translate_virtual_range_to_host(
-            &mut location.range,
-            region_start_line,
-            region_start_column,
-        );
+        translate_virtual_range_to_host(&mut location.range, offset);
         return Some(location);
     }
 
@@ -207,8 +197,7 @@ fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<LocationLink> {
     let uri_str = link.target_uri.as_str();
 
@@ -220,18 +209,10 @@ fn transform_location_link_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         link.target_uri = host_uri.clone();
-        translate_virtual_range_to_host(
-            &mut link.target_range,
-            region_start_line,
-            region_start_column,
-        );
-        translate_virtual_range_to_host(
-            &mut link.target_selection_range,
-            region_start_line,
-            region_start_column,
-        );
+        translate_virtual_range_to_host(&mut link.target_range, offset);
+        translate_virtual_range_to_host(&mut link.target_selection_range, offset);
         if let Some(ref mut origin_range) = link.origin_selection_range {
-            translate_virtual_range_to_host(origin_range, region_start_line, region_start_column);
+            translate_virtual_range_to_host(origin_range, offset);
         }
         return Some(link);
     }

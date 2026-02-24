@@ -24,7 +24,7 @@ use url::Url;
 
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::actor::ResponseRouter;
-use crate::lsp::bridge::protocol::{RequestId, VirtualDocumentUri};
+use crate::lsp::bridge::protocol::{RegionOffset, RequestId, VirtualDocumentUri};
 
 /// RAII guard that removes a pending ResponseRouter entry on drop.
 ///
@@ -63,12 +63,8 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// The host document URI in `lsp_types::Uri` form (for rewriting virtual
     /// URIs back to the host URI in goto responses).
     pub host_uri_lsp: &'a Uri,
-    /// The starting line of the injection region in the host document
-    /// (for coordinate translation back to host space).
-    pub region_start_line: u32,
-    /// The starting column of the injection region on its first host line
-    /// (for coordinate translation back to host space on virtual line 0).
-    pub region_start_column: u32,
+    /// The injection region offset for coordinate translation back to host space.
+    pub offset: RegionOffset,
 }
 
 impl LanguageServerPool {
@@ -84,8 +80,7 @@ impl LanguageServerPool {
     /// * `host_uri` - The host document URI
     /// * `injection_language` - The injection language (e.g., "lua")
     /// * `region_id` - The unique region ID for this injection
-    /// * `region_start_line` - The starting line of the injection region in the host document
-    /// * `region_start_column` - The starting column of the injection region on its first host line
+    /// * `offset` - The region offset for coordinate translation
     /// * `virtual_content` - The content of the virtual document
     /// * `upstream_request_id` - The original request ID from the upstream client
     /// * `build_request` - Closure to build the JSON-RPC request from the
@@ -100,8 +95,7 @@ impl LanguageServerPool {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
@@ -188,8 +182,7 @@ impl LanguageServerPool {
         let context = BridgeResponseContext {
             virtual_uri_string: virtual_uri.to_uri_string(),
             host_uri_lsp: &host_uri_lsp,
-            region_start_line,
-            region_start_column,
+            offset,
         };
 
         Ok(transform_response(response?, &context))
@@ -235,8 +228,7 @@ mod tests {
                 },
                 "lua",
                 TEST_ULID_LUA_0,
-                0,
-                0,
+                RegionOffset { line: 0, column: 0 },
                 "print('hello')",
                 None,
             )
@@ -275,8 +267,7 @@ mod tests {
                 &host_uri,
                 "lua",
                 TEST_ULID_LUA_0,
-                0,
-                0,
+                RegionOffset { line: 0, column: 0 },
                 "print('hello')",
                 None,
             )
@@ -336,12 +327,11 @@ mod tests {
         let ctx = BridgeResponseContext {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
-            region_start_line: 5,
-            region_start_column: 0,
+            offset: RegionOffset { line: 5, column: 0 },
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);
-        assert_eq!(ctx.region_start_line, 5);
-        assert_eq!(ctx.region_start_column, 0);
+        assert_eq!(ctx.offset.line, 5);
+        assert_eq!(ctx.offset.column, 0);
     }
 }

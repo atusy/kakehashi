@@ -5,7 +5,7 @@
 //! document coordinates.
 
 use super::request_id::RequestId;
-use super::translation::translate_host_position_to_virtual;
+use super::translation::{RegionOffset, translate_host_position_to_virtual};
 use super::virtual_uri::VirtualDocumentUri;
 
 /// Build a position-based JSON-RPC request for a downstream language server.
@@ -18,8 +18,7 @@ use super::virtual_uri::VirtualDocumentUri;
 /// # Arguments
 /// * `virtual_uri` - The pre-built virtual document URI
 /// * `host_position` - The position in the host document
-/// * `region_start_line` - The starting line of the injection region in the host document
-/// * `region_start_column` - The starting column of the injection region on its first host line
+/// * `offset` - The region offset for coordinate translation
 /// * `request_id` - The JSON-RPC request ID
 /// * `method` - The LSP method name (e.g., "textDocument/hover")
 ///
@@ -32,14 +31,13 @@ use super::virtual_uri::VirtualDocumentUri;
 pub(crate) fn build_position_based_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
     request_id: RequestId,
     method: &str,
 ) -> serde_json::Value {
     // Translate position from host to virtual coordinates
     let mut virtual_position = host_position;
-    translate_host_position_to_virtual(&mut virtual_position, region_start_line, region_start_column);
+    translate_host_position_to_virtual(&mut virtual_position, offset);
 
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -163,6 +161,10 @@ mod tests {
         crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
     }
 
+    fn offset(line: u32, column: u32) -> RegionOffset {
+        RegionOffset { line, column }
+    }
+
     #[test]
     fn position_request_first_line_applies_column_offset() {
         // Host position on first line of region → column offset subtracted
@@ -176,8 +178,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            5,
-            4,
+            offset(5, 4),
             RequestId::new(1),
             "textDocument/completion",
         );
@@ -199,8 +200,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            5,
-            4,
+            offset(5, 4),
             RequestId::new(1),
             "textDocument/completion",
         );
@@ -220,8 +220,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            5,
-            10,
+            offset(5, 10),
             RequestId::new(1),
             "textDocument/completion",
         );

@@ -23,6 +23,7 @@ pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub use pool::LanguageServerPool;
+pub(crate) use protocol::RegionOffset;
 pub(crate) use pool::UpstreamId;
 pub(crate) use protocol::location_link_to_location;
 
@@ -36,6 +37,7 @@ pub(crate) use protocol::location_link_to_location;
 #[cfg(test)]
 mod tests {
     use super::pool::{LanguageServerPool, UpstreamId};
+    use super::protocol::RegionOffset;
     use crate::config::settings::BridgeServerConfig;
     use tower_lsp_server::ls_types::Position;
     use url::Url;
@@ -76,8 +78,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                3, // region_start_line
-                0, // region_start_column
+                RegionOffset { line: 3, column: 0 },
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -122,8 +123,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                3, // region_start_line
-                0, // region_start_column
+                RegionOffset { line: 3, column: 0 },
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -177,8 +177,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                3, // region_start_line
-                0, // region_start_column
+                RegionOffset { line: 3, column: 0 },
                 virtual_content,
                 Some(UpstreamId::Number(42)), // upstream_request_id (unused)
             )
@@ -229,8 +228,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                3, // region_start_line
-                0, // region_start_column
+                RegionOffset { line: 3, column: 0 },
                 virtual_content,
                 Some(UpstreamId::Number(123)), // upstream_request_id (unused)
             )
@@ -271,8 +269,7 @@ mod tests {
                 &host_uri,
                 "lua",
                 "region-0",
-                3, // region_start_line
-                0, // region_start_column
+                RegionOffset { line: 3, column: 0 },
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )

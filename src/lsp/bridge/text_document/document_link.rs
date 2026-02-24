@@ -21,7 +21,7 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{RequestId, VirtualDocumentUri, build_whole_document_request};
+use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request};
 
 impl LanguageServerPool {
     /// Send a document link request and wait for the response.
@@ -37,8 +37,7 @@ impl LanguageServerPool {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<DocumentLink>>> {
@@ -54,16 +53,14 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
-            region_start_column,
+            offset,
             virtual_content,
             upstream_request_id,
             build_document_link_request,
             |response, ctx| {
                 transform_document_link_response_to_host(
                     response,
-                    ctx.region_start_line,
-                    ctx.region_start_column,
+                    ctx.offset,
                 )
             },
         )
@@ -94,8 +91,7 @@ fn build_document_link_request(
 /// * `region_start_column` - The starting column of the injection region on its first host line
 fn transform_document_link_response_to_host(
     mut response: serde_json::Value,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<DocumentLink>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentLink: {}", error);
@@ -111,7 +107,7 @@ fn transform_document_link_response_to_host(
 
     // Transform ranges to host coordinates
     for link in &mut links {
-        translate_virtual_range_to_host(&mut link.range, region_start_line, region_start_column);
+        translate_virtual_range_to_host(&mut link.range, offset);
     }
 
     Some(links)
@@ -199,7 +195,7 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_document_link_response_to_host(response, region_start_line, 0);
+        let transformed = transform_document_link_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -222,7 +218,7 @@ mod tests {
     fn document_link_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_link_response_to_host(response, 5, 0);
+        let transformed = transform_document_link_response_to_host(response, RegionOffset { line: 5, column: 0 });
         assert!(transformed.is_none());
     }
 
@@ -230,7 +226,7 @@ mod tests {
     fn document_link_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed = transform_document_link_response_to_host(response, 5, 0);
+        let transformed = transform_document_link_response_to_host(response, RegionOffset { line: 5, column: 0 });
         assert!(transformed.is_some());
         let links = transformed.unwrap();
         assert!(links.is_empty());
@@ -252,7 +248,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_document_link_response_to_host(response, region_start_line, 0);
+        let transformed = transform_document_link_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -278,7 +274,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_document_link_response_to_host(response, region_start_line, 0);
+        let transformed = transform_document_link_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -301,7 +297,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_document_link_response_to_host(response, region_start_line, 0);
+        let transformed = transform_document_link_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();

@@ -18,7 +18,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based_request};
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+};
 
 impl LanguageServerPool {
     /// Send a hover request and wait for the response.
@@ -35,8 +37,7 @@ impl LanguageServerPool {
         host_position: Position,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
-        region_start_column: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Hover>> {
@@ -52,26 +53,13 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
-            region_start_column,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_hover_request(
-                    virtual_uri,
-                    host_position,
-                    region_start_line,
-                    region_start_column,
-                    request_id,
-                )
+                build_hover_request(virtual_uri, host_position, offset, request_id)
             },
-            |response, ctx| {
-                transform_hover_response_to_host(
-                    response,
-                    ctx.region_start_line,
-                    ctx.region_start_column,
-                )
-            },
+            |response, ctx| transform_hover_response_to_host(response, ctx.offset),
         )
         .await
     }
@@ -81,15 +69,13 @@ impl LanguageServerPool {
 fn build_hover_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
-        region_start_line,
-        region_start_column,
+        offset,
         request_id,
         "textDocument/hover",
     )
@@ -104,12 +90,10 @@ fn build_hover_request(
 ///
 /// # Arguments
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
-/// * `region_start_line` - Line offset to add to hover range if present
-/// * `region_start_column` - Column offset to add on virtual line 0
+/// * `offset` - The region offset for coordinate translation
 fn transform_hover_response_to_host(
     mut response: serde_json::Value,
-    region_start_line: u32,
-    region_start_column: u32,
+    offset: RegionOffset,
 ) -> Option<Hover> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/hover: {}", error);
@@ -126,7 +110,7 @@ fn transform_hover_response_to_host(
 
     // Transform range if present
     if let Some(range) = &mut hover.range {
-        translate_virtual_range_to_host(range, region_start_line, region_start_column);
+        translate_virtual_range_to_host(range, offset);
     }
 
     Some(hover)
@@ -138,6 +122,10 @@ mod tests {
     use rstest::rstest;
     use tower_lsp_server::ls_types::Position;
     use url::Url;
+
+    fn offset(line: u32, column: u32) -> RegionOffset {
+        RegionOffset { line, column }
+    }
 
     // ==========================================================================
     // Test helpers
@@ -206,7 +194,7 @@ mod tests {
     #[test]
     fn hover_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, test_position(), 3, 0, test_request_id());
+        let request = build_hover_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -215,7 +203,7 @@ mod tests {
     fn hover_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, test_position(), 3, 0, test_request_id());
+        let request = build_hover_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
 
         assert_position_request(&request, "textDocument/hover", 2);
     }
@@ -229,7 +217,7 @@ mod tests {
         };
 
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, host_position, 3, 0, test_request_id());
+        let request = build_hover_request(&virtual_uri, host_position, offset(3, 0), test_request_id());
 
         assert_eq!(
             request["params"]["position"]["line"], 0,
@@ -246,7 +234,7 @@ mod tests {
         };
 
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, host_position, 0, 0, test_request_id());
+        let request = build_hover_request(&virtual_uri, host_position, offset(0, 0), test_request_id());
 
         assert_eq!(
             request["params"]["position"]["line"], 5,
@@ -267,8 +255,7 @@ mod tests {
         let request = build_hover_request(
             &virtual_uri,
             host_position,
-            5, // region_start_line > host_position.line
-            0,
+            offset(5, 0), // region_start_line > host_position.line
             test_request_id(),
         );
 
@@ -304,7 +291,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_hover_response_to_host(response, region_start_line, 0);
+        let transformed = transform_hover_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -326,7 +313,7 @@ mod tests {
             }
         });
 
-        let transformed = transform_hover_response_to_host(response, 5, 0);
+        let transformed = transform_hover_response_to_host(response, offset(5, 0));
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
         assert!(hover.range.is_none());
@@ -337,7 +324,7 @@ mod tests {
     #[case::no_result_key(serde_json::json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     #[case::malformed_result(serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_hover_object"}))]
     fn hover_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_hover_response_to_host(response, 5, 0);
+        let transformed = transform_hover_response_to_host(response, offset(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -356,7 +343,7 @@ mod tests {
         });
         let region_start_line = 0;
 
-        let transformed = transform_hover_response_to_host(response, region_start_line, 0);
+        let transformed = transform_hover_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -382,7 +369,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_hover_response_to_host(response, region_start_line, 0);
+        let transformed = transform_hover_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -413,7 +400,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_hover_response_to_host(response, region_start_line, 0);
+        let transformed = transform_hover_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
