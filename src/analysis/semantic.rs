@@ -1229,4 +1229,173 @@ foo
             "Python fence line 7 should have tokens"
         );
     }
+
+    /// Integration test: Blockquote-wrapped fenced code blocks should produce
+    /// consistent injection tokens across all content lines, and `> ` prefixes
+    /// should not leak into the injection parser or suppress host tokens.
+    #[tokio::test]
+    async fn test_blockquote_injection_consistent_tokens() {
+        use crate::config::WorkspaceSettings;
+        use crate::config::defaults::default_capture_mappings;
+        use crate::language::LanguageCoordinator;
+        use std::sync::Arc;
+
+        let coordinator = Arc::new(LanguageCoordinator::new());
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(settings);
+
+        let md_result = coordinator.ensure_language_loaded("markdown");
+        let lua_result = coordinator.ensure_language_loaded("lua");
+        if !md_result.success || !lua_result.success {
+            eprintln!("Skipping: markdown or lua parser not available");
+            return;
+        }
+
+        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+            eprintln!("Skipping: markdown highlight query not available");
+            return;
+        };
+
+        // Blockquote with a Lua code block — two identical content lines
+        let text = "> ```lua\n> local x = 1\n> local y = 2\n> ```\n".to_string();
+        // Lines:
+        //   0: "> ```lua"
+        //   1: "> local x = 1"
+        //   2: "> local y = 2"
+        //   3: "> ```"
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            return;
+        };
+        let Some(tree) = parser.parse(&text, None) else {
+            return;
+        };
+        parser_pool.release("markdown".to_string(), parser);
+
+        let capture_mappings = default_capture_mappings();
+
+        let result = handle_semantic_tokens_full(
+            text,
+            tree,
+            md_query,
+            Some("markdown".to_string()),
+            Some(capture_mappings),
+            coordinator,
+            false,
+        )
+        .await;
+
+        assert!(result.is_some(), "Should return semantic tokens");
+
+        let SemanticTokensResult::Tokens(tokens) = result.unwrap() else {
+            panic!("Expected full tokens result");
+        };
+
+        let decoded = decode_tokens(&tokens.data);
+
+        let keyword_type = 1u32; // SemanticTokenType::KEYWORD
+        let string_type = 2u32; // SemanticTokenType::STRING
+
+        // Both content lines should have injection tokens
+        let line1_tokens: Vec<_> = decoded.iter().filter(|t| t.0 == 1).collect();
+        let line2_tokens: Vec<_> = decoded.iter().filter(|t| t.0 == 2).collect();
+
+        assert!(
+            !line1_tokens.is_empty(),
+            "Line 1 should have injection tokens. All: {:?}",
+            decoded
+        );
+        assert!(
+            !line2_tokens.is_empty(),
+            "Line 2 should have injection tokens. All: {:?}",
+            decoded
+        );
+
+        // Both lines should have `keyword` token for `local` at the same column
+        let line1_keywords: Vec<_> = line1_tokens
+            .iter()
+            .filter(|t| t.3 == keyword_type)
+            .collect();
+        let line2_keywords: Vec<_> = line2_tokens
+            .iter()
+            .filter(|t| t.3 == keyword_type)
+            .collect();
+
+        assert!(
+            !line1_keywords.is_empty(),
+            "Line 1 should have keyword token for 'local'. Line 1 tokens: {:?}",
+            line1_tokens
+        );
+        assert!(
+            !line2_keywords.is_empty(),
+            "Line 2 should have keyword token for 'local'. Line 2 tokens: {:?}",
+            line2_tokens
+        );
+
+        // Keyword column should be at absolute column 2 (after `> ` prefix)
+        assert_eq!(
+            line1_keywords[0].1, 2,
+            "Keyword 'local' should start at column 2 (after `> `). L1: {:?}",
+            line1_keywords
+        );
+        // Token columns should match between lines (both after "> ")
+        assert_eq!(
+            line1_keywords[0].1, line2_keywords[0].1,
+            "Keyword column should be identical on both lines. L1: {:?}, L2: {:?}",
+            line1_keywords, line2_keywords
+        );
+
+        // Token sequences (col, len, type) should be identical on both lines
+        let line1_types: Vec<(u32, u32, u32)> =
+            line1_tokens.iter().map(|t| (t.1, t.2, t.3)).collect();
+        let line2_types: Vec<(u32, u32, u32)> =
+            line2_tokens.iter().map(|t| (t.1, t.2, t.3)).collect();
+        assert_eq!(
+            line1_types, line2_types,
+            "Both content lines should produce identical token sequences (col, len, type)"
+        );
+
+        // No host `string` tokens INSIDE the injection region (after col 2).
+        // The `> ` prefix at col 0-2 IS a valid host token (outside injection).
+        let line1_string_leaks: Vec<_> = line1_tokens
+            .iter()
+            .filter(|t| t.3 == string_type && t.1 >= 2)
+            .collect();
+        let line2_string_leaks: Vec<_> = line2_tokens
+            .iter()
+            .filter(|t| t.3 == string_type && t.1 >= 2)
+            .collect();
+        assert!(
+            line1_string_leaks.is_empty(),
+            "Host `string` tokens must not leak inside injection on line 1. Leaks: {:?}",
+            line1_string_leaks
+        );
+        assert!(
+            line2_string_leaks.is_empty(),
+            "Host `string` tokens must not leak inside injection on line 2. Leaks: {:?}",
+            line2_string_leaks
+        );
+
+        // The `> ` prefix at col 0 should HAVE a host string token
+        let line1_prefix: Vec<_> = line1_tokens
+            .iter()
+            .filter(|t| t.1 == 0 && t.3 == string_type)
+            .collect();
+        let line2_prefix: Vec<_> = line2_tokens
+            .iter()
+            .filter(|t| t.1 == 0 && t.3 == string_type)
+            .collect();
+        assert!(
+            !line1_prefix.is_empty(),
+            "Line 1 should have host `string` for `> ` prefix"
+        );
+        assert!(
+            !line2_prefix.is_empty(),
+            "Line 2 should have host `string` for `> ` prefix"
+        );
+    }
 }
