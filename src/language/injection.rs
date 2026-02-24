@@ -290,7 +290,11 @@ pub struct CacheableInjectionRegion {
 }
 
 impl CacheableInjectionRegion {
-    /// Create from an InjectionRegionInfo, extracting position data from the node
+    /// Create from an InjectionRegionInfo, extracting position data from the node.
+    ///
+    /// # Panics (debug builds)
+    /// Panics if the content node is zero-width (`start_byte >= end_byte`).
+    /// Callers must filter zero-width nodes upstream (see `collect_all_injections`).
     pub fn from_region_info(info: &InjectionRegionInfo<'_>, region_id: &str, text: &str) -> Self {
         let node = &info.content_node;
         debug_assert!(
@@ -303,6 +307,9 @@ impl CacheableInjectionRegion {
         // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
         // Tree-sitter reports columns as byte offsets, but LSP positions use UTF-16.
         // For ASCII they're identical, but non-ASCII prefixes (CJK, emoji) differ.
+        // tree-sitter's `column` is a byte offset from the line start, so
+        // `start_byte() - column` correctly recovers the line-start byte even
+        // when the line contains multi-byte UTF-8 characters before the node.
         let byte_column = node.start_position().column;
         let line_start_byte = node.start_byte() - byte_column;
         let line_prefix = &text[line_start_byte..node.start_byte()];
