@@ -260,10 +260,6 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
-    fn offset(line: u32, column: u32) -> RegionOffset {
-        RegionOffset { line, column }
-    }
-
     // ==========================================================================
     // Rename request builder tests
     // ==========================================================================
@@ -283,7 +279,7 @@ mod tests {
         let request = build_rename_request(
             &virtual_uri,
             host_position,
-            offset(3, 0),
+            RegionOffset::new(3, 0),
             "newName",
             RequestId::new(1),
         );
@@ -316,7 +312,7 @@ mod tests {
         let request = build_rename_request(
             &virtual_uri,
             host_position,
-            offset(3, 0),
+            RegionOffset::new(3, 0),
             "renamedVariable",
             RequestId::new(42),
         );
@@ -353,7 +349,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         );
         assert!(result.is_none());
     }
@@ -392,7 +388,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(10, 0),
+            RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -442,7 +438,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -481,7 +477,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(10, 0),
+            RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -529,7 +525,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(10, 0),
+            RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -575,7 +571,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(10, 0),
+            RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -635,7 +631,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -677,7 +673,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         )
         .unwrap();
 
@@ -728,7 +724,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         )
         .unwrap();
 
@@ -772,7 +768,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         )
         .unwrap();
 

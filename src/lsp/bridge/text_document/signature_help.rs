@@ -119,10 +119,6 @@ mod tests {
     use tower_lsp_server::ls_types::Position;
     use url::Url;
 
-    fn offset(line: u32, column: u32) -> RegionOffset {
-        RegionOffset { line, column }
-    }
-
     // ==========================================================================
     // Test helpers
     // ==========================================================================
@@ -193,7 +189,7 @@ mod tests {
         let request = build_signature_help_request(
             &virtual_uri,
             test_position(),
-            offset(3, 0),
+            RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -207,7 +203,7 @@ mod tests {
         let request = build_signature_help_request(
             &virtual_uri,
             test_position(),
-            offset(3, 0),
+            RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -227,7 +223,7 @@ mod tests {
         let request = build_signature_help_request(
             &virtual_uri,
             host_position,
-            offset(5, 0), // region_start_line > host_position.line
+            RegionOffset::new(5, 0), // region_start_line > host_position.line
             test_request_id(),
         );
 
@@ -267,7 +263,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_signature_help_response_to_host(response, offset(region_start_line, 0));
+            transform_signature_help_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
@@ -289,7 +285,7 @@ mod tests {
     fn signature_help_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_signature_help_response_to_host(response, offset(3, 0));
+        let transformed = transform_signature_help_response_to_host(response, RegionOffset::new(3, 0));
         assert!(transformed.is_none());
     }
 
@@ -310,7 +306,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_signature_help_response_to_host(response, offset(region_start_line, 0));
+            transform_signature_help_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
@@ -343,7 +339,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_signature_help_response_to_host(response, offset(region_start_line, 0));
+            transform_signature_help_response_to_host(response, RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();

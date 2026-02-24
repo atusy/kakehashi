@@ -152,10 +152,6 @@ mod tests {
     use super::RegionOffset;
     use super::transform_references_response_to_host;
 
-    fn offset(line: u32, column: u32) -> RegionOffset {
-        RegionOffset { line, column }
-    }
-
     /// Standard test host URI used across most tests.
     fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
         let url = url::Url::parse("file:///project/doc.md").unwrap();
@@ -178,7 +174,7 @@ mod tests {
             response,
             "file:///virtual.lua",
             &test_host_uri(),
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_none());
@@ -197,7 +193,7 @@ mod tests {
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
             &test_host_uri(),
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_some());
@@ -231,7 +227,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -268,7 +264,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -302,7 +298,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
@@ -353,7 +349,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());

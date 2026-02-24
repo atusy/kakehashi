@@ -217,10 +217,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn offset(line: u32, column: u32) -> RegionOffset {
-        RegionOffset { line, column }
-    }
-
     #[test]
     fn diagnostic_response_transforms_range_to_host_coordinates() {
         let response = json!({
@@ -249,7 +245,7 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(5, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
 
         assert_eq!(diagnostics.len(), 2);
 
@@ -296,7 +292,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, offset(3, 0), "file:///test.md");
+            transform_diagnostic_response_to_host(response, RegionOffset::new(3, 0), "file:///test.md");
 
         assert_eq!(diagnostics.len(), 1);
 
@@ -342,7 +338,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, offset(3, 0), "file:///test.md");
+            transform_diagnostic_response_to_host(response, RegionOffset::new(3, 0), "file:///test.md");
 
         assert_eq!(diagnostics.len(), 1);
 
@@ -368,7 +364,7 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(5, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -376,7 +372,7 @@ mod tests {
     fn diagnostic_response_null_result_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(5, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -384,7 +380,7 @@ mod tests {
     fn diagnostic_response_missing_result_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "error": { "code": -32603, "message": "internal error" } });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(5, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -399,7 +395,7 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(5, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -414,7 +410,7 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(5, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -459,7 +455,7 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(3, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(3, 0), "unused");
 
         assert_eq!(diagnostics.len(), 1);
         let related = diagnostics[0].related_information.as_ref().unwrap();
@@ -512,7 +508,7 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(3, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(3, 0), "unused");
 
         assert_eq!(diagnostics.len(), 1);
         let related = diagnostics[0].related_information.as_ref().unwrap();
@@ -592,7 +588,7 @@ mod tests {
         });
 
         // This should not panic due to overflow
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(100, 0), "unused");
+        let diagnostics = transform_diagnostic_response_to_host(response, RegionOffset::new(100, 0), "unused");
 
         // Values should saturate at u32::MAX
         assert_eq!(diagnostics.len(), 1);

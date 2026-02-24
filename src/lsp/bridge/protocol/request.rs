@@ -161,10 +161,6 @@ mod tests {
         crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
     }
 
-    fn offset(line: u32, column: u32) -> RegionOffset {
-        RegionOffset { line, column }
-    }
-
     #[test]
     fn position_request_first_line_applies_column_offset() {
         // Host position on first line of region → column offset subtracted
@@ -178,7 +174,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            offset(5, 4),
+            RegionOffset::new(5, 4),
             RequestId::new(1),
             "textDocument/completion",
         );
@@ -200,7 +196,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            offset(5, 4),
+            RegionOffset::new(5, 4),
             RequestId::new(1),
             "textDocument/completion",
         );
@@ -220,7 +216,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            offset(5, 10),
+            RegionOffset::new(5, 10),
             RequestId::new(1),
             "textDocument/completion",
         );

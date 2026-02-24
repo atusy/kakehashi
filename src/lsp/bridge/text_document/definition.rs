@@ -92,10 +92,6 @@ mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Position;
 
-    fn offset(line: u32, column: u32) -> RegionOffset {
-        RegionOffset { line, column }
-    }
-
     // ==========================================================================
     // Test helpers
     // ==========================================================================
@@ -166,7 +162,7 @@ mod tests {
         let request = build_definition_request(
             &virtual_uri,
             test_position(),
-            offset(3, 0),
+            RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -180,7 +176,7 @@ mod tests {
         let request = build_definition_request(
             &virtual_uri,
             test_position(),
-            offset(3, 0),
+            RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -212,7 +208,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -255,7 +251,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -292,7 +288,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -327,7 +323,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -361,7 +357,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
@@ -410,7 +406,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -434,7 +430,7 @@ mod tests {
             response,
             "file:///virtual.lua",
             &test_host_uri(),
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_none());
@@ -453,7 +449,7 @@ mod tests {
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
             &test_host_uri(),
-            offset(5, 0),
+            RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_some());
@@ -483,7 +479,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -530,7 +526,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            offset(region_start_line, 0),
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
