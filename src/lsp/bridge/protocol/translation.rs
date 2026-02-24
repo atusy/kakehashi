@@ -43,22 +43,30 @@ pub(crate) fn translate_virtual_range_to_host(
 
 /// Translate a single host position to virtual coordinates.
 ///
-/// When the resulting virtual line is 0, subtracts column offset from character.
+/// When the position is genuinely on the first line of the region (virtual line 0),
+/// subtracts column offset from character. When the line underflows to 0 due to
+/// stale region data (race condition), the column offset is NOT applied to avoid
+/// compounding the already-invalid result.
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_host_position_to_virtual(
     pos: &mut Position,
     region_start_line: u32,
     region_start_column: u32,
 ) {
+    let underflowed = pos.line < region_start_line;
     pos.line = pos.line.saturating_sub(region_start_line);
-    if pos.line == 0 {
+    if pos.line == 0 && !underflowed {
         pos.character = pos.character.saturating_sub(region_start_column);
     }
 }
 
 /// Translate a host range to virtual coordinates.
 ///
-/// Applies position translation to both start and end.
+/// Applies position translation to both start and end **independently**.
+/// This means asymmetric column treatment is possible: if the start line
+/// underflows (stale region data) but the end line does not, only the start
+/// will skip column adjustment. This is intentional — each endpoint should
+/// degrade independently rather than coupling their error behavior.
 pub(crate) fn translate_host_range_to_virtual(
     range: &mut Range,
     region_start_line: u32,
@@ -207,8 +215,8 @@ mod tests {
         };
         translate_host_position_to_virtual(&mut pos, 10, 4);
         assert_eq!(pos.line, 0);
-        // Line saturated to 0, so column offset is subtracted
-        assert_eq!(pos.character, 4); // 8 - 4
+        // Line underflowed (stale data), so column offset is NOT applied
+        assert_eq!(pos.character, 8);
     }
 
     #[test]
