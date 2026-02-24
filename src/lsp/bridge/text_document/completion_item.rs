@@ -21,7 +21,6 @@
 //! instance. The resolve will fail and the fallback path returns the
 //! unresolved item with its envelope intact — graceful degradation.
 
-use std::io;
 use std::sync::Arc;
 
 use log::warn;
@@ -34,32 +33,89 @@ use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
 };
-use crate::config::settings::BridgeServerConfig;
+use crate::config::settings::WorkspaceSettings;
+use crate::config::{resolve_language_server_with_wildcard, settings::BridgeServerConfig};
 use crate::lsp::bridge::actor::ResponseRouter;
 
 impl LanguageServerPool {
+    /// Route a `completionItem/resolve` request to the origin downstream server.
+    ///
+    /// Strips the Kakehashi envelope to identify the origin server, looks up
+    /// the server config from `settings`, and delegates to
+    /// `send_completion_resolve_request`. If any routing step fails (no envelope,
+    /// server not configured), the item is returned as-is.
+    pub(crate) async fn dispatch_completion_resolve(
+        &self,
+        mut item: CompletionItem,
+        settings: &WorkspaceSettings,
+    ) -> CompletionItem {
+        // Extract envelope — if absent, this item wasn't produced by Kakehashi
+        let Some(envelope) = strip_envelope(&mut item) else {
+            return item;
+        };
+
+        // Look up the server config for the origin server
+        let config = settings
+            .language_servers
+            .as_ref()
+            .and_then(|servers| resolve_language_server_with_wildcard(servers, &envelope.origin));
+
+        let Some(config) = config else {
+            // Server no longer configured — re-envelope and return as-is
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+
+        self.send_completion_resolve_request(&config, item, envelope)
+            .await
+    }
+
     /// Send a `completionItem/resolve` request to the downstream server that
     /// produced the item, re-enveloping the resolved item for return to the client.
     ///
-    /// If the downstream doesn't support resolve, returns the item with its
-    /// envelope restored (graceful no-op).
-    pub(crate) async fn send_completion_resolve_request(
+    /// Always returns the item. All failure modes (connection error, timeout, parse
+    /// failure, missing capability) return the original item with its envelope
+    /// restored so the client can still use the basic completion item.
+    async fn send_completion_resolve_request(
         &self,
-        server_name: &str,
         server_config: &BridgeServerConfig,
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
-    ) -> io::Result<CompletionItem> {
-        let handle = self
+    ) -> CompletionItem {
+        let server_name = &envelope.origin;
+        let handle = match self
             .get_or_create_connection(server_name, server_config)
-            .await?;
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: failed to connect to {}: {}",
+                    server_name, e
+                );
+                re_envelope_item(&mut item, &envelope);
+                return item;
+            }
+        };
 
         if !handle.has_capability("completionItem/resolve") {
             re_envelope_item(&mut item, &envelope);
-            return Ok(item);
+            return item;
         }
 
-        let (request_id, response_rx) = handle.register_request_with_upstream(None)?;
+        let (request_id, response_rx) = match handle.register_request_with_upstream(None) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: failed to register request for {}: {}",
+                    server_name, e
+                );
+                re_envelope_item(&mut item, &envelope);
+                return item;
+            }
+        };
 
         let request = build_completion_resolve_request(&item, request_id);
 
@@ -69,8 +125,13 @@ impl LanguageServerPool {
         };
 
         if let Err(e) = handle.send_request(request, request_id) {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: failed to send request for {}: {}",
+                server_name, e
+            );
             re_envelope_item(&mut item, &envelope);
-            return Err(e.into());
+            return item;
         }
 
         let response = handle.wait_for_response(request_id, response_rx).await;
@@ -85,7 +146,7 @@ impl LanguageServerPool {
                     server_name, e
                 );
                 re_envelope_item(&mut item, &envelope);
-                return Ok(item);
+                return item;
             }
         };
 
@@ -94,11 +155,11 @@ impl LanguageServerPool {
                 let offset = RegionOffset::from(&envelope.offset);
                 transform_completion_item(&mut resolved, offset);
                 re_envelope_item(&mut resolved, &envelope);
-                Ok(resolved)
+                resolved
             }
             None => {
                 re_envelope_item(&mut item, &envelope);
-                Ok(item)
+                item
             }
         }
     }
@@ -274,6 +335,62 @@ mod tests {
 
         let extracted = extract_envelope(&item).expect("should have envelope");
         assert_eq!(extracted.inner, None);
+    }
+
+    // ==========================================================================
+    // strip_envelope round-trip (used in lsp_impl layer)
+    // ==========================================================================
+
+    // ==========================================================================
+    // dispatch_completion_resolve integration tests
+    // ==========================================================================
+
+    /// Helper to create a completion item with a Kakehashi envelope.
+    fn enveloped_item(server: &str) -> CompletionItem {
+        let envelope = KakehashiEnvelope {
+            origin: server.to_string(),
+            inner: Some(json!({"resolve_id": 42})),
+            offset: EnvelopeOffset { line: 5, column: 0 },
+        };
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            data: Some(json!({"resolve_id": 42})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &envelope);
+        item
+    }
+
+    /// dispatch returns item unchanged when it has no envelope.
+    #[tokio::test]
+    async fn dispatch_returns_non_envelope_item_unchanged() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default();
+        let item = CompletionItem {
+            label: "plain".to_string(),
+            data: Some(json!({"custom": true})),
+            ..Default::default()
+        };
+
+        let result = pool
+            .dispatch_completion_resolve(item.clone(), &settings)
+            .await;
+        assert_eq!(result.label, "plain");
+        assert_eq!(result.data, Some(json!({"custom": true})));
+    }
+
+    /// dispatch re-envelopes and returns item when origin server is not in settings.
+    #[tokio::test]
+    async fn dispatch_re_envelopes_when_server_not_configured() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default(); // no language_servers configured
+
+        let item = enveloped_item("nonexistent-ls");
+        let result = pool.dispatch_completion_resolve(item, &settings).await;
+
+        // Should be re-enveloped (routing info preserved for future attempts)
+        let envelope = extract_envelope(&result).expect("should have envelope");
+        assert_eq!(envelope.origin, "nonexistent-ls");
     }
 
     // ==========================================================================
