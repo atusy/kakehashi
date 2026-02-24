@@ -65,7 +65,16 @@ impl LanguageServerPool {
             |virtual_uri, request_id| {
                 build_completion_request(virtual_uri, host_position, offset, request_id)
             },
-            |response, ctx| transform_completion_response_to_host(response, ctx.offset),
+            |response, ctx| {
+                transform_completion_response_to_host(
+                    response,
+                    ctx.offset,
+                    Some(EnvelopeContext {
+                        server_name,
+                        offset: ctx.offset,
+                    }),
+                )
+            },
         )
         .await
     }
@@ -97,9 +106,11 @@ fn build_completion_request(
 /// # Arguments
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
 /// * `offset` - The region offset for coordinate translation
+/// * `envelope_ctx` - If `Some`, each item's `data` is wrapped in a routing envelope
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: RegionOffset,
+    envelope_ctx: Option<EnvelopeContext<'_>>,
 ) -> Option<CompletionList> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/completion: {}", error);
@@ -127,9 +138,12 @@ fn transform_completion_response_to_host(
         list
     };
 
-    // Transform all items in the list
+    // Transform all items in the list, then optionally envelope for resolve routing
     for item in &mut list.items {
         transform_completion_item(item, offset);
+        if let Some(ref ctx) = envelope_ctx {
+            envelope_item_data(item, ctx);
+        }
     }
 
     Some(list)
@@ -378,6 +392,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -406,7 +421,8 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(3, 0));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(3, 0), None);
         assert!(transformed.is_none());
     }
 
@@ -431,6 +447,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -478,6 +495,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -522,6 +540,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -559,7 +578,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(10, 4));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(10, 4), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -595,7 +615,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(10, 4));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(10, 4), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -635,7 +656,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(5, 7));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(5, 7), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
@@ -677,7 +699,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(5, 3));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(5, 3), None);
 
         let list = transformed.unwrap();
         let edits = list.items[0].additional_text_edits.as_ref().unwrap();
@@ -747,6 +770,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
