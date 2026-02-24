@@ -188,7 +188,7 @@ const ENVELOPE_KEY: &str = "kakehashi";
 /// `data` field is wrapped in this envelope so that a later `completionItem/resolve`
 /// can be routed back to the correct server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(super) struct KakehashiEnvelope {
+pub(crate) struct KakehashiEnvelope {
     /// Server name identifying which downstream produced the item.
     pub origin: String,
     /// The downstream server's original `data` value (preserved verbatim).
@@ -199,7 +199,7 @@ pub(super) struct KakehashiEnvelope {
 
 /// Offset snapshot stored in the envelope for coordinate back-translation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub(super) struct EnvelopeOffset {
+pub(crate) struct EnvelopeOffset {
     pub line: u32,
     pub column: u32,
 }
@@ -223,7 +223,7 @@ impl From<&EnvelopeOffset> for RegionOffset {
 }
 
 /// Context needed to create envelopes during completion response processing.
-pub(super) struct EnvelopeContext<'a> {
+pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
     pub offset: RegionOffset,
 }
@@ -232,7 +232,7 @@ pub(super) struct EnvelopeContext<'a> {
 ///
 /// The original `data` value is moved into `inner`, and the envelope is
 /// serialized as `{"kakehashi": {...}}`.
-pub(super) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContext) {
+pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContext) {
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: ctx.server_name.to_string(),
@@ -245,7 +245,7 @@ pub(super) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
 /// Extract the envelope from a completion item's `data` without modifying the item.
 ///
 /// Returns `None` if `data` is absent or not an envelope.
-pub(super) fn extract_envelope(item: &CompletionItem) -> Option<KakehashiEnvelope> {
+pub(crate) fn extract_envelope(item: &CompletionItem) -> Option<KakehashiEnvelope> {
     let data = item.data.as_ref()?;
     let wrapper = data.get(ENVELOPE_KEY)?;
     serde_json::from_value(wrapper.clone()).ok()
@@ -255,7 +255,7 @@ pub(super) fn extract_envelope(item: &CompletionItem) -> Option<KakehashiEnvelop
 ///
 /// On success, `item.data` is set back to the downstream's original value (`inner`).
 /// Returns the extracted envelope. Returns `None` if not an envelope (item unchanged).
-pub(super) fn strip_envelope(item: &mut CompletionItem) -> Option<KakehashiEnvelope> {
+pub(crate) fn strip_envelope(item: &mut CompletionItem) -> Option<KakehashiEnvelope> {
     let envelope = extract_envelope(item)?;
     item.data = envelope.inner.clone();
     Some(envelope)

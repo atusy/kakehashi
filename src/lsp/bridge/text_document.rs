@@ -8,6 +8,7 @@
 #[cfg(feature = "experimental")]
 mod color_presentation;
 mod completion;
+mod completion_item;
 mod declaration;
 mod definition;
 mod diagnostic;
