@@ -306,9 +306,7 @@ impl CacheableInjectionRegion {
         let byte_column = node.start_position().column;
         let line_start_byte = node.start_byte() - byte_column;
         let line_prefix = &text[line_start_byte..node.start_byte()];
-        let start_column =
-            crate::text::position::convert_byte_to_utf16_in_line(line_prefix, line_prefix.len())
-                .unwrap_or(byte_column) as u32;
+        let start_column = line_prefix.encode_utf16().count() as u32;
 
         let start_line = node.start_position().row as u32;
         let end_pos = node.end_position();
