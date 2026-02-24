@@ -310,10 +310,22 @@ impl CacheableInjectionRegion {
             crate::text::position::convert_byte_to_utf16_in_line(line_prefix, line_prefix.len())
                 .unwrap_or(byte_column) as u32;
 
+        let start_line = node.start_position().row as u32;
+        let end_pos = node.end_position();
+        // end_position() points past the last byte. When that position is mid-line
+        // (column > 0), the node still occupies that row → exclusive end is row + 1.
+        // When column == 0 (node ended with newline), the row is already one past
+        // the last occupied line — use it directly.
+        let end_line = if end_pos.column > 0 {
+            end_pos.row as u32 + 1
+        } else {
+            end_pos.row as u32
+        };
+
         Self {
             language: info.language.clone(),
             byte_range: node.start_byte()..node.end_byte(),
-            line_range: (node.start_position().row as u32)..(node.end_position().row as u32),
+            line_range: start_line..end_line,
             start_column,
             region_id: region_id.to_string(),
             content_hash: Self::hash_content(content),
@@ -1037,7 +1049,7 @@ mod tests {
         );
         assert_eq!(
             cacheable.line_range.end,
-            region_info.content_node.end_position().row as u32
+            region_info.content_node.start_position().row as u32 + 1
         );
         assert_eq!(cacheable.region_id, "test-result-id");
     }
@@ -1459,6 +1471,63 @@ mod tests {
             content.starts_with(';'),
             "Injected content should start with ';', got: {:?}",
             content
+        );
+    }
+
+    // ============================================================
+    // Tests for line_range edge cases in CacheableInjectionRegion
+    // ============================================================
+
+    /// Helper: parse `text` with tree-sitter Rust, match `string_content` nodes
+    /// via injection query, and return the `CacheableInjectionRegion` for the first match.
+    fn cacheable_from_first_injection(text: &str) -> CacheableInjectionRegion {
+        let mut parser = create_rust_parser();
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((string_literal
+              (string_content) @injection.content)
+             (#set! injection.language "test"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let regions =
+            collect_all_injections(&root, text, Some(&query)).expect("should find injections");
+        assert!(!regions.is_empty(), "expected at least one injection");
+
+        CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text)
+    }
+
+    #[rstest]
+    #[case::single_line_no_trailing_newline(
+        // "hello" sits entirely on row 0; no trailing newline → exclusive end = 1
+        r#"let s = "hello";"#,
+        0..1,
+    )]
+    #[case::multi_line_trailing_newline(
+        // string_content starts at the byte after `"` on row 0; the content
+        // ends with `\n` so end_position().column == 0 at row 4 → exclusive end = 4.
+        "let s = \"\nline1\nline2\nline3\n\";",
+        0..4,
+    )]
+    #[case::multi_line_no_trailing_newline(
+        // string_content starts on row 0; last line has content (no trailing \n),
+        // so end_position().column > 0 at row 2 → exclusive end = 3.
+        "let s = \"\nline1\nline2\";",
+        0..3,
+    )]
+    #[trace]
+    fn test_line_range_edge_cases(
+        #[case] text: &str,
+        #[case] expected_line_range: std::ops::Range<u32>,
+    ) {
+        let cacheable = cacheable_from_first_injection(text);
+        assert_eq!(
+            cacheable.line_range, expected_line_range,
+            "line_range mismatch for text: {:?}",
+            text
         );
     }
 }
