@@ -21,7 +21,10 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Range, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RequestId, VirtualDocumentUri};
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host,
+};
 
 impl LanguageServerPool {
     /// Send an inlay hint request and wait for the response.
@@ -38,7 +41,7 @@ impl LanguageServerPool {
         host_range: Range,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<InlayHint>>> {
@@ -54,18 +57,18 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_inlay_hint_request(virtual_uri, host_range, region_start_line, request_id)
+                build_inlay_hint_request(virtual_uri, host_range, offset, request_id)
             },
             |response, ctx| {
                 transform_inlay_hint_response_to_host(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
-                    ctx.region_start_line,
+                    ctx.offset,
                 )
             },
         )
@@ -87,21 +90,12 @@ impl LanguageServerPool {
 fn build_inlay_hint_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
-    region_start_line: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     // Translate range from host to virtual coordinates
-    // Uses saturating_sub to prevent panic on race conditions
-    let virtual_range = Range {
-        start: tower_lsp_server::ls_types::Position {
-            line: host_range.start.line.saturating_sub(region_start_line),
-            character: host_range.start.character,
-        },
-        end: tower_lsp_server::ls_types::Position {
-            line: host_range.end.line.saturating_sub(region_start_line),
-            character: host_range.end.character,
-        },
-    };
+    let mut virtual_range = host_range;
+    translate_host_range_to_virtual(&mut virtual_range, offset);
 
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -142,12 +136,12 @@ fn build_inlay_hint_request(
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `region_start_line` - Line offset to add when transforming to host coordinates
+/// * `offset` - The region offset for coordinate translation
 fn transform_inlay_hint_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<InlayHint>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/inlayHint: {}", error);
@@ -163,13 +157,12 @@ fn transform_inlay_hint_response_to_host(
 
     for hint in &mut hints {
         // Transform position to host coordinates
-        hint.position.line = hint.position.line.saturating_add(region_start_line);
+        translate_virtual_position_to_host(&mut hint.position, offset);
 
         // Transform textEdits ranges
         if let Some(text_edits) = &mut hint.text_edits {
             for edit in text_edits.iter_mut() {
-                edit.range.start.line = edit.range.start.line.saturating_add(region_start_line);
-                edit.range.end.line = edit.range.end.line.saturating_add(region_start_line);
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
         }
 
@@ -190,10 +183,7 @@ fn transform_inlay_hint_response_to_host(
                 // Case 2: Same virtual URI → transform to host coordinates
                 if uri_str == request_virtual_uri {
                     location.uri = host_uri.clone();
-                    location.range.start.line =
-                        location.range.start.line.saturating_add(region_start_line);
-                    location.range.end.line =
-                        location.range.end.line.saturating_add(region_start_line);
+                    translate_virtual_range_to_host(&mut location.range, offset);
                     return true;
                 }
 
@@ -234,7 +224,12 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_inlay_hint_request(&virtual_uri, host_range, 5, RequestId::new(1));
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(5, 0),
+            RequestId::new(1),
+        );
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -271,7 +266,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
             RequestId::new(42),
         );
 
@@ -283,6 +278,74 @@ mod tests {
         assert_eq!(request["params"]["range"]["start"]["character"], 5);
         assert_eq!(request["params"]["range"]["end"]["line"], 12);
         assert_eq!(request["params"]["range"]["end"]["character"], 30);
+    }
+
+    #[test]
+    fn inlay_hint_request_first_line_applies_column_offset() {
+        use url::Url;
+
+        let host_uri: Uri =
+            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
+                .unwrap();
+        // Host range starts on first line of region (line 5), region starts at col 4
+        let host_range = Range {
+            start: tower_lsp_server::ls_types::Position {
+                line: 5,
+                character: 10,
+            },
+            end: tower_lsp_server::ls_types::Position {
+                line: 8,
+                character: 15,
+            },
+        };
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(5, 4),
+            RequestId::new(1),
+        );
+
+        // Start: virtual line 0 -> character 10 - 4 = 6
+        assert_eq!(request["params"]["range"]["start"]["line"], 0);
+        assert_eq!(request["params"]["range"]["start"]["character"], 6);
+        // End: virtual line 3 -> character unchanged
+        assert_eq!(request["params"]["range"]["end"]["line"], 3);
+        assert_eq!(request["params"]["range"]["end"]["character"], 15);
+    }
+
+    #[test]
+    fn inlay_hint_request_non_first_line_ignores_column_offset() {
+        use url::Url;
+
+        let host_uri: Uri =
+            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
+                .unwrap();
+        // Host range starts on non-first line of region
+        let host_range = Range {
+            start: tower_lsp_server::ls_types::Position {
+                line: 7,
+                character: 10,
+            },
+            end: tower_lsp_server::ls_types::Position {
+                line: 9,
+                character: 15,
+            },
+        };
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(5, 4),
+            RequestId::new(1),
+        );
+
+        // Start: virtual line 2 -> character unchanged
+        assert_eq!(request["params"]["range"]["start"]["line"], 2);
+        assert_eq!(request["params"]["range"]["start"]["character"], 10);
+        // End: virtual line 4 -> character unchanged
+        assert_eq!(request["params"]["range"]["end"]["line"], 4);
+        assert_eq!(request["params"]["range"]["end"]["character"], 15);
     }
 
     #[test]
@@ -304,7 +367,12 @@ mod tests {
             },
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_inlay_hint_request(&virtual_uri, host_range, 10, RequestId::new(1));
+        let request = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            RegionOffset::new(10, 0),
+            RequestId::new(1),
+        );
 
         // saturating_sub: 2 - 10 = 0, 5 - 10 = 0
         assert_eq!(request["params"]["range"]["start"]["line"], 0);
@@ -347,7 +415,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         );
 
         let hints = hints.unwrap();
@@ -368,7 +436,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         );
         assert!(result.is_none());
     }
@@ -381,7 +449,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         );
 
         assert!(hints.is_some());
@@ -419,7 +487,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -460,8 +528,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10).unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         assert_eq!(hints[0].position.line, 10);
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
@@ -504,8 +577,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10).unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
             assert_eq!(parts.len(), 1);
@@ -557,8 +635,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10).unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
             assert_eq!(parts.len(), 1, "Cross-region part should be filtered out");
@@ -595,7 +678,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(hints.is_some());
@@ -642,8 +725,13 @@ mod tests {
             }]
         });
 
-        let hints =
-            transform_inlay_hint_response_to_host(response, &virtual_uri, &host_uri, 10).unwrap();
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         if let InlayHintLabel::LabelParts(parts) = &hints[0].label {
             assert_eq!(parts.len(), 2);

@@ -21,7 +21,10 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based_request};
+use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+};
 
 impl LanguageServerPool {
     /// Send a rename request and wait for the response.
@@ -38,7 +41,7 @@ impl LanguageServerPool {
         host_position: Position,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         new_name: &str,
         upstream_request_id: Option<UpstreamId>,
@@ -55,24 +58,18 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_rename_request(
-                    virtual_uri,
-                    host_position,
-                    region_start_line,
-                    new_name,
-                    request_id,
-                )
+                build_rename_request(virtual_uri, host_position, offset, new_name, request_id)
             },
             |response, ctx| {
                 transform_workspace_edit_response_to_host(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
-                    ctx.region_start_line,
+                    ctx.offset,
                 )
             },
         )
@@ -92,14 +89,14 @@ impl LanguageServerPool {
 fn build_rename_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    region_start_line: u32,
+    offset: RegionOffset,
     new_name: &str,
     request_id: RequestId,
 ) -> serde_json::Value {
     let mut request = build_position_based_request(
         virtual_uri,
         host_position,
-        region_start_line,
+        offset,
         request_id,
         "textDocument/rename",
     );
@@ -127,12 +124,12 @@ fn build_rename_request(
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `region_start_line` - Line offset to add when transforming to host coordinates
+/// * `offset` - The region offset for coordinate translation
 fn transform_workspace_edit_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<WorkspaceEdit> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/rename: {}", error);
@@ -148,17 +145,12 @@ fn transform_workspace_edit_response_to_host(
 
     // Transform changes map: { [uri: string]: TextEdit[] }
     if let Some(changes) = &mut edit.changes {
-        transform_changes_map(changes, request_virtual_uri, host_uri, region_start_line);
+        transform_changes_map(changes, request_virtual_uri, host_uri, offset);
     }
 
     // Transform documentChanges array
     if let Some(doc_changes) = &mut edit.document_changes {
-        transform_document_changes(
-            doc_changes,
-            request_virtual_uri,
-            host_uri,
-            region_start_line,
-        );
+        transform_document_changes(doc_changes, request_virtual_uri, host_uri, offset);
     }
 
     Some(edit)
@@ -172,7 +164,7 @@ fn transform_changes_map(
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) {
     // Collect keys to process (can't modify HashMap keys in-place)
     let keys: Vec<Uri> = changes.keys().cloned().collect();
@@ -189,8 +181,7 @@ fn transform_changes_map(
         if uri_str == request_virtual_uri {
             if let Some(mut edits) = changes.remove(&key) {
                 for edit in &mut edits {
-                    edit.range.start.line = edit.range.start.line.saturating_add(region_start_line);
-                    edit.range.end.line = edit.range.end.line.saturating_add(region_start_line);
+                    translate_virtual_range_to_host(&mut edit.range, offset);
                 }
                 changes.entry(host_uri.clone()).or_default().extend(edits);
             }
@@ -211,22 +202,19 @@ fn transform_document_changes(
     doc_changes: &mut DocumentChanges,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) {
     match doc_changes {
         DocumentChanges::Edits(edits) => {
             edits.retain_mut(|edit| {
-                transform_text_document_edit(edit, request_virtual_uri, host_uri, region_start_line)
+                transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
             });
         }
         DocumentChanges::Operations(ops) => {
             ops.retain_mut(|op| match op {
-                DocumentChangeOperation::Edit(edit) => transform_text_document_edit(
-                    edit,
-                    request_virtual_uri,
-                    host_uri,
-                    region_start_line,
-                ),
+                DocumentChangeOperation::Edit(edit) => {
+                    transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
+                }
                 DocumentChangeOperation::Op(_) => true, // File operations preserved
             });
         }
@@ -240,7 +228,7 @@ fn transform_text_document_edit(
     edit: &mut TextDocumentEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> bool {
     let uri_str = edit.text_document.uri.as_str();
 
@@ -257,9 +245,7 @@ fn transform_text_document_edit(
                 OneOf::Left(text_edit) => text_edit,
                 OneOf::Right(annotated_edit) => &mut annotated_edit.text_edit,
             };
-            text_edit.range.start.line =
-                text_edit.range.start.line.saturating_add(region_start_line);
-            text_edit.range.end.line = text_edit.range.end.line.saturating_add(region_start_line);
+            translate_virtual_range_to_host(&mut text_edit.range, offset);
         }
         return true;
     }
@@ -290,8 +276,13 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_rename_request(&virtual_uri, host_position, 3, "newName", RequestId::new(1));
+        let request = build_rename_request(
+            &virtual_uri,
+            host_position,
+            RegionOffset::new(3, 0),
+            "newName",
+            RequestId::new(1),
+        );
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -321,7 +312,7 @@ mod tests {
         let request = build_rename_request(
             &virtual_uri,
             host_position,
-            3,
+            RegionOffset::new(3, 0),
             "renamedVariable",
             RequestId::new(42),
         );
@@ -358,7 +349,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         );
         assert!(result.is_none());
     }
@@ -393,8 +384,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 10)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         let changes = edit.changes.unwrap();
         // Virtual URI key should be replaced with host URI
@@ -438,8 +434,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 5)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(5, 0),
+        )
+        .unwrap();
 
         let changes = edit.changes.unwrap();
         assert_eq!(
@@ -472,8 +473,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 10)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         let changes = edit.changes.unwrap();
         let real_uri: Uri = real_file_uri.parse().unwrap();
@@ -515,8 +521,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 10)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         let changes = edit.changes.unwrap();
         let edits = changes.get(&host_uri).expect("Should have host URI key");
@@ -556,8 +567,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 10)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(10, 0),
+        )
+        .unwrap();
 
         let doc_changes = edit.document_changes.unwrap();
         match doc_changes {
@@ -611,8 +627,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 5)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(5, 0),
+        )
+        .unwrap();
 
         match edit.document_changes.unwrap() {
             DocumentChanges::Edits(edits) => {
@@ -652,7 +673,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         )
         .unwrap();
 
@@ -703,7 +724,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         )
         .unwrap();
 
@@ -743,8 +764,13 @@ mod tests {
             }
         });
 
-        let edit = transform_workspace_edit_response_to_host(response, &virtual_uri, &host_uri, 5)
-            .unwrap();
+        let edit = transform_workspace_edit_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            RegionOffset::new(5, 0),
+        )
+        .unwrap();
 
         assert!(edit.changes.unwrap().is_empty());
     }

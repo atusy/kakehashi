@@ -39,7 +39,7 @@ impl Kakehashi {
                         range,
                         &t.injection_language,
                         &t.region_id,
-                        t.region_start_line,
+                        t.offset,
                         &t.virtual_content,
                         t.upstream_id,
                     )

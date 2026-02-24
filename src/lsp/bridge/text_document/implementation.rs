@@ -16,7 +16,8 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    RequestId, VirtualDocumentUri, build_position_based_request, transform_goto_response_to_host,
+    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    transform_goto_response_to_host,
 };
 
 impl LanguageServerPool {
@@ -34,7 +35,7 @@ impl LanguageServerPool {
         host_position: Position,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<LocationLink>>> {
@@ -50,23 +51,18 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_implementation_request(
-                    virtual_uri,
-                    host_position,
-                    region_start_line,
-                    request_id,
-                )
+                build_implementation_request(virtual_uri, host_position, offset, request_id)
             },
             |response, ctx| {
                 transform_goto_response_to_host(
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
-                    ctx.region_start_line,
+                    ctx.offset,
                 )
             },
         )
@@ -78,13 +74,13 @@ impl LanguageServerPool {
 fn build_implementation_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    region_start_line: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
-        region_start_line,
+        offset,
         request_id,
         "textDocument/implementation",
     )
@@ -108,7 +104,12 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_implementation_request(&virtual_uri, position, 3, RequestId::new(42));
+        let request = build_implementation_request(
+            &virtual_uri,
+            position,
+            RegionOffset { line: 3, column: 0 },
+            RequestId::new(42),
+        );
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -137,7 +138,12 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_implementation_request(&virtual_uri, position, 3, RequestId::new(42));
+        let request = build_implementation_request(
+            &virtual_uri,
+            position,
+            RegionOffset { line: 3, column: 0 },
+            RequestId::new(42),
+        );
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 42);

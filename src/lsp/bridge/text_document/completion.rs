@@ -13,11 +13,14 @@ use std::io;
 use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based_request};
+use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+};
 
 impl LanguageServerPool {
     /// Send a completion request and wait for the response.
@@ -38,7 +41,7 @@ impl LanguageServerPool {
         host_position: Position,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
@@ -54,13 +57,13 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_completion_request(virtual_uri, host_position, region_start_line, request_id)
+                build_completion_request(virtual_uri, host_position, offset, request_id)
             },
-            |response, ctx| transform_completion_response_to_host(response, ctx.region_start_line),
+            |response, ctx| transform_completion_response_to_host(response, ctx.offset),
         )
         .await
     }
@@ -70,13 +73,13 @@ impl LanguageServerPool {
 fn build_completion_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    region_start_line: u32,
+    offset: RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
-        region_start_line,
+        offset,
         request_id,
         "textDocument/completion",
     )
@@ -91,10 +94,10 @@ fn build_completion_request(
 ///
 /// # Arguments
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
-/// * `region_start_line` - Line offset to add to completion item ranges
+/// * `offset` - The region offset for coordinate translation
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<CompletionList> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/completion: {}", error);
@@ -124,7 +127,7 @@ fn transform_completion_response_to_host(
 
     // Transform all items in the list
     for item in &mut list.items {
-        transform_completion_item(item, region_start_line);
+        transform_completion_item(item, offset);
     }
 
     Some(list)
@@ -134,16 +137,16 @@ fn transform_completion_response_to_host(
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
-fn transform_completion_item(item: &mut CompletionItem, region_start_line: u32) {
+fn transform_completion_item(item: &mut CompletionItem, offset: RegionOffset) {
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
-                transform_range(&mut edit.range, region_start_line);
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
             tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                transform_range(&mut edit.insert, region_start_line);
-                transform_range(&mut edit.replace, region_start_line);
+                translate_virtual_range_to_host(&mut edit.insert, offset);
+                translate_virtual_range_to_host(&mut edit.replace, offset);
             }
         }
     }
@@ -151,19 +154,9 @@ fn transform_completion_item(item: &mut CompletionItem, region_start_line: u32) 
     // Transform additional_text_edits if present
     if let Some(ref mut additional_edits) = item.additional_text_edits {
         for edit in additional_edits {
-            transform_range(&mut edit.range, region_start_line);
+            translate_virtual_range_to_host(&mut edit.range, offset);
         }
     }
-}
-
-/// Transform a range's line numbers from virtual to host coordinates.
-///
-/// Uses saturating_add to prevent overflow for large line numbers, consistent
-/// with saturating_sub used elsewhere in the codebase.
-fn transform_range(range: &mut Range, region_start_line: u32) {
-    // Transform start and end positions
-    range.start.line = range.start.line.saturating_add(region_start_line);
-    range.end.line = range.end.line.saturating_add(region_start_line);
 }
 
 #[cfg(test)]
@@ -241,7 +234,12 @@ mod tests {
     #[test]
     fn completion_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_completion_request(&virtual_uri, test_position(), 3, test_request_id());
+        let request = build_completion_request(
+            &virtual_uri,
+            test_position(),
+            RegionOffset::new(3, 0),
+            test_request_id(),
+        );
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -250,7 +248,12 @@ mod tests {
     fn completion_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_completion_request(&virtual_uri, test_position(), 3, test_request_id());
+        let request = build_completion_request(
+            &virtual_uri,
+            test_position(),
+            RegionOffset::new(3, 0),
+            test_request_id(),
+        );
 
         assert_position_request(&request, "textDocument/completion", 2);
     }
@@ -284,7 +287,10 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -312,7 +318,7 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_completion_response_to_host(response, 3);
+        let transformed = transform_completion_response_to_host(response, RegionOffset::new(3, 0));
         assert!(transformed.is_none());
     }
 
@@ -334,7 +340,10 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -378,7 +387,10 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -419,7 +431,10 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -429,6 +444,197 @@ mod tests {
         let edits = item.additional_text_edits.as_ref().unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].range.start.line, 5); // 0 + 5 = 5
+    }
+
+    // ==========================================================================
+    // Column offset tests for completion response transformation
+    // ==========================================================================
+
+    #[test]
+    fn completion_response_applies_column_offset_on_first_virtual_line() {
+        // Item on virtual line 0 → column offset added to character positions
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "func",
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 0, "character": 2 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "function"
+                    }
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, RegionOffset::new(10, 4));
+
+        let list = transformed.unwrap();
+        if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
+            list.items[0].text_edit
+        {
+            assert_eq!(edit.range.start.line, 10); // 0 + 10
+            assert_eq!(edit.range.start.character, 6); // 2 + 4 (first line)
+            assert_eq!(edit.range.end.line, 10);
+            assert_eq!(edit.range.end.character, 9); // 5 + 4 (first line)
+        } else {
+            panic!("Expected TextEdit");
+        }
+    }
+
+    #[test]
+    fn completion_response_ignores_column_offset_on_non_first_virtual_line() {
+        // Item on virtual line 1 → only line offset, character unchanged
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "func",
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 1, "character": 2 },
+                            "end": { "line": 1, "character": 5 }
+                        },
+                        "newText": "function"
+                    }
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, RegionOffset::new(10, 4));
+
+        let list = transformed.unwrap();
+        if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
+            list.items[0].text_edit
+        {
+            assert_eq!(edit.range.start.line, 11); // 1 + 10
+            assert_eq!(edit.range.start.character, 2); // unchanged
+            assert_eq!(edit.range.end.line, 11);
+            assert_eq!(edit.range.end.character, 5); // unchanged
+        } else {
+            panic!("Expected TextEdit");
+        }
+    }
+
+    #[test]
+    fn completion_response_column_offset_with_insert_replace_edit() {
+        // InsertReplaceEdit on virtual line 0 → column offset on both ranges
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "println!",
+                    "textEdit": {
+                        "insert": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 }
+                        },
+                        "replace": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 10 }
+                        },
+                        "newText": "println!"
+                    }
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, RegionOffset::new(5, 7));
+
+        let list = transformed.unwrap();
+        if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
+            list.items[0].text_edit
+        {
+            // Insert range: line 0→5, char +7
+            assert_eq!(edit.insert.start.line, 5);
+            assert_eq!(edit.insert.start.character, 10); // 3 + 7
+            assert_eq!(edit.insert.end.line, 5);
+            assert_eq!(edit.insert.end.character, 13); // 6 + 7
+            // Replace range: line 0→5, char +7
+            assert_eq!(edit.replace.start.line, 5);
+            assert_eq!(edit.replace.start.character, 10); // 3 + 7
+            assert_eq!(edit.replace.end.line, 5);
+            assert_eq!(edit.replace.end.character, 17); // 10 + 7
+        } else {
+            panic!("Expected InsertReplaceEdit");
+        }
+    }
+
+    #[test]
+    fn completion_response_column_offset_with_additional_text_edits_on_first_line() {
+        // additionalTextEdits on virtual line 0 → column offset applied
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "import",
+                    "additionalTextEdits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 }
+                        },
+                        "newText": "use std::io;\n"
+                    }]
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, RegionOffset::new(5, 3));
+
+        let list = transformed.unwrap();
+        let edits = list.items[0].additional_text_edits.as_ref().unwrap();
+        assert_eq!(edits[0].range.start.line, 5);
+        assert_eq!(edits[0].range.start.character, 3); // 0 + 3
+        assert_eq!(edits[0].range.end.line, 5);
+        assert_eq!(edits[0].range.end.character, 3); // 0 + 3
+    }
+
+    #[test]
+    fn completion_request_applies_column_offset_on_first_line() {
+        // Host position on first line of region → column subtracted in request
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 5,
+            character: 14,
+        };
+        let request = build_completion_request(
+            &virtual_uri,
+            host_pos,
+            RegionOffset::new(5, 4),
+            test_request_id(),
+        );
+
+        assert_eq!(request["params"]["position"]["line"], 0); // 5 - 5
+        assert_eq!(request["params"]["position"]["character"], 10); // 14 - 4
+    }
+
+    #[test]
+    fn completion_request_ignores_column_offset_on_non_first_line() {
+        // Host position on non-first line → column NOT subtracted
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 7,
+            character: 14,
+        };
+        let request = build_completion_request(
+            &virtual_uri,
+            host_pos,
+            RegionOffset::new(5, 4),
+            test_request_id(),
+        );
+
+        assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
+        assert_eq!(request["params"]["position"]["character"], 14); // unchanged
     }
 
     #[test]
@@ -450,7 +656,10 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(
+            response,
+            RegionOffset::new(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();

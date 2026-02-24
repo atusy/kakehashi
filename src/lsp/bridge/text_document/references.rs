@@ -17,7 +17,9 @@ use tower_lsp_server::ls_types::{Location, Position, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{build_position_based_request, transform_location_for_goto};
+use super::super::protocol::{
+    RegionOffset, build_position_based_request, transform_location_for_goto,
+};
 
 impl LanguageServerPool {
     /// Send a references request and wait for the response.
@@ -34,7 +36,7 @@ impl LanguageServerPool {
         host_position: Position,
         injection_language: &str,
         region_id: &str,
-        region_start_line: u32,
+        offset: RegionOffset,
         virtual_content: &str,
         include_declaration: bool,
         upstream_request_id: Option<UpstreamId>,
@@ -51,14 +53,14 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            region_start_line,
+            offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
                 let mut request = build_position_based_request(
                     virtual_uri,
                     host_position,
-                    region_start_line,
+                    offset,
                     request_id,
                     "textDocument/references",
                 );
@@ -75,7 +77,7 @@ impl LanguageServerPool {
                     response,
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
-                    ctx.region_start_line,
+                    ctx.offset,
                 )
             },
         )
@@ -102,12 +104,12 @@ impl LanguageServerPool {
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `region_start_line` - Line offset to add when transforming to host coordinates
+/// * `offset` - The region offset for coordinate translation
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<Location>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/references: {}", error);
@@ -132,12 +134,7 @@ fn transform_references_response_to_host(
             let transformed: Vec<Location> = locations
                 .into_iter()
                 .filter_map(|location| {
-                    transform_location_for_goto(
-                        location,
-                        request_virtual_uri,
-                        host_uri,
-                        region_start_line,
-                    )
+                    transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
                 })
                 .collect();
 
@@ -152,6 +149,7 @@ fn transform_references_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use super::RegionOffset;
     use super::transform_references_response_to_host;
 
     /// Standard test host URI used across most tests.
@@ -176,7 +174,7 @@ mod tests {
             response,
             "file:///virtual.lua",
             &test_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_none());
@@ -195,7 +193,7 @@ mod tests {
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
             &test_host_uri(),
-            5,
+            RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_some());
@@ -229,7 +227,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -266,7 +264,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -300,7 +298,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
@@ -351,7 +349,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            region_start_line,
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());

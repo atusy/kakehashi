@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::LanguageServerPool;
+use crate::lsp::bridge::RegionOffset;
 use crate::lsp::bridge::UpstreamId;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
@@ -26,7 +27,7 @@ pub(crate) struct FanOutTask {
     pub(crate) uri: url::Url,
     pub(crate) injection_language: String,
     pub(crate) region_id: String,
-    pub(crate) region_start_line: u32,
+    pub(crate) offset: RegionOffset,
     pub(crate) virtual_content: String,
     pub(crate) upstream_id: Option<UpstreamId>,
 }
@@ -70,7 +71,10 @@ where
             uri: ctx.uri.clone(),
             injection_language: ctx.resolved.injection_language.clone(),
             region_id: ctx.resolved.region.region_id.clone(),
-            region_start_line: ctx.resolved.region.line_range.start,
+            offset: RegionOffset {
+                line: ctx.resolved.region.line_range.start,
+                column: ctx.resolved.region.start_column,
+            },
             virtual_content: ctx.resolved.virtual_content.clone(),
             upstream_id: ctx.upstream_request_id.clone(),
         };

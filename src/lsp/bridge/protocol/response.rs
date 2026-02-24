@@ -1,13 +1,13 @@
 //! Response transformers for LSP bridge communication.
 //!
 //! This module provides type-safe functions to transform JSON-RPC responses from
-//! downstream language servers back to host document coordinates by adding the
-//! region_start_line offset to line numbers.
+//! downstream language servers back to host document coordinates by applying a
+//! `RegionOffset` (line offset + first-line column adjustment) to coordinates.
 //!
 //! ## Function Signature Pattern
 //!
 //! Transform functions use the signature:
-//! `fn(response, request_virtual_uri, host_uri, region_start_line)`
+//! `fn(response, request_virtual_uri, host_uri, offset: RegionOffset)`
 //!
 //! They return strongly-typed LSP types instead of JSON, with URI-based filtering:
 //! - Real file URIs → keep as-is (cross-file jumps)
@@ -18,8 +18,9 @@
 
 use log::warn;
 
+use super::translation::{RegionOffset, translate_virtual_range_to_host};
 use super::virtual_uri::VirtualDocumentUri;
-use tower_lsp_server::ls_types::{Location, LocationLink, Range, Uri};
+use tower_lsp_server::ls_types::{Location, LocationLink, Uri};
 
 // =============================================================================
 // Type-safe goto-family transformers
@@ -46,12 +47,12 @@ use tower_lsp_server::ls_types::{Location, LocationLink, Range, Uri};
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `region_start_line` - Line offset to add when transforming to host coordinates
+/// * `offset` - The region offset for coordinate translation
 pub(crate) fn transform_goto_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<Vec<LocationLink>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for goto request: {}", error);
@@ -67,13 +68,8 @@ pub(crate) fn transform_goto_response_to_host(
     if result.is_object() {
         // Single Location → convert to LocationLink
         if let Ok(location) = serde_json::from_value::<Location>(result) {
-            return transform_location_for_goto(
-                location,
-                request_virtual_uri,
-                host_uri,
-                region_start_line,
-            )
-            .map(|loc| vec![location_to_location_link(loc)]);
+            return transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
+                .map(|loc| vec![location_to_location_link(loc)]);
         }
     } else if result.is_array() {
         // Could be Location[] or LocationLink[]
@@ -94,7 +90,7 @@ pub(crate) fn transform_goto_response_to_host(
                             link,
                             request_virtual_uri,
                             host_uri,
-                            region_start_line,
+                            offset,
                         )
                     })
                     .collect();
@@ -108,13 +104,8 @@ pub(crate) fn transform_goto_response_to_host(
                 let transformed: Vec<LocationLink> = locations
                     .into_iter()
                     .filter_map(|location| {
-                        transform_location_for_goto(
-                            location,
-                            request_virtual_uri,
-                            host_uri,
-                            region_start_line,
-                        )
-                        .map(location_to_location_link)
+                        transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
+                            .map(location_to_location_link)
                     })
                     .collect();
 
@@ -166,7 +157,7 @@ pub(crate) fn transform_location_for_goto(
     mut location: Location,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<Location> {
     let uri_str = location.uri.as_str();
 
@@ -178,7 +169,7 @@ pub(crate) fn transform_location_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         location.uri = host_uri.clone();
-        transform_range_for_goto(&mut location.range, region_start_line);
+        translate_virtual_range_to_host(&mut location.range, offset);
         return Some(location);
     }
 
@@ -191,12 +182,12 @@ pub(crate) fn transform_location_for_goto(
 /// Returns `None` if the location should be filtered out (cross-region virtual URI).
 ///
 /// All ranges (targetRange, targetSelectionRange, originSelectionRange) are in virtual
-/// coordinates from the downstream server and need the region_start_line offset applied.
+/// coordinates from the downstream server and need the region offset applied.
 fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    region_start_line: u32,
+    offset: RegionOffset,
 ) -> Option<LocationLink> {
     let uri_str = link.target_uri.as_str();
 
@@ -208,23 +199,14 @@ fn transform_location_link_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         link.target_uri = host_uri.clone();
-        transform_range_for_goto(&mut link.target_range, region_start_line);
-        transform_range_for_goto(&mut link.target_selection_range, region_start_line);
+        translate_virtual_range_to_host(&mut link.target_range, offset);
+        translate_virtual_range_to_host(&mut link.target_selection_range, offset);
         if let Some(ref mut origin_range) = link.origin_selection_range {
-            transform_range_for_goto(origin_range, region_start_line);
+            translate_virtual_range_to_host(origin_range, offset);
         }
         return Some(link);
     }
 
     // Case 3: Different virtual URI (cross-region) → filter out
     None
-}
-
-/// Transform a range from virtual to host coordinates for goto endpoints.
-///
-/// Uses `saturating_add` to prevent overflow, consistent with `saturating_sub`
-/// used elsewhere in the codebase for defensive arithmetic.
-fn transform_range_for_goto(range: &mut Range, region_start_line: u32) {
-    range.start.line = range.start.line.saturating_add(region_start_line);
-    range.end.line = range.end.line.saturating_add(region_start_line);
 }
