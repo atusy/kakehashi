@@ -1,13 +1,13 @@
 //! Response transformers for LSP bridge communication.
 //!
 //! This module provides type-safe functions to transform JSON-RPC responses from
-//! downstream language servers back to host document coordinates by adding the
-//! region_start_line and region_start_column offsets to coordinates.
+//! downstream language servers back to host document coordinates by applying a
+//! `RegionOffset` (line offset + first-line column adjustment) to coordinates.
 //!
 //! ## Function Signature Pattern
 //!
 //! Transform functions use the signature:
-//! `fn(response, request_virtual_uri, host_uri, region_start_line, region_start_column)`
+//! `fn(response, request_virtual_uri, host_uri, offset: RegionOffset)`
 //!
 //! They return strongly-typed LSP types instead of JSON, with URI-based filtering:
 //! - Real file URIs → keep as-is (cross-file jumps)
@@ -182,7 +182,7 @@ pub(crate) fn transform_location_for_goto(
 /// Returns `None` if the location should be filtered out (cross-region virtual URI).
 ///
 /// All ranges (targetRange, targetSelectionRange, originSelectionRange) are in virtual
-/// coordinates from the downstream server and need the region_start_line offset applied.
+/// coordinates from the downstream server and need the region offset applied.
 fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,

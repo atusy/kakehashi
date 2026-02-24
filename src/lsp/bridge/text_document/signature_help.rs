@@ -45,8 +45,7 @@ fn build_signature_help_request(
 ///
 /// # Arguments
 /// * `response` - The JSON-RPC response from the downstream language server
-/// * `_region_start_line` - The starting line (unused, kept for API consistency)
-/// * `_region_start_column` - The starting column (unused, kept for API consistency)
+/// * `_offset` - The region offset (unused, kept for API consistency)
 ///
 /// # Returns
 /// * `Some(SignatureHelp)` if the response contains valid signature help data

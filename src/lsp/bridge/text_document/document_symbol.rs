@@ -114,7 +114,7 @@ fn build_document_symbol_request(
 /// - SymbolInformation[] (flat with location.uri + location.range)
 ///
 /// For DocumentSymbol format:
-/// - range and selectionRange lines are offset by region_start_line
+/// - range and selectionRange are translated using the region offset
 /// - children are recursively processed
 ///
 /// For SymbolInformation format:
@@ -126,8 +126,7 @@ fn build_document_symbol_request(
 /// # Arguments
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `request_virtual_uri` - The virtual URI from the request
-/// * `region_start_line` - The starting line of the injection region in the host document
-/// * `region_start_column` - The starting column of the injection region on its first host line
+/// * `offset` - The region offset for coordinate translation
 fn transform_document_symbol_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,

@@ -184,7 +184,7 @@ fn transform_diagnostic_response_to_host(
     diagnostics
 }
 
-/// Transform a single typed Diagnostic by adding region_start_line to its range.
+/// Transform a single typed Diagnostic by applying the region offset to its range.
 ///
 /// Also transforms relatedInformation locations if present, filtering out entries
 /// that reference virtual URIs (which clients cannot resolve).

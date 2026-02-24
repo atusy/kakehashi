@@ -84,8 +84,7 @@ fn build_document_color_request(
 ///
 /// # Arguments
 /// * `response` - The JSON-RPC response from the downstream language server
-/// * `region_start_line` - The starting line of the injection region in the host document
-/// * `region_start_column` - The starting column of the injection region in the host document
+/// * `offset` - The region offset for coordinate translation
 fn transform_document_color_response_to_host(
     mut response: serde_json::Value,
     offset: RegionOffset,
