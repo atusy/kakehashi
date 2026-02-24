@@ -23,4 +23,8 @@ pub(super) struct InjectionContext<'a> {
     pub content_text: &'a str,
     /// Byte offset in the host document where this injection starts
     pub host_start_byte: usize,
+    /// Included ranges for the injection parser (content-text-relative).
+    /// When `Some`, `Parser::set_included_ranges()` restricts parsing to these
+    /// byte ranges, excluding named children like `block_continuation`.
+    pub included_ranges: Option<Vec<tree_sitter::Range>>,
 }
