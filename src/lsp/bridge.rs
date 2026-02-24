@@ -77,6 +77,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3, // region_start_line
+                0, // region_start_column
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -122,6 +123,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3, // region_start_line
+                0, // region_start_column
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -176,6 +178,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3, // region_start_line
+                0, // region_start_column
                 virtual_content,
                 Some(UpstreamId::Number(42)), // upstream_request_id (unused)
             )
@@ -227,6 +230,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3, // region_start_line
+                0, // region_start_column
                 virtual_content,
                 Some(UpstreamId::Number(123)), // upstream_request_id (unused)
             )
@@ -268,6 +272,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3, // region_start_line
+                0, // region_start_column
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )

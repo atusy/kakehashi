@@ -27,6 +27,7 @@ pub(crate) struct FanOutTask {
     pub(crate) injection_language: String,
     pub(crate) region_id: String,
     pub(crate) region_start_line: u32,
+    pub(crate) region_start_column: u32,
     pub(crate) virtual_content: String,
     pub(crate) upstream_id: Option<UpstreamId>,
 }
@@ -71,6 +72,7 @@ where
             injection_language: ctx.resolved.injection_language.clone(),
             region_id: ctx.resolved.region.region_id.clone(),
             region_start_line: ctx.resolved.region.line_range.start,
+            region_start_column: ctx.resolved.region.start_column,
             virtual_content: ctx.resolved.virtual_content.clone(),
             upstream_id: ctx.upstream_request_id.clone(),
         };

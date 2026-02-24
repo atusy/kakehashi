@@ -14,6 +14,7 @@ mod lifecycle;
 mod request;
 mod request_id;
 mod response;
+mod translation;
 mod virtual_uri;
 
 // Re-export all public items for external use
@@ -21,4 +22,5 @@ pub(crate) use lifecycle::*;
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;
+pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;

@@ -13,10 +13,11 @@ use std::io;
 use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{RequestId, VirtualDocumentUri, build_position_based_request};
 
 impl LanguageServerPool {
@@ -39,6 +40,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
@@ -55,12 +57,25 @@ impl LanguageServerPool {
             injection_language,
             region_id,
             region_start_line,
+            region_start_column,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_completion_request(virtual_uri, host_position, region_start_line, request_id)
+                build_completion_request(
+                    virtual_uri,
+                    host_position,
+                    region_start_line,
+                    region_start_column,
+                    request_id,
+                )
             },
-            |response, ctx| transform_completion_response_to_host(response, ctx.region_start_line),
+            |response, ctx| {
+                transform_completion_response_to_host(
+                    response,
+                    ctx.region_start_line,
+                    ctx.region_start_column,
+                )
+            },
         )
         .await
     }
@@ -71,12 +86,14 @@ fn build_completion_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
     region_start_line: u32,
+    region_start_column: u32,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
         region_start_line,
+        region_start_column,
         request_id,
         "textDocument/completion",
     )
@@ -92,9 +109,11 @@ fn build_completion_request(
 /// # Arguments
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
 /// * `region_start_line` - Line offset to add to completion item ranges
+/// * `region_start_column` - Column offset to add on virtual line 0
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     region_start_line: u32,
+    region_start_column: u32,
 ) -> Option<CompletionList> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/completion: {}", error);
@@ -124,7 +143,7 @@ fn transform_completion_response_to_host(
 
     // Transform all items in the list
     for item in &mut list.items {
-        transform_completion_item(item, region_start_line);
+        transform_completion_item(item, region_start_line, region_start_column);
     }
 
     Some(list)
@@ -134,16 +153,32 @@ fn transform_completion_response_to_host(
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
-fn transform_completion_item(item: &mut CompletionItem, region_start_line: u32) {
+fn transform_completion_item(
+    item: &mut CompletionItem,
+    region_start_line: u32,
+    region_start_column: u32,
+) {
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
             tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit) => {
-                transform_range(&mut edit.range, region_start_line);
+                translate_virtual_range_to_host(
+                    &mut edit.range,
+                    region_start_line,
+                    region_start_column,
+                );
             }
             tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                transform_range(&mut edit.insert, region_start_line);
-                transform_range(&mut edit.replace, region_start_line);
+                translate_virtual_range_to_host(
+                    &mut edit.insert,
+                    region_start_line,
+                    region_start_column,
+                );
+                translate_virtual_range_to_host(
+                    &mut edit.replace,
+                    region_start_line,
+                    region_start_column,
+                );
             }
         }
     }
@@ -151,19 +186,13 @@ fn transform_completion_item(item: &mut CompletionItem, region_start_line: u32) 
     // Transform additional_text_edits if present
     if let Some(ref mut additional_edits) = item.additional_text_edits {
         for edit in additional_edits {
-            transform_range(&mut edit.range, region_start_line);
+            translate_virtual_range_to_host(
+                &mut edit.range,
+                region_start_line,
+                region_start_column,
+            );
         }
     }
-}
-
-/// Transform a range's line numbers from virtual to host coordinates.
-///
-/// Uses saturating_add to prevent overflow for large line numbers, consistent
-/// with saturating_sub used elsewhere in the codebase.
-fn transform_range(range: &mut Range, region_start_line: u32) {
-    // Transform start and end positions
-    range.start.line = range.start.line.saturating_add(region_start_line);
-    range.end.line = range.end.line.saturating_add(region_start_line);
 }
 
 #[cfg(test)]
@@ -241,7 +270,8 @@ mod tests {
     #[test]
     fn completion_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_completion_request(&virtual_uri, test_position(), 3, test_request_id());
+        let request =
+            build_completion_request(&virtual_uri, test_position(), 3, 0, test_request_id());
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -250,7 +280,8 @@ mod tests {
     fn completion_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_completion_request(&virtual_uri, test_position(), 3, test_request_id());
+        let request =
+            build_completion_request(&virtual_uri, test_position(), 3, 0, test_request_id());
 
         assert_position_request(&request, "textDocument/completion", 2);
     }
@@ -284,7 +315,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -312,7 +343,7 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_completion_response_to_host(response, 3);
+        let transformed = transform_completion_response_to_host(response, 3, 0);
         assert!(transformed.is_none());
     }
 
@@ -334,7 +365,7 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -378,7 +409,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -419,7 +450,7 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -450,7 +481,7 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(response, region_start_line);
+        let transformed = transform_completion_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();

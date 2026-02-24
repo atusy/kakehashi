@@ -220,6 +220,7 @@ async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<D
             &t.injection_language,
             &t.region_id,
             t.region_start_line,
+            t.region_start_column,
             &t.virtual_content,
             t.upstream_id,
             None, // No previous_result_id

@@ -5,6 +5,7 @@
 //! document coordinates.
 
 use super::request_id::RequestId;
+use super::translation::translate_host_position_to_virtual;
 use super::virtual_uri::VirtualDocumentUri;
 
 /// Build a position-based JSON-RPC request for a downstream language server.
@@ -18,6 +19,7 @@ use super::virtual_uri::VirtualDocumentUri;
 /// * `virtual_uri` - The pre-built virtual document URI
 /// * `host_position` - The position in the host document
 /// * `region_start_line` - The starting line of the injection region in the host document
+/// * `region_start_column` - The starting column of the injection region on its first host line
 /// * `request_id` - The JSON-RPC request ID
 /// * `method` - The LSP method name (e.g., "textDocument/hover")
 ///
@@ -31,16 +33,13 @@ pub(crate) fn build_position_based_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
     region_start_line: u32,
+    region_start_column: u32,
     request_id: RequestId,
     method: &str,
 ) -> serde_json::Value {
     // Translate position from host to virtual coordinates
-    // Uses saturating_sub to prevent panic on race conditions where stale region data
-    // has region_start_line > host_position.line after a document edit
-    let virtual_position = tower_lsp_server::ls_types::Position {
-        line: host_position.line.saturating_sub(region_start_line),
-        character: host_position.character,
-    };
+    let mut virtual_position = host_position;
+    translate_host_position_to_virtual(&mut virtual_position, region_start_line, region_start_column);
 
     serde_json::json!({
         "jsonrpc": "2.0",

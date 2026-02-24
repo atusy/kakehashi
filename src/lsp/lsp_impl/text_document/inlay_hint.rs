@@ -40,6 +40,7 @@ impl Kakehashi {
                         &t.injection_language,
                         &t.region_id,
                         t.region_start_line,
+                        t.region_start_column,
                         &t.virtual_content,
                         t.upstream_id,
                     )

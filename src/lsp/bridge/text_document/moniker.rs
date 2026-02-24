@@ -35,6 +35,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<Moniker>>> {
@@ -51,10 +52,17 @@ impl LanguageServerPool {
             injection_language,
             region_id,
             region_start_line,
+            region_start_column,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_moniker_request(virtual_uri, host_position, region_start_line, request_id)
+                build_moniker_request(
+                    virtual_uri,
+                    host_position,
+                    region_start_line,
+                    region_start_column,
+                    request_id,
+                )
             },
             |response, _ctx| transform_moniker_response_to_host(response),
         )
@@ -67,12 +75,14 @@ fn build_moniker_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
     region_start_line: u32,
+    region_start_column: u32,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
         region_start_line,
+        region_start_column,
         request_id,
         "textDocument/moniker",
     )
@@ -121,7 +131,7 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_moniker_request(&virtual_uri, position, 3, RequestId::new(42));
+        let request = build_moniker_request(&virtual_uri, position, 3, 0, RequestId::new(42));
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -150,7 +160,7 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request = build_moniker_request(&virtual_uri, position, 3, RequestId::new(42));
+        let request = build_moniker_request(&virtual_uri, position, 3, 0, RequestId::new(42));
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 42);

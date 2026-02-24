@@ -35,6 +35,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<LocationLink>>> {
@@ -51,10 +52,17 @@ impl LanguageServerPool {
             injection_language,
             region_id,
             region_start_line,
+            region_start_column,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_definition_request(virtual_uri, host_position, region_start_line, request_id)
+                build_definition_request(
+                    virtual_uri,
+                    host_position,
+                    region_start_line,
+                    region_start_column,
+                    request_id,
+                )
             },
             |response, ctx| {
                 transform_goto_response_to_host(
@@ -62,6 +70,7 @@ impl LanguageServerPool {
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
                     ctx.region_start_line,
+                    ctx.region_start_column,
                 )
             },
         )
@@ -74,12 +83,14 @@ fn build_definition_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
     region_start_line: u32,
+    region_start_column: u32,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
         region_start_line,
+        region_start_column,
         request_id,
         "textDocument/definition",
     )
@@ -158,7 +169,8 @@ mod tests {
     #[test]
     fn definition_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_definition_request(&virtual_uri, test_position(), 3, test_request_id());
+        let request =
+            build_definition_request(&virtual_uri, test_position(), 3, 0, test_request_id());
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -167,7 +179,8 @@ mod tests {
     fn definition_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_definition_request(&virtual_uri, test_position(), 3, test_request_id());
+        let request =
+            build_definition_request(&virtual_uri, test_position(), 3, 0, test_request_id());
 
         assert_position_request(&request, "textDocument/definition", 2);
     }
@@ -194,7 +207,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line);
+            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line, 0);
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -233,7 +246,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line);
+            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line, 0);
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -266,7 +279,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line);
+            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line, 0);
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -297,7 +310,7 @@ mod tests {
         let region_start_line = 5;
 
         let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line);
+            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line, 0);
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -331,6 +344,7 @@ mod tests {
             request_virtual_uri,
             &host_uri,
             region_start_line,
+            0,
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
@@ -380,6 +394,7 @@ mod tests {
             request_virtual_uri,
             &host_uri,
             region_start_line,
+            0,
         );
 
         assert!(transformed.is_some());
@@ -399,8 +414,13 @@ mod tests {
             "result": null
         });
 
-        let transformed =
-            transform_goto_response_to_host(response, "file:///virtual.lua", &test_host_uri(), 5);
+        let transformed = transform_goto_response_to_host(
+            response,
+            "file:///virtual.lua",
+            &test_host_uri(),
+            5,
+            0,
+        );
 
         assert!(transformed.is_none());
     }
@@ -419,6 +439,7 @@ mod tests {
             "file:///project/kakehashi-virtual-uri-region-0.lua",
             &test_host_uri(),
             5,
+            0,
         );
 
         assert!(transformed.is_some());
@@ -445,7 +466,7 @@ mod tests {
         let region_start_line = 10;
 
         let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line);
+            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line, 0);
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -488,7 +509,7 @@ mod tests {
         let region_start_line = 10;
 
         let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line);
+            transform_goto_response_to_host(response, virtual_uri, &host_uri, region_start_line, 0);
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();

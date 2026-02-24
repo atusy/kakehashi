@@ -24,12 +24,14 @@ fn build_signature_help_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
     region_start_line: u32,
+    region_start_column: u32,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
         virtual_uri,
         host_position,
         region_start_line,
+        region_start_column,
         request_id,
         "textDocument/signatureHelp",
     )
@@ -44,6 +46,7 @@ fn build_signature_help_request(
 /// # Arguments
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `_region_start_line` - The starting line (unused, kept for API consistency)
+/// * `_region_start_column` - The starting column (unused, kept for API consistency)
 ///
 /// # Returns
 /// * `Some(SignatureHelp)` if the response contains valid signature help data
@@ -51,6 +54,7 @@ fn build_signature_help_request(
 fn transform_signature_help_response_to_host(
     mut response: serde_json::Value,
     _region_start_line: u32,
+    _region_start_column: u32,
 ) -> Option<SignatureHelp> {
     // SignatureHelp doesn't have ranges that need transformation.
     // activeSignature and activeParameter are indices, not coordinates.
@@ -83,6 +87,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<SignatureHelp>> {
@@ -99,6 +104,7 @@ impl LanguageServerPool {
             injection_language,
             region_id,
             region_start_line,
+            region_start_column,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
@@ -106,10 +112,17 @@ impl LanguageServerPool {
                     virtual_uri,
                     host_position,
                     region_start_line,
+                    region_start_column,
                     request_id,
                 )
             },
-            |response, _ctx| transform_signature_help_response_to_host(response, region_start_line),
+            |response, ctx| {
+                transform_signature_help_response_to_host(
+                    response,
+                    ctx.region_start_line,
+                    ctx.region_start_column,
+                )
+            },
         )
         .await
     }
@@ -190,7 +203,7 @@ mod tests {
     fn signature_help_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request =
-            build_signature_help_request(&virtual_uri, test_position(), 3, test_request_id());
+            build_signature_help_request(&virtual_uri, test_position(), 3, 0, test_request_id());
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -200,7 +213,7 @@ mod tests {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request =
-            build_signature_help_request(&virtual_uri, test_position(), 3, test_request_id());
+            build_signature_help_request(&virtual_uri, test_position(), 3, 0, test_request_id());
 
         assert_position_request(&request, "textDocument/signatureHelp", 2);
     }
@@ -219,6 +232,7 @@ mod tests {
             &virtual_uri,
             host_position,
             5, // region_start_line > host_position.line
+            0,
             test_request_id(),
         );
 
@@ -257,7 +271,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
+        let transformed = transform_signature_help_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
@@ -279,7 +293,7 @@ mod tests {
     fn signature_help_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_signature_help_response_to_host(response, 3);
+        let transformed = transform_signature_help_response_to_host(response, 3, 0);
         assert!(transformed.is_none());
     }
 
@@ -299,7 +313,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
+        let transformed = transform_signature_help_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();
@@ -331,7 +345,7 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_signature_help_response_to_host(response, region_start_line);
+        let transformed = transform_signature_help_response_to_host(response, region_start_line, 0);
 
         assert!(transformed.is_some());
         let signature_help = transformed.unwrap();

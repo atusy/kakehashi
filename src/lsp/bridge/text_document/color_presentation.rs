@@ -21,7 +21,10 @@ use tower_lsp_server::ls_types::{ColorPresentation, Range};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RequestId, VirtualDocumentUri};
+use super::super::protocol::{
+    translate_host_range_to_virtual, translate_virtual_range_to_host, RequestId,
+    VirtualDocumentUri,
+};
 
 impl LanguageServerPool {
     /// Send a color presentation request and wait for the response.
@@ -40,6 +43,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<ColorPresentation>> {
@@ -56,6 +60,7 @@ impl LanguageServerPool {
             injection_language,
             region_id,
             region_start_line,
+            region_start_column,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
@@ -64,11 +69,16 @@ impl LanguageServerPool {
                     host_range,
                     color,
                     region_start_line,
+                    region_start_column,
                     request_id,
                 )
             },
             |response, ctx| {
-                transform_color_presentation_response_to_host(response, ctx.region_start_line)
+                transform_color_presentation_response_to_host(
+                    response,
+                    ctx.region_start_line,
+                    ctx.region_start_column,
+                )
             },
         )
         .await
@@ -89,20 +99,12 @@ fn build_color_presentation_request(
     host_range: Range,
     color: &serde_json::Value,
     region_start_line: u32,
+    region_start_column: u32,
     request_id: RequestId,
 ) -> serde_json::Value {
     // Translate range from host to virtual coordinates
-    // Uses saturating_sub to prevent panic on race conditions
-    let virtual_range = Range {
-        start: tower_lsp_server::ls_types::Position {
-            line: host_range.start.line.saturating_sub(region_start_line),
-            character: host_range.start.character,
-        },
-        end: tower_lsp_server::ls_types::Position {
-            line: host_range.end.line.saturating_sub(region_start_line),
-            character: host_range.end.character,
-        },
-    };
+    let mut virtual_range = host_range;
+    translate_host_range_to_virtual(&mut virtual_range, region_start_line, region_start_column);
 
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -137,9 +139,11 @@ fn build_color_presentation_request(
 /// # Arguments
 /// * `response` - The JSON-RPC response from the downstream language server
 /// * `region_start_line` - The starting line of the injection region in the host document
+/// * `region_start_column` - The starting column of the injection region in the host document
 fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
     region_start_line: u32,
+    region_start_column: u32,
 ) -> Vec<ColorPresentation> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/colorPresentation: {}", error);
@@ -161,15 +165,20 @@ fn transform_color_presentation_response_to_host(
     // Transform textEdit and additionalTextEdits ranges to host coordinates
     for presentation in &mut presentations {
         if let Some(text_edit) = &mut presentation.text_edit {
-            text_edit.range.start.line =
-                text_edit.range.start.line.saturating_add(region_start_line);
-            text_edit.range.end.line = text_edit.range.end.line.saturating_add(region_start_line);
+            translate_virtual_range_to_host(
+                &mut text_edit.range,
+                region_start_line,
+                region_start_column,
+            );
         }
 
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
             for edit in additional_edits.iter_mut() {
-                edit.range.start.line = edit.range.start.line.saturating_add(region_start_line);
-                edit.range.end.line = edit.range.end.line.saturating_add(region_start_line);
+                translate_virtual_range_to_host(
+                    &mut edit.range,
+                    region_start_line,
+                    region_start_column,
+                );
             }
         }
     }
@@ -217,6 +226,7 @@ mod tests {
             host_range,
             &color,
             3,
+            0,
             RequestId::new(42),
         );
 
@@ -265,6 +275,7 @@ mod tests {
             host_range,
             &color,
             3,
+            0,
             RequestId::new(42),
         );
 
@@ -317,6 +328,7 @@ mod tests {
             host_range,
             &color,
             3,
+            0,
             RequestId::new(42),
         );
 
@@ -327,6 +339,82 @@ mod tests {
         assert_eq!(request["params"]["color"]["green"], 0.25);
         assert_eq!(request["params"]["color"]["blue"], 0.75);
         assert_eq!(request["params"]["color"]["alpha"], 1.0);
+    }
+
+    #[test]
+    fn color_presentation_request_first_line_applies_column_offset() {
+        use tower_lsp_server::ls_types::Position;
+        use url::Url;
+
+        let host_uri =
+            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
+                .unwrap();
+        // Host range on first line of region (line 3), region starts at col 5
+        let host_range = Range {
+            start: Position {
+                line: 3,
+                character: 10,
+            },
+            end: Position {
+                line: 3,
+                character: 17,
+            },
+        };
+        let color = json!({ "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 });
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let request = build_color_presentation_request(
+            &virtual_uri,
+            host_range,
+            &color,
+            3,
+            5,
+            RequestId::new(42),
+        );
+
+        let range = &request["params"]["range"];
+        // Virtual line 0 -> character adjusted: 10 - 5 = 5, 17 - 5 = 12
+        assert_eq!(range["start"]["line"], 0);
+        assert_eq!(range["start"]["character"], 5);
+        assert_eq!(range["end"]["line"], 0);
+        assert_eq!(range["end"]["character"], 12);
+    }
+
+    #[test]
+    fn color_presentation_request_non_first_line_ignores_column_offset() {
+        use tower_lsp_server::ls_types::Position;
+        use url::Url;
+
+        let host_uri =
+            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
+                .unwrap();
+        // Host range on non-first line of region
+        let host_range = Range {
+            start: Position {
+                line: 5,
+                character: 10,
+            },
+            end: Position {
+                line: 5,
+                character: 17,
+            },
+        };
+        let color = json!({ "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 });
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let request = build_color_presentation_request(
+            &virtual_uri,
+            host_range,
+            &color,
+            3,
+            5,
+            RequestId::new(42),
+        );
+
+        let range = &request["params"]["range"];
+        // Virtual line 2 -> character unchanged
+        assert_eq!(range["start"]["line"], 2);
+        assert_eq!(range["start"]["character"], 10);
+        assert_eq!(range["end"]["line"], 2);
+        assert_eq!(range["end"]["character"], 17);
     }
 
     #[test]
@@ -361,6 +449,7 @@ mod tests {
             host_range,
             &color,
             10, // region_start_line > range lines
+            0,
             RequestId::new(42),
         );
 
@@ -400,7 +489,7 @@ mod tests {
         let region_start_line = 5;
 
         let presentations =
-            transform_color_presentation_response_to_host(response, region_start_line);
+            transform_color_presentation_response_to_host(response, region_start_line, 0);
 
         assert_eq!(presentations.len(), 1);
         let text_edit = presentations[0].text_edit.as_ref().unwrap();
@@ -445,7 +534,7 @@ mod tests {
         let region_start_line = 3;
 
         let presentations =
-            transform_color_presentation_response_to_host(response, region_start_line);
+            transform_color_presentation_response_to_host(response, region_start_line, 0);
 
         assert_eq!(presentations.len(), 1);
         let text_edit = presentations[0].text_edit.as_ref().unwrap();
@@ -474,7 +563,7 @@ mod tests {
         let region_start_line = 5;
 
         let presentations =
-            transform_color_presentation_response_to_host(response, region_start_line);
+            transform_color_presentation_response_to_host(response, region_start_line, 0);
 
         assert_eq!(presentations.len(), 3);
         assert_eq!(presentations[0].label, "#ff0000");
@@ -489,7 +578,7 @@ mod tests {
     fn color_presentation_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let presentations = transform_color_presentation_response_to_host(response, 5);
+        let presentations = transform_color_presentation_response_to_host(response, 5, 0);
         assert!(presentations.is_empty());
     }
 
@@ -497,7 +586,7 @@ mod tests {
     fn color_presentation_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let presentations = transform_color_presentation_response_to_host(response, 5);
+        let presentations = transform_color_presentation_response_to_host(response, 5, 0);
         assert!(presentations.is_empty());
     }
 }

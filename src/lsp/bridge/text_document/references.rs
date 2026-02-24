@@ -35,6 +35,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         include_declaration: bool,
         upstream_request_id: Option<UpstreamId>,
@@ -52,6 +53,7 @@ impl LanguageServerPool {
             injection_language,
             region_id,
             region_start_line,
+            region_start_column,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
@@ -59,6 +61,7 @@ impl LanguageServerPool {
                     virtual_uri,
                     host_position,
                     region_start_line,
+                    region_start_column,
                     request_id,
                     "textDocument/references",
                 );
@@ -76,6 +79,7 @@ impl LanguageServerPool {
                     &ctx.virtual_uri_string,
                     ctx.host_uri_lsp,
                     ctx.region_start_line,
+                    ctx.region_start_column,
                 )
             },
         )
@@ -103,11 +107,13 @@ impl LanguageServerPool {
 /// * `request_virtual_uri` - The virtual URI from the request
 /// * `host_uri` - The pre-parsed host URI to use in transformed responses
 /// * `region_start_line` - Line offset to add when transforming to host coordinates
+/// * `region_start_column` - Column offset to add on virtual line 0
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
     region_start_line: u32,
+    region_start_column: u32,
 ) -> Option<Vec<Location>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/references: {}", error);
@@ -137,6 +143,7 @@ fn transform_references_response_to_host(
                         request_virtual_uri,
                         host_uri,
                         region_start_line,
+                        region_start_column,
                     )
                 })
                 .collect();
@@ -177,6 +184,7 @@ mod tests {
             "file:///virtual.lua",
             &test_host_uri(),
             5,
+            0,
         );
 
         assert!(transformed.is_none());
@@ -196,6 +204,7 @@ mod tests {
             "file:///project/kakehashi-virtual-uri-region-0.lua",
             &test_host_uri(),
             5,
+            0,
         );
 
         assert!(transformed.is_some());
@@ -230,6 +239,7 @@ mod tests {
             virtual_uri,
             &host_uri,
             region_start_line,
+            0,
         );
 
         assert!(transformed.is_some());
@@ -267,6 +277,7 @@ mod tests {
             virtual_uri,
             &host_uri,
             region_start_line,
+            0,
         );
 
         assert!(transformed.is_some());
@@ -301,6 +312,7 @@ mod tests {
             request_virtual_uri,
             &host_uri,
             region_start_line,
+            0,
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
@@ -352,6 +364,7 @@ mod tests {
             request_virtual_uri,
             &host_uri,
             region_start_line,
+            0,
         );
 
         assert!(transformed.is_some());

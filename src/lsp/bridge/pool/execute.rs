@@ -66,6 +66,9 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// The starting line of the injection region in the host document
     /// (for coordinate translation back to host space).
     pub region_start_line: u32,
+    /// The starting column of the injection region on its first host line
+    /// (for coordinate translation back to host space on virtual line 0).
+    pub region_start_column: u32,
 }
 
 impl LanguageServerPool {
@@ -82,6 +85,7 @@ impl LanguageServerPool {
     /// * `injection_language` - The injection language (e.g., "lua")
     /// * `region_id` - The unique region ID for this injection
     /// * `region_start_line` - The starting line of the injection region in the host document
+    /// * `region_start_column` - The starting column of the injection region on its first host line
     /// * `virtual_content` - The content of the virtual document
     /// * `upstream_request_id` - The original request ID from the upstream client
     /// * `build_request` - Closure to build the JSON-RPC request from the
@@ -97,6 +101,7 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         region_start_line: u32,
+        region_start_column: u32,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
@@ -184,6 +189,7 @@ impl LanguageServerPool {
             virtual_uri_string: virtual_uri.to_uri_string(),
             host_uri_lsp: &host_uri_lsp,
             region_start_line,
+            region_start_column,
         };
 
         Ok(transform_response(response?, &context))
@@ -230,6 +236,7 @@ mod tests {
                 "lua",
                 TEST_ULID_LUA_0,
                 0,
+                0,
                 "print('hello')",
                 None,
             )
@@ -268,6 +275,7 @@ mod tests {
                 &host_uri,
                 "lua",
                 TEST_ULID_LUA_0,
+                0,
                 0,
                 "print('hello')",
                 None,
@@ -329,9 +337,11 @@ mod tests {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
             region_start_line: 5,
+            region_start_column: 0,
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);
         assert_eq!(ctx.region_start_line, 5);
+        assert_eq!(ctx.region_start_column, 0);
     }
 }

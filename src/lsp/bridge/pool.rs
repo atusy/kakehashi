@@ -1248,6 +1248,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1271,6 +1272,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1319,6 +1321,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1350,6 +1353,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(2)), // upstream_request_id
             )
@@ -1391,6 +1395,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1424,6 +1429,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('world')",
                 Some(UpstreamId::Number(2)), // upstream_request_id
             )
@@ -1688,6 +1694,7 @@ mod tests {
                 "lua",
                 TEST_ULID_LUA_0,
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)),
             )
@@ -1746,6 +1753,7 @@ mod tests {
                 "lua",
                 TEST_ULID_LUA_0,
                 3, // region starts at line 3, position is at line 4, so virtual line = 1
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)),
             )
@@ -1764,6 +1772,7 @@ mod tests {
                 "lua",
                 TEST_ULID_LUA_1,
                 7, // region starts at line 7, position is at line 8, so virtual line = 1
+                0,
                 "print('world')",
                 Some(UpstreamId::Number(2)),
             )
@@ -2026,6 +2035,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -2049,6 +2059,7 @@ mod tests {
                 "lua",
                 "region-0",
                 3,
+                0,
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
