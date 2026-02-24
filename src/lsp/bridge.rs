@@ -23,8 +23,8 @@ pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub use pool::LanguageServerPool;
-pub(crate) use protocol::RegionOffset;
 pub(crate) use pool::UpstreamId;
+pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::location_link_to_location;
 
 /// Integration tests for the bridge module.

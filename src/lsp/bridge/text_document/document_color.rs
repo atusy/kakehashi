@@ -21,7 +21,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request};
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request,
+};
 
 impl LanguageServerPool {
     /// Send a document color request and wait for the response.
@@ -57,12 +59,7 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             build_document_color_request,
-            |response, ctx| {
-                transform_document_color_response_to_host(
-                    response,
-                    ctx.offset,
-                )
-            },
+            |response, ctx| transform_document_color_response_to_host(response, ctx.offset),
         )
         .await
     }
@@ -211,7 +208,13 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let colors = transform_document_color_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let colors = transform_document_color_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert_eq!(colors.len(), 2);
         assert_eq!(colors[0].range.start.line, 5);
@@ -230,7 +233,10 @@ mod tests {
     fn document_color_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let colors = transform_document_color_response_to_host(response, RegionOffset { line: 5, column: 0 });
+        let colors = transform_document_color_response_to_host(
+            response,
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(colors.is_empty());
     }
 
@@ -238,7 +244,10 @@ mod tests {
     fn document_color_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let colors = transform_document_color_response_to_host(response, RegionOffset { line: 5, column: 0 });
+        let colors = transform_document_color_response_to_host(
+            response,
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(colors.is_empty());
     }
 
@@ -262,7 +271,13 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let colors = transform_document_color_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let colors = transform_document_color_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert_eq!(colors.len(), 1);
         assert_eq!(colors[0].range.start.line, 3);
@@ -292,7 +307,13 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let colors = transform_document_color_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let colors = transform_document_color_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert_eq!(colors.len(), 1);
         assert_eq!(

@@ -134,12 +134,7 @@ fn transform_references_response_to_host(
             let transformed: Vec<Location> = locations
                 .into_iter()
                 .filter_map(|location| {
-                    transform_location_for_goto(
-                        location,
-                        request_virtual_uri,
-                        host_uri,
-                        offset,
-                    )
+                    transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
                 })
                 .collect();
 
@@ -154,8 +149,8 @@ fn transform_references_response_to_host(
 
 #[cfg(test)]
 mod tests {
-    use super::transform_references_response_to_host;
     use super::RegionOffset;
+    use super::transform_references_response_to_host;
 
     fn offset(line: u32, column: u32) -> RegionOffset {
         RegionOffset { line, column }

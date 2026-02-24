@@ -11,8 +11,8 @@ use tokio::task::JoinSet;
 
 use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::LanguageServerPool;
-use crate::lsp::bridge::UpstreamId;
 use crate::lsp::bridge::RegionOffset;
+use crate::lsp::bridge::UpstreamId;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
 /// Per-server arguments produced by [`fan_out()`].

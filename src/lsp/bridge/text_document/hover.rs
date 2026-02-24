@@ -194,7 +194,12 @@ mod tests {
     #[test]
     fn hover_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
+        let request = build_hover_request(
+            &virtual_uri,
+            test_position(),
+            offset(3, 0),
+            test_request_id(),
+        );
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -203,7 +208,12 @@ mod tests {
     fn hover_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
+        let request = build_hover_request(
+            &virtual_uri,
+            test_position(),
+            offset(3, 0),
+            test_request_id(),
+        );
 
         assert_position_request(&request, "textDocument/hover", 2);
     }
@@ -217,7 +227,8 @@ mod tests {
         };
 
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, host_position, offset(3, 0), test_request_id());
+        let request =
+            build_hover_request(&virtual_uri, host_position, offset(3, 0), test_request_id());
 
         assert_eq!(
             request["params"]["position"]["line"], 0,
@@ -234,7 +245,8 @@ mod tests {
         };
 
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(&virtual_uri, host_position, offset(0, 0), test_request_id());
+        let request =
+            build_hover_request(&virtual_uri, host_position, offset(0, 0), test_request_id());
 
         assert_eq!(
             request["params"]["position"]["line"], 5,

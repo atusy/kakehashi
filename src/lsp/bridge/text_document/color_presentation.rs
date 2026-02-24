@@ -22,8 +22,8 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    translate_host_range_to_virtual, translate_virtual_range_to_host, RegionOffset, RequestId,
-    VirtualDocumentUri,
+    RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    translate_virtual_range_to_host,
 };
 
 impl LanguageServerPool {
@@ -62,20 +62,9 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_color_presentation_request(
-                    virtual_uri,
-                    host_range,
-                    color,
-                    offset,
-                    request_id,
-                )
+                build_color_presentation_request(virtual_uri, host_range, color, offset, request_id)
             },
-            |response, ctx| {
-                transform_color_presentation_response_to_host(
-                    response,
-                    ctx.offset,
-                )
-            },
+            |response, ctx| transform_color_presentation_response_to_host(response, ctx.offset),
         )
         .await
     }
@@ -159,18 +148,12 @@ fn transform_color_presentation_response_to_host(
     // Transform textEdit and additionalTextEdits ranges to host coordinates
     for presentation in &mut presentations {
         if let Some(text_edit) = &mut presentation.text_edit {
-            translate_virtual_range_to_host(
-                &mut text_edit.range,
-                offset,
-            );
+            translate_virtual_range_to_host(&mut text_edit.range, offset);
         }
 
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
             for edit in additional_edits.iter_mut() {
-                translate_virtual_range_to_host(
-                    &mut edit.range,
-                    offset,
-                );
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
         }
     }
@@ -435,7 +418,10 @@ mod tests {
             &virtual_uri,
             host_range,
             &color,
-            RegionOffset { line: 10, column: 0 }, // region_start_line > range lines
+            RegionOffset {
+                line: 10,
+                column: 0,
+            }, // region_start_line > range lines
             RequestId::new(42),
         );
 
@@ -474,8 +460,13 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert_eq!(presentations.len(), 1);
         let text_edit = presentations[0].text_edit.as_ref().unwrap();
@@ -519,8 +510,13 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert_eq!(presentations.len(), 1);
         let text_edit = presentations[0].text_edit.as_ref().unwrap();
@@ -548,8 +544,13 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let presentations =
-            transform_color_presentation_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert_eq!(presentations.len(), 3);
         assert_eq!(presentations[0].label, "#ff0000");
@@ -564,7 +565,10 @@ mod tests {
     fn color_presentation_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let presentations = transform_color_presentation_response_to_host(response, RegionOffset { line: 5, column: 0 });
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(presentations.is_empty());
     }
 
@@ -572,7 +576,10 @@ mod tests {
     fn color_presentation_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let presentations = transform_color_presentation_response_to_host(response, RegionOffset { line: 5, column: 0 });
+        let presentations = transform_color_presentation_response_to_host(
+            response,
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(presentations.is_empty());
     }
 }

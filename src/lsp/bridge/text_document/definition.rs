@@ -163,8 +163,12 @@ mod tests {
     #[test]
     fn definition_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request =
-            build_definition_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
+        let request = build_definition_request(
+            &virtual_uri,
+            test_position(),
+            offset(3, 0),
+            test_request_id(),
+        );
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -173,8 +177,12 @@ mod tests {
     fn definition_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request =
-            build_definition_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
+        let request = build_definition_request(
+            &virtual_uri,
+            test_position(),
+            offset(3, 0),
+            test_request_id(),
+        );
 
         assert_position_request(&request, "textDocument/definition", 2);
     }
@@ -200,8 +208,12 @@ mod tests {
         let host_uri = test_host_uri();
         let region_start_line = 3;
 
-        let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, offset(region_start_line, 0));
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            offset(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -239,8 +251,12 @@ mod tests {
         let host_uri = test_host_uri();
         let region_start_line = 3;
 
-        let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, offset(region_start_line, 0));
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            offset(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -272,8 +288,12 @@ mod tests {
         let host_uri = test_host_uri();
         let region_start_line = 3;
 
-        let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, offset(region_start_line, 0));
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            offset(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -303,8 +323,12 @@ mod tests {
         let host_uri = test_host_uri();
         let region_start_line = 5;
 
-        let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, offset(region_start_line, 0));
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            offset(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -455,8 +479,12 @@ mod tests {
         let host_uri = test_host_uri();
         let region_start_line = 10;
 
-        let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, offset(region_start_line, 0));
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            offset(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();
@@ -498,8 +526,12 @@ mod tests {
         let host_uri = test_host_uri();
         let region_start_line = 10;
 
-        let transformed =
-            transform_goto_response_to_host(response, virtual_uri, &host_uri, offset(region_start_line, 0));
+        let transformed = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &host_uri,
+            offset(region_start_line, 0),
+        );
 
         assert!(transformed.is_some());
         let links = transformed.unwrap();

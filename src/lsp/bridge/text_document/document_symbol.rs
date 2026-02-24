@@ -37,7 +37,9 @@ use tower_lsp_server::ls_types::{DocumentSymbol, SymbolInformation};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request};
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request,
+};
 use super::super::protocol::{translate_virtual_position_to_host, translate_virtual_range_to_host};
 
 impl LanguageServerPool {
@@ -152,11 +154,7 @@ fn transform_document_symbol_response_to_host(
     // SymbolInformation has "location"; DocumentSymbol has "range" + "selectionRange".
     if items.first().and_then(|i| i.get("location")).is_some() {
         // SymbolInformation[] format → convert to Vec<DocumentSymbol>
-        transform_symbol_information_response(
-            result,
-            request_virtual_uri,
-            offset,
-        )
+        transform_symbol_information_response(result, request_virtual_uri, offset)
     } else {
         // DocumentSymbol[] format
         transform_document_symbol_nested_response(result, offset)
@@ -244,15 +242,9 @@ fn transform_document_symbol_nested_response(
 /// Recursively transform a single DocumentSymbol's ranges from virtual to host coordinates.
 ///
 /// Uses saturating_add to prevent overflow for large line numbers.
-fn transform_document_symbol_ranges(
-    symbol: &mut DocumentSymbol,
-    offset: RegionOffset,
-) {
+fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: RegionOffset) {
     translate_virtual_range_to_host(&mut symbol.range, offset);
-    translate_virtual_range_to_host(
-        &mut symbol.selection_range,
-        offset,
-    );
+    translate_virtual_range_to_host(&mut symbol.selection_range, offset);
 
     if let Some(children) = &mut symbol.children {
         for child in children {
@@ -339,7 +331,12 @@ mod tests {
             ]
         });
 
-        let symbols = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 3, column: 0 }).unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            "unused",
+            RegionOffset { line: 3, column: 0 },
+        )
+        .unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].range.start.line, 3);
@@ -398,7 +395,12 @@ mod tests {
             ]
         });
 
-        let symbols = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 5, column: 0 }).unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            "unused",
+            RegionOffset { line: 5, column: 0 },
+        )
+        .unwrap();
 
         assert_eq!(symbols[0].range.start.line, 5);
         assert_eq!(symbols[0].range.end.line, 15);
@@ -470,7 +472,11 @@ mod tests {
     fn document_symbol_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 5, column: 0 });
+        let transformed = transform_document_symbol_response_to_host(
+            response,
+            "unused",
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(transformed.is_none());
     }
 
@@ -478,7 +484,12 @@ mod tests {
     fn document_symbol_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let symbols = transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 5, column: 0 }).unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            "unused",
+            RegionOffset { line: 5, column: 0 },
+        )
+        .unwrap();
         assert!(symbols.is_empty());
     }
 
@@ -503,8 +514,12 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, virtual_uri, RegionOffset { line: 7, column: 0 }).unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            virtual_uri,
+            RegionOffset { line: 7, column: 0 },
+        )
+        .unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "myVariable");
@@ -542,9 +557,12 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, request_virtual_uri, RegionOffset { line: 5, column: 0 })
-                .unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            request_virtual_uri,
+            RegionOffset { line: 5, column: 0 },
+        )
+        .unwrap();
 
         assert!(
             symbols.is_empty(),
@@ -589,9 +607,12 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, request_virtual_uri, RegionOffset { line: 5, column: 0 })
-                .unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            request_virtual_uri,
+            RegionOffset { line: 5, column: 0 },
+        )
+        .unwrap();
 
         // Only the same-region virtual URI symbol should remain.
         // Cross-region and real file URIs are both filtered out.
@@ -625,8 +646,15 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, "unused", RegionOffset { line: 10, column: 0 }).unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            "unused",
+            RegionOffset {
+                line: 10,
+                column: 0,
+            },
+        )
+        .unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(
@@ -659,8 +687,12 @@ mod tests {
             ]
         });
 
-        let symbols =
-            transform_document_symbol_response_to_host(response, virtual_uri, RegionOffset { line: 0, column: 0 }).unwrap();
+        let symbols = transform_document_symbol_response_to_host(
+            response,
+            virtual_uri,
+            RegionOffset { line: 0, column: 0 },
+        )
+        .unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].tags.as_ref().unwrap().len(), 1);

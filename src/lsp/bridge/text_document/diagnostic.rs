@@ -295,7 +295,8 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(3, 0), "file:///test.md");
+        let diagnostics =
+            transform_diagnostic_response_to_host(response, offset(3, 0), "file:///test.md");
 
         assert_eq!(diagnostics.len(), 1);
 
@@ -340,7 +341,8 @@ mod tests {
             }
         });
 
-        let diagnostics = transform_diagnostic_response_to_host(response, offset(3, 0), "file:///test.md");
+        let diagnostics =
+            transform_diagnostic_response_to_host(response, offset(3, 0), "file:///test.md");
 
         assert_eq!(diagnostics.len(), 1);
 

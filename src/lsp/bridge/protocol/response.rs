@@ -68,13 +68,8 @@ pub(crate) fn transform_goto_response_to_host(
     if result.is_object() {
         // Single Location → convert to LocationLink
         if let Ok(location) = serde_json::from_value::<Location>(result) {
-            return transform_location_for_goto(
-                location,
-                request_virtual_uri,
-                host_uri,
-                offset,
-            )
-            .map(|loc| vec![location_to_location_link(loc)]);
+            return transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
+                .map(|loc| vec![location_to_location_link(loc)]);
         }
     } else if result.is_array() {
         // Could be Location[] or LocationLink[]
@@ -109,13 +104,8 @@ pub(crate) fn transform_goto_response_to_host(
                 let transformed: Vec<LocationLink> = locations
                     .into_iter()
                     .filter_map(|location| {
-                        transform_location_for_goto(
-                            location,
-                            request_virtual_uri,
-                            host_uri,
-                            offset,
-                        )
-                        .map(location_to_location_link)
+                        transform_location_for_goto(location, request_virtual_uri, host_uri, offset)
+                            .map(location_to_location_link)
                     })
                     .collect();
 

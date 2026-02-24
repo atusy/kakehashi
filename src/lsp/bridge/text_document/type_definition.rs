@@ -103,8 +103,12 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_type_definition_request(&virtual_uri, position, RegionOffset { line: 3, column: 0 }, RequestId::new(42));
+        let request = build_type_definition_request(
+            &virtual_uri,
+            position,
+            RegionOffset { line: 3, column: 0 },
+            RequestId::new(42),
+        );
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -133,8 +137,12 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_type_definition_request(&virtual_uri, position, RegionOffset { line: 3, column: 0 }, RequestId::new(42));
+        let request = build_type_definition_request(
+            &virtual_uri,
+            position,
+            RegionOffset { line: 3, column: 0 },
+            RequestId::new(42),
+        );
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 42);

@@ -18,7 +18,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request};
+use super::super::protocol::{
+    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+};
 
 impl LanguageServerPool {
     /// Send a document highlight request and wait for the response.
@@ -55,19 +57,9 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_document_highlight_request(
-                    virtual_uri,
-                    host_position,
-                    offset,
-                    request_id,
-                )
+                build_document_highlight_request(virtual_uri, host_position, offset, request_id)
             },
-            |response, ctx| {
-                transform_document_highlight_response_to_host(
-                    response,
-                    ctx.offset,
-                )
-            },
+            |response, ctx| transform_document_highlight_response_to_host(response, ctx.offset),
         )
         .await
     }
@@ -119,10 +111,7 @@ fn transform_document_highlight_response_to_host(
 
     // Transform ranges to host coordinates
     for highlight in &mut highlights {
-        translate_virtual_range_to_host(
-            &mut highlight.range,
-            offset,
-        );
+        translate_virtual_range_to_host(&mut highlight.range, offset);
     }
 
     Some(highlights)
@@ -148,8 +137,12 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_document_highlight_request(&virtual_uri, position, RegionOffset { line: 3, column: 0 }, RequestId::new(42));
+        let request = build_document_highlight_request(
+            &virtual_uri,
+            position,
+            RegionOffset { line: 3, column: 0 },
+            RequestId::new(42),
+        );
 
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
@@ -178,8 +171,12 @@ mod tests {
             character: 10,
         };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
-        let request =
-            build_document_highlight_request(&virtual_uri, position, RegionOffset { line: 3, column: 0 }, RequestId::new(42));
+        let request = build_document_highlight_request(
+            &virtual_uri,
+            position,
+            RegionOffset { line: 3, column: 0 },
+            RequestId::new(42),
+        );
 
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 42);
@@ -218,8 +215,13 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed =
-            transform_document_highlight_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let transformed = transform_document_highlight_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
@@ -240,7 +242,10 @@ mod tests {
     fn document_highlight_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_highlight_response_to_host(response, RegionOffset { line: 5, column: 0 });
+        let transformed = transform_document_highlight_response_to_host(
+            response,
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(transformed.is_none());
     }
 
@@ -248,7 +253,10 @@ mod tests {
     fn document_highlight_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed = transform_document_highlight_response_to_host(response, RegionOffset { line: 5, column: 0 });
+        let transformed = transform_document_highlight_response_to_host(
+            response,
+            RegionOffset { line: 5, column: 0 },
+        );
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
         assert!(highlights.is_empty());
@@ -272,8 +280,13 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed =
-            transform_document_highlight_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let transformed = transform_document_highlight_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
@@ -307,8 +320,13 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed =
-            transform_document_highlight_response_to_host(response, RegionOffset { line: region_start_line, column: 0 });
+        let transformed = transform_document_highlight_response_to_host(
+            response,
+            RegionOffset {
+                line: region_start_line,
+                column: 0,
+            },
+        );
 
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();

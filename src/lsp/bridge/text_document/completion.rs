@@ -238,8 +238,12 @@ mod tests {
     #[test]
     fn completion_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request =
-            build_completion_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
+        let request = build_completion_request(
+            &virtual_uri,
+            test_position(),
+            offset(3, 0),
+            test_request_id(),
+        );
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -248,8 +252,12 @@ mod tests {
     fn completion_request_translates_position_to_virtual_coordinates() {
         // Host line 5, region starts at line 3 -> virtual line 2
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request =
-            build_completion_request(&virtual_uri, test_position(), offset(3, 0), test_request_id());
+        let request = build_completion_request(
+            &virtual_uri,
+            test_position(),
+            offset(3, 0),
+            test_request_id(),
+        );
 
         assert_position_request(&request, "textDocument/completion", 2);
     }
@@ -283,7 +291,8 @@ mod tests {
         });
         let region_start_line = 3;
 
-        let transformed = transform_completion_response_to_host(response, offset(region_start_line, 0));
+        let transformed =
+            transform_completion_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -333,7 +342,8 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(response, offset(region_start_line, 0));
+        let transformed =
+            transform_completion_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -377,7 +387,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(response, offset(region_start_line, 0));
+        let transformed =
+            transform_completion_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -418,7 +429,8 @@ mod tests {
         });
         let region_start_line = 5;
 
-        let transformed = transform_completion_response_to_host(response, offset(region_start_line, 0));
+        let transformed =
+            transform_completion_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
@@ -591,7 +603,8 @@ mod tests {
             line: 5,
             character: 14,
         };
-        let request = build_completion_request(&virtual_uri, host_pos, offset(5, 4), test_request_id());
+        let request =
+            build_completion_request(&virtual_uri, host_pos, offset(5, 4), test_request_id());
 
         assert_eq!(request["params"]["position"]["line"], 0); // 5 - 5
         assert_eq!(request["params"]["position"]["character"], 10); // 14 - 4
@@ -605,7 +618,8 @@ mod tests {
             line: 7,
             character: 14,
         };
-        let request = build_completion_request(&virtual_uri, host_pos, offset(5, 4), test_request_id());
+        let request =
+            build_completion_request(&virtual_uri, host_pos, offset(5, 4), test_request_id());
 
         assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
         assert_eq!(request["params"]["position"]["character"], 14); // unchanged
@@ -630,7 +644,8 @@ mod tests {
         });
         let region_start_line = 10;
 
-        let transformed = transform_completion_response_to_host(response, offset(region_start_line, 0));
+        let transformed =
+            transform_completion_response_to_host(response, offset(region_start_line, 0));
 
         assert!(transformed.is_some());
         let list = transformed.unwrap();
