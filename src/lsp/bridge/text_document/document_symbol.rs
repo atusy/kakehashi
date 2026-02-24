@@ -37,10 +37,10 @@ use tower_lsp_server::ls_types::{DocumentSymbol, SymbolInformation};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request,
 };
-use super::super::protocol::{translate_virtual_position_to_host, translate_virtual_range_to_host};
 
 impl LanguageServerPool {
     /// Send a document symbol request and wait for the response.
@@ -201,11 +201,8 @@ fn transform_symbol_information_response(
             false
         })
         .map(|symbol| {
-            let mut start = symbol.location.range.start;
-            let mut end = symbol.location.range.end;
-            translate_virtual_position_to_host(&mut start, offset);
-            translate_virtual_position_to_host(&mut end, offset);
-            let range = tower_lsp_server::ls_types::Range { start, end };
+            let mut range = symbol.location.range;
+            translate_virtual_range_to_host(&mut range, offset);
 
             DocumentSymbol {
                 name: symbol.name,
