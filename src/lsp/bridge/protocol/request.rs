@@ -150,4 +150,83 @@ mod tests {
         // This should pass - the extension is .py even though URI ends with #cell-id
         assert_uses_virtual_uri(&request, "py");
     }
+
+    // ==========================================================================
+    // Column offset tests for build_position_based_request
+    // ==========================================================================
+
+    use super::*;
+    use tower_lsp_server::ls_types::Position;
+
+    fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
+        let url = url::Url::parse("file:///project/doc.md").unwrap();
+        crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
+    }
+
+    #[test]
+    fn position_request_first_line_applies_column_offset() {
+        // Host position on first line of region → column offset subtracted
+        // Host line 5, char 10; region starts at line 5, col 4
+        // → virtual line 0, virtual char 6 (10 - 4)
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 5,
+            character: 10,
+        };
+        let request = build_position_based_request(
+            &virtual_uri,
+            host_pos,
+            5,
+            4,
+            RequestId::new(1),
+            "textDocument/completion",
+        );
+
+        assert_eq!(request["params"]["position"]["line"], 0);
+        assert_eq!(request["params"]["position"]["character"], 6); // 10 - 4
+    }
+
+    #[test]
+    fn position_request_non_first_line_ignores_column_offset() {
+        // Host position on non-first line of region → column offset NOT applied
+        // Host line 7, char 10; region starts at line 5, col 4
+        // → virtual line 2, virtual char 10 (unchanged)
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 7,
+            character: 10,
+        };
+        let request = build_position_based_request(
+            &virtual_uri,
+            host_pos,
+            5,
+            4,
+            RequestId::new(1),
+            "textDocument/completion",
+        );
+
+        assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
+        assert_eq!(request["params"]["position"]["character"], 10); // unchanged
+    }
+
+    #[test]
+    fn position_request_column_offset_saturates_on_underflow() {
+        // Host character < region_start_column → saturating_sub gives 0
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 5,
+            character: 2,
+        };
+        let request = build_position_based_request(
+            &virtual_uri,
+            host_pos,
+            5,
+            10,
+            RequestId::new(1),
+            "textDocument/completion",
+        );
+
+        assert_eq!(request["params"]["position"]["line"], 0);
+        assert_eq!(request["params"]["position"]["character"], 0); // saturated
+    }
 }

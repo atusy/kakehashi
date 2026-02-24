@@ -462,6 +462,187 @@ mod tests {
         assert_eq!(edits[0].range.start.line, 5); // 0 + 5 = 5
     }
 
+    // ==========================================================================
+    // Column offset tests for completion response transformation
+    // ==========================================================================
+
+    #[test]
+    fn completion_response_applies_column_offset_on_first_virtual_line() {
+        // Item on virtual line 0 → column offset added to character positions
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "func",
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 0, "character": 2 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "function"
+                    }
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, 10, 4);
+
+        let list = transformed.unwrap();
+        if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
+            list.items[0].text_edit
+        {
+            assert_eq!(edit.range.start.line, 10); // 0 + 10
+            assert_eq!(edit.range.start.character, 6); // 2 + 4 (first line)
+            assert_eq!(edit.range.end.line, 10);
+            assert_eq!(edit.range.end.character, 9); // 5 + 4 (first line)
+        } else {
+            panic!("Expected TextEdit");
+        }
+    }
+
+    #[test]
+    fn completion_response_ignores_column_offset_on_non_first_virtual_line() {
+        // Item on virtual line 1 → only line offset, character unchanged
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "func",
+                    "textEdit": {
+                        "range": {
+                            "start": { "line": 1, "character": 2 },
+                            "end": { "line": 1, "character": 5 }
+                        },
+                        "newText": "function"
+                    }
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, 10, 4);
+
+        let list = transformed.unwrap();
+        if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
+            list.items[0].text_edit
+        {
+            assert_eq!(edit.range.start.line, 11); // 1 + 10
+            assert_eq!(edit.range.start.character, 2); // unchanged
+            assert_eq!(edit.range.end.line, 11);
+            assert_eq!(edit.range.end.character, 5); // unchanged
+        } else {
+            panic!("Expected TextEdit");
+        }
+    }
+
+    #[test]
+    fn completion_response_column_offset_with_insert_replace_edit() {
+        // InsertReplaceEdit on virtual line 0 → column offset on both ranges
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "println!",
+                    "textEdit": {
+                        "insert": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 6 }
+                        },
+                        "replace": {
+                            "start": { "line": 0, "character": 3 },
+                            "end": { "line": 0, "character": 10 }
+                        },
+                        "newText": "println!"
+                    }
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, 5, 7);
+
+        let list = transformed.unwrap();
+        if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
+            list.items[0].text_edit
+        {
+            // Insert range: line 0→5, char +7
+            assert_eq!(edit.insert.start.line, 5);
+            assert_eq!(edit.insert.start.character, 10); // 3 + 7
+            assert_eq!(edit.insert.end.line, 5);
+            assert_eq!(edit.insert.end.character, 13); // 6 + 7
+            // Replace range: line 0→5, char +7
+            assert_eq!(edit.replace.start.line, 5);
+            assert_eq!(edit.replace.start.character, 10); // 3 + 7
+            assert_eq!(edit.replace.end.line, 5);
+            assert_eq!(edit.replace.end.character, 17); // 10 + 7
+        } else {
+            panic!("Expected InsertReplaceEdit");
+        }
+    }
+
+    #[test]
+    fn completion_response_column_offset_with_additional_text_edits_on_first_line() {
+        // additionalTextEdits on virtual line 0 → column offset applied
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": {
+                "isIncomplete": false,
+                "items": [{
+                    "label": "import",
+                    "additionalTextEdits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 }
+                        },
+                        "newText": "use std::io;\n"
+                    }]
+                }]
+            }
+        });
+
+        let transformed = transform_completion_response_to_host(response, 5, 3);
+
+        let list = transformed.unwrap();
+        let edits = list.items[0].additional_text_edits.as_ref().unwrap();
+        assert_eq!(edits[0].range.start.line, 5);
+        assert_eq!(edits[0].range.start.character, 3); // 0 + 3
+        assert_eq!(edits[0].range.end.line, 5);
+        assert_eq!(edits[0].range.end.character, 3); // 0 + 3
+    }
+
+    #[test]
+    fn completion_request_applies_column_offset_on_first_line() {
+        // Host position on first line of region → column subtracted in request
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 5,
+            character: 14,
+        };
+        let request = build_completion_request(&virtual_uri, host_pos, 5, 4, test_request_id());
+
+        assert_eq!(request["params"]["position"]["line"], 0); // 5 - 5
+        assert_eq!(request["params"]["position"]["character"], 10); // 14 - 4
+    }
+
+    #[test]
+    fn completion_request_ignores_column_offset_on_non_first_line() {
+        // Host position on non-first line → column NOT subtracted
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 7,
+            character: 14,
+        };
+        let request = build_completion_request(&virtual_uri, host_pos, 5, 4, test_request_id());
+
+        assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
+        assert_eq!(request["params"]["position"]["character"], 14); // unchanged
+    }
+
     #[test]
     fn completion_range_transformation_saturates_on_overflow() {
         // Test defensive arithmetic: saturating_add prevents panic on overflow

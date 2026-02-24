@@ -185,7 +185,11 @@ pub(crate) fn transform_location_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         location.uri = host_uri.clone();
-        translate_virtual_range_to_host(&mut location.range, region_start_line, region_start_column);
+        translate_virtual_range_to_host(
+            &mut location.range,
+            region_start_line,
+            region_start_column,
+        );
         return Some(location);
     }
 
@@ -216,7 +220,11 @@ fn transform_location_link_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         link.target_uri = host_uri.clone();
-        translate_virtual_range_to_host(&mut link.target_range, region_start_line, region_start_column);
+        translate_virtual_range_to_host(
+            &mut link.target_range,
+            region_start_line,
+            region_start_column,
+        );
         translate_virtual_range_to_host(
             &mut link.target_selection_range,
             region_start_line,
@@ -231,4 +239,3 @@ fn transform_location_link_for_goto(
     // Case 3: Different virtual URI (cross-region) → filter out
     None
 }
-
