@@ -1535,4 +1535,63 @@ mod tests {
             text
         );
     }
+
+    #[test]
+    fn test_has_include_children_for_pattern_without_property() {
+        // Pattern 0 has NO #set! injection.include-children
+        let query_str = r#"
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_include_children_for_pattern(&query, 0),
+            "Pattern without #set! injection.include-children should return false"
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_for_pattern_with_property() {
+        // Pattern has #set! injection.include-children (value-less property)
+        let query_str = r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "html")
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            has_include_children_for_pattern(&query, 0),
+            "Pattern with #set! injection.include-children should return true"
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_multi_pattern() {
+        // Two patterns: first without, second with include-children
+        let query_str = r#"
+            ; Pattern 0: NO include-children
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ; Pattern 1: HAS include-children
+            ((line_comment) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_include_children_for_pattern(&query, 0),
+            "Pattern 0 should not have include-children"
+        );
+        assert!(
+            has_include_children_for_pattern(&query, 1),
+            "Pattern 1 should have include-children"
+        );
+    }
 }
