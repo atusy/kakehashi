@@ -297,7 +297,8 @@ pub(crate) fn extract_clean_content(
     match included_ranges {
         None => content.to_string(),
         Some(ranges) => {
-            let mut result = String::new();
+            let capacity: usize = ranges.iter().map(|r| r.end_byte - r.start_byte).sum();
+            let mut result = String::with_capacity(capacity);
             for range in ranges {
                 result.push_str(&content[range.start_byte..range.end_byte]);
             }
