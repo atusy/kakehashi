@@ -340,9 +340,7 @@ pub(crate) fn compute_line_column_offsets(
                 // How many virtual lines does this gap span?
                 let gap_end_line = range.end_point.row;
                 for line in gap_start_line..=gap_end_line {
-                    while offsets.len() <= line {
-                        offsets.push(0);
-                    }
+                    offsets.resize(line + 1, 0);
                     if line == gap_start_line {
                         // The column offset is the gap's start column within the host line.
                         // For the first line (row 0) of the content node, use start_column
@@ -371,6 +369,31 @@ pub(crate) fn compute_line_column_offsets(
             }
         }
     }
+}
+
+/// Compute clean virtual content and per-line column offsets for an injection region.
+///
+/// This combines `compute_included_ranges`, `extract_clean_content`, and
+/// `compute_line_column_offsets` into a single call, avoiding duplication
+/// across resolve methods.
+fn extract_virtual_content_and_offsets(
+    region: &InjectionRegionInfo,
+    cacheable: &CacheableInjectionRegion,
+    text: &str,
+) -> (String, Vec<u32>) {
+    let included_ranges = compute_included_ranges(&region.content_node, region.include_children);
+    let virtual_content = extract_clean_content(
+        text,
+        cacheable.byte_range.clone(),
+        included_ranges.as_deref(),
+    );
+    let line_column_offsets = compute_line_column_offsets(
+        text,
+        cacheable.byte_range.clone(),
+        cacheable.start_column,
+        included_ranges.as_deref(),
+    );
+    (virtual_content, line_column_offsets)
 }
 
 /// Parse text with optional included ranges, resetting parser state afterward.
@@ -833,26 +856,11 @@ impl InjectionResolver {
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
 
-        // 5. Compute included ranges for blockquote-aware content extraction
-        let included_ranges =
-            compute_included_ranges(&region.content_node, region.include_children);
+        // 5. Extract clean virtual content and per-line column offsets
+        let (virtual_content, line_column_offsets) =
+            extract_virtual_content_and_offsets(region, &cacheable_region, text);
 
-        // 6. Extract clean virtual document content (strips blockquote prefixes)
-        let virtual_content = extract_clean_content(
-            text,
-            cacheable_region.byte_range.clone(),
-            included_ranges.as_deref(),
-        );
-
-        // 7. Compute per-line column offsets for coordinate translation
-        let line_column_offsets = compute_line_column_offsets(
-            text,
-            cacheable_region.byte_range.clone(),
-            cacheable_region.start_column,
-            included_ranges.as_deref(),
-        );
-
-        // 8. Resolve injection language using unified detection (ADR-0005)
+        // 6. Resolve injection language using unified detection (ADR-0005)
         // This normalizes tokens like "py" -> "python" for bridge server lookup
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
@@ -955,19 +963,8 @@ impl InjectionResolver {
                 let cacheable_region =
                     CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
 
-                let included_ranges =
-                    compute_included_ranges(&region.content_node, region.include_children);
-                let virtual_content = extract_clean_content(
-                    text,
-                    cacheable_region.byte_range.clone(),
-                    included_ranges.as_deref(),
-                );
-                let line_column_offsets = compute_line_column_offsets(
-                    text,
-                    cacheable_region.byte_range.clone(),
-                    cacheable_region.start_column,
-                    included_ranges.as_deref(),
-                );
+                let (virtual_content, line_column_offsets) =
+                    extract_virtual_content_and_offsets(region, &cacheable_region, text);
 
                 // Resolve injection language using unified detection (ADR-0005)
                 let resolved_language =
