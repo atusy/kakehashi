@@ -23,33 +23,8 @@ use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use super::{ConnectionHandle, ConnectionHandleSender, LanguageServerPool, UpstreamId};
-use crate::lsp::bridge::actor::ResponseRouter;
+use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{RegionOffset, RequestId, VirtualDocumentUri};
-
-/// RAII guard that removes a pending ResponseRouter entry on drop.
-///
-/// When a `first_win()` task is aborted (via `JoinSet::abort_all()`), the
-/// future is dropped at its next `.await` point. Without this guard, the
-/// ResponseRouter entry for the in-flight request would remain until the
-/// downstream server responds (oneshot send fails silently) or the
-/// connection drops (`fail_all()`).
-///
-/// The guard is disarmed after `wait_for_response` completes, because at
-/// that point the router has already consumed or cleaned up the entry.
-struct RouterCleanupGuard {
-    router: Arc<ResponseRouter>,
-    /// When `Some`, Drop will remove the router entry for this ID.
-    /// `take()`d after wait_for_response completes to disarm.
-    request_id: Option<RequestId>,
-}
-
-impl Drop for RouterCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(id) = self.request_id {
-            self.router.remove(id);
-        }
-    }
-}
 
 /// Context provided to response transformers during bridge request execution.
 ///
@@ -135,10 +110,7 @@ impl LanguageServerPool {
         // RAII guard: removes the ResponseRouter entry if the task is aborted
         // (e.g., by JoinSet::abort_all() in first_win). Disarmed after
         // wait_for_response completes normally (any exit path).
-        let mut router_guard = RouterCleanupGuard {
-            router: Arc::clone(handle.router()),
-            request_id: Some(request_id),
-        };
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
         // Send didOpen notification only if document hasn't been opened yet
         if let Err(e) = self
@@ -171,7 +143,7 @@ impl LanguageServerPool {
         // After this returns (success, channel-closed, or timeout),
         // the router entry has been consumed or cleaned up internally.
         let response = handle.wait_for_response(request_id, response_rx).await;
-        router_guard.request_id.take();
+        router_guard.disarm();
 
         // Unregister from the upstream request registry regardless of result
         if let Some(ref id) = upstream_request_id {
@@ -283,13 +255,12 @@ mod tests {
     /// RouterCleanupGuard removes the router entry when dropped while armed.
     #[test]
     fn router_cleanup_guard_removes_entry_when_armed() {
+        use crate::lsp::bridge::actor::ResponseRouter;
+
         let router = Arc::new(ResponseRouter::new());
         let rx = router.register(RequestId::new(1)).expect("should register");
 
-        let guard = RouterCleanupGuard {
-            router: Arc::clone(&router),
-            request_id: Some(RequestId::new(1)),
-        };
+        let guard = RouterCleanupGuard::new(Arc::clone(&router), RequestId::new(1));
         drop(guard);
 
         // The entry should have been removed — register again should succeed
@@ -303,14 +274,13 @@ mod tests {
     /// RouterCleanupGuard does NOT remove the router entry when disarmed.
     #[test]
     fn router_cleanup_guard_skips_removal_when_disarmed() {
+        use crate::lsp::bridge::actor::ResponseRouter;
+
         let router = Arc::new(ResponseRouter::new());
         let _rx = router.register(RequestId::new(1)).expect("should register");
 
-        let mut guard = RouterCleanupGuard {
-            router: Arc::clone(&router),
-            request_id: Some(RequestId::new(1)),
-        };
-        guard.request_id.take();
+        let mut guard = RouterCleanupGuard::new(Arc::clone(&router), RequestId::new(1));
+        guard.disarm();
         drop(guard);
 
         // The entry should still be present — re-registering should fail (duplicate)

@@ -459,6 +459,11 @@ impl ConnectionHandle {
                 Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
             ),
             "textDocument/completion" => caps.completion_provider.is_some(),
+            "completionItem/resolve" => caps
+                .completion_provider
+                .as_ref()
+                .and_then(|opts| opts.resolve_provider)
+                .unwrap_or(false),
             "textDocument/definition" => {
                 matches!(
                     caps.definition_provider,
@@ -1951,5 +1956,65 @@ mod tests {
                 method
             );
         }
+    }
+
+    // ========================================
+    // completionItem/resolve capability tests
+    // ========================================
+
+    #[tokio::test]
+    async fn completion_resolve_capability_true_when_resolve_provider_true() {
+        use tower_lsp_server::ls_types::CompletionOptions;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            completion_provider: Some(CompletionOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(handle.has_capability("completionItem/resolve"));
+    }
+
+    #[tokio::test]
+    async fn completion_resolve_capability_false_when_resolve_provider_false() {
+        use tower_lsp_server::ls_types::CompletionOptions;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            completion_provider: Some(CompletionOptions {
+                resolve_provider: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(!handle.has_capability("completionItem/resolve"));
+    }
+
+    #[tokio::test]
+    async fn completion_resolve_capability_false_when_resolve_provider_absent() {
+        use tower_lsp_server::ls_types::CompletionOptions;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            completion_provider: Some(CompletionOptions {
+                resolve_provider: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(!handle.has_capability("completionItem/resolve"));
+    }
+
+    #[tokio::test]
+    async fn completion_resolve_capability_false_when_no_completion_provider() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+
+        assert!(!handle.has_capability("completionItem/resolve"));
     }
 }

@@ -11,6 +11,8 @@
 use std::io;
 
 use log::warn;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
@@ -63,7 +65,16 @@ impl LanguageServerPool {
             |virtual_uri, request_id| {
                 build_completion_request(virtual_uri, host_position, offset, request_id)
             },
-            |response, ctx| transform_completion_response_to_host(response, ctx.offset),
+            |response, ctx| {
+                transform_completion_response_to_host(
+                    response,
+                    ctx.offset,
+                    Some(EnvelopeContext {
+                        server_name,
+                        offset: ctx.offset,
+                    }),
+                )
+            },
         )
         .await
     }
@@ -95,9 +106,11 @@ fn build_completion_request(
 /// # Arguments
 /// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
 /// * `offset` - The region offset for coordinate translation
+/// * `envelope_ctx` - If `Some`, each item's `data` is wrapped in a routing envelope
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: RegionOffset,
+    envelope_ctx: Option<EnvelopeContext<'_>>,
 ) -> Option<CompletionList> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/completion: {}", error);
@@ -125,9 +138,12 @@ fn transform_completion_response_to_host(
         list
     };
 
-    // Transform all items in the list
+    // Transform all items in the list, then optionally envelope for resolve routing
     for item in &mut list.items {
         transform_completion_item(item, offset);
+        if let Some(ref ctx) = envelope_ctx {
+            envelope_item_data(item, ctx);
+        }
     }
 
     Some(list)
@@ -137,7 +153,7 @@ fn transform_completion_response_to_host(
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
-fn transform_completion_item(item: &mut CompletionItem, offset: RegionOffset) {
+pub(super) fn transform_completion_item(item: &mut CompletionItem, offset: RegionOffset) {
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
@@ -157,6 +173,92 @@ fn transform_completion_item(item: &mut CompletionItem, offset: RegionOffset) {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
     }
+}
+
+// =============================================================================
+// Envelope types for completionItem/resolve routing
+// =============================================================================
+
+/// Wrapper key inside `CompletionItem.data` that identifies the origin server.
+const ENVELOPE_KEY: &str = "kakehashi";
+
+/// Envelope stored in `CompletionItem.data` for routing `completionItem/resolve`.
+///
+/// When Kakehashi fans out completion to multiple downstream servers, each item's
+/// `data` field is wrapped in this envelope so that a later `completionItem/resolve`
+/// can be routed back to the correct server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct KakehashiEnvelope {
+    /// Server name identifying which downstream produced the item.
+    pub origin: String,
+    /// The downstream server's original `data` value (preserved verbatim).
+    pub inner: Option<Value>,
+    /// Region offset snapshot for coordinate transformation of the resolved response.
+    pub offset: EnvelopeOffset,
+}
+
+/// Offset snapshot stored in the envelope for coordinate back-translation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub(crate) struct EnvelopeOffset {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl From<RegionOffset> for EnvelopeOffset {
+    fn from(o: RegionOffset) -> Self {
+        Self {
+            line: o.line,
+            column: o.column,
+        }
+    }
+}
+
+impl From<&EnvelopeOffset> for RegionOffset {
+    fn from(o: &EnvelopeOffset) -> Self {
+        Self {
+            line: o.line,
+            column: o.column,
+        }
+    }
+}
+
+/// Context needed to create envelopes during completion response processing.
+pub(crate) struct EnvelopeContext<'a> {
+    pub server_name: &'a str,
+    pub offset: RegionOffset,
+}
+
+/// Wrap `item.data` in a Kakehashi envelope for origin tracking.
+///
+/// The original `data` value is moved into `inner`, and the envelope is
+/// serialized as `{"kakehashi": {...}}`.
+pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContext) {
+    let inner = item.data.take();
+    let envelope = KakehashiEnvelope {
+        origin: ctx.server_name.to_string(),
+        inner,
+        offset: EnvelopeOffset::from(ctx.offset),
+    };
+    item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+}
+
+/// Extract the envelope from a completion item's `data` without modifying the item.
+///
+/// Returns `None` if `data` is absent or not an envelope.
+pub(crate) fn extract_envelope(item: &CompletionItem) -> Option<KakehashiEnvelope> {
+    let data = item.data.as_ref()?;
+    let wrapper = data.get(ENVELOPE_KEY)?;
+    serde_json::from_value(wrapper.clone()).ok()
+}
+
+/// Extract the envelope and restore the original `data` value.
+///
+/// On success, `item.data` is set back to the downstream's original value (`inner`).
+/// Returns the extracted envelope. Returns `None` if not an envelope (item unchanged).
+pub(crate) fn strip_envelope(item: &mut CompletionItem) -> Option<KakehashiEnvelope> {
+    let mut envelope = extract_envelope(item)?;
+    item.data = envelope.inner.take();
+    Some(envelope)
 }
 
 #[cfg(test)]
@@ -290,6 +392,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -318,7 +421,8 @@ mod tests {
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_completion_response"}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(3, 0));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(3, 0), None);
         assert!(transformed.is_none());
     }
 
@@ -343,6 +447,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -390,6 +495,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -434,6 +540,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -471,7 +578,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(10, 4));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(10, 4), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -507,7 +615,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(10, 4));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(10, 4), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -547,7 +656,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(5, 7));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(5, 7), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
@@ -589,7 +699,8 @@ mod tests {
             }
         });
 
-        let transformed = transform_completion_response_to_host(response, RegionOffset::new(5, 3));
+        let transformed =
+            transform_completion_response_to_host(response, RegionOffset::new(5, 3), None);
 
         let list = transformed.unwrap();
         let edits = list.items[0].additional_text_edits.as_ref().unwrap();
@@ -659,6 +770,7 @@ mod tests {
         let transformed = transform_completion_response_to_host(
             response,
             RegionOffset::new(region_start_line, 0),
+            None,
         );
 
         assert!(transformed.is_some());
@@ -674,5 +786,88 @@ mod tests {
         } else {
             panic!("Expected TextEdit");
         }
+    }
+
+    // ==========================================================================
+    // Envelope round-trip tests
+    // ==========================================================================
+
+    fn test_envelope_ctx() -> EnvelopeContext<'static> {
+        EnvelopeContext {
+            server_name: "lua-ls",
+            offset: RegionOffset::new(3, 4),
+        }
+    }
+
+    #[test]
+    fn envelope_round_trip_with_data() {
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            data: Some(json!({"resolve_id": 42})),
+            ..Default::default()
+        };
+        let ctx = test_envelope_ctx();
+        envelope_item_data(&mut item, &ctx);
+
+        // data should now be wrapped
+        let envelope = extract_envelope(&item).expect("should extract envelope");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
+        assert_eq!(envelope.offset, EnvelopeOffset { line: 3, column: 4 });
+
+        // strip restores original data
+        let stripped = strip_envelope(&mut item).expect("should strip");
+        assert_eq!(stripped.origin, "lua-ls");
+        assert_eq!(item.data, Some(json!({"resolve_id": 42})));
+    }
+
+    #[test]
+    fn envelope_round_trip_with_none_data() {
+        let mut item = CompletionItem {
+            label: "pairs".to_string(),
+            data: None,
+            ..Default::default()
+        };
+        let ctx = test_envelope_ctx();
+        envelope_item_data(&mut item, &ctx);
+
+        let envelope = extract_envelope(&item).expect("should extract envelope");
+        assert_eq!(envelope.inner, None);
+
+        let stripped = strip_envelope(&mut item).expect("should strip");
+        assert_eq!(stripped.inner, None);
+        assert_eq!(item.data, None);
+    }
+
+    #[test]
+    fn extract_envelope_returns_none_for_non_envelope_data() {
+        let item = CompletionItem {
+            label: "test".to_string(),
+            data: Some(json!({"some_other_key": "value"})),
+            ..Default::default()
+        };
+        assert!(extract_envelope(&item).is_none());
+    }
+
+    #[test]
+    fn extract_envelope_returns_none_for_no_data() {
+        let item = CompletionItem {
+            label: "test".to_string(),
+            data: None,
+            ..Default::default()
+        };
+        assert!(extract_envelope(&item).is_none());
+    }
+
+    #[test]
+    fn strip_envelope_leaves_non_envelope_data_unchanged() {
+        let original_data = json!({"custom": true});
+        let mut item = CompletionItem {
+            label: "test".to_string(),
+            data: Some(original_data.clone()),
+            ..Default::default()
+        };
+        assert!(strip_envelope(&mut item).is_none());
+        assert_eq!(item.data, Some(original_data));
     }
 }

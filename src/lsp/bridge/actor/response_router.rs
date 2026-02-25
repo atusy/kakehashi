@@ -11,6 +11,7 @@
 //! - The original requester awaits on the Receiver without holding any Mutex
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
@@ -305,6 +306,48 @@ impl ResponseRouter {
                 }
             });
             let _ = tx.send(error_response);
+        }
+    }
+}
+
+/// RAII guard that removes a pending ResponseRouter entry on drop.
+///
+/// When an async task is aborted (e.g., via `JoinSet::abort_all()`), the
+/// future is dropped at its next `.await` point. Without this guard, the
+/// ResponseRouter entry for the in-flight request would remain until the
+/// downstream server responds (oneshot send fails silently) or the
+/// connection drops (`fail_all()`).
+///
+/// The guard is disarmed after `wait_for_response` completes, because at
+/// that point the router has already consumed or cleaned up the entry.
+pub(crate) struct RouterCleanupGuard {
+    router: Arc<ResponseRouter>,
+    /// When `Some`, Drop will remove the router entry for this ID.
+    /// Cleared by `disarm()` after wait_for_response completes.
+    request_id: Option<RequestId>,
+}
+
+impl RouterCleanupGuard {
+    pub(crate) fn new(router: Arc<ResponseRouter>, request_id: RequestId) -> Self {
+        Self {
+            router,
+            request_id: Some(request_id),
+        }
+    }
+
+    /// Prevent the guard from cleaning up on drop.
+    ///
+    /// Call this after `wait_for_response` completes, because at that point
+    /// the router has already consumed or cleaned up the entry.
+    pub(crate) fn disarm(&mut self) {
+        self.request_id.take();
+    }
+}
+
+impl Drop for RouterCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.request_id {
+            self.router.remove(id);
         }
     }
 }
