@@ -22,7 +22,8 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request,
+    DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    build_whole_document_request,
 };
 
 impl LanguageServerPool {
@@ -72,7 +73,7 @@ impl LanguageServerPool {
 fn build_document_color_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<DocumentParams> {
     build_whole_document_request(virtual_uri, request_id, "textDocument/documentColor")
 }
 

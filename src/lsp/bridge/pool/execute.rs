@@ -63,7 +63,7 @@ impl LanguageServerPool {
     /// * `transform_response` - Closure to transform the raw JSON-RPC response into the
     ///   typed result, given the response context
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn execute_bridge_request_with_handle<T>(
+    pub(crate) async fn execute_bridge_request_with_handle<T, R: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
         server_name: &str,
@@ -73,7 +73,7 @@ impl LanguageServerPool {
         offset: &RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
-        build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
+        build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> R,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions

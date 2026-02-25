@@ -48,6 +48,8 @@ pub(crate) enum NotificationSendResult {
     QueueFull,
     /// Channel is closed (terminal failure - writer task exited)
     ChannelClosed,
+    /// Payload could not be serialized to JSON (indicates a bug in the caller)
+    SerializationFailed,
 }
 
 /// Handle wrapping a connection with its state (ADR-0015 per-connection state).
@@ -215,10 +217,23 @@ impl ConnectionHandle {
     /// # Example
     ///
     /// ```ignore
-    /// let notification = json!({"jsonrpc": "2.0", "method": "textDocument/didChange", ...});
+    /// let notification = build_initialized_notification();
     /// handle.send_notification(notification); // Fire-and-forget
     /// ```
-    pub(crate) fn send_notification(&self, payload: serde_json::Value) -> NotificationSendResult {
+    pub(crate) fn send_notification(
+        &self,
+        payload: impl serde::Serialize,
+    ) -> NotificationSendResult {
+        let payload = match serde_json::to_value(payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "Failed to serialize notification: {}", e
+                );
+                return NotificationSendResult::SerializationFailed;
+            }
+        };
         match self.tx.try_send(OutboundMessage::Untracked(payload)) {
             Ok(()) => NotificationSendResult::Queued,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -276,9 +291,20 @@ impl ConnectionHandle {
     /// ```
     pub(crate) fn send_request(
         &self,
-        payload: serde_json::Value,
+        payload: impl serde::Serialize,
         request_id: RequestId,
     ) -> Result<(), BridgeError> {
+        let payload = match serde_json::to_value(payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "Failed to serialize request: {}", e
+                );
+                self.router.remove(request_id);
+                return Err(BridgeError::SerializationFailed);
+            }
+        };
         match self.tx.try_send(OutboundMessage::Tracked {
             payload,
             request_id,

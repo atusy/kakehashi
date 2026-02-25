@@ -24,11 +24,10 @@
 use std::sync::Arc;
 
 use log::warn;
-use serde_json::json;
 use tower_lsp_server::ls_types::CompletionItem;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RegionOffset, RequestId};
+use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId};
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
@@ -182,16 +181,14 @@ impl LanguageServerPool {
 }
 
 /// Build a JSON-RPC `completionItem/resolve` request.
+///
+/// The `completionItem/resolve` method is unique: its params is the
+/// `CompletionItem` itself (not a wrapper struct), per the LSP spec.
 fn build_completion_resolve_request(
     item: &CompletionItem,
     request_id: RequestId,
-) -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "completionItem/resolve",
-        "params": item,
-    })
+) -> JsonRpcRequest<&CompletionItem> {
+    JsonRpcRequest::new(request_id.as_i64(), "completionItem/resolve", item)
 }
 
 /// Parse a JSON-RPC resolve response into a `CompletionItem`.

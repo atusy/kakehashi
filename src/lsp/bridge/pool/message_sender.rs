@@ -31,18 +31,23 @@ use crate::lsp::bridge::actor::OutboundMessage;
 pub(crate) trait MessageSender: Send {
     /// Send a notification to the downstream language server.
     ///
+    /// Accepts any `Serialize` type (typed JSON-RPC messages or raw `serde_json::Value`).
+    /// Serialization to wire format happens internally.
+    ///
     /// Notifications are fire-and-forget (no response expected). If the send
     /// fails (e.g., queue full or channel closed), the notification is lost
     /// but an error is returned.
     fn send_notification(
         &mut self,
-        payload: serde_json::Value,
+        payload: impl serde::Serialize + Send,
     ) -> impl std::future::Future<Output = io::Result<()>> + Send;
 }
 
 // Implementation for channel-based sends
 impl MessageSender for mpsc::Sender<OutboundMessage> {
-    async fn send_notification(&mut self, payload: serde_json::Value) -> io::Result<()> {
+    async fn send_notification(&mut self, payload: impl serde::Serialize + Send) -> io::Result<()> {
+        let payload = serde_json::to_value(payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Use try_send for non-blocking backpressure per ADR-0015
         self.try_send(OutboundMessage::Untracked(payload))
             .map_err(|e| match e {
@@ -68,8 +73,9 @@ pub(crate) struct ConnectionHandleSender<'a>(pub(crate) &'a Arc<ConnectionHandle
 // - Queued -> Ok(())
 // - QueueFull -> WouldBlock (temporary backpressure, caller may retry)
 // - ChannelClosed -> BrokenPipe (terminal failure)
+// - SerializationFailed -> InvalidData (bug in caller)
 impl MessageSender for ConnectionHandleSender<'_> {
-    async fn send_notification(&mut self, payload: serde_json::Value) -> io::Result<()> {
+    async fn send_notification(&mut self, payload: impl serde::Serialize + Send) -> io::Result<()> {
         match self.0.send_notification(payload) {
             NotificationSendResult::Queued => Ok(()),
             NotificationSendResult::QueueFull => Err(io::Error::new(
@@ -79,6 +85,10 @@ impl MessageSender for ConnectionHandleSender<'_> {
             NotificationSendResult::ChannelClosed => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "bridge: notification channel closed",
+            )),
+            NotificationSendResult::SerializationFailed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge: failed to serialize notification payload",
             )),
         }
     }

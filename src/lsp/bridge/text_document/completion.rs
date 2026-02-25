@@ -21,8 +21,9 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
 };
+use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
     /// Send a completion request and wait for the response.
@@ -86,7 +87,7 @@ fn build_completion_request(
     host_position: tower_lsp_server::ls_types::Position,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<TextDocumentPositionParams> {
     build_position_based_request(
         virtual_uri,
         host_position,
@@ -303,7 +304,8 @@ mod tests {
     }
 
     /// Assert that a request uses a virtual URI with the expected extension.
-    fn assert_uses_virtual_uri(request: &serde_json::Value, extension: &str) {
+    fn assert_uses_virtual_uri(request: &impl serde::Serialize, extension: &str) {
+        let request = serde_json::to_value(request).unwrap();
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         // Use url crate for robust parsing (handles query strings with slashes, fragments, etc.)
         let url = url::Url::parse(uri_str).expect("URI should be parseable");
@@ -322,10 +324,11 @@ mod tests {
 
     /// Assert that a position-based request has correct structure and translated coordinates.
     fn assert_position_request(
-        request: &serde_json::Value,
+        request: &impl serde::Serialize,
         expected_method: &str,
         expected_virtual_line: u64,
     ) {
+        let request = serde_json::to_value(request).unwrap();
         assert_eq!(request["jsonrpc"], "2.0");
         assert_eq!(request["id"], 42);
         assert_eq!(request["method"], expected_method);

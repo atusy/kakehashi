@@ -21,9 +21,11 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Range, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
+use tower_lsp_server::ls_types::{InlayHintParams, TextDocumentIdentifier};
+
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -92,31 +94,19 @@ fn build_inlay_hint_request(
     host_range: Range,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<InlayHintParams> {
     // Translate range from host to virtual coordinates
     let mut virtual_range = host_range;
     translate_host_range_to_virtual(&mut virtual_range, offset);
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "textDocument/inlayHint",
-        "params": {
-            "textDocument": {
-                "uri": virtual_uri.to_uri_string()
-            },
-            "range": {
-                "start": {
-                    "line": virtual_range.start.line,
-                    "character": virtual_range.start.character
-                },
-                "end": {
-                    "line": virtual_range.end.line,
-                    "character": virtual_range.end.character
-                }
-            }
-        }
-    })
+    let params = InlayHintParams {
+        text_document: TextDocumentIdentifier {
+            uri: virtual_uri_to_lsp_uri(virtual_uri),
+        },
+        range: virtual_range,
+        work_done_progress_params: Default::default(),
+    };
+    JsonRpcRequest::new(request_id.as_i64(), "textDocument/inlayHint", params)
 }
 
 /// Transform an inlay hint response from virtual to host document coordinates.

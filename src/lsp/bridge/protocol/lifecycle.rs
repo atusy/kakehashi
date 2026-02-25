@@ -11,6 +11,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::client_capabilities::build_bridge_client_capabilities;
+use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
 
 /// Build an LSP initialize request.
@@ -27,7 +28,7 @@ pub(crate) fn build_initialize_request(
     root_uri: Option<String>,
     workspace_folders: Option<Vec<WorkspaceFolder>>,
     upstream_capabilities: Option<&ClientCapabilities>,
-) -> serde_json::Value {
+) -> JsonRpcRequest<InitializeParams> {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
             .ok()
@@ -47,77 +48,55 @@ pub(crate) fn build_initialize_request(
         ..Default::default()
     };
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "initialize",
-        "params": params
-    })
+    JsonRpcRequest::new(request_id.as_i64(), "initialize", params)
 }
 
 /// Build an LSP initialized notification.
 ///
 /// Sent after receiving the initialize response to signal
 /// that the client is ready to receive requests.
-pub(crate) fn build_initialized_notification() -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": InitializedParams {}
-    })
+pub(crate) fn build_initialized_notification() -> JsonRpcNotification<InitializedParams> {
+    JsonRpcNotification::new("initialized", InitializedParams {})
 }
 
 /// Build an LSP shutdown request.
 ///
 /// # Arguments
 /// * `request_id` - The JSON-RPC request ID
-pub(crate) fn build_shutdown_request(request_id: RequestId) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "shutdown",
-        "params": null
-    })
+pub(crate) fn build_shutdown_request(request_id: RequestId) -> JsonRpcRequest<()> {
+    JsonRpcRequest::new(request_id.as_i64(), "shutdown", ())
 }
 
 /// Build an LSP exit notification.
 ///
 /// Sent after receiving the shutdown response to terminate the server.
-pub(crate) fn build_exit_notification() -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "exit",
-        "params": null
-    })
+pub(crate) fn build_exit_notification() -> JsonRpcNotification<()> {
+    JsonRpcNotification::new("exit", ())
 }
 
 /// Build a textDocument/didClose notification.
 ///
 /// # Arguments
 /// * `uri` - The URI of the document being closed
-pub(crate) fn build_didclose_notification(uri: &str) -> serde_json::Value {
-    // Parse to Uri for type-safe DidCloseTextDocumentParams construction.
-    // Invalid URIs are unexpected here (they were validated when the document was opened),
-    // so we fall back to raw JSON construction as a safety net.
-    let Some(uri) = Uri::from_str(uri).ok() else {
-        return serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didClose",
-            "params": {
-                "textDocument": { "uri": uri }
-            }
-        });
+pub(crate) fn build_didclose_notification(
+    uri: &str,
+) -> Option<JsonRpcNotification<DidCloseTextDocumentParams>> {
+    let uri = match Uri::from_str(uri) {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Skipping didClose for invalid URI '{}': {}", uri, e
+            );
+            return None;
+        }
     };
 
     let params = DidCloseTextDocumentParams {
         text_document: TextDocumentIdentifier { uri },
     };
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didClose",
-        "params": params
-    })
+    Some(JsonRpcNotification::new("textDocument/didClose", params))
 }
 
 /// Validates a JSON-RPC initialize response.
@@ -365,7 +344,7 @@ mod tests {
     #[test]
     fn didclose_notification_with_virtual_uri() {
         let uri = "file:///project/kakehashi-virtual-uri-abc123.lua";
-        let notification = build_didclose_notification(uri);
+        let notification = build_didclose_notification(uri).expect("valid URI");
 
         assert_eq!(notification["params"]["textDocument"]["uri"], uri);
     }

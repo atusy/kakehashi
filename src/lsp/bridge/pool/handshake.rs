@@ -94,6 +94,12 @@ pub(super) async fn perform_lsp_handshake(
                 "bridge: initialized notification channel closed",
             ));
         }
+        NotificationSendResult::SerializationFailed => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge: failed to serialize initialized notification",
+            ));
+        }
     }
 
     Ok(capabilities)

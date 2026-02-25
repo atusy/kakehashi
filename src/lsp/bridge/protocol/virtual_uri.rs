@@ -8,6 +8,8 @@
 //! original scheme and directory. For "cannot-be-a-base" URIs (untitled:,
 //! mailto:, data:), a kakehashi:// scheme fallback is used.
 
+use std::str::FromStr;
+
 /// Prefix used for virtual document filenames.
 ///
 /// This distinctive prefix identifies virtual URIs and prevents collisions with real files.
@@ -76,6 +78,22 @@ impl VirtualDocumentUri {
     /// Get the language.
     pub(crate) fn language(&self) -> &str {
         &self.language
+    }
+
+    /// Convert to `ls_types::Uri`.
+    ///
+    /// Parse failure is structurally unreachable (`to_uri_string()` always produces
+    /// valid URIs via `url::Url::to_string()` or a hardcoded format string), but the
+    /// fallback to the host URI prevents panics for defense in depth.
+    pub(crate) fn to_lsp_uri(&self) -> tower_lsp_server::ls_types::Uri {
+        let uri_string = self.to_uri_string();
+        tower_lsp_server::ls_types::Uri::from_str(&uri_string).unwrap_or_else(|e| {
+            log::error!(
+                target: "kakehashi::bridge",
+                "BUG: VirtualDocumentUri produced invalid URI '{}': {}", uri_string, e
+            );
+            self.host_uri.clone()
+        })
     }
 
     /// Check if a URI string represents a virtual document.

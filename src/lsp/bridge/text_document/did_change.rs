@@ -9,11 +9,17 @@
 //! channel-based writer task. This replaces the previous `tokio::spawn` fire-and-forget
 //! pattern that could violate FIFO ordering.
 
+use std::str::FromStr;
 use std::sync::Arc;
+
+use tower_lsp_server::ls_types::{
+    DidChangeTextDocumentParams, TextDocumentContentChangeEvent, Uri,
+    VersionedTextDocumentIdentifier,
+};
 use url::Url;
 
 use super::super::pool::{ConnectionHandle, ConnectionState, LanguageServerPool};
-use super::super::protocol::VirtualDocumentUri;
+use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 impl LanguageServerPool {
     /// Forward didChange notifications to all opened virtual documents for a host document.
@@ -134,22 +140,27 @@ impl LanguageServerPool {
         content: &str,
         version: i32,
     ) {
-        // Build the didChange notification
-        let notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didChange",
-            "params": {
-                "textDocument": {
-                    "uri": virtual_uri,
-                    "version": version
-                },
-                "contentChanges": [
-                    {
-                        "text": content
-                    }
-                ]
+        let uri = match Uri::from_str(virtual_uri) {
+            Ok(u) => u,
+            Err(e) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "Skipping didChange for invalid URI '{}': {}", virtual_uri, e
+                );
+                return;
             }
-        });
+        };
+
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri, version),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: content.to_string(),
+            }],
+        };
+
+        let notification = JsonRpcNotification::new("textDocument/didChange", params);
 
         // Send via the single-writer loop (non-blocking, fire-and-forget)
         handle.send_notification(notification);

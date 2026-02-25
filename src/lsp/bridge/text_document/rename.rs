@@ -21,9 +21,12 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
+use tower_lsp_server::ls_types::RenameParams;
+
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    build_text_document_position_params,
 };
 
 impl LanguageServerPool {
@@ -84,29 +87,25 @@ impl LanguageServerPool {
 ///
 /// # Coordinate Translation
 ///
-/// Uses `build_position_based_request` to handle host→virtual position
-/// translation, then adds the `newName` field to params.
+/// Uses `build_text_document_position_params` to handle host→virtual position
+/// translation, then wraps the result in `RenameParams` with the new name.
 fn build_rename_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
     offset: &RegionOffset,
     new_name: &str,
     request_id: RequestId,
-) -> serde_json::Value {
-    let mut request = build_position_based_request(
-        virtual_uri,
-        host_position,
-        offset,
-        request_id,
-        "textDocument/rename",
-    );
-
-    // Add the newName parameter required by rename request
-    if let Some(params) = request.get_mut("params") {
-        params["newName"] = serde_json::json!(new_name);
-    }
-
-    request
+) -> JsonRpcRequest<RenameParams> {
+    let params = RenameParams {
+        text_document_position: build_text_document_position_params(
+            virtual_uri,
+            host_position,
+            offset,
+        ),
+        new_name: new_name.to_string(),
+        work_done_progress_params: Default::default(),
+    };
+    JsonRpcRequest::new(request_id.as_i64(), "textDocument/rename", params)
 }
 
 /// Transform a WorkspaceEdit response from virtual to host document coordinates.

@@ -3,22 +3,40 @@ source: src/lsp/bridge/protocol/lifecycle.rs
 expression: request
 ---
 {
-  "id": 1,
   "jsonrpc": "2.0",
+  "id": 1,
   "method": "initialize",
   "params": {
+    "processId": "[PID]",
+    "rootUri": null,
     "capabilities": {
-      "general": {
-        "positionEncodings": [
-          "utf-16"
-        ]
+      "workspace": {
+        "diagnostics": {
+          "refreshSupport": true
+        }
       },
       "textDocument": {
         "completion": {
+          "dynamicRegistration": false,
           "completionItem": {
             "insertReplaceSupport": true
-          },
+          }
+        },
+        "hover": {
           "dynamicRegistration": false
+        },
+        "signatureHelp": {
+          "dynamicRegistration": false
+        },
+        "references": {
+          "dynamicRegistration": false
+        },
+        "documentHighlight": {
+          "dynamicRegistration": false
+        },
+        "documentSymbol": {
+          "dynamicRegistration": false,
+          "hierarchicalDocumentSymbolSupport": true
         },
         "declaration": {
           "dynamicRegistration": false,
@@ -28,52 +46,34 @@ expression: request
           "dynamicRegistration": false,
           "linkSupport": true
         },
-        "diagnostic": {
-          "dynamicRegistration": true,
-          "relatedDocumentSupport": true
-        },
-        "documentHighlight": {
-          "dynamicRegistration": false
-        },
-        "documentLink": {
+        "typeDefinition": {
           "dynamicRegistration": false,
-          "tooltipSupport": true
-        },
-        "documentSymbol": {
-          "dynamicRegistration": false,
-          "hierarchicalDocumentSymbolSupport": true
-        },
-        "hover": {
-          "dynamicRegistration": false
+          "linkSupport": true
         },
         "implementation": {
           "dynamicRegistration": false,
           "linkSupport": true
         },
-        "inlayHint": {
-          "dynamicRegistration": false
+        "documentLink": {
+          "dynamicRegistration": false,
+          "tooltipSupport": true
         },
         "moniker": {
           "dynamicRegistration": false
         },
-        "references": {
+        "inlayHint": {
           "dynamicRegistration": false
         },
-        "signatureHelp": {
-          "dynamicRegistration": false
-        },
-        "typeDefinition": {
-          "dynamicRegistration": false,
-          "linkSupport": true
+        "diagnostic": {
+          "dynamicRegistration": true,
+          "relatedDocumentSupport": true
         }
       },
-      "workspace": {
-        "diagnostics": {
-          "refreshSupport": true
-        }
+      "general": {
+        "positionEncodings": [
+          "utf-16"
+        ]
       }
-    },
-    "processId": "[PID]",
-    "rootUri": null
+    }
   }
 }

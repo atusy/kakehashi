@@ -18,8 +18,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    RegionOffset, build_position_based_request, transform_location_for_goto,
+    JsonRpcRequest, RegionOffset, build_text_document_position_params, transform_location_for_goto,
 };
+use tower_lsp_server::ls_types::{ReferenceContext, ReferenceParams};
 
 impl LanguageServerPool {
     /// Send a references request and wait for the response.
@@ -57,20 +58,19 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                let mut request = build_position_based_request(
-                    virtual_uri,
-                    host_position,
-                    &offset,
-                    request_id,
-                    "textDocument/references",
-                );
-                // Add the context parameter required by references request
-                if let Some(params) = request.get_mut("params") {
-                    params["context"] = serde_json::json!({
-                        "includeDeclaration": include_declaration
-                    });
-                }
-                request
+                let params = ReferenceParams {
+                    text_document_position: build_text_document_position_params(
+                        virtual_uri,
+                        host_position,
+                        &offset,
+                    ),
+                    context: ReferenceContext {
+                        include_declaration,
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                JsonRpcRequest::new(request_id.as_i64(), "textDocument/references", params)
             },
             |response, ctx| {
                 transform_references_response_to_host(

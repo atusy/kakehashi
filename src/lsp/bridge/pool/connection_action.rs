@@ -38,6 +38,11 @@ pub(crate) enum BridgeError {
     /// This occurs when the writer task has exited (normally or via panic)
     /// and the channel is no longer accepting messages.
     ChannelClosed,
+    /// Payload could not be serialized to JSON.
+    ///
+    /// This indicates a bug in the caller (e.g., an invalid `Serialize` impl).
+    /// It is distinct from channel errors and should not trigger reconnection.
+    SerializationFailed,
 }
 
 impl BridgeError {
@@ -77,6 +82,9 @@ impl std::fmt::Display for BridgeError {
             }
             BridgeError::QueueFull => write!(f, "bridge: request queue full"),
             BridgeError::ChannelClosed => write!(f, "bridge: writer channel closed"),
+            BridgeError::SerializationFailed => {
+                write!(f, "bridge: failed to serialize request payload")
+            }
         }
     }
 }
@@ -273,5 +281,6 @@ mod tests {
         assert_eq!(BridgeError::Disabled.lsp_error_code(), -32803);
         assert_eq!(BridgeError::QueueFull.lsp_error_code(), -32803);
         assert_eq!(BridgeError::ChannelClosed.lsp_error_code(), -32803);
+        assert_eq!(BridgeError::SerializationFailed.lsp_error_code(), -32803);
     }
 }

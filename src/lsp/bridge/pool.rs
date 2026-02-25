@@ -1051,6 +1051,10 @@ impl LanguageServerPool {
                 io::ErrorKind::BrokenPipe,
                 "bridge: cancel notification channel closed",
             )),
+            NotificationSendResult::SerializationFailed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge: failed to serialize cancel notification",
+            )),
         }
     }
 

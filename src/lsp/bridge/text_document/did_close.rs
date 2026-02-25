@@ -57,7 +57,9 @@ impl LanguageServerPool {
         drop(connections); // Release lock before I/O
 
         // Build and send the didClose notification via single-writer loop (ADR-0015)
-        let notification = build_didclose_notification(&uri_string);
+        let Some(notification) = build_didclose_notification(&uri_string) else {
+            return Ok(());
+        };
 
         match handle.send_notification(notification) {
             NotificationSendResult::Queued => Ok(()),
@@ -68,6 +70,10 @@ impl LanguageServerPool {
             NotificationSendResult::ChannelClosed => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "bridge: didClose notification channel closed",
+            )),
+            NotificationSendResult::SerializationFailed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge: failed to serialize didClose notification",
             )),
         }
     }

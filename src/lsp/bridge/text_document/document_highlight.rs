@@ -19,8 +19,9 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
 };
+use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
     /// Send a document highlight request and wait for the response.
@@ -74,7 +75,7 @@ fn build_document_highlight_request(
     host_position: tower_lsp_server::ls_types::Position,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<TextDocumentPositionParams> {
     build_position_based_request(
         virtual_uri,
         host_position,

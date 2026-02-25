@@ -23,8 +23,12 @@ use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
 
 use super::super::pool::{INIT_TIMEOUT_SECS, LanguageServerPool, UpstreamId};
+use tower_lsp_server::ls_types::{DocumentDiagnosticParams, TextDocumentIdentifier};
+
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{RegionOffset, RequestId, VirtualDocumentUri};
+use super::super::protocol::{
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, virtual_uri_to_lsp_uri,
+};
 
 impl LanguageServerPool {
     /// Send a diagnostic request and wait for the response.
@@ -108,23 +112,17 @@ fn build_diagnostic_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
     previous_result_id: Option<&str>,
-) -> serde_json::Value {
-    let mut params = serde_json::json!({
-        "textDocument": {
-            "uri": virtual_uri.to_uri_string()
-        }
-    });
-
-    if let Some(prev_id) = previous_result_id {
-        params["previousResultId"] = serde_json::json!(prev_id);
-    }
-
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "textDocument/diagnostic",
-        "params": params
-    })
+) -> JsonRpcRequest<DocumentDiagnosticParams> {
+    let params = DocumentDiagnosticParams {
+        text_document: TextDocumentIdentifier {
+            uri: virtual_uri_to_lsp_uri(virtual_uri),
+        },
+        identifier: None,
+        previous_result_id: previous_result_id.map(|s| s.to_string()),
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    JsonRpcRequest::new(request_id.as_i64(), "textDocument/diagnostic", params)
 }
 
 /// Parse a JSON-RPC diagnostic response and transform coordinates to host document space.
@@ -565,10 +563,10 @@ mod tests {
             request["params"].get("position").is_none(),
             "Diagnostic request should not have position parameter"
         );
-        // Without previous_result_id, there should be no previousResultId field
+        // Without previous_result_id, the field should be null (typed params serialize None as null)
         assert!(
-            request["params"].get("previousResultId").is_none(),
-            "Diagnostic request without previous_result_id should not have previousResultId"
+            request["params"]["previousResultId"].is_null(),
+            "Diagnostic request without previous_result_id should have null previousResultId"
         );
     }
 

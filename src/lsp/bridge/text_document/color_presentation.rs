@@ -17,13 +17,15 @@ use std::io;
 use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
-use tower_lsp_server::ls_types::{ColorPresentation, Range};
+use tower_lsp_server::ls_types::{
+    Color, ColorPresentation, ColorPresentationParams, Range, TextDocumentIdentifier,
+};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
-    translate_virtual_range_to_host,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -39,7 +41,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         host_uri: &Url,
         host_range: Range,
-        color: &serde_json::Value,
+        color: Color,
         injection_language: &str,
         region_id: &str,
         offset: RegionOffset,
@@ -88,35 +90,28 @@ impl LanguageServerPool {
 fn build_color_presentation_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
-    color: &serde_json::Value,
+    color: Color,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<ColorPresentationParams> {
     // Translate range from host to virtual coordinates
     let mut virtual_range = host_range;
     translate_host_range_to_virtual(&mut virtual_range, offset);
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "textDocument/colorPresentation",
-        "params": {
-            "textDocument": {
-                "uri": virtual_uri.to_uri_string()
-            },
-            "color": color,
-            "range": {
-                "start": {
-                    "line": virtual_range.start.line,
-                    "character": virtual_range.start.character
-                },
-                "end": {
-                    "line": virtual_range.end.line,
-                    "character": virtual_range.end.character
-                }
-            }
-        }
-    })
+    let params = ColorPresentationParams {
+        text_document: TextDocumentIdentifier {
+            uri: virtual_uri_to_lsp_uri(virtual_uri),
+        },
+        color,
+        range: virtual_range,
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    JsonRpcRequest::new(
+        request_id.as_i64(),
+        "textDocument/colorPresentation",
+        params,
+    )
 }
 
 /// Transform a color presentation response from virtual to host document coordinates.
@@ -194,17 +189,17 @@ mod tests {
                 character: 17,
             },
         };
-        let color = json!({
-            "red": 1.0,
-            "green": 0.0,
-            "blue": 0.0,
-            "alpha": 1.0
-        });
+        let color = Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_color_presentation_request(
             &virtual_uri,
             host_range,
-            &color,
+            color,
             &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
@@ -242,17 +237,17 @@ mod tests {
                 character: 17,
             },
         };
-        let color = json!({
-            "red": 1.0,
-            "green": 0.0,
-            "blue": 0.0,
-            "alpha": 1.0
-        });
+        let color = Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_color_presentation_request(
             &virtual_uri,
             host_range,
-            &color,
+            color,
             &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
@@ -294,17 +289,17 @@ mod tests {
                 character: 7,
             },
         };
-        let color = json!({
-            "red": 0.5,
-            "green": 0.25,
-            "blue": 0.75,
-            "alpha": 1.0
-        });
+        let color = Color {
+            red: 0.5,
+            green: 0.25,
+            blue: 0.75,
+            alpha: 1.0,
+        };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_color_presentation_request(
             &virtual_uri,
             host_range,
-            &color,
+            color,
             &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
@@ -337,12 +332,17 @@ mod tests {
                 character: 17,
             },
         };
-        let color = json!({ "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 });
+        let color = Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_color_presentation_request(
             &virtual_uri,
             host_range,
-            &color,
+            color,
             &RegionOffset::new(3, 5),
             RequestId::new(42),
         );
@@ -374,12 +374,17 @@ mod tests {
                 character: 17,
             },
         };
-        let color = json!({ "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 });
+        let color = Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        };
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_color_presentation_request(
             &virtual_uri,
             host_range,
-            &color,
+            color,
             &RegionOffset::new(3, 5),
             RequestId::new(42),
         );
@@ -411,18 +416,18 @@ mod tests {
                 character: 12,
             },
         };
-        let color = json!({
-            "red": 1.0,
-            "green": 0.0,
-            "blue": 0.0,
-            "alpha": 1.0
-        });
+        let color = Color {
+            red: 1.0,
+            green: 0.0,
+            blue: 0.0,
+            alpha: 1.0,
+        };
 
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_color_presentation_request(
             &virtual_uri,
             host_range,
-            &color,
+            color,
             &RegionOffset::new(10, 0), // region_start_line > range lines
             RequestId::new(42),
         );
