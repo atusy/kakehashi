@@ -71,9 +71,9 @@ where
             uri: ctx.uri.clone(),
             injection_language: ctx.resolved.injection_language.clone(),
             region_id: ctx.resolved.region.region_id.clone(),
-            offset: RegionOffset::new(
+            offset: RegionOffset::with_per_line_offsets(
                 ctx.resolved.region.line_range.start,
-                ctx.resolved.region.start_column,
+                ctx.resolved.line_column_offsets.clone(),
             ),
             virtual_content: ctx.resolved.virtual_content.clone(),
             upstream_id: ctx.upstream_request_id.clone(),
