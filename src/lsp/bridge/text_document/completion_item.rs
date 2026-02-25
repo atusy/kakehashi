@@ -27,7 +27,7 @@ use log::warn;
 use serde_json::json;
 use tower_lsp_server::ls_types::CompletionItem;
 
-use super::super::pool::LanguageServerPool;
+use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{RegionOffset, RequestId};
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
@@ -48,6 +48,7 @@ impl LanguageServerPool {
         &self,
         mut item: CompletionItem,
         settings: &WorkspaceSettings,
+        upstream_id: Option<UpstreamId>,
     ) -> CompletionItem {
         // Extract envelope — if absent, this item wasn't produced by Kakehashi
         let Some(envelope) = strip_envelope(&mut item) else {
@@ -66,7 +67,7 @@ impl LanguageServerPool {
             return item;
         };
 
-        self.send_completion_resolve_request(&config, item, envelope)
+        self.send_completion_resolve_request(&config, item, envelope, upstream_id)
             .await
     }
 
@@ -81,6 +82,7 @@ impl LanguageServerPool {
         server_config: &BridgeServerConfig,
         mut item: CompletionItem,
         envelope: KakehashiEnvelope,
+        upstream_id: Option<UpstreamId>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
         let handle = match self
@@ -104,18 +106,27 @@ impl LanguageServerPool {
             return item;
         }
 
-        let (request_id, response_rx) = match handle.register_request_with_upstream(None) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve: failed to register request for {}: {}",
-                    server_name, e
-                );
-                re_envelope_item(&mut item, &envelope);
-                return item;
-            }
-        };
+        // Register in the upstream request registry FIRST for cancel lookup.
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request(id.clone(), server_name);
+        }
+
+        let (request_id, response_rx) =
+            match handle.register_request_with_upstream(upstream_id.clone()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(
+                        target: "kakehashi::bridge",
+                        "completionItem/resolve: failed to register request for {}: {}",
+                        server_name, e
+                    );
+                    if let Some(ref id) = upstream_id {
+                        self.unregister_upstream_request(id, server_name);
+                    }
+                    re_envelope_item(&mut item, &envelope);
+                    return item;
+                }
+            };
 
         let request = build_completion_resolve_request(&item, request_id);
 
@@ -127,12 +138,20 @@ impl LanguageServerPool {
                 "completionItem/resolve: failed to send request for {}: {}",
                 server_name, e
             );
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, server_name);
+            }
             re_envelope_item(&mut item, &envelope);
             return item;
         }
 
         let response = handle.wait_for_response(request_id, response_rx).await;
         router_guard.disarm();
+
+        // Unregister from the upstream request registry regardless of result
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, server_name);
+        }
 
         let response = match response {
             Ok(r) => r,
@@ -352,7 +371,7 @@ mod tests {
         };
 
         let result = pool
-            .dispatch_completion_resolve(item.clone(), &settings)
+            .dispatch_completion_resolve(item.clone(), &settings, None)
             .await;
         assert_eq!(result.label, "plain");
         assert_eq!(result.data, Some(json!({"custom": true})));
@@ -365,7 +384,9 @@ mod tests {
         let settings = WorkspaceSettings::default(); // no language_servers configured
 
         let item = enveloped_item("nonexistent-ls");
-        let result = pool.dispatch_completion_resolve(item, &settings).await;
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None)
+            .await;
 
         // Should be re-enveloped (routing info preserved for future attempts)
         let envelope = extract_envelope(&result).expect("should have envelope");
