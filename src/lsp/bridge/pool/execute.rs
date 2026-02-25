@@ -200,7 +200,7 @@ mod tests {
                 },
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset { line: 0, column: 0 },
+                RegionOffset::new(0, 0),
                 "print('hello')",
                 None,
             )
@@ -239,7 +239,7 @@ mod tests {
                 &host_uri,
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset { line: 0, column: 0 },
+                RegionOffset::new(0, 0),
                 "print('hello')",
                 None,
             )
@@ -297,7 +297,7 @@ mod tests {
         let ctx = BridgeResponseContext {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
-            offset: RegionOffset { line: 5, column: 0 },
+            offset: RegionOffset::new(5, 0),
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);

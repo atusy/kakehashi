@@ -78,7 +78,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -123,7 +123,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -177,7 +177,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 virtual_content,
                 Some(UpstreamId::Number(42)), // upstream_request_id (unused)
             )
@@ -228,7 +228,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 virtual_content,
                 Some(UpstreamId::Number(123)), // upstream_request_id (unused)
             )
@@ -269,7 +269,7 @@ mod tests {
                 &host_uri,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 virtual_content,
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )

@@ -215,10 +215,7 @@ impl From<RegionOffset> for EnvelopeOffset {
 
 impl From<&EnvelopeOffset> for RegionOffset {
     fn from(o: &EnvelopeOffset) -> Self {
-        Self {
-            line: o.line,
-            column: o.column,
-        }
+        Self::new(o.line, o.column)
     }
 }
 

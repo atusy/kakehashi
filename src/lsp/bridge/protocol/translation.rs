@@ -18,9 +18,8 @@ pub(crate) struct RegionOffset {
     pub column: u32,
 }
 
-#[cfg(test)]
 impl RegionOffset {
-    /// Shorthand constructor for tests.
+    /// Construct a `RegionOffset` from line and column values.
     pub(crate) fn new(line: u32, column: u32) -> Self {
         Self { line, column }
     }

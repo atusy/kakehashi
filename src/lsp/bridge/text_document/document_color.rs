@@ -209,10 +209,7 @@ mod tests {
 
         let colors = transform_document_color_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert_eq!(colors.len(), 2);
@@ -232,10 +229,7 @@ mod tests {
     fn document_color_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let colors = transform_document_color_response_to_host(
-            response,
-            RegionOffset { line: 5, column: 0 },
-        );
+        let colors = transform_document_color_response_to_host(response, RegionOffset::new(5, 0));
         assert!(colors.is_empty());
     }
 
@@ -243,10 +237,7 @@ mod tests {
     fn document_color_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let colors = transform_document_color_response_to_host(
-            response,
-            RegionOffset { line: 5, column: 0 },
-        );
+        let colors = transform_document_color_response_to_host(response, RegionOffset::new(5, 0));
         assert!(colors.is_empty());
     }
 
@@ -272,10 +263,7 @@ mod tests {
 
         let colors = transform_document_color_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert_eq!(colors.len(), 1);
@@ -308,10 +296,7 @@ mod tests {
 
         let colors = transform_document_color_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert_eq!(colors.len(), 1);

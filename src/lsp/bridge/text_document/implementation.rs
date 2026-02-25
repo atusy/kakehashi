@@ -107,7 +107,7 @@ mod tests {
         let request = build_implementation_request(
             &virtual_uri,
             position,
-            RegionOffset { line: 3, column: 0 },
+            RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 
@@ -141,7 +141,7 @@ mod tests {
         let request = build_implementation_request(
             &virtual_uri,
             position,
-            RegionOffset { line: 3, column: 0 },
+            RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 

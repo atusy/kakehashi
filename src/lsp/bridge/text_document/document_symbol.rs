@@ -327,12 +327,9 @@ mod tests {
             ]
         });
 
-        let symbols = transform_document_symbol_response_to_host(
-            response,
-            "unused",
-            RegionOffset { line: 3, column: 0 },
-        )
-        .unwrap();
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", RegionOffset::new(3, 0))
+                .unwrap();
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].range.start.line, 3);
@@ -391,12 +388,9 @@ mod tests {
             ]
         });
 
-        let symbols = transform_document_symbol_response_to_host(
-            response,
-            "unused",
-            RegionOffset { line: 5, column: 0 },
-        )
-        .unwrap();
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", RegionOffset::new(5, 0))
+                .unwrap();
 
         assert_eq!(symbols[0].range.start.line, 5);
         assert_eq!(symbols[0].range.end.line, 15);
@@ -450,7 +444,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
-            RegionOffset { line: 7, column: 0 },
+            RegionOffset::new(7, 0),
         )
         .unwrap();
 
@@ -468,11 +462,8 @@ mod tests {
     fn document_symbol_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_symbol_response_to_host(
-            response,
-            "unused",
-            RegionOffset { line: 5, column: 0 },
-        );
+        let transformed =
+            transform_document_symbol_response_to_host(response, "unused", RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -480,12 +471,9 @@ mod tests {
     fn document_symbol_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let symbols = transform_document_symbol_response_to_host(
-            response,
-            "unused",
-            RegionOffset { line: 5, column: 0 },
-        )
-        .unwrap();
+        let symbols =
+            transform_document_symbol_response_to_host(response, "unused", RegionOffset::new(5, 0))
+                .unwrap();
         assert!(symbols.is_empty());
     }
 
@@ -513,7 +501,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             virtual_uri,
-            RegionOffset { line: 7, column: 0 },
+            RegionOffset::new(7, 0),
         )
         .unwrap();
 
@@ -556,7 +544,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             request_virtual_uri,
-            RegionOffset { line: 5, column: 0 },
+            RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -606,7 +594,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             request_virtual_uri,
-            RegionOffset { line: 5, column: 0 },
+            RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -645,10 +633,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "unused",
-            RegionOffset {
-                line: 10,
-                column: 0,
-            },
+            RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -686,7 +671,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             virtual_uri,
-            RegionOffset { line: 0, column: 0 },
+            RegionOffset::new(0, 0),
         )
         .unwrap();
 

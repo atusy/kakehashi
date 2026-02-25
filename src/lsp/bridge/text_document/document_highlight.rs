@@ -139,7 +139,7 @@ mod tests {
         let request = build_document_highlight_request(
             &virtual_uri,
             position,
-            RegionOffset { line: 3, column: 0 },
+            RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 
@@ -173,7 +173,7 @@ mod tests {
         let request = build_document_highlight_request(
             &virtual_uri,
             position,
-            RegionOffset { line: 3, column: 0 },
+            RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 
@@ -216,10 +216,7 @@ mod tests {
 
         let transformed = transform_document_highlight_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -241,10 +238,8 @@ mod tests {
     fn document_highlight_response_returns_none_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let transformed = transform_document_highlight_response_to_host(
-            response,
-            RegionOffset { line: 5, column: 0 },
-        );
+        let transformed =
+            transform_document_highlight_response_to_host(response, RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -252,10 +247,8 @@ mod tests {
     fn document_highlight_response_with_empty_array_returns_empty_vec() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let transformed = transform_document_highlight_response_to_host(
-            response,
-            RegionOffset { line: 5, column: 0 },
-        );
+        let transformed =
+            transform_document_highlight_response_to_host(response, RegionOffset::new(5, 0));
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
         assert!(highlights.is_empty());
@@ -281,10 +274,7 @@ mod tests {
 
         let transformed = transform_document_highlight_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -321,10 +311,7 @@ mod tests {
 
         let transformed = transform_document_highlight_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
