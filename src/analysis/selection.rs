@@ -636,6 +636,125 @@ array: ["xxxx"]"#;
         ranges
     }
 
+    /// Selection ranges in blockquote code blocks use correct positions.
+    ///
+    /// Blockquote code blocks have `block_continuation` named children (the `> ` prefixes).
+    /// The injection parser must use `set_included_ranges()` to exclude these prefixes,
+    /// otherwise the injected language parser sees `> key1: val1` instead of `key1: val1`.
+    ///
+    /// Uses YAML as the injected language because `> ` is a YAML folded scalar indicator,
+    /// causing a dramatically different parse tree when prefixes leak into the content.
+    /// Compares blockquote vs non-blockquote to verify identical selection structure.
+    #[test]
+    fn test_selection_range_in_blockquote_code_block() {
+        use crate::language::LanguageCoordinator;
+        use tree_sitter::{Parser, Query};
+
+        let coordinator = LanguageCoordinator::new();
+        coordinator.register_language_for_test("yaml", tree_sitter_yaml::LANGUAGE.into());
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+
+        let mut parser = Parser::new();
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser
+            .set_language(&md_language)
+            .expect("load markdown grammar");
+
+        // Note: injection.include-children is intentionally NOT set.
+        // Its absence causes has_include_children_for_pattern() to return false,
+        // which triggers compute_included_ranges() to exclude block_continuation
+        // children — the code path under test.
+        let injection_query_str = r#"
+            (fenced_code_block
+              (info_string (language) @_lang)
+              (code_fence_content) @injection.content
+              (#set-lang-from-info-string! @_lang))
+        "#;
+        let injection_query =
+            Query::new(&md_language, injection_query_str).expect("valid injection query");
+        coordinator.register_injection_query_for_test("markdown", injection_query);
+
+        // --- Blockquote case ---
+        // Line 0: "> ```yaml"
+        // Line 1: "> key1: val1"
+        // Line 2: "> key2: val2"
+        // Line 3: "> ```"
+        let text = "> ```yaml\n> key1: val1\n> key2: val2\n> ```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let root = tree.root_node();
+        let mapper = crate::text::PositionMapper::new(text);
+
+        // Cursor on 'k' of 'key2' at line 2, character 2 (after "> ")
+        let cursor_pos = Position::new(2, 2);
+        let cursor_byte = mapper.position_to_byte(cursor_pos).unwrap();
+        let point =
+            tree_sitter::Point::new(cursor_pos.line as usize, cursor_pos.character as usize);
+        let node = root
+            .descendant_for_point_range(point, point)
+            .expect("find node");
+
+        let doc_ctx = DocumentContext::new(text, &mapper, root, "markdown");
+        let mut inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
+        let selection = range_builder::build(node, &doc_ctx, &mut inj_ctx, cursor_byte);
+        let ranges = collect_ranges(&selection);
+
+        // --- Reference case: same YAML without blockquote ---
+        let ref_text = "```yaml\nkey1: val1\nkey2: val2\n```\n";
+        let ref_tree = parser.parse(ref_text, None).expect("parse ref markdown");
+        let ref_root = ref_tree.root_node();
+        let ref_mapper = crate::text::PositionMapper::new(ref_text);
+
+        let ref_cursor_pos = Position::new(2, 0);
+        let ref_cursor_byte = ref_mapper.position_to_byte(ref_cursor_pos).unwrap();
+        let ref_point = tree_sitter::Point::new(
+            ref_cursor_pos.line as usize,
+            ref_cursor_pos.character as usize,
+        );
+        let ref_node = ref_root
+            .descendant_for_point_range(ref_point, ref_point)
+            .expect("find ref node");
+
+        let ref_doc_ctx = DocumentContext::new(ref_text, &ref_mapper, ref_root, "markdown");
+        let mut ref_inj_ctx = InjectionContext::new(&coordinator, &mut parser_pool);
+        let ref_selection =
+            range_builder::build(ref_node, &ref_doc_ctx, &mut ref_inj_ctx, ref_cursor_byte);
+        let ref_ranges = collect_ranges(&ref_selection);
+
+        // The innermost range must be on the same line as the cursor (line 2).
+        // Without the fix, the YAML parser sees `key1: val1\n> key2: val2\n> `
+        // and the `> ` prefix corrupts the parse tree, causing the innermost
+        // range to land on line 1 instead of line 2.
+        assert_eq!(
+            selection.range.start.line, 2,
+            "Innermost selection range should be on cursor line 2.\n\
+             Blockquote ranges: {:?}\n\
+             Reference ranges: {:?}",
+            ranges, ref_ranges
+        );
+
+        // The injected ranges on the cursor line should have the same widths —
+        // same YAML AST structure, just column-shifted by 2 for the `> ` prefix.
+        // (Total depth may differ because blockquote adds extra host levels.)
+        let bq_widths: Vec<_> = ranges
+            .iter()
+            .filter(|r| r.start.line == 2 && r.end.line == 2)
+            .map(|r| r.end.character - r.start.character)
+            .collect();
+        let ref_widths: Vec<_> = ref_ranges
+            .iter()
+            .filter(|r| r.start.line == 2 && r.end.line == 2)
+            .map(|r| r.end.character - r.start.character)
+            .collect();
+        assert_eq!(
+            bq_widths, ref_widths,
+            "Injected ranges on the cursor line should have identical widths.\n\
+             Blockquote ranges: {:?}\n\
+             Reference ranges: {:?}",
+            ranges, ref_ranges
+        );
+    }
+
     /// Empty documents return valid fallback range at (0, 0).
     #[test]
     fn test_selection_range_handles_empty_document() {

@@ -197,6 +197,129 @@ pub(crate) fn has_include_children_for_pattern(query: &Query, pattern_index: usi
     false
 }
 
+/// Compute the included ranges for an injection content node.
+///
+/// When `include_children` is false and the content node has named children
+/// (e.g., `block_continuation` nodes in blockquote code blocks), this function
+/// computes the "gap" ranges between those children — the actual code content.
+///
+/// Returns `None` when:
+/// - `include_children` is true (the injection parser should see everything)
+/// - The content node has no named children (no gaps to compute)
+/// - All content is covered by named children (no gaps exist)
+///
+/// The returned ranges are **relative** to the content node's start position:
+/// byte offsets are subtracted by `content_node.start_byte()`, and row/column
+/// Points are adjusted relative to `content_node.start_position()`.
+pub(crate) fn compute_included_ranges(
+    content_node: &tree_sitter::Node,
+    include_children: bool,
+) -> Option<Vec<tree_sitter::Range>> {
+    if include_children || content_node.named_child_count() == 0 {
+        return None;
+    }
+
+    let node_start_byte = content_node.start_byte();
+    let node_start_pos = content_node.start_position();
+    let node_end_byte = content_node.end_byte();
+    let node_end_pos = content_node.end_position();
+
+    // Helper to make a Point relative to the content node's start.
+    // Column is only adjusted when the point is on the same row as the node start,
+    // because only that row has a non-zero column offset from the node origin.
+    let relativize_point = |p: tree_sitter::Point| -> tree_sitter::Point {
+        tree_sitter::Point {
+            row: p.row.saturating_sub(node_start_pos.row),
+            column: if p.row == node_start_pos.row {
+                p.column.saturating_sub(node_start_pos.column)
+            } else {
+                p.column
+            },
+        }
+    };
+
+    let mut ranges = Vec::new();
+    let mut cursor_byte = node_start_byte;
+    let mut cursor_point = node_start_pos;
+
+    let mut tree_cursor = content_node.walk();
+    for child in content_node.named_children(&mut tree_cursor) {
+        let child_start_byte = child.start_byte();
+        let child_end_byte = child.end_byte();
+
+        // Gap before this child
+        if cursor_byte < child_start_byte {
+            ranges.push(tree_sitter::Range {
+                start_byte: cursor_byte - node_start_byte,
+                end_byte: child_start_byte - node_start_byte,
+                start_point: relativize_point(cursor_point),
+                end_point: relativize_point(child.start_position()),
+            });
+        }
+
+        cursor_byte = child_end_byte;
+        cursor_point = child.end_position();
+    }
+
+    // Gap after last child
+    if cursor_byte < node_end_byte {
+        ranges.push(tree_sitter::Range {
+            start_byte: cursor_byte - node_start_byte,
+            end_byte: node_end_byte - node_start_byte,
+            start_point: relativize_point(cursor_point),
+            end_point: relativize_point(node_end_pos),
+        });
+    }
+
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
+}
+
+/// Parse text with optional included ranges, resetting parser state afterward.
+///
+/// This is the shared protocol for interacting with Tree-sitter's
+/// `set_included_ranges` API. Both the semantic tokens and selection range
+/// paths delegate here to avoid divergence.
+///
+/// # Behavior
+///
+/// 1. If `included_ranges` is `Some`, calls `parser.set_included_ranges()`
+/// 2. On failure, logs a warning, resets ranges, and returns `None`
+/// 3. Calls `parser.parse(text, None)`
+/// 4. Always resets `parser.set_included_ranges(&[])` after parsing
+///
+/// The unconditional reset ensures parsers returned to pools or caches
+/// never carry stale included-range state.
+pub(crate) fn parse_with_ranges(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    included_ranges: Option<&[tree_sitter::Range]>,
+    log_target: &str,
+    lang_name: &str,
+) -> Option<tree_sitter::Tree> {
+    if let Some(ranges) = included_ranges
+        && let Err(e) = parser.set_included_ranges(ranges)
+    {
+        log::warn!(
+            target: log_target,
+            "Failed to set included ranges for {}: {}. Skipping parse.",
+            lang_name, e
+        );
+        let _ = parser.set_included_ranges(&[]);
+        return None;
+    }
+
+    let tree = parser.parse(text, None);
+
+    // Always reset included ranges after parsing to prevent stale state
+    let _ = parser.set_included_ranges(&[]);
+
+    tree
+}
+
 /// Extracts language from #set! injection.language property
 fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String> {
     // Use unified accessor to check property settings
@@ -1619,6 +1742,108 @@ mod tests {
         assert!(
             has_include_children_for_pattern(&query, 1),
             "Pattern 1 should have include-children"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_when_include_children() {
+        // When include_children is true, all content is included (no restriction)
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        assert!(
+            compute_included_ranges(&root, true).is_none(),
+            "include_children=true should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_for_no_named_children() {
+        // A leaf node (identifier) has no named children
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("x", None).unwrap();
+        let root = tree.root_node();
+
+        // Find identifier leaf node
+        let ident = root
+            .named_descendant_for_byte_range(0, 1)
+            .expect("should find node");
+        assert_eq!(ident.named_child_count(), 0);
+
+        assert!(
+            compute_included_ranges(&ident, false).is_none(),
+            "Node with no named children should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_computes_gap_ranges() {
+        // Use a node that has named children with gaps between them.
+        // In Rust, a function_item has named children (name, parameters, body)
+        // with gaps (the "fn" keyword, whitespace, etc.)
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        // function_item is the top-level node
+        let func = root.named_child(0).expect("should have function_item");
+        let func_start = func.start_byte();
+        let func_size = func.end_byte() - func_start;
+
+        let ranges = compute_included_ranges(&func, false);
+        let ranges = ranges.expect("Node with named children should produce gap ranges");
+        assert!(
+            !ranges.is_empty(),
+            "Should have at least one gap range between named children"
+        );
+
+        // Collect named children byte ranges (relative to func start)
+        let mut tree_cursor = func.walk();
+        let child_ranges: Vec<(usize, usize)> = func
+            .named_children(&mut tree_cursor)
+            .map(|c| (c.start_byte() - func_start, c.end_byte() - func_start))
+            .collect();
+
+        // Gap ranges must not overlap any named child
+        for r in &ranges {
+            assert!(
+                r.start_byte < r.end_byte,
+                "Range should be non-empty: {r:?}"
+            );
+            assert!(r.end_byte <= func_size, "Range exceeds node bounds: {r:?}");
+            for (cs, ce) in &child_ranges {
+                assert!(
+                    r.end_byte <= *cs || r.start_byte >= *ce,
+                    "Gap range {r:?} overlaps named child [{cs}, {ce})"
+                );
+            }
+        }
+
+        // Gap ranges + named child ranges should cover the entire node
+        let mut covered = vec![false; func_size];
+        for r in &ranges {
+            for b in r.start_byte..r.end_byte {
+                covered[b] = true;
+            }
+        }
+        for (cs, ce) in &child_ranges {
+            for b in *cs..*ce {
+                covered[b] = true;
+            }
+        }
+        assert!(
+            covered.iter().all(|&b| b),
+            "Gaps + children should cover the entire node"
         );
     }
 }
