@@ -280,7 +280,7 @@ mod tests {
         let _rx = router.register(RequestId::new(1)).expect("should register");
 
         let mut guard = RouterCleanupGuard::new(Arc::clone(&router), RequestId::new(1));
-        guard.request_id.take();
+        guard.disarm();
         drop(guard);
 
         // The entry should still be present — re-registering should fail (duplicate)
