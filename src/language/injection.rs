@@ -278,6 +278,124 @@ pub(crate) fn compute_included_ranges(
     }
 }
 
+/// Extract clean injection content, stripping child node bytes when included_ranges present.
+///
+/// When `included_ranges` is `Some`, only the gap bytes (actual code content) are
+/// concatenated, effectively stripping blockquote prefixes like `> `. When `None`,
+/// returns the full content slice as-is.
+///
+/// # Arguments
+/// * `host_text` - The full host document text
+/// * `byte_range` - The byte range of the injection content node
+/// * `included_ranges` - Gap ranges from `compute_included_ranges()`, relative to node start
+pub(crate) fn extract_clean_content(
+    host_text: &str,
+    byte_range: std::ops::Range<usize>,
+    included_ranges: Option<&[tree_sitter::Range]>,
+) -> String {
+    let content = &host_text[byte_range.clone()];
+    match included_ranges {
+        None => content.to_string(),
+        Some(ranges) => {
+            let capacity: usize = ranges.iter().map(|r| r.end_byte - r.start_byte).sum();
+            let mut result = String::with_capacity(capacity);
+            for range in ranges {
+                result.push_str(&content[range.start_byte..range.end_byte]);
+            }
+            result
+        }
+    }
+}
+
+/// Compute per-virtual-line column offsets from included ranges.
+///
+/// For each virtual line in the injection, computes the UTF-16 column offset
+/// (the width of the blockquote prefix or other excluded content before the
+/// gap on that line).
+///
+/// When `included_ranges` is `None`, returns `vec![start_column]` (the
+/// non-blockquote fallback — only line 0 has a column offset).
+///
+/// # Arguments
+/// * `host_text` - The full host document text
+/// * `byte_range` - The byte range of the injection content node
+/// * `start_column` - UTF-16 column offset for the first line
+/// * `included_ranges` - Gap ranges from `compute_included_ranges()`, relative to node start
+pub(crate) fn compute_line_column_offsets(
+    host_text: &str,
+    byte_range: std::ops::Range<usize>,
+    start_column: u32,
+    included_ranges: Option<&[tree_sitter::Range]>,
+) -> Vec<u32> {
+    match included_ranges {
+        None => vec![start_column],
+        Some(ranges) => {
+            // Build a map from virtual line → column offset.
+            // Each gap range starts at a known point with a column value.
+            // The column value represents how many columns of prefix exist
+            // before the actual code on that line.
+            let mut offsets = Vec::new();
+            for range in ranges {
+                let gap_start_line = range.start_point.row;
+                // How many virtual lines does this gap span?
+                let gap_end_line = range.end_point.row;
+                for line in gap_start_line..=gap_end_line {
+                    offsets.resize(line + 1, 0);
+                    if line == gap_start_line {
+                        // The column offset is the gap's start column within the host line.
+                        // For the first line (row 0) of the content node, use start_column
+                        // (which accounts for the full prefix from the line start).
+                        // For subsequent lines, the start_point.column from
+                        // compute_included_ranges is already the raw byte column
+                        // within the line — convert to UTF-16.
+                        if line == 0 {
+                            offsets[line] = start_column;
+                        } else {
+                            // Convert byte column to UTF-16 code units.
+                            // The gap's start_byte is relative to content node start.
+                            // The line starts at the byte after the previous newline.
+                            let gap_abs_byte = byte_range.start + range.start_byte;
+                            let line_start_byte = gap_abs_byte - range.start_point.column;
+                            let prefix = &host_text[line_start_byte..gap_abs_byte];
+                            offsets[line] = prefix.encode_utf16().count() as u32;
+                        }
+                    }
+                }
+            }
+            if offsets.is_empty() {
+                vec![start_column]
+            } else {
+                offsets
+            }
+        }
+    }
+}
+
+/// Compute clean virtual content and per-line column offsets for an injection region.
+///
+/// This combines `compute_included_ranges`, `extract_clean_content`, and
+/// `compute_line_column_offsets` into a single call, avoiding duplication
+/// across resolve methods.
+fn extract_virtual_content_and_offsets(
+    region: &InjectionRegionInfo,
+    cacheable: &CacheableInjectionRegion,
+    text: &str,
+) -> (String, Vec<u32>) {
+    let included_ranges = compute_included_ranges(&region.content_node, region.include_children);
+    let virtual_content = extract_clean_content(
+        text,
+        cacheable.byte_range.clone(),
+        included_ranges.as_deref(),
+    );
+    let line_column_offsets = compute_line_column_offsets(
+        text,
+        cacheable.byte_range.clone(),
+        cacheable.start_column,
+        included_ranges.as_deref(),
+    );
+    (virtual_content, line_column_offsets)
+}
+
 /// Parse text with optional included ranges, resetting parser state afterward.
 ///
 /// This is the shared protocol for interacting with Tree-sitter's
@@ -683,8 +801,11 @@ pub struct ResolvedInjection {
     pub region_id: String,
     /// Language of the injection content
     pub injection_language: String,
-    /// Extracted virtual document content
+    /// Extracted virtual document content (clean, with blockquote prefixes stripped)
     pub virtual_content: String,
+    /// Per-virtual-line column offsets for coordinate translation.
+    /// Each entry is the UTF-16 column offset for that virtual line.
+    pub line_column_offsets: Vec<u32>,
 }
 
 /// Central service for resolving injection regions at LSP positions
@@ -735,8 +856,9 @@ impl InjectionResolver {
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
 
-        // 5. Extract virtual document content
-        let virtual_content = cacheable_region.extract_content(text).to_string();
+        // 5. Extract clean virtual content and per-line column offsets
+        let (virtual_content, line_column_offsets) =
+            extract_virtual_content_and_offsets(region, &cacheable_region, text);
 
         // 6. Resolve injection language using unified detection (ADR-0005)
         // This normalizes tokens like "py" -> "python" for bridge server lookup
@@ -748,6 +870,7 @@ impl InjectionResolver {
             region_id: region_id_str,
             injection_language: resolved_language,
             virtual_content,
+            line_column_offsets,
         })
     }
 
@@ -839,7 +962,9 @@ impl InjectionResolver {
                 let region_id_str = region_id.to_string();
                 let cacheable_region =
                     CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
-                let virtual_content = cacheable_region.extract_content(text).to_string();
+
+                let (virtual_content, line_column_offsets) =
+                    extract_virtual_content_and_offsets(region, &cacheable_region, text);
 
                 // Resolve injection language using unified detection (ADR-0005)
                 let resolved_language =
@@ -850,6 +975,7 @@ impl InjectionResolver {
                     region_id: region_id_str,
                     injection_language: resolved_language,
                     virtual_content,
+                    line_column_offsets,
                 }
             })
             .collect()
@@ -1844,6 +1970,145 @@ mod tests {
         assert!(
             covered.iter().all(|&b| b),
             "Gaps + children should cover the entire node"
+        );
+    }
+
+    #[test]
+    fn test_blockquote_bridge_content_strips_prefixes() {
+        // Verify that extract_clean_content strips blockquote prefixes so that
+        // downstream language servers receive parseable code.
+        let text = "> ```lua\n> local x = 1\n> local y = 2\n> ```\n";
+        let (byte_range, _start_column, included_ranges) = blockquote_injection_data(text);
+
+        let clean = extract_clean_content(text, byte_range, included_ranges.as_deref());
+        assert!(
+            !clean.contains("> "),
+            "Clean content should NOT contain blockquote prefixes: {:?}",
+            clean
+        );
+        assert!(
+            clean.contains("local x = 1"),
+            "Clean content should contain the code: {:?}",
+            clean
+        );
+        assert!(
+            clean.contains("local y = 2"),
+            "Clean content should contain the code: {:?}",
+            clean
+        );
+    }
+
+    // ============================================================
+    // Tests for extract_clean_content and compute_line_column_offsets
+    // ============================================================
+
+    /// Helper to set up a markdown parser and injection query, parse text,
+    /// and return the first injection's content node byte range and included ranges.
+    fn blockquote_injection_data(
+        text: &str,
+    ) -> (std::ops::Range<usize>, u32, Option<Vec<tree_sitter::Range>>) {
+        let mut parser = Parser::new();
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser
+            .set_language(&md_language)
+            .expect("load markdown grammar");
+
+        let injection_query_str = r#"
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+        "#;
+        let injection_query =
+            Query::new(&md_language, injection_query_str).expect("valid injection query");
+
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let root = tree.root_node();
+
+        let injections = collect_all_injections(&root, text, Some(&injection_query))
+            .expect("Should find injections");
+        assert!(!injections.is_empty(), "Should find at least one injection");
+
+        let region = &injections[0];
+        let byte_range = region.content_node.byte_range();
+        let included_ranges =
+            compute_included_ranges(&region.content_node, region.include_children);
+
+        // Compute start_column (UTF-16)
+        let byte_column = region.content_node.start_position().column;
+        let line_start_byte = region.content_node.start_byte() - byte_column;
+        let line_prefix = &text[line_start_byte..region.content_node.start_byte()];
+        let start_column = line_prefix.encode_utf16().count() as u32;
+
+        (byte_range, start_column, included_ranges)
+    }
+
+    #[test]
+    fn extract_clean_content_without_ranges_returns_full_text() {
+        // When called with None for included_ranges, returns the full content slice
+        let text = "hello world";
+        let clean = extract_clean_content(text, 0..text.len(), None);
+        assert_eq!(clean, text);
+    }
+
+    #[test]
+    fn extract_clean_content_with_ranges_strips_prefixes() {
+        // Blockquote case: included_ranges present → only gap content
+        let text = "> ```lua\n> local x = 1\n> local y = 2\n> ```\n";
+        let (byte_range, _start_column, included_ranges) = blockquote_injection_data(text);
+        assert!(
+            included_ranges.is_some(),
+            "Blockquote should have included ranges"
+        );
+
+        let clean = extract_clean_content(text, byte_range, included_ranges.as_deref());
+        assert!(
+            !clean.contains("> "),
+            "Clean content should not contain blockquote prefixes: {:?}",
+            clean
+        );
+        assert!(
+            clean.contains("local x = 1"),
+            "Clean content should contain the code: {:?}",
+            clean
+        );
+        assert!(
+            clean.contains("local y = 2"),
+            "Clean content should contain the code: {:?}",
+            clean
+        );
+    }
+
+    #[test]
+    fn compute_line_column_offsets_without_ranges_returns_start_column() {
+        // When called with None for included_ranges, returns vec![start_column]
+        let offsets = compute_line_column_offsets("hello", 0..5, 4, None);
+        assert_eq!(offsets, vec![4]);
+    }
+
+    #[test]
+    fn compute_line_column_offsets_with_ranges_returns_per_line() {
+        // Blockquote case: "> " prefix on each line → 2 UTF-16 units per line
+        let text = "> ```lua\n> local x = 1\n> local y = 2\n> ```\n";
+        let (byte_range, start_column, included_ranges) = blockquote_injection_data(text);
+        assert!(included_ranges.is_some());
+
+        let offsets =
+            compute_line_column_offsets(text, byte_range, start_column, included_ranges.as_deref());
+        // Virtual lines 0 and 1 contain actual code after "> " prefixes.
+        // Line 2 may be trailing content (the "> " before "```") — its offset
+        // is 0 because there's no gap range starting on that line.
+        assert!(
+            offsets.len() >= 2,
+            "Should have at least 2 line offsets: {:?}",
+            offsets
+        );
+        assert_eq!(
+            offsets[0], 2,
+            "Line 0 should have offset 2 (for '> ' prefix)"
+        );
+        assert_eq!(
+            offsets[1], 2,
+            "Line 1 should have offset 2 (for '> ' prefix)"
         );
     }
 }

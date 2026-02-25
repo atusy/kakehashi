@@ -39,7 +39,7 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// URIs back to the host URI in goto responses).
     pub host_uri_lsp: &'a Uri,
     /// The injection region offset for coordinate translation back to host space.
-    pub offset: RegionOffset,
+    pub offset: &'a RegionOffset,
 }
 
 impl LanguageServerPool {
@@ -70,7 +70,7 @@ impl LanguageServerPool {
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
-        offset: RegionOffset,
+        offset: &RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> serde_json::Value,
@@ -200,7 +200,7 @@ mod tests {
                 },
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset { line: 0, column: 0 },
+                RegionOffset::new(0, 0),
                 "print('hello')",
                 None,
             )
@@ -239,7 +239,7 @@ mod tests {
                 &host_uri,
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset { line: 0, column: 0 },
+                RegionOffset::new(0, 0),
                 "print('hello')",
                 None,
             )
@@ -294,14 +294,15 @@ mod tests {
     #[test]
     fn bridge_response_context_exposes_fields() {
         let host_uri: Uri = "file:///project/doc.md".parse().unwrap();
+        let offset = RegionOffset::new(5, 0);
         let ctx = BridgeResponseContext {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
-            offset: RegionOffset { line: 5, column: 0 },
+            offset: &offset,
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);
-        assert_eq!(ctx.offset.line, 5);
-        assert_eq!(ctx.offset.column, 0);
+        assert_eq!(ctx.offset.line(), 5);
+        assert_eq!(ctx.offset.column_for_line(0), 0);
     }
 }

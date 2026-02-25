@@ -76,7 +76,7 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             build_document_symbol_request,
@@ -130,7 +130,7 @@ fn build_document_symbol_request(
 fn transform_document_symbol_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<DocumentSymbol>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentSymbol: {}", error);
@@ -177,7 +177,7 @@ fn transform_document_symbol_response_to_host(
 fn transform_symbol_information_response(
     result: serde_json::Value,
     request_virtual_uri: &str,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<DocumentSymbol>> {
     let symbols: Vec<SymbolInformation> = serde_json::from_value(result).ok()?;
 
@@ -226,7 +226,7 @@ fn transform_symbol_information_response(
 /// and selectionRange in all items and their children.
 fn transform_document_symbol_nested_response(
     result: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<DocumentSymbol>> {
     let mut symbols: Vec<DocumentSymbol> = serde_json::from_value(result).ok()?;
     for symbol in &mut symbols {
@@ -238,7 +238,7 @@ fn transform_document_symbol_nested_response(
 /// Recursively transform a single DocumentSymbol's ranges from virtual to host coordinates.
 ///
 /// Uses saturating_add to prevent overflow for large line numbers.
-fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: RegionOffset) {
+fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &RegionOffset) {
     translate_virtual_range_to_host(&mut symbol.range, offset);
     translate_virtual_range_to_host(&mut symbol.selection_range, offset);
 
@@ -330,7 +330,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "unused",
-            RegionOffset { line: 3, column: 0 },
+            &RegionOffset::new(3, 0),
         )
         .unwrap();
 
@@ -394,7 +394,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "unused",
-            RegionOffset { line: 5, column: 0 },
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -450,7 +450,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
-            RegionOffset { line: 7, column: 0 },
+            &RegionOffset::new(7, 0),
         )
         .unwrap();
 
@@ -471,7 +471,7 @@ mod tests {
         let transformed = transform_document_symbol_response_to_host(
             response,
             "unused",
-            RegionOffset { line: 5, column: 0 },
+            &RegionOffset::new(5, 0),
         );
         assert!(transformed.is_none());
     }
@@ -483,7 +483,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "unused",
-            RegionOffset { line: 5, column: 0 },
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
         assert!(symbols.is_empty());
@@ -513,7 +513,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             virtual_uri,
-            RegionOffset { line: 7, column: 0 },
+            &RegionOffset::new(7, 0),
         )
         .unwrap();
 
@@ -556,7 +556,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             request_virtual_uri,
-            RegionOffset { line: 5, column: 0 },
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -606,7 +606,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             request_virtual_uri,
-            RegionOffset { line: 5, column: 0 },
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -645,10 +645,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             "unused",
-            RegionOffset {
-                line: 10,
-                column: 0,
-            },
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -686,7 +683,7 @@ mod tests {
         let symbols = transform_document_symbol_response_to_host(
             response,
             virtual_uri,
-            RegionOffset { line: 0, column: 0 },
+            &RegionOffset::new(0, 0),
         )
         .unwrap();
 

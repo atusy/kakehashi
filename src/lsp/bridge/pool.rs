@@ -1280,7 +1280,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1303,7 +1303,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1351,7 +1351,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1382,7 +1382,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(2)), // upstream_request_id
             )
@@ -1423,7 +1423,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -1456,7 +1456,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('world')",
                 Some(UpstreamId::Number(2)), // upstream_request_id
             )
@@ -1720,7 +1720,7 @@ mod tests {
                 host_position,
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)),
             )
@@ -1778,7 +1778,7 @@ mod tests {
                 },
                 "lua",
                 TEST_ULID_LUA_0,
-                RegionOffset { line: 3, column: 0 }, // region starts at line 3, position is at line 4, so virtual line = 1
+                RegionOffset::new(3, 0), // region starts at line 3, position is at line 4, so virtual line = 1
                 "print('hello')",
                 Some(UpstreamId::Number(1)),
             )
@@ -1796,7 +1796,7 @@ mod tests {
                 },
                 "lua",
                 TEST_ULID_LUA_1,
-                RegionOffset { line: 7, column: 0 }, // region starts at line 7, position is at line 8, so virtual line = 1
+                RegionOffset::new(7, 0), // region starts at line 7, position is at line 8, so virtual line = 1
                 "print('world')",
                 Some(UpstreamId::Number(2)),
             )
@@ -2058,7 +2058,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )
@@ -2081,7 +2081,7 @@ mod tests {
                 host_position,
                 "lua",
                 "region-0",
-                RegionOffset { line: 3, column: 0 },
+                RegionOffset::new(3, 0),
                 "print('hello')",
                 Some(UpstreamId::Number(1)), // upstream_request_id
             )

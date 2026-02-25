@@ -53,14 +53,14 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
                 let mut request = build_position_based_request(
                     virtual_uri,
                     host_position,
-                    offset,
+                    &offset,
                     request_id,
                     "textDocument/references",
                 );
@@ -109,7 +109,7 @@ fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<Location>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/references: {}", error);
@@ -174,7 +174,7 @@ mod tests {
             response,
             "file:///virtual.lua",
             &test_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_none());
@@ -193,7 +193,7 @@ mod tests {
             response,
             "file:///project/kakehashi-virtual-uri-region-0.lua",
             &test_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         );
 
         assert!(transformed.is_some());
@@ -227,7 +227,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -264,7 +264,7 @@ mod tests {
             response,
             virtual_uri,
             &host_uri,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -298,7 +298,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         // Should filter out cross-region virtual URI, resulting in empty array
@@ -349,7 +349,7 @@ mod tests {
             response,
             request_virtual_uri,
             &host_uri,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());

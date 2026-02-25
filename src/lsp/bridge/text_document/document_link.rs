@@ -55,7 +55,7 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             build_document_link_request,
@@ -87,7 +87,7 @@ fn build_document_link_request(
 /// * `offset` - The region offset for coordinate translation
 fn transform_document_link_response_to_host(
     mut response: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<DocumentLink>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentLink: {}", error);
@@ -193,10 +193,7 @@ mod tests {
 
         let transformed = transform_document_link_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -221,7 +218,7 @@ mod tests {
         #[case] response: serde_json::Value,
     ) {
         let transformed =
-            transform_document_link_response_to_host(response, RegionOffset { line: 5, column: 0 });
+            transform_document_link_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -230,7 +227,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let transformed =
-            transform_document_link_response_to_host(response, RegionOffset { line: 5, column: 0 });
+            transform_document_link_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_some());
         let links = transformed.unwrap();
         assert!(links.is_empty());
@@ -254,10 +251,7 @@ mod tests {
 
         let transformed = transform_document_link_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -286,10 +280,7 @@ mod tests {
 
         let transformed = transform_document_link_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -315,10 +306,7 @@ mod tests {
 
         let transformed = transform_document_link_response_to_host(
             response,
-            RegionOffset {
-                line: region_start_line,
-                column: 0,
-            },
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());

@@ -31,7 +31,7 @@ use super::virtual_uri::VirtualDocumentUri;
 pub(crate) fn build_position_based_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
     method: &str,
 ) -> serde_json::Value {
@@ -174,7 +174,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            RegionOffset::new(5, 4),
+            &RegionOffset::new(5, 4),
             RequestId::new(1),
             "textDocument/completion",
         );
@@ -196,7 +196,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            RegionOffset::new(5, 4),
+            &RegionOffset::new(5, 4),
             RequestId::new(1),
             "textDocument/completion",
         );
@@ -216,7 +216,7 @@ mod tests {
         let request = build_position_based_request(
             &virtual_uri,
             host_pos,
-            RegionOffset::new(5, 10),
+            &RegionOffset::new(5, 10),
             RequestId::new(1),
             "textDocument/completion",
         );

@@ -52,11 +52,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_moniker_request(virtual_uri, host_position, offset, request_id)
+                build_moniker_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, _ctx| transform_moniker_response_to_host(response),
         )
@@ -68,7 +68,7 @@ impl LanguageServerPool {
 fn build_moniker_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
@@ -126,7 +126,7 @@ mod tests {
         let request = build_moniker_request(
             &virtual_uri,
             position,
-            RegionOffset { line: 3, column: 0 },
+            &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 
@@ -160,7 +160,7 @@ mod tests {
         let request = build_moniker_request(
             &virtual_uri,
             position,
-            RegionOffset { line: 3, column: 0 },
+            &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 

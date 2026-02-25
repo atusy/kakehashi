@@ -57,11 +57,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_inlay_hint_request(virtual_uri, host_range, offset, request_id)
+                build_inlay_hint_request(virtual_uri, host_range, &offset, request_id)
             },
             |response, ctx| {
                 transform_inlay_hint_response_to_host(
@@ -90,7 +90,7 @@ impl LanguageServerPool {
 fn build_inlay_hint_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     // Translate range from host to virtual coordinates
@@ -141,7 +141,7 @@ fn transform_inlay_hint_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<InlayHint>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/inlayHint: {}", error);
@@ -227,7 +227,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
             RequestId::new(1),
         );
 
@@ -266,7 +266,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
             RequestId::new(42),
         );
 
@@ -302,7 +302,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            RegionOffset::new(5, 4),
+            &RegionOffset::new(5, 4),
             RequestId::new(1),
         );
 
@@ -336,7 +336,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            RegionOffset::new(5, 4),
+            &RegionOffset::new(5, 4),
             RequestId::new(1),
         );
 
@@ -370,7 +370,7 @@ mod tests {
         let request = build_inlay_hint_request(
             &virtual_uri,
             host_range,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
             RequestId::new(1),
         );
 
@@ -415,7 +415,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         );
 
         let hints = hints.unwrap();
@@ -436,7 +436,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         );
         assert!(result.is_none());
     }
@@ -449,7 +449,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         );
 
         assert!(hints.is_some());
@@ -487,7 +487,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -532,7 +532,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -581,7 +581,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -639,7 +639,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -678,7 +678,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(hints.is_some());
@@ -729,7 +729,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 

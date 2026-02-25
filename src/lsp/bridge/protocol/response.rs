@@ -52,7 +52,7 @@ pub(crate) fn transform_goto_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<LocationLink>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for goto request: {}", error);
@@ -157,7 +157,7 @@ pub(crate) fn transform_location_for_goto(
     mut location: Location,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Location> {
     let uri_str = location.uri.as_str();
 
@@ -187,7 +187,7 @@ fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<LocationLink> {
     let uri_str = link.target_uri.as_str();
 

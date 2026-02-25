@@ -58,11 +58,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_rename_request(virtual_uri, host_position, offset, new_name, request_id)
+                build_rename_request(virtual_uri, host_position, &offset, new_name, request_id)
             },
             |response, ctx| {
                 transform_workspace_edit_response_to_host(
@@ -89,7 +89,7 @@ impl LanguageServerPool {
 fn build_rename_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     new_name: &str,
     request_id: RequestId,
 ) -> serde_json::Value {
@@ -129,7 +129,7 @@ fn transform_workspace_edit_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<WorkspaceEdit> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/rename: {}", error);
@@ -164,7 +164,7 @@ fn transform_changes_map(
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) {
     // Collect keys to process (can't modify HashMap keys in-place)
     let keys: Vec<Uri> = changes.keys().cloned().collect();
@@ -202,7 +202,7 @@ fn transform_document_changes(
     doc_changes: &mut DocumentChanges,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) {
     match doc_changes {
         DocumentChanges::Edits(edits) => {
@@ -228,7 +228,7 @@ fn transform_text_document_edit(
     edit: &mut TextDocumentEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> bool {
     let uri_str = edit.text_document.uri.as_str();
 
@@ -279,7 +279,7 @@ mod tests {
         let request = build_rename_request(
             &virtual_uri,
             host_position,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             "newName",
             RequestId::new(1),
         );
@@ -312,7 +312,7 @@ mod tests {
         let request = build_rename_request(
             &virtual_uri,
             host_position,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             "renamedVariable",
             RequestId::new(42),
         );
@@ -349,7 +349,7 @@ mod tests {
             response,
             &make_virtual_uri_string(),
             &make_host_uri(),
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         );
         assert!(result.is_none());
     }
@@ -388,7 +388,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -438,7 +438,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -477,7 +477,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -525,7 +525,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -571,7 +571,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(10, 0),
+            &RegionOffset::new(10, 0),
         )
         .unwrap();
 
@@ -631,7 +631,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 
@@ -673,7 +673,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         )
         .unwrap();
 
@@ -724,7 +724,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         )
         .unwrap();
 
@@ -768,7 +768,7 @@ mod tests {
             response,
             &virtual_uri,
             &host_uri,
-            RegionOffset::new(5, 0),
+            &RegionOffset::new(5, 0),
         )
         .unwrap();
 

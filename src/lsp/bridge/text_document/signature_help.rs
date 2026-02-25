@@ -25,7 +25,7 @@ use super::super::protocol::{
 fn build_signature_help_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
@@ -52,7 +52,7 @@ fn build_signature_help_request(
 /// * `None` if the result is null or cannot be parsed
 fn transform_signature_help_response_to_host(
     mut response: serde_json::Value,
-    _offset: RegionOffset,
+    _offset: &RegionOffset,
 ) -> Option<SignatureHelp> {
     // SignatureHelp doesn't have ranges that need transformation.
     // activeSignature and activeParameter are indices, not coordinates.
@@ -100,11 +100,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_signature_help_request(virtual_uri, host_position, offset, request_id)
+                build_signature_help_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| transform_signature_help_response_to_host(response, ctx.offset),
         )
@@ -189,7 +189,7 @@ mod tests {
         let request = build_signature_help_request(
             &virtual_uri,
             test_position(),
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -203,7 +203,7 @@ mod tests {
         let request = build_signature_help_request(
             &virtual_uri,
             test_position(),
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -223,7 +223,7 @@ mod tests {
         let request = build_signature_help_request(
             &virtual_uri,
             host_position,
-            RegionOffset::new(5, 0), // region_start_line > host_position.line
+            &RegionOffset::new(5, 0), // region_start_line > host_position.line
             test_request_id(),
         );
 
@@ -264,7 +264,7 @@ mod tests {
 
         let transformed = transform_signature_help_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -288,7 +288,7 @@ mod tests {
         #[case] response: serde_json::Value,
     ) {
         let transformed =
-            transform_signature_help_response_to_host(response, RegionOffset::new(3, 0));
+            transform_signature_help_response_to_host(response, &RegionOffset::new(3, 0));
         assert!(transformed.is_none());
     }
 
@@ -310,7 +310,7 @@ mod tests {
 
         let transformed = transform_signature_help_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -345,7 +345,7 @@ mod tests {
 
         let transformed = transform_signature_help_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
