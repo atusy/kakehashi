@@ -35,7 +35,7 @@ use super::completion::{
 };
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{resolve_language_server_with_wildcard, settings::BridgeServerConfig};
-use crate::lsp::bridge::actor::ResponseRouter;
+use crate::lsp::bridge::actor::RouterCleanupGuard;
 
 impl LanguageServerPool {
     /// Route a `completionItem/resolve` request to the origin downstream server.
@@ -119,10 +119,7 @@ impl LanguageServerPool {
 
         let request = build_completion_resolve_request(&item, request_id);
 
-        let mut router_guard = RouterCleanupGuard {
-            router: Arc::clone(handle.router()),
-            request_id: Some(request_id),
-        };
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
         if let Err(e) = handle.send_request(request, request_id) {
             warn!(
@@ -206,24 +203,6 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         offset: RegionOffset::from(&envelope.offset),
     };
     envelope_item_data(item, &ctx);
-}
-
-/// RAII guard that removes a pending ResponseRouter entry on drop.
-///
-/// Mirrors the guard in `execute.rs` for the same abort-safety guarantee:
-/// if the resolve task is dropped before `wait_for_response` completes,
-/// the router entry is cleaned up to prevent a memory leak.
-struct RouterCleanupGuard {
-    router: Arc<ResponseRouter>,
-    request_id: Option<RequestId>,
-}
-
-impl Drop for RouterCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(id) = self.request_id {
-            self.router.remove(id);
-        }
-    }
 }
 
 #[cfg(test)]
