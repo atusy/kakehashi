@@ -181,6 +181,22 @@ fn extract_injection_language(query: &Query, match_: &QueryMatch, text: &str) ->
     extract_dynamic_language(query, match_, text)
 }
 
+/// Checks whether the given pattern has `#set! injection.include-children`.
+///
+/// This is a value-less property — its **presence** alone means "include children"
+/// (the injection parser sees the full content node including named children).
+/// When absent, named children should be excluded via `set_included_ranges()`.
+pub(crate) fn has_include_children_for_pattern(query: &Query, pattern_index: usize) -> bool {
+    for predicate in get_all_predicates(query, pattern_index) {
+        if let UnifiedPredicate::Property(prop) = predicate
+            && prop.key.as_ref() == "injection.include-children"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extracts language from #set! injection.language property
 fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String> {
     // Use unified accessor to check property settings
@@ -258,6 +274,10 @@ pub struct InjectionRegionInfo<'a> {
     pub content_node: Node<'a>,
     /// The pattern index (for offset directive lookups)
     pub pattern_index: usize,
+    /// Whether `#set! injection.include-children` is set for this pattern.
+    /// When true, the injection parser sees the full content node (including named children).
+    /// When false, named children (e.g., `block_continuation`) should be excluded.
+    pub include_children: bool,
 }
 
 use std::ops::Range;
@@ -395,6 +415,7 @@ pub fn collect_all_injections<'a>(
                     language,
                     content_node: capture.node,
                     pattern_index: match_.pattern_index,
+                    include_children: has_include_children_for_pattern(query, match_.pattern_index),
                 });
             }
         }
@@ -1311,16 +1332,19 @@ mod tests {
                 language: "lua".to_string(),
                 content_node: nodes[0],
                 pattern_index: 0,
+                include_children: false,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
                 content_node: nodes[1],
                 pattern_index: 0,
+                include_children: false,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
                 content_node: nodes[2],
                 pattern_index: 0,
+                include_children: false,
             },
         ];
 
@@ -1385,16 +1409,19 @@ mod tests {
                 language: "lua".to_string(),
                 content_node: nodes[0],
                 pattern_index: 0,
+                include_children: false,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
                 content_node: nodes[1],
                 pattern_index: 0,
+                include_children: false,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
                 content_node: nodes[2],
                 pattern_index: 0,
+                include_children: false,
             },
         ];
 
@@ -1533,6 +1560,65 @@ mod tests {
             cacheable.line_range, expected_line_range,
             "line_range mismatch for text: {:?}",
             text
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_for_pattern_without_property() {
+        // Pattern 0 has NO #set! injection.include-children
+        let query_str = r#"
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_include_children_for_pattern(&query, 0),
+            "Pattern without #set! injection.include-children should return false"
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_for_pattern_with_property() {
+        // Pattern has #set! injection.include-children (value-less property)
+        let query_str = r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "html")
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            has_include_children_for_pattern(&query, 0),
+            "Pattern with #set! injection.include-children should return true"
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_multi_pattern() {
+        // Two patterns: first without, second with include-children
+        let query_str = r#"
+            ; Pattern 0: NO include-children
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ; Pattern 1: HAS include-children
+            ((line_comment) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_include_children_for_pattern(&query, 0),
+            "Pattern 0 should not have include-children"
+        );
+        assert!(
+            has_include_children_for_pattern(&query, 1),
+            "Pattern 1 should have include-children"
         );
     }
 }

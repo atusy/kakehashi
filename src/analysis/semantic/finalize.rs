@@ -9,6 +9,8 @@
 //! relative position encoding (delta_line, delta_start), not the
 //! SemanticTokensDelta optimization which is handled by the `delta` module.
 
+use std::collections::HashMap;
+
 use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensResult};
 
 use super::legend::map_capture_to_token_type_and_modifiers;
@@ -185,16 +187,160 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
     tokens.truncate(write + 1);
 }
 
-/// Check whether a single-line token is inside any active injection region.
+/// Check whether a single-line token is fully inside any active injection region.
 ///
 /// Uses lexicographic tuple comparison: `(line, col) >= (start_line, start_col)`
 /// covers all four cases (middle line, start line, end line, single-line region).
-fn is_in_active_injection_region(token: &RawToken, regions: &[InjectionRegion]) -> bool {
+fn is_fully_in_active_injection_region(token: &RawToken, regions: &[InjectionRegion]) -> bool {
     let token_end = token.column + token.length;
     regions.iter().any(|r| {
         (token.line, token.column) >= (r.start_line, r.start_col)
             && (token.line, token_end) <= (r.end_line, r.end_col)
     })
+}
+
+/// Collect the injection region intervals that overlap a host token's line.
+///
+/// For each region that overlaps the token's line, returns the `(start_col, end_col)`
+/// interval on that line. Multi-line regions produce intervals that extend to
+/// line-end or start from column 0 as appropriate.
+///
+/// Used in tests as a helper to produce precomputed intervals for
+/// `split_host_token_around_regions`. Production code uses
+/// `build_region_intervals_map` which precomputes intervals for all lines in one pass.
+#[cfg(test)]
+fn region_intervals_on_line(
+    token_line: usize,
+    line_width: usize,
+    regions: &[InjectionRegion],
+) -> Vec<(usize, usize)> {
+    let mut intervals = Vec::new();
+    for r in regions {
+        // Region must overlap this line
+        if token_line < r.start_line || token_line > r.end_line {
+            continue;
+        }
+        // Determine the interval on this line
+        let start_col = if token_line == r.start_line {
+            r.start_col
+        } else {
+            0
+        };
+        let end_col = if token_line == r.end_line {
+            r.end_col
+        } else {
+            line_width
+        };
+        if start_col < end_col {
+            intervals.push((start_col, end_col));
+        }
+    }
+    // Sort intervals by (start_col, end_col). Overlaps are handled correctly
+    // by the consumer's cursor-based subtraction (cursor advances past the
+    // further end of overlapping intervals).
+    intervals.sort_unstable();
+    intervals
+}
+
+/// Precompute per-line region intervals from all injection regions.
+///
+/// Builds a map from line number to sorted `(start_col, end_col)` intervals,
+/// so that `split_host_token_around_regions` can look up intervals in O(1)
+/// instead of scanning all regions per token.
+fn build_region_intervals_map(
+    regions: &[InjectionRegion],
+    lines: &[&str],
+) -> HashMap<usize, Vec<(usize, usize)>> {
+    let mut map: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for r in regions {
+        for line_idx in r.start_line..=r.end_line {
+            if line_idx >= lines.len() {
+                continue;
+            }
+            let line_width = utf16_width(lines[line_idx]);
+            let start_col = if line_idx == r.start_line {
+                r.start_col
+            } else {
+                0
+            };
+            let end_col = if line_idx == r.end_line {
+                r.end_col
+            } else {
+                line_width
+            };
+            if start_col < end_col {
+                map.entry(line_idx).or_default().push((start_col, end_col));
+            }
+        }
+    }
+    // Sort each line's intervals
+    for intervals in map.values_mut() {
+        intervals.sort_unstable();
+    }
+    map
+}
+
+/// Split a host token around injection region intervals, keeping only the
+/// fragments that fall outside all regions.
+///
+/// This handles the case where a host token (e.g., `@markup.raw.block` covering
+/// the full fenced_code_block including `> ` prefix) partially overlaps with an
+/// injection region. The overlapping part is removed; non-overlapping fragments
+/// (like the `> ` prefix) survive.
+///
+/// `intervals` should be the precomputed sorted intervals for the token's line,
+/// obtained from `build_region_intervals_map`.
+fn split_host_token_around_regions(
+    token: &RawToken,
+    intervals: &[(usize, usize)],
+) -> Vec<RawToken> {
+    if intervals.is_empty() {
+        return vec![token.clone()];
+    }
+
+    let token_start = token.column;
+    let token_end = token.column + token.length;
+
+    // Subtract region intervals from the token's range
+    let mut fragments = Vec::new();
+    let mut cursor = token_start;
+
+    for (region_start, region_end) in intervals {
+        if cursor >= token_end {
+            break;
+        }
+        // Fragment before this region
+        if cursor < *region_start {
+            let frag_end = (*region_start).min(token_end);
+            if cursor < frag_end {
+                fragments.push(RawToken {
+                    line: token.line,
+                    column: cursor,
+                    length: frag_end - cursor,
+                    mapped_name: token.mapped_name.clone(),
+                    depth: token.depth,
+                    pattern_index: token.pattern_index,
+                    priority: token.priority,
+                });
+            }
+        }
+        cursor = (*region_end).max(cursor);
+    }
+
+    // Fragment after all regions
+    if cursor < token_end {
+        fragments.push(RawToken {
+            line: token.line,
+            column: cursor,
+            length: token_end - cursor,
+            mapped_name: token.mapped_name.clone(),
+            depth: token.depth,
+            pattern_index: token.pattern_index,
+            priority: token.priority,
+        });
+    }
+
+    fragments
 }
 
 /// Post-process and delta-encode raw tokens into SemanticTokensResult.
@@ -216,17 +362,35 @@ pub(super) fn finalize_tokens(
     // Unknown captures are already filtered at collection time (apply_capture_mapping returns None).
     all_tokens.retain(|token| token.length > 0);
 
-    // Injection region exclusion: remove host tokens (depth=0) inside active
-    // injection regions.
+    // Injection region exclusion: remove or split host tokens (depth=0) that
+    // overlap with active injection regions.
+    //
+    // Host tokens fully inside a region are removed entirely.
+    // Host tokens that partially overlap (e.g., a `@markup.raw.block` token
+    // covering both `> ` prefix and code content in a blockquote) are split,
+    // keeping only the fragments outside the injection regions.
     if !active_injection_regions.is_empty() {
-        all_tokens.retain(|token| {
-            // Non-host tokens (injection tokens) are always kept
+        let region_map = build_region_intervals_map(active_injection_regions, lines);
+        let mut filtered = Vec::with_capacity(all_tokens.len());
+        for token in all_tokens {
             if token.depth > 0 {
-                return true;
+                // Non-host tokens (injection tokens) are always kept
+                filtered.push(token);
+                continue;
             }
-            // Remove host tokens inside active injection regions
-            !is_in_active_injection_region(token, active_injection_regions)
-        });
+            if is_fully_in_active_injection_region(&token, active_injection_regions) {
+                // Fully contained → remove entirely (fast path)
+                continue;
+            }
+            // Check for partial overlap and split if needed.
+            let intervals = region_map
+                .get(&token.line)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let fragments = split_host_token_around_regions(&token, intervals);
+            filtered.extend(fragments);
+        }
+        all_tokens = filtered;
     }
 
     // Split overlapping tokens using sweep line algorithm.
@@ -825,6 +989,285 @@ mod tests {
             vec![(0, 10, "keyword".to_string())],
             "priority 100 should beat priority 90, regardless of pattern_index"
         );
+    }
+
+    // ── region_intervals_on_line tests ─────────────────────────────
+
+    #[test]
+    fn region_intervals_no_overlap_returns_empty() {
+        // Token on line 5, region on lines 0-2 → no overlap
+        let regions = vec![InjectionRegion {
+            start_line: 0,
+            start_col: 0,
+            end_line: 2,
+            end_col: 10,
+        }];
+        let result = region_intervals_on_line(5, 80, &regions);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn region_intervals_single_line_region() {
+        // Region entirely on line 3: cols 5..15
+        let regions = vec![InjectionRegion {
+            start_line: 3,
+            start_col: 5,
+            end_line: 3,
+            end_col: 15,
+        }];
+        let result = region_intervals_on_line(3, 80, &regions);
+        assert_eq!(result, vec![(5, 15)]);
+    }
+
+    #[test]
+    fn region_intervals_multiline_start_line() {
+        // Region on lines 3..5, querying line 3 → start_col..line_width
+        let regions = vec![InjectionRegion {
+            start_line: 3,
+            start_col: 10,
+            end_line: 5,
+            end_col: 20,
+        }];
+        let result = region_intervals_on_line(3, 80, &regions);
+        assert_eq!(result, vec![(10, 80)]);
+    }
+
+    #[test]
+    fn region_intervals_multiline_middle_line() {
+        // Region on lines 3..5, querying line 4 → 0..line_width
+        let regions = vec![InjectionRegion {
+            start_line: 3,
+            start_col: 10,
+            end_line: 5,
+            end_col: 20,
+        }];
+        let result = region_intervals_on_line(4, 80, &regions);
+        assert_eq!(result, vec![(0, 80)]);
+    }
+
+    #[test]
+    fn region_intervals_multiline_end_line() {
+        // Region on lines 3..5, querying line 5 → 0..end_col
+        let regions = vec![InjectionRegion {
+            start_line: 3,
+            start_col: 10,
+            end_line: 5,
+            end_col: 20,
+        }];
+        let result = region_intervals_on_line(5, 80, &regions);
+        assert_eq!(result, vec![(0, 20)]);
+    }
+
+    #[test]
+    fn region_intervals_multiple_regions_sorted() {
+        // Two regions on line 1: cols 5..10 and cols 2..4 → sorted by start
+        let regions = vec![
+            InjectionRegion {
+                start_line: 1,
+                start_col: 5,
+                end_line: 1,
+                end_col: 10,
+            },
+            InjectionRegion {
+                start_line: 1,
+                start_col: 2,
+                end_line: 1,
+                end_col: 4,
+            },
+        ];
+        let result = region_intervals_on_line(1, 80, &regions);
+        assert_eq!(result, vec![(2, 4), (5, 10)]);
+    }
+
+    // ── split_host_token_around_regions tests ────────────────────
+
+    #[test]
+    fn split_around_no_overlap_token_survives() {
+        // Token at cols 0..5, region at cols 10..20 → no overlap on token range
+        let token = make_token(1, 0, 5, "string", 0, 0);
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 10,
+            end_line: 1,
+            end_col: 20,
+        }];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 1);
+        assert_eq!((frags[0].column, frags[0].length), (0, 5));
+    }
+
+    #[test]
+    fn split_around_partial_overlap_prefix_survives() {
+        // Token at cols 0..15, region at cols 5..15 → prefix [0,5) survives
+        let token = make_token(1, 0, 15, "string", 0, 0);
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 5,
+            end_line: 1,
+            end_col: 15,
+        }];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 1);
+        assert_eq!((frags[0].column, frags[0].length), (0, 5));
+    }
+
+    #[test]
+    fn split_around_partial_overlap_suffix_survives() {
+        // Token at cols 5..20, region at cols 5..15 → suffix [15,20) survives
+        let token = make_token(1, 5, 15, "string", 0, 0);
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 5,
+            end_line: 1,
+            end_col: 15,
+        }];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 1);
+        assert_eq!((frags[0].column, frags[0].length), (15, 5));
+    }
+
+    #[test]
+    fn split_around_region_in_middle_two_fragments() {
+        // Token at cols 0..20, region at cols 5..15 → [0,5) and [15,20)
+        let token = make_token(1, 0, 20, "string", 0, 0);
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 5,
+            end_line: 1,
+            end_col: 15,
+        }];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 2);
+        assert_eq!((frags[0].column, frags[0].length), (0, 5));
+        assert_eq!((frags[1].column, frags[1].length), (15, 5));
+    }
+
+    #[test]
+    fn split_around_multiple_regions_three_fragments() {
+        // Token at cols 0..30, regions at cols 5..10 and 15..20
+        // → [0,5), [10,15), [20,30)
+        let token = make_token(1, 0, 30, "string", 0, 0);
+        let regions = vec![
+            InjectionRegion {
+                start_line: 1,
+                start_col: 5,
+                end_line: 1,
+                end_col: 10,
+            },
+            InjectionRegion {
+                start_line: 1,
+                start_col: 15,
+                end_line: 1,
+                end_col: 20,
+            },
+        ];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 3);
+        assert_eq!((frags[0].column, frags[0].length), (0, 5));
+        assert_eq!((frags[1].column, frags[1].length), (10, 5));
+        assert_eq!((frags[2].column, frags[2].length), (20, 10));
+    }
+
+    #[test]
+    fn split_around_fully_covered_returns_empty() {
+        // Token at cols 5..10, region at cols 0..20 → fully covered
+        let token = make_token(1, 5, 5, "string", 0, 0);
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 20,
+        }];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert!(frags.is_empty());
+    }
+
+    #[test]
+    fn split_around_preserves_token_metadata() {
+        // Verify fragments retain mapped_name, depth, pattern_index, priority
+        let token = make_token(1, 0, 20, "markup.raw.block", 0, 5);
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 5,
+            end_line: 1,
+            end_col: 15,
+        }];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 2);
+        for frag in &frags {
+            assert_eq!(frag.mapped_name, "markup.raw.block");
+            assert_eq!(frag.depth, 0);
+            assert_eq!(frag.pattern_index, 5);
+            assert_eq!(frag.priority, 100);
+        }
+    }
+
+    #[test]
+    fn region_intervals_zero_width_region_filtered_out() {
+        // A zero-width region (start_col == end_col) should produce no interval
+        let regions = vec![InjectionRegion {
+            start_line: 1,
+            start_col: 5,
+            end_line: 1,
+            end_col: 5,
+        }];
+        let result = region_intervals_on_line(1, 80, &regions);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn region_intervals_overlapping_regions_both_emitted() {
+        // Two overlapping regions on the same line: (2,8) and (5,12)
+        // Both are emitted sorted; the consumer's cursor handles overlap.
+        let regions = vec![
+            InjectionRegion {
+                start_line: 1,
+                start_col: 2,
+                end_line: 1,
+                end_col: 8,
+            },
+            InjectionRegion {
+                start_line: 1,
+                start_col: 5,
+                end_line: 1,
+                end_col: 12,
+            },
+        ];
+        let result = region_intervals_on_line(1, 80, &regions);
+        assert_eq!(result, vec![(2, 8), (5, 12)]);
+    }
+
+    #[test]
+    fn split_around_overlapping_regions_merged_by_cursor() {
+        // Token at cols 0..20, overlapping regions (2,8) and (5,12)
+        // Cursor advancement merges overlaps: → [0,2) and [12,20)
+        let token = make_token(1, 0, 20, "string", 0, 0);
+        let regions = vec![
+            InjectionRegion {
+                start_line: 1,
+                start_col: 2,
+                end_line: 1,
+                end_col: 8,
+            },
+            InjectionRegion {
+                start_line: 1,
+                start_col: 5,
+                end_line: 1,
+                end_col: 12,
+            },
+        ];
+        let intervals = region_intervals_on_line(1, 80, &regions);
+        let frags = split_host_token_around_regions(&token, &intervals);
+        assert_eq!(frags.len(), 2);
+        assert_eq!((frags[0].column, frags[0].length), (0, 2));
+        assert_eq!((frags[1].column, frags[1].length), (12, 8));
     }
 
     #[test]

@@ -126,11 +126,19 @@ impl ThreadLocalParserFactory {
     /// # Arguments
     /// * `language_id` - The language to use for parsing
     /// * `text` - The source text to parse
+    /// * `included_ranges` - Optional ranges to restrict parsing to (content-text-relative).
+    ///   When `Some`, only these byte ranges are visible to the parser, excluding
+    ///   structural markers like blockquote `> ` prefixes.
     ///
     /// # Returns
     /// - `Some(tree)` if parsing succeeds
     /// - `None` if the language is not registered or parsing fails
-    pub fn parse(&self, language_id: &str, text: &str) -> Option<Tree> {
+    pub fn parse(
+        &self,
+        language_id: &str,
+        text: &str,
+        included_ranges: Option<&[tree_sitter::Range]>,
+    ) -> Option<Tree> {
         PARSER_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
 
@@ -144,7 +152,37 @@ impl ThreadLocalParserFactory {
 
             // Parse using the cached parser
             let parser = cache.get_mut(language_id)?;
-            parser.parse(text, None)
+
+            // Set included ranges if provided. On failure, skip parsing entirely
+            // rather than parsing without restriction — unrestricted parsing would
+            // include excluded content (e.g., blockquote `> ` prefixes), producing
+            // incorrect tokens.
+            if let Some(ranges) = included_ranges
+                && let Err(e) = parser.set_included_ranges(ranges)
+            {
+                log::warn!(
+                    target: "kakehashi::semantic",
+                    "Failed to set included ranges for {}: {}. Skipping parse.",
+                    language_id, e
+                );
+                // Defensive reset: although the failed set_included_ranges call
+                // shouldn't leave stale state, reset explicitly to uphold the
+                // invariant that cached parsers always have empty included ranges.
+                let _ = parser.set_included_ranges(&[]);
+                return None;
+            }
+
+            let result = parser.parse(text, None);
+
+            // Always reset included ranges after parsing to prevent stale state
+            // in the LRU cache (next parse of same language may not need ranges).
+            // Note: a full RAII guard would be ideal but conflicts with the &mut
+            // borrow needed by parser.parse(). The risk is low — parse() is a
+            // Tree-sitter C FFI call that returns None on failure rather than
+            // panicking.
+            let _ = parser.set_included_ranges(&[]);
+
+            result
         })
     }
 
@@ -165,6 +203,87 @@ impl ThreadLocalParserFactory {
         PARSER_CACHE.with(|cache| {
             cache.borrow_mut().clear();
         });
+    }
+}
+
+/// Compute the included ranges for an injection content node.
+///
+/// When `include_children` is false and the content node has named children
+/// (e.g., `block_continuation` nodes in blockquote code blocks), this function
+/// computes the "gap" ranges between those children — the actual code content.
+///
+/// Returns `None` when:
+/// - `include_children` is true (the injection parser should see everything)
+/// - The content node has no named children (no gaps to compute)
+/// - All content is covered by named children (no gaps exist)
+///
+/// The returned ranges are **relative** to the content node's start position:
+/// byte offsets are subtracted by `content_node.start_byte()`, and row/column
+/// Points are adjusted relative to `content_node.start_position()`.
+fn compute_included_ranges(
+    content_node: &tree_sitter::Node,
+    include_children: bool,
+) -> Option<Vec<tree_sitter::Range>> {
+    if include_children || content_node.named_child_count() == 0 {
+        return None;
+    }
+
+    let node_start_byte = content_node.start_byte();
+    let node_start_pos = content_node.start_position();
+    let node_end_byte = content_node.end_byte();
+    let node_end_pos = content_node.end_position();
+
+    // Helper to make a Point relative to the content node's start.
+    // Column is only adjusted when the point is on the same row as the node start,
+    // because only that row has a non-zero column offset from the node origin.
+    let relativize_point = |p: tree_sitter::Point| -> tree_sitter::Point {
+        tree_sitter::Point {
+            row: p.row.saturating_sub(node_start_pos.row),
+            column: if p.row == node_start_pos.row {
+                p.column.saturating_sub(node_start_pos.column)
+            } else {
+                p.column
+            },
+        }
+    };
+
+    let mut ranges = Vec::new();
+    let mut cursor_byte = node_start_byte;
+    let mut cursor_point = node_start_pos;
+
+    let mut tree_cursor = content_node.walk();
+    for child in content_node.named_children(&mut tree_cursor) {
+        let child_start_byte = child.start_byte();
+        let child_end_byte = child.end_byte();
+
+        // Gap before this child
+        if cursor_byte < child_start_byte {
+            ranges.push(tree_sitter::Range {
+                start_byte: cursor_byte - node_start_byte,
+                end_byte: child_start_byte - node_start_byte,
+                start_point: relativize_point(cursor_point),
+                end_point: relativize_point(child.start_position()),
+            });
+        }
+
+        cursor_byte = child_end_byte;
+        cursor_point = child.end_position();
+    }
+
+    // Gap after last child
+    if cursor_byte < node_end_byte {
+        ranges.push(tree_sitter::Range {
+            start_byte: cursor_byte - node_start_byte,
+            end_byte: node_end_byte - node_start_byte,
+            start_point: relativize_point(cursor_point),
+            end_point: relativize_point(node_end_pos),
+        });
+    }
+
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
     }
 }
 
@@ -201,8 +320,12 @@ pub(crate) fn process_injection_sync(
         return Vec::new();
     }
 
-    // Parse the injection content
-    let Some(tree) = factory.parse(&ctx.resolved_lang, ctx.content_text) else {
+    // Parse the injection content (with optional included ranges for blockquotes)
+    let Some(tree) = factory.parse(
+        &ctx.resolved_lang,
+        ctx.content_text,
+        ctx.included_ranges.as_deref(),
+    ) else {
         return Vec::new();
     };
 
@@ -329,14 +452,45 @@ fn collect_injection_contexts_sync<'a>(
             continue;
         }
 
-        // Record exclusion range (content-local) for parent token suppression
-        exclusion_ranges.push((inj_start_byte, inj_end_byte));
+        // Compute included ranges for the injection parser (Problem 1: blockquote prefixes).
+        // When include_children is false and content_node has named children
+        // (e.g., block_continuation), we compute gap ranges so the injection parser
+        // only sees actual code content.
+        //
+        // Disabled when an offset directive is active: compute_included_ranges()
+        // returns ranges relative to content_node.start_byte(), but content_text
+        // starts at inj_start_byte (offset-adjusted). Passing misaligned ranges
+        // to the parser would produce incorrect results.
+        let included_ranges = if offset.is_some() {
+            None
+        } else {
+            compute_included_ranges(&injection.content_node, injection.include_children)
+        };
+
+        // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).
+        // When we have per-gap included ranges, push EACH gap as a separate exclusion entry
+        // so that compute_active_injection_regions() produces per-line InjectionRegions.
+        // Otherwise, push the single full content range as before.
+        if let Some(ref ranges) = included_ranges {
+            // compute_included_ranges returns ranges relative to content_node.start_byte().
+            // In this branch, offset.is_none(), so inj_start_byte == content_node.start_byte();
+            // we use content_node.start_byte() explicitly as the base for clarity.
+            let base_byte = content_node.start_byte();
+            for r in ranges {
+                let abs_start = base_byte + r.start_byte;
+                let abs_end = base_byte + r.end_byte;
+                exclusion_ranges.push((abs_start, abs_end));
+            }
+        } else {
+            exclusion_ranges.push((inj_start_byte, inj_end_byte));
+        }
 
         contexts.push(InjectionContext {
             resolved_lang,
             highlight_query,
             content_text: &text[inj_start_byte..inj_end_byte],
             host_start_byte: content_start_byte + inj_start_byte,
+            included_ranges,
         });
     }
 
@@ -530,7 +684,7 @@ mod tests {
         let factory = ThreadLocalParserFactory::new(registry);
 
         let code = "fn main() {}";
-        let tree = factory.parse("rust", code);
+        let tree = factory.parse("rust", code, None);
 
         assert!(tree.is_some(), "Should parse registered language");
         let tree = tree.unwrap();
@@ -545,7 +699,7 @@ mod tests {
         let registry = create_test_registry();
         let factory = ThreadLocalParserFactory::new(registry);
 
-        let tree = factory.parse("unknown_language", "some code");
+        let tree = factory.parse("unknown_language", "some code", None);
         assert!(
             tree.is_none(),
             "Should return None for unregistered language"
@@ -561,11 +715,11 @@ mod tests {
         ThreadLocalParserFactory::clear_cache();
 
         // First parse creates and caches parser
-        let tree1 = factory.parse("rust", "fn main() {}");
+        let tree1 = factory.parse("rust", "fn main() {}", None);
         assert!(tree1.is_some());
 
         // Second parse reuses cached parser
-        let tree2 = factory.parse("rust", "fn test() {}");
+        let tree2 = factory.parse("rust", "fn test() {}", None);
         assert!(tree2.is_some());
 
         // Both should produce valid parse trees
@@ -579,13 +733,13 @@ mod tests {
         let factory = ThreadLocalParserFactory::new(registry);
 
         // Parse to create cached parser
-        let _ = factory.parse("rust", "fn main() {}");
+        let _ = factory.parse("rust", "fn main() {}", None);
 
         // Clear the cache
         ThreadLocalParserFactory::clear_cache();
 
         // Verify can still parse after cache clear (parser recreated)
-        let tree = factory.parse("rust", "fn test() {}");
+        let tree = factory.parse("rust", "fn test() {}", None);
         assert!(tree.is_some(), "Should still parse after cache clear");
     }
 
@@ -617,7 +771,7 @@ mod tests {
             }
         "#;
 
-        let tree = factory.parse("rust", code);
+        let tree = factory.parse("rust", code, None);
         assert!(tree.is_some(), "Should parse complex code");
         assert!(
             !tree.unwrap().root_node().has_error(),
@@ -643,6 +797,7 @@ mod tests {
             highlight_query: Arc::new(query),
             content_text: "fn main() {}",
             host_start_byte: 100,
+            included_ranges: None,
         };
 
         assert_eq!(ctx.resolved_lang, "rust");
@@ -720,6 +875,7 @@ mod tests {
             highlight_query,
             content_text: code,
             host_start_byte: 0,
+            included_ranges: None,
         };
 
         let tokens = process_injection_sync(
@@ -774,6 +930,7 @@ mod tests {
             highlight_query,
             content_text: code,
             host_start_byte: 0,
+            included_ranges: None,
         };
 
         // Process at MAX_INJECTION_DEPTH should return empty
@@ -1077,6 +1234,86 @@ local b = 2
             "Recently accessed lang0 should not be evicted"
         );
         assert!(!cache.contains("lang1"), "LRU lang1 should be evicted");
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_when_include_children() {
+        // When include_children is true, all content is included (no restriction)
+        let registry = create_test_registry();
+        let factory = ThreadLocalParserFactory::new(registry);
+        let tree = factory.parse("rust", "fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        assert!(
+            compute_included_ranges(&root, true).is_none(),
+            "include_children=true should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_for_no_named_children() {
+        // A leaf node (identifier) has no named children
+        let registry = create_test_registry();
+        let factory = ThreadLocalParserFactory::new(registry);
+        let tree = factory.parse("rust", "x", None).unwrap();
+        let root = tree.root_node();
+
+        // Find identifier leaf node
+        let ident = root
+            .named_descendant_for_byte_range(0, 1)
+            .expect("should find node");
+        assert_eq!(ident.named_child_count(), 0);
+
+        assert!(
+            compute_included_ranges(&ident, false).is_none(),
+            "Node with no named children should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_computes_gap_ranges() {
+        // Use a node that has named children with gaps between them.
+        // In Rust, a function_item has named children (name, parameters, body)
+        // with gaps (the "fn" keyword, whitespace, etc.)
+        let registry = create_test_registry();
+        let factory = ThreadLocalParserFactory::new(registry);
+        let tree = factory.parse("rust", "fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        // function_item is the top-level node
+        let func = root.named_child(0).expect("should have function_item");
+        assert!(
+            func.named_child_count() > 0,
+            "function_item should have named children"
+        );
+
+        let ranges = compute_included_ranges(&func, false);
+        assert!(
+            ranges.is_some(),
+            "Node with named children should produce gap ranges"
+        );
+
+        let ranges = ranges.unwrap();
+        assert!(
+            !ranges.is_empty(),
+            "Should have at least one gap range between named children"
+        );
+
+        // All ranges should be within the function_item's bounds (relative)
+        let func_size = func.end_byte() - func.start_byte();
+        for r in &ranges {
+            assert!(
+                r.start_byte < r.end_byte,
+                "Range should be non-empty: {:?}",
+                r
+            );
+            assert!(
+                r.end_byte <= func_size,
+                "Range end {} should be within node size {}",
+                r.end_byte,
+                func_size
+            );
+        }
     }
 
     #[test]
