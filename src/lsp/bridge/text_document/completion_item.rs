@@ -132,7 +132,7 @@ impl LanguageServerPool {
         }
 
         let response = handle.wait_for_response(request_id, response_rx).await;
-        router_guard.request_id.take();
+        router_guard.disarm();
 
         let response = match response {
             Ok(r) => r,

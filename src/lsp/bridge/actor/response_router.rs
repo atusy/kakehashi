@@ -323,8 +323,8 @@ impl ResponseRouter {
 pub(crate) struct RouterCleanupGuard {
     router: Arc<ResponseRouter>,
     /// When `Some`, Drop will remove the router entry for this ID.
-    /// `take()`d after wait_for_response completes to disarm.
-    pub(crate) request_id: Option<RequestId>,
+    /// Cleared by `disarm()` after wait_for_response completes.
+    request_id: Option<RequestId>,
 }
 
 impl RouterCleanupGuard {
@@ -333,6 +333,14 @@ impl RouterCleanupGuard {
             router,
             request_id: Some(request_id),
         }
+    }
+
+    /// Prevent the guard from cleaning up on drop.
+    ///
+    /// Call this after `wait_for_response` completes, because at that point
+    /// the router has already consumed or cleaned up the entry.
+    pub(crate) fn disarm(&mut self) {
+        self.request_id.take();
     }
 }
 

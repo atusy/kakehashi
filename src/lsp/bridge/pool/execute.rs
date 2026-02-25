@@ -143,7 +143,7 @@ impl LanguageServerPool {
         // After this returns (success, channel-closed, or timeout),
         // the router entry has been consumed or cleaned up internally.
         let response = handle.wait_for_response(request_id, response_rx).await;
-        router_guard.request_id.take();
+        router_guard.disarm();
 
         // Unregister from the upstream request registry regardless of result
         if let Some(ref id) = upstream_request_id {
