@@ -32,7 +32,7 @@ use super::injection_aware::{
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::injection::{
     self, compute_included_ranges, has_include_children_for_pattern,
-    parse_offset_directive_for_pattern,
+    parse_offset_directive_for_pattern, parse_with_ranges,
 };
 use crate::text::PositionMapper;
 
@@ -141,8 +141,8 @@ pub fn build_from_node_in_injection(
 /// Parse injection content with included-range exclusion for named children.
 ///
 /// Computes included ranges to exclude named children (e.g., `block_continuation`
-/// nodes in blockquote code blocks), sets them on the parser, parses, and resets
-/// the parser state. Skipped when an offset directive is active because
+/// nodes in blockquote code blocks), then delegates to [`parse_with_ranges`] for
+/// the set/parse/reset protocol. Skipped when an offset directive is active because
 /// `compute_included_ranges()` returns ranges relative to `content_node.start_byte()`,
 /// which would be misaligned with the offset-adjusted `content_text`.
 ///
@@ -162,26 +162,13 @@ fn parse_with_included_ranges(
         compute_included_ranges(content_node, include_children)
     };
 
-    if let Some(ref ranges) = included_ranges
-        && let Err(e) = parser.set_included_ranges(ranges)
-    {
-        log::warn!(
-            target: "kakehashi::selection",
-            "Failed to set included ranges for {}: {}. Skipping parse.",
-            lang_name, e
-        );
-        let _ = parser.set_included_ranges(&[]);
-        return None;
-    }
-
-    let tree = parser.parse(content_text, None);
-
-    // Reset included ranges (if set) to prevent stale state in the parser pool
-    if included_ranges.is_some() {
-        let _ = parser.set_included_ranges(&[]);
-    }
-
-    tree
+    parse_with_ranges(
+        parser,
+        content_text,
+        included_ranges.as_deref(),
+        "kakehashi::selection",
+        lang_name,
+    )
 }
 
 /// Build SelectionRange with automatic injection detection and handling.

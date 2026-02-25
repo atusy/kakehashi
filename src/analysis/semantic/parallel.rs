@@ -18,7 +18,7 @@ use super::injection::{InjectionContext, MAX_INJECTION_DEPTH};
 use super::token_collector::{InjectionRegion, RawToken, byte_to_utf16_col, collect_host_tokens};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
-use crate::language::injection::compute_included_ranges;
+use crate::language::injection::{compute_included_ranges, parse_with_ranges};
 
 /// Maximum number of parsers to cache per Rayon worker thread.
 ///
@@ -151,39 +151,16 @@ impl ThreadLocalParserFactory {
                 cache.insert(language_id.to_string(), parser);
             }
 
-            // Parse using the cached parser
+            // Parse using the cached parser, delegating the set/parse/reset
+            // protocol to the shared parse_with_ranges function.
             let parser = cache.get_mut(language_id)?;
-
-            // Set included ranges if provided. On failure, skip parsing entirely
-            // rather than parsing without restriction — unrestricted parsing would
-            // include excluded content (e.g., blockquote `> ` prefixes), producing
-            // incorrect tokens.
-            if let Some(ranges) = included_ranges
-                && let Err(e) = parser.set_included_ranges(ranges)
-            {
-                log::warn!(
-                    target: "kakehashi::semantic",
-                    "Failed to set included ranges for {}: {}. Skipping parse.",
-                    language_id, e
-                );
-                // Defensive reset: although the failed set_included_ranges call
-                // shouldn't leave stale state, reset explicitly to uphold the
-                // invariant that cached parsers always have empty included ranges.
-                let _ = parser.set_included_ranges(&[]);
-                return None;
-            }
-
-            let result = parser.parse(text, None);
-
-            // Always reset included ranges after parsing to prevent stale state
-            // in the LRU cache (next parse of same language may not need ranges).
-            // Note: a full RAII guard would be ideal but conflicts with the &mut
-            // borrow needed by parser.parse(). The risk is low — parse() is a
-            // Tree-sitter C FFI call that returns None on failure rather than
-            // panicking.
-            let _ = parser.set_included_ranges(&[]);
-
-            result
+            parse_with_ranges(
+                parser,
+                text,
+                included_ranges,
+                "kakehashi::semantic",
+                language_id,
+            )
         })
     }
 

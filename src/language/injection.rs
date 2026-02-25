@@ -278,6 +278,48 @@ pub(crate) fn compute_included_ranges(
     }
 }
 
+/// Parse text with optional included ranges, resetting parser state afterward.
+///
+/// This is the shared protocol for interacting with Tree-sitter's
+/// `set_included_ranges` API. Both the semantic tokens and selection range
+/// paths delegate here to avoid divergence.
+///
+/// # Behavior
+///
+/// 1. If `included_ranges` is `Some`, calls `parser.set_included_ranges()`
+/// 2. On failure, logs a warning, resets ranges, and returns `None`
+/// 3. Calls `parser.parse(text, None)`
+/// 4. Always resets `parser.set_included_ranges(&[])` after parsing
+///
+/// The unconditional reset ensures parsers returned to pools or caches
+/// never carry stale included-range state.
+pub(crate) fn parse_with_ranges(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    included_ranges: Option<&[tree_sitter::Range]>,
+    log_target: &str,
+    lang_name: &str,
+) -> Option<tree_sitter::Tree> {
+    if let Some(ranges) = included_ranges
+        && let Err(e) = parser.set_included_ranges(ranges)
+    {
+        log::warn!(
+            target: log_target,
+            "Failed to set included ranges for {}: {}. Skipping parse.",
+            lang_name, e
+        );
+        let _ = parser.set_included_ranges(&[]);
+        return None;
+    }
+
+    let tree = parser.parse(text, None);
+
+    // Always reset included ranges after parsing to prevent stale state
+    let _ = parser.set_included_ranges(&[]);
+
+    tree
+}
+
 /// Extracts language from #set! injection.language property
 fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String> {
     // Use unified accessor to check property settings
