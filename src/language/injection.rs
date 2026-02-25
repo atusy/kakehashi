@@ -1797,37 +1797,53 @@ mod tests {
 
         // function_item is the top-level node
         let func = root.named_child(0).expect("should have function_item");
-        assert!(
-            func.named_child_count() > 0,
-            "function_item should have named children"
-        );
+        let func_start = func.start_byte();
+        let func_size = func.end_byte() - func_start;
 
         let ranges = compute_included_ranges(&func, false);
-        assert!(
-            ranges.is_some(),
-            "Node with named children should produce gap ranges"
-        );
-
-        let ranges = ranges.unwrap();
+        let ranges = ranges.expect("Node with named children should produce gap ranges");
         assert!(
             !ranges.is_empty(),
             "Should have at least one gap range between named children"
         );
 
-        // All ranges should be within the function_item's bounds (relative)
-        let func_size = func.end_byte() - func.start_byte();
+        // Collect named children byte ranges (relative to func start)
+        let mut tree_cursor = func.walk();
+        let child_ranges: Vec<(usize, usize)> = func
+            .named_children(&mut tree_cursor)
+            .map(|c| (c.start_byte() - func_start, c.end_byte() - func_start))
+            .collect();
+
+        // Gap ranges must not overlap any named child
         for r in &ranges {
             assert!(
                 r.start_byte < r.end_byte,
-                "Range should be non-empty: {:?}",
-                r
+                "Range should be non-empty: {r:?}"
             );
-            assert!(
-                r.end_byte <= func_size,
-                "Range end {} should be within node size {}",
-                r.end_byte,
-                func_size
-            );
+            assert!(r.end_byte <= func_size, "Range exceeds node bounds: {r:?}");
+            for (cs, ce) in &child_ranges {
+                assert!(
+                    r.end_byte <= *cs || r.start_byte >= *ce,
+                    "Gap range {r:?} overlaps named child [{cs}, {ce})"
+                );
+            }
         }
+
+        // Gap ranges + named child ranges should cover the entire node
+        let mut covered = vec![false; func_size];
+        for r in &ranges {
+            for b in r.start_byte..r.end_byte {
+                covered[b] = true;
+            }
+        }
+        for (cs, ce) in &child_ranges {
+            for b in *cs..*ce {
+                covered[b] = true;
+            }
+        }
+        assert!(
+            covered.iter().all(|&b| b),
+            "Gaps + children should cover the entire node"
+        );
     }
 }
