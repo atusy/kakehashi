@@ -66,14 +66,16 @@ impl RegionOffset {
 
 /// Translate a single virtual position to host coordinates.
 ///
-/// On virtual line 0, adds column offset to character.
+/// Applies the per-line column offset for the virtual line, then adds the
+/// line offset. For non-blockquote injections (single-element `columns`),
+/// only line 0 gets a column adjustment (line 1+ falls back to 0).
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: &RegionOffset) {
-    let was_first_line = pos.line == 0;
+    let virtual_line = pos.line;
     pos.line = pos.line.saturating_add(offset.line());
-    if was_first_line {
-        pos.character = pos.character.saturating_add(offset.column_for_line(0));
-    }
+    pos.character = pos
+        .character
+        .saturating_add(offset.column_for_line(virtual_line));
 }
 
 /// Translate a virtual range to host coordinates.
@@ -90,16 +92,17 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 
 /// Translate a single host position to virtual coordinates.
 ///
-/// When the position is genuinely on the first line of the region (virtual line 0),
-/// subtracts column offset from character. When the line underflows to 0 due to
-/// stale region data (race condition), the column offset is NOT applied to avoid
-/// compounding the already-invalid result.
+/// Subtracts the line offset, then applies the per-line column offset for the
+/// resulting virtual line. When the line underflows (stale region data / race
+/// condition), column offset is NOT applied to avoid compounding the error.
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: &RegionOffset) {
     let underflowed = pos.line < offset.line();
     pos.line = pos.line.saturating_sub(offset.line());
-    if pos.line == 0 && !underflowed {
-        pos.character = pos.character.saturating_sub(offset.column_for_line(0));
+    if !underflowed {
+        pos.character = pos
+            .character
+            .saturating_sub(offset.column_for_line(pos.line));
     }
 }
 
