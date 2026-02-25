@@ -796,11 +796,19 @@ impl Kakehashi {
                     uri,
                     region,
                 );
-                let content = &text[region.content_node.byte_range()];
+                let included_ranges = crate::language::injection::compute_included_ranges(
+                    &region.content_node,
+                    region.include_children,
+                );
+                let content = crate::language::injection::extract_clean_content(
+                    &text,
+                    region.content_node.byte_range(),
+                    included_ranges.as_deref(),
+                );
                 InjectionRegion {
                     language: region.language.clone(),
                     region_id: region_id.to_string(),
-                    content: content.to_string(),
+                    content,
                 }
             })
             .collect()
