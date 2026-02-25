@@ -1,6 +1,6 @@
 ---
 source: src/lsp/bridge/protocol/lifecycle.rs
-expression: capabilities
+expression: merged
 ---
 {
   "general": {
@@ -11,7 +11,40 @@ expression: capabilities
   "textDocument": {
     "completion": {
       "completionItem": {
-        "insertReplaceSupport": true
+        "commitCharactersSupport": true,
+        "deprecatedSupport": true,
+        "documentationFormat": [
+          "markdown",
+          "plaintext"
+        ],
+        "insertReplaceSupport": true,
+        "insertTextModeSupport": {
+          "valueSet": [
+            1,
+            2
+          ]
+        },
+        "labelDetailsSupport": true,
+        "preselectSupport": true,
+        "resolveSupport": {
+          "properties": [
+            "documentation",
+            "detail",
+            "additionalTextEdits",
+            "sortText",
+            "filterText",
+            "insertText",
+            "textEdit",
+            "insertTextFormat",
+            "insertTextMode"
+          ]
+        },
+        "snippetSupport": true,
+        "tagSupport": {
+          "valueSet": [
+            1
+          ]
+        }
       },
       "dynamicRegistration": false
     },
@@ -39,6 +72,10 @@ expression: capabilities
       "hierarchicalDocumentSymbolSupport": true
     },
     "hover": {
+      "contentFormat": [
+        "markdown",
+        "plaintext"
+      ],
       "dynamicRegistration": false
     },
     "implementation": {
@@ -55,7 +92,17 @@ expression: capabilities
       "dynamicRegistration": false
     },
     "signatureHelp": {
-      "dynamicRegistration": false
+      "dynamicRegistration": false,
+      "signatureInformation": {
+        "activeParameterSupport": true,
+        "documentationFormat": [
+          "markdown",
+          "plaintext"
+        ],
+        "parameterInformation": {
+          "labelOffsetSupport": true
+        }
+      }
     },
     "typeDefinition": {
       "dynamicRegistration": false,

@@ -242,6 +242,12 @@ pub struct LanguageServerPool {
     /// Set via `set_workspace_folders()` after receiving the upstream initialize request.
     /// Passed to downstream servers during LSP handshake as JSON value.
     workspace_folders: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Client capabilities forwarded from upstream client.
+    ///
+    /// Set via `set_client_capabilities()` after receiving the upstream initialize request.
+    /// Merged into bridge defaults during downstream LSP handshake so servers
+    /// can provide richer responses (e.g., markdown docs, resolve support).
+    client_capabilities: std::sync::Mutex<Option<tower_lsp_server::ls_types::ClientCapabilities>>,
     /// Sender for forwarding downstream server notifications to the upstream editor.
     ///
     /// Cloned into each reader task so they can signal events like
@@ -285,6 +291,7 @@ impl LanguageServerPool {
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: std::sync::Mutex::new(None),
             workspace_folders: std::sync::Mutex::new(None),
+            client_capabilities: std::sync::Mutex::new(None),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
         }
@@ -322,6 +329,29 @@ impl LanguageServerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         workspace_folders.clone()
+    }
+
+    /// Set the upstream client capabilities.
+    ///
+    /// Called during upstream initialize to forward capabilities to downstream servers.
+    pub(crate) fn set_client_capabilities(
+        &self,
+        caps: tower_lsp_server::ls_types::ClientCapabilities,
+    ) {
+        let mut client_capabilities = self
+            .client_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *client_capabilities = Some(caps);
+    }
+
+    /// Get the upstream client capabilities.
+    fn client_capabilities(&self) -> Option<tower_lsp_server::ls_types::ClientCapabilities> {
+        let client_capabilities = self
+            .client_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        client_capabilities.clone()
     }
 
     /// Take the upstream notification receiver for forwarding to the editor.
@@ -789,6 +819,7 @@ impl LanguageServerPool {
         let init_options = server_config.initialization_options.clone();
         let root_uri = self.root_uri();
         let workspace_folders = self.workspace_folders();
+        let client_capabilities = self.client_capabilities();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
         let handshake_task = tokio::spawn(async move {
@@ -801,6 +832,7 @@ impl LanguageServerPool {
                     init_options,
                     root_uri,
                     workspace_folders,
+                    client_capabilities,
                 ),
             )
             .await;

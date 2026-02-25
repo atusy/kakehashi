@@ -16,8 +16,7 @@ expression: request
       "textDocument": {
         "completion": {
           "completionItem": {
-            "insertReplaceSupport": true,
-            "snippetSupport": true
+            "insertReplaceSupport": true
           },
           "dynamicRegistration": false
         },
@@ -45,10 +44,6 @@ expression: request
           "hierarchicalDocumentSymbolSupport": true
         },
         "hover": {
-          "contentFormat": [
-            "markdown",
-            "plaintext"
-          ],
           "dynamicRegistration": false
         },
         "implementation": {
