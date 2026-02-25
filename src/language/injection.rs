@@ -1976,44 +1976,27 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_content_includes_blockquote_prefixes() {
-        // Demonstrate the problem: extract_content() returns raw text including
-        // `> ` blockquote prefixes for blockquoted code blocks. A downstream
-        // language server receiving this content cannot parse it correctly.
-        let mut parser = Parser::new();
-        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
-        parser
-            .set_language(&md_language)
-            .expect("load markdown grammar");
-
-        let injection_query_str = r#"
-            (fenced_code_block
-              (info_string (language) @injection.language)
-              (code_fence_content) @injection.content)
-        "#;
-        let injection_query =
-            Query::new(&md_language, injection_query_str).expect("valid injection query");
-
-        // Markdown with blockquoted Lua code
+    fn test_blockquote_bridge_content_strips_prefixes() {
+        // Verify that extract_clean_content strips blockquote prefixes so that
+        // downstream language servers receive parseable code.
         let text = "> ```lua\n> local x = 1\n> local y = 2\n> ```\n";
+        let (byte_range, _start_column, included_ranges) = blockquote_injection_data(text);
 
-        let tree = parser.parse(text, None).expect("parse markdown");
-        let root = tree.root_node();
-
-        let injections = collect_all_injections(&root, text, Some(&injection_query))
-            .expect("Should find injections");
-        assert_eq!(injections.len(), 1, "Should find one injection");
-
-        let region = CacheableInjectionRegion::from_region_info(&injections[0], "test-id", text);
-        let content = region.extract_content(text);
-
-        // BUG: extract_content returns raw host text with `> ` prefixes.
-        // A downstream LS sees "> local x = 1\n> local y = 2\n" instead of
-        // "local x = 1\nlocal y = 2\n".
+        let clean = extract_clean_content(text, byte_range, included_ranges.as_deref());
         assert!(
-            content.contains("> "),
-            "extract_content should currently include blockquote prefixes (proving the bug): {:?}",
-            content
+            !clean.contains("> "),
+            "Clean content should NOT contain blockquote prefixes: {:?}",
+            clean
+        );
+        assert!(
+            clean.contains("local x = 1"),
+            "Clean content should contain the code: {:?}",
+            clean
+        );
+        assert!(
+            clean.contains("local y = 2"),
+            "Clean content should contain the code: {:?}",
+            clean
         );
     }
 
