@@ -198,24 +198,37 @@ pub(crate) struct KakehashiEnvelope {
 }
 
 /// Offset snapshot stored in the envelope for coordinate back-translation.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+///
+/// Serialized into `CompletionItem.data` and roundtripped through the client.
+/// The optional `line_column_offsets` field preserves per-line column offsets
+/// for blockquoted injections. Old envelopes without this field deserialize
+/// with `None` thanks to `#[serde(default)]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct EnvelopeOffset {
     pub line: u32,
     pub column: u32,
+    /// Per-line column offsets for blockquoted injections.
+    /// `None` for non-blockquote injections (backwards-compatible default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_column_offsets: Option<Vec<u32>>,
 }
 
 impl From<&RegionOffset> for EnvelopeOffset {
     fn from(o: &RegionOffset) -> Self {
         Self {
-            line: o.line,
-            column: o.column,
+            line: o.line(),
+            column: o.column_for_line(0),
+            line_column_offsets: Some(o.columns().to_vec()),
         }
     }
 }
 
 impl From<&EnvelopeOffset> for RegionOffset {
     fn from(o: &EnvelopeOffset) -> Self {
-        Self::new(o.line, o.column)
+        match &o.line_column_offsets {
+            Some(columns) => Self::with_per_line_offsets(o.line, columns.clone()),
+            None => Self::new(o.line, o.column),
+        }
     }
 }
 
@@ -807,7 +820,14 @@ mod tests {
         let envelope = extract_envelope(&item).expect("should extract envelope");
         assert_eq!(envelope.origin, "lua-ls");
         assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
-        assert_eq!(envelope.offset, EnvelopeOffset { line: 3, column: 4 });
+        assert_eq!(
+            envelope.offset,
+            EnvelopeOffset {
+                line: 3,
+                column: 4,
+                line_column_offsets: Some(vec![4])
+            }
+        );
 
         // strip restores original data
         let stripped = strip_envelope(&mut item).expect("should strip");
@@ -867,5 +887,42 @@ mod tests {
         };
         assert!(strip_envelope(&mut item).is_none());
         assert_eq!(item.data, Some(original_data));
+    }
+
+    #[test]
+    fn envelope_offset_deserializes_without_line_column_offsets() {
+        // Old envelopes serialized before the line_column_offsets field was added
+        // should still deserialize correctly with None for the new field.
+        let json = json!({"line": 5, "column": 3});
+        let offset: EnvelopeOffset =
+            serde_json::from_value(json).expect("should deserialize old format");
+        assert_eq!(offset.line, 5);
+        assert_eq!(offset.column, 3);
+        assert_eq!(offset.line_column_offsets, None);
+    }
+
+    #[test]
+    fn envelope_offset_round_trips_with_line_column_offsets() {
+        let offset = EnvelopeOffset {
+            line: 5,
+            column: 2,
+            line_column_offsets: Some(vec![2, 2, 2]),
+        };
+        let json = serde_json::to_value(&offset).expect("should serialize");
+        let deserialized: EnvelopeOffset =
+            serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(deserialized, offset);
+    }
+
+    #[test]
+    fn envelope_offset_without_line_column_offsets_omits_field() {
+        // skip_serializing_if = "Option::is_none" should omit the field
+        let offset = EnvelopeOffset {
+            line: 5,
+            column: 0,
+            line_column_offsets: None,
+        };
+        let json = serde_json::to_value(&offset).expect("should serialize");
+        assert!(json.get("line_column_offsets").is_none());
     }
 }

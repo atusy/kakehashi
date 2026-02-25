@@ -236,7 +236,11 @@ mod tests {
         KakehashiEnvelope {
             origin: "lua-ls".to_string(),
             inner: Some(json!({"resolve_id": 99})),
-            offset: EnvelopeOffset { line: 5, column: 0 },
+            offset: EnvelopeOffset {
+                line: 5,
+                column: 0,
+                line_column_offsets: None,
+            },
         }
     }
 
@@ -318,7 +322,16 @@ mod tests {
         assert_eq!(extracted.origin, "lua-ls");
         // The resolved item's own data is preserved in inner
         assert_eq!(extracted.inner, Some(json!({"new_data": true})));
-        assert_eq!(extracted.offset, EnvelopeOffset { line: 5, column: 0 });
+        // After round-trip (EnvelopeOffset → RegionOffset → EnvelopeOffset),
+        // line_column_offsets is always populated.
+        assert_eq!(
+            extracted.offset,
+            EnvelopeOffset {
+                line: 5,
+                column: 0,
+                line_column_offsets: Some(vec![0])
+            }
+        );
     }
 
     #[test]
@@ -344,7 +357,11 @@ mod tests {
         let envelope = KakehashiEnvelope {
             origin: server.to_string(),
             inner: Some(json!({"resolve_id": 42})),
-            offset: EnvelopeOffset { line: 5, column: 0 },
+            offset: EnvelopeOffset {
+                line: 5,
+                column: 0,
+                line_column_offsets: None,
+            },
         };
         let mut item = CompletionItem {
             label: "print".to_string(),
@@ -425,6 +442,14 @@ mod tests {
         let final_envelope = extract_envelope(&item).expect("should have envelope");
         assert_eq!(final_envelope.origin, "lua-ls");
         assert_eq!(final_envelope.inner, Some(json!({"resolved": true})));
-        assert_eq!(final_envelope.offset, EnvelopeOffset { line: 5, column: 0 });
+        // After round-trip, line_column_offsets is always populated.
+        assert_eq!(
+            final_envelope.offset,
+            EnvelopeOffset {
+                line: 5,
+                column: 0,
+                line_column_offsets: Some(vec![0])
+            }
+        );
     }
 }

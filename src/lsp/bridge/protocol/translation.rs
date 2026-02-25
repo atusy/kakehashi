@@ -7,21 +7,56 @@ use tower_lsp_server::ls_types::{Position, Range};
 
 /// The starting offset of an injection region in the host document.
 ///
-/// Bundles the line and column offset that are always passed together
-/// through the bridge request/response pipeline for coordinate translation.
+/// Bundles the line offset and per-virtual-line column offsets that are always
+/// passed together through the bridge request/response pipeline for coordinate
+/// translation.
+///
+/// For non-blockquote injections, `columns` is `vec![start_column]`:
+/// virtual line 0 gets `start_column`, line 1+ gets `0` (via fallback).
+///
+/// For blockquoted injections, `columns` has one entry per virtual line,
+/// each representing the width of the blockquote prefix (e.g., `> ` = 2).
 #[derive(Debug, Clone)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
-    pub line: u32,
-    /// The starting column (UTF-16 code units) on the first host line.
-    /// Only applied to virtual line 0.
-    pub column: u32,
+    line: u32,
+    /// Per-virtual-line column offsets (UTF-16 code units).
+    /// Index = virtual line number, value = column offset for that line.
+    columns: Vec<u32>,
 }
 
 impl RegionOffset {
-    /// Construct a `RegionOffset` from line and column values.
+    /// Construct a `RegionOffset` with a single column offset (non-blockquote case).
     pub(crate) fn new(line: u32, column: u32) -> Self {
-        Self { line, column }
+        Self {
+            line,
+            columns: vec![column],
+        }
+    }
+
+    /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
+    pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
+        Self { line, columns }
+    }
+
+    /// Get the starting line of the injection region.
+    pub(crate) fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// Get a slice of all per-line column offsets.
+    pub(crate) fn columns(&self) -> &[u32] {
+        &self.columns
+    }
+
+    /// Get the column offset for the given virtual line.
+    ///
+    /// Returns the per-line offset if available, otherwise 0.
+    pub(crate) fn column_for_line(&self, virtual_line: u32) -> u32 {
+        self.columns
+            .get(virtual_line as usize)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -35,9 +70,9 @@ impl RegionOffset {
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_virtual_position_to_host(pos: &mut Position, offset: &RegionOffset) {
     let was_first_line = pos.line == 0;
-    pos.line = pos.line.saturating_add(offset.line);
+    pos.line = pos.line.saturating_add(offset.line());
     if was_first_line {
-        pos.character = pos.character.saturating_add(offset.column);
+        pos.character = pos.character.saturating_add(offset.column_for_line(0));
     }
 }
 
@@ -61,10 +96,10 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 /// compounding the already-invalid result.
 /// Uses saturating arithmetic for race-condition safety.
 pub(crate) fn translate_host_position_to_virtual(pos: &mut Position, offset: &RegionOffset) {
-    let underflowed = pos.line < offset.line;
-    pos.line = pos.line.saturating_sub(offset.line);
+    let underflowed = pos.line < offset.line();
+    pos.line = pos.line.saturating_sub(offset.line());
     if pos.line == 0 && !underflowed {
-        pos.character = pos.character.saturating_sub(offset.column);
+        pos.character = pos.character.saturating_sub(offset.column_for_line(0));
     }
 }
 

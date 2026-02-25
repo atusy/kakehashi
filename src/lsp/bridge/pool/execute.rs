@@ -302,7 +302,7 @@ mod tests {
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);
-        assert_eq!(ctx.offset.line, 5);
-        assert_eq!(ctx.offset.column, 0);
+        assert_eq!(ctx.offset.line(), 5);
+        assert_eq!(ctx.offset.column_for_line(0), 0);
     }
 }
