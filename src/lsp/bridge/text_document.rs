@@ -24,6 +24,7 @@ mod hover;
 mod implementation;
 mod inlay_hint;
 mod moniker;
+mod prepare_rename;
 mod references;
 mod rename;
 mod signature_help;

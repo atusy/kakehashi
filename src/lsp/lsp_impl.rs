@@ -22,13 +22,14 @@ use tower_lsp_server::ls_types::{
     DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
     ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHint, InlayHintParams, Location, Moniker, MonikerParams, OneOf, ReferenceParams,
-    RenameParams, SaveOptions, SelectionRange, SelectionRangeParams,
-    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensFullOptions,
-    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    InlayHint, InlayHintParams, Location, Moniker, MonikerParams, OneOf, PrepareRenameResponse,
+    ReferenceParams, RenameOptions, RenameParams, SaveOptions, SelectionRange,
+    SelectionRangeParams, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
     WorkspaceEdit,
@@ -1196,7 +1197,10 @@ impl LanguageServer for Kakehashi {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                })),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 #[cfg(feature = "experimental")]
                 color_provider: Some(ColorProviderCapability::Simple(true)),
@@ -1624,6 +1628,13 @@ impl LanguageServer for Kakehashi {
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         self.rename_impl(params).await
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        self.prepare_rename_impl(params).await
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
