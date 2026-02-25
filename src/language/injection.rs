@@ -197,6 +197,87 @@ pub(crate) fn has_include_children_for_pattern(query: &Query, pattern_index: usi
     false
 }
 
+/// Compute the included ranges for an injection content node.
+///
+/// When `include_children` is false and the content node has named children
+/// (e.g., `block_continuation` nodes in blockquote code blocks), this function
+/// computes the "gap" ranges between those children — the actual code content.
+///
+/// Returns `None` when:
+/// - `include_children` is true (the injection parser should see everything)
+/// - The content node has no named children (no gaps to compute)
+/// - All content is covered by named children (no gaps exist)
+///
+/// The returned ranges are **relative** to the content node's start position:
+/// byte offsets are subtracted by `content_node.start_byte()`, and row/column
+/// Points are adjusted relative to `content_node.start_position()`.
+pub(crate) fn compute_included_ranges(
+    content_node: &tree_sitter::Node,
+    include_children: bool,
+) -> Option<Vec<tree_sitter::Range>> {
+    if include_children || content_node.named_child_count() == 0 {
+        return None;
+    }
+
+    let node_start_byte = content_node.start_byte();
+    let node_start_pos = content_node.start_position();
+    let node_end_byte = content_node.end_byte();
+    let node_end_pos = content_node.end_position();
+
+    // Helper to make a Point relative to the content node's start.
+    // Column is only adjusted when the point is on the same row as the node start,
+    // because only that row has a non-zero column offset from the node origin.
+    let relativize_point = |p: tree_sitter::Point| -> tree_sitter::Point {
+        tree_sitter::Point {
+            row: p.row.saturating_sub(node_start_pos.row),
+            column: if p.row == node_start_pos.row {
+                p.column.saturating_sub(node_start_pos.column)
+            } else {
+                p.column
+            },
+        }
+    };
+
+    let mut ranges = Vec::new();
+    let mut cursor_byte = node_start_byte;
+    let mut cursor_point = node_start_pos;
+
+    let mut tree_cursor = content_node.walk();
+    for child in content_node.named_children(&mut tree_cursor) {
+        let child_start_byte = child.start_byte();
+        let child_end_byte = child.end_byte();
+
+        // Gap before this child
+        if cursor_byte < child_start_byte {
+            ranges.push(tree_sitter::Range {
+                start_byte: cursor_byte - node_start_byte,
+                end_byte: child_start_byte - node_start_byte,
+                start_point: relativize_point(cursor_point),
+                end_point: relativize_point(child.start_position()),
+            });
+        }
+
+        cursor_byte = child_end_byte;
+        cursor_point = child.end_position();
+    }
+
+    // Gap after last child
+    if cursor_byte < node_end_byte {
+        ranges.push(tree_sitter::Range {
+            start_byte: cursor_byte - node_start_byte,
+            end_byte: node_end_byte - node_start_byte,
+            start_point: relativize_point(cursor_point),
+            end_point: relativize_point(node_end_pos),
+        });
+    }
+
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
+}
+
 /// Extracts language from #set! injection.language property
 fn extract_static_language(query: &Query, match_: &QueryMatch) -> Option<String> {
     // Use unified accessor to check property settings

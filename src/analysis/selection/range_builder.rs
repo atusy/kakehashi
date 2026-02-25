@@ -21,7 +21,7 @@
 //! ```
 
 use tower_lsp_server::ls_types::{Position, Range, SelectionRange};
-use tree_sitter::Node;
+use tree_sitter::{Node, Parser, Tree};
 
 use super::context::{DocumentContext, InjectionContext};
 use super::hierarchy_chain::{chain_injected_to_host, ranges_equal};
@@ -30,7 +30,10 @@ use super::injection_aware::{
     is_node_in_selection_chain,
 };
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
-use crate::language::injection::{self, parse_offset_directive_for_pattern};
+use crate::language::injection::{
+    self, compute_included_ranges, has_include_children_for_pattern,
+    parse_offset_directive_for_pattern,
+};
 use crate::text::PositionMapper;
 
 /// Convert tree-sitter Node to LSP Range with proper UTF-16 encoding.
@@ -135,6 +138,52 @@ pub fn build_from_node_in_injection(
     }
 }
 
+/// Parse injection content with included-range exclusion for named children.
+///
+/// Computes included ranges to exclude named children (e.g., `block_continuation`
+/// nodes in blockquote code blocks), sets them on the parser, parses, and resets
+/// the parser state. Skipped when an offset directive is active because
+/// `compute_included_ranges()` returns ranges relative to `content_node.start_byte()`,
+/// which would be misaligned with the offset-adjusted `content_text`.
+///
+/// Returns `None` if `set_included_ranges` fails (after logging a warning).
+fn parse_with_included_ranges(
+    parser: &mut Parser,
+    content_text: &str,
+    content_node: &Node,
+    has_offset: bool,
+    include_children: bool,
+    lang_name: &str,
+) -> Option<Tree> {
+    // Skip included ranges when offset directive is active (misaligned byte ranges)
+    let included_ranges = if has_offset {
+        None
+    } else {
+        compute_included_ranges(content_node, include_children)
+    };
+
+    if let Some(ref ranges) = included_ranges
+        && let Err(e) = parser.set_included_ranges(ranges)
+    {
+        log::warn!(
+            target: "kakehashi::selection",
+            "Failed to set included ranges for {}: {}. Skipping parse.",
+            lang_name, e
+        );
+        let _ = parser.set_included_ranges(&[]);
+        return None;
+    }
+
+    let tree = parser.parse(content_text, None);
+
+    // Reset included ranges (if set) to prevent stale state in the parser pool
+    if included_ranges.is_some() {
+        let _ = parser.set_included_ranges(&[]);
+    }
+
+    tree
+}
+
 /// Build SelectionRange with automatic injection detection and handling.
 ///
 /// This is the main entry point for building selection ranges. It:
@@ -215,7 +264,17 @@ pub fn build(
         )
     };
 
-    let Some(injected_tree) = parser.parse(content_text, None) else {
+    let include_children =
+        injection_query_ref.is_some_and(|q| has_include_children_for_pattern(q, pattern_index));
+
+    let Some(injected_tree) = parse_with_included_ranges(
+        &mut parser,
+        content_text,
+        &content_node,
+        offset_from_query.is_some(),
+        include_children,
+        injected_lang,
+    ) else {
         inj_ctx.release_parser(injected_lang.to_string(), parser);
         return build_fallback();
     };
@@ -338,7 +397,17 @@ fn build_nested_injection(
     let Some(mut nested_parser) = inj_ctx.acquire_parser(&nested_lang) else {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
-    let Some(nested_tree) = nested_parser.parse(nested_text, None) else {
+
+    let include_children = has_include_children_for_pattern(injection_query, pattern_index);
+
+    let Some(nested_tree) = parse_with_included_ranges(
+        &mut nested_parser,
+        nested_text,
+        &content_node,
+        offset.is_some(),
+        include_children,
+        &nested_lang,
+    ) else {
         inj_ctx.release_parser(nested_lang.to_string(), nested_parser);
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
