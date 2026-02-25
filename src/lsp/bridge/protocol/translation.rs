@@ -329,4 +329,86 @@ mod tests {
         assert_eq!(range.end.line, 3);
         assert_eq!(range.end.character, 8); // unchanged
     }
+
+    // ======================================================================
+    // Per-line column offset tests (blockquote case)
+    // ======================================================================
+
+    #[test]
+    fn position_to_host_blockquote_adds_per_line_column_offset() {
+        // Blockquote: virtual (1, 5) with per-line offsets [2, 2]
+        // Virtual line 1 → host line (start_line + 1), char (5 + 2) = 7
+        let mut pos = Position {
+            line: 1,
+            character: 5,
+        };
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        translate_virtual_position_to_host(&mut pos, &offset);
+        assert_eq!(pos.line, 11);
+        assert_eq!(pos.character, 7); // 5 + 2
+    }
+
+    #[test]
+    fn position_to_virtual_blockquote_subtracts_per_line_column_offset() {
+        // Host (start_line + 1, 7) with per-line offsets [2, 2]
+        // → virtual (1, 5): char (7 - 2) = 5
+        let mut pos = Position {
+            line: 11,
+            character: 7,
+        };
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        translate_host_position_to_virtual(&mut pos, &offset);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.character, 5); // 7 - 2
+    }
+
+    #[test]
+    fn position_to_host_blockquote_line_beyond_offsets_no_column_adjust() {
+        // Virtual line 3 is beyond offsets [2, 2] (len=2)
+        // column_for_line(3) returns 0 → no column adjustment
+        let mut pos = Position {
+            line: 3,
+            character: 5,
+        };
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        translate_virtual_position_to_host(&mut pos, &offset);
+        assert_eq!(pos.line, 13);
+        assert_eq!(pos.character, 5); // unchanged
+    }
+
+    #[test]
+    fn position_to_virtual_blockquote_column_saturates_on_underflow() {
+        // Host char 1 with per-line offset 2 → saturates to 0
+        let mut pos = Position {
+            line: 10,
+            character: 1,
+        };
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2]);
+        translate_host_position_to_virtual(&mut pos, &offset);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.character, 0); // saturated
+    }
+
+    #[test]
+    fn range_to_host_blockquote_spanning_lines() {
+        // Range from virtual (0, 3) to (1, 7) with per-line offsets [2, 2]
+        // Start: (0+10, 3+2) = (10, 5)
+        // End:   (1+10, 7+2) = (11, 9)
+        let mut range = Range {
+            start: Position {
+                line: 0,
+                character: 3,
+            },
+            end: Position {
+                line: 1,
+                character: 7,
+            },
+        };
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        translate_virtual_range_to_host(&mut range, &offset);
+        assert_eq!(range.start.line, 10);
+        assert_eq!(range.start.character, 5); // 3 + 2
+        assert_eq!(range.end.line, 11);
+        assert_eq!(range.end.character, 9); // 7 + 2
+    }
 }
