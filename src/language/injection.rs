@@ -1702,4 +1702,90 @@ mod tests {
             "Pattern 1 should have include-children"
         );
     }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_when_include_children() {
+        // When include_children is true, all content is included (no restriction)
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        assert!(
+            compute_included_ranges(&root, true).is_none(),
+            "include_children=true should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_for_no_named_children() {
+        // A leaf node (identifier) has no named children
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("x", None).unwrap();
+        let root = tree.root_node();
+
+        // Find identifier leaf node
+        let ident = root
+            .named_descendant_for_byte_range(0, 1)
+            .expect("should find node");
+        assert_eq!(ident.named_child_count(), 0);
+
+        assert!(
+            compute_included_ranges(&ident, false).is_none(),
+            "Node with no named children should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_computes_gap_ranges() {
+        // Use a node that has named children with gaps between them.
+        // In Rust, a function_item has named children (name, parameters, body)
+        // with gaps (the "fn" keyword, whitespace, etc.)
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        // function_item is the top-level node
+        let func = root.named_child(0).expect("should have function_item");
+        assert!(
+            func.named_child_count() > 0,
+            "function_item should have named children"
+        );
+
+        let ranges = compute_included_ranges(&func, false);
+        assert!(
+            ranges.is_some(),
+            "Node with named children should produce gap ranges"
+        );
+
+        let ranges = ranges.unwrap();
+        assert!(
+            !ranges.is_empty(),
+            "Should have at least one gap range between named children"
+        );
+
+        // All ranges should be within the function_item's bounds (relative)
+        let func_size = func.end_byte() - func.start_byte();
+        for r in &ranges {
+            assert!(
+                r.start_byte < r.end_byte,
+                "Range should be non-empty: {:?}",
+                r
+            );
+            assert!(
+                r.end_byte <= func_size,
+                "Range end {} should be within node size {}",
+                r.end_byte,
+                func_size
+            );
+        }
+    }
 }
