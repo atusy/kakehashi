@@ -14,7 +14,7 @@
 
 use std::io;
 
-use tower_lsp_server::ls_types::{ClientCapabilities, ServerCapabilities};
+use tower_lsp_server::ls_types::{ClientCapabilities, ServerCapabilities, WorkspaceFolder};
 
 use super::ConnectionHandle;
 use super::connection_handle::NotificationSendResult;
@@ -49,7 +49,7 @@ pub(super) async fn perform_lsp_handshake(
     init_response_rx: tokio::sync::oneshot::Receiver<serde_json::Value>,
     init_options: Option<serde_json::Value>,
     root_uri: Option<String>,
-    workspace_folders: Option<serde_json::Value>,
+    workspace_folders: Option<Vec<WorkspaceFolder>>,
     client_capabilities: Option<ClientCapabilities>,
 ) -> io::Result<ServerCapabilities> {
     // 1. Build and send initialize request via the single-writer loop

@@ -3,7 +3,12 @@
 //! Provides builders for initialize, shutdown, and exit messages
 //! used during connection lifecycle management.
 
-use tower_lsp_server::ls_types::ClientCapabilities;
+use std::str::FromStr;
+
+use tower_lsp_server::ls_types::{
+    ClientCapabilities, DidCloseTextDocumentParams, InitializeParams, InitializedParams,
+    TextDocumentIdentifier, Uri, WorkspaceFolder,
+};
 
 use super::client_capabilities::build_bridge_client_capabilities;
 use super::request_id::RequestId;
@@ -20,7 +25,7 @@ pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
     root_uri: Option<String>,
-    workspace_folders: Option<serde_json::Value>,
+    workspace_folders: Option<Vec<WorkspaceFolder>>,
     upstream_capabilities: Option<&ClientCapabilities>,
 ) -> serde_json::Value {
     let root_path = root_uri.as_deref().and_then(|uri| {
@@ -29,19 +34,24 @@ pub(crate) fn build_initialize_request(
             .and_then(|u| u.to_file_path().ok())
             .map(|p| p.to_string_lossy().into_owned())
     });
+    let root_uri = root_uri.as_deref().and_then(|s| Uri::from_str(s).ok());
+
+    #[allow(deprecated)] // root_uri and root_path are deprecated in favor of workspace_folders
+    let params = InitializeParams {
+        process_id: Some(std::process::id()),
+        root_uri,
+        root_path,
+        workspace_folders,
+        capabilities: build_bridge_client_capabilities(upstream_capabilities),
+        initialization_options,
+        ..Default::default()
+    };
 
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id.as_i64(),
         "method": "initialize",
-        "params": {
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "rootPath": root_path,
-            "workspaceFolders": workspace_folders,
-            "capabilities": build_bridge_client_capabilities(upstream_capabilities),
-            "initializationOptions": initialization_options
-        }
+        "params": params
     })
 }
 
@@ -53,7 +63,7 @@ pub(crate) fn build_initialized_notification() -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "initialized",
-        "params": {}
+        "params": InitializedParams {}
     })
 }
 
@@ -86,14 +96,27 @@ pub(crate) fn build_exit_notification() -> serde_json::Value {
 /// # Arguments
 /// * `uri` - The URI of the document being closed
 pub(crate) fn build_didclose_notification(uri: &str) -> serde_json::Value {
+    // Parse to Uri for type-safe DidCloseTextDocumentParams construction.
+    // Invalid URIs are unexpected here (they were validated when the document was opened),
+    // so we fall back to raw JSON construction as a safety net.
+    let Some(uri) = Uri::from_str(uri).ok() else {
+        return serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didClose",
+            "params": {
+                "textDocument": { "uri": uri }
+            }
+        });
+    };
+
+    let params = DidCloseTextDocumentParams {
+        text_document: TextDocumentIdentifier { uri },
+    };
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "textDocument/didClose",
-        "params": {
-            "textDocument": {
-                "uri": uri
-            }
-        }
+        "params": params
     })
 }
 
@@ -211,13 +234,16 @@ mod tests {
 
     #[test]
     fn initialize_request_includes_workspace_folders_when_provided() {
-        let folders = serde_json::json!([
-            { "uri": "file:///home/user/project", "name": "project" }
-        ]);
-        let request =
-            build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()), None);
+        let folders = vec![WorkspaceFolder {
+            uri: Uri::from_str("file:///home/user/project").unwrap(),
+            name: "project".to_string(),
+        }];
+        let request = build_initialize_request(RequestId::new(1), None, None, Some(folders), None);
 
-        assert_eq!(request["params"]["workspaceFolders"], folders);
+        assert_eq!(
+            request["params"]["workspaceFolders"],
+            serde_json::json!([{ "uri": "file:///home/user/project", "name": "project" }])
+        );
     }
 
     #[test]

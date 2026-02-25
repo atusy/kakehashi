@@ -231,17 +231,8 @@ fn merge_upstream_capabilities(
 /// See [`merge_upstream_capabilities`] for merge semantics.
 pub(super) fn build_bridge_client_capabilities(
     upstream: Option<&ClientCapabilities>,
-) -> serde_json::Value {
-    let capabilities = merge_upstream_capabilities(build_baseline_capabilities(), upstream);
-
-    serde_json::to_value(capabilities).unwrap_or_else(|e| {
-        log::warn!(
-            target: "kakehashi::bridge",
-            "Failed to serialize ClientCapabilities, falling back to empty: {}",
-            e
-        );
-        serde_json::json!({})
-    })
+) -> ClientCapabilities {
+    merge_upstream_capabilities(build_baseline_capabilities(), upstream)
 }
 
 #[cfg(test)]

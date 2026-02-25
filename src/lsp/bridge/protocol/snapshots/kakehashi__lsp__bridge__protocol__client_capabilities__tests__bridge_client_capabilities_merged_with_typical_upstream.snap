@@ -3,29 +3,29 @@ source: src/lsp/bridge/protocol/client_capabilities.rs
 expression: merged
 ---
 {
-  "general": {
-    "positionEncodings": [
-      "utf-16"
-    ]
+  "workspace": {
+    "diagnostics": {
+      "refreshSupport": true
+    }
   },
   "textDocument": {
     "completion": {
+      "dynamicRegistration": false,
       "completionItem": {
+        "snippetSupport": true,
         "commitCharactersSupport": true,
-        "deprecatedSupport": true,
         "documentationFormat": [
           "markdown",
           "plaintext"
         ],
-        "insertReplaceSupport": true,
-        "insertTextModeSupport": {
+        "deprecatedSupport": true,
+        "preselectSupport": true,
+        "tagSupport": {
           "valueSet": [
-            1,
-            2
+            1
           ]
         },
-        "labelDetailsSupport": true,
-        "preselectSupport": true,
+        "insertReplaceSupport": true,
         "resolveSupport": {
           "properties": [
             "documentation",
@@ -39,14 +39,44 @@ expression: merged
             "insertTextMode"
           ]
         },
-        "snippetSupport": true,
-        "tagSupport": {
+        "insertTextModeSupport": {
           "valueSet": [
-            1
+            1,
+            2
           ]
-        }
-      },
+        },
+        "labelDetailsSupport": true
+      }
+    },
+    "hover": {
+      "dynamicRegistration": false,
+      "contentFormat": [
+        "markdown",
+        "plaintext"
+      ]
+    },
+    "signatureHelp": {
+      "dynamicRegistration": false,
+      "signatureInformation": {
+        "documentationFormat": [
+          "markdown",
+          "plaintext"
+        ],
+        "parameterInformation": {
+          "labelOffsetSupport": true
+        },
+        "activeParameterSupport": true
+      }
+    },
+    "references": {
       "dynamicRegistration": false
+    },
+    "documentHighlight": {
+      "dynamicRegistration": false
+    },
+    "documentSymbol": {
+      "dynamicRegistration": false,
+      "hierarchicalDocumentSymbolSupport": true
     },
     "declaration": {
       "dynamicRegistration": false,
@@ -56,62 +86,32 @@ expression: merged
       "dynamicRegistration": false,
       "linkSupport": true
     },
-    "diagnostic": {
-      "dynamicRegistration": true,
-      "relatedDocumentSupport": true
-    },
-    "documentHighlight": {
-      "dynamicRegistration": false
-    },
-    "documentLink": {
+    "typeDefinition": {
       "dynamicRegistration": false,
-      "tooltipSupport": true
-    },
-    "documentSymbol": {
-      "dynamicRegistration": false,
-      "hierarchicalDocumentSymbolSupport": true
-    },
-    "hover": {
-      "contentFormat": [
-        "markdown",
-        "plaintext"
-      ],
-      "dynamicRegistration": false
+      "linkSupport": true
     },
     "implementation": {
       "dynamicRegistration": false,
       "linkSupport": true
     },
-    "inlayHint": {
-      "dynamicRegistration": false
+    "documentLink": {
+      "dynamicRegistration": false,
+      "tooltipSupport": true
     },
     "moniker": {
       "dynamicRegistration": false
     },
-    "references": {
+    "inlayHint": {
       "dynamicRegistration": false
     },
-    "signatureHelp": {
-      "dynamicRegistration": false,
-      "signatureInformation": {
-        "activeParameterSupport": true,
-        "documentationFormat": [
-          "markdown",
-          "plaintext"
-        ],
-        "parameterInformation": {
-          "labelOffsetSupport": true
-        }
-      }
-    },
-    "typeDefinition": {
-      "dynamicRegistration": false,
-      "linkSupport": true
+    "diagnostic": {
+      "dynamicRegistration": true,
+      "relatedDocumentSupport": true
     }
   },
-  "workspace": {
-    "diagnostics": {
-      "refreshSupport": true
-    }
+  "general": {
+    "positionEncodings": [
+      "utf-16"
+    ]
   }
 }

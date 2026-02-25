@@ -240,8 +240,8 @@ pub struct LanguageServerPool {
     /// Workspace folders forwarded from upstream client.
     ///
     /// Set via `set_workspace_folders()` after receiving the upstream initialize request.
-    /// Passed to downstream servers during LSP handshake as JSON value.
-    workspace_folders: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Passed to downstream servers during LSP handshake.
+    workspace_folders: std::sync::Mutex<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -314,7 +314,10 @@ impl LanguageServerPool {
     /// Set the workspace folders.
     ///
     /// Called during upstream initialize to forward workspace folders to downstream servers.
-    pub(crate) fn set_workspace_folders(&self, folders: Option<serde_json::Value>) {
+    pub(crate) fn set_workspace_folders(
+        &self,
+        folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
+    ) {
         let mut workspace_folders = self
             .workspace_folders
             .lock()
@@ -323,7 +326,7 @@ impl LanguageServerPool {
     }
 
     /// Get the workspace folders.
-    fn workspace_folders(&self) -> Option<serde_json::Value> {
+    fn workspace_folders(&self) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
         let workspace_folders = self
             .workspace_folders
             .lock()
