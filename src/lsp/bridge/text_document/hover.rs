@@ -53,11 +53,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_hover_request(virtual_uri, host_position, offset, request_id)
+                build_hover_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| transform_hover_response_to_host(response, ctx.offset),
         )
@@ -69,7 +69,7 @@ impl LanguageServerPool {
 fn build_hover_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
@@ -93,7 +93,7 @@ fn build_hover_request(
 /// * `offset` - The region offset for coordinate translation
 fn transform_hover_response_to_host(
     mut response: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Hover> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/hover: {}", error);
@@ -193,7 +193,7 @@ mod tests {
         let request = build_hover_request(
             &virtual_uri,
             test_position(),
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -207,7 +207,7 @@ mod tests {
         let request = build_hover_request(
             &virtual_uri,
             test_position(),
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -226,7 +226,7 @@ mod tests {
         let request = build_hover_request(
             &virtual_uri,
             host_position,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -248,7 +248,7 @@ mod tests {
         let request = build_hover_request(
             &virtual_uri,
             host_position,
-            RegionOffset::new(0, 0),
+            &RegionOffset::new(0, 0),
             test_request_id(),
         );
 
@@ -271,7 +271,7 @@ mod tests {
         let request = build_hover_request(
             &virtual_uri,
             host_position,
-            RegionOffset::new(5, 0), // region_start_line > host_position.line
+            &RegionOffset::new(5, 0), // region_start_line > host_position.line
             test_request_id(),
         );
 
@@ -308,7 +308,7 @@ mod tests {
         let region_start_line = 3;
 
         let transformed =
-            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+            transform_hover_response_to_host(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -330,7 +330,7 @@ mod tests {
             }
         });
 
-        let transformed = transform_hover_response_to_host(response, RegionOffset::new(5, 0));
+        let transformed = transform_hover_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
         assert!(hover.range.is_none());
@@ -341,7 +341,7 @@ mod tests {
     #[case::no_result_key(serde_json::json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     #[case::malformed_result(serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_hover_object"}))]
     fn hover_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_hover_response_to_host(response, RegionOffset::new(5, 0));
+        let transformed = transform_hover_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -361,7 +361,7 @@ mod tests {
         let region_start_line = 0;
 
         let transformed =
-            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+            transform_hover_response_to_host(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -388,7 +388,7 @@ mod tests {
         let region_start_line = 10;
 
         let transformed =
-            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+            transform_hover_response_to_host(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();
@@ -420,7 +420,7 @@ mod tests {
         let region_start_line = 10;
 
         let transformed =
-            transform_hover_response_to_host(response, RegionOffset::new(region_start_line, 0));
+            transform_hover_response_to_host(response, &RegionOffset::new(region_start_line, 0));
 
         assert!(transformed.is_some());
         let hover = transformed.unwrap();

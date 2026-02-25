@@ -59,11 +59,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_completion_request(virtual_uri, host_position, offset, request_id)
+                build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
                 transform_completion_response_to_host(
@@ -84,7 +84,7 @@ impl LanguageServerPool {
 fn build_completion_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
@@ -109,7 +109,7 @@ fn build_completion_request(
 /// * `envelope_ctx` - If `Some`, each item's `data` is wrapped in a routing envelope
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     envelope_ctx: Option<EnvelopeContext<'_>>,
 ) -> Option<CompletionList> {
     if let Some(error) = response.get("error") {
@@ -153,7 +153,7 @@ fn transform_completion_response_to_host(
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
 /// additionalTextEdits if present.
-pub(super) fn transform_completion_item(item: &mut CompletionItem, offset: RegionOffset) {
+pub(super) fn transform_completion_item(item: &mut CompletionItem, offset: &RegionOffset) {
     // Transform text_edit if present
     if let Some(ref mut text_edit) = item.text_edit {
         match text_edit {
@@ -204,8 +204,8 @@ pub(crate) struct EnvelopeOffset {
     pub column: u32,
 }
 
-impl From<RegionOffset> for EnvelopeOffset {
-    fn from(o: RegionOffset) -> Self {
+impl From<&RegionOffset> for EnvelopeOffset {
+    fn from(o: &RegionOffset) -> Self {
         Self {
             line: o.line,
             column: o.column,
@@ -222,7 +222,7 @@ impl From<&EnvelopeOffset> for RegionOffset {
 /// Context needed to create envelopes during completion response processing.
 pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
-    pub offset: RegionOffset,
+    pub offset: &'a RegionOffset,
 }
 
 /// Wrap `item.data` in a Kakehashi envelope for origin tracking.
@@ -336,7 +336,7 @@ mod tests {
         let request = build_completion_request(
             &virtual_uri,
             test_position(),
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -350,7 +350,7 @@ mod tests {
         let request = build_completion_request(
             &virtual_uri,
             test_position(),
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             test_request_id(),
         );
 
@@ -388,7 +388,7 @@ mod tests {
 
         let transformed = transform_completion_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
             None,
         );
 
@@ -419,7 +419,7 @@ mod tests {
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     fn completion_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
         let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(3, 0), None);
+            transform_completion_response_to_host(response, &RegionOffset::new(3, 0), None);
         assert!(transformed.is_none());
     }
 
@@ -443,7 +443,7 @@ mod tests {
 
         let transformed = transform_completion_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
             None,
         );
 
@@ -491,7 +491,7 @@ mod tests {
 
         let transformed = transform_completion_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
             None,
         );
 
@@ -536,7 +536,7 @@ mod tests {
 
         let transformed = transform_completion_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
             None,
         );
 
@@ -576,7 +576,7 @@ mod tests {
         });
 
         let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(10, 4), None);
+            transform_completion_response_to_host(response, &RegionOffset::new(10, 4), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -613,7 +613,7 @@ mod tests {
         });
 
         let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(10, 4), None);
+            transform_completion_response_to_host(response, &RegionOffset::new(10, 4), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(ref edit)) =
@@ -654,7 +654,7 @@ mod tests {
         });
 
         let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(5, 7), None);
+            transform_completion_response_to_host(response, &RegionOffset::new(5, 7), None);
 
         let list = transformed.unwrap();
         if let Some(tower_lsp_server::ls_types::CompletionTextEdit::InsertAndReplace(ref edit)) =
@@ -697,7 +697,7 @@ mod tests {
         });
 
         let transformed =
-            transform_completion_response_to_host(response, RegionOffset::new(5, 3), None);
+            transform_completion_response_to_host(response, &RegionOffset::new(5, 3), None);
 
         let list = transformed.unwrap();
         let edits = list.items[0].additional_text_edits.as_ref().unwrap();
@@ -718,7 +718,7 @@ mod tests {
         let request = build_completion_request(
             &virtual_uri,
             host_pos,
-            RegionOffset::new(5, 4),
+            &RegionOffset::new(5, 4),
             test_request_id(),
         );
 
@@ -737,7 +737,7 @@ mod tests {
         let request = build_completion_request(
             &virtual_uri,
             host_pos,
-            RegionOffset::new(5, 4),
+            &RegionOffset::new(5, 4),
             test_request_id(),
         );
 
@@ -766,7 +766,7 @@ mod tests {
 
         let transformed = transform_completion_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
             None,
         );
 
@@ -789,13 +789,6 @@ mod tests {
     // Envelope round-trip tests
     // ==========================================================================
 
-    fn test_envelope_ctx() -> EnvelopeContext<'static> {
-        EnvelopeContext {
-            server_name: "lua-ls",
-            offset: RegionOffset::new(3, 4),
-        }
-    }
-
     #[test]
     fn envelope_round_trip_with_data() {
         let mut item = CompletionItem {
@@ -803,7 +796,11 @@ mod tests {
             data: Some(json!({"resolve_id": 42})),
             ..Default::default()
         };
-        let ctx = test_envelope_ctx();
+        let offset = RegionOffset::new(3, 4);
+        let ctx = EnvelopeContext {
+            server_name: "lua-ls",
+            offset: &offset,
+        };
         envelope_item_data(&mut item, &ctx);
 
         // data should now be wrapped
@@ -825,7 +822,11 @@ mod tests {
             data: None,
             ..Default::default()
         };
-        let ctx = test_envelope_ctx();
+        let offset = RegionOffset::new(3, 4);
+        let ctx = EnvelopeContext {
+            server_name: "lua-ls",
+            offset: &offset,
+        };
         envelope_item_data(&mut item, &ctx);
 
         let envelope = extract_envelope(&item).expect("should extract envelope");

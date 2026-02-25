@@ -81,7 +81,7 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
@@ -141,7 +141,7 @@ fn build_diagnostic_request(
 /// * `host_uri` - The host document URI; only related info matching this URI gets transformed
 fn transform_diagnostic_response_to_host(
     mut response: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     host_uri: &str,
 ) -> Vec<Diagnostic> {
     if let Some(error) = response.get("error") {
@@ -188,7 +188,7 @@ fn transform_diagnostic_response_to_host(
 ///
 /// Also transforms relatedInformation locations if present, filtering out entries
 /// that reference virtual URIs (which clients cannot resolve).
-fn transform_diagnostic(diag: &mut Diagnostic, offset: RegionOffset, host_uri: &str) {
+fn transform_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, host_uri: &str) {
     // Transform main range
     translate_virtual_range_to_host(&mut diag.range, offset);
 
@@ -246,7 +246,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
 
         assert_eq!(diagnostics.len(), 2);
 
@@ -294,7 +294,7 @@ mod tests {
 
         let diagnostics = transform_diagnostic_response_to_host(
             response,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             "file:///test.md",
         );
 
@@ -343,7 +343,7 @@ mod tests {
 
         let diagnostics = transform_diagnostic_response_to_host(
             response,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             "file:///test.md",
         );
 
@@ -372,7 +372,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -381,7 +381,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": null });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -390,7 +390,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "error": { "code": -32603, "message": "internal error" } });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -406,7 +406,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -422,7 +422,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(5, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused");
         assert!(diagnostics.is_empty());
     }
 
@@ -468,7 +468,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(3, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(3, 0), "unused");
 
         assert_eq!(diagnostics.len(), 1);
         let related = diagnostics[0].related_information.as_ref().unwrap();
@@ -522,7 +522,7 @@ mod tests {
         });
 
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(3, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(3, 0), "unused");
 
         assert_eq!(diagnostics.len(), 1);
         let related = diagnostics[0].related_information.as_ref().unwrap();
@@ -603,7 +603,7 @@ mod tests {
 
         // This should not panic due to overflow
         let diagnostics =
-            transform_diagnostic_response_to_host(response, RegionOffset::new(100, 0), "unused");
+            transform_diagnostic_response_to_host(response, &RegionOffset::new(100, 0), "unused");
 
         // Values should saturate at u32::MAX
         assert_eq!(diagnostics.len(), 1);

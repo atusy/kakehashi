@@ -55,7 +55,7 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             build_document_color_request,
@@ -87,7 +87,7 @@ fn build_document_color_request(
 /// * `offset` - The region offset for coordinate translation
 fn transform_document_color_response_to_host(
     mut response: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Vec<ColorInformation> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentColor: {}", error);
@@ -209,7 +209,7 @@ mod tests {
 
         let colors = transform_document_color_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert_eq!(colors.len(), 2);
@@ -229,7 +229,7 @@ mod tests {
     fn document_color_response_returns_empty_for_invalid_response(
         #[case] response: serde_json::Value,
     ) {
-        let colors = transform_document_color_response_to_host(response, RegionOffset::new(5, 0));
+        let colors = transform_document_color_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(colors.is_empty());
     }
 
@@ -237,7 +237,7 @@ mod tests {
     fn document_color_response_with_empty_array_returns_empty() {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
-        let colors = transform_document_color_response_to_host(response, RegionOffset::new(5, 0));
+        let colors = transform_document_color_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(colors.is_empty());
     }
 
@@ -263,7 +263,7 @@ mod tests {
 
         let colors = transform_document_color_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert_eq!(colors.len(), 1);
@@ -296,7 +296,7 @@ mod tests {
 
         let colors = transform_document_color_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert_eq!(colors.len(), 1);

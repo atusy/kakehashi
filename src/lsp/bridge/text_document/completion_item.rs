@@ -169,7 +169,7 @@ impl LanguageServerPool {
         match parse_completion_resolve_response(response) {
             Some(mut resolved) => {
                 let offset = RegionOffset::from(&envelope.offset);
-                transform_completion_item(&mut resolved, offset);
+                transform_completion_item(&mut resolved, &offset);
                 re_envelope_item(&mut resolved, &envelope);
                 resolved
             }
@@ -219,7 +219,7 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     let ctx = EnvelopeContext {
         server_name: &envelope.origin,
-        offset: RegionOffset::from(&envelope.offset),
+        offset: &RegionOffset::from(&envelope.offset),
     };
     envelope_item_data(item, &ctx);
 }

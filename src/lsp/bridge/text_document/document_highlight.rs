@@ -53,11 +53,11 @@ impl LanguageServerPool {
             host_uri,
             injection_language,
             region_id,
-            offset,
+            &offset,
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| {
-                build_document_highlight_request(virtual_uri, host_position, offset, request_id)
+                build_document_highlight_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| transform_document_highlight_response_to_host(response, ctx.offset),
         )
@@ -72,7 +72,7 @@ impl LanguageServerPool {
 fn build_document_highlight_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
-    offset: RegionOffset,
+    offset: &RegionOffset,
     request_id: RequestId,
 ) -> serde_json::Value {
     build_position_based_request(
@@ -94,7 +94,7 @@ fn build_document_highlight_request(
 /// * `offset` - The region offset for coordinate translation
 fn transform_document_highlight_response_to_host(
     mut response: serde_json::Value,
-    offset: RegionOffset,
+    offset: &RegionOffset,
 ) -> Option<Vec<DocumentHighlight>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentHighlight: {}", error);
@@ -139,7 +139,7 @@ mod tests {
         let request = build_document_highlight_request(
             &virtual_uri,
             position,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 
@@ -173,7 +173,7 @@ mod tests {
         let request = build_document_highlight_request(
             &virtual_uri,
             position,
-            RegionOffset::new(3, 0),
+            &RegionOffset::new(3, 0),
             RequestId::new(42),
         );
 
@@ -216,7 +216,7 @@ mod tests {
 
         let transformed = transform_document_highlight_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -239,7 +239,7 @@ mod tests {
         #[case] response: serde_json::Value,
     ) {
         let transformed =
-            transform_document_highlight_response_to_host(response, RegionOffset::new(5, 0));
+            transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }
 
@@ -248,7 +248,7 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let transformed =
-            transform_document_highlight_response_to_host(response, RegionOffset::new(5, 0));
+            transform_document_highlight_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_some());
         let highlights = transformed.unwrap();
         assert!(highlights.is_empty());
@@ -274,7 +274,7 @@ mod tests {
 
         let transformed = transform_document_highlight_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
@@ -311,7 +311,7 @@ mod tests {
 
         let transformed = transform_document_highlight_response_to_host(
             response,
-            RegionOffset::new(region_start_line, 0),
+            &RegionOffset::new(region_start_line, 0),
         );
 
         assert!(transformed.is_some());
