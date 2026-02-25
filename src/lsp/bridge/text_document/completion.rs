@@ -256,8 +256,8 @@ pub(crate) fn extract_envelope(item: &CompletionItem) -> Option<KakehashiEnvelop
 /// On success, `item.data` is set back to the downstream's original value (`inner`).
 /// Returns the extracted envelope. Returns `None` if not an envelope (item unchanged).
 pub(crate) fn strip_envelope(item: &mut CompletionItem) -> Option<KakehashiEnvelope> {
-    let envelope = extract_envelope(item)?;
-    item.data = envelope.inner.clone();
+    let mut envelope = extract_envelope(item)?;
+    item.data = envelope.inner.take();
     Some(envelope)
 }
 
