@@ -196,12 +196,27 @@ fn merge_upstream_capabilities(
             );
         }
 
-        // --- SignatureHelp signatureInformation (Category B) ---
-        if let Some(upstream_sig) = &upstream_td.signature_help {
-            let base_sig = base_td.signature_help.get_or_insert_with(Default::default);
+        // --- SignatureHelp signatureInformation sub-fields (Category B) ---
+        if let Some(upstream_sig) = &upstream_td.signature_help
+            && let Some(upstream_sig_info) = &upstream_sig.signature_information
+        {
+            let base_sig = base_td
+                .signature_help
+                .get_or_insert_with(Default::default);
+            let base_sig_info = base_sig
+                .signature_information
+                .get_or_insert_with(Default::default);
             merge_option(
-                &mut base_sig.signature_information,
-                upstream_sig.signature_information.clone(),
+                &mut base_sig_info.documentation_format,
+                upstream_sig_info.documentation_format.clone(),
+            );
+            merge_option(
+                &mut base_sig_info.parameter_information,
+                upstream_sig_info.parameter_information.clone(),
+            );
+            merge_option(
+                &mut base_sig_info.active_parameter_support,
+                upstream_sig_info.active_parameter_support,
             );
         }
     }
