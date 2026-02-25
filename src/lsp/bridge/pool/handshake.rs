@@ -14,7 +14,7 @@
 
 use std::io;
 
-use tower_lsp_server::ls_types::ServerCapabilities;
+use tower_lsp_server::ls_types::{ClientCapabilities, ServerCapabilities};
 
 use super::ConnectionHandle;
 use super::connection_handle::NotificationSendResult;
@@ -38,6 +38,7 @@ use crate::lsp::bridge::protocol::{
 /// * `init_options` - Server-specific initialization options
 /// * `root_uri` - The workspace root URI (forwarded from upstream client)
 /// * `workspace_folders` - The workspace folders (forwarded from upstream client)
+/// * `client_capabilities` - Upstream client capabilities (merged into bridge defaults)
 ///
 /// # Returns
 /// * `Ok(capabilities)` - Handshake completed, returns typed `ServerCapabilities`
@@ -49,10 +50,16 @@ pub(super) async fn perform_lsp_handshake(
     init_options: Option<serde_json::Value>,
     root_uri: Option<String>,
     workspace_folders: Option<serde_json::Value>,
+    client_capabilities: Option<ClientCapabilities>,
 ) -> io::Result<ServerCapabilities> {
     // 1. Build and send initialize request via the single-writer loop
-    let init_request =
-        build_initialize_request(init_request_id, init_options, root_uri, workspace_folders);
+    let init_request = build_initialize_request(
+        init_request_id,
+        init_options,
+        root_uri,
+        workspace_folders,
+        client_capabilities.as_ref(),
+    );
     handle
         .send_request(init_request, init_request_id)
         .map_err(|e| -> io::Error { e.into() })?;

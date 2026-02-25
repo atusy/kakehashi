@@ -3,113 +3,10 @@
 //! Provides builders for initialize, shutdown, and exit messages
 //! used during connection lifecycle management.
 
+use tower_lsp_server::ls_types::ClientCapabilities;
+
+use super::client_capabilities::build_bridge_client_capabilities;
 use super::request_id::RequestId;
-
-/// Build the client capabilities the bridge declares to downstream servers.
-///
-/// These capabilities inform downstream servers which LSP features the bridge
-/// can handle, enabling richer responses (e.g., `LocationLink` instead of `Location`).
-///
-/// Uses typed `ClientCapabilities` from `ls_types` for compile-time field validation.
-fn build_bridge_client_capabilities() -> serde_json::Value {
-    use tower_lsp_server::ls_types::{
-        ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-        DiagnosticClientCapabilities, DiagnosticWorkspaceClientCapabilities,
-        DocumentLinkClientCapabilities, DocumentSymbolClientCapabilities,
-        DynamicRegistrationClientCapabilities, GeneralClientCapabilities, GotoCapability,
-        HoverClientCapabilities, InlayHintClientCapabilities, MarkupKind, PositionEncodingKind,
-        SignatureHelpClientCapabilities, TextDocumentClientCapabilities,
-        WorkspaceClientCapabilities,
-    };
-
-    let goto_link = Some(GotoCapability {
-        dynamic_registration: Some(false),
-        link_support: Some(true),
-    });
-
-    #[allow(unused_mut)] // mutated only with "experimental" feature
-    let mut text_document = TextDocumentClientCapabilities {
-        hover: Some(HoverClientCapabilities {
-            dynamic_registration: Some(false),
-            content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
-        }),
-        completion: Some(CompletionClientCapabilities {
-            dynamic_registration: Some(false),
-            completion_item: Some(CompletionItemCapability {
-                snippet_support: Some(true),
-                insert_replace_support: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        definition: goto_link,
-        type_definition: goto_link,
-        implementation: goto_link,
-        declaration: goto_link,
-        references: Some(DynamicRegistrationClientCapabilities {
-            dynamic_registration: Some(false),
-        }),
-        signature_help: Some(SignatureHelpClientCapabilities {
-            dynamic_registration: Some(false),
-            ..Default::default()
-        }),
-        document_highlight: Some(DynamicRegistrationClientCapabilities {
-            dynamic_registration: Some(false),
-        }),
-        document_symbol: Some(DocumentSymbolClientCapabilities {
-            dynamic_registration: Some(false),
-            hierarchical_document_symbol_support: Some(true),
-            ..Default::default()
-        }),
-        document_link: Some(DocumentLinkClientCapabilities {
-            dynamic_registration: Some(false),
-            tooltip_support: Some(true),
-        }),
-        inlay_hint: Some(InlayHintClientCapabilities {
-            dynamic_registration: Some(false),
-            ..Default::default()
-        }),
-        diagnostic: Some(DiagnosticClientCapabilities {
-            dynamic_registration: Some(true),
-            related_document_support: Some(true),
-        }),
-        moniker: Some(DynamicRegistrationClientCapabilities {
-            dynamic_registration: Some(false),
-        }),
-        ..Default::default()
-    };
-
-    #[cfg(feature = "experimental")]
-    {
-        text_document.color_provider = Some(DynamicRegistrationClientCapabilities {
-            dynamic_registration: Some(false),
-        });
-    }
-
-    let capabilities = ClientCapabilities {
-        text_document: Some(text_document),
-        workspace: Some(WorkspaceClientCapabilities {
-            diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
-                refresh_support: Some(true),
-            }),
-            ..Default::default()
-        }),
-        general: Some(GeneralClientCapabilities {
-            position_encodings: Some(vec![PositionEncodingKind::UTF16]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    serde_json::to_value(capabilities).unwrap_or_else(|e| {
-        log::warn!(
-            target: "kakehashi::bridge",
-            "Failed to serialize ClientCapabilities, falling back to empty: {}",
-            e
-        );
-        serde_json::json!({})
-    })
-}
 
 /// Build an LSP initialize request.
 ///
@@ -118,11 +15,13 @@ fn build_bridge_client_capabilities() -> serde_json::Value {
 /// * `initialization_options` - Server-specific initialization options
 /// * `root_uri` - The workspace root URI (forwarded from upstream client)
 /// * `workspace_folders` - The workspace folders (forwarded from upstream client)
+/// * `upstream_capabilities` - The upstream client's capabilities (merged into bridge defaults)
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
     root_uri: Option<String>,
     workspace_folders: Option<serde_json::Value>,
+    upstream_capabilities: Option<&ClientCapabilities>,
 ) -> serde_json::Value {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
@@ -140,7 +39,7 @@ pub(crate) fn build_initialize_request(
             "rootUri": root_uri,
             "rootPath": root_path,
             "workspaceFolders": workspace_folders,
-            "capabilities": build_bridge_client_capabilities(),
+            "capabilities": build_bridge_client_capabilities(upstream_capabilities),
             "initializationOptions": initialization_options
         }
     })
@@ -240,14 +139,8 @@ mod tests {
     use rstest::rstest;
 
     #[test]
-    fn bridge_client_capabilities_snapshot() {
-        let capabilities = build_bridge_client_capabilities();
-        insta::assert_json_snapshot!(capabilities);
-    }
-
-    #[test]
     fn initialize_request_has_correct_structure() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
         insta::assert_json_snapshot!(request, {
             ".params.processId" => "[PID]",
@@ -256,7 +149,7 @@ mod tests {
 
     #[test]
     fn initialize_request_includes_bridge_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
         let capabilities = &request["params"]["capabilities"];
 
         // Should declare linkSupport for goto-family methods
@@ -281,7 +174,7 @@ mod tests {
             }
         });
         let request =
-            build_initialize_request(RequestId::new(42), Some(options.clone()), None, None);
+            build_initialize_request(RequestId::new(42), Some(options.clone()), None, None, None);
 
         assert_eq!(request["id"], 42);
         assert_eq!(request["params"]["initializationOptions"], options);
@@ -290,22 +183,27 @@ mod tests {
     #[test]
     fn initialize_request_includes_root_uri_when_provided() {
         let root_uri = "file:///home/user/project";
-        let request =
-            build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()), None);
+        let request = build_initialize_request(
+            RequestId::new(1),
+            None,
+            Some(root_uri.to_string()),
+            None,
+            None,
+        );
 
         assert_eq!(request["params"]["rootUri"], root_uri);
     }
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
         assert!(request["params"]["rootUri"].is_null());
     }
 
     #[test]
     fn initialize_request_includes_position_encoding() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
         let general = &request["params"]["capabilities"]["general"];
 
         assert_eq!(general["positionEncodings"], serde_json::json!(["utf-16"]));
@@ -317,14 +215,14 @@ mod tests {
             { "uri": "file:///home/user/project", "name": "project" }
         ]);
         let request =
-            build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()));
+            build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()), None);
 
         assert_eq!(request["params"]["workspaceFolders"], folders);
     }
 
     #[test]
     fn initialize_request_includes_workspace_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
         let workspace = &request["params"]["capabilities"]["workspace"];
 
         // Only declare capabilities that the bridge actually handles
@@ -337,7 +235,7 @@ mod tests {
 
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
         assert!(request["params"]["workspaceFolders"].is_null());
     }
@@ -345,17 +243,69 @@ mod tests {
     #[test]
     fn initialize_request_includes_root_path_derived_from_root_uri() {
         let root_uri = "file:///home/user/project";
-        let request =
-            build_initialize_request(RequestId::new(1), None, Some(root_uri.to_string()), None);
+        let request = build_initialize_request(
+            RequestId::new(1),
+            None,
+            Some(root_uri.to_string()),
+            None,
+            None,
+        );
 
         assert_eq!(request["params"]["rootPath"], "/home/user/project");
     }
 
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None);
+        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
         assert!(request["params"]["rootPath"].is_null());
+    }
+
+    #[test]
+    fn initialize_request_with_upstream_capabilities() {
+        use tower_lsp_server::ls_types::{
+            CompletionClientCapabilities, CompletionItemCapability,
+            CompletionItemCapabilityResolveSupport, MarkupKind, TextDocumentClientCapabilities,
+        };
+
+        let upstream = ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                completion: Some(CompletionClientCapabilities {
+                    completion_item: Some(CompletionItemCapability {
+                        documentation_format: Some(vec![
+                            MarkupKind::Markdown,
+                            MarkupKind::PlainText,
+                        ]),
+                        resolve_support: Some(CompletionItemCapabilityResolveSupport {
+                            properties: vec!["documentation".to_string()],
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let request =
+            build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream));
+        let caps = &request["params"]["capabilities"];
+
+        // Merged fields should be present
+        assert_eq!(
+            caps["textDocument"]["completion"]["completionItem"]["documentationFormat"],
+            serde_json::json!(["markdown", "plaintext"])
+        );
+        assert_eq!(
+            caps["textDocument"]["completion"]["completionItem"]["resolveSupport"]["properties"],
+            serde_json::json!(["documentation"])
+        );
+        // Bridge-controlled fields unchanged
+        assert_eq!(
+            caps["textDocument"]["completion"]["completionItem"]["insertReplaceSupport"],
+            true
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-source: src/lsp/bridge/protocol/lifecycle.rs
+source: src/lsp/bridge/protocol/client_capabilities.rs
 expression: capabilities
 ---
 {
@@ -11,8 +11,7 @@ expression: capabilities
   "textDocument": {
     "completion": {
       "completionItem": {
-        "insertReplaceSupport": true,
-        "snippetSupport": true
+        "insertReplaceSupport": true
       },
       "dynamicRegistration": false
     },
@@ -40,10 +39,6 @@ expression: capabilities
       "hierarchicalDocumentSymbolSupport": true
     },
     "hover": {
-      "contentFormat": [
-        "markdown",
-        "plaintext"
-      ],
       "dynamicRegistration": false
     },
     "implementation": {

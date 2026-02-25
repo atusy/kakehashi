@@ -1076,6 +1076,9 @@ impl LanguageServer for Kakehashi {
         self.bridge
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
+        self.bridge
+            .pool()
+            .set_client_capabilities(params.capabilities);
 
         // Get root path from workspace folders, deprecated root_uri, or current directory
         let uri_to_path = |uri: &Uri| uri_to_url(uri).ok().and_then(|url| url.to_file_path().ok());

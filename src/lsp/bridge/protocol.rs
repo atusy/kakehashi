@@ -10,6 +10,7 @@
 //! - `request` - Request builders for downstream language servers
 //! - `response` - Response transformers for coordinate translation
 
+mod client_capabilities;
 mod lifecycle;
 mod request;
 mod request_id;
