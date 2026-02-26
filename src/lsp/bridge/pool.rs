@@ -53,7 +53,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use url::Url;
 
-use super::protocol::{VirtualDocumentUri, build_didopen_notification};
+use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
+
+use super::protocol::{JsonRpcNotification, VirtualDocumentUri, build_didopen_notification};
 
 /// Timeout for LSP initialize handshake (ADR-0018 Tier 0: 30-60s recommended).
 ///
@@ -1023,13 +1025,12 @@ impl LanguageServerPool {
 
         // Build and send the cancel notification via single-writer loop (ADR-0015)
         // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
-        let notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "$/cancelRequest",
-            "params": {
-                "id": downstream_id.as_i64()
-            }
-        });
+        let notification = JsonRpcNotification::new(
+            "$/cancelRequest",
+            CancelParams {
+                id: NumberOrString::Number(downstream_id.as_i64() as i32),
+            },
+        );
 
         match handle.send_notification(notification) {
             NotificationSendResult::Queued => {
@@ -2558,7 +2559,9 @@ mod tests {
         let handle = create_handle_with_state(ConnectionState::Ready).await;
 
         // Send a notification before shutdown (will be queued)
-        let result = handle.send_notification(serde_json::json!({"method": "test", "params": {}}));
+        let notification =
+            super::super::protocol::JsonRpcNotification::new("test", serde_json::json!({}));
+        let result = handle.send_notification(notification);
         assert_eq!(
             result,
             NotificationSendResult::Queued,
