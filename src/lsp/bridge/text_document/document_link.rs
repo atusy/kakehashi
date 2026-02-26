@@ -22,7 +22,8 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, build_whole_document_request,
+    DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    build_whole_document_request,
 };
 
 impl LanguageServerPool {
@@ -73,7 +74,7 @@ impl LanguageServerPool {
 fn build_document_link_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<DocumentParams> {
     build_whole_document_request(virtual_uri, request_id, "textDocument/documentLink")
 }
 
@@ -131,7 +132,8 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_document_link_request(&virtual_uri, RequestId::new(42));
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -155,11 +157,12 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_document_link_request(&virtual_uri, RequestId::new(123));
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 123);
-        assert_eq!(request["method"], "textDocument/documentLink");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 123);
+        assert_eq!(json["method"], "textDocument/documentLink");
         assert!(
-            request["params"].get("position").is_none(),
+            json["params"].get("position").is_none(),
             "DocumentLink request should not have position parameter"
         );
     }

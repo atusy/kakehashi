@@ -4,9 +4,39 @@
 //! language servers with proper coordinate translation from host to virtual
 //! document coordinates.
 
+use tower_lsp_server::ls_types::{
+    DidOpenTextDocumentParams, Position, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri,
+};
+
+use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
 use super::translation::{RegionOffset, translate_host_position_to_virtual};
 use super::virtual_uri::VirtualDocumentUri;
+
+/// Build `TextDocumentPositionParams` with host-to-virtual coordinate translation.
+///
+/// This is the shared helper for all request builders that need position
+/// translation (hover, completion, definition, references, rename, etc.).
+///
+/// # Defensive Arithmetic
+///
+/// Uses `saturating_sub` for line translation to prevent panic on underflow.
+pub(crate) fn build_text_document_position_params(
+    virtual_uri: &VirtualDocumentUri,
+    host_position: Position,
+    offset: &RegionOffset,
+) -> TextDocumentPositionParams {
+    let mut virtual_position = host_position;
+    translate_host_position_to_virtual(&mut virtual_position, offset);
+
+    TextDocumentPositionParams::new(
+        TextDocumentIdentifier {
+            uri: virtual_uri_to_lsp_uri(virtual_uri),
+        },
+        virtual_position,
+    )
+}
 
 /// Build a position-based JSON-RPC request for a downstream language server.
 ///
@@ -30,29 +60,13 @@ use super::virtual_uri::VirtualDocumentUri;
 /// line 0, which may produce incorrect results but won't crash the server.
 pub(crate) fn build_position_based_request(
     virtual_uri: &VirtualDocumentUri,
-    host_position: tower_lsp_server::ls_types::Position,
+    host_position: Position,
     offset: &RegionOffset,
     request_id: RequestId,
-    method: &str,
-) -> serde_json::Value {
-    // Translate position from host to virtual coordinates
-    let mut virtual_position = host_position;
-    translate_host_position_to_virtual(&mut virtual_position, offset);
-
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": method,
-        "params": {
-            "textDocument": {
-                "uri": virtual_uri.to_uri_string()
-            },
-            "position": {
-                "line": virtual_position.line,
-                "character": virtual_position.character
-            }
-        }
-    })
+    method: &'static str,
+) -> JsonRpcRequest<TextDocumentPositionParams> {
+    let params = build_text_document_position_params(virtual_uri, host_position, offset);
+    JsonRpcRequest::new(request_id.as_i64(), method, params)
 }
 
 /// Build a whole-document JSON-RPC request for a downstream language server.
@@ -69,18 +83,15 @@ pub(crate) fn build_position_based_request(
 pub(crate) fn build_whole_document_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
-    method: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": method,
-        "params": {
-            "textDocument": {
-                "uri": virtual_uri.to_uri_string()
-            }
-        }
-    })
+    method: &'static str,
+) -> JsonRpcRequest<DocumentParams> {
+    let params = DocumentParams {
+        text_document: TextDocumentIdentifier {
+            uri: virtual_uri_to_lsp_uri(virtual_uri),
+        },
+    };
+
+    JsonRpcRequest::new(request_id.as_i64(), method, params)
 }
 
 /// Build a JSON-RPC didOpen notification for a downstream language server.
@@ -94,19 +105,36 @@ pub(crate) fn build_whole_document_request(
 pub(crate) fn build_didopen_notification(
     virtual_uri: &VirtualDocumentUri,
     content: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didOpen",
-        "params": {
-            "textDocument": {
-                "uri": virtual_uri.to_uri_string(),
-                "languageId": virtual_uri.language(),
-                "version": 1,
-                "text": content
-            }
-        }
-    })
+) -> JsonRpcNotification<DidOpenTextDocumentParams> {
+    let params = DidOpenTextDocumentParams {
+        text_document: TextDocumentItem::new(
+            virtual_uri_to_lsp_uri(virtual_uri),
+            virtual_uri.language().to_string(),
+            1,
+            content.to_string(),
+        ),
+    };
+
+    JsonRpcNotification::new("textDocument/didOpen", params)
+}
+
+/// Params for requests that only need a text document identifier.
+///
+/// Used by document-wide requests (documentLink, documentSymbol, documentColor, etc.)
+/// where the LSP spec defines different params types per method but the bridge
+/// only sends the `textDocument` field.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DocumentParams {
+    #[serde(rename = "textDocument")]
+    text_document: TextDocumentIdentifier,
+}
+
+/// Convert a `VirtualDocumentUri` to a `ls_types::Uri`.
+///
+/// Delegates to [`VirtualDocumentUri::to_lsp_uri()`] which handles parse
+/// failures gracefully (logs + falls back to host URI).
+pub(crate) fn virtual_uri_to_lsp_uri(virtual_uri: &VirtualDocumentUri) -> Uri {
+    virtual_uri.to_lsp_uri()
 }
 
 #[cfg(test)]
@@ -116,7 +144,8 @@ mod tests {
     // ==========================================================================
 
     /// Assert that a request uses a virtual URI with the expected extension.
-    fn assert_uses_virtual_uri(request: &serde_json::Value, extension: &str) {
+    fn assert_uses_virtual_uri(request: &impl serde::Serialize, extension: &str) {
+        let request = serde_json::to_value(request).unwrap();
         let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
         // Use url crate for robust parsing (handles query strings with slashes, fragments, etc.)
         let url = url::Url::parse(uri_str).expect("URI should be parseable");
@@ -179,8 +208,9 @@ mod tests {
             "textDocument/completion",
         );
 
-        assert_eq!(request["params"]["position"]["line"], 0);
-        assert_eq!(request["params"]["position"]["character"], 6); // 10 - 4
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 0);
+        assert_eq!(json["params"]["position"]["character"], 6); // 10 - 4
     }
 
     #[test]
@@ -201,8 +231,9 @@ mod tests {
             "textDocument/completion",
         );
 
-        assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
-        assert_eq!(request["params"]["position"]["character"], 10); // unchanged
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 2); // 7 - 5
+        assert_eq!(json["params"]["position"]["character"], 10); // unchanged
     }
 
     #[test]
@@ -221,7 +252,8 @@ mod tests {
             "textDocument/completion",
         );
 
-        assert_eq!(request["params"]["position"]["line"], 0);
-        assert_eq!(request["params"]["position"]["character"], 0); // saturated
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 0);
+        assert_eq!(json["params"]["position"]["character"], 0); // saturated
     }
 }

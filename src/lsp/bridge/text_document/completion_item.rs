@@ -24,11 +24,10 @@
 use std::sync::Arc;
 
 use log::warn;
-use serde_json::json;
 use tower_lsp_server::ls_types::CompletionItem;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{RegionOffset, RequestId};
+use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId};
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
@@ -182,16 +181,14 @@ impl LanguageServerPool {
 }
 
 /// Build a JSON-RPC `completionItem/resolve` request.
+///
+/// The `completionItem/resolve` method is unique: its params is the
+/// `CompletionItem` itself (not a wrapper struct), per the LSP spec.
 fn build_completion_resolve_request(
     item: &CompletionItem,
     request_id: RequestId,
-) -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "completionItem/resolve",
-        "params": item,
-    })
+) -> JsonRpcRequest<&CompletionItem> {
+    JsonRpcRequest::new(request_id.as_i64(), "completionItem/resolve", item)
 }
 
 /// Parse a JSON-RPC resolve response into a `CompletionItem`.
@@ -257,11 +254,12 @@ mod tests {
         };
         let request = build_completion_resolve_request(&item, RequestId::new(7));
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 7i64);
-        assert_eq!(request["method"], "completionItem/resolve");
-        assert_eq!(request["params"]["label"], "print");
-        assert_eq!(request["params"]["data"]["resolve_id"], 99);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 7i64);
+        assert_eq!(json["method"], "completionItem/resolve");
+        assert_eq!(json["params"]["label"], "print");
+        assert_eq!(json["params"]["data"]["resolve_id"], 99);
     }
 
     // ==========================================================================

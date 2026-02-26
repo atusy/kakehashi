@@ -21,9 +21,11 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Range, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
+use tower_lsp_server::ls_types::{InlayHintParams, TextDocumentIdentifier};
+
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -92,31 +94,19 @@ fn build_inlay_hint_request(
     host_range: Range,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<InlayHintParams> {
     // Translate range from host to virtual coordinates
     let mut virtual_range = host_range;
     translate_host_range_to_virtual(&mut virtual_range, offset);
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "textDocument/inlayHint",
-        "params": {
-            "textDocument": {
-                "uri": virtual_uri.to_uri_string()
-            },
-            "range": {
-                "start": {
-                    "line": virtual_range.start.line,
-                    "character": virtual_range.start.character
-                },
-                "end": {
-                    "line": virtual_range.end.line,
-                    "character": virtual_range.end.character
-                }
-            }
-        }
-    })
+    let params = InlayHintParams {
+        text_document: TextDocumentIdentifier {
+            uri: virtual_uri_to_lsp_uri(virtual_uri),
+        },
+        range: virtual_range,
+        work_done_progress_params: Default::default(),
+    };
+    JsonRpcRequest::new(request_id.as_i64(), "textDocument/inlayHint", params)
 }
 
 /// Transform an inlay hint response from virtual to host document coordinates.
@@ -231,7 +221,8 @@ mod tests {
             RequestId::new(1),
         );
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -270,14 +261,15 @@ mod tests {
             RequestId::new(42),
         );
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["method"], "textDocument/inlayHint");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 42);
+        assert_eq!(json["method"], "textDocument/inlayHint");
         // Range translated: line 10 - 8 = 2, line 20 - 8 = 12
-        assert_eq!(request["params"]["range"]["start"]["line"], 2);
-        assert_eq!(request["params"]["range"]["start"]["character"], 5);
-        assert_eq!(request["params"]["range"]["end"]["line"], 12);
-        assert_eq!(request["params"]["range"]["end"]["character"], 30);
+        assert_eq!(json["params"]["range"]["start"]["line"], 2);
+        assert_eq!(json["params"]["range"]["start"]["character"], 5);
+        assert_eq!(json["params"]["range"]["end"]["line"], 12);
+        assert_eq!(json["params"]["range"]["end"]["character"], 30);
     }
 
     #[test]
@@ -306,12 +298,13 @@ mod tests {
             RequestId::new(1),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         // Start: virtual line 0 -> character 10 - 4 = 6
-        assert_eq!(request["params"]["range"]["start"]["line"], 0);
-        assert_eq!(request["params"]["range"]["start"]["character"], 6);
+        assert_eq!(json["params"]["range"]["start"]["line"], 0);
+        assert_eq!(json["params"]["range"]["start"]["character"], 6);
         // End: virtual line 3 -> character unchanged
-        assert_eq!(request["params"]["range"]["end"]["line"], 3);
-        assert_eq!(request["params"]["range"]["end"]["character"], 15);
+        assert_eq!(json["params"]["range"]["end"]["line"], 3);
+        assert_eq!(json["params"]["range"]["end"]["character"], 15);
     }
 
     #[test]
@@ -340,12 +333,13 @@ mod tests {
             RequestId::new(1),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         // Start: virtual line 2 -> character unchanged
-        assert_eq!(request["params"]["range"]["start"]["line"], 2);
-        assert_eq!(request["params"]["range"]["start"]["character"], 10);
+        assert_eq!(json["params"]["range"]["start"]["line"], 2);
+        assert_eq!(json["params"]["range"]["start"]["character"], 10);
         // End: virtual line 4 -> character unchanged
-        assert_eq!(request["params"]["range"]["end"]["line"], 4);
-        assert_eq!(request["params"]["range"]["end"]["character"], 15);
+        assert_eq!(json["params"]["range"]["end"]["line"], 4);
+        assert_eq!(json["params"]["range"]["end"]["character"], 15);
     }
 
     #[test]
@@ -374,9 +368,10 @@ mod tests {
             RequestId::new(1),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         // saturating_sub: 2 - 10 = 0, 5 - 10 = 0
-        assert_eq!(request["params"]["range"]["start"]["line"], 0);
-        assert_eq!(request["params"]["range"]["end"]["line"], 0);
+        assert_eq!(json["params"]["range"]["start"]["line"], 0);
+        assert_eq!(json["params"]["range"]["end"]["line"], 0);
     }
 
     // ==========================================================================

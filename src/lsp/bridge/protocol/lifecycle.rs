@@ -3,9 +3,15 @@
 //! Provides builders for initialize, shutdown, and exit messages
 //! used during connection lifecycle management.
 
-use tower_lsp_server::ls_types::ClientCapabilities;
+use std::str::FromStr;
+
+use tower_lsp_server::ls_types::{
+    ClientCapabilities, DidCloseTextDocumentParams, InitializeParams, InitializedParams,
+    TextDocumentIdentifier, Uri, WorkspaceFolder,
+};
 
 use super::client_capabilities::build_bridge_client_capabilities;
+use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
 
 /// Build an LSP initialize request.
@@ -20,81 +26,77 @@ pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
     root_uri: Option<String>,
-    workspace_folders: Option<serde_json::Value>,
+    workspace_folders: Option<Vec<WorkspaceFolder>>,
     upstream_capabilities: Option<&ClientCapabilities>,
-) -> serde_json::Value {
+) -> JsonRpcRequest<InitializeParams> {
     let root_path = root_uri.as_deref().and_then(|uri| {
         url::Url::parse(uri)
             .ok()
             .and_then(|u| u.to_file_path().ok())
             .map(|p| p.to_string_lossy().into_owned())
     });
+    let root_uri = root_uri.as_deref().and_then(|s| Uri::from_str(s).ok());
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "initialize",
-        "params": {
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "rootPath": root_path,
-            "workspaceFolders": workspace_folders,
-            "capabilities": build_bridge_client_capabilities(upstream_capabilities),
-            "initializationOptions": initialization_options
-        }
-    })
+    #[allow(deprecated)] // root_uri and root_path are deprecated in favor of workspace_folders
+    let params = InitializeParams {
+        process_id: Some(std::process::id()),
+        root_uri,
+        root_path,
+        workspace_folders,
+        capabilities: build_bridge_client_capabilities(upstream_capabilities),
+        initialization_options,
+        ..Default::default()
+    };
+
+    JsonRpcRequest::new(request_id.as_i64(), "initialize", params)
 }
 
 /// Build an LSP initialized notification.
 ///
 /// Sent after receiving the initialize response to signal
 /// that the client is ready to receive requests.
-pub(crate) fn build_initialized_notification() -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "initialized",
-        "params": {}
-    })
+pub(crate) fn build_initialized_notification() -> JsonRpcNotification<InitializedParams> {
+    JsonRpcNotification::new("initialized", InitializedParams {})
 }
 
 /// Build an LSP shutdown request.
 ///
 /// # Arguments
 /// * `request_id` - The JSON-RPC request ID
-pub(crate) fn build_shutdown_request(request_id: RequestId) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request_id.as_i64(),
-        "method": "shutdown",
-        "params": null
-    })
+pub(crate) fn build_shutdown_request(request_id: RequestId) -> JsonRpcRequest<()> {
+    JsonRpcRequest::new(request_id.as_i64(), "shutdown", ())
 }
 
 /// Build an LSP exit notification.
 ///
 /// Sent after receiving the shutdown response to terminate the server.
-pub(crate) fn build_exit_notification() -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "exit",
-        "params": null
-    })
+pub(crate) fn build_exit_notification() -> JsonRpcNotification<()> {
+    JsonRpcNotification::new("exit", ())
 }
 
 /// Build a textDocument/didClose notification.
 ///
 /// # Arguments
 /// * `uri` - The URI of the document being closed
-pub(crate) fn build_didclose_notification(uri: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "textDocument/didClose",
-        "params": {
-            "textDocument": {
-                "uri": uri
-            }
+pub(crate) fn build_didclose_notification(
+    uri: &str,
+) -> Option<JsonRpcNotification<DidCloseTextDocumentParams>> {
+    let uri = match Uri::from_str(uri) {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Skipping didClose for invalid URI '{}': {}", uri, e
+            );
+            return None;
         }
-    })
+    };
+
+    let params = DidCloseTextDocumentParams {
+        text_document: TextDocumentIdentifier { uri },
+    };
+
+    Some(JsonRpcNotification::new("textDocument/didClose", params))
 }
 
 /// Validates a JSON-RPC initialize response.
@@ -138,30 +140,23 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    fn feature_suffix() -> &'static str {
+        if cfg!(feature = "experimental") {
+            "experimental"
+        } else {
+            "default"
+        }
+    }
+
     #[test]
     fn initialize_request_has_correct_structure() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        insta::assert_json_snapshot!(request, {
-            ".params.processId" => "[PID]",
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
         });
-    }
-
-    #[test]
-    fn initialize_request_includes_bridge_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
-        let capabilities = &request["params"]["capabilities"];
-
-        // Should declare linkSupport for goto-family methods
-        assert_eq!(
-            capabilities["textDocument"]["definition"]["linkSupport"],
-            true
-        );
-        // Should declare hierarchical document symbol support
-        assert_eq!(
-            capabilities["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"],
-            true
-        );
     }
 
     #[test]
@@ -176,8 +171,11 @@ mod tests {
         let request =
             build_initialize_request(RequestId::new(42), Some(options.clone()), None, None, None);
 
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["params"]["initializationOptions"], options);
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
+        });
     }
 
     #[test]
@@ -191,53 +189,39 @@ mod tests {
             None,
         );
 
-        assert_eq!(request["params"]["rootUri"], root_uri);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["rootUri"], root_uri);
     }
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        assert!(request["params"]["rootUri"].is_null());
-    }
-
-    #[test]
-    fn initialize_request_includes_position_encoding() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
-        let general = &request["params"]["capabilities"]["general"];
-
-        assert_eq!(general["positionEncodings"], serde_json::json!(["utf-16"]));
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["params"]["rootUri"].is_null());
     }
 
     #[test]
     fn initialize_request_includes_workspace_folders_when_provided() {
-        let folders = serde_json::json!([
-            { "uri": "file:///home/user/project", "name": "project" }
-        ]);
-        let request =
-            build_initialize_request(RequestId::new(1), None, None, Some(folders.clone()), None);
+        let folders = vec![WorkspaceFolder {
+            uri: Uri::from_str("file:///home/user/project").unwrap(),
+            name: "project".to_string(),
+        }];
+        let request = build_initialize_request(RequestId::new(1), None, None, Some(folders), None);
 
-        assert_eq!(request["params"]["workspaceFolders"], folders);
-    }
-
-    #[test]
-    fn initialize_request_includes_workspace_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
-        let workspace = &request["params"]["capabilities"]["workspace"];
-
-        // Only declare capabilities that the bridge actually handles
-        assert_eq!(workspace["diagnostics"]["refreshSupport"], true);
-        // workspaceFolders and configuration are NOT declared because
-        // the bridge doesn't implement the corresponding handlers
-        assert!(workspace.get("workspaceFolders").is_none());
-        assert!(workspace.get("configuration").is_none());
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
+        });
     }
 
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        assert!(request["params"]["workspaceFolders"].is_null());
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["params"]["workspaceFolders"].is_null());
     }
 
     #[test]
@@ -251,14 +235,16 @@ mod tests {
             None,
         );
 
-        assert_eq!(request["params"]["rootPath"], "/home/user/project");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["rootPath"], "/home/user/project");
     }
 
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        assert!(request["params"]["rootPath"].is_null());
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["params"]["rootPath"].is_null());
     }
 
     #[test]
@@ -290,22 +276,12 @@ mod tests {
 
         let request =
             build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream));
-        let caps = &request["params"]["capabilities"];
 
-        // Merged fields should be present
-        assert_eq!(
-            caps["textDocument"]["completion"]["completionItem"]["documentationFormat"],
-            serde_json::json!(["markdown", "plaintext"])
-        );
-        assert_eq!(
-            caps["textDocument"]["completion"]["completionItem"]["resolveSupport"]["properties"],
-            serde_json::json!(["documentation"])
-        );
-        // Bridge-controlled fields unchanged
-        assert_eq!(
-            caps["textDocument"]["completion"]["completionItem"]["insertReplaceSupport"],
-            true
-        );
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
+        });
     }
 
     #[test]
@@ -339,9 +315,10 @@ mod tests {
     #[test]
     fn didclose_notification_with_virtual_uri() {
         let uri = "file:///project/kakehashi-virtual-uri-abc123.lua";
-        let notification = build_didclose_notification(uri);
+        let notification = build_didclose_notification(uri).expect("valid URI");
 
-        assert_eq!(notification["params"]["textDocument"]["uri"], uri);
+        let json = serde_json::to_value(&notification).unwrap();
+        assert_eq!(json["params"]["textDocument"]["uri"], uri);
     }
 
     // Tests for validate_initialize_response

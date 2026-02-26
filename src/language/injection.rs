@@ -1958,13 +1958,13 @@ mod tests {
         // Gap ranges + named child ranges should cover the entire node
         let mut covered = vec![false; func_size];
         for r in &ranges {
-            for b in r.start_byte..r.end_byte {
-                covered[b] = true;
+            for c in covered[r.start_byte..r.end_byte].iter_mut() {
+                *c = true;
             }
         }
         for (cs, ce) in &child_ranges {
-            for b in *cs..*ce {
-                covered[b] = true;
+            for c in covered[*cs..*ce].iter_mut() {
+                *c = true;
             }
         }
         assert!(

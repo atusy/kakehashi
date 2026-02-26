@@ -22,9 +22,6 @@ impl Kakehashi {
             return Ok(Vec::new());
         };
 
-        // Convert Color to JSON Value for bridge (shared across all tasks)
-        let color_json = serde_json::to_value(color).unwrap_or_default();
-
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
 
@@ -34,24 +31,21 @@ impl Kakehashi {
         let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
-            |t| {
-                let color_json = color_json.clone();
-                async move {
-                    t.pool
-                        .send_color_presentation_request(
-                            &t.server_name,
-                            &t.server_config,
-                            &t.uri,
-                            range,
-                            &color_json,
-                            &t.injection_language,
-                            &t.region_id,
-                            t.offset,
-                            &t.virtual_content,
-                            t.upstream_id,
-                        )
-                        .await
-                }
+            |t| async move {
+                t.pool
+                    .send_color_presentation_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        range,
+                        color,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.offset,
+                        &t.virtual_content,
+                        t.upstream_id,
+                    )
+                    .await
             },
             |presentations| !presentations.is_empty(),
             cancel_rx,

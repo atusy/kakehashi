@@ -1,0 +1,70 @@
+---
+source: src/lsp/bridge/protocol/client_capabilities.rs
+expression: capabilities
+---
+{
+  "workspace": {
+    "diagnostics": {
+      "refreshSupport": true
+    }
+  },
+  "textDocument": {
+    "completion": {
+      "dynamicRegistration": false,
+      "completionItem": {
+        "insertReplaceSupport": true
+      }
+    },
+    "hover": {
+      "dynamicRegistration": false
+    },
+    "signatureHelp": {
+      "dynamicRegistration": false
+    },
+    "references": {
+      "dynamicRegistration": false
+    },
+    "documentHighlight": {
+      "dynamicRegistration": false
+    },
+    "documentSymbol": {
+      "dynamicRegistration": false,
+      "hierarchicalDocumentSymbolSupport": true
+    },
+    "declaration": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "definition": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "typeDefinition": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "implementation": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "documentLink": {
+      "dynamicRegistration": false,
+      "tooltipSupport": true
+    },
+    "moniker": {
+      "dynamicRegistration": false
+    },
+    "inlayHint": {
+      "dynamicRegistration": false
+    },
+    "diagnostic": {
+      "dynamicRegistration": true,
+      "relatedDocumentSupport": true
+    }
+  },
+  "general": {
+    "positionEncodings": [
+      "utf-16"
+    ]
+  }
+}

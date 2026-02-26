@@ -32,7 +32,10 @@ impl BridgeWriter {
     ///
     /// Formats the message with LSP Content-Length header:
     /// `Content-Length: <length>\r\n\r\n<json>`
-    pub(crate) async fn write_message(&mut self, message: &serde_json::Value) -> io::Result<()> {
+    pub(crate) async fn write_message(
+        &mut self,
+        message: &impl serde::Serialize,
+    ) -> io::Result<()> {
         let body = serde_json::to_string(message)?;
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
@@ -140,7 +143,10 @@ pub(crate) struct SplitConnectionWriter {
 
 impl SplitConnectionWriter {
     /// Write a JSON-RPC message to the child process stdin.
-    pub(crate) async fn write_message(&mut self, message: &serde_json::Value) -> io::Result<()> {
+    pub(crate) async fn write_message(
+        &mut self,
+        message: &impl serde::Serialize,
+    ) -> io::Result<()> {
         self.writer.write_message(message).await
     }
 

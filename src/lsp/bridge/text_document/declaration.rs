@@ -16,9 +16,10 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
     transform_goto_response_to_host,
 };
+use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
     /// Send a declaration request and wait for the response.
@@ -76,7 +77,7 @@ fn build_declaration_request(
     host_position: tower_lsp_server::ls_types::Position,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> serde_json::Value {
+) -> JsonRpcRequest<TextDocumentPositionParams> {
     build_position_based_request(
         virtual_uri,
         host_position,
@@ -110,7 +111,8 @@ mod tests {
             RequestId::new(42),
         );
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -144,10 +146,6 @@ mod tests {
             RequestId::new(42),
         );
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["method"], "textDocument/declaration");
-        assert_eq!(request["params"]["position"]["line"], 2);
-        assert_eq!(request["params"]["position"]["character"], 10);
+        insta::assert_json_snapshot!(request);
     }
 }

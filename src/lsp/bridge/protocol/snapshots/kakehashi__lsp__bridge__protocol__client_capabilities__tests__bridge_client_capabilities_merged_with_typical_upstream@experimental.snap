@@ -1,0 +1,120 @@
+---
+source: src/lsp/bridge/protocol/client_capabilities.rs
+expression: merged
+---
+{
+  "workspace": {
+    "diagnostics": {
+      "refreshSupport": true
+    }
+  },
+  "textDocument": {
+    "completion": {
+      "dynamicRegistration": false,
+      "completionItem": {
+        "snippetSupport": true,
+        "commitCharactersSupport": true,
+        "documentationFormat": [
+          "markdown",
+          "plaintext"
+        ],
+        "deprecatedSupport": true,
+        "preselectSupport": true,
+        "tagSupport": {
+          "valueSet": [
+            1
+          ]
+        },
+        "insertReplaceSupport": true,
+        "resolveSupport": {
+          "properties": [
+            "documentation",
+            "detail",
+            "additionalTextEdits",
+            "sortText",
+            "filterText",
+            "insertText",
+            "textEdit",
+            "insertTextFormat",
+            "insertTextMode"
+          ]
+        },
+        "insertTextModeSupport": {
+          "valueSet": [
+            1,
+            2
+          ]
+        },
+        "labelDetailsSupport": true
+      }
+    },
+    "hover": {
+      "dynamicRegistration": false,
+      "contentFormat": [
+        "markdown",
+        "plaintext"
+      ]
+    },
+    "signatureHelp": {
+      "dynamicRegistration": false,
+      "signatureInformation": {
+        "documentationFormat": [
+          "markdown",
+          "plaintext"
+        ],
+        "parameterInformation": {
+          "labelOffsetSupport": true
+        },
+        "activeParameterSupport": true
+      }
+    },
+    "references": {
+      "dynamicRegistration": false
+    },
+    "documentHighlight": {
+      "dynamicRegistration": false
+    },
+    "documentSymbol": {
+      "dynamicRegistration": false,
+      "hierarchicalDocumentSymbolSupport": true
+    },
+    "declaration": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "definition": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "typeDefinition": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "implementation": {
+      "dynamicRegistration": false,
+      "linkSupport": true
+    },
+    "documentLink": {
+      "dynamicRegistration": false,
+      "tooltipSupport": true
+    },
+    "colorProvider": {
+      "dynamicRegistration": false
+    },
+    "moniker": {
+      "dynamicRegistration": false
+    },
+    "inlayHint": {
+      "dynamicRegistration": false
+    },
+    "diagnostic": {
+      "dynamicRegistration": true,
+      "relatedDocumentSupport": true
+    }
+  },
+  "general": {
+    "positionEncodings": [
+      "utf-16"
+    ]
+  }
+}

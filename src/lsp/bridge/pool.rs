@@ -53,7 +53,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use url::Url;
 
-use super::protocol::{VirtualDocumentUri, build_didopen_notification};
+use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
+
+use super::protocol::{JsonRpcNotification, VirtualDocumentUri, build_didopen_notification};
 
 /// Timeout for LSP initialize handshake (ADR-0018 Tier 0: 30-60s recommended).
 ///
@@ -240,8 +242,8 @@ pub struct LanguageServerPool {
     /// Workspace folders forwarded from upstream client.
     ///
     /// Set via `set_workspace_folders()` after receiving the upstream initialize request.
-    /// Passed to downstream servers during LSP handshake as JSON value.
-    workspace_folders: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Passed to downstream servers during LSP handshake.
+    workspace_folders: std::sync::Mutex<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -314,7 +316,10 @@ impl LanguageServerPool {
     /// Set the workspace folders.
     ///
     /// Called during upstream initialize to forward workspace folders to downstream servers.
-    pub(crate) fn set_workspace_folders(&self, folders: Option<serde_json::Value>) {
+    pub(crate) fn set_workspace_folders(
+        &self,
+        folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
+    ) {
         let mut workspace_folders = self
             .workspace_folders
             .lock()
@@ -323,7 +328,7 @@ impl LanguageServerPool {
     }
 
     /// Get the workspace folders.
-    fn workspace_folders(&self) -> Option<serde_json::Value> {
+    fn workspace_folders(&self) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
         let workspace_folders = self
             .workspace_folders
             .lock()
@@ -1020,13 +1025,14 @@ impl LanguageServerPool {
 
         // Build and send the cancel notification via single-writer loop (ADR-0015)
         // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
-        let notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "$/cancelRequest",
-            "params": {
-                "id": downstream_id.as_i64()
-            }
-        });
+        let notification = JsonRpcNotification::new(
+            "$/cancelRequest",
+            CancelParams {
+                // Safe: IDs are generated from an atomic counter starting at 0,
+                // well within i32 range. ls-types constrains Number to i32.
+                id: NumberOrString::Number(downstream_id.as_i64() as i32),
+            },
+        );
 
         match handle.send_notification(notification) {
             NotificationSendResult::Queued => {
@@ -1047,6 +1053,10 @@ impl LanguageServerPool {
             NotificationSendResult::ChannelClosed => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "bridge: cancel notification channel closed",
+            )),
+            NotificationSendResult::SerializationFailed => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bridge: failed to serialize cancel notification",
             )),
         }
     }
@@ -2551,7 +2561,9 @@ mod tests {
         let handle = create_handle_with_state(ConnectionState::Ready).await;
 
         // Send a notification before shutdown (will be queued)
-        let result = handle.send_notification(serde_json::json!({"method": "test", "params": {}}));
+        let notification =
+            super::super::protocol::JsonRpcNotification::new("test", serde_json::json!({}));
+        let result = handle.send_notification(notification);
         assert_eq!(
             result,
             NotificationSendResult::Queued,
