@@ -381,6 +381,34 @@ mod tests {
         assert!(dest.join(".git").exists(), "Should be a git repository");
     }
 
+    /// Test that compile_parser compiles a parser from source to a shared library.
+    #[test]
+    fn test_compile_parser_with_loader() {
+        let temp = tempdir().expect("Failed to create temp dir");
+        let clone_dir = temp.path().join("tree-sitter-json");
+
+        // Clone tree-sitter-json (small repo)
+        clone_repo(
+            "https://github.com/tree-sitter/tree-sitter-json",
+            "v0.24.8",
+            &clone_dir,
+        )
+        .expect("clone should succeed");
+
+        let output_path = temp.path().join(format!(
+            "json.{}",
+            std::env::consts::DLL_EXTENSION
+        ));
+
+        compile_parser(&clone_dir, &output_path).expect("compile should succeed");
+
+        assert!(
+            output_path.exists(),
+            "Compiled parser should exist at {}",
+            output_path.display()
+        );
+    }
+
     /// Test that clone_repo works with commit hash revisions
     #[test]
     fn test_clone_repo_with_commit_hash() {
