@@ -140,15 +140,15 @@ pub fn install_parser(
         eprintln!("Revision: {}", metadata.revision);
     }
 
-    // Create temp directory for cloning
+    // Create temp directory for source acquisition
     let temp_dir = tempfile::tempdir()?;
     let clone_dir = temp_dir.path().join("parser");
 
-    // Clone the repository
+    // Fetch parser source code
     if options.verbose {
-        eprintln!("Cloning repository...");
+        eprintln!("Fetching source...");
     }
-    clone_repo(&metadata.url, &metadata.revision, &clone_dir)?;
+    fetch_source(&metadata.url, &metadata.revision, &clone_dir)?;
 
     // Determine the source directory (handle monorepos)
     let source_dir = if let Some(ref location) = metadata.location {
@@ -174,6 +174,11 @@ pub fn install_parser(
         install_path: parser_file,
         revision: metadata.revision,
     })
+}
+
+/// Fetch parser source code into a destination directory.
+fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
+    clone_repo(url, revision, dest)
 }
 
 /// Clone a git repository at a specific revision.
