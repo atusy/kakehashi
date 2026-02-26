@@ -1,4 +1,5 @@
 pub(crate) mod bridge_context;
+mod kakehashi;
 pub(crate) mod text_document;
 
 use std::collections::HashSet;

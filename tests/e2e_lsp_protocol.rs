@@ -47,6 +47,43 @@ fn test_initialize_returns_capabilities() {
 }
 
 #[test]
+fn test_effective_configuration_returns_settings() {
+    let mut client = LspClient::new();
+
+    // Initialize handshake
+    let _init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Call custom method with empty params
+    let response = client.send_request("kakehashi/internal/effectiveConfiguration", json!({}));
+
+    let result = response
+        .get("result")
+        .expect("effectiveConfiguration should return a result");
+    let settings = result
+        .get("settings")
+        .expect("result should contain settings");
+
+    // Verify it returns a valid settings object with expected default fields
+    assert!(
+        settings.get("autoInstall").is_some(),
+        "settings should contain autoInstall"
+    );
+    assert_eq!(
+        settings["autoInstall"],
+        json!(true),
+        "autoInstall should default to true"
+    );
+}
+
+#[test]
 fn test_shutdown_terminates_cleanly() {
     let mut client = LspClient::new();
 

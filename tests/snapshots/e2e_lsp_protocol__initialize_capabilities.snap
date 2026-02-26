@@ -24,7 +24,9 @@ expression: capabilities
   "inlayHintProvider": true,
   "monikerProvider": true,
   "referencesProvider": true,
-  "renameProvider": true,
+  "renameProvider": {
+    "prepareProvider": true
+  },
   "selectionRangeProvider": true,
   "semanticTokensProvider": {
     "full": {
