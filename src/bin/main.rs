@@ -544,13 +544,18 @@ async fn run_lsp_server() {
     // Create Kakehashi with the shared pool and cancel forwarder
     let pool_for_service = Arc::clone(&pool);
     let forwarder_for_service = cancel_forwarder.clone();
-    let (service, socket) = LspService::new(move |client| {
+    let (service, socket) = LspService::build(move |client| {
         Kakehashi::with_cancel_forwarder(
             client,
             Arc::clone(&pool_for_service),
             forwarder_for_service.clone(),
         )
-    });
+    })
+    .custom_method(
+        "kakehashi/internal/effectiveConfiguration",
+        Kakehashi::effective_configuration,
+    )
+    .finish();
 
     // Wrap service with RequestIdCapture to:
     // 1. Capture upstream request IDs (for ADR-0016 bridge requests)

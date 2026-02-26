@@ -286,13 +286,25 @@ impl LanguageSettings {
 }
 
 /// Workspace-wide Tree-sitter configuration as required by the domain.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSettings {
     pub search_paths: Vec<String>,
     pub languages: HashMap<String, LanguageSettings>,
     pub capture_mappings: CaptureMappings,
     pub auto_install: bool,
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            search_paths: Vec::new(),
+            languages: HashMap::new(),
+            capture_mappings: CaptureMappings::default(),
+            auto_install: true, // Default to true for zero-config experience
+            language_servers: None,
+        }
+    }
 }
 
 impl WorkspaceSettings {
