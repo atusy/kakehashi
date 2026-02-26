@@ -22,7 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - run: cargo install tree-sitter-cli
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
