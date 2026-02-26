@@ -190,7 +190,7 @@ pub fn install_parser(
 /// Returns `None` if the URL is not a GitHub HTTPS URL.
 /// GitHub serves tarballs at `https://github.com/{owner}/{repo}/archive/{revision}.tar.gz`.
 fn github_archive_url(repo_url: &str, revision: &str) -> Option<String> {
-    let url = repo_url.strip_suffix(".git").unwrap_or(repo_url);
+    let url = clean_url(repo_url);
     if !url.starts_with("https://github.com/") {
         return None;
     }
@@ -201,11 +201,17 @@ fn github_archive_url(repo_url: &str, revision: &str) -> Option<String> {
 ///
 /// For `https://github.com/tree-sitter/tree-sitter-json.git`, returns `"tree-sitter-json"`.
 fn repo_name_from_url(url: &str) -> Option<String> {
-    let url = url.strip_suffix(".git").unwrap_or(url);
+    let url = clean_url(url);
     url.rsplit('/')
         .next()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// Strip `.git` suffix and trailing slashes from a URL.
+fn clean_url(url: &str) -> &str {
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    url.trim_end_matches('/')
 }
 
 /// Fetch parser source code into a destination directory.
@@ -487,6 +493,21 @@ mod tests {
     }
 
     #[test]
+    fn test_github_archive_url_strips_trailing_slash() {
+        let url = github_archive_url(
+            "https://github.com/tree-sitter/tree-sitter-json/",
+            "v0.24.8",
+        );
+        assert_eq!(
+            url,
+            Some(
+                "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn test_repo_name_from_url() {
         assert_eq!(
             repo_name_from_url("https://github.com/tree-sitter/tree-sitter-json"),
@@ -499,6 +520,10 @@ mod tests {
         assert_eq!(
             repo_name_from_url("https://github.com/tree-sitter-grammars/tree-sitter-markdown"),
             Some("tree-sitter-markdown".to_string())
+        );
+        assert_eq!(
+            repo_name_from_url("https://github.com/tree-sitter/tree-sitter-json/"),
+            Some("tree-sitter-json".to_string())
         );
     }
 
