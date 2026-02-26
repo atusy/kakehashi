@@ -199,6 +199,23 @@ fn is_fully_in_active_injection_region(token: &RawToken, regions: &[InjectionReg
     })
 }
 
+/// Check whether a token exactly matches any active injection region's bounds.
+///
+/// This mirrors the exact-match exception in `is_in_exclusion_range()`: when
+/// a host capture sits on the same tree-sitter node as `@injection.content`
+/// (e.g., fish `(comment) @comment` + `(comment) @injection.content`), the
+/// host token should survive to the sweep-line algorithm, which splits it
+/// around injection tokens and preserves the host type in uncovered gaps.
+fn is_exact_match_active_injection_region(token: &RawToken, regions: &[InjectionRegion]) -> bool {
+    let token_end = token.column + token.length;
+    regions.iter().any(|r| {
+        token.line == r.start_line
+            && token.line == r.end_line
+            && token.column == r.start_col
+            && token_end == r.end_col
+    })
+}
+
 /// Collect the injection region intervals that overlap a host token's line.
 ///
 /// For each region that overlaps the token's line, returns the `(start_col, end_col)`
@@ -365,7 +382,13 @@ pub(super) fn finalize_tokens(
     // Injection region exclusion: remove or split host tokens (depth=0) that
     // overlap with active injection regions.
     //
-    // Host tokens fully inside a region are removed entirely.
+    // Host tokens fully inside a region are removed entirely — UNLESS the
+    // token exactly matches a region's bounds. Exact matches occur when a
+    // host capture and injection content share the same tree-sitter node
+    // (e.g., fish `(comment) @comment` + `(comment) @injection.content`).
+    // In that case the sweep-line algorithm resolves the overlap, preserving
+    // the host token in gaps not covered by injection tokens.
+    //
     // Host tokens that partially overlap (e.g., a `@markup.raw.block` token
     // covering both `> ` prefix and code content in a blockquote) are split,
     // keeping only the fragments outside the injection regions.
@@ -378,8 +401,16 @@ pub(super) fn finalize_tokens(
                 filtered.push(token);
                 continue;
             }
+            // Exact-match exception: when a host token's bounds match a region
+            // exactly, keep it so the sweep-line can split it around injection
+            // tokens. This mirrors the is_in_exclusion_range() exact-match
+            // exception in token_collector.rs.
+            if is_exact_match_active_injection_region(&token, active_injection_regions) {
+                filtered.push(token);
+                continue;
+            }
             if is_fully_in_active_injection_region(&token, active_injection_regions) {
-                // Fully contained → remove entirely (fast path)
+                // Fully contained (strictly) → remove entirely (fast path)
                 continue;
             }
             // Check for partial overlap and split if needed.
@@ -1289,6 +1320,64 @@ mod tests {
         assert_eq!(
             (result[1].line, result[1].column, result[1].length),
             (1, 0, 2)
+        );
+    }
+
+    #[test]
+    fn finalize_preserves_host_token_exactly_matching_active_injection_region() {
+        // Reproduces the fish comment bug: a host `comment` token (depth=0)
+        // exactly matches an active injection region because `(comment) @comment`
+        // and `(comment) @injection.content` capture the same node.
+        //
+        // The comment grammar produces `number` tokens for `#123` but leaves
+        // the rest of the comment uncovered. The sweep-line should split the
+        // host comment around the injection numbers.
+        //
+        // Input:  "# comment with #123 text"
+        //          0         1         2
+        //          0123456789012345678901234
+        //
+        // Host:   comment [0, 24) depth=0
+        // Inj:    number  [15, 19) depth=1  (#123)
+        let line_text = "# comment with #123 text";
+        let lines: Vec<&str> = vec![line_text];
+        let tokens = vec![
+            make_token(0, 0, 24, "comment", 0, 0), // host comment (full line)
+            make_token(0, 15, 4, "number", 1, 0),  // injection number (#123)
+        ];
+        // The injection region exactly matches the host comment token
+        let regions = vec![InjectionRegion {
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 24,
+        }];
+
+        let result = finalize_tokens(tokens, &regions, &lines);
+        assert!(result.is_some(), "Should produce tokens");
+
+        let SemanticTokensResult::Tokens(st) = result.unwrap() else {
+            panic!("Expected Tokens");
+        };
+
+        // Expect 3 tokens: comment[0,15) + number[15,19) + comment[19,24)
+        let positions: Vec<(u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| (t.delta_start, t.length, t.token_type))
+            .collect();
+        let (comment_type, _) = map_capture_to_token_type_and_modifiers("comment").unwrap();
+        let (number_type, _) = map_capture_to_token_type_and_modifiers("number").unwrap();
+
+        // delta_start is relative to previous token on the same line
+        assert_eq!(
+            positions,
+            vec![
+                (0, 15, comment_type), // comment [0, 15)
+                (15, 4, number_type),  // number  [15, 19)  delta=15-0=15
+                (4, 5, comment_type),  // comment [19, 24)  delta=19-15=4
+            ],
+            "Host comment should be split around injection number by sweep-line"
         );
     }
 }
