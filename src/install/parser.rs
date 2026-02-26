@@ -109,17 +109,6 @@ fn which_tree_sitter() -> Option<PathBuf> {
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
 }
 
-/// Get the shared library extension for the current platform.
-fn shared_lib_extension() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "dylib"
-    } else if cfg!(target_os = "windows") {
-        "dll"
-    } else {
-        "so"
-    }
-}
-
 /// Check if a parser file exists for the given language.
 ///
 /// Returns the path to the parser file if it exists, None otherwise.
@@ -127,7 +116,7 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
     let parser_file =
         data_dir
             .join("parser")
-            .join(format!("{}.{}", language, shared_lib_extension()));
+            .join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
     if parser_file.exists() {
         Some(parser_file)
     } else {
@@ -141,7 +130,7 @@ pub fn install_parser(
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
     let parser_dir = options.data_dir.join("parser");
-    let parser_file = parser_dir.join(format!("{}.{}", language, shared_lib_extension()));
+    let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
     // Check if parser already exists
     if parser_file.exists() && !options.force {
@@ -301,7 +290,7 @@ fn build_parser(
 
 /// Find the built shared library in the source directory.
 fn find_built_library(source_dir: &Path) -> Result<PathBuf, ParserInstallError> {
-    let ext = shared_lib_extension();
+    let ext = std::env::consts::DLL_EXTENSION;
 
     // tree-sitter build creates the library in the current directory
     // with a name like "libtree-sitter-lua.dylib" or just the language name
@@ -327,8 +316,8 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_shared_lib_extension() {
-        let ext = shared_lib_extension();
+    fn test_dll_extension_is_valid() {
+        let ext = std::env::consts::DLL_EXTENSION;
         assert!(ext == "so" || ext == "dylib" || ext == "dll");
     }
 
@@ -354,7 +343,7 @@ mod tests {
         fs::create_dir_all(&parser_dir).expect("create parser dir");
 
         // Create a fake parser file
-        let ext = shared_lib_extension();
+        let ext = std::env::consts::DLL_EXTENSION;
         let parser_file = parser_dir.join(format!("lua.{}", ext));
         fs::write(&parser_file, b"fake parser").expect("write fake parser");
 
