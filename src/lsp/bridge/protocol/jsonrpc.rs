@@ -47,34 +47,6 @@ impl<P> JsonRpcNotification<P> {
 mod tests {
     use super::*;
 
-    /// Allow indexing into `JsonRpcRequest` by string key for test assertions.
-    ///
-    /// Serializes the request to `serde_json::Value` and indexes into it.
-    /// Uses `Box::leak` so the reference outlives the call — acceptable in tests
-    /// since each test process exits quickly.
-    impl<P: Serialize> std::ops::Index<&str> for JsonRpcRequest<P> {
-        type Output = serde_json::Value;
-
-        fn index(&self, key: &str) -> &Self::Output {
-            let value = Box::leak(Box::new(
-                serde_json::to_value(self).expect("JsonRpcRequest should serialize"),
-            ));
-            &value[key]
-        }
-    }
-
-    /// Allow indexing into `JsonRpcNotification` by string key for test assertions.
-    impl<P: Serialize> std::ops::Index<&str> for JsonRpcNotification<P> {
-        type Output = serde_json::Value;
-
-        fn index(&self, key: &str) -> &Self::Output {
-            let value = Box::leak(Box::new(
-                serde_json::to_value(self).expect("JsonRpcNotification should serialize"),
-            ));
-            &value[key]
-        }
-    }
-
     #[test]
     fn request_serializes_correctly() {
         let req = JsonRpcRequest::new(

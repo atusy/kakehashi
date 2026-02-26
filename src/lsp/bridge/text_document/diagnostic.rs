@@ -537,7 +537,8 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_diagnostic_request(&virtual_uri, RequestId::new(42), None);
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         let url = url::Url::parse(uri_str).expect("URI should be parseable");
         let filename = url
             .path_segments()
@@ -555,17 +556,18 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_diagnostic_request(&virtual_uri, RequestId::new(123), None);
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 123);
-        assert_eq!(request["method"], "textDocument/diagnostic");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 123);
+        assert_eq!(json["method"], "textDocument/diagnostic");
         // Diagnostic request has no position parameter (whole-document operation)
         assert!(
-            request["params"].get("position").is_none(),
+            json["params"].get("position").is_none(),
             "Diagnostic request should not have position parameter"
         );
         // Without previous_result_id, the field should be null (typed params serialize None as null)
         assert!(
-            request["params"]["previousResultId"].is_null(),
+            json["params"]["previousResultId"].is_null(),
             "Diagnostic request without previous_result_id should have null previousResultId"
         );
     }
@@ -576,7 +578,8 @@ mod tests {
         let request =
             build_diagnostic_request(&virtual_uri, RequestId::new(123), Some("prev-result-123"));
 
-        assert_eq!(request["params"]["previousResultId"], "prev-result-123");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["previousResultId"], "prev-result-123");
     }
 
     #[test]

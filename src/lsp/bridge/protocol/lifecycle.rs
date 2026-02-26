@@ -150,23 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn initialize_request_includes_bridge_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
-        let capabilities = &request["params"]["capabilities"];
-
-        // Should declare linkSupport for goto-family methods
-        assert_eq!(
-            capabilities["textDocument"]["definition"]["linkSupport"],
-            true
-        );
-        // Should declare hierarchical document symbol support
-        assert_eq!(
-            capabilities["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"],
-            true
-        );
-    }
-
-    #[test]
     fn initialize_request_includes_initialization_options() {
         let options = serde_json::json!({
             "settings": {
@@ -178,8 +161,9 @@ mod tests {
         let request =
             build_initialize_request(RequestId::new(42), Some(options.clone()), None, None, None);
 
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["params"]["initializationOptions"], options);
+        insta::assert_json_snapshot!(request, {
+            ".params.processId" => "[PID]",
+        });
     }
 
     #[test]
@@ -193,22 +177,16 @@ mod tests {
             None,
         );
 
-        assert_eq!(request["params"]["rootUri"], root_uri);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["rootUri"], root_uri);
     }
 
     #[test]
     fn initialize_request_has_null_root_uri_when_not_provided() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        assert!(request["params"]["rootUri"].is_null());
-    }
-
-    #[test]
-    fn initialize_request_includes_position_encoding() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
-        let general = &request["params"]["capabilities"]["general"];
-
-        assert_eq!(general["positionEncodings"], serde_json::json!(["utf-16"]));
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["params"]["rootUri"].is_null());
     }
 
     #[test]
@@ -219,30 +197,17 @@ mod tests {
         }];
         let request = build_initialize_request(RequestId::new(1), None, None, Some(folders), None);
 
-        assert_eq!(
-            request["params"]["workspaceFolders"],
-            serde_json::json!([{ "uri": "file:///home/user/project", "name": "project" }])
-        );
-    }
-
-    #[test]
-    fn initialize_request_includes_workspace_capabilities() {
-        let request = build_initialize_request(RequestId::new(1), None, None, None, None);
-        let workspace = &request["params"]["capabilities"]["workspace"];
-
-        // Only declare capabilities that the bridge actually handles
-        assert_eq!(workspace["diagnostics"]["refreshSupport"], true);
-        // workspaceFolders and configuration are NOT declared because
-        // the bridge doesn't implement the corresponding handlers
-        assert!(workspace.get("workspaceFolders").is_none());
-        assert!(workspace.get("configuration").is_none());
+        insta::assert_json_snapshot!(request, {
+            ".params.processId" => "[PID]",
+        });
     }
 
     #[test]
     fn initialize_request_has_null_workspace_folders_when_not_provided() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        assert!(request["params"]["workspaceFolders"].is_null());
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["params"]["workspaceFolders"].is_null());
     }
 
     #[test]
@@ -256,14 +221,16 @@ mod tests {
             None,
         );
 
-        assert_eq!(request["params"]["rootPath"], "/home/user/project");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["rootPath"], "/home/user/project");
     }
 
     #[test]
     fn initialize_request_has_null_root_path_when_no_root_uri() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        assert!(request["params"]["rootPath"].is_null());
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json["params"]["rootPath"].is_null());
     }
 
     #[test]
@@ -295,22 +262,10 @@ mod tests {
 
         let request =
             build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream));
-        let caps = &request["params"]["capabilities"];
 
-        // Merged fields should be present
-        assert_eq!(
-            caps["textDocument"]["completion"]["completionItem"]["documentationFormat"],
-            serde_json::json!(["markdown", "plaintext"])
-        );
-        assert_eq!(
-            caps["textDocument"]["completion"]["completionItem"]["resolveSupport"]["properties"],
-            serde_json::json!(["documentation"])
-        );
-        // Bridge-controlled fields unchanged
-        assert_eq!(
-            caps["textDocument"]["completion"]["completionItem"]["insertReplaceSupport"],
-            true
-        );
+        insta::assert_json_snapshot!(request, {
+            ".params.processId" => "[PID]",
+        });
     }
 
     #[test]
@@ -346,7 +301,8 @@ mod tests {
         let uri = "file:///project/kakehashi-virtual-uri-abc123.lua";
         let notification = build_didclose_notification(uri).expect("valid URI");
 
-        assert_eq!(notification["params"]["textDocument"]["uri"], uri);
+        let json = serde_json::to_value(&notification).unwrap();
+        assert_eq!(json["params"]["textDocument"]["uri"], uri);
     }
 
     // Tests for validate_initialize_response

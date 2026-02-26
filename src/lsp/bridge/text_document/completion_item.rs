@@ -254,11 +254,12 @@ mod tests {
         };
         let request = build_completion_resolve_request(&item, RequestId::new(7));
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 7i64);
-        assert_eq!(request["method"], "completionItem/resolve");
-        assert_eq!(request["params"]["label"], "print");
-        assert_eq!(request["params"]["data"]["resolve_id"], 99);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 7i64);
+        assert_eq!(json["method"], "completionItem/resolve");
+        assert_eq!(json["params"]["label"], "print");
+        assert_eq!(json["params"]["data"]["resolve_id"], 99);
     }
 
     // ==========================================================================

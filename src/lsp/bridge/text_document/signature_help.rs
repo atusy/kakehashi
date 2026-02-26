@@ -230,12 +230,13 @@ mod tests {
             test_request_id(),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         assert_eq!(
-            request["params"]["position"]["line"], 0,
+            json["params"]["position"]["line"], 0,
             "Underflow should saturate to line 0, not panic"
         );
         assert_eq!(
-            request["params"]["position"]["character"], 10,
+            json["params"]["position"]["character"], 10,
             "Character should remain unchanged"
         );
     }

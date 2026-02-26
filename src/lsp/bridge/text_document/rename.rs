@@ -283,7 +283,8 @@ mod tests {
             RequestId::new(1),
         );
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -316,14 +317,7 @@ mod tests {
             RequestId::new(42),
         );
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["method"], "textDocument/rename");
-        // Position translated: line 5 - 3 = 2
-        assert_eq!(request["params"]["position"]["line"], 2);
-        assert_eq!(request["params"]["position"]["character"], 10);
-        // newName included
-        assert_eq!(request["params"]["newName"], "renamedVariable");
+        insta::assert_json_snapshot!(request);
     }
 
     // ==========================================================================

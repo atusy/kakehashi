@@ -738,8 +738,9 @@ mod tests {
             test_request_id(),
         );
 
-        assert_eq!(request["params"]["position"]["line"], 0); // 5 - 5
-        assert_eq!(request["params"]["position"]["character"], 10); // 14 - 4
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 0); // 5 - 5
+        assert_eq!(json["params"]["position"]["character"], 10); // 14 - 4
     }
 
     #[test]
@@ -757,8 +758,9 @@ mod tests {
             test_request_id(),
         );
 
-        assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
-        assert_eq!(request["params"]["position"]["character"], 14); // unchanged
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 2); // 7 - 5
+        assert_eq!(json["params"]["position"]["character"], 14); // unchanged
     }
 
     #[test]

@@ -1,0 +1,19 @@
+---
+source: src/lsp/bridge/text_document/rename.rs
+expression: request
+---
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "textDocument/rename",
+  "params": {
+    "textDocument": {
+      "uri": "file:///project/kakehashi-virtual-uri-region-0.lua"
+    },
+    "position": {
+      "line": 2,
+      "character": 10
+    },
+    "newName": "renamedVariable"
+  }
+}

@@ -221,7 +221,8 @@ mod tests {
             RequestId::new(1),
         );
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -260,14 +261,15 @@ mod tests {
             RequestId::new(42),
         );
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["method"], "textDocument/inlayHint");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 42);
+        assert_eq!(json["method"], "textDocument/inlayHint");
         // Range translated: line 10 - 8 = 2, line 20 - 8 = 12
-        assert_eq!(request["params"]["range"]["start"]["line"], 2);
-        assert_eq!(request["params"]["range"]["start"]["character"], 5);
-        assert_eq!(request["params"]["range"]["end"]["line"], 12);
-        assert_eq!(request["params"]["range"]["end"]["character"], 30);
+        assert_eq!(json["params"]["range"]["start"]["line"], 2);
+        assert_eq!(json["params"]["range"]["start"]["character"], 5);
+        assert_eq!(json["params"]["range"]["end"]["line"], 12);
+        assert_eq!(json["params"]["range"]["end"]["character"], 30);
     }
 
     #[test]
@@ -296,12 +298,13 @@ mod tests {
             RequestId::new(1),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         // Start: virtual line 0 -> character 10 - 4 = 6
-        assert_eq!(request["params"]["range"]["start"]["line"], 0);
-        assert_eq!(request["params"]["range"]["start"]["character"], 6);
+        assert_eq!(json["params"]["range"]["start"]["line"], 0);
+        assert_eq!(json["params"]["range"]["start"]["character"], 6);
         // End: virtual line 3 -> character unchanged
-        assert_eq!(request["params"]["range"]["end"]["line"], 3);
-        assert_eq!(request["params"]["range"]["end"]["character"], 15);
+        assert_eq!(json["params"]["range"]["end"]["line"], 3);
+        assert_eq!(json["params"]["range"]["end"]["character"], 15);
     }
 
     #[test]
@@ -330,12 +333,13 @@ mod tests {
             RequestId::new(1),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         // Start: virtual line 2 -> character unchanged
-        assert_eq!(request["params"]["range"]["start"]["line"], 2);
-        assert_eq!(request["params"]["range"]["start"]["character"], 10);
+        assert_eq!(json["params"]["range"]["start"]["line"], 2);
+        assert_eq!(json["params"]["range"]["start"]["character"], 10);
         // End: virtual line 4 -> character unchanged
-        assert_eq!(request["params"]["range"]["end"]["line"], 4);
-        assert_eq!(request["params"]["range"]["end"]["character"], 15);
+        assert_eq!(json["params"]["range"]["end"]["line"], 4);
+        assert_eq!(json["params"]["range"]["end"]["character"], 15);
     }
 
     #[test]
@@ -364,9 +368,10 @@ mod tests {
             RequestId::new(1),
         );
 
+        let json = serde_json::to_value(&request).unwrap();
         // saturating_sub: 2 - 10 = 0, 5 - 10 = 0
-        assert_eq!(request["params"]["range"]["start"]["line"], 0);
-        assert_eq!(request["params"]["range"]["end"]["line"], 0);
+        assert_eq!(json["params"]["range"]["start"]["line"], 0);
+        assert_eq!(json["params"]["range"]["end"]["line"], 0);
     }
 
     // ==========================================================================

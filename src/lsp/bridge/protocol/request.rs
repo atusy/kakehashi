@@ -208,8 +208,9 @@ mod tests {
             "textDocument/completion",
         );
 
-        assert_eq!(request["params"]["position"]["line"], 0);
-        assert_eq!(request["params"]["position"]["character"], 6); // 10 - 4
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 0);
+        assert_eq!(json["params"]["position"]["character"], 6); // 10 - 4
     }
 
     #[test]
@@ -230,8 +231,9 @@ mod tests {
             "textDocument/completion",
         );
 
-        assert_eq!(request["params"]["position"]["line"], 2); // 7 - 5
-        assert_eq!(request["params"]["position"]["character"], 10); // unchanged
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 2); // 7 - 5
+        assert_eq!(json["params"]["position"]["character"], 10); // unchanged
     }
 
     #[test]
@@ -250,7 +252,8 @@ mod tests {
             "textDocument/completion",
         );
 
-        assert_eq!(request["params"]["position"]["line"], 0);
-        assert_eq!(request["params"]["position"]["character"], 0); // saturated
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 0);
+        assert_eq!(json["params"]["position"]["character"], 0); // saturated
     }
 }

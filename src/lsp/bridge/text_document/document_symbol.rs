@@ -271,7 +271,8 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_document_symbol_request(&virtual_uri, RequestId::new(42));
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -294,11 +295,12 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
         let request = build_document_symbol_request(&virtual_uri, RequestId::new(123));
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 123);
-        assert_eq!(request["method"], "textDocument/documentSymbol");
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["jsonrpc"], "2.0");
+        assert_eq!(json["id"], 123);
+        assert_eq!(json["method"], "textDocument/documentSymbol");
         assert!(
-            request["params"].get("position").is_none(),
+            json["params"].get("position").is_none(),
             "DocumentSymbol request should not have position parameter"
         );
     }
