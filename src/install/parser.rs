@@ -275,11 +275,7 @@ fn download_and_extract_archive(
         )));
     }
 
-    let bytes = response
-        .bytes()
-        .map_err(|e| ParserInstallError::ArchiveError(format!("Failed to read body: {}", e)))?;
-
-    let decoder = GzDecoder::new(bytes.as_ref());
+    let decoder = GzDecoder::new(response);
     let mut archive = Archive::new(decoder);
 
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
@@ -307,6 +303,17 @@ fn download_and_extract_archive(
         // Skip empty relative paths (the root directory itself)
         if relative.as_os_str().is_empty() {
             continue;
+        }
+
+        // Prevent path traversal attacks (zip slip)
+        if relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(ParserInstallError::ArchiveError(format!(
+                "Path traversal attempt detected in archive: {}",
+                relative.display()
+            )));
         }
 
         let target = dest.join(&relative);
