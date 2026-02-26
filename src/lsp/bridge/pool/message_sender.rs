@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use super::connection_handle::{ConnectionHandle, NotificationSendResult};
 use crate::lsp::bridge::actor::OutboundMessage;
+use crate::lsp::bridge::protocol::JsonRpcNotification;
 
 /// Abstraction for sending messages to a downstream language server.
 ///
@@ -31,22 +32,26 @@ use crate::lsp::bridge::actor::OutboundMessage;
 pub(crate) trait MessageSender: Send {
     /// Send a notification to the downstream language server.
     ///
-    /// Accepts any `Serialize` type (typed JSON-RPC messages or raw `serde_json::Value`).
+    /// Accepts typed `JsonRpcNotification<P>` to ensure callers provide
+    /// well-formed JSON-RPC 2.0 notification envelopes at compile time.
     /// Serialization to wire format happens internally.
     ///
     /// Notifications are fire-and-forget (no response expected). If the send
     /// fails (e.g., queue full or channel closed), the notification is lost
     /// but an error is returned.
-    fn send_notification(
+    fn send_notification<P: serde::Serialize + Send>(
         &mut self,
-        payload: impl serde::Serialize + Send,
+        notification: JsonRpcNotification<P>,
     ) -> impl std::future::Future<Output = io::Result<()>> + Send;
 }
 
 // Implementation for channel-based sends
 impl MessageSender for mpsc::Sender<OutboundMessage> {
-    async fn send_notification(&mut self, payload: impl serde::Serialize + Send) -> io::Result<()> {
-        let payload = serde_json::to_value(payload)
+    async fn send_notification<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        let payload = serde_json::to_value(notification)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         // Use try_send for non-blocking backpressure per ADR-0015
         self.try_send(OutboundMessage::Untracked(payload))
@@ -75,8 +80,11 @@ pub(crate) struct ConnectionHandleSender<'a>(pub(crate) &'a Arc<ConnectionHandle
 // - ChannelClosed -> BrokenPipe (terminal failure)
 // - SerializationFailed -> InvalidData (bug in caller)
 impl MessageSender for ConnectionHandleSender<'_> {
-    async fn send_notification(&mut self, payload: impl serde::Serialize + Send) -> io::Result<()> {
-        match self.0.send_notification(payload) {
+    async fn send_notification<P: serde::Serialize + Send>(
+        &mut self,
+        notification: JsonRpcNotification<P>,
+    ) -> io::Result<()> {
+        match self.0.send_notification(notification) {
             NotificationSendResult::Queued => Ok(()),
             NotificationSendResult::QueueFull => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -99,15 +107,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Helper to create a test notification.
+    fn test_notification(method: &'static str) -> JsonRpcNotification<serde_json::Value> {
+        JsonRpcNotification::new(method, json!({}))
+    }
+
     /// Test that mpsc::Sender implements MessageSender correctly (non-blocking).
     #[tokio::test]
     async fn channel_sender_sends_notification() {
         let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
         let mut sender: mpsc::Sender<OutboundMessage> = tx;
 
-        let payload = json!({"method": "textDocument/didChange"});
+        let notification = test_notification("textDocument/didChange");
+        let expected = serde_json::to_value(&notification).unwrap();
         sender
-            .send_notification(payload.clone())
+            .send_notification(notification)
             .await
             .expect("should send notification");
 
@@ -115,7 +129,7 @@ mod tests {
         let msg = rx.recv().await.expect("should receive message");
         match msg {
             OutboundMessage::Untracked(received) => {
-                assert_eq!(received, payload);
+                assert_eq!(received, expected);
             }
             _ => panic!("Expected Untracked variant"),
         }
@@ -130,12 +144,12 @@ mod tests {
 
         // Fill the channel
         sender
-            .send_notification(json!({"first": true}))
+            .send_notification(test_notification("first"))
             .await
             .expect("first send should succeed");
 
         // Second send should fail with WouldBlock
-        let result = sender.send_notification(json!({"second": true})).await;
+        let result = sender.send_notification(test_notification("second")).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
@@ -151,7 +165,7 @@ mod tests {
         // Drop the receiver to close the channel
         drop(rx);
 
-        let result = sender.send_notification(json!({"test": true})).await;
+        let result = sender.send_notification(test_notification("test")).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);

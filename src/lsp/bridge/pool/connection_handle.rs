@@ -33,7 +33,9 @@ use crate::lsp::bridge::actor::{
     OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ReaderTaskHandle, ResponseRouter, WriterTaskHandle,
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
-use crate::lsp::bridge::protocol::{RequestId, build_exit_notification, build_shutdown_request};
+use crate::lsp::bridge::protocol::{
+    JsonRpcNotification, JsonRpcRequest, RequestId, build_exit_notification, build_shutdown_request,
+};
 
 /// Result of attempting to send a notification.
 ///
@@ -213,6 +215,7 @@ impl ConnectionHandle {
     /// - `NotificationSendResult::Queued` if the notification was queued successfully
     /// - `NotificationSendResult::QueueFull` if the queue is full (temporary backpressure)
     /// - `NotificationSendResult::ChannelClosed` if the channel is closed (terminal failure)
+    /// - `NotificationSendResult::SerializationFailed` if the payload could not be serialized
     ///
     /// # Example
     ///
@@ -220,11 +223,11 @@ impl ConnectionHandle {
     /// let notification = build_initialized_notification();
     /// handle.send_notification(notification); // Fire-and-forget
     /// ```
-    pub(crate) fn send_notification(
+    pub(crate) fn send_notification<P: serde::Serialize>(
         &self,
-        payload: impl serde::Serialize,
+        notification: JsonRpcNotification<P>,
     ) -> NotificationSendResult {
-        let payload = match serde_json::to_value(payload) {
+        let payload = match serde_json::to_value(notification) {
             Ok(v) => v,
             Err(e) => {
                 log::error!(
@@ -267,7 +270,7 @@ impl ConnectionHandle {
     ///
     /// # Arguments
     ///
-    /// * `payload` - The JSON-RPC request payload
+    /// * `request` - The typed JSON-RPC request
     /// * `request_id` - The request ID (must be pre-registered with router)
     ///
     /// # Returns
@@ -289,12 +292,12 @@ impl ConnectionHandle {
     /// // Finally wait for response
     /// let response = handle.wait_for_response(request_id, response_rx).await?;
     /// ```
-    pub(crate) fn send_request(
+    pub(crate) fn send_request<P: serde::Serialize>(
         &self,
-        payload: impl serde::Serialize,
+        request: JsonRpcRequest<P>,
         request_id: RequestId,
     ) -> Result<(), BridgeError> {
-        let payload = match serde_json::to_value(payload) {
+        let payload = match serde_json::to_value(request) {
             Ok(v) => v,
             Err(e) => {
                 log::error!(
@@ -317,6 +320,35 @@ impl ConnectionHandle {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Clean up router registration on failure (idempotent)
+                self.router.remove(request_id);
+                Err(BridgeError::ChannelClosed)
+            }
+        }
+    }
+
+    /// Send a raw payload for echo-server tests.
+    ///
+    /// Echo-server tests need to send a message that, when echoed back, is
+    /// classified as a `Response` (has `id`, no `method`). Since `send_request`
+    /// only accepts typed `JsonRpcRequest<P>` (which always includes `method`),
+    /// this test helper bypasses the type constraint to send response-shaped
+    /// payloads through the channel.
+    #[cfg(test)]
+    pub(crate) fn send_raw_for_echo_test(
+        &self,
+        payload: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<(), BridgeError> {
+        match self.tx.try_send(OutboundMessage::Tracked {
+            payload,
+            request_id,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.router.remove(request_id);
+                Err(BridgeError::QueueFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.router.remove(request_id);
                 Err(BridgeError::ChannelClosed)
             }
@@ -913,7 +945,7 @@ mod tests {
         );
 
         // Can send notification via channel (ADR-0015)
-        let notification = serde_json::json!({"method": "test", "params": {}});
+        let notification = JsonRpcNotification::new("test", serde_json::json!({}));
         let result = handle.send_notification(notification);
         assert_eq!(
             result,
@@ -1168,13 +1200,9 @@ mod tests {
         // Send a response-shaped message that will be echoed back.
         // We deliberately omit "method" so the echo is classified as a Response
         // (not a ServerRequest), matching the routing expected by this test.
-        let request1 = json!({
-            "jsonrpc": "2.0",
-            "id": request_id1.as_i64(),
-            "result": null
-        });
+        let payload1 = json!({"jsonrpc": "2.0", "id": request_id1.as_i64(), "result": null});
         handle
-            .send_request(request1, request_id1)
+            .send_raw_for_echo_test(payload1, request_id1)
             .expect("should send request");
 
         // Wait 100ms (half the timeout), then check we received the response
@@ -1201,13 +1229,9 @@ mod tests {
         let (request_id2, response_rx2) = handle.register_request().expect("should register");
 
         // Send response-shaped message for echo (see first request comment)
-        let request2 = json!({
-            "jsonrpc": "2.0",
-            "id": request_id2.as_i64(),
-            "result": null
-        });
+        let payload2 = json!({"jsonrpc": "2.0", "id": request_id2.as_i64(), "result": null});
         handle
-            .send_request(request2, request_id2)
+            .send_raw_for_echo_test(payload2, request_id2)
             .expect("should send request");
 
         // Wait another 150ms - this is past the original 200ms timeout from the start
