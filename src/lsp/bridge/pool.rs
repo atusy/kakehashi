@@ -1028,6 +1028,8 @@ impl LanguageServerPool {
         let notification = JsonRpcNotification::new(
             "$/cancelRequest",
             CancelParams {
+                // Safe: IDs are generated from an atomic counter starting at 0,
+                // well within i32 range. ls-types constrains Number to i32.
                 id: NumberOrString::Number(downstream_id.as_i64() as i32),
             },
         );
