@@ -1,11 +1,13 @@
 //! Parser compilation and installation.
 //!
 //! This module handles cloning parser repositories, compiling them with
-//! tree-sitter CLI, and installing the resulting shared library.
+//! tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use tree_sitter_loader::Loader;
 
 use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
@@ -16,8 +18,6 @@ pub enum ParserInstallError {
     MetadataError(MetadataError),
     /// Git operation failed.
     GitError(String),
-    /// tree-sitter CLI not found.
-    TreeSitterNotFound,
     /// Compilation failed.
     CompileError(String),
     /// File system operation failed.
@@ -31,12 +31,6 @@ impl std::fmt::Display for ParserInstallError {
         match self {
             Self::MetadataError(e) => write!(f, "{}", e),
             Self::GitError(msg) => write!(f, "Git error: {}", msg),
-            Self::TreeSitterNotFound => {
-                write!(
-                    f,
-                    "tree-sitter CLI not found. Install with: cargo install tree-sitter-cli"
-                )
-            }
             Self::CompileError(msg) => write!(f, "Compilation error: {}", msg),
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::AlreadyExists(path) => {
@@ -86,29 +80,6 @@ pub struct InstallOptions {
     pub no_cache: bool,
 }
 
-/// Find the tree-sitter CLI executable.
-fn find_tree_sitter() -> Option<PathBuf> {
-    // Check common locations
-    let paths = [
-        // Cargo bin directory
-        dirs::home_dir().map(|h| h.join(".cargo/bin/tree-sitter")),
-        // System PATH
-        which_tree_sitter(),
-    ];
-
-    paths.into_iter().flatten().find(|path| path.exists())
-}
-
-/// Try to find tree-sitter in PATH.
-fn which_tree_sitter() -> Option<PathBuf> {
-    Command::new("which")
-        .arg("tree-sitter")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
-}
-
 /// Check if a parser file exists for the given language.
 ///
 /// Returns the path to the parser file if it exists, None otherwise.
@@ -124,6 +95,15 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Compile a Tree-sitter parser from source using tree-sitter-loader.
+fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+    let loader =
+        Loader::with_parser_lib_path(output_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+    loader
+        .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
+        .map_err(|e| ParserInstallError::CompileError(e.to_string()))
+}
+
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
     language: &str,
@@ -135,13 +115,6 @@ pub fn install_parser(
     // Check if parser already exists
     if parser_file.exists() && !options.force {
         return Err(ParserInstallError::AlreadyExists(parser_file));
-    }
-
-    // Find tree-sitter CLI
-    let tree_sitter = find_tree_sitter().ok_or(ParserInstallError::TreeSitterNotFound)?;
-
-    if options.verbose {
-        eprintln!("Using tree-sitter at: {}", tree_sitter.display());
     }
 
     // Fetch metadata (with caching support)
@@ -180,19 +153,9 @@ pub fn install_parser(
         eprintln!("Building parser in: {}", source_dir.display());
     }
 
-    // Build the parser
-    build_parser(&tree_sitter, &source_dir, options.verbose)?;
-
-    // Find the built library
-    let built_lib = find_built_library(&source_dir)?;
-
-    if options.verbose {
-        eprintln!("Built library: {}", built_lib.display());
-    }
-
-    // Create parser directory and copy the library
+    // Compile the parser directly to the install path
     fs::create_dir_all(&parser_dir)?;
-    fs::copy(&built_lib, &parser_file)?;
+    compile_parser(&source_dir, &parser_file)?;
 
     if options.verbose {
         eprintln!("Installed to: {}", parser_file.display());
@@ -257,59 +220,6 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     Ok(())
 }
 
-/// Build the parser using tree-sitter CLI.
-fn build_parser(
-    tree_sitter: &Path,
-    source_dir: &Path,
-    verbose: bool,
-) -> Result<(), ParserInstallError> {
-    let mut cmd = Command::new(tree_sitter);
-    cmd.current_dir(source_dir).arg("build");
-
-    let output = cmd
-        .output()
-        .map_err(|e| ParserInstallError::CompileError(e.to_string()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        if verbose {
-            eprintln!("Build stdout: {}", stdout);
-            eprintln!("Build stderr: {}", stderr);
-        }
-
-        return Err(ParserInstallError::CompileError(format!(
-            "tree-sitter build failed: {}",
-            stderr
-        )));
-    }
-
-    Ok(())
-}
-
-/// Find the built shared library in the source directory.
-fn find_built_library(source_dir: &Path) -> Result<PathBuf, ParserInstallError> {
-    let ext = std::env::consts::DLL_EXTENSION;
-
-    // tree-sitter build creates the library in the current directory
-    // with a name like "libtree-sitter-lua.dylib" or just the language name
-    for entry in fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some(extension) = path.extension()
-            && extension == ext
-        {
-            return Ok(path);
-        }
-    }
-
-    Err(ParserInstallError::CompileError(format!(
-        "No .{} file found after build",
-        ext
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,14 +229,6 @@ mod tests {
     fn test_dll_extension_is_valid() {
         let ext = std::env::consts::DLL_EXTENSION;
         assert!(ext == "so" || ext == "dylib" || ext == "dll");
-    }
-
-    #[test]
-    fn test_find_tree_sitter_exists() {
-        // This test may fail if tree-sitter is not installed
-        // but that's okay - it's testing the search logic
-        let _result = find_tree_sitter();
-        // Just verify it doesn't panic
     }
 
     #[test]
@@ -395,10 +297,9 @@ mod tests {
         )
         .expect("clone should succeed");
 
-        let output_path = temp.path().join(format!(
-            "json.{}",
-            std::env::consts::DLL_EXTENSION
-        ));
+        let output_path = temp
+            .path()
+            .join(format!("json.{}", std::env::consts::DLL_EXTENSION));
 
         compile_parser(&clone_dir, &output_path).expect("compile should succeed");
 
