@@ -204,7 +204,8 @@ mod tests {
             RequestId::new(42),
         );
 
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
         assert!(
             VirtualDocumentUri::is_virtual_uri(uri_str),
             "Request should use a virtual URI: {}",
@@ -252,7 +253,8 @@ mod tests {
             RequestId::new(42),
         );
 
-        let range = &request["params"]["range"];
+        let json = serde_json::to_value(&request).unwrap();
+        let range = &json["params"]["range"];
         assert_eq!(
             range["start"]["line"], 2,
             "Start line should be translated from 5 to 2 (5-3)"
@@ -304,13 +306,7 @@ mod tests {
             RequestId::new(42),
         );
 
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["method"], "textDocument/colorPresentation");
-        assert_eq!(request["params"]["color"]["red"], 0.5);
-        assert_eq!(request["params"]["color"]["green"], 0.25);
-        assert_eq!(request["params"]["color"]["blue"], 0.75);
-        assert_eq!(request["params"]["color"]["alpha"], 1.0);
+        insta::assert_json_snapshot!(request);
     }
 
     #[test]
@@ -347,7 +343,8 @@ mod tests {
             RequestId::new(42),
         );
 
-        let range = &request["params"]["range"];
+        let json = serde_json::to_value(&request).unwrap();
+        let range = &json["params"]["range"];
         // Virtual line 0 -> character adjusted: 10 - 5 = 5, 17 - 5 = 12
         assert_eq!(range["start"]["line"], 0);
         assert_eq!(range["start"]["character"], 5);
@@ -389,7 +386,8 @@ mod tests {
             RequestId::new(42),
         );
 
-        let range = &request["params"]["range"];
+        let json = serde_json::to_value(&request).unwrap();
+        let range = &json["params"]["range"];
         // Virtual line 2 -> character unchanged
         assert_eq!(range["start"]["line"], 2);
         assert_eq!(range["start"]["character"], 10);
@@ -432,7 +430,8 @@ mod tests {
             RequestId::new(42),
         );
 
-        let range = &request["params"]["range"];
+        let json = serde_json::to_value(&request).unwrap();
+        let range = &json["params"]["range"];
         assert_eq!(
             range["start"]["line"], 0,
             "Start line underflow should saturate to 0"
