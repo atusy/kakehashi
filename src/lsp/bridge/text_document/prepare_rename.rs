@@ -45,6 +45,13 @@ impl LanguageServerPool {
             .get_or_create_connection(server_name, server_config)
             .await?;
         if !handle.has_capability("textDocument/prepareRename") {
+            // Returning None would cause clients to treat the symbol as "not renameable",
+            // silently disabling rename for servers that only advertise textDocument/rename.
+            if handle.has_capability("textDocument/rename") {
+                return Ok(Some(PrepareRenameResponse::DefaultBehavior {
+                    default_behavior: true,
+                }));
+            }
             return Ok(None);
         }
         self.execute_bridge_request_with_handle(
