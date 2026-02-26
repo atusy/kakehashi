@@ -345,4 +345,76 @@ mod tests {
 
         assert!(dest.exists(), "Clone directory should exist");
     }
+
+    #[test]
+    fn test_github_archive_url_from_standard_repo() {
+        let url =
+            github_archive_url("https://github.com/tree-sitter/tree-sitter-json", "v0.24.8");
+        assert_eq!(
+            url,
+            Some(
+                "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_github_archive_url_from_commit_hash() {
+        let url = github_archive_url(
+            "https://github.com/tree-sitter/tree-sitter-json",
+            "abc123def456",
+        );
+        assert_eq!(
+            url,
+            Some(
+                "https://github.com/tree-sitter/tree-sitter-json/archive/abc123def456.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_github_archive_url_strips_dot_git_suffix() {
+        let url = github_archive_url(
+            "https://github.com/tree-sitter/tree-sitter-json.git",
+            "v0.24.8",
+        );
+        assert_eq!(
+            url,
+            Some(
+                "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_github_archive_url_returns_none_for_non_github() {
+        let url = github_archive_url("https://gitlab.com/foo/bar", "v1.0.0");
+        assert!(url.is_none());
+    }
+
+    #[test]
+    fn test_github_archive_url_returns_none_for_ssh() {
+        let url =
+            github_archive_url("git@github.com:tree-sitter/tree-sitter-json.git", "v1.0.0");
+        assert!(url.is_none());
+    }
+
+    #[test]
+    fn test_repo_name_from_url() {
+        assert_eq!(
+            repo_name_from_url("https://github.com/tree-sitter/tree-sitter-json"),
+            Some("tree-sitter-json".to_string())
+        );
+        assert_eq!(
+            repo_name_from_url("https://github.com/tree-sitter/tree-sitter-json.git"),
+            Some("tree-sitter-json".to_string())
+        );
+        assert_eq!(
+            repo_name_from_url("https://github.com/tree-sitter-grammars/tree-sitter-markdown"),
+            Some("tree-sitter-markdown".to_string())
+        );
+    }
 }
