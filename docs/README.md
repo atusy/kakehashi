@@ -44,9 +44,8 @@ kakehashi automatically compiles Tree-sitter parsers from source, which requires
 
 | Dependency | Purpose | Installation |
 |------------|---------|--------------|
-| **tree-sitter CLI** | Compiles parser grammars into shared libraries | `cargo install tree-sitter-cli` |
 | **Git** | Clones parser repositories during installation | Usually pre-installed |
-| **C Compiler** | Required by tree-sitter CLI for compilation | See platform-specific instructions |
+| **C Compiler** | Compiles parser grammars into shared libraries | See platform-specific instructions |
 
 ### C Compiler Installation
 
@@ -61,9 +60,6 @@ kakehashi automatically compiles Tree-sitter parsers from source, which requires
 ### Verifying Installation
 
 ```bash
-# Check tree-sitter CLI
-tree-sitter --version
-
 # Check C compiler
 cc --version  # or gcc --version / clang --version
 

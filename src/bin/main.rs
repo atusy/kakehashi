@@ -198,7 +198,7 @@ fn run_language_status(data_dir: Option<PathBuf>, verbose: bool) {
             let path = entry.path();
             let is_parser = path
                 .extension()
-                .map(|ext| ext == "so" || ext == "dylib" || ext == "dll")
+                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
                 .unwrap_or(false);
             if is_parser && let Some(stem) = path.file_stem() {
                 languages.insert(stem.to_string_lossy().to_string());
@@ -287,7 +287,7 @@ fn run_language_uninstall(
                 let path = entry.path();
                 let is_parser = path
                     .extension()
-                    .map(|ext| ext == "so" || ext == "dylib" || ext == "dll")
+                    .map(|ext| ext == std::env::consts::DLL_EXTENSION)
                     .unwrap_or(false);
                 if is_parser && let Some(stem) = path.file_stem() {
                     languages.insert(stem.to_string_lossy().to_string());
@@ -387,15 +387,10 @@ fn run_language_uninstall(
     }
 }
 
-/// Find the parser file for a language (handles .so, .dylib, .dll extensions)
+/// Find the parser file for a language.
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
-    for ext in &["dylib", "so", "dll"] {
-        let path = parser_dir.join(format!("{}.{}", lang, ext));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
+    let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
+    if path.exists() { Some(path) } else { None }
 }
 
 /// Run the config init command

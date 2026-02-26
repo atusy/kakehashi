@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted |
+| **Status** | superseded by [ADR-0022](0022-replace-tree-sitter-cli-with-loader.md) |
 | **Date** | 2025-12-18 |
 | **Decision-makers** | atusy |
 | **Consulted** | Claude Code |

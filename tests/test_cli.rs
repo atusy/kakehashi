@@ -482,7 +482,8 @@ fn test_language_status_shows_installed() {
     fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
     fs::create_dir_all(format!("{}/queries/testlang", test_dir))
         .expect("Failed to create queries dir");
-    fs::write(format!("{}/parser/testlang.dylib", test_dir), "fake")
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(format!("{}/parser/testlang.{ext}", test_dir), "fake")
         .expect("Failed to write parser");
     fs::write(
         format!("{}/queries/testlang/highlights.scm", test_dir),
@@ -525,7 +526,8 @@ fn test_language_status_missing_queries() {
     // Clean up and setup with parser only (no queries)
     let _ = fs::remove_dir_all(test_dir);
     fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
-    fs::write(format!("{}/parser/incomplete.so", test_dir), "fake")
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(format!("{}/parser/incomplete.{ext}", test_dir), "fake")
         .expect("Failed to write parser");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
@@ -594,7 +596,8 @@ fn test_language_uninstall_removes_files() {
     fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
     fs::create_dir_all(format!("{}/queries/testlang", test_dir))
         .expect("Failed to create queries dir");
-    fs::write(format!("{}/parser/testlang.dylib", test_dir), "fake")
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(format!("{}/parser/testlang.{ext}", test_dir), "fake")
         .expect("Failed to write parser");
     fs::write(
         format!("{}/queries/testlang/highlights.scm", test_dir),
@@ -623,7 +626,7 @@ fn test_language_uninstall_removes_files() {
 
     // Parser should be removed
     assert!(
-        !std::path::Path::new(&format!("{}/parser/testlang.dylib", test_dir)).exists(),
+        !std::path::Path::new(&format!("{}/parser/testlang.{ext}", test_dir)).exists(),
         "Parser should be removed"
     );
 
@@ -651,8 +654,9 @@ fn test_language_uninstall_all() {
         .expect("Failed to create queries dir");
     fs::create_dir_all(format!("{}/queries/lang2", test_dir))
         .expect("Failed to create queries dir");
-    fs::write(format!("{}/parser/lang1.so", test_dir), "fake").expect("Failed to write parser");
-    fs::write(format!("{}/parser/lang2.dylib", test_dir), "fake").expect("Failed to write parser");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(format!("{}/parser/lang1.{ext}", test_dir), "fake").expect("Failed to write parser");
+    fs::write(format!("{}/parser/lang2.{ext}", test_dir), "fake").expect("Failed to write parser");
     fs::write(
         format!("{}/queries/lang1/highlights.scm", test_dir),
         "(comment) @comment",
@@ -712,7 +716,8 @@ fn test_language_uninstall_cancel() {
     // Clean up and setup
     let _ = fs::remove_dir_all(test_dir);
     fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
-    fs::write(format!("{}/parser/testlang.dylib", test_dir), "fake")
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(format!("{}/parser/testlang.{ext}", test_dir), "fake")
         .expect("Failed to write parser");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
@@ -744,7 +749,7 @@ fn test_language_uninstall_cancel() {
 
     // Parser should still exist
     assert!(
-        std::path::Path::new(&format!("{}/parser/testlang.dylib", test_dir)).exists(),
+        std::path::Path::new(&format!("{}/parser/testlang.{ext}", test_dir)).exists(),
         "Parser should still exist after cancellation"
     );
 
