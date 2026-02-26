@@ -97,8 +97,16 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
 
 /// Compile a Tree-sitter parser from source using tree-sitter-loader.
 fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
-    let loader =
-        Loader::with_parser_lib_path(output_path.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let parent_dir = output_path.parent().ok_or_else(|| {
+        ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Could not determine parent directory for output path '{}'",
+                output_path.display()
+            ),
+        ))
+    })?;
+    let loader = Loader::with_parser_lib_path(parent_dir.to_path_buf());
     loader
         .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
