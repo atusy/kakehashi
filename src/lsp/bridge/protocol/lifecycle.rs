@@ -140,12 +140,22 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    fn feature_suffix() -> &'static str {
+        if cfg!(feature = "experimental") {
+            "experimental"
+        } else {
+            "default"
+        }
+    }
+
     #[test]
     fn initialize_request_has_correct_structure() {
         let request = build_initialize_request(RequestId::new(1), None, None, None, None);
 
-        insta::assert_json_snapshot!(request, {
-            ".params.processId" => "[PID]",
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
         });
     }
 
@@ -161,8 +171,10 @@ mod tests {
         let request =
             build_initialize_request(RequestId::new(42), Some(options.clone()), None, None, None);
 
-        insta::assert_json_snapshot!(request, {
-            ".params.processId" => "[PID]",
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
         });
     }
 
@@ -197,8 +209,10 @@ mod tests {
         }];
         let request = build_initialize_request(RequestId::new(1), None, None, Some(folders), None);
 
-        insta::assert_json_snapshot!(request, {
-            ".params.processId" => "[PID]",
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
         });
     }
 
@@ -263,8 +277,10 @@ mod tests {
         let request =
             build_initialize_request(RequestId::new(1), None, None, None, Some(&upstream));
 
-        insta::assert_json_snapshot!(request, {
-            ".params.processId" => "[PID]",
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(request, {
+                ".params.processId" => "[PID]",
+            });
         });
     }
 

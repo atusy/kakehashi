@@ -239,10 +239,20 @@ pub(super) fn build_bridge_client_capabilities(
 mod tests {
     use super::*;
 
+    fn feature_suffix() -> &'static str {
+        if cfg!(feature = "experimental") {
+            "experimental"
+        } else {
+            "default"
+        }
+    }
+
     #[test]
     fn bridge_client_capabilities_snapshot() {
         let capabilities = build_bridge_client_capabilities(None);
-        insta::assert_json_snapshot!(capabilities);
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(capabilities);
+        });
     }
 
     #[test]
@@ -594,6 +604,8 @@ mod tests {
         };
 
         let merged = build_bridge_client_capabilities(Some(&upstream));
-        insta::assert_json_snapshot!(merged);
+        insta::with_settings!({snapshot_suffix => feature_suffix()}, {
+            insta::assert_json_snapshot!(merged);
+        });
     }
 }
