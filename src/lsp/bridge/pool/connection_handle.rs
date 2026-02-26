@@ -23,7 +23,8 @@ use log::warn;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-    ImplementationProviderCapability, OneOf, ServerCapabilities, TypeDefinitionProviderCapability,
+    ImplementationProviderCapability, OneOf, RenameOptions, ServerCapabilities,
+    TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -569,6 +570,13 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/prepareRename" => matches!(
+                caps.rename_provider,
+                Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    ..
+                }))
+            ),
             "textDocument/moniker" => {
                 matches!(
                     caps.moniker_provider,
@@ -1782,6 +1790,15 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/prepareRename",
+                Box::new(|c| {
+                    c.rename_provider = Some(OneOf::Right(RenameOptions {
+                        prepare_provider: Some(true),
+                        work_done_progress_options: Default::default(),
+                    }));
+                }),
+            ),
+            (
                 "textDocument/moniker",
                 Box::new(|c| {
                     c.moniker_provider = Some(OneOf::Left(true));
@@ -1938,6 +1955,13 @@ mod tests {
                 }),
             ),
             (
+                "textDocument/prepareRename",
+                Box::new(|c| {
+                    // rename supported but prepareRename not advertised
+                    c.rename_provider = Some(OneOf::Left(true));
+                }),
+            ),
+            (
                 "textDocument/moniker",
                 Box::new(|c| {
                     c.moniker_provider = Some(OneOf::Left(false));
@@ -1994,6 +2018,7 @@ mod tests {
             "textDocument/signatureHelp",
             "textDocument/documentLink",
             "textDocument/rename",
+            "textDocument/prepareRename",
             "textDocument/moniker",
             "textDocument/inlayHint",
             "textDocument/documentColor",

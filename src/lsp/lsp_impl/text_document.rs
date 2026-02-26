@@ -16,6 +16,7 @@ mod hover;
 mod implementation;
 mod inlay_hint;
 mod moniker;
+mod prepare_rename;
 pub(crate) mod publish_diagnostic;
 mod references;
 mod rename;
