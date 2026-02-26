@@ -44,8 +44,15 @@ kakehashi automatically compiles Tree-sitter parsers from source, which requires
 
 | Dependency | Purpose | Installation |
 |------------|---------|--------------|
-| **Git** | Clones parser repositories during installation | Usually pre-installed |
 | **C Compiler** | Compiles parser grammars into shared libraries | See platform-specific instructions |
+
+### Optional Dependencies
+
+| Dependency | Purpose | Installation |
+|------------|---------|--------------|
+| **Git** | Fallback for non-GitHub parser repositories | Usually pre-installed |
+
+Parser source code is downloaded via HTTP from GitHub archives. Git is only needed as a fallback for parsers hosted outside GitHub.
 
 ### C Compiler Installation
 
@@ -62,9 +69,6 @@ kakehashi automatically compiles Tree-sitter parsers from source, which requires
 ```bash
 # Check C compiler
 cc --version  # or gcc --version / clang --version
-
-# Check git
-git --version
 ```
 
 If any command fails, install the missing dependency before using kakehashi.
