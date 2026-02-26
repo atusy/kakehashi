@@ -62,8 +62,8 @@ Download the latest release for your platform from [GitHub Releases](https://git
 
 Prepare the following, and kakehashi will auto-install Tree-sitter parsers and queries as needed:
 
-- Git
 - C compiler
+- Git (optional — only needed for non-GitHub parser repositories)
 
 ---
 
