@@ -1541,6 +1541,27 @@ kind = "injections""#;
     }
 
     #[test]
+    fn should_parse_max_fan_out_with_value() {
+        let json = r#"{ "maxFanOut": 2 }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_fan_out, Some(2));
+    }
+
+    #[test]
+    fn should_parse_max_fan_out_null_as_none() {
+        let json = r#"{ "maxFanOut": null }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_fan_out, None);
+    }
+
+    #[test]
+    fn should_parse_max_fan_out_absent_as_none() {
+        let json = r#"{}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_fan_out, None);
+    }
+
+    #[test]
     fn should_parse_aggregation_strategy_from_toml() {
         let toml_str = r#"strategy = "preferred""#;
         let config: AggregationConfig = toml::from_str(toml_str).unwrap();
