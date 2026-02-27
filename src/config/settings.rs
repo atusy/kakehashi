@@ -82,6 +82,19 @@ impl BridgeLanguageConfig {
             .unwrap_or_default()
     }
 
+    /// Resolve max fan-out for a specific LSP method.
+    ///
+    /// Falls back to wildcard `"_"` key, then `None` (no limit).
+    /// Negative values are treated as no limit (`None`).
+    pub(crate) fn resolve_max_fan_out(&self, method: &str) -> Option<usize> {
+        let map = self.aggregation.as_ref()?;
+        let raw = map
+            .get(method)
+            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .and_then(|c| c.max_fan_out)?;
+        if raw < 0 { None } else { Some(raw as usize) }
+    }
+
     /// Resolve aggregation strategy for a specific LSP method.
     ///
     /// Falls back to wildcard `"_"` key, then `default`.
