@@ -12,6 +12,7 @@ use tokio::task::JoinSet;
 use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::bridge::RegionOffset;
+use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::bridge::UpstreamId;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
@@ -40,6 +41,22 @@ pub(crate) struct FanOutTask {
 pub(crate) struct TaggedResult<T> {
     pub(crate) server_name: String,
     pub(crate) value: io::Result<T>,
+}
+
+/// Select which servers to fan out to, respecting priority ordering and max fan-out limit.
+///
+/// When `max_fan_out` is `None`, all configs are returned (in priority order).
+/// When `max_fan_out` is `Some(0)`, an empty list is returned (fan-out disabled).
+/// When `max_fan_out` is `Some(n)`, at most `n` configs are returned.
+///
+/// Priority servers appear first (in the order listed in `priorities`),
+/// followed by remaining servers in their original order.
+pub(crate) fn select_servers(
+    configs: &[ResolvedServerConfig],
+    priorities: &[String],
+    max_fan_out: Option<usize>,
+) -> Vec<ResolvedServerConfig> {
+    todo!()
 }
 
 /// Spawn one task per matching server, returning a `JoinSet` for collection.
@@ -87,4 +104,109 @@ where
         });
     }
     join_set
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(name: &str) -> ResolvedServerConfig {
+        ResolvedServerConfig {
+            server_name: name.to_string(),
+            config: Arc::new(BridgeServerConfig {
+                cmd: vec![name.to_string()],
+                languages: vec![],
+                initialization_options: None,
+                workspace_type: None,
+            }),
+        }
+    }
+
+    fn names(configs: &[ResolvedServerConfig]) -> Vec<&str> {
+        configs.iter().map(|c| c.server_name.as_str()).collect()
+    }
+
+    #[test]
+    fn select_servers_no_limit_returns_all() {
+        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let result = select_servers(&configs, &[], None);
+        assert_eq!(names(&result), &["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn select_servers_zero_returns_empty() {
+        let configs = vec![make_config("alpha"), make_config("beta")];
+        let result = select_servers(&configs, &[], Some(0));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn select_servers_truncates_to_n() {
+        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let result = select_servers(&configs, &[], Some(2));
+        assert_eq!(names(&result), &["alpha", "beta"]);
+    }
+
+    #[test]
+    fn select_servers_priority_servers_first() {
+        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let priorities = vec!["gamma".to_string(), "alpha".to_string()];
+        let result = select_servers(&configs, &priorities, None);
+        assert_eq!(names(&result), &["gamma", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn select_servers_non_priority_order_preserved() {
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
+            make_config("delta"),
+        ];
+        let priorities = vec!["gamma".to_string()];
+        let result = select_servers(&configs, &priorities, None);
+        // gamma first (priority), then remaining in original order
+        assert_eq!(names(&result), &["gamma", "alpha", "beta", "delta"]);
+    }
+
+    #[test]
+    fn select_servers_truncate_after_priority_reordering() {
+        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let priorities = vec!["gamma".to_string()];
+        let result = select_servers(&configs, &priorities, Some(2));
+        assert_eq!(names(&result), &["gamma", "alpha"]);
+    }
+
+    #[test]
+    fn select_servers_limit_larger_than_configs_returns_all() {
+        let configs = vec![make_config("alpha"), make_config("beta")];
+        let result = select_servers(&configs, &[], Some(10));
+        assert_eq!(names(&result), &["alpha", "beta"]);
+    }
+
+    #[test]
+    fn select_servers_unknown_priority_ignored() {
+        let configs = vec![make_config("alpha"), make_config("beta")];
+        let priorities = vec!["unknown".to_string(), "alpha".to_string()];
+        let result = select_servers(&configs, &priorities, None);
+        assert_eq!(names(&result), &["alpha", "beta"]);
+    }
+
+    #[test]
+    fn select_servers_empty_configs_returns_empty() {
+        let result = select_servers(&[], &["alpha".to_string()], Some(5));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn select_servers_all_in_priorities_uses_priority_order() {
+        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let priorities = vec![
+            "gamma".to_string(),
+            "beta".to_string(),
+            "alpha".to_string(),
+        ];
+        let result = select_servers(&configs, &priorities, None);
+        assert_eq!(names(&result), &["gamma", "beta", "alpha"]);
+    }
 }
