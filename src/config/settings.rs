@@ -45,6 +45,10 @@ pub(crate) struct AggregationConfig {
     /// Aggregation strategy override. `None` = use handler default.
     #[serde(default)]
     pub(crate) strategy: Option<AggregationStrategy>,
+    /// Maximum number of servers to fan out to. `None` = no limit.
+    /// `Some(0)` disables fan-out. Negative values are treated as no limit.
+    #[serde(default, rename = "maxFanOut")]
+    pub(crate) max_fan_out: Option<i64>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -1481,6 +1485,7 @@ kind = "injections""#;
                 AggregationConfig {
                     priorities: vec!["server_a".to_string()],
                     strategy: None,
+                    ..Default::default()
                 },
             )])),
         };

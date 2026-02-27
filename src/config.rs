@@ -3157,6 +3157,7 @@ mod tests {
                     settings::AggregationConfig {
                         priorities: vec!["ruff".to_string()],
                         strategy: Some(settings::AggregationStrategy::Concatenated),
+                        ..Default::default()
                     },
                 )])),
             },
@@ -3172,6 +3173,7 @@ mod tests {
                     settings::AggregationConfig {
                         priorities: vec!["pyright".to_string()],
                         strategy: Some(settings::AggregationStrategy::Preferred),
+                        ..Default::default()
                     },
                 )])),
             },
