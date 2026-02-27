@@ -92,7 +92,7 @@ impl BridgeLanguageConfig {
             .get(method)
             .or_else(|| map.get(crate::config::WILDCARD_KEY))
             .and_then(|c| c.max_fan_out)?;
-        if raw < 0 { None } else { Some(raw as usize) }
+        usize::try_from(raw).ok()
     }
 
     /// Resolve aggregation strategy for a specific LSP method.

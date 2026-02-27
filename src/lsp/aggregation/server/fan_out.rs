@@ -56,7 +56,37 @@ pub(crate) fn select_servers(
     priorities: &[String],
     max_fan_out: Option<usize>,
 ) -> Vec<ResolvedServerConfig> {
-    todo!()
+    let mut result: Vec<ResolvedServerConfig> = Vec::with_capacity(configs.len());
+    let mut added: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(configs.len());
+
+    // Build a map for O(1) lookup of configs by server name
+    let config_map: std::collections::HashMap<&str, &ResolvedServerConfig> = configs
+        .iter()
+        .map(|c| (c.server_name.as_str(), c))
+        .collect();
+
+    // Add priority servers in priority order (skip unknown/duplicate names)
+    for name in priorities {
+        if let Some(cfg) = config_map.get(name.as_str())
+            && added.insert(&cfg.server_name)
+        {
+            result.push((*cfg).clone());
+        }
+    }
+
+    // Add remaining servers in their original order
+    for cfg in configs {
+        if !added.contains(cfg.server_name.as_str()) {
+            result.push(cfg.clone());
+        }
+    }
+
+    // Truncate to max_fan_out if specified
+    if let Some(limit) = max_fan_out {
+        result.truncate(limit);
+    }
+    result
 }
 
 /// Spawn one task per matching server, returning a `JoinSet` for collection.
@@ -128,7 +158,11 @@ mod tests {
 
     #[test]
     fn select_servers_no_limit_returns_all() {
-        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
+        ];
         let result = select_servers(&configs, &[], None);
         assert_eq!(names(&result), &["alpha", "beta", "gamma"]);
     }
@@ -142,14 +176,22 @@ mod tests {
 
     #[test]
     fn select_servers_truncates_to_n() {
-        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
+        ];
         let result = select_servers(&configs, &[], Some(2));
         assert_eq!(names(&result), &["alpha", "beta"]);
     }
 
     #[test]
     fn select_servers_priority_servers_first() {
-        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
+        ];
         let priorities = vec!["gamma".to_string(), "alpha".to_string()];
         let result = select_servers(&configs, &priorities, None);
         assert_eq!(names(&result), &["gamma", "alpha", "beta"]);
@@ -171,7 +213,11 @@ mod tests {
 
     #[test]
     fn select_servers_truncate_after_priority_reordering() {
-        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
+        ];
         let priorities = vec!["gamma".to_string()];
         let result = select_servers(&configs, &priorities, Some(2));
         assert_eq!(names(&result), &["gamma", "alpha"]);
@@ -199,13 +245,26 @@ mod tests {
     }
 
     #[test]
-    fn select_servers_all_in_priorities_uses_priority_order() {
-        let configs = vec![make_config("alpha"), make_config("beta"), make_config("gamma")];
-        let priorities = vec![
-            "gamma".to_string(),
-            "beta".to_string(),
-            "alpha".to_string(),
+    fn select_servers_duplicate_priority_added_only_once() {
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
         ];
+        let priorities = vec!["alpha".to_string(), "alpha".to_string(), "beta".to_string()];
+        let result = select_servers(&configs, &priorities, None);
+        // alpha should appear only once despite being in priorities twice
+        assert_eq!(names(&result), &["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn select_servers_all_in_priorities_uses_priority_order() {
+        let configs = vec![
+            make_config("alpha"),
+            make_config("beta"),
+            make_config("gamma"),
+        ];
+        let priorities = vec!["gamma".to_string(), "beta".to_string(), "alpha".to_string()];
         let result = select_servers(&configs, &priorities, None);
         assert_eq!(names(&result), &["gamma", "beta", "alpha"]);
     }
