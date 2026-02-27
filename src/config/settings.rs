@@ -1496,6 +1496,85 @@ kind = "injections""#;
     }
 
     #[test]
+    fn should_resolve_max_fan_out_for_specific_method() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    "textDocument/completion".to_string(),
+                    AggregationConfig {
+                        max_fan_out: Some(2),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        max_fan_out: Some(5),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+        };
+        // Method-specific should win over wildcard
+        assert_eq!(
+            config.resolve_max_fan_out("textDocument/completion"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_falls_back_to_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    max_fan_out: Some(3),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), Some(3));
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_none_when_no_aggregation() {
+        let config = BridgeLanguageConfig::default();
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), None);
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_negative_as_none() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    max_fan_out: Some(-1),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), None);
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_zero_as_some_zero() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    max_fan_out: Some(0),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), Some(0));
+    }
+
+    #[test]
     fn should_parse_bridge_language_config_with_aggregation() {
         let json = r#"{
             "enabled": true,
