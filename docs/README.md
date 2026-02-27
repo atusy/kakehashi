@@ -233,8 +233,9 @@ When multiple language servers can handle the same injection language, `aggregat
 |-------|-------------|
 | `priorities` | Ordered list of server names. The first server that returns a valid response wins. Empty list falls back to arrival-order (first-win) behavior. |
 | `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
+| `maxFanOut` | Maximum number of servers to query. `null` or omitted = no limit (default). `0` = disable fan-out entirely. Positive integer = cap at N servers. Priority servers are selected first when limiting. Negative values are treated as no limit. |
 
-Example with per-method priorities and strategy:
+Example with per-method priorities, strategy, and maxFanOut:
 
 ```json
 {
@@ -242,7 +243,7 @@ Example with per-method priorities and strategy:
     "python": {
       "enabled": true,
       "aggregation": {
-        "textDocument/completion": { "priorities": ["pyright", "pylsp"] },
+        "textDocument/completion": { "priorities": ["pyright", "pylsp"], "maxFanOut": 1 },
         "textDocument/diagnostic": { "strategy": "preferred", "priorities": ["pyright"] },
         "_": { "priorities": ["pylsp"] }
       }
