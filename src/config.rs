@@ -3196,4 +3196,100 @@ mod tests {
             "overlay strategy should win atomically"
         );
     }
+
+    #[test]
+    fn test_merge_bridge_maps_preserves_max_fan_out_from_base_only_keys() {
+        // Overlay omits method key entirely → base maxFanOut preserved
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "_".to_string(),
+                    settings::AggregationConfig {
+                        max_fan_out: Some(3),
+                        ..Default::default()
+                    },
+                )])),
+            },
+        );
+
+        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        overlay_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["pyright".to_string()],
+                        ..Default::default()
+                    },
+                )])),
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
+        let python = merged.get("python").unwrap();
+        let agg = python.aggregation.as_ref().unwrap();
+
+        // Base-only key "_" is preserved (overlay didn't touch it)
+        assert_eq!(
+            agg["_"].max_fan_out,
+            Some(3),
+            "base maxFanOut should be preserved when overlay omits the method key"
+        );
+    }
+
+    #[test]
+    fn test_merge_bridge_maps_overlay_same_key_without_max_fan_out_replaces_atomically() {
+        // Overlay includes same method key without maxFanOut →
+        // base maxFanOut is lost (atomic per-key replacement)
+        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        base_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: Some(true),
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["ruff".to_string()],
+                        max_fan_out: Some(2),
+                        ..Default::default()
+                    },
+                )])),
+            },
+        );
+
+        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        overlay_map.insert(
+            "python".to_string(),
+            settings::BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    settings::AggregationConfig {
+                        priorities: vec!["pyright".to_string()],
+                        ..Default::default()
+                    },
+                )])),
+            },
+        );
+
+        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
+        let python = merged.get("python").unwrap();
+        let agg = python.aggregation.as_ref().unwrap();
+        let hover = &agg["textDocument/hover"];
+
+        assert_eq!(
+            hover.priorities,
+            vec!["pyright".to_string()],
+            "overlay priorities should win"
+        );
+        assert_eq!(
+            hover.max_fan_out, None,
+            "base maxFanOut should be lost when overlay replaces the same method key atomically"
+        );
+    }
 }
