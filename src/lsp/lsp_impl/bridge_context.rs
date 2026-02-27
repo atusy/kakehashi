@@ -59,6 +59,9 @@ pub(crate) struct DocumentRequestContext {
     /// dynamically from the bridge language config's aggregation settings via
     /// [`Kakehashi::resolve_aggregation_strategy`].
     pub(crate) strategy: AggregationStrategy,
+    /// Maximum number of servers to fan out to.
+    /// `None` = no limit, `Some(0)` = disable fan-out.
+    pub(crate) max_fan_out: Option<usize>,
 }
 
 /// Document context plus a cursor position.
@@ -261,6 +264,12 @@ impl Kakehashi {
             method_name,
         );
 
+        let max_fan_out = self.resolve_max_fan_out(
+            &preamble.language_name,
+            &preamble.resolved.injection_language,
+            method_name,
+        );
+
         Some(DocumentRequestContext {
             uri: preamble.uri,
             resolved: preamble.resolved,
@@ -268,6 +277,7 @@ impl Kakehashi {
             upstream_request_id: preamble.upstream_request_id,
             priorities,
             strategy: AggregationStrategy::Preferred,
+            max_fan_out,
         })
     }
 
@@ -296,6 +306,31 @@ impl Kakehashi {
             })
             .map(|bridge_config| bridge_config.resolve_strategy(method_name, default))
             .unwrap_or(default)
+    }
+
+    /// Resolve max fan-out for a given host language, injection language,
+    /// and LSP method.
+    ///
+    /// Resolution chain:
+    /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
+    /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
+    /// 3. `bridge_config.resolve_max_fan_out(method)` → max fan-out
+    pub(crate) fn resolve_max_fan_out(
+        &self,
+        host_language: &str,
+        injection_language: &str,
+        method_name: &str,
+    ) -> Option<usize> {
+        let settings = self.settings_manager.load_settings();
+        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
+            .and_then(|lang_settings| lang_settings.bridge)
+            .and_then(|bridge_map| {
+                crate::config::resolve_bridge_language_with_wildcard(
+                    &bridge_map,
+                    injection_language,
+                )
+            })
+            .and_then(|bridge_config| bridge_config.resolve_max_fan_out(method_name))
     }
 
     /// Resolve aggregation priorities for a given host language, injection language,

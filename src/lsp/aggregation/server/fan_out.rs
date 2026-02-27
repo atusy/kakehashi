@@ -109,7 +109,8 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut join_set = JoinSet::new();
-    for config in &ctx.configs {
+    let selected = select_servers(&ctx.configs, &ctx.priorities, ctx.max_fan_out);
+    for config in &selected {
         let server_name = config.server_name.clone();
         let task = FanOutTask {
             pool: Arc::clone(&pool),
