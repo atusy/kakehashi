@@ -45,7 +45,7 @@ pub(crate) struct TaggedResult<T> {
 
 /// Select which servers to fan out to, respecting priority ordering and max fan-out limit.
 ///
-/// When `max_fan_out` is `None`, all configs are returned (in priority order).
+/// When `max_fan_out` is `None`, all configs are returned (priority servers first, then remaining in original order).
 /// When `max_fan_out` is `Some(0)`, an empty list is returned (fan-out disabled).
 /// When `max_fan_out` is `Some(n)`, at most `n` configs are returned.
 ///
