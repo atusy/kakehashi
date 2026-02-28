@@ -1558,6 +1558,37 @@ kind = "injections""#;
     }
 
     #[test]
+    fn should_resolve_max_fan_out_method_entry_without_field_does_not_fallback_to_wildcard() {
+        // When a method-specific AggregationConfig exists but has max_fan_out: None,
+        // the wildcard's max_fan_out does NOT apply. This is atomic-per-entry behavior:
+        // the method key selects the entire AggregationConfig, not individual fields.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    "textDocument/completion".to_string(),
+                    AggregationConfig {
+                        priorities: vec!["server_a".to_string()],
+                        ..Default::default() // max_fan_out: None
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        max_fan_out: Some(5),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+        };
+        assert_eq!(
+            config.resolve_max_fan_out("textDocument/completion"),
+            None,
+            "method-specific entry without maxFanOut should NOT fall back to wildcard"
+        );
+    }
+
+    #[test]
     fn should_resolve_max_fan_out_negative_as_none() {
         let config = BridgeLanguageConfig {
             enabled: Some(true),
