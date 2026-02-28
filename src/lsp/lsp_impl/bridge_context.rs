@@ -281,13 +281,29 @@ impl Kakehashi {
         })
     }
 
-    /// Resolve aggregation strategy for a given host language, injection language,
-    /// and LSP method.
+    /// Resolve the `BridgeLanguageConfig` for a given host/injection language pair.
     ///
     /// Resolution chain:
     /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
     /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
-    /// 3. `bridge_config.resolve_strategy(method, default)` → strategy
+    fn resolve_bridge_language_config(
+        &self,
+        host_language: &str,
+        injection_language: &str,
+    ) -> Option<crate::config::settings::BridgeLanguageConfig> {
+        let settings = self.settings_manager.load_settings();
+        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
+            .and_then(|lang_settings| lang_settings.bridge)
+            .and_then(|bridge_map| {
+                crate::config::resolve_bridge_language_with_wildcard(
+                    &bridge_map,
+                    injection_language,
+                )
+            })
+    }
+
+    /// Resolve aggregation strategy for a given host language, injection language,
+    /// and LSP method.
     pub(crate) fn resolve_aggregation_strategy(
         &self,
         host_language: &str,
@@ -295,66 +311,32 @@ impl Kakehashi {
         method_name: &str,
         default: crate::config::settings::AggregationStrategy,
     ) -> crate::config::settings::AggregationStrategy {
-        let settings = self.settings_manager.load_settings();
-        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
-            .and_then(|lang_settings| lang_settings.bridge)
-            .and_then(|bridge_map| {
-                crate::config::resolve_bridge_language_with_wildcard(
-                    &bridge_map,
-                    injection_language,
-                )
-            })
+        self.resolve_bridge_language_config(host_language, injection_language)
             .map(|bridge_config| bridge_config.resolve_strategy(method_name, default))
             .unwrap_or(default)
     }
 
     /// Resolve max fan-out for a given host language, injection language,
     /// and LSP method.
-    ///
-    /// Resolution chain:
-    /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
-    /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
-    /// 3. `bridge_config.resolve_max_fan_out(method)` → max fan-out
     pub(crate) fn resolve_max_fan_out(
         &self,
         host_language: &str,
         injection_language: &str,
         method_name: &str,
     ) -> Option<usize> {
-        let settings = self.settings_manager.load_settings();
-        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
-            .and_then(|lang_settings| lang_settings.bridge)
-            .and_then(|bridge_map| {
-                crate::config::resolve_bridge_language_with_wildcard(
-                    &bridge_map,
-                    injection_language,
-                )
-            })
+        self.resolve_bridge_language_config(host_language, injection_language)
             .and_then(|bridge_config| bridge_config.resolve_max_fan_out(method_name))
     }
 
     /// Resolve aggregation priorities for a given host language, injection language,
     /// and LSP method.
-    ///
-    /// Resolution chain:
-    /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
-    /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
-    /// 3. `bridge_config.resolve_priorities(method)` → priority list
     pub(crate) fn resolve_aggregation_priorities(
         &self,
         host_language: &str,
         injection_language: &str,
         method_name: &str,
     ) -> Vec<String> {
-        let settings = self.settings_manager.load_settings();
-        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
-            .and_then(|lang_settings| lang_settings.bridge)
-            .and_then(|bridge_map| {
-                crate::config::resolve_bridge_language_with_wildcard(
-                    &bridge_map,
-                    injection_language,
-                )
-            })
+        self.resolve_bridge_language_config(host_language, injection_language)
             .map(|bridge_config| bridge_config.resolve_priorities(method_name))
             .unwrap_or_default()
     }
