@@ -84,7 +84,9 @@ impl BridgeLanguageConfig {
 
     /// Resolve max fan-out for a specific LSP method.
     ///
-    /// Falls back to wildcard `"_"` key, then `None` (no limit).
+    /// Looks up the method-specific entry, falling back to the wildcard `"_"` entry.
+    /// Resolution is per-entry: if a method-specific entry exists but omits `maxFanOut`,
+    /// the wildcard entry's value is NOT consulted.
     /// Negative values are treated as no limit (`None`).
     pub(crate) fn resolve_max_fan_out(&self, method: &str) -> Option<usize> {
         let map = self.aggregation.as_ref()?;
