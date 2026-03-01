@@ -164,6 +164,11 @@ impl Kakehashi {
                 "textDocument/publishDiagnostics",
                 AggregationStrategy::Concatenated,
             );
+            let max_fan_out = self.resolve_max_fan_out(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/publishDiagnostics",
+            );
 
             contexts.push(DocumentRequestContext {
                 uri: uri.clone(),
@@ -172,6 +177,7 @@ impl Kakehashi {
                 upstream_request_id: None, // Push diagnostics are synthetic
                 priorities,
                 strategy,
+                max_fan_out,
             });
         }
 

@@ -45,6 +45,10 @@ pub(crate) struct AggregationConfig {
     /// Aggregation strategy override. `None` = use handler default.
     #[serde(default)]
     pub(crate) strategy: Option<AggregationStrategy>,
+    /// Maximum number of servers to fan out to. `None` = no limit.
+    /// `Some(0)` disables fan-out. Negative values are treated as no limit.
+    #[serde(default, rename = "maxFanOut")]
+    pub(crate) max_fan_out: Option<i64>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -76,6 +80,21 @@ impl BridgeLanguageConfig {
             .or_else(|| map.get(crate::config::WILDCARD_KEY))
             .map(|c| c.priorities.clone())
             .unwrap_or_default()
+    }
+
+    /// Resolve max fan-out for a specific LSP method.
+    ///
+    /// Falls back to the wildcard `"_"` entry only when no method-specific entry exists.
+    /// Resolution is per-entry: if a method-specific entry exists but omits `maxFanOut`,
+    /// the wildcard entry's `maxFanOut` is not consulted.
+    /// Negative values are treated as no limit (`None`).
+    pub(crate) fn resolve_max_fan_out(&self, method: &str) -> Option<usize> {
+        let map = self.aggregation.as_ref()?;
+        let raw = map
+            .get(method)
+            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .and_then(|c| c.max_fan_out)?;
+        usize::try_from(raw).ok()
     }
 
     /// Resolve aggregation strategy for a specific LSP method.
@@ -1481,6 +1500,7 @@ kind = "injections""#;
                 AggregationConfig {
                     priorities: vec!["server_a".to_string()],
                     strategy: None,
+                    ..Default::default()
                 },
             )])),
         };
@@ -1488,6 +1508,116 @@ kind = "injections""#;
             config.resolve_strategy("textDocument/diagnostic", AggregationStrategy::Concatenated),
             AggregationStrategy::Concatenated,
         );
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_for_specific_method() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    "textDocument/completion".to_string(),
+                    AggregationConfig {
+                        max_fan_out: Some(2),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        max_fan_out: Some(5),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+        };
+        // Method-specific should win over wildcard
+        assert_eq!(
+            config.resolve_max_fan_out("textDocument/completion"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_falls_back_to_wildcard() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    max_fan_out: Some(3),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), Some(3));
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_none_when_no_aggregation() {
+        let config = BridgeLanguageConfig::default();
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), None);
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_method_entry_without_field_does_not_fallback_to_wildcard() {
+        // When a method-specific AggregationConfig exists but has max_fan_out: None,
+        // the wildcard's max_fan_out does NOT apply. This is atomic-per-entry behavior:
+        // the method key selects the entire AggregationConfig, not individual fields.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([
+                (
+                    "textDocument/completion".to_string(),
+                    AggregationConfig {
+                        priorities: vec!["server_a".to_string()],
+                        ..Default::default() // max_fan_out: None
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    AggregationConfig {
+                        max_fan_out: Some(5),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+        };
+        assert_eq!(
+            config.resolve_max_fan_out("textDocument/completion"),
+            None,
+            "method-specific entry without maxFanOut should NOT fall back to wildcard"
+        );
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_negative_as_none() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    max_fan_out: Some(-1),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), None);
+    }
+
+    #[test]
+    fn should_resolve_max_fan_out_zero_as_some_zero() {
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    max_fan_out: Some(0),
+                    ..Default::default()
+                },
+            )])),
+        };
+        assert_eq!(config.resolve_max_fan_out("textDocument/hover"), Some(0));
     }
 
     #[test]
@@ -1538,6 +1668,27 @@ kind = "injections""#;
         let json = r#"{}"#;
         let config: AggregationConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.strategy, None);
+    }
+
+    #[test]
+    fn should_parse_max_fan_out_with_value() {
+        let json = r#"{ "maxFanOut": 2 }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_fan_out, Some(2));
+    }
+
+    #[test]
+    fn should_parse_max_fan_out_null_as_none() {
+        let json = r#"{ "maxFanOut": null }"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_fan_out, None);
+    }
+
+    #[test]
+    fn should_parse_max_fan_out_absent_as_none() {
+        let json = r#"{}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_fan_out, None);
     }
 
     #[test]
