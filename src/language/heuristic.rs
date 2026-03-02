@@ -19,8 +19,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use syntect::parsing::SyntaxSet;
 
-/// Lazily initialized syntax set with default syntaxes.
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+/// Lazily initialized syntax set with extended syntaxes (via two-face).
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
 /// Detect language from a token (e.g., "py", "js", "bash").
 ///
@@ -68,22 +68,11 @@ fn normalize_syntax_name(name: &str) -> String {
         // Shell variants
         "Bourne Again Shell (bash)" => "bash".to_string(),
         "Shell-Unix-Generic" => "bash".to_string(),
-        // Common languages with different naming
-        "JavaScript" => "javascript".to_string(),
-        "TypeScript" => "typescript".to_string(),
-        "Python" => "python".to_string(),
-        "Ruby" => "ruby".to_string(),
-        "Rust" => "rust".to_string(),
-        "Go" => "go".to_string(),
+        // Names that need explicit canonicalization or multi-name normalization
+        "JavaScript" | "JavaScript (Babel)" => "javascript".to_string(),
+        "TypeScriptReact" => "tsx".to_string(),
         "C++" => "cpp".to_string(),
-        "C" => "c".to_string(),
-        "Java" => "java".to_string(),
-        "Perl" => "perl".to_string(),
-        "PHP" => "php".to_string(),
-        "Lua" => "lua".to_string(),
-        "R" => "r".to_string(),
         "Makefile" => "make".to_string(),
-        "Dockerfile" => "dockerfile".to_string(),
         // Default: lowercase the name
         _ => name.to_lowercase(),
     }
@@ -101,6 +90,8 @@ mod tests {
     #[case::js("js", Some("javascript"))]
     #[case::bash("bash", Some("bash"))]
     #[case::rust("rust", Some("rust"))]
+    #[case::ts("ts", Some("typescript"))]
+    #[case::tsx("tsx", Some("tsx"))]
     #[case::unknown("unknown_language_xyz", None)]
     fn test_detect_from_token(#[case] token: &str, #[case] expected: Option<&str>) {
         assert_eq!(detect_from_token(token), expected.map(String::from));
