@@ -2111,4 +2111,73 @@ mod tests {
             "Line 1 should have offset 2 (for '> ' prefix)"
         );
     }
+
+    /// Tree-sitter assigns column positions from Range.start_point, not byte offset.
+    ///
+    /// When `set_included_ranges` is called with ranges whose `start_point.column = 2`,
+    /// tree-sitter reports parsed nodes at column 2 — not column 0 — even though the
+    /// bytes start at offset 2 within the raw text.
+    ///
+    /// This is the invariant that makes blockquote injection work correctly:
+    /// `compute_included_ranges` builds ranges with `start_point.column = prefix_len`
+    /// (e.g. 2 for `> `), so injected keywords appear at their true host column.
+    #[test]
+    fn test_parse_with_included_ranges_preserves_start_point_column() {
+        // Simulate "> let x = 1;\n> let y = 2;\n" with included_ranges skipping `> `
+        // Line 0: "> let x = 1;\n" = 13 bytes (0..13, \n at byte 12)
+        // Line 1: "> let y = 2;\n" = 13 bytes (13..26, \n at byte 25)
+        // Content ranges (skipping 2-byte `> ` prefix on each line):
+        //   Range 0: bytes  2..13 = "let x = 1;\n", start_point {row:0, col:2}
+        //   Range 1: bytes 15..26 = "let y = 2;\n", start_point {row:1, col:2}
+        let content_text = "> let x = 1;\n> let y = 2;\n";
+        let included_ranges = vec![
+            tree_sitter::Range {
+                start_byte: 2,
+                end_byte: 13,
+                start_point: tree_sitter::Point { row: 0, column: 2 },
+                end_point: tree_sitter::Point { row: 1, column: 0 },
+            },
+            tree_sitter::Range {
+                start_byte: 15,
+                end_byte: 26,
+                start_point: tree_sitter::Point { row: 1, column: 2 },
+                end_point: tree_sitter::Point { row: 2, column: 0 },
+            },
+        ];
+
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&rust_language).unwrap();
+        let tree = parse_with_ranges(
+            &mut parser,
+            content_text,
+            Some(&included_ranges),
+            "test",
+            "rust",
+        )
+        .expect("should parse");
+
+        let query = Query::new(&rust_language, "(let_declaration) @decl").unwrap();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), content_text.as_bytes());
+
+        let mut let_columns: Vec<usize> = Vec::new();
+        while let Some(m) = matches.next() {
+            for c in m.captures {
+                let node = c.node;
+                let mut walk = node.walk();
+                for child in node.children(&mut walk) {
+                    if child.kind() == "let" {
+                        let_columns.push(child.start_position().column);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            let_columns,
+            vec![2, 2],
+            "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
+        );
+    }
 }

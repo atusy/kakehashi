@@ -1,84 +1,83 @@
 ---
 source: tests/e2e_semantic.rs
-assertion_line: 365
 expression: snapshot_tokens
 ---
 [
   {
+    "line": 0,
+    "start": 0,
     "length": 5,
-    "line": 0,
-    "modifiers": 0,
-    "start": 0,
-    "type": "keyword"
+    "type": "keyword",
+    "modifiers": 0
   },
   {
-    "length": 1,
     "line": 0,
-    "modifiers": 4,
     "start": 6,
-    "type": "variable"
+    "length": 1,
+    "type": "variable",
+    "modifiers": 4
   },
   {
-    "length": 1,
     "line": 0,
-    "modifiers": 0,
     "start": 8,
-    "type": "operator"
+    "length": 1,
+    "type": "operator",
+    "modifiers": 0
   },
   {
-    "length": 2,
     "line": 0,
-    "modifiers": 0,
     "start": 10,
-    "type": "function"
+    "length": 2,
+    "type": "function",
+    "modifiers": 0
   },
   {
+    "line": 2,
+    "start": 0,
     "length": 8,
-    "line": 2,
-    "modifiers": 0,
-    "start": 0,
-    "type": "keyword"
+    "type": "keyword",
+    "modifiers": 0
   },
   {
-    "length": 1,
     "line": 2,
-    "modifiers": 4,
     "start": 9,
-    "type": "variable"
+    "length": 1,
+    "type": "variable",
+    "modifiers": 4
   },
   {
-    "length": 1,
     "line": 2,
-    "modifiers": 0,
     "start": 11,
-    "type": "function"
-  },
-  {
-    "length": 6,
-    "line": 3,
-    "modifiers": 0,
-    "start": 1,
-    "type": "keyword"
-  },
-  {
-    "length": 3,
-    "line": 4,
-    "modifiers": 0,
-    "start": 0,
-    "type": "keyword"
-  },
-  {
-    "length": 6,
-    "line": 6,
-    "modifiers": 0,
-    "start": 0,
-    "type": "keyword"
-  },
-  {
     "length": 1,
+    "type": "function",
+    "modifiers": 0
+  },
+  {
+    "line": 3,
+    "start": 1,
+    "length": 6,
+    "type": "keyword",
+    "modifiers": 0
+  },
+  {
+    "line": 4,
+    "start": 0,
+    "length": 3,
+    "type": "keyword",
+    "modifiers": 0
+  },
+  {
     "line": 6,
-    "modifiers": 4,
+    "start": 0,
+    "length": 6,
+    "type": "keyword",
+    "modifiers": 0
+  },
+  {
+    "line": 6,
     "start": 7,
-    "type": "variable"
+    "length": 1,
+    "type": "variable",
+    "modifiers": 4
   }
 ]
