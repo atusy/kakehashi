@@ -36,14 +36,12 @@ impl SettingsEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSource {
     InitializationOptions,
-    ClientConfiguration,
 }
 
 impl SettingsSource {
     fn description(self) -> &'static str {
         match self {
             SettingsSource::InitializationOptions => "initialization options",
-            SettingsSource::ClientConfiguration => "client configuration",
         }
     }
 }
