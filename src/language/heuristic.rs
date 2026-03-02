@@ -101,6 +101,8 @@ mod tests {
     #[case::js("js", Some("javascript"))]
     #[case::bash("bash", Some("bash"))]
     #[case::rust("rust", Some("rust"))]
+    #[case::ts("ts", Some("typescript"))]
+    #[case::tsx("tsx", Some("tsx"))]
     #[case::unknown("unknown_language_xyz", None)]
     fn test_detect_from_token(#[case] token: &str, #[case] expected: Option<&str>) {
         assert_eq!(detect_from_token(token), expected.map(String::from));
