@@ -19,8 +19,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 use syntect::parsing::SyntaxSet;
 
-/// Lazily initialized syntax set with default syntaxes.
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+/// Lazily initialized syntax set with extended syntaxes (via two-face).
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 
 /// Detect language from a token (e.g., "py", "js", "bash").
 ///
@@ -69,8 +69,9 @@ fn normalize_syntax_name(name: &str) -> String {
         "Bourne Again Shell (bash)" => "bash".to_string(),
         "Shell-Unix-Generic" => "bash".to_string(),
         // Common languages with different naming
-        "JavaScript" => "javascript".to_string(),
+        "JavaScript" | "JavaScript (Babel)" => "javascript".to_string(),
         "TypeScript" => "typescript".to_string(),
+        "TypeScriptReact" => "tsx".to_string(),
         "Python" => "python".to_string(),
         "Ruby" => "ruby".to_string(),
         "Rust" => "rust".to_string(),
