@@ -82,7 +82,13 @@ fn token_type_name(index: u32) -> &'static str {
 fn test_blockquote_injection_tokens() {
     let mut client = LspClient::new();
 
-    // Initialize with default captureMappings
+    // Initialize with explicit captureMappings to ensure deterministic output
+    // regardless of user's ~/.config/kakehashi/kakehashi.toml settings.
+    //
+    // `markup.quote → "string"` makes the `block_quote` node produce a `string`
+    // token, enabling us to verify that `finalize_tokens` correctly SPLITS the
+    // multiline host token at the injection boundary (preserving the `> ` prefix
+    // at col=0 as a `string` while suppressing the col=2+ portion inside injection).
     client.send_request(
         "initialize",
         json!({
@@ -95,6 +101,15 @@ fn test_blockquote_injection_tokens() {
                         "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
                         "tokenModifiers": [],
                         "formats": ["relative"]
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.quote": "string"
+                        }
                     }
                 }
             }
