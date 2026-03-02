@@ -24,10 +24,83 @@ pub struct LspClient {
     request_id: i64,
 }
 
+/// Builder for creating LspClient instances with custom configuration.
+///
+/// Supports setting environment variables, removing inherited env vars,
+/// and passing CLI arguments to the kakehashi binary.
+pub struct LspClientBuilder {
+    args: Vec<String>,
+    envs: Vec<(String, String)>,
+    env_removes: Vec<String>,
+}
+
+impl LspClientBuilder {
+    pub fn new() -> Self {
+        Self {
+            args: Vec::new(),
+            envs: Vec::new(),
+            env_removes: Vec::new(),
+        }
+    }
+
+    /// Add a CLI argument to pass to the kakehashi binary.
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Set an environment variable for the spawned process.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.envs.push((key.into(), value.into()));
+        self
+    }
+
+    /// Remove an environment variable from the spawned process.
+    pub fn env_remove(mut self, key: impl Into<String>) -> Self {
+        self.env_removes.push(key.into());
+        self
+    }
+
+    /// Build and spawn the LspClient.
+    pub fn build(self) -> LspClient {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
+        cmd.args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        for (key, value) in &self.envs {
+            cmd.env(key, value);
+        }
+        for key in &self.env_removes {
+            cmd.env_remove(key);
+        }
+
+        let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+
+        let stdin = child.stdin.take().expect("Failed to get stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
+        let stderr = child.stderr.take();
+
+        LspClient {
+            child,
+            stdin: Some(stdin),
+            stdout,
+            stderr,
+            request_id: 0,
+        }
+    }
+}
+
 impl LspClient {
     /// Spawn the kakehashi binary and create a new LSP client.
     pub fn new() -> Self {
         Self::with_debug(false)
+    }
+
+    /// Return a builder for configuring the LspClient before spawning.
+    pub fn builder() -> LspClientBuilder {
+        LspClientBuilder::new()
     }
 
     /// Spawn the kakehashi binary with optional debug logging.
