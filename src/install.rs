@@ -36,6 +36,19 @@ use std::path::PathBuf;
 /// - macOS: ~/Library/Application Support/kakehashi/
 /// - Windows: %APPDATA%/kakehashi/
 pub fn default_data_dir() -> Option<PathBuf> {
+    resolve_data_dir(|var| std::env::var(var).ok())
+}
+
+/// Resolve the data directory from an env lookup and platform default.
+///
+/// Separated from `default_data_dir()` so tests can inject a mock env
+/// without `unsafe` env var mutation.
+fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(val) = env_fn("KAKEHASHI_DATA_DIR")
+        && !val.is_empty()
+    {
+        return Some(PathBuf::from(val));
+    }
     dirs::data_dir().map(|p| p.join("kakehashi"))
 }
 
@@ -134,6 +147,39 @@ mod tests {
         assert!(dir.is_some());
         let path = dir.unwrap();
         assert!(path.to_string_lossy().contains("kakehashi"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_uses_env_var_when_set() {
+        let env = |var: &str| match var {
+            "KAKEHASHI_DATA_DIR" => Some("/custom/data/dir".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_data_dir(env),
+            Some(PathBuf::from("/custom/data/dir"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_data_dir_ignores_empty_env_var() {
+        let env = |var: &str| match var {
+            "KAKEHASHI_DATA_DIR" => Some(String::new()),
+            _ => None,
+        };
+        let dir = resolve_data_dir(env);
+        // Should fall back to platform default, not return empty path
+        assert!(dir.is_some());
+        assert!(dir.unwrap().to_string_lossy().contains("kakehashi"));
+    }
+
+    #[test]
+    fn test_resolve_data_dir_falls_back_when_env_unset() {
+        let env = |_: &str| None;
+        let dir = resolve_data_dir(env);
+        // Should use platform default (dirs::data_dir() + "kakehashi")
+        assert!(dir.is_some());
+        assert!(dir.unwrap().to_string_lossy().contains("kakehashi"));
     }
 
     #[test]
