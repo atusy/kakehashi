@@ -171,7 +171,7 @@ fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<TreeSi
                 Some(settings)
             }
             Err(err) => {
-                events.push(SettingsEvent::warning(format!(
+                events.push(SettingsEvent::error(format!(
                     "Failed to parse {}: {}",
                     path.display(),
                     err
@@ -574,11 +574,10 @@ mod tests {
 
         assert!(result.is_none(), "invalid TOML should return None");
         assert!(
-            events
-                .iter()
-                .any(|e| e.kind == SettingsEventKind::Warning
-                    && e.message.contains("Failed to parse")),
-            "should emit warning for invalid TOML"
+            events.iter().any(
+                |e| e.kind == SettingsEventKind::Error && e.message.contains("Failed to parse")
+            ),
+            "should emit error for invalid TOML in explicit config file"
         );
     }
 }
