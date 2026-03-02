@@ -84,6 +84,76 @@ fn test_effective_configuration_returns_settings() {
 }
 
 #[test]
+fn test_did_change_configuration_preserves_initialization_options_languages() {
+    let mut client = LspClient::new();
+
+    // Initialize with languages in initializationOptions
+    let _init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "languages": {
+                    "foo": {
+                        "parser": "/path/to/foo.so"
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Send didChangeConfiguration with only languageServers (no languages)
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languageServers": {
+                    "myserver": {
+                        "cmd": ["my-lsp"],
+                        "languages": ["foo"]
+                    }
+                }
+            }
+        }),
+    );
+
+    // Small delay to let the server process the notification
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Verify languages from initializationOptions are preserved
+    let response = client.send_request("kakehashi/internal/effectiveConfiguration", json!({}));
+    let result = response
+        .get("result")
+        .expect("effectiveConfiguration should return a result");
+    let settings = result
+        .get("settings")
+        .expect("result should contain settings");
+
+    // The "foo" language from initializationOptions should still be present
+    let languages = settings
+        .get("languages")
+        .expect("settings should contain languages");
+    assert!(
+        languages.get("foo").is_some(),
+        "Language 'foo' from initializationOptions should be preserved after didChangeConfiguration, but got: {}",
+        serde_json::to_string_pretty(languages).unwrap()
+    );
+
+    // The languageServers from didChangeConfiguration should also be present
+    let servers = settings
+        .get("languageServers")
+        .expect("settings should contain languageServers");
+    assert!(
+        servers.get("myserver").is_some(),
+        "languageServer 'myserver' from didChangeConfiguration should be present, but got: {}",
+        serde_json::to_string_pretty(servers).unwrap()
+    );
+}
+
+#[test]
 fn test_shutdown_terminates_cleanly() {
     let mut client = LspClient::new();
 
