@@ -18,6 +18,26 @@ pub fn data_dir_override() -> Option<&'static Path> {
     DATA_DIR_OVERRIDE.get().map(|p| p.as_path())
 }
 
+/// Process-global override for config file paths, set by the `--config-file` CLI flag.
+///
+/// When set, these files replace the default user config (XDG) and project config
+/// (`./kakehashi.toml`). Multiple files merge in specified order (later overrides earlier).
+static CONFIG_FILE_OVERRIDE: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Set the config file override (called once from main).
+///
+/// Only stores if `files` is non-empty; an empty vec means "not specified".
+pub fn set_config_file_override(files: Vec<PathBuf>) {
+    if !files.is_empty() {
+        CONFIG_FILE_OVERRIDE.set(files).ok();
+    }
+}
+
+/// Get the config file override paths, if set.
+pub(crate) fn config_file_override() -> Option<&'static [PathBuf]> {
+    CONFIG_FILE_OVERRIDE.get().map(|v| v.as_slice())
+}
+
 /// Error returned when a single path expansion fails.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ExpandError {
