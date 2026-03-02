@@ -89,6 +89,14 @@ kakehashi works out of the box with no configuration required:
 | macOS | `~/Library/Application Support/kakehashi/` |
 | Windows | `%APPDATA%/kakehashi/` |
 
+You can override the data directory by setting the `KAKEHASHI_DATA_DIR` environment variable or using the `--data-dir` global CLI flag. The precedence order is:
+
+1. `--data-dir` global CLI flag (highest — sets `KAKEHASHI_DATA_DIR` in-process)
+2. `KAKEHASHI_DATA_DIR` environment variable
+3. Platform-specific default (lowest)
+
+**Note:** Tilde (`~`) in `KAKEHASHI_DATA_DIR` is **not** expanded — use absolute paths.
+
 Parsers are stored in `{data_dir}/parser/` and queries in `{data_dir}/queries/`.
 
 ## Configuration
@@ -135,7 +143,7 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `languages[*].parser`
 - `languages[*].queries[*].path`
 
-**Behavior on undefined variables:** If a referenced environment variable is not defined, configuration loading fails with an error notification and falls back to previous settings (or defaults).
+**Behavior on undefined variables:** If a referenced environment variable is not defined, configuration loading fails with an error notification and falls back to previous settings (or defaults). The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
 
 ### Option Reference
 
@@ -310,8 +318,8 @@ kakehashi language install rust --verbose
 # Force reinstall
 kakehashi language install python --force
 
-# Custom data directory
-kakehashi language install go --data-dir /custom/path
+# Custom data directory (--data-dir is a global flag, works at any position)
+kakehashi --data-dir /custom/path language install go
 
 # Bypass metadata cache
 kakehashi language install ruby --no-cache
@@ -326,7 +334,7 @@ kakehashi language status
 kakehashi language status --verbose
 
 # Show status for custom data directory
-kakehashi language status --data-dir /custom/path
+kakehashi --data-dir /custom/path language status
 
 # Uninstall a language (parser + queries)
 kakehashi language uninstall lua

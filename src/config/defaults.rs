@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// This is used by `config init` to generate type-safe default configurations.
 pub fn default_settings() -> TreeSitterSettings {
     TreeSitterSettings {
-        search_paths: None,
+        search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: HashMap::new(),
         capture_mappings: default_capture_mappings(),
         auto_install: Some(true),
@@ -235,6 +235,33 @@ mod tests {
     }
 
     #[test]
+    fn default_settings_has_search_paths_template() {
+        let settings = default_settings();
+        assert_eq!(
+            settings.search_paths,
+            Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
+            "searchPaths should default to [\"${{KAKEHASHI_DATA_DIR}}\"]"
+        );
+    }
+
+    #[test]
+    fn default_settings_search_paths_in_toml() {
+        let settings = default_settings();
+        let toml_string =
+            toml::to_string_pretty(&settings).expect("should serialize to TOML without error");
+        assert!(
+            toml_string.contains("searchPaths"),
+            "TOML should contain searchPaths. Got:\n{}",
+            toml_string
+        );
+        assert!(
+            toml_string.contains("KAKEHASHI_DATA_DIR"),
+            "TOML should contain KAKEHASHI_DATA_DIR template. Got:\n{}",
+            toml_string
+        );
+    }
+
+    #[test]
     fn default_settings_through_coordinator_has_markup_strong_mapping() {
         // This test verifies the full chain from default_settings() through
         // WorkspaceSettings and into LanguageCoordinator, ensuring that
@@ -242,10 +269,16 @@ mod tests {
         use crate::config::WorkspaceSettings;
         use crate::language::LanguageCoordinator;
 
-        // Create settings from defaults
+        // Create settings from defaults — use with_kakehashi_defaults so that
+        // ${KAKEHASHI_DATA_DIR} in searchPaths resolves to the platform default.
+        use crate::config::expand::with_kakehashi_defaults;
         let ts_settings = default_settings();
-        let ws_settings = WorkspaceSettings::try_from_settings(&ts_settings, None, |_| None)
-            .expect("default settings should expand without errors");
+        let ws_settings = WorkspaceSettings::try_from_settings(
+            &ts_settings,
+            None,
+            with_kakehashi_defaults(|_| None),
+        )
+        .expect("default settings should expand without errors");
 
         // Verify WorkspaceSettings has the mapping
         assert!(

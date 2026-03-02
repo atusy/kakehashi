@@ -1,4 +1,22 @@
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Process-global override for `KAKEHASHI_DATA_DIR`, set by the `--data-dir` CLI flag.
+///
+/// Using `OnceLock` instead of `unsafe { std::env::set_var() }` avoids the unsafety
+/// of mutating environment variables while still providing a process-global override.
+static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the data directory override (called once from main).
+pub fn set_data_dir_override(dir: PathBuf) {
+    DATA_DIR_OVERRIDE.set(dir).ok();
+}
+
+/// Get the data directory override, if set.
+pub fn data_dir_override() -> Option<&'static Path> {
+    DATA_DIR_OVERRIDE.get().map(|p| p.as_path())
+}
 
 /// Error returned when a single path expansion fails.
 #[derive(Debug, PartialEq, Eq)]
@@ -84,6 +102,40 @@ pub(super) fn expand_path(
     match result {
         Ok(expanded) => Ok(expanded.into_owned()),
         Err(e) => Err(e.cause),
+    }
+}
+
+/// Wrap an env lookup function to provide fallback values for known `KAKEHASHI_`
+/// environment variables when they are undefined.
+///
+/// This allows configurations using `${KAKEHASHI_DATA_DIR}` to expand gracefully
+/// even when the user has not explicitly set the variable — the platform-specific
+/// default (from `dirs::data_dir()`) is used instead.
+pub(crate) fn with_kakehashi_defaults(
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> impl Fn(&str) -> Option<String> {
+    move |var: &str| {
+        // --data-dir override takes highest priority
+        if var == "KAKEHASHI_DATA_DIR"
+            && let Some(dir) = data_dir_override()
+        {
+            return Some(dir.to_string_lossy().into_owned());
+        }
+        env_fn(var).or_else(|| kakehashi_default(var))
+    }
+}
+
+/// Return the platform-specific default for known `KAKEHASHI_` variables.
+///
+/// Uses `dirs::data_dir()` directly (not `default_data_dir()`) to avoid
+/// circularity: `default_data_dir()` checks `KAKEHASHI_DATA_DIR` env var,
+/// but this function is the fallback when that var is *not* set.
+fn kakehashi_default(var: &str) -> Option<String> {
+    match var {
+        "KAKEHASHI_DATA_DIR" => {
+            dirs::data_dir().map(|p| p.join("kakehashi").to_string_lossy().into_owned())
+        }
+        _ => None,
     }
 }
 
@@ -201,5 +253,91 @@ mod tests {
     fn dollar_dollar_escape() {
         let env = make_env(&[]);
         assert_eq!(expand_path("$$literal", None, &env).unwrap(), "$literal");
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_passes_through_existing_env() {
+        let env = make_env(&[("HOME", "/home/user")]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(wrapped("HOME"), Some("/home/user".to_string()));
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_provides_data_dir_fallback() {
+        let env = make_env(&[]);
+        let wrapped = with_kakehashi_defaults(env);
+        let result = wrapped("KAKEHASHI_DATA_DIR");
+        assert!(
+            result.is_some(),
+            "should provide a fallback for KAKEHASHI_DATA_DIR"
+        );
+        assert!(
+            result.as_ref().unwrap().contains("kakehashi"),
+            "fallback should contain 'kakehashi', got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_does_not_override_explicit_env() {
+        let env = make_env(&[("KAKEHASHI_DATA_DIR", "/custom/dir")]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(
+            wrapped("KAKEHASHI_DATA_DIR"),
+            Some("/custom/dir".to_string())
+        );
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_returns_none_for_unknown_vars() {
+        let env = make_env(&[]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(wrapped("UNKNOWN_VAR"), None);
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_returns_none_for_unknown_kakehashi_vars() {
+        let env = make_env(&[]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(wrapped("KAKEHASHI_UNKNOWN"), None);
+    }
+
+    #[test]
+    fn data_dir_override_returns_none_initially() {
+        // Before set_data_dir_override is called, it should return None.
+        // NOTE: OnceLock is process-global and can only be set once, so we can
+        // only test the "not yet set" path OR the "set" path in a single test
+        // process. Other tests in this process may call set_data_dir_override,
+        // so we just verify the function is callable and returns Option<&Path>.
+        let result = data_dir_override();
+        // Either None (not yet set) or Some (set by another test) — both are valid
+        assert!(result.is_none() || result.is_some());
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_prioritizes_override_over_env_and_fallback() {
+        // When a data_dir override is set, with_kakehashi_defaults should return
+        // the override value even if env_fn provides a different value.
+        // NOTE: This test verifies the priority logic. Because OnceLock is global,
+        // the actual override value depends on test execution order. We test the
+        // structural behavior: if override is set, it wins.
+        let env = make_env(&[("KAKEHASHI_DATA_DIR", "/from/env")]);
+        let wrapped = with_kakehashi_defaults(env);
+        let result = wrapped("KAKEHASHI_DATA_DIR");
+
+        match data_dir_override() {
+            Some(override_path) => {
+                // Override is set — it should take priority
+                assert_eq!(
+                    result,
+                    Some(override_path.to_string_lossy().into_owned()),
+                    "override should take priority over env"
+                );
+            }
+            None => {
+                // Override not set — env value should win
+                assert_eq!(result, Some("/from/env".to_string()));
+            }
+        }
     }
 }

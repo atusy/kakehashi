@@ -1,12 +1,12 @@
 pub mod defaults;
-mod expand;
+pub(crate) mod expand;
 pub mod settings;
 
 #[cfg(test)]
 pub(crate) use expand::make_env;
 pub(crate) mod user;
 
-pub use expand::ExpandErrors;
+pub use expand::{ExpandErrors, set_data_dir_override};
 pub use settings::{
     BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageConfig, LanguageSettings,
     QueryItem, QueryKind, QueryTypeMappings, TreeSitterSettings, WorkspaceSettings,

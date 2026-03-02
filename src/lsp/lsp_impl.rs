@@ -1152,7 +1152,7 @@ impl LanguageServer for Kakehashi {
             WorkspaceSettings::try_from_settings(
                 &crate::config::defaults::default_settings(),
                 self.home_dir.as_deref(),
-                |var| std::env::var(var).ok(),
+                crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
             )
             .expect("default settings should expand without errors")
         });
@@ -1556,7 +1556,7 @@ impl LanguageServer for Kakehashi {
             match WorkspaceSettings::try_from_settings(
                 &merged_ts,
                 self.home_dir.as_deref(),
-                |var| std::env::var(var).ok(),
+                crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
             ) {
                 Ok(settings) => {
                     self.apply_settings(settings).await;

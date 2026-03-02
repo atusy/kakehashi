@@ -8,6 +8,10 @@ use std::path::PathBuf;
 #[command(version)]
 #[command(about = "A Language Server Protocol (LSP) server using Tree-sitter for parsing")]
 struct Cli {
+    /// Custom data directory (overrides KAKEHASHI_DATA_DIR and platform default)
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -33,10 +37,6 @@ enum LanguageAction {
         /// The language to install (e.g., lua, rust, python)
         language: String,
 
-        /// Custom data directory (default: ~/.local/share/kakehashi on Linux)
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
         /// Overwrite existing files if they exist
         #[arg(long)]
         force: bool,
@@ -57,10 +57,6 @@ enum LanguageAction {
     },
     /// Show installed languages and their status
     Status {
-        /// Custom data directory (default: ~/.local/share/kakehashi on Linux)
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-
         /// Print verbose output (show file paths)
         #[arg(long, short)]
         verbose: bool,
@@ -70,10 +66,6 @@ enum LanguageAction {
         /// The language to uninstall (e.g., lua, rust, python)
         #[arg(required_unless_present = "all")]
         language: Option<String>,
-
-        /// Custom data directory (default: ~/.local/share/kakehashi on Linux)
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
 
         /// Skip confirmation prompt
         #[arg(long)]
@@ -105,30 +97,34 @@ enum ConfigAction {
 fn main() {
     let cli = Cli::parse();
 
+    // Set data directory override so default_data_dir() and config expansion
+    // all resolve consistently from this single flag
+    if let Some(ref dir) = cli.data_dir {
+        kakehashi::config::set_data_dir_override(dir.clone());
+    }
+
     match cli.command {
         Some(Commands::Language { action }) => match action {
             LanguageAction::Install {
                 language,
-                data_dir,
                 force,
                 verbose,
                 no_cache,
             } => {
-                run_install(&language, data_dir, force, verbose, no_cache);
+                run_install(&language, force, verbose, no_cache);
             }
             LanguageAction::List { no_cache } => {
                 run_list_languages(no_cache);
             }
-            LanguageAction::Status { data_dir, verbose } => {
-                run_language_status(data_dir, verbose);
+            LanguageAction::Status { verbose } => {
+                run_language_status(verbose);
             }
             LanguageAction::Uninstall {
                 language,
-                data_dir,
                 force,
                 all,
             } => {
-                run_language_uninstall(language, data_dir, force, all);
+                run_language_uninstall(language, force, all);
             }
         },
         Some(Commands::Config { action }) => match action {
@@ -177,11 +173,11 @@ const DOC_LINK: &str =
     "# Documentation: https://github.com/atusy/kakehashi/blob/main/docs/README.md\n";
 
 /// Run the language status command
-fn run_language_status(data_dir: Option<PathBuf>, verbose: bool) {
+fn run_language_status(verbose: bool) {
     use std::collections::BTreeSet;
     use std::fs;
 
-    let data_dir = data_dir.or_else(default_data_dir).unwrap_or_else(|| {
+    let data_dir = default_data_dir().unwrap_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
         std::process::exit(1);
     });
@@ -259,17 +255,12 @@ fn run_language_status(data_dir: Option<PathBuf>, verbose: bool) {
 }
 
 /// Run the language uninstall command
-fn run_language_uninstall(
-    language: Option<String>,
-    data_dir: Option<PathBuf>,
-    force: bool,
-    all: bool,
-) {
+fn run_language_uninstall(language: Option<String>, force: bool, all: bool) {
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{self, Write};
 
-    let data_dir = data_dir.or_else(default_data_dir).unwrap_or_else(|| {
+    let data_dir = default_data_dir().unwrap_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
         std::process::exit(1);
     });
@@ -444,14 +435,8 @@ fn run_config_init(output: Option<PathBuf>, force: bool) {
 }
 
 /// Run the install command (synchronous - no tokio runtime)
-fn run_install(
-    language: &str,
-    data_dir: Option<PathBuf>,
-    force: bool,
-    verbose: bool,
-    no_cache: bool,
-) {
-    let data_dir = data_dir.or_else(default_data_dir).unwrap_or_else(|| {
+fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) {
+    let data_dir = default_data_dir().unwrap_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
         std::process::exit(1);
     });

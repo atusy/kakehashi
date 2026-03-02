@@ -67,6 +67,7 @@ pub fn load_settings(
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
 ) -> SettingsLoadOutcome {
+    let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
 
     // Layer 1: Programmed defaults (ADR-0010: lowest precedence)

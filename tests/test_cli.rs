@@ -65,13 +65,14 @@ fn test_install_help_shows_language_argument() {
 /// Test that language install command with unsupported language shows helpful error
 #[test]
 fn test_install_command_unsupported_language_shows_error() {
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args([
             "language",
             "install",
             "nonexistent_language_xyz",
             "--data-dir",
-            "/tmp/test-cli",
+            test_dir.path().to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute command");
@@ -270,18 +271,13 @@ fn test_config_init_includes_capture_mappings() {
 #[test]
 fn test_config_init_output_creates_file() {
     use std::fs;
-    use std::path::Path;
 
-    let test_dir = "/tmp/test-config-init-output";
-    let config_path = Path::new(test_dir).join("kakehashi.toml");
-
-    // Clean up before test
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(test_dir).expect("Failed to create test directory");
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = test_dir.path().join("kakehashi.toml");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args(["config", "init", "--output", "kakehashi.toml"])
-        .current_dir(test_dir)
+        .current_dir(test_dir.path())
         .output()
         .expect("Failed to execute command");
 
@@ -306,28 +302,21 @@ fn test_config_init_output_creates_file() {
         "Config should contain expected options. Got: {}",
         content
     );
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 /// Test that config init --output does not overwrite existing file without --force
 #[test]
 fn test_config_init_output_no_overwrite_without_force() {
     use std::fs;
-    use std::path::Path;
 
-    let test_dir = "/tmp/test-config-no-overwrite";
-    let config_path = Path::new(test_dir).join("kakehashi.toml");
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = test_dir.path().join("kakehashi.toml");
 
-    // Clean up and setup
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(test_dir).expect("Failed to create test directory");
     fs::write(&config_path, "existing").expect("Failed to write existing config");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args(["config", "init", "--output", "kakehashi.toml"])
-        .current_dir(test_dir)
+        .current_dir(test_dir.path())
         .output()
         .expect("Failed to execute command");
 
@@ -340,28 +329,21 @@ fn test_config_init_output_no_overwrite_without_force() {
     // Original content should be preserved
     let content = fs::read_to_string(&config_path).expect("Failed to read config");
     assert_eq!(content, "existing", "Original content should be preserved");
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 /// Test that config init --output --force overwrites existing file
 #[test]
 fn test_config_init_output_force_overwrites() {
     use std::fs;
-    use std::path::Path;
 
-    let test_dir = "/tmp/test-config-force";
-    let config_path = Path::new(test_dir).join("kakehashi.toml");
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let config_path = test_dir.path().join("kakehashi.toml");
 
-    // Clean up and setup
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(test_dir).expect("Failed to create test directory");
     fs::write(&config_path, "existing").expect("Failed to write existing config");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args(["config", "init", "--output", "kakehashi.toml", "--force"])
-        .current_dir(test_dir)
+        .current_dir(test_dir.path())
         .output()
         .expect("Failed to execute command");
 
@@ -381,9 +363,6 @@ fn test_config_init_output_force_overwrites() {
         content.contains("autoInstall"),
         "New content should be present"
     );
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 /// Test that config init --force without --output warns to stderr
@@ -475,24 +454,31 @@ fn test_language_status_help() {
 fn test_language_status_shows_installed() {
     use std::fs;
 
-    let test_dir = "/tmp/test-status-installed";
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    // Clean up and setup with a fake parser and queries
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
-    fs::create_dir_all(format!("{}/queries/testlang", test_dir))
+    // Setup with a fake parser and queries
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/testlang"))
         .expect("Failed to create queries dir");
     let ext = std::env::consts::DLL_EXTENSION;
-    fs::write(format!("{}/parser/testlang.{ext}", test_dir), "fake")
-        .expect("Failed to write parser");
     fs::write(
-        format!("{}/queries/testlang/highlights.scm", test_dir),
+        test_dir.path().join(format!("parser/testlang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/testlang/highlights.scm"),
         "(comment) @comment",
     )
     .expect("Failed to write query");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
-        .args(["language", "status", "--data-dir", test_dir])
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute command");
 
@@ -511,9 +497,6 @@ fn test_language_status_shows_installed() {
         "Status should show parser and queries as installed. Got: {}",
         combined
     );
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 /// Test that language status shows missing queries
@@ -521,17 +504,24 @@ fn test_language_status_shows_installed() {
 fn test_language_status_missing_queries() {
     use std::fs;
 
-    let test_dir = "/tmp/test-status-missing";
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    // Clean up and setup with parser only (no queries)
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
+    // Setup with parser only (no queries)
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
     let ext = std::env::consts::DLL_EXTENSION;
-    fs::write(format!("{}/parser/incomplete.{ext}", test_dir), "fake")
-        .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join(format!("parser/incomplete.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
-        .args(["language", "status", "--data-dir", test_dir])
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute command");
 
@@ -550,9 +540,6 @@ fn test_language_status_missing_queries() {
         "Status should indicate missing queries. Got: {}",
         combined
     );
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 /// Test that language uninstall --help shows expected options
@@ -589,18 +576,20 @@ fn test_language_uninstall_help() {
 fn test_language_uninstall_removes_files() {
     use std::fs;
 
-    let test_dir = "/tmp/test-uninstall-files";
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    // Clean up and setup
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
-    fs::create_dir_all(format!("{}/queries/testlang", test_dir))
+    // Setup
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/testlang"))
         .expect("Failed to create queries dir");
     let ext = std::env::consts::DLL_EXTENSION;
-    fs::write(format!("{}/parser/testlang.{ext}", test_dir), "fake")
-        .expect("Failed to write parser");
     fs::write(
-        format!("{}/queries/testlang/highlights.scm", test_dir),
+        test_dir.path().join(format!("parser/testlang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/testlang/highlights.scm"),
         "(comment) @comment",
     )
     .expect("Failed to write query");
@@ -611,7 +600,7 @@ fn test_language_uninstall_removes_files() {
             "uninstall",
             "testlang",
             "--data-dir",
-            test_dir,
+            test_dir.path().to_str().unwrap(),
             "--force",
         ])
         .output()
@@ -626,18 +615,18 @@ fn test_language_uninstall_removes_files() {
 
     // Parser should be removed
     assert!(
-        !std::path::Path::new(&format!("{}/parser/testlang.{ext}", test_dir)).exists(),
+        !test_dir
+            .path()
+            .join(format!("parser/testlang.{ext}"))
+            .exists(),
         "Parser should be removed"
     );
 
     // Queries should be removed
     assert!(
-        !std::path::Path::new(&format!("{}/queries/testlang", test_dir)).exists(),
+        !test_dir.path().join("queries/testlang").exists(),
         "Queries directory should be removed"
     );
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
 
 /// Test that language uninstall --all removes all languages
@@ -645,25 +634,26 @@ fn test_language_uninstall_removes_files() {
 fn test_language_uninstall_all() {
     use std::fs;
 
-    let test_dir = "/tmp/test-uninstall-all";
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    // Clean up and setup multiple languages
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
-    fs::create_dir_all(format!("{}/queries/lang1", test_dir))
+    // Setup multiple languages
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/lang1"))
         .expect("Failed to create queries dir");
-    fs::create_dir_all(format!("{}/queries/lang2", test_dir))
+    fs::create_dir_all(test_dir.path().join("queries/lang2"))
         .expect("Failed to create queries dir");
     let ext = std::env::consts::DLL_EXTENSION;
-    fs::write(format!("{}/parser/lang1.{ext}", test_dir), "fake").expect("Failed to write parser");
-    fs::write(format!("{}/parser/lang2.{ext}", test_dir), "fake").expect("Failed to write parser");
+    fs::write(test_dir.path().join(format!("parser/lang1.{ext}")), "fake")
+        .expect("Failed to write parser");
+    fs::write(test_dir.path().join(format!("parser/lang2.{ext}")), "fake")
+        .expect("Failed to write parser");
     fs::write(
-        format!("{}/queries/lang1/highlights.scm", test_dir),
+        test_dir.path().join("queries/lang1/highlights.scm"),
         "(comment) @comment",
     )
     .expect("Failed to write query");
     fs::write(
-        format!("{}/queries/lang2/highlights.scm", test_dir),
+        test_dir.path().join("queries/lang2/highlights.scm"),
         "(comment) @comment",
     )
     .expect("Failed to write query");
@@ -674,7 +664,7 @@ fn test_language_uninstall_all() {
             "uninstall",
             "--all",
             "--data-dir",
-            test_dir,
+            test_dir.path().to_str().unwrap(),
             "--force",
         ])
         .output()
@@ -688,21 +678,69 @@ fn test_language_uninstall_all() {
     );
 
     // All parsers should be removed
-    let parser_dir = format!("{}/parser", test_dir);
-    let parsers: Vec<_> = fs::read_dir(&parser_dir)
+    let parsers: Vec<_> = fs::read_dir(test_dir.path().join("parser"))
         .map(|entries| entries.filter_map(|e| e.ok()).collect())
         .unwrap_or_default();
     assert!(parsers.is_empty(), "All parsers should be removed");
 
     // All queries should be removed
-    let queries_dir = format!("{}/queries", test_dir);
-    let queries: Vec<_> = fs::read_dir(&queries_dir)
+    let queries: Vec<_> = fs::read_dir(test_dir.path().join("queries"))
         .map(|entries| entries.filter_map(|e| e.ok()).collect())
         .unwrap_or_default();
     assert!(queries.is_empty(), "All queries should be removed");
+}
 
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
+/// Test that --data-dir works as a top-level flag (before subcommand)
+#[test]
+fn test_data_dir_top_level_flag() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+
+    // Setup with a fake parser and queries
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::create_dir_all(test_dir.path().join("queries/testlang"))
+        .expect("Failed to create queries dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::write(
+        test_dir.path().join(format!("parser/testlang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join("queries/testlang/highlights.scm"),
+        "(comment) @comment",
+    )
+    .expect("Failed to write query");
+
+    // Use --data-dir BEFORE the subcommand (top-level position)
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "language",
+            "status",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    // Should exit successfully
+    assert!(
+        output.status.success(),
+        "Top-level --data-dir should work with language status. stderr: {}",
+        stderr
+    );
+
+    // Should show testlang
+    assert!(
+        combined.contains("testlang"),
+        "Status should show testlang with top-level --data-dir. Got: {}",
+        combined
+    );
 }
 
 /// Test that language uninstall cancels without --force when user enters 'n'
@@ -711,17 +749,25 @@ fn test_language_uninstall_cancel() {
     use std::fs;
     use std::process::Stdio;
 
-    let test_dir = "/tmp/test-uninstall-cancel";
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
 
-    // Clean up and setup
-    let _ = fs::remove_dir_all(test_dir);
-    fs::create_dir_all(format!("{}/parser", test_dir)).expect("Failed to create parser dir");
+    // Setup
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
     let ext = std::env::consts::DLL_EXTENSION;
-    fs::write(format!("{}/parser/testlang.{ext}", test_dir), "fake")
-        .expect("Failed to write parser");
+    fs::write(
+        test_dir.path().join(format!("parser/testlang.{ext}")),
+        "fake",
+    )
+    .expect("Failed to write parser");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
-        .args(["language", "uninstall", "testlang", "--data-dir", test_dir])
+        .args([
+            "language",
+            "uninstall",
+            "testlang",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -749,10 +795,10 @@ fn test_language_uninstall_cancel() {
 
     // Parser should still exist
     assert!(
-        std::path::Path::new(&format!("{}/parser/testlang.{ext}", test_dir)).exists(),
+        test_dir
+            .path()
+            .join(format!("parser/testlang.{ext}"))
+            .exists(),
         "Parser should still exist after cancellation"
     );
-
-    // Clean up
-    let _ = fs::remove_dir_all(test_dir);
 }
