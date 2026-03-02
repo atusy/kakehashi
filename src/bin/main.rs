@@ -97,12 +97,10 @@ enum ConfigAction {
 fn main() {
     let cli = Cli::parse();
 
-    // Set KAKEHASHI_DATA_DIR so default_data_dir() and config expansion
+    // Set data directory override so default_data_dir() and config expansion
     // all resolve consistently from this single flag
     if let Some(ref dir) = cli.data_dir {
-        unsafe {
-            std::env::set_var("KAKEHASHI_DATA_DIR", dir);
-        }
+        kakehashi::config::set_data_dir_override(dir.clone());
     }
 
     match cli.command {

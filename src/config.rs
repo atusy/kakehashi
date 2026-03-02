@@ -6,7 +6,7 @@ pub mod settings;
 pub(crate) use expand::make_env;
 pub(crate) mod user;
 
-pub use expand::ExpandErrors;
+pub use expand::{ExpandErrors, set_data_dir_override};
 pub use settings::{
     BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageConfig, LanguageSettings,
     QueryItem, QueryKind, QueryTypeMappings, TreeSitterSettings, WorkspaceSettings,

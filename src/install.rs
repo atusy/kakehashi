@@ -36,6 +36,10 @@ use std::path::PathBuf;
 /// - macOS: ~/Library/Application Support/kakehashi/
 /// - Windows: %APPDATA%/kakehashi/
 pub fn default_data_dir() -> Option<PathBuf> {
+    // --data-dir CLI flag override (highest priority)
+    if let Some(dir) = crate::config::expand::data_dir_override() {
+        return Some(dir.to_path_buf());
+    }
     resolve_data_dir(|var| std::env::var(var).ok())
 }
 
