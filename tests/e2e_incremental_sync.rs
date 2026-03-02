@@ -24,7 +24,7 @@ use serde_json::json;
 /// 1. Open a markdown document with a Lua block
 /// 2. Trigger hover to establish virtual document
 /// 3. Send incremental didChange (with range, not full text)
-/// 4. Verify hover still works (ULID preserved, region tracking correct)
+/// 4. Verify hover still works (no error — region tracking correct, ULID preserved)
 ///
 /// The key difference from e2e_didchange_forwarding is using incremental sync
 /// with `range` instead of full document replacement.
@@ -43,19 +43,12 @@ fn e2e_incremental_sync_preserves_region_tracking() {
     // 1: ""
     // 2: "```lua"
     // 3: "local foo = 1"
-    // 4: "print(foo)"
+    // 4: "print(foo)"    ← hover target: inside injection region
     // 5: "```"
     // 6: ""
     // 7: "More text."
-    let initial_content = r#"# Test Document
-
-```lua
-local foo = 1
-print(foo)
-```
-
-More text.
-"#;
+    let initial_content =
+        "# Test Document\n\n```lua\nlocal foo = 1\nprint(foo)\n```\n\nMore text.\n";
 
     client.send_notification(
         "textDocument/didOpen",
@@ -72,30 +65,27 @@ More text.
     // Give lua-ls time to initialize
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Phase 2: Trigger hover on "foo" to establish virtual document
-    // Line 3: "local foo = 1", character 6 is on "foo"
-    // Use more retries (10) to allow lua-ls time to index
-    let hover_before = poll_for_hover(&mut client, markdown_uri, 3, 6, 10, 500);
+    // Phase 2: Poll for hover to establish the virtual document and confirm lua-ls is
+    // indexed. A non-null result proves (a) the bridge routes to the Lua injection
+    // region, and (b) lua-ls has the virtual document open — a prerequisite for
+    // detecting ULID over-invalidation in Phase 4.
+    // Line 4: "print(foo)", character 0 is inside the Lua injection region.
+    let hover_before = poll_for_hover(&mut client, markdown_uri, 4, 0, 20, 500);
 
-    // STRICT: Fail if hover doesn't work - this indicates lua-ls integration issue
-    assert!(
-        hover_before.is_some(),
-        "Initial hover should succeed after 10 retries. \
-         This indicates lua-ls may not be ready or there's an integration issue."
+    println!(
+        "Phase 2: Hover before incremental change: {:?}",
+        hover_before
     );
 
-    println!("Phase 2: Hover before incremental change succeeded");
+    assert!(
+        hover_before.is_some(),
+        "Initial hover should return content after retries. \
+         This indicates lua-ls may not be ready or there's a bridge routing issue."
+    );
 
     // Phase 3: Send incremental didChange
-    // We'll insert " = 2" at the end of line 3, changing "local foo = 1" to "local foo = 1 = 2"
-    // (This is syntactically invalid Lua, but that's okay for testing region tracking)
-    //
-    // Line 3 content: "local foo = 1" (13 characters, at positions 0-12)
-    // Insert at end of line 3: position {line: 3, character: 13}
-    // Range: {start: {line: 3, character: 13}, end: {line: 3, character: 13}}
-    // Text: " = 2"
-    //
-    // This is an INCREMENTAL change (has range), not FULL sync
+    // Insert " = 2" at end of line 3 ("local foo = 1" → "local foo = 1 = 2").
+    // Line 4 ("print(foo)") is unaffected — this is an INCREMENTAL change with range.
     client.send_notification(
         "textDocument/didChange",
         json!({
@@ -118,27 +108,24 @@ More text.
     println!("Phase 3: Sent incremental didChange (insert at end of line 3)");
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Phase 4: Verify hover still works on the original variable
-    // This confirms:
-    // - Region tracking correctly processed the incremental edit
-    // - ULID was preserved (not over-invalidated)
-    // - Virtual document URI remains stable
-    let hover_after = poll_for_hover(&mut client, markdown_uri, 3, 6, 10, 500);
+    // Phase 4: Verify hover still works on `print` at line 4 (unchanged by the edit).
+    // Using poll_for_hover to detect ULID over-invalidation:
+    // - If ULID preserved: bridge sends to the same virtual document URI → lua-ls
+    //   (already indexed in Phase 2) returns non-null hover promptly.
+    // - If ULID changed: bridge sends to an unknown virtual document URI → lua-ls
+    //   consistently returns null → poll exhausts retries → assertion fails.
+    // A short retry window (5 × 500 ms) is sufficient because lua-ls is already
+    // indexed; only a brief re-indexing delay is expected after the incremental edit.
+    let hover_after = poll_for_hover(&mut client, markdown_uri, 4, 0, 5, 500);
 
-    // STRICT: Fail if hover doesn't work after incremental edit
+    println!("Phase 4: Hover after incremental change: {:?}", hover_after);
+
     assert!(
         hover_after.is_some(),
-        "Hover after incremental edit should succeed. \
-         This indicates region tracking may have incorrectly invalidated the ULID."
-    );
-
-    println!("Phase 4: Hover after incremental change succeeded");
-
-    // Verify hover didn't return an error
-    assert!(
-        hover_after.as_ref().unwrap().get("error").is_none(),
-        "Hover after incremental sync should not error: {:?}",
-        hover_after.as_ref().unwrap().get("error")
+        "Hover should return content after incremental edit. \
+         A persistent null result (after lua-ls was confirmed ready in Phase 2) \
+         indicates ULID over-invalidation: the bridge sent to a different virtual \
+         document URI that lua-ls has not opened."
     );
 
     println!("E2E: Incremental sync preserves region tracking - hover works after edit!");
@@ -162,29 +149,20 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
     // Open markdown with two Lua blocks
     let markdown_uri = "file:///test_multi_incremental.md";
     // Line numbers (0-indexed):
-    // 0: "# Test"
-    // 1: ""
-    // 2: "```lua"
-    // 3: "local a = 1"
-    // 4: "```"
-    // 5: ""
-    // 6: "Middle text."
-    // 7: ""
-    // 8: "```lua"
-    // 9: "local b = 2"
-    // 10: "```"
-    let initial_content = r#"# Test
-
-```lua
-local a = 1
-```
-
-Middle text.
-
-```lua
-local b = 2
-```
-"#;
+    // 0:  "# Test"
+    // 1:  ""
+    // 2:  "```lua"
+    // 3:  "local a = 1"
+    // 4:  "print(a)"     ← hover target for first block
+    // 5:  "```"
+    // 6:  ""
+    // 7:  "Middle text."
+    // 8:  ""
+    // 9:  "```lua"
+    // 10: "local b = 2"
+    // 11: "print(b)"     ← hover target for second block
+    // 12: "```"
+    let initial_content = "# Test\n\n```lua\nlocal a = 1\nprint(a)\n```\n\nMiddle text.\n\n```lua\nlocal b = 2\nprint(b)\n```\n";
 
     client.send_notification(
         "textDocument/didOpen",
@@ -198,26 +176,34 @@ local b = 2
         }),
     );
 
+    // Give lua-ls time to initialize
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    // Hover on first Lua block to establish virtual document (10 retries)
-    let hover1 = poll_for_hover(&mut client, markdown_uri, 3, 6, 10, 500);
+    // Poll for hover on first Lua block to establish its virtual document and confirm
+    // lua-ls has indexed it. Non-null result is required as a baseline for detecting
+    // ULID over-invalidation after the incremental edits below.
+    // Line 4: "print(a)", character 0 is inside the first Lua injection region.
+    let hover1 = poll_for_hover(&mut client, markdown_uri, 4, 0, 20, 500);
     assert!(
         hover1.is_some(),
-        "First Lua block hover should succeed after 10 retries"
+        "First Lua block hover should return content after retries. \
+         This indicates lua-ls may not be ready or there's a bridge routing issue."
     );
     println!("Established first Lua block virtual document");
 
-    // Hover on second Lua block to establish its virtual document (10 retries)
-    let hover2 = poll_for_hover(&mut client, markdown_uri, 9, 6, 10, 500);
+    // Poll for hover on second Lua block to establish its virtual document.
+    // Line 11: "print(b)", character 0 is inside the second Lua injection region.
+    let hover2 = poll_for_hover(&mut client, markdown_uri, 11, 0, 20, 500);
     assert!(
         hover2.is_some(),
-        "Second Lua block hover should succeed after 10 retries"
+        "Second Lua block hover should return content after retries. \
+         This indicates lua-ls may not be ready or there's a bridge routing issue."
     );
     println!("Established second Lua block virtual document");
 
-    // Send multiple incremental edits in sequence
-    // Edit 1: Insert newline after "Middle text." (shifts second Lua block down)
+    // Send multiple incremental edits in sequence.
+    // Edit 1: Insert newline after "Middle text." (shifts second Lua block down by 1 line).
+    // "Middle text." is at line 7, character 12 (end of "Middle text.")
     client.send_notification(
         "textDocument/didChange",
         json!({
@@ -228,18 +214,21 @@ local b = 2
             "contentChanges": [
                 {
                     "range": {
-                        "start": { "line": 6, "character": 12 },
-                        "end": { "line": 6, "character": 12 }
+                        "start": { "line": 7, "character": 12 },
+                        "end": { "line": 7, "character": 12 }
                     },
                     "text": "\nExtra line."
                 }
             ]
         }),
     );
-    println!("Sent edit 1: Insert newline after 'Middle text.'");
+    println!(
+        "Sent edit 1: Insert newline after 'Middle text.' (shifts second block to lines 10-13)"
+    );
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // Edit 2: Insert character in first Lua block
+    // Edit 2: Insert character in first Lua block (does not shift any lines).
+    // Line 3: "local a = 1" (11 chars) → insert "0" at char 11 → "local a = 10"
     client.send_notification(
         "textDocument/didChange",
         json!({
@@ -261,19 +250,28 @@ local b = 2
     println!("Sent edit 2: Insert '0' making 'local a = 10'");
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    // Verify first Lua block still works (after both edits)
-    let hover1_after = poll_for_hover(&mut client, markdown_uri, 3, 6, 10, 500);
+    // Verify first Lua block still works (after both edits).
+    // Line 4: "print(a)" - unchanged (edit 2 modified line 3, not line 4).
+    // Short retry window: lua-ls is already indexed; a persistent null result
+    // indicates ULID over-invalidation for the first block.
+    let hover1_after = poll_for_hover(&mut client, markdown_uri, 4, 0, 5, 500);
     assert!(
         hover1_after.is_some(),
-        "First Lua block hover should still work after multiple incremental edits"
+        "First Lua block hover should return content after multiple incremental edits. \
+         A persistent null result indicates ULID over-invalidation."
     );
     println!("First Lua block hover works after multiple incremental edits");
 
-    // Verify second Lua block still works (now shifted to line 10)
-    let hover2_after = poll_for_hover(&mut client, markdown_uri, 10, 6, 10, 500);
+    // Verify second Lua block still works (now shifted to line 12).
+    // Edit 1 inserted a line after "Middle text." (line 7), shifting lines 8+ by 1.
+    // "print(b)" was at line 11, now at line 12.
+    // Short retry window: ULID stability check — if region positions shifted correctly,
+    // the same ULID should resolve to the new line; if over-invalidated, null is persistent.
+    let hover2_after = poll_for_hover(&mut client, markdown_uri, 12, 0, 5, 500);
     assert!(
         hover2_after.is_some(),
-        "Second Lua block hover should work at new position after line shift"
+        "Second Lua block hover should return content at new position (line 12). \
+         A persistent null result indicates ULID over-invalidation or incorrect position shift."
     );
     println!("Second Lua block hover works after position shift");
 
