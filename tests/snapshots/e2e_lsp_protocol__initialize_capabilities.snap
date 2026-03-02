@@ -3,6 +3,15 @@ source: tests/e2e_lsp_protocol.rs
 expression: capabilities
 ---
 {
+  "textDocumentSync": {
+    "openClose": true,
+    "change": 2,
+    "save": {
+      "includeText": false
+    }
+  },
+  "selectionRangeProvider": true,
+  "hoverProvider": true,
   "completionProvider": {
     "resolveProvider": true,
     "triggerCharacters": [
@@ -10,41 +19,28 @@ expression: capabilities
       ":"
     ]
   },
-  "declarationProvider": true,
-  "definitionProvider": true,
-  "diagnosticProvider": {
-    "interFileDependencies": false,
-    "workspaceDiagnostics": false
+  "signatureHelpProvider": {
+    "triggerCharacters": [
+      "(",
+      ","
+    ],
+    "retriggerCharacters": [
+      ","
+    ]
   },
-  "documentHighlightProvider": true,
-  "documentLinkProvider": {},
-  "documentSymbolProvider": true,
-  "hoverProvider": true,
+  "definitionProvider": true,
+  "typeDefinitionProvider": true,
   "implementationProvider": true,
-  "inlayHintProvider": true,
-  "monikerProvider": true,
   "referencesProvider": true,
+  "documentHighlightProvider": true,
+  "documentSymbolProvider": true,
   "renameProvider": {
     "prepareProvider": true
   },
-  "selectionRangeProvider": true,
+  "documentLinkProvider": {},
+  "declarationProvider": true,
   "semanticTokensProvider": {
-    "full": {
-      "delta": true
-    },
     "legend": {
-      "tokenModifiers": [
-        "declaration",
-        "definition",
-        "readonly",
-        "static",
-        "deprecated",
-        "abstract",
-        "async",
-        "modification",
-        "documentation",
-        "defaultLibrary"
-      ],
       "tokenTypes": [
         "comment",
         "keyword",
@@ -69,25 +65,29 @@ expression: capabilities
         "event",
         "modifier",
         "decorator"
+      ],
+      "tokenModifiers": [
+        "declaration",
+        "definition",
+        "readonly",
+        "static",
+        "deprecated",
+        "abstract",
+        "async",
+        "modification",
+        "documentation",
+        "defaultLibrary"
       ]
     },
-    "range": true
-  },
-  "signatureHelpProvider": {
-    "retriggerCharacters": [
-      ","
-    ],
-    "triggerCharacters": [
-      "(",
-      ","
-    ]
-  },
-  "textDocumentSync": {
-    "change": 2,
-    "openClose": true,
-    "save": {
-      "includeText": false
+    "range": true,
+    "full": {
+      "delta": true
     }
   },
-  "typeDefinitionProvider": true
+  "monikerProvider": true,
+  "inlayHintProvider": true,
+  "diagnosticProvider": {
+    "interFileDependencies": false,
+    "workspaceDiagnostics": false
+  }
 }
