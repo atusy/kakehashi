@@ -177,15 +177,27 @@ impl<'a> ClientNotifier<'a> {
     ///
     /// Settings events are emitted during configuration loading and include
     /// informational messages and warnings about configuration issues.
+    /// Error events use `window/showMessage` so they appear as visible
+    /// notifications in the editor, not just in the output panel.
     pub(crate) async fn log_settings_events(&self, events: &[SettingsEvent]) {
         for event in events {
-            let message_type = match event.kind {
-                SettingsEventKind::Info => MessageType::INFO,
-                SettingsEventKind::Warning => MessageType::WARNING,
-            };
-            self.client
-                .log_message(message_type, event.message.clone())
-                .await;
+            match event.kind {
+                SettingsEventKind::Error => {
+                    self.client
+                        .show_message(MessageType::ERROR, event.message.clone())
+                        .await;
+                }
+                SettingsEventKind::Warning => {
+                    self.client
+                        .log_message(MessageType::WARNING, event.message.clone())
+                        .await;
+                }
+                SettingsEventKind::Info => {
+                    self.client
+                        .log_message(MessageType::INFO, event.message.clone())
+                        .await;
+                }
+            }
         }
     }
 

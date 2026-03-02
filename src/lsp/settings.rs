@@ -9,6 +9,8 @@ use std::path::Path;
 pub enum SettingsEventKind {
     Info,
     Warning,
+    /// Hard error surfaced via `window/showMessage` so the user cannot miss it.
+    Error,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +30,13 @@ impl SettingsEvent {
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             kind: SettingsEventKind::Warning,
+            message: message.into(),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            kind: SettingsEventKind::Error,
             message: message.into(),
         }
     }
@@ -55,6 +64,8 @@ pub struct SettingsLoadOutcome {
 pub fn load_settings(
     root_path: Option<&Path>,
     override_settings: Option<(SettingsSource, Value)>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
 ) -> SettingsLoadOutcome {
     let mut events = Vec::new();
 
@@ -73,7 +84,20 @@ pub fn load_settings(
 
     // Merge all layers: defaults < user < project < override (later layers override earlier)
     let merged = merge_all(&[defaults, user_config, project_settings, override_settings]);
-    let settings = merged.map(WorkspaceSettings::from);
+    let settings =
+        merged.and_then(
+            |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
+                Ok(ws) => Some(ws),
+                Err(errs) => {
+                    events.push(SettingsEvent::error(format!(
+                        "Environment variable expansion failed: {errs}. \
+                     This configuration has been discarded; previous settings remain in effect. \
+                     Please define the missing variables or remove them from your config.",
+                    )));
+                    None
+                }
+            },
+        );
 
     SettingsLoadOutcome { settings, events }
 }
@@ -218,7 +242,10 @@ mod tests {
         }
 
         // Load settings with project path
-        let outcome = load_settings(Some(project_dir.path()), None);
+        let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+        let outcome = load_settings(Some(project_dir.path()), None, home.as_deref(), |var| {
+            std::env::var(var).ok()
+        });
 
         // Restore original XDG_CONFIG_HOME
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
@@ -301,9 +328,12 @@ mod tests {
         });
 
         // Load settings with override
+        let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
         let outcome = load_settings(
             Some(project_dir.path()),
             Some((SettingsSource::InitializationOptions, override_json)),
+            home.as_deref(),
+            |var| std::env::var(var).ok(),
         );
 
         // Restore original XDG_CONFIG_HOME
@@ -361,7 +391,8 @@ mod tests {
         }
 
         // Load settings (no project path, just user config)
-        let outcome = load_settings(None, None);
+        let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+        let outcome = load_settings(None, None, home.as_deref(), |var| std::env::var(var).ok());
 
         // Restore original XDG_CONFIG_HOME
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
@@ -385,6 +416,47 @@ mod tests {
                 .events
                 .iter()
                 .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Verify that undefined env vars in override settings produce an Error event
+    /// and discard the settings (returning None).
+    #[test]
+    fn test_load_settings_expansion_error_discards_settings() {
+        use crate::config::make_env;
+
+        let override_json = serde_json::json!({
+            "searchPaths": ["$UNDEFINED_VAR/parsers"]
+        });
+
+        // Use a deterministic empty env so the test does not depend on
+        // any particular variable being absent from the real environment.
+        let env = make_env(&[]);
+        let outcome = load_settings(
+            None,
+            Some((SettingsSource::InitializationOptions, override_json)),
+            None,
+            env,
+        );
+
+        assert!(
+            outcome.settings.is_none(),
+            "Settings should be None when expansion fails"
+        );
+
+        let has_error_event = outcome
+            .events
+            .iter()
+            .any(|e| e.kind == SettingsEventKind::Error && e.message.contains("expansion failed"));
+
+        assert!(
+            has_error_event,
+            "Should have an Error event about expansion failure. Events: {:?}",
+            outcome
+                .events
+                .iter()
+                .map(|e| format!("{:?}: {}", e.kind, &e.message))
                 .collect::<Vec<_>>()
         );
     }

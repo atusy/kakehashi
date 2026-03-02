@@ -22,7 +22,8 @@ fn test_dynamic_lua_load_from_search_paths() {
     };
 
     // Load settings into coordinator
-    let workspace_settings: WorkspaceSettings = settings.into();
+    let workspace_settings = WorkspaceSettings::try_from_settings(&settings, None, |_| None)
+        .expect("test settings should expand without errors");
     let _summary = coordinator.load_settings(workspace_settings);
 
     // Verify search paths are set

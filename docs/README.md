@@ -99,13 +99,13 @@ Configuration is provided via LSP `initializationOptions`. All options are optio
 
 ```json
 {
-  "searchPaths": ["/custom/path/to/parsers", "/another/path"],
+  "searchPaths": ["$HOME/.local/share/kakehashi", "/another/path"],
   "autoInstall": true,
   "languages": {
     "lua": {
-      "parser": "/path/to/lua.so",
+      "parser": "$HOME/parsers/lua.so",
       "queries": [
-        {"path": "/path/to/highlights.scm", "kind": "highlights"},
+        {"path": "~/queries/highlights.scm", "kind": "highlights"},
         {"path": "/path/to/custom.scm", "kind": "highlights"},
         {"path": "/path/to/injections.scm", "kind": "injections"}
       ]
@@ -120,6 +120,22 @@ Configuration is provided via LSP `initializationOptions`. All options are optio
   }
 }
 ```
+
+### Environment Variable Expansion
+
+Path fields support environment variable expansion and tilde (`~`) expansion, making configurations portable across machines.
+
+**Supported syntax:**
+- `$VAR` or `${VAR}` — expands to the value of environment variable `VAR`
+- `~` — expands to the user's home directory
+- `$$` — produces a literal `$` (escape mechanism)
+
+**Supported fields:**
+- `searchPaths[*]`
+- `languages[*].parser`
+- `languages[*].queries[*].path`
+
+**Behavior on undefined variables:** If a referenced environment variable is not defined, configuration loading fails with an error notification and falls back to previous settings (or defaults).
 
 ### Option Reference
 

@@ -244,7 +244,8 @@ mod tests {
 
         // Create settings from defaults
         let ts_settings = default_settings();
-        let ws_settings = WorkspaceSettings::from(&ts_settings);
+        let ws_settings = WorkspaceSettings::try_from_settings(&ts_settings, None, |_| None)
+            .expect("default settings should expand without errors");
 
         // Verify WorkspaceSettings has the mapping
         assert!(
