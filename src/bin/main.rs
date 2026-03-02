@@ -12,6 +12,12 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
+    /// Config file(s) to use instead of default locations (LSP mode only).
+    /// Can be specified multiple times; files merge in order.
+    /// Skips ~/.config/kakehashi/kakehashi.toml and ./kakehashi.toml.
+    #[arg(long, global = true)]
+    config_file: Vec<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -101,6 +107,10 @@ fn main() {
     // all resolve consistently from this single flag
     if let Some(ref dir) = cli.data_dir {
         kakehashi::config::set_data_dir_override(dir.clone());
+    }
+
+    if !cli.config_file.is_empty() {
+        kakehashi::config::set_config_file_override(cli.config_file);
     }
 
     match cli.command {
