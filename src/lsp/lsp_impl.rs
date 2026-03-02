@@ -135,6 +135,10 @@ pub struct Kakehashi {
     /// dropped. Cancelling the token gives deterministic shutdown: `shutdown()`
     /// cancels → task exits immediately → no waiting for channel drainage.
     shutdown_token: tokio_util::sync::CancellationToken,
+    /// Pre-computed home directory for tilde expansion in config paths.
+    /// Computed once at construction — `dirs::home_dir()` is stable for the
+    /// process lifetime.
+    home_dir: Option<String>,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -151,6 +155,7 @@ impl std::fmt::Debug for Kakehashi {
             .field("synthetic_diagnostics", &"SyntheticDiagnosticsManager")
             .field("debounced_diagnostics", &"DebouncedDiagnosticsManager")
             .field("shutdown_token", &"CancellationToken")
+            .field("home_dir", &self.home_dir)
             .finish_non_exhaustive()
     }
 }
@@ -176,6 +181,7 @@ impl Kakehashi {
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             debounced_diagnostics: DebouncedDiagnosticsManager::new(),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
         }
     }
 
@@ -210,6 +216,7 @@ impl Kakehashi {
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             debounced_diagnostics: DebouncedDiagnosticsManager::new(),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
         }
     }
 
@@ -1131,6 +1138,8 @@ impl LanguageServer for Kakehashi {
             params
                 .initialization_options
                 .map(|options| (SettingsSource::InitializationOptions, options)),
+            self.home_dir.as_deref(),
+            |var| std::env::var(var).ok(),
         );
         self.report_settings_events(&settings_outcome.events).await;
 
@@ -1140,7 +1149,12 @@ impl LanguageServer for Kakehashi {
         // because the derived Default creates empty capture_mappings while default_settings() includes
         // the full default capture_mappings (markup.strong → "", etc.)
         let settings = settings_outcome.settings.unwrap_or_else(|| {
-            WorkspaceSettings::from(crate::config::defaults::default_settings())
+            WorkspaceSettings::try_from_settings(
+                &crate::config::defaults::default_settings(),
+                self.home_dir.as_deref(),
+                |var| std::env::var(var).ok(),
+            )
+            .expect("default settings should expand without errors")
         });
         self.apply_settings(settings).await;
 
@@ -1539,9 +1553,24 @@ impl LanguageServer for Kakehashi {
         let merged = merge_settings(Some(current_ts), Some(parsed));
 
         if let Some(merged_ts) = merged {
-            let settings = WorkspaceSettings::from(merged_ts);
-            self.apply_settings(settings).await;
-            self.notifier().log_info("Configuration updated!").await;
+            match WorkspaceSettings::try_from_settings(
+                &merged_ts,
+                self.home_dir.as_deref(),
+                |var| std::env::var(var).ok(),
+            ) {
+                Ok(settings) => {
+                    self.apply_settings(settings).await;
+                    self.notifier().log_info("Configuration updated!").await;
+                }
+                Err(errs) => {
+                    let event = crate::lsp::SettingsEvent::error(format!(
+                        "Environment variable expansion failed: {errs}. \
+                         This configuration has been discarded; previous settings remain in effect. \
+                         Please define the missing variables or remove them from your config.",
+                    ));
+                    self.report_settings_events(&[event]).await;
+                }
+            }
         }
     }
 

@@ -1,7 +1,12 @@
 pub mod defaults;
+mod expand;
 pub mod settings;
+
+#[cfg(test)]
+pub(crate) use expand::make_env;
 pub(crate) mod user;
 
+pub use expand::ExpandErrors;
 pub use settings::{
     BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageConfig, LanguageSettings,
     QueryItem, QueryKind, QueryTypeMappings, TreeSitterSettings, WorkspaceSettings,
@@ -279,47 +284,97 @@ impl From<&LanguageSettings> for LanguageConfig {
     }
 }
 
-impl From<&TreeSitterSettings> for WorkspaceSettings {
-    fn from(settings: &TreeSitterSettings) -> Self {
-        let languages = settings
-            .languages
-            .iter()
-            .map(|(name, config)| (name.clone(), LanguageSettings::from(config)))
-            .collect();
-        let capture_mappings = settings
-            .capture_mappings
-            .iter()
-            .map(|(lang, mappings)| {
-                (
-                    lang.clone(),
-                    QueryTypeMappings {
-                        highlights: mappings.highlights.clone(),
-                        locals: mappings.locals.clone(),
-                        folds: mappings.folds.clone(),
-                    },
-                )
-            })
-            .collect();
+/// Convert `TreeSitterSettings` to `WorkspaceSettings` without expanding
+/// environment variables or tilde. This is the base conversion used
+/// internally by `try_from_settings`.
+fn base_convert(settings: &TreeSitterSettings) -> WorkspaceSettings {
+    let languages = settings
+        .languages
+        .iter()
+        .map(|(name, config)| (name.clone(), LanguageSettings::from(config)))
+        .collect();
+    let capture_mappings = settings
+        .capture_mappings
+        .iter()
+        .map(|(lang, mappings)| {
+            (
+                lang.clone(),
+                QueryTypeMappings {
+                    highlights: mappings.highlights.clone(),
+                    locals: mappings.locals.clone(),
+                    folds: mappings.folds.clone(),
+                },
+            )
+        })
+        .collect();
 
-        // Use explicit search_paths if provided, otherwise use platform defaults
-        let search_paths = settings
-            .search_paths
-            .clone()
-            .unwrap_or_else(default_search_paths);
+    // Use explicit search_paths if provided, otherwise use platform defaults
+    let search_paths = settings
+        .search_paths
+        .clone()
+        .unwrap_or_else(default_search_paths);
 
-        WorkspaceSettings::with_language_servers(
-            search_paths,
-            languages,
-            capture_mappings,
-            settings.auto_install.unwrap_or(true), // Default to true for zero-config
-            settings.language_servers.clone(),
-        )
-    }
+    WorkspaceSettings::with_language_servers(
+        search_paths,
+        languages,
+        capture_mappings,
+        settings.auto_install.unwrap_or(true), // Default to true for zero-config
+        settings.language_servers.clone(),
+    )
 }
 
-impl From<TreeSitterSettings> for WorkspaceSettings {
-    fn from(settings: TreeSitterSettings) -> Self {
-        WorkspaceSettings::from(&settings)
+impl WorkspaceSettings {
+    /// Convert `TreeSitterSettings` to `WorkspaceSettings`, expanding environment
+    /// variables (`$VAR`, `${VAR}`) and tilde (`~`) in path fields.
+    ///
+    /// Path fields expanded: `search_paths`, `languages[*].parser`, `languages[*].queries[*].path`.
+    ///
+    /// `home` is the pre-computed home directory (from `dirs::home_dir()`),
+    /// passed in so the caller computes it once and tests can inject `None`.
+    ///
+    /// Uses `base_convert` for the structural conversion, then expands only the
+    /// path fields. This avoids duplicating conversion logic.
+    pub fn try_from_settings(
+        settings: &TreeSitterSettings,
+        home: Option<&str>,
+        env_fn: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, expand::ExpandErrors> {
+        let mut ws = base_convert(settings);
+        let mut errors = Vec::new();
+
+        for p in &mut ws.search_paths {
+            match expand::expand_path(p, home, &env_fn) {
+                Ok(expanded) => *p = expanded,
+                Err(e) => errors.push(e),
+            }
+        }
+
+        // Sort keys for deterministic error reporting (HashMap iteration is unordered)
+        let mut lang_names: Vec<_> = ws.languages.keys().cloned().collect();
+        lang_names.sort();
+        for name in lang_names {
+            let lang = ws.languages.get_mut(&name).unwrap();
+            if let Some(parser) = lang.parser.as_mut() {
+                match expand::expand_path(parser, home, &env_fn) {
+                    Ok(expanded) => *parser = expanded,
+                    Err(e) => errors.push(e),
+                }
+            }
+            if let Some(queries) = lang.queries.as_mut() {
+                for q in queries.iter_mut() {
+                    match expand::expand_path(&q.path, home, &env_fn) {
+                        Ok(expanded) => q.path = expanded,
+                        Err(e) => errors.push(e),
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(ws)
+        } else {
+            Err(expand::ExpandErrors(errors))
+        }
     }
 }
 
@@ -781,7 +836,7 @@ mod tests {
             language_servers: None,
         };
 
-        let workspace: WorkspaceSettings = WorkspaceSettings::from(&settings);
+        let workspace: WorkspaceSettings = base_convert(&settings);
 
         // Default paths should be populated (not empty)
         assert!(
@@ -809,7 +864,7 @@ mod tests {
             language_servers: None,
         };
 
-        let workspace: WorkspaceSettings = WorkspaceSettings::from(&settings);
+        let workspace: WorkspaceSettings = base_convert(&settings);
 
         // Should use explicit paths, not default
         assert_eq!(workspace.search_paths, vec!["/custom/path".to_string()]);
@@ -830,7 +885,7 @@ mod tests {
             language_servers: None,
         };
 
-        let workspace: WorkspaceSettings = WorkspaceSettings::from(&settings);
+        let workspace: WorkspaceSettings = base_convert(&settings);
 
         // Should use the combined paths
         assert_eq!(workspace.search_paths.len(), 2); // 1 custom + 1 default (base dir only)
@@ -855,7 +910,7 @@ mod tests {
             language_servers: None,
         };
 
-        let workspace: WorkspaceSettings = WorkspaceSettings::from(&settings);
+        let workspace: WorkspaceSettings = base_convert(&settings);
         assert_eq!(workspace.auto_install, expected);
     }
 
@@ -3290,6 +3345,149 @@ mod tests {
         assert_eq!(
             hover.max_fan_out, None,
             "base maxFanOut should be lost when overlay replaces the same method key atomically"
+        );
+    }
+}
+
+#[cfg(test)]
+mod try_from_settings_tests {
+    use super::*;
+    use expand::make_env;
+    use std::collections::HashMap;
+
+    #[test]
+    fn expands_search_paths() {
+        let settings = TreeSitterSettings {
+            search_paths: Some(vec!["$TEST_VAR/parsers".to_string()]),
+            languages: HashMap::new(),
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+        let env = make_env(&[("TEST_VAR", "/home/user")]);
+        let ws = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap();
+        assert_eq!(ws.search_paths, vec!["/home/user/parsers"]);
+    }
+
+    #[test]
+    fn expands_parser_path() {
+        let mut languages = HashMap::new();
+        languages.insert(
+            "lua".to_string(),
+            LanguageConfig {
+                parser: Some("$TEST_VAR/lua.so".to_string()),
+                queries: None,
+                bridge: None,
+                aliases: None,
+            },
+        );
+        let settings = TreeSitterSettings {
+            search_paths: None,
+            languages,
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+        let env = make_env(&[("TEST_VAR", "/opt/parsers")]);
+        let ws = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap();
+        assert_eq!(
+            ws.languages.get("lua").unwrap().parser.as_deref(),
+            Some("/opt/parsers/lua.so")
+        );
+    }
+
+    #[test]
+    fn expands_query_path() {
+        let mut languages = HashMap::new();
+        languages.insert(
+            "lua".to_string(),
+            LanguageConfig {
+                parser: None,
+                queries: Some(vec![QueryItem {
+                    path: "${TEST_VAR}/highlights.scm".to_string(),
+                    kind: Some(QueryKind::Highlights),
+                }]),
+                bridge: None,
+                aliases: None,
+            },
+        );
+        let settings = TreeSitterSettings {
+            search_paths: None,
+            languages,
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+        let env = make_env(&[("TEST_VAR", "/queries")]);
+        let ws = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap();
+        let queries = ws.languages.get("lua").unwrap().queries.as_ref().unwrap();
+        assert_eq!(queries[0].path, "/queries/highlights.scm");
+    }
+
+    #[test]
+    fn undefined_var_returns_error() {
+        let settings = TreeSitterSettings {
+            search_paths: Some(vec!["$UNDEFINED/path".to_string()]),
+            languages: HashMap::new(),
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+        let env = make_env(&[]);
+        let errs = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap_err();
+        assert_eq!(
+            errs.0,
+            vec![expand::ExpandError::UndefinedVar {
+                var_name: "UNDEFINED".to_string(),
+                input: "$UNDEFINED/path".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn collects_all_expansion_errors() {
+        let mut languages = HashMap::new();
+        languages.insert(
+            "lua".to_string(),
+            LanguageConfig {
+                parser: Some("$ALSO_MISSING/lua.so".to_string()),
+                queries: None,
+                bridge: None,
+                aliases: None,
+            },
+        );
+        let settings = TreeSitterSettings {
+            search_paths: Some(vec!["$MISSING_ONE/parsers".to_string()]),
+            languages,
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+        let env = make_env(&[]);
+        let errs = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap_err();
+        assert_eq!(
+            errs.0.len(),
+            2,
+            "Should collect errors from all path fields"
+        );
+    }
+
+    #[test]
+    fn tilde_without_home_dir_returns_error() {
+        let settings = TreeSitterSettings {
+            search_paths: Some(vec!["~/parsers".to_string()]),
+            languages: HashMap::new(),
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+        let env = make_env(&[]);
+        let errs = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap_err();
+        assert_eq!(
+            errs.0,
+            vec![expand::ExpandError::NoHomeDir {
+                input: "~/parsers".to_string(),
+            }]
         );
     }
 }
