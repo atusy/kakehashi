@@ -68,23 +68,11 @@ fn normalize_syntax_name(name: &str) -> String {
         // Shell variants
         "Bourne Again Shell (bash)" => "bash".to_string(),
         "Shell-Unix-Generic" => "bash".to_string(),
-        // Common languages with different naming
+        // Names that don't map cleanly via to_lowercase()
         "JavaScript" | "JavaScript (Babel)" => "javascript".to_string(),
-        "TypeScript" => "typescript".to_string(),
         "TypeScriptReact" => "tsx".to_string(),
-        "Python" => "python".to_string(),
-        "Ruby" => "ruby".to_string(),
-        "Rust" => "rust".to_string(),
-        "Go" => "go".to_string(),
         "C++" => "cpp".to_string(),
-        "C" => "c".to_string(),
-        "Java" => "java".to_string(),
-        "Perl" => "perl".to_string(),
-        "PHP" => "php".to_string(),
-        "Lua" => "lua".to_string(),
-        "R" => "r".to_string(),
         "Makefile" => "make".to_string(),
-        "Dockerfile" => "dockerfile".to_string(),
         // Default: lowercase the name
         _ => name.to_lowercase(),
     }
