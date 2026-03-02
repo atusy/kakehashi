@@ -74,7 +74,7 @@ queries = [
 
 3. **Project configuration file**
    - Location: `./kakehashi.toml` in workspace root (loaded via `load_toml_settings()`)
-   - Future: `--config` CLI option to specify alternative path
+   - `--config-file` CLI option to specify alternative path(s)
    - Purpose: Project-specific settings, version-controlled with the project
 
 4. **Session-specific overrides** (highest precedence)
@@ -190,15 +190,15 @@ This design allows adding new layers (e.g., workspace-level config) without chan
 
 1. **Missing files are silently ignored**
    - User config doesn't exist: proceed with empty user config
-   - Project config doesn't exist (and `--config` not specified): proceed with empty project config
+   - Project config doesn't exist (and `--config-file` not specified): proceed with empty project config
    - No error, no warning—this enables zero-config startup
 
 2. **Invalid files cause startup failure**
    - Parse errors in any config file should fail fast with a clear error message
    - Users should know immediately if their config is malformed
 
-3. **`--config` option with missing file**
-   - If user explicitly specifies `--config /path/to/config.toml` and file doesn't exist: error
+3. **`--config-file` option with missing file**
+   - If user explicitly specifies `--config-file /path/to/config.toml` and file doesn't exist: error
    - Explicit paths should be validated; implicit defaults can be missing
 
 ### Implementation Notes
@@ -267,10 +267,10 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<TreeSitterSettin
 - [x] Load user config from `$XDG_CONFIG_HOME/kakehashi/kakehashi.toml`
 - [x] Silent ignore for missing user config file
 
-### Phase 4: Project Configuration (Partial - existing `./kakehashi.toml`)
+### Phase 4: Project Configuration (Completed)
 - [x] Load project config from `./kakehashi.toml`
-- [ ] `--config` CLI option for alternative path
-- [ ] Error on missing file when explicitly specified
+- [x] `--config-file` CLI option for alternative path(s)
+- [x] Error on missing file when explicitly specified
 
 ### Phase 5: Testing
 - [ ] Unit tests for `QueryItem` parsing and type inference

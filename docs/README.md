@@ -286,9 +286,9 @@ The `bridge` map in language configuration controls which injection languages ar
 | `{}` | Disable bridging entirely for this host language |
 | `null` or omitted | Bridge all configured languages (default) |
 
-### Project Configuration File
+### Configuration Files
 
-You can also use a `kakehashi.toml` file in your project root:
+kakehashi loads configuration from `~/.config/kakehashi/kakehashi.toml` (user config) and `./kakehashi.toml` (project config). Both use the same TOML format:
 
 ```toml
 [captureMappings._.highlights]
@@ -300,7 +300,26 @@ queries = [
 ]
 ```
 
-Project configuration is merged with LSP initialization options.
+Configuration files are merged with LSP initialization options (which take highest precedence).
+
+You can override the default locations with `--config-file`:
+
+```bash
+# Use a single custom config file (skips default user and project configs)
+kakehashi --config-file /path/to/custom.toml
+
+# Use multiple config files (merged in order; later files override earlier)
+kakehashi --config-file /path/to/base.toml --config-file /path/to/overrides.toml
+
+# Use an empty file for test isolation (only programmed defaults apply)
+kakehashi --config-file /path/to/empty.toml
+```
+
+When `--config-file` is specified:
+- Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
+- Default project config (`./kakehashi.toml`) is **skipped**
+- Non-existent files produce an error
+- `initializationOptions` from the LSP client still apply on top
 
 ## CLI Commands
 
