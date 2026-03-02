@@ -101,8 +101,8 @@ fn test_config_file_two_files_merge_in_order() {
     );
 }
 
-/// --config-file with non-existent path: missing file is silently skipped in the
-/// merge (returns None), so effective settings fall back to programmed defaults.
+/// --config-file with non-existent path: the file load fails with an error,
+/// and the configuration layer is skipped, so effective settings fall back to defaults.
 #[test]
 fn test_config_file_nonexistent_falls_back_to_defaults() {
     let mut client = LspClient::builder()
