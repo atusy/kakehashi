@@ -87,6 +87,32 @@ pub(super) fn expand_path(
     }
 }
 
+/// Wrap an env lookup function to provide fallback values for known `KAKEHASHI_`
+/// environment variables when they are undefined.
+///
+/// This allows configurations using `${KAKEHASHI_DATA_DIR}` to expand gracefully
+/// even when the user has not explicitly set the variable — the platform-specific
+/// default (from `dirs::data_dir()`) is used instead.
+pub(crate) fn with_kakehashi_defaults(
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> impl Fn(&str) -> Option<String> {
+    move |var: &str| env_fn(var).or_else(|| kakehashi_default(var))
+}
+
+/// Return the platform-specific default for known `KAKEHASHI_` variables.
+///
+/// Uses `dirs::data_dir()` directly (not `default_data_dir()`) to avoid
+/// circularity: `default_data_dir()` checks `KAKEHASHI_DATA_DIR` env var,
+/// but this function is the fallback when that var is *not* set.
+fn kakehashi_default(var: &str) -> Option<String> {
+    match var {
+        "KAKEHASHI_DATA_DIR" => {
+            dirs::data_dir().map(|p| p.join("kakehashi").to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Build an env lookup function from a slice of `(key, value)` pairs.
 /// Intended for tests that need a deterministic `env_fn`.
 #[cfg(test)]

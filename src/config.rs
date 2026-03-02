@@ -1,5 +1,5 @@
 pub mod defaults;
-mod expand;
+pub(crate) mod expand;
 pub mod settings;
 
 #[cfg(test)]
