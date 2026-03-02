@@ -73,18 +73,35 @@ pub fn load_settings(
     // Layer 1: Programmed defaults (ADR-0010: lowest precedence)
     let defaults = Some(default_settings());
 
-    // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-    let user_config = load_user_config_with_events(&mut events);
-
-    // Layer 3: Project config from root_path/kakehashi.toml
-    let project_settings = load_toml_settings(root_path, &mut events);
+    // Layers 2+3: config files (either explicit --config-file or default locations)
+    let config_layers: Vec<Option<TreeSitterSettings>> =
+        if let Some(files) = crate::config::expand::config_file_override() {
+            events.push(SettingsEvent::info(format!(
+                "Using {} explicit config file(s); default config locations skipped",
+                files.len()
+            )));
+            files
+                .iter()
+                .map(|p| load_toml_file(p, &mut events))
+                .collect()
+        } else {
+            vec![
+                // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
+                load_user_config_with_events(&mut events),
+                // Layer 3: Project config from root_path/kakehashi.toml
+                load_toml_settings(root_path, &mut events),
+            ]
+        };
 
     // Layer 4: Override settings from initialization options or client configuration
     let override_settings = override_settings
         .and_then(|(source, value)| parse_override_settings(source, value, &mut events));
 
-    // Merge all layers: defaults < user < project < override (later layers override earlier)
-    let merged = merge_all(&[defaults, user_config, project_settings, override_settings]);
+    // Merge all layers: defaults < config_layers < override (later layers override earlier)
+    let mut layers = vec![defaults];
+    layers.extend(config_layers);
+    layers.push(override_settings);
+    let merged = merge_all(&layers);
     let settings =
         merged.and_then(
             |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
@@ -119,6 +136,53 @@ fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<TreeS
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
                 "Failed to load user config: {}",
+                err
+            )));
+            None
+        }
+    }
+}
+
+/// Load a TOML config file from an explicit path (used with `--config-file`).
+///
+/// Unlike `load_toml_settings`, non-existent files are treated as errors
+/// because explicit paths represent user intent (ADR-0010).
+fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<TreeSitterSettings> {
+    if !path.exists() {
+        events.push(SettingsEvent::error(format!(
+            "Config file not found: {}",
+            path.display()
+        )));
+        return None;
+    }
+
+    events.push(SettingsEvent::info(format!(
+        "Loading config file: {}",
+        path.display()
+    )));
+
+    match fs::read_to_string(path) {
+        Ok(contents) => match toml::from_str::<TreeSitterSettings>(&contents) {
+            Ok(settings) => {
+                events.push(SettingsEvent::info(format!(
+                    "Successfully loaded {}",
+                    path.display()
+                )));
+                Some(settings)
+            }
+            Err(err) => {
+                events.push(SettingsEvent::warning(format!(
+                    "Failed to parse {}: {}",
+                    path.display(),
+                    err
+                )));
+                None
+            }
+        },
+        Err(err) => {
+            events.push(SettingsEvent::error(format!(
+                "Failed to read {}: {}",
+                path.display(),
                 err
             )));
             None
@@ -459,6 +523,62 @@ mod tests {
                 .iter()
                 .map(|e| format!("{:?}: {}", e.kind, &e.message))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// load_toml_file: valid TOML parses correctly.
+    #[test]
+    fn test_load_toml_file_valid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, "autoInstall = false\n").unwrap();
+
+        let mut events = Vec::new();
+        let result = load_toml_file(&path, &mut events);
+
+        assert!(result.is_some(), "valid TOML should parse");
+        assert_eq!(result.unwrap().auto_install, Some(false));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == SettingsEventKind::Info
+                    && e.message.contains("Successfully loaded")),
+            "should log success"
+        );
+    }
+
+    /// load_toml_file: non-existent path returns None + error event (ADR-0010).
+    #[test]
+    fn test_load_toml_file_missing() {
+        let mut events = Vec::new();
+        let result = load_toml_file(Path::new("/nonexistent/config.toml"), &mut events);
+
+        assert!(result.is_none(), "missing file should return None");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == SettingsEventKind::Error && e.message.contains("not found")),
+            "should emit error event for missing file"
+        );
+    }
+
+    /// load_toml_file: invalid TOML returns None + warning event.
+    #[test]
+    fn test_load_toml_file_invalid_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not [valid toml").unwrap();
+
+        let mut events = Vec::new();
+        let result = load_toml_file(&path, &mut events);
+
+        assert!(result.is_none(), "invalid TOML should return None");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == SettingsEventKind::Warning
+                    && e.message.contains("Failed to parse")),
+            "should emit warning for invalid TOML"
         );
     }
 }
