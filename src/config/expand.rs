@@ -202,4 +202,51 @@ mod tests {
         let env = make_env(&[]);
         assert_eq!(expand_path("$$literal", None, &env).unwrap(), "$literal");
     }
+
+    #[test]
+    fn with_kakehashi_defaults_passes_through_existing_env() {
+        let env = make_env(&[("HOME", "/home/user")]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(wrapped("HOME"), Some("/home/user".to_string()));
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_provides_data_dir_fallback() {
+        let env = make_env(&[]);
+        let wrapped = with_kakehashi_defaults(env);
+        let result = wrapped("KAKEHASHI_DATA_DIR");
+        assert!(
+            result.is_some(),
+            "should provide a fallback for KAKEHASHI_DATA_DIR"
+        );
+        assert!(
+            result.as_ref().unwrap().contains("kakehashi"),
+            "fallback should contain 'kakehashi', got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_does_not_override_explicit_env() {
+        let env = make_env(&[("KAKEHASHI_DATA_DIR", "/custom/dir")]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(
+            wrapped("KAKEHASHI_DATA_DIR"),
+            Some("/custom/dir".to_string())
+        );
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_returns_none_for_unknown_vars() {
+        let env = make_env(&[]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(wrapped("UNKNOWN_VAR"), None);
+    }
+
+    #[test]
+    fn with_kakehashi_defaults_returns_none_for_unknown_kakehashi_vars() {
+        let env = make_env(&[]);
+        let wrapped = with_kakehashi_defaults(env);
+        assert_eq!(wrapped("KAKEHASHI_UNKNOWN"), None);
+    }
 }
