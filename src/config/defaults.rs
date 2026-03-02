@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// This is used by `config init` to generate type-safe default configurations.
 pub fn default_settings() -> TreeSitterSettings {
     TreeSitterSettings {
-        search_paths: None,
+        search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: HashMap::new(),
         capture_mappings: default_capture_mappings(),
         auto_install: Some(true),
@@ -269,10 +269,16 @@ mod tests {
         use crate::config::WorkspaceSettings;
         use crate::language::LanguageCoordinator;
 
-        // Create settings from defaults
+        // Create settings from defaults — use with_kakehashi_defaults so that
+        // ${KAKEHASHI_DATA_DIR} in searchPaths resolves to the platform default.
+        use crate::config::expand::with_kakehashi_defaults;
         let ts_settings = default_settings();
-        let ws_settings = WorkspaceSettings::try_from_settings(&ts_settings, None, |_| None)
-            .expect("default settings should expand without errors");
+        let ws_settings = WorkspaceSettings::try_from_settings(
+            &ts_settings,
+            None,
+            with_kakehashi_defaults(|_| None),
+        )
+        .expect("default settings should expand without errors");
 
         // Verify WorkspaceSettings has the mapping
         assert!(
