@@ -68,7 +68,7 @@ fn normalize_syntax_name(name: &str) -> String {
         // Shell variants
         "Bourne Again Shell (bash)" => "bash".to_string(),
         "Shell-Unix-Generic" => "bash".to_string(),
-        // Names that don't map cleanly via to_lowercase()
+        // Names that need explicit canonicalization or multi-name normalization
         "JavaScript" | "JavaScript (Babel)" => "javascript".to_string(),
         "TypeScriptReact" => "tsx".to_string(),
         "C++" => "cpp".to_string(),
