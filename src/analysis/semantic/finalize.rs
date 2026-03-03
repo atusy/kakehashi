@@ -833,6 +833,43 @@ mod tests {
     }
 
     #[test]
+    fn deeper_node_beats_shallower_at_same_priority() {
+        // Simulates blockquote language-less codeblock:
+        // - block_quote (node_depth=1, pattern_index=107) produces "keyword" over [0,5)
+        // - fenced_code_block (node_depth=2, pattern_index=47) produces "string" over [2,5)
+        // Both have priority=90. fenced_code_block is a CHILD of block_quote, so
+        // deeper node should win in the overlap region [2,5).
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 5,
+                mapped_name: "keyword".to_string(),
+                depth: 0,
+                pattern_index: 107, // higher pattern_index
+                priority: 90,
+                node_depth: 1, // shallower
+            },
+            RawToken {
+                line: 0,
+                column: 2,
+                length: 3,
+                mapped_name: "string".to_string(),
+                depth: 0,
+                pattern_index: 47, // lower pattern_index
+                priority: 90,
+                node_depth: 2, // deeper — should win in [2,5)
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        // [0,2) → keyword wins (only token), [2,5) → string wins (deeper node)
+        assert_eq!(
+            fragments,
+            vec![(0, 2, "keyword".to_string()), (2, 3, "string".to_string()),]
+        );
+    }
+
+    #[test]
     fn split_higher_pattern_index_beats_deeper_node() {
         // Simulates Rust `///` doc comments: the anonymous `"/"` node is deeper
         // in the AST (node_depth=3) than `line_comment` (node_depth=1), but
