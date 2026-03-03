@@ -51,6 +51,19 @@ pub(super) struct TokenCollectionParams<'a> {
     pub(super) is_injection: bool,
 }
 
+/// Compute the depth of a tree-sitter node from the root.
+///
+/// Walks the `parent()` chain counting steps. Root node has depth 0.
+fn compute_node_depth(node: &Node) -> usize {
+    let mut depth = 0;
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        depth += 1;
+        current = parent;
+    }
+    depth
+}
+
 /// Check whether a node is strictly contained within any exclusion range.
 ///
 /// A node is excluded only if it is **properly inside** a range — meaning fully
@@ -114,6 +127,9 @@ pub(crate) struct RawToken {
     /// Priority from `#set! priority N` directive (default 100).
     /// Higher values win during overlap resolution.
     pub priority: u32,
+    /// Depth of the tree-sitter node from the root (0 = root).
+    /// Deeper nodes are more specific and win tiebreaks at the same priority/depth.
+    pub node_depth: usize,
 }
 
 /// Represents the line/column boundaries of an injection region in the host document.
@@ -458,6 +474,7 @@ pub(super) fn collect_host_tokens(
                     depth,
                     pattern_index: m.pattern_index,
                     priority,
+                    node_depth: compute_node_depth(&node),
                 });
             } else if supports_multiline && prefix_widths.is_empty() {
                 // Multiline token with client support: emit a single token spanning multiple lines.
@@ -529,6 +546,7 @@ pub(super) fn collect_host_tokens(
                     depth,
                     pattern_index: m.pattern_index,
                     priority,
+                    node_depth: compute_node_depth(&node),
                 });
             } else {
                 // Multiline token without client support: split into per-line tokens
@@ -564,6 +582,7 @@ pub(super) fn collect_host_tokens(
                             depth,
                             pattern_index: m.pattern_index,
                             priority,
+                            node_depth: compute_node_depth(&node),
                         });
                     }
                 }

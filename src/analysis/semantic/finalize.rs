@@ -76,6 +76,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
                 depth: token.depth,
                 pattern_index: token.pattern_index,
                 priority: token.priority,
+                node_depth: token.node_depth,
             });
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
@@ -150,6 +151,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                     depth: winner.depth,
                     pattern_index: winner.pattern_index,
                     priority: winner.priority,
+                    node_depth: winner.node_depth,
                 });
             }
         }
@@ -178,7 +180,8 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
             && tokens[write].mapped_name == tokens[read].mapped_name
             && tokens[write].depth == tokens[read].depth
             && tokens[write].pattern_index == tokens[read].pattern_index
-            && tokens[write].priority == tokens[read].priority;
+            && tokens[write].priority == tokens[read].priority
+            && tokens[write].node_depth == tokens[read].node_depth;
 
         if can_merge {
             tokens[write].length += tokens[read].length;
@@ -343,6 +346,7 @@ fn split_host_token_around_regions(
                     depth: token.depth,
                     pattern_index: token.pattern_index,
                     priority: token.priority,
+                    node_depth: token.node_depth,
                 });
             }
         }
@@ -359,6 +363,7 @@ fn split_host_token_around_regions(
             depth: token.depth,
             pattern_index: token.pattern_index,
             priority: token.priority,
+            node_depth: token.node_depth,
         });
     }
 
@@ -497,6 +502,7 @@ mod tests {
             depth,
             pattern_index,
             priority: 100,
+            node_depth: 0,
         }
     }
 
@@ -518,6 +524,7 @@ mod tests {
             depth,
             pattern_index,
             priority,
+            node_depth: 0,
         }
     }
 
