@@ -119,16 +119,9 @@ expression: snapshot
   {
     "line": 3,
     "start": 0,
-    "length": 1,
-    "type": "operator",
-    "text": ">"
-  },
-  {
-    "line": 3,
-    "start": 1,
-    "length": 1,
+    "length": 2,
     "type": "keyword",
-    "text": " "
+    "text": "> "
   },
   {
     "line": 3,
@@ -168,9 +161,16 @@ expression: snapshot
   {
     "line": 4,
     "start": 0,
-    "length": 8,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 4,
+    "start": 2,
+    "length": 6,
     "type": "string",
-    "text": ">   foo{"
+    "text": "  foo{"
   },
   {
     "line": 4,
@@ -217,9 +217,16 @@ expression: snapshot
   {
     "line": 5,
     "start": 0,
-    "length": 5,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 5,
+    "start": 2,
+    "length": 3,
     "type": "string",
-    "text": "> \"\"\""
+    "text": "\"\"\""
   },
   {
     "line": 6,

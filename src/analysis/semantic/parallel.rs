@@ -238,20 +238,29 @@ pub(crate) fn process_injection_sync(
         ctx.host_start_byte,
     );
 
-    // Derive included_ranges for nested injections that lack them.
-    // At depth 2+, leaf content nodes (e.g., code_fence_content) produce
-    // included_ranges = None, causing the parser to see raw `> ` prefix bytes.
-    // We derive ranges from the host-level prefix widths instead.
+    // Derive included_ranges for nested injections from host-level prefix widths.
+    //
+    // At depth 2+, `compute_included_ranges` returns gap ranges between
+    // `block_continuation` children. But when the parent tree was parsed with
+    // its own included_ranges (which treated `> ` bytes as whitespace), those
+    // children are **zero-width** — so the gaps include the raw `> ` prefix.
+    // Deriving ranges from the known host prefix widths produces correct ranges
+    // regardless of whether `compute_included_ranges` returned Some or None.
+    //
+    // The unconditional override is correct because at depth 2+,
+    // `block_continuation` children are always zero-width when the parent tree
+    // was parsed with included_ranges. If a future injection type needs to
+    // preserve its computed ranges, a more targeted condition should be
+    // introduced here.
     if !host_prefix_widths.is_empty() {
         for nested_ctx in &mut nested_contexts {
-            if nested_ctx.included_ranges.is_none() {
-                nested_ctx.included_ranges =
-                    super::token_collector::derive_included_ranges_from_host_prefix(
-                        nested_ctx.content_text,
-                        nested_ctx.host_start_byte,
-                        host_text,
-                        host_prefix_widths,
-                    );
+            if let Some(derived) = super::token_collector::derive_included_ranges_from_host_prefix(
+                nested_ctx.content_text,
+                nested_ctx.host_start_byte,
+                host_text,
+                host_prefix_widths,
+            ) {
+                nested_ctx.included_ranges = Some(derived);
             }
         }
     }
