@@ -975,6 +975,119 @@ mod tests {
         assert_eq!(byte_to_utf16_col(line, 24), 14); // After "あいうえお\"" (15 bytes + 1 quote)
     }
 
+    // ── derive_included_ranges_from_host_prefix tests ─────────────
+
+    #[test]
+    fn derive_ranges_for_nested_python_in_blockquote() {
+        // Matches the ACTUAL runtime scenario: at depth 2, the python
+        // injection's content starts mid-line (at 'y', col 2) because the
+        // depth-1 included_ranges already stripped the `> ` prefix for the
+        // first line. Lines 1+ still contain `> ` prefix bytes.
+        let host_text = "> ``````markdown\n> ```python\n> y = 1 + 2\n> x = f\"\"\"\n>   foo{1 + 2}\n> \"\"\"\n> ```\n> ``````\n";
+        let host_prefix_widths = vec![2, 2, 2, 2, 2, 2, 2, 2];
+
+        // content starts at 'y' (col 2 of host line 2) — first line has no prefix
+        let host_start_byte = host_text.find("y = 1 + 2").unwrap();
+        let content_end = host_text.find("\n> ```\n").unwrap();
+        let content_text = &host_text[host_start_byte..content_end];
+
+        // Verify the content matches what the runtime produces
+        assert_eq!(
+            content_text.split('\n').collect::<Vec<_>>(),
+            vec!["y = 1 + 2", "> x = f\"\"\"", ">   foo{1 + 2}", "> \"\"\""],
+        );
+
+        let ranges = derive_included_ranges_from_host_prefix(
+            content_text,
+            host_start_byte,
+            host_text,
+            &host_prefix_widths,
+        )
+        .expect("Should produce Some(ranges)");
+
+        assert_eq!(ranges.len(), 4, "One range per content line");
+
+        // Line 0: starts mid-line (col 2 >= prefix 2), so no prefix applied
+        assert_eq!(ranges[0].start_point.column, 0);
+        // Lines 1-3: skip 2-byte `> ` prefix
+        for (i, range) in ranges.iter().enumerate().skip(1) {
+            assert_eq!(
+                range.start_point.column, 2,
+                "Line {} should skip '> ' prefix",
+                i
+            );
+        }
+
+        // Verify visible content after applying ranges
+        let visible: Vec<&str> = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let line = content_text.split('\n').nth(i).unwrap();
+                &line[r.start_point.column..]
+            })
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["y = 1 + 2", "x = f\"\"\"", "  foo{1 + 2}", "\"\"\""]
+        );
+    }
+
+    #[test]
+    fn derive_ranges_parser_skips_prefix() {
+        // Verify that a parser using derived included_ranges produces no
+        // nodes in the `> ` prefix zone on continuation lines.
+        let host_text = "> ``````markdown\n> ```python\n> y = 1 + 2\n> x = f\"\"\"\n>   foo{1 + 2}\n> \"\"\"\n> ```\n> ``````\n";
+        let host_prefix_widths = vec![2, 2, 2, 2, 2, 2, 2, 2];
+
+        let host_start_byte = host_text.find("y = 1 + 2").unwrap();
+        let content_end = host_text.find("\n> ```\n").unwrap();
+        let content_text = &host_text[host_start_byte..content_end];
+
+        let ranges = derive_included_ranges_from_host_prefix(
+            content_text,
+            host_start_byte,
+            host_text,
+            &host_prefix_widths,
+        )
+        .expect("Should have ranges");
+
+        // Use tree_sitter_rust as a proxy parser (python isn't a dev dependency)
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.set_included_ranges(&ranges).unwrap();
+
+        let tree = parser.parse(content_text, None).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+
+        // Walk all nodes iteratively: none should start in the `> ` prefix zone on lines 1+
+        let mut reached_root = false;
+        while !reached_root {
+            let node = cursor.node();
+            if node.start_position().row > 0 {
+                assert!(
+                    node.start_position().column >= 2,
+                    "Node {:?} at ({},{}) starts in prefix zone",
+                    node.kind(),
+                    node.start_position().row,
+                    node.start_position().column,
+                );
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    reached_root = true;
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn byte_to_utf16_col_emoji() {
         // Emoji (4 bytes in UTF-8, 2 code units in UTF-16)

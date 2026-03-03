@@ -2180,4 +2180,91 @@ mod tests {
             "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
         );
     }
+
+    /// When a markdown tree is parsed with included_ranges that skip `> `
+    /// prefixes, nested `code_fence_content` nodes contain zero-width
+    /// `block_continuation` children. `compute_included_ranges` creates gap
+    /// ranges between these children, but since they're zero-width, the gaps
+    /// include the raw `> ` prefix bytes.
+    ///
+    /// This test verifies the problem exists so the fix in `parallel.rs`
+    /// (deriving ranges from host prefix widths instead) remains justified.
+    #[test]
+    fn nested_blockquote_injection_has_zero_width_block_continuation() {
+        let host_text = "> ``````markdown\n> ```python\n> y = 1 + 2\n> x = f\"\"\"\n>   foo{1 + 2}\n> \"\"\"\n> ```\n> ``````\n";
+
+        // ── Depth 0: parse host as markdown ──
+        let mut parser = Parser::new();
+        let md_lang: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&md_lang).unwrap();
+        let host_tree = parser.parse(host_text, None).unwrap();
+
+        let injection_query_str = r#"
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content)
+        "#;
+        let injection_query = Query::new(&md_lang, injection_query_str).unwrap();
+
+        let injections =
+            collect_all_injections(&host_tree.root_node(), host_text, Some(&injection_query))
+                .unwrap();
+        let outer = &injections[0];
+        let outer_content_text =
+            &host_text[outer.content_node.start_byte()..outer.content_node.end_byte()];
+
+        // Get included_ranges for outer injection (skips `> ` prefix)
+        let outer_ranges = compute_included_ranges(&outer.content_node, outer.include_children)
+            .expect("Outer content should have included_ranges");
+
+        // ── Depth 1: parse outer content as markdown ──
+        parser.set_language(&md_lang).unwrap();
+        let depth1_tree = parse_with_ranges(
+            &mut parser,
+            outer_content_text,
+            Some(&outer_ranges),
+            "test",
+            "markdown",
+        )
+        .unwrap();
+
+        // Find python injection in depth-1 tree
+        let depth1_injections = collect_all_injections(
+            &depth1_tree.root_node(),
+            outer_content_text,
+            Some(&injection_query),
+        )
+        .unwrap();
+        let python_inj = &depth1_injections[0];
+        let python_node = python_inj.content_node;
+
+        // The block_continuation children should all be zero-width
+        let mut cursor = python_node.walk();
+        for child in python_node.named_children(&mut cursor) {
+            assert_eq!(child.kind(), "block_continuation");
+            assert_eq!(
+                child.start_byte(),
+                child.end_byte(),
+                "block_continuation should be zero-width when parent was parsed with included_ranges"
+            );
+        }
+
+        // compute_included_ranges returns Some (has children), but the gap
+        // ranges include `> ` prefix bytes because the children are zero-width
+        let python_ranges = compute_included_ranges(&python_node, python_inj.include_children)
+            .expect("Should return Some because of named children");
+        let python_content_text =
+            &outer_content_text[python_node.start_byte()..python_node.end_byte()];
+
+        // Lines 1+ should start with `> ` prefix — the ranges don't skip it
+        assert!(
+            python_ranges.len() > 1,
+            "Expected at least 2 gap ranges for blockquote lines, got {}",
+            python_ranges.len()
+        );
+        assert!(
+            python_content_text[python_ranges[1].start_byte..].starts_with("> "),
+            "Gap ranges should include `> ` prefix (the bug that derive fixes)"
+        );
+    }
 }
