@@ -77,7 +77,7 @@ fn token_type_name(index: u32) -> &'static str {
 /// Uses a comprehensive captureMappings config (matching typical user configs) with
 /// both heading and code block examples in a single document.
 #[test]
-fn test_blockquote_user_config_diagnostic() {
+fn test_blockquote_multiline_support_with_full_config() {
     let mut client = LspClient::new();
 
     // User's EXACT captureMappings config
@@ -92,7 +92,8 @@ fn test_blockquote_user_config_diagnostic() {
                         "requests": { "full": true },
                         "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
                         "tokenModifiers": [],
-                        "formats": ["relative"]
+                        "formats": ["relative"],
+                        "multilineTokenSupport": true
                     }
                 }
             },
