@@ -72,6 +72,135 @@ fn token_type_name(index: u32) -> &'static str {
     }
 }
 
+/// E2E test: multiline Python string in blockquote preserves host prefix tokens.
+///
+/// When a Python `"""..."""` triple-quoted string spans multiple lines inside a
+/// blockquote, the injection tokens on continuation lines must NOT start before
+/// column 2 (the `> ` prefix). Each content line should have a host token at
+/// col 0 (the `> ` prefix) and injection tokens starting at col 2 or later.
+#[test]
+fn test_blockquote_multiline_injection_token_prefix() {
+    let mut client = LspClient::new();
+
+    // captureMappings: markup.quote → "keyword" so the `> ` prefix produces host tokens,
+    // markup.raw.block and markup.raw → "string" for the fenced code block itself.
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.quote": "keyword",
+                            "markup.raw.block": "string",
+                            "markup.raw": "string"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Python triple-quoted string spanning 3 lines inside a blockquote:
+    //   Line 0: > ```py
+    //   Line 1: > """
+    //   Line 2: >   foo
+    //   Line 3: > """
+    //   Line 4: > ```
+    let content = "> ```py\n> \"\"\"\n>   foo\n> \"\"\"\n> ```\n";
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({
+            "textDocument": { "uri": uri }
+        }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let tokens = decode_semantic_tokens(&data_u32);
+
+    assert!(!tokens.is_empty(), "Should have semantic tokens");
+
+    // Lines 1-3 each should have a host token at col 0 (the `> ` prefix, mapped to "keyword")
+    for line_num in 1..=3 {
+        let line_tokens: Vec<_> = tokens.iter().filter(|t| t.line == line_num).collect();
+        assert!(
+            !line_tokens.is_empty(),
+            "Line {} should have tokens. All: {:?}",
+            line_num,
+            tokens
+        );
+
+        let has_prefix_token = line_tokens
+            .iter()
+            .any(|t| t.start == 0 && token_type_name(t.token_type) == "keyword");
+        assert!(
+            has_prefix_token,
+            "Line {} should have a host 'keyword' token at col 0 for `> ` prefix. Tokens: {:?}",
+            line_num, line_tokens
+        );
+    }
+
+    // No injection tokens should start before col 2 on lines 1-3
+    // (injection tokens have depth >= 1, but LSP doesn't expose depth,
+    // so we check that no "string" tokens start at col 0 or 1)
+    for line_num in 1..=3 {
+        let line_tokens: Vec<_> = tokens.iter().filter(|t| t.line == line_num).collect();
+        let bad_injection_tokens: Vec<_> = line_tokens
+            .iter()
+            .filter(|t| t.start < 2 && token_type_name(t.token_type) == "string")
+            .collect();
+        assert!(
+            bad_injection_tokens.is_empty(),
+            "Line {} should have no injection 'string' tokens before col 2. Bad tokens: {:?}",
+            line_num, bad_injection_tokens
+        );
+    }
+}
+
 /// E2E test: blockquote-wrapped fenced code blocks produce consistent tokens.
 ///
 /// Tests that both content lines in a blockquote Lua code block:
