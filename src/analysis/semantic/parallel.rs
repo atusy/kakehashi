@@ -211,7 +211,11 @@ pub(crate) fn process_injection_sync(
     host_lines: &[&str],
     depth: usize,
     supports_multiline: bool,
+    host_prefix_widths: &[usize],
 ) -> Vec<RawToken> {
+    // host_prefix_widths is used below when deriving included_ranges for nested injections
+    let _ = host_prefix_widths;
+
     // Check recursion depth
     if depth >= MAX_INJECTION_DEPTH {
         return Vec::new();
@@ -271,6 +275,7 @@ pub(crate) fn process_injection_sync(
             host_lines,
             depth + 1,
             supports_multiline,
+            host_prefix_widths,
         );
         tokens.extend(nested_tokens);
     }
@@ -429,6 +434,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     coordinator: &LanguageCoordinator,
     capture_mappings: Option<&CaptureMappings>,
     supports_multiline: bool,
+    host_prefix_widths: &[usize],
 ) -> (Vec<RawToken>, Vec<InjectionRegion>) {
     use rayon::prelude::*;
 
@@ -464,6 +470,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     &host_lines,
                     1, // depth 1 (first level of injection, host is 0)
                     supports_multiline,
+                    host_prefix_widths,
                 )
             })
             .collect()
@@ -481,6 +488,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     &host_lines,
                     1,
                     supports_multiline,
+                    host_prefix_widths,
                 )
             })
             .collect()
@@ -788,6 +796,7 @@ mod tests {
             &host_lines,
             1, // depth 1 (not host document)
             false,
+            &[],
         );
 
         // Should produce some tokens (at minimum "fn" keyword and "main" identifier)
@@ -844,6 +853,7 @@ mod tests {
             &host_lines,
             MAX_INJECTION_DEPTH,
             false,
+            &[],
         );
 
         assert!(
@@ -898,6 +908,7 @@ mod tests {
             &coordinator,
             None,
             false,
+            &[],
         );
 
         assert!(tokens.is_empty(), "Empty document should have no tokens");
@@ -950,6 +961,7 @@ local x = 42
             &coordinator,
             None,
             false,
+            &[],
         );
 
         // Should have tokens from the Lua injection
@@ -1021,6 +1033,7 @@ local b = 2
             &coordinator,
             None,
             false,
+            &[],
         );
 
         // Verify tokens are sorted by position

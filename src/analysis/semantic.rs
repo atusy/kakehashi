@@ -88,6 +88,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             &coordinator,
             capture_mappings.as_ref(),
             supports_multiline,
+            &prefix_widths,
         );
 
         // Merge injection tokens with host tokens
