@@ -266,6 +266,94 @@ pub(super) fn compute_prefix_widths_from_tree(tree: &Tree) -> Vec<usize> {
     widths
 }
 
+/// Derive `included_ranges` for a nested injection from host-level prefix widths.
+///
+/// When a nested injection (depth 2+) has `included_ranges = None` (e.g., leaf
+/// `code_fence_content` node with no children for `compute_included_ranges` to
+/// work with), the parser sees raw `> ` prefix bytes. This function creates
+/// ranges that skip prefix bytes on each line, using the host-level prefix widths.
+///
+/// Returns `Some(ranges)` if any line has a non-zero prefix, `None` otherwise.
+///
+/// # Arguments
+/// * `content_text` - The injection content text (may include `> ` prefixes)
+/// * `host_start_byte` - Byte offset of this content in the host document
+/// * `host_text` - Full host document text
+/// * `host_prefix_widths` - Per-line prefix widths from `compute_prefix_widths_from_tree`
+pub(super) fn derive_included_ranges_from_host_prefix(
+    content_text: &str,
+    host_start_byte: usize,
+    host_text: &str,
+    host_prefix_widths: &[usize],
+) -> Option<Vec<tree_sitter::Range>> {
+    if host_prefix_widths.is_empty() || content_text.is_empty() {
+        return None;
+    }
+
+    // Determine which host line the content starts on, and where on that line.
+    let clamped = host_start_byte.min(host_text.len());
+    let host_start_row = host_text[..clamped].chars().filter(|c| *c == '\n').count();
+
+    // Check if content starts mid-line (parent injection already stripped prefix).
+    let host_line_start_byte = if host_start_row == 0 {
+        0
+    } else {
+        host_text[..clamped].rfind('\n').map_or(0, |p| p + 1)
+    };
+    let content_col_in_host_line = clamped - host_line_start_byte;
+
+    let mut ranges = Vec::new();
+    let mut has_nonzero_prefix = false;
+    let mut byte_offset = 0;
+
+    for (content_row, line) in content_text.split('\n').enumerate() {
+        let host_row = host_start_row + content_row;
+        let raw_prefix_width = host_prefix_widths.get(host_row).copied().unwrap_or(0);
+
+        // For the first line, if the content starts at or past the prefix boundary
+        // in the host line, the prefix is NOT present in content_text (it was already
+        // stripped by the parent injection's included_ranges). Only apply prefix to
+        // lines that actually contain the prefix bytes.
+        let effective_prefix = if content_row == 0 && content_col_in_host_line >= raw_prefix_width {
+            0
+        } else {
+            raw_prefix_width
+        };
+
+        if effective_prefix > 0 {
+            has_nonzero_prefix = true;
+        }
+
+        let line_start = byte_offset;
+        let line_end = byte_offset + line.len();
+        let content_start = (line_start + effective_prefix).min(line_end);
+
+        if content_start < line_end {
+            ranges.push(tree_sitter::Range {
+                start_byte: content_start,
+                end_byte: line_end,
+                start_point: tree_sitter::Point {
+                    row: content_row,
+                    column: effective_prefix,
+                },
+                end_point: tree_sitter::Point {
+                    row: content_row,
+                    column: line.len(),
+                },
+            });
+        }
+
+        // +1 for the '\n' separator (split doesn't include it)
+        byte_offset = line_end + 1;
+    }
+
+    if has_nonzero_prefix {
+        Some(ranges)
+    } else {
+        None
+    }
+}
+
 /// Calculate byte offsets for a line within a multiline token.
 ///
 /// This helper computes the start and end byte positions for a specific line (row)

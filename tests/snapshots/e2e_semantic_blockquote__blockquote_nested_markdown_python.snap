@@ -1,5 +1,6 @@
 ---
 source: tests/e2e_semantic_blockquote.rs
+assertion_line: 961
 expression: snapshot
 ---
 [
@@ -167,9 +168,23 @@ expression: snapshot
   {
     "line": 4,
     "start": 0,
-    "length": 10,
+    "length": 8,
     "type": "string",
-    "text": ">   foo{1 "
+    "text": ">   foo{"
+  },
+  {
+    "line": 4,
+    "start": 8,
+    "length": 1,
+    "type": "number",
+    "text": "1"
+  },
+  {
+    "line": 4,
+    "start": 9,
+    "length": 1,
+    "type": "string",
+    "text": " "
   },
   {
     "line": 4,
@@ -181,9 +196,23 @@ expression: snapshot
   {
     "line": 4,
     "start": 11,
-    "length": 3,
+    "length": 1,
     "type": "string",
-    "text": " 2}"
+    "text": " "
+  },
+  {
+    "line": 4,
+    "start": 12,
+    "length": 1,
+    "type": "number",
+    "text": "2"
+  },
+  {
+    "line": 4,
+    "start": 13,
+    "length": 1,
+    "type": "string",
+    "text": "}"
   },
   {
     "line": 5,

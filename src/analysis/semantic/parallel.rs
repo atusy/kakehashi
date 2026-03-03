@@ -213,9 +213,6 @@ pub(crate) fn process_injection_sync(
     supports_multiline: bool,
     host_prefix_widths: &[usize],
 ) -> Vec<RawToken> {
-    // host_prefix_widths is used below when deriving included_ranges for nested injections
-    let _ = host_prefix_widths;
-
     // Check recursion depth
     if depth >= MAX_INJECTION_DEPTH {
         return Vec::new();
@@ -233,13 +230,31 @@ pub(crate) fn process_injection_sync(
     // Discover nested injections BEFORE collecting tokens so we can compute
     // exclusion ranges. This suppresses this level's captures within regions
     // that will be handled by deeper injection languages.
-    let (nested_contexts, nested_exclusion_ranges) = collect_injection_contexts_sync(
+    let (mut nested_contexts, nested_exclusion_ranges) = collect_injection_contexts_sync(
         ctx.content_text,
         &tree,
         Some(&ctx.resolved_lang),
         coordinator,
         ctx.host_start_byte,
     );
+
+    // Derive included_ranges for nested injections that lack them.
+    // At depth 2+, leaf content nodes (e.g., code_fence_content) produce
+    // included_ranges = None, causing the parser to see raw `> ` prefix bytes.
+    // We derive ranges from the host-level prefix widths instead.
+    if !host_prefix_widths.is_empty() {
+        for nested_ctx in &mut nested_contexts {
+            if nested_ctx.included_ranges.is_none() {
+                nested_ctx.included_ranges =
+                    super::token_collector::derive_included_ranges_from_host_prefix(
+                        nested_ctx.content_text,
+                        nested_ctx.host_start_byte,
+                        host_text,
+                        host_prefix_widths,
+                    );
+            }
+        }
+    }
 
     let mut tokens = Vec::new();
 
