@@ -36,6 +36,11 @@ fn utf16_width(s: &str) -> usize {
 /// tokens encode their total UTF-16 length (including +1 per inter-line
 /// newline) in `length`, producing invalid fragments when the sweep line
 /// splits around other tokens on the same start line.
+/// **IMPORTANT**: This function starts continuation lines at column 0 (line 79).
+/// In blockquote contexts, this would cover the `> ` prefix with the wrong token type.
+/// `collect_host_tokens` prevents this by forcing per-line splitting when `prefix_widths`
+/// is non-empty — multiline tokens in blockquote context never reach this function.
+/// If you add a new path that emits multiline tokens, ensure it also handles prefix widths.
 fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken> {
     let mut result = Vec::with_capacity(tokens.len());
     for token in tokens {

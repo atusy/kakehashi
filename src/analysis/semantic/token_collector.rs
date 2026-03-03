@@ -324,8 +324,12 @@ pub(super) fn collect_host_tokens(
                     pattern_index: m.pattern_index,
                     priority,
                 });
-            } else if supports_multiline {
+            } else if supports_multiline && prefix_widths.is_empty() {
                 // Multiline token with client support: emit a single token spanning multiple lines.
+                // NOTE: When prefix_widths is non-empty (blockquote context), we fall through to
+                // per-line splitting. This is because split_multiline_tokens in finalize.rs
+                // always starts continuation lines at column 0, which would cover the `> ` prefix
+                // with a depth-1 injection token, overriding the host markup.quote token.
                 // LSP semantic tokens use line-relative positions, so the token naturally starts on
                 // the first line (start_pos.row), and its length spans across all lines in UTF-16
                 // code units (including newline characters) up to the end position on end_pos.row.
