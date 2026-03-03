@@ -37,9 +37,18 @@ pub(super) struct TokenCollectionParams<'a> {
     pub(super) supports_multiline: bool,
     /// Byte ranges in host text occupied by nested injections (host tokens here are excluded).
     pub(super) exclusion_ranges: &'a [(usize, usize)],
-    /// Tree-sitter included ranges used for blockquote injection parsing.
-    /// `Some` at the injection level; `None` at the host level.
-    pub(super) included_ranges: Option<&'a [tree_sitter::Range]>,
+    /// Pre-computed per-line prefix widths for blockquote contexts.
+    /// Empty slice for non-blockquote documents (no prefix handling needed).
+    ///
+    /// At the injection level, compute via [`compute_per_line_prefix_widths`].
+    /// At the host level, compute via [`compute_prefix_widths_from_tree`].
+    pub(super) prefix_widths: &'a [usize],
+    /// Whether this is an injection-level collection (affects prefix handling).
+    ///
+    /// Injection tokens always use per-row prefix widths because the injection
+    /// content starts after the prefix. Host tokens only use prefix widths for
+    /// tokens starting at or after the prefix boundary.
+    pub(super) is_injection: bool,
 }
 
 /// Check whether a node is strictly contained within any exclusion range.
@@ -150,7 +159,9 @@ pub(super) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
 ///
 /// Returns a Vec where `result[row] = prefix_width_in_bytes` for each row covered by
 /// the included ranges. Returns an empty Vec when `included_ranges` is `None` (non-blockquote).
-fn compute_per_line_prefix_widths(included_ranges: Option<&[tree_sitter::Range]>) -> Vec<usize> {
+pub(super) fn compute_per_line_prefix_widths(
+    included_ranges: Option<&[tree_sitter::Range]>,
+) -> Vec<usize> {
     let Some(ranges) = included_ranges else {
         return Vec::new();
     };
@@ -195,7 +206,7 @@ fn compute_per_line_prefix_widths(included_ranges: Option<&[tree_sitter::Range]>
 ///
 /// Returns an empty Vec for non-blockquote documents — the walk visits all nodes
 /// but collects nothing.
-fn compute_prefix_widths_from_tree(tree: &Tree) -> Vec<usize> {
+pub(super) fn compute_prefix_widths_from_tree(tree: &Tree) -> Vec<usize> {
     let mut widths = Vec::new();
     let mut cursor = tree.root_node().walk();
 
@@ -330,21 +341,13 @@ pub(super) fn collect_host_tokens(
         depth,
         supports_multiline,
         exclusion_ranges,
-        included_ranges,
+        prefix_widths,
+        is_injection,
     } = params;
     let content_start_byte = *content_start_byte;
     let depth = *depth;
     let supports_multiline = *supports_multiline;
-
-    // Compute per-line prefix widths for blockquote contexts.
-    // At the injection level, prefix widths come from `included_ranges`.
-    // At the host level, we walk the tree looking for `block_continuation`/`block_quote_marker`.
-    // This ensures multiline tokens are correctly split at prefix boundaries in both cases.
-    let prefix_widths = if included_ranges.is_some() {
-        compute_per_line_prefix_widths(*included_ranges)
-    } else {
-        compute_prefix_widths_from_tree(tree)
-    };
+    let is_injection = *is_injection;
 
     // Calculate position mapping from content-local to host document
     let content_start_line = if content_start_byte == 0 {
@@ -413,7 +416,6 @@ pub(super) fn collect_host_tokens(
             //   content always starts after the prefix. The start row may have prefix=0
             //   while continuation rows have prefix>0 (e.g., [0, 2]), so we can't use a
             //   single per-token flag.
-            let is_injection = included_ranges.is_some();
             let token_uses_prefix = if is_injection {
                 true // injection tokens always use per-row prefix widths
             } else {
@@ -606,7 +608,8 @@ mod tests {
             depth: 0,
             supports_multiline: false,
             exclusion_ranges,
-            included_ranges: None,
+            prefix_widths: &[],
+            is_injection: false,
         }
     }
 

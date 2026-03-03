@@ -60,6 +60,8 @@ pub(crate) async fn handle_semantic_tokens_full(
         let lines: Vec<&str> = text.lines().collect();
 
         // Collect host document tokens first (no exclusion — finalize handles it).
+        // Compute prefix widths once from the tree — used for blockquote handling.
+        let prefix_widths = token_collector::compute_prefix_widths_from_tree(&tree);
         let host_params = token_collector::TokenCollectionParams {
             text: &text,
             tree: &tree,
@@ -72,7 +74,8 @@ pub(crate) async fn handle_semantic_tokens_full(
             depth: 0,
             supports_multiline,
             exclusion_ranges: &[],
-            included_ranges: None, // No included_ranges for host-level call
+            prefix_widths: &prefix_widths,
+            is_injection: false,
         };
         collect_host_tokens(&host_params, &mut all_tokens);
 

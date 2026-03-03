@@ -241,6 +241,8 @@ pub(crate) fn process_injection_sync(
 
     // Collect tokens from this injection's highlight query, excluding
     // regions covered by nested injections
+    let prefix_widths =
+        super::token_collector::compute_per_line_prefix_widths(ctx.included_ranges.as_deref());
     let params = super::token_collector::TokenCollectionParams {
         text: ctx.content_text,
         tree: &tree,
@@ -253,7 +255,8 @@ pub(crate) fn process_injection_sync(
         depth,
         supports_multiline,
         exclusion_ranges: &nested_exclusion_ranges,
-        included_ranges: ctx.included_ranges.as_deref(),
+        prefix_widths: &prefix_widths,
+        is_injection: true,
     };
     collect_host_tokens(&params, &mut tokens);
 
