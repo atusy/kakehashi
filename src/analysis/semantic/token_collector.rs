@@ -642,6 +642,37 @@ mod tests {
         );
     }
 
+    // ── calculate_line_byte_offsets tests ──────────────────────────
+
+    #[test]
+    fn calculate_line_byte_offsets_continuation_line_uses_prefix_width() {
+        // Simulates a multiline token spanning rows 0..2 in a blockquote injection.
+        // Row 1 is a continuation line (row != start_pos.row) and should start at
+        // the prefix width (e.g., 2 for `> `), not 0.
+        let start_pos = tree_sitter::Point { row: 0, column: 4 }; // e.g., `> """`  col 4
+        let end_pos = tree_sitter::Point { row: 2, column: 5 }; // e.g., `> """`  col 5
+        let content_start_col = 0; // not row 0, so unused for this row
+        let content_line_len = 10; // arbitrary line length
+
+        // Row 1 is a continuation line — currently returns (0, content_line_len)
+        // but should return (prefix_width, content_line_len) when prefix > 0.
+        let (line_start, line_end) =
+            calculate_line_byte_offsets(1, start_pos, end_pos, content_start_col, content_line_len);
+
+        // The bug: line_start is 0 but should be 2 (prefix width for `> `)
+        // For now, this test documents the expected behavior WITH the fix.
+        // We pass continuation_col_offset=2 once the parameter is added.
+        // Until then, this assertion will FAIL (line_start == 0, not 2).
+        assert_eq!(
+            line_start, 2,
+            "Continuation line should start at prefix width (2 for `> `), not 0"
+        );
+        assert_eq!(
+            line_end, content_line_len,
+            "Non-final continuation line should end at content_line_len"
+        );
+    }
+
     #[test]
     fn byte_to_utf16_col_ascii() {
         let line = "hello world";
