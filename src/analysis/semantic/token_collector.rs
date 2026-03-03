@@ -9,6 +9,39 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
 use super::legend::apply_capture_mapping;
 
+/// Parameters for token collection from a tree-sitter highlight query.
+///
+/// Bundles the configuration needed by [`collect_host_tokens`] to avoid a
+/// 13-parameter function signature.  The only output (`all_tokens`) stays
+/// as a separate `&mut` parameter because it is the call's sole side-effect.
+pub(super) struct TokenCollectionParams<'a> {
+    /// The content text being parsed (may be injection content or full document).
+    pub(super) text: &'a str,
+    /// The parsed syntax tree for the content.
+    pub(super) tree: &'a Tree,
+    /// The tree-sitter highlight query.
+    pub(super) query: &'a Query,
+    /// Filetype for capture-mapping lookup (e.g. `"markdown"`).
+    pub(super) filetype: Option<&'a str>,
+    /// Capture-name → LSP token-type mappings.
+    pub(super) capture_mappings: Option<&'a CaptureMappings>,
+    /// Full host document text (same as `text` for host-level calls).
+    pub(super) host_text: &'a str,
+    /// Lines of the full host document.
+    pub(super) host_lines: &'a [&'a str],
+    /// Byte offset where this content starts in the host document (0 for host-level).
+    pub(super) content_start_byte: usize,
+    /// Nesting depth (0 = host, 1+ = injection).
+    pub(super) depth: usize,
+    /// Whether the LSP client supports multiline tokens (per LSP 3.16.0+).
+    pub(super) supports_multiline: bool,
+    /// Byte ranges in host text occupied by nested injections (host tokens here are excluded).
+    pub(super) exclusion_ranges: &'a [(usize, usize)],
+    /// Tree-sitter included ranges used for blockquote injection parsing.
+    /// `Some` at the injection level; `None` at the host level.
+    pub(super) included_ranges: Option<&'a [tree_sitter::Range]>,
+}
+
 /// Check whether a node is strictly contained within any exclusion range.
 ///
 /// A node is excluded only if it is **properly inside** a range — meaning fully
@@ -274,34 +307,41 @@ fn calculate_line_byte_offsets(
 ///
 /// When `supports_multiline` is false, multiline tokens are split into per-line
 /// tokens for compatibility with clients that don't support multiline tokens.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_host_tokens(
-    text: &str,
-    tree: &Tree,
-    query: &Query,
-    filetype: Option<&str>,
-    capture_mappings: Option<&CaptureMappings>,
-    host_text: &str,
-    host_lines: &[&str],
-    content_start_byte: usize,
-    depth: usize,
-    supports_multiline: bool,
-    exclusion_ranges: &[(usize, usize)],
-    included_ranges: Option<&[tree_sitter::Range]>,
+    params: &TokenCollectionParams<'_>,
     all_tokens: &mut Vec<RawToken>,
 ) {
     // Validate content_start_byte is within bounds to prevent slice panics
     // This can happen during concurrent edits when document text shortens
-    if content_start_byte > host_text.len() {
+    if params.content_start_byte > params.host_text.len() {
         return;
     }
+
+    // Destructure for readability within the function body
+    let TokenCollectionParams {
+        text,
+        tree,
+        query,
+        filetype,
+        capture_mappings,
+        host_text,
+        host_lines,
+        content_start_byte,
+        depth,
+        supports_multiline,
+        exclusion_ranges,
+        included_ranges,
+    } = params;
+    let content_start_byte = *content_start_byte;
+    let depth = *depth;
+    let supports_multiline = *supports_multiline;
 
     // Compute per-line prefix widths for blockquote contexts.
     // At the injection level, prefix widths come from `included_ranges`.
     // At the host level, we walk the tree looking for `block_continuation`/`block_quote_marker`.
     // This ensures multiline tokens are correctly split at prefix boundaries in both cases.
     let prefix_widths = if included_ranges.is_some() {
-        compute_per_line_prefix_widths(included_ranges)
+        compute_per_line_prefix_widths(*included_ranges)
     } else {
         compute_prefix_widths_from_tree(tree)
     };
@@ -348,7 +388,8 @@ pub(super) fn collect_host_tokens(
 
             // Get the mapped capture name early to avoid repeated mapping
             let capture_name = &query.capture_names()[c.index as usize];
-            let Some(mapped_name) = apply_capture_mapping(capture_name, filetype, capture_mappings)
+            let Some(mapped_name) =
+                apply_capture_mapping(capture_name, *filetype, *capture_mappings)
             else {
                 // Skip unknown captures (None)
                 continue;
@@ -545,6 +586,30 @@ mod tests {
         parser.parse(text, None).unwrap()
     }
 
+    /// Build a [`TokenCollectionParams`] for simple Rust test cases.
+    fn rust_params<'a>(
+        code: &'a str,
+        tree: &'a tree_sitter::Tree,
+        query: &'a tree_sitter::Query,
+        lines: &'a [&'a str],
+        exclusion_ranges: &'a [(usize, usize)],
+    ) -> TokenCollectionParams<'a> {
+        TokenCollectionParams {
+            text: code,
+            tree,
+            query,
+            filetype: Some("rust"),
+            capture_mappings: None,
+            host_text: code,
+            host_lines: lines,
+            content_start_byte: 0,
+            depth: 0,
+            supports_multiline: false,
+            exclusion_ranges,
+            included_ranges: None,
+        }
+    }
+
     #[test]
     fn is_in_exclusion_range_empty_ranges_returns_false() {
         let tree = parse_rust_tree("fn main() {}");
@@ -660,43 +725,18 @@ mod tests {
 
         // Without exclusion: should get the "main" identifier token
         let mut tokens_no_excl = Vec::new();
-        collect_host_tokens(
-            code,
-            &tree,
-            &query,
-            Some("rust"),
-            None,
-            code,
-            &lines,
-            0,
-            0,
-            false,
-            &[],
-            None,
-            &mut tokens_no_excl,
-        );
+        let params = rust_params(code, &tree, &query, &lines, &[]);
+        collect_host_tokens(&params, &mut tokens_no_excl);
         assert!(
             !tokens_no_excl.is_empty(),
             "Without exclusion should produce tokens"
         );
 
         // Exclusion range [0, 12) strictly contains the identifier [3, 7) → suppressed
+        let excl = [(0, code.len())];
         let mut tokens_excl = Vec::new();
-        collect_host_tokens(
-            code,
-            &tree,
-            &query,
-            Some("rust"),
-            None,
-            code,
-            &lines,
-            0,
-            0,
-            false,
-            &[(0, code.len())],
-            None,
-            &mut tokens_excl,
-        );
+        let params = rust_params(code, &tree, &query, &lines, &excl);
+        collect_host_tokens(&params, &mut tokens_excl);
         assert!(
             tokens_excl.is_empty(),
             "Identifier strictly inside exclusion range should be suppressed"
@@ -715,22 +755,10 @@ mod tests {
         // Exclusion range [3, 7) exactly matches the identifier node → NOT suppressed.
         // This models the Markdown heading case where @markup.heading.1 is captured
         // on the same node that is the injection content.
+        let excl = [(3, 7)];
         let mut tokens = Vec::new();
-        collect_host_tokens(
-            code,
-            &tree,
-            &query,
-            Some("rust"),
-            None,
-            code,
-            &lines,
-            0,
-            0,
-            false,
-            &[(3, 7)],
-            None,
-            &mut tokens,
-        );
+        let params = rust_params(code, &tree, &query, &lines, &excl);
+        collect_host_tokens(&params, &mut tokens);
         assert!(
             !tokens.is_empty(),
             "Token with exact-match exclusion range should NOT be suppressed"
@@ -749,22 +777,10 @@ mod tests {
         let lines: Vec<&str> = code.lines().collect();
 
         // Exclusion range [0, 12) strictly contains both "fn" [0,2) and "main" [3,7)
+        let excl_all = [(0, code.len())];
         let mut tokens = Vec::new();
-        collect_host_tokens(
-            code,
-            &tree,
-            &query,
-            Some("rust"),
-            None,
-            code,
-            &lines,
-            0,
-            0,
-            false,
-            &[(0, code.len())],
-            None,
-            &mut tokens,
-        );
+        let params = rust_params(code, &tree, &query, &lines, &excl_all);
+        collect_host_tokens(&params, &mut tokens);
 
         // Both are strictly contained → both suppressed
         assert!(
@@ -774,22 +790,10 @@ mod tests {
 
         // But with a range that only strictly contains "main" [3,7):
         // Use [2, 8) which contains [3,7) but not [0,2)
+        let excl_main = [(2, 8)];
         let mut tokens2 = Vec::new();
-        collect_host_tokens(
-            code,
-            &tree,
-            &query,
-            Some("rust"),
-            None,
-            code,
-            &lines,
-            0,
-            0,
-            false,
-            &[(2, 8)],
-            None,
-            &mut tokens2,
-        );
+        let params = rust_params(code, &tree, &query, &lines, &excl_main);
+        collect_host_tokens(&params, &mut tokens2);
 
         let has_keyword = tokens2.iter().any(|t| t.mapped_name == "keyword");
         let has_variable = tokens2.iter().any(|t| t.mapped_name == "variable");

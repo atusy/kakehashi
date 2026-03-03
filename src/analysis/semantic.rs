@@ -60,21 +60,21 @@ pub(crate) async fn handle_semantic_tokens_full(
         let lines: Vec<&str> = text.lines().collect();
 
         // Collect host document tokens first (no exclusion — finalize handles it).
-        collect_host_tokens(
-            &text,
-            &tree,
-            &query,
-            filetype.as_deref(),
-            capture_mappings.as_ref(),
-            &text,
-            &lines,
-            0,
-            0,
+        let host_params = token_collector::TokenCollectionParams {
+            text: &text,
+            tree: &tree,
+            query: &query,
+            filetype: filetype.as_deref(),
+            capture_mappings: capture_mappings.as_ref(),
+            host_text: &text,
+            host_lines: &lines,
+            content_start_byte: 0,
+            depth: 0,
             supports_multiline,
-            &[],
-            None, // No included_ranges for host-level call
-            &mut all_tokens,
-        );
+            exclusion_ranges: &[],
+            included_ranges: None, // No included_ranges for host-level call
+        };
+        collect_host_tokens(&host_params, &mut all_tokens);
 
         // Collect injection tokens in parallel using Rayon.
         // Also returns active injection regions for finalize-time exclusion.

@@ -241,21 +241,21 @@ pub(crate) fn process_injection_sync(
 
     // Collect tokens from this injection's highlight query, excluding
     // regions covered by nested injections
-    collect_host_tokens(
-        ctx.content_text,
-        &tree,
-        &ctx.highlight_query,
-        Some(&ctx.resolved_lang),
+    let params = super::token_collector::TokenCollectionParams {
+        text: ctx.content_text,
+        tree: &tree,
+        query: &ctx.highlight_query,
+        filetype: Some(&ctx.resolved_lang),
         capture_mappings,
         host_text,
         host_lines,
-        ctx.host_start_byte,
+        content_start_byte: ctx.host_start_byte,
         depth,
         supports_multiline,
-        &nested_exclusion_ranges,
-        ctx.included_ranges.as_deref(),
-        &mut tokens,
-    );
+        exclusion_ranges: &nested_exclusion_ranges,
+        included_ranges: ctx.included_ranges.as_deref(),
+    };
+    collect_host_tokens(&params, &mut tokens);
 
     // Recursively process nested injections (same thread, no parallelism)
     for nested_ctx in nested_contexts {
