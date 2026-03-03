@@ -72,6 +72,153 @@ fn token_type_name(index: u32) -> &'static str {
     }
 }
 
+/// E2E test: blockquote multiline injection with full captureMappings.
+///
+/// Uses a comprehensive captureMappings config (matching typical user configs) with
+/// both heading and code block examples in a single document.
+#[test]
+fn test_blockquote_user_config_diagnostic() {
+    let mut client = LspClient::new();
+
+    // User's EXACT captureMappings config
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.heading": "class",
+                            "markup.heading.1": "class",
+                            "markup.heading.2": "class",
+                            "markup.heading.3": "class",
+                            "markup.heading.4": "class",
+                            "markup.heading.5": "class",
+                            "markup.heading.6": "class",
+                            "markup.italic": "keyword",
+                            "markup.link.label": "keyword",
+                            "markup.link.url": "",
+                            "markup.link": "",
+                            "markup.list.checked": "property",
+                            "markup.list.unchecked": "property",
+                            "markup.list": "property",
+                            "markup.math": "",
+                            "markup.quote": "keyword",
+                            "markup.raw.block": "string",
+                            "markup.raw": "string",
+                            "markup.strikethrough": "keyword.deprecated",
+                            "markup.strong": "keyword",
+                            "markup.underline": "keyword"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Both examples in one document, matching user's screenshot
+    let content = "> # foo\n> bar\n\n> ```py\n> \"\"\"\n>   foo\n> \"\"\"\n> ```\n";
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({
+            "textDocument": { "uri": uri }
+        }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let tokens = decode_semantic_tokens(&data_u32);
+
+    // Lines:
+    //   0: "> # foo"
+    //   1: "> bar"
+    //   2: ""
+    //   3: "> ```py"
+    //   4: "> """
+    //   5: ">   foo"
+    //   6: "> """
+    //   7: "> ```"
+
+    // Check code block content lines (4-6): `> ` prefix should have a host token
+    for line_num in 4..=6 {
+        let line_tokens: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.line == line_num as u32)
+            .collect();
+        assert!(
+            !line_tokens.is_empty(),
+            "Line {} should have tokens. All: {:?}",
+            line_num,
+            tokens
+        );
+
+        // The `> ` prefix should have a host "keyword" token at col 0
+        let has_keyword_prefix = line_tokens
+            .iter()
+            .any(|t| t.start == 0 && token_type_name(t.token_type) == "keyword");
+        assert!(
+            has_keyword_prefix,
+            "Line {} should have a 'keyword' token at col 0 for `> ` prefix. Tokens: {:?}",
+            line_num, line_tokens
+        );
+
+        // No injection "string" tokens should cover the `> ` prefix (col 0-1)
+        let bad_tokens: Vec<_> = line_tokens
+            .iter()
+            .filter(|t| t.start == 0 && token_type_name(t.token_type) == "string")
+            .collect();
+        assert!(
+            bad_tokens.is_empty(),
+            "Line {} should NOT have 'string' tokens at col 0 (prefix leak). Bad: {:?}",
+            line_num,
+            bad_tokens
+        );
+    }
+}
+
 /// E2E test: multiline Python string in blockquote preserves host prefix tokens.
 ///
 /// When a Python `"""..."""` triple-quoted string spans multiple lines inside a
@@ -200,6 +347,117 @@ fn test_blockquote_multiline_injection_token_prefix() {
             bad_injection_tokens
         );
     }
+}
+
+/// E2E test: heading in blockquote preserves host tokens on all lines.
+///
+/// Tests `> # foo\n> bar\n` — the heading on line 0 creates a markdown_inline
+/// injection, and the continuation line should still have proper host tokens.
+#[test]
+fn test_blockquote_heading_host_token_preservation() {
+    let mut client = LspClient::new();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.heading.1": "class",
+                            "markup.quote": "keyword"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Content: blockquote with heading
+    //   Line 0: > # foo
+    //   Line 1: > bar
+    let content = "> # foo\n> bar\n";
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({
+            "textDocument": { "uri": uri }
+        }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let tokens = decode_semantic_tokens(&data_u32);
+
+    assert!(!tokens.is_empty(), "Should have semantic tokens");
+
+    // Line 0 should have tokens (heading and/or blockquote prefix)
+    let line0_tokens: Vec<_> = tokens.iter().filter(|t| t.line == 0).collect();
+    assert!(
+        !line0_tokens.is_empty(),
+        "Line 0 should have tokens. All: {:?}",
+        tokens
+    );
+
+    // Line 1 should have a host token at col 0 (the `> ` prefix, mapped to "keyword")
+    let line1_tokens: Vec<_> = tokens.iter().filter(|t| t.line == 1).collect();
+    assert!(
+        !line1_tokens.is_empty(),
+        "Line 1 should have tokens. All: {:?}",
+        tokens
+    );
+
+    // The `> ` prefix should have a host token at col 0, length 2.
+    // The type may be "keyword" (from markup.quote) or "class" (from markup.heading.1)
+    // depending on capture priority — the key property is the prefix is covered.
+    let line1_has_prefix = line1_tokens.iter().any(|t| t.start == 0 && t.length == 2);
+    assert!(
+        line1_has_prefix,
+        "Line 1 should have a host token at col 0 with length 2 for `> ` prefix. Tokens: {:?}",
+        line1_tokens
+    );
 }
 
 /// E2E test: blockquote-wrapped fenced code blocks produce consistent tokens.
