@@ -67,6 +67,7 @@ fn token_type_name(index: u32) -> &'static str {
         5 => "operator",
         6 => "namespace",
         7 => "type",
+        9 => "class",
         17 => "variable",
         _ => "other",
     }
@@ -457,6 +458,119 @@ fn test_blockquote_heading_host_token_preservation() {
     assert!(
         line1_has_prefix,
         "Line 1 should have a host token at col 0 with length 2 for `> ` prefix. Tokens: {:?}",
+        line1_tokens
+    );
+}
+
+/// E2E test: heading in blockquote with multilineTokenSupport preserves prefix type.
+///
+/// When `multilineTokenSupport: true`, the `atx_heading` node spans lines 0-1 and
+/// gets emitted as a single multiline token. Without proper prefix width handling at
+/// the HOST level, `split_multiline_tokens` starts continuation lines at col 0,
+/// causing the heading "class" token (priority 100) to overwrite `markup.quote`
+/// "keyword" (priority 90) on the `> ` prefix of line 1.
+///
+/// The correct behavior: line 1 col 0 should be "keyword" (from `markup.quote`),
+/// because the heading content doesn't include the `> ` prefix.
+#[test]
+fn test_blockquote_heading_multiline_support_prefix_type() {
+    let mut client = LspClient::new();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"],
+                        "multilineTokenSupport": true
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.heading.1": "class",
+                            "markup.quote": "keyword"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // Content: blockquote with heading
+    //   Line 0: > # foo
+    //   Line 1: > bar
+    let content = "> # foo\n> bar\n";
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({
+            "textDocument": { "uri": uri }
+        }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let tokens = decode_semantic_tokens(&data_u32);
+
+    // Line 1 tokens
+    let line1_tokens: Vec<_> = tokens.iter().filter(|t| t.line == 1).collect();
+    assert!(
+        !line1_tokens.is_empty(),
+        "Line 1 should have tokens. All: {:?}",
+        tokens
+    );
+
+    // The `> ` prefix on line 1 MUST be "keyword" (from markup.quote, priority 90),
+    // NOT "class" (from markup.heading.1, priority 100).
+    // The heading content should not extend into the `> ` prefix region.
+    let prefix_token = line1_tokens
+        .iter()
+        .find(|t| t.start == 0)
+        .expect("Line 1 should have a token at col 0");
+    assert_eq!(
+        token_type_name(prefix_token.token_type),
+        "keyword",
+        "Line 1 col 0 should be 'keyword' (markup.quote), not 'class' (heading). \
+         The heading multiline token should not cover the `> ` prefix. Tokens: {:?}",
         line1_tokens
     );
 }
