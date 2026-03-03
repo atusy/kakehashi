@@ -146,6 +146,66 @@ fn compute_per_line_prefix_widths(included_ranges: Option<&[tree_sitter::Range]>
     widths
 }
 
+/// Compute per-line prefix widths from the syntax tree itself.
+///
+/// Walks the tree looking for `block_continuation` and `block_quote_marker` nodes
+/// (which represent the `> ` prefix in blockquotes). The end column of these nodes
+/// gives the byte width of the prefix on each line.
+///
+/// This is used at the **host level** (where `included_ranges` is not available)
+/// to ensure multiline tokens spanning blockquote continuation lines are correctly
+/// offset. Without this, `split_multiline_tokens` would start continuation lines
+/// at col 0, covering the `> ` prefix.
+///
+/// Uses an iterative depth-first traversal to avoid stack overflow on deeply nested
+/// documents (e.g., five-level nested blockquotes with many block elements).
+///
+/// Returns an empty Vec for non-blockquote documents — the walk visits all nodes
+/// but collects nothing.
+fn compute_prefix_widths_from_tree(tree: &Tree) -> Vec<usize> {
+    let mut widths = Vec::new();
+    let mut cursor = tree.root_node().walk();
+
+    // Iterative depth-first traversal using TreeCursor's state machine.
+    // The pattern: try going deeper first, then sideways, then back up.
+    'walk: loop {
+        let node = cursor.node();
+        let kind = node.kind();
+
+        if kind == "block_continuation" || kind == "block_quote_marker" {
+            let row = node.start_position().row;
+            let end_col = node.end_position().column;
+            if row >= widths.len() {
+                widths.resize(row + 1, 0);
+            }
+            // Use max for nested blockquotes (multiple prefix nodes on same line)
+            widths[row] = widths[row].max(end_col);
+        }
+
+        // Try descending into first child
+        if cursor.goto_first_child() {
+            continue;
+        }
+
+        // No children — try next sibling
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+
+        // No siblings — walk back up until we find an ancestor with a next sibling
+        loop {
+            if !cursor.goto_parent() {
+                break 'walk; // Back at root — done
+            }
+            if cursor.goto_next_sibling() {
+                break; // Found an ancestor's sibling — continue walk
+            }
+        }
+    }
+
+    widths
+}
+
 /// Calculate byte offsets for a line within a multiline token.
 ///
 /// This helper computes the start and end byte positions for a specific line (row)
@@ -236,9 +296,15 @@ pub(super) fn collect_host_tokens(
         return;
     }
 
-    // Compute per-line prefix widths from included_ranges (e.g., 2 for `> ` in blockquotes).
-    // Used to offset continuation lines of multiline tokens correctly.
-    let prefix_widths = compute_per_line_prefix_widths(included_ranges);
+    // Compute per-line prefix widths for blockquote contexts.
+    // At the injection level, prefix widths come from `included_ranges`.
+    // At the host level, we walk the tree looking for `block_continuation`/`block_quote_marker`.
+    // This ensures multiline tokens are correctly split at prefix boundaries in both cases.
+    let prefix_widths = if included_ranges.is_some() {
+        compute_per_line_prefix_widths(included_ranges)
+    } else {
+        compute_prefix_widths_from_tree(tree)
+    };
 
     // Calculate position mapping from content-local to host document
     let content_start_line = if content_start_byte == 0 {
@@ -292,6 +358,32 @@ pub(super) fn collect_host_tokens(
             if is_in_exclusion_range(&node, exclusion_ranges) {
                 continue;
             }
+
+            // Determine whether this token's continuation lines should use the prefix offset.
+            //
+            // At the HOST level (included_ranges is None, prefix_widths from tree):
+            //   Tokens starting AT or AFTER the prefix boundary (e.g., `atx_heading` at col 2
+            //   in `> # foo`) should continue at prefix_width on subsequent lines.
+            //   Tokens starting BEFORE the prefix (e.g., `block_quote` at col 0) should
+            //   continue at col 0 — the `> ` IS part of that token.
+            //
+            // At the INJECTION level (included_ranges is Some, prefix_widths from ranges):
+            //   ALL tokens use per-row prefix widths unconditionally, because the injection
+            //   content always starts after the prefix. The start row may have prefix=0
+            //   while continuation rows have prefix>0 (e.g., [0, 2]), so we can't use a
+            //   single per-token flag.
+            let is_injection = included_ranges.is_some();
+            let token_uses_prefix = if is_injection {
+                true // injection tokens always use per-row prefix widths
+            } else {
+                let prefix_on_start_row = prefix_widths.get(start_pos.row).copied().unwrap_or(0);
+                let token_start_col = if start_pos.row == 0 {
+                    content_start_col + start_pos.column
+                } else {
+                    start_pos.column
+                };
+                prefix_on_start_row > 0 && token_start_col >= prefix_on_start_row
+            };
 
             if is_single_line || is_trailing_newline {
                 // Single-line token: emit as before
@@ -355,7 +447,11 @@ pub(super) fn collect_host_tokens(
                     let line_text = host_lines.get(host_row).unwrap_or(&"");
                     let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
 
-                    let continuation_offset = prefix_widths.get(row).copied().unwrap_or(0);
+                    let continuation_offset = if token_uses_prefix {
+                        prefix_widths.get(row).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
                     let (line_start, line_end) = calculate_line_byte_offsets(
                         row,
                         start_pos,
@@ -398,7 +494,11 @@ pub(super) fn collect_host_tokens(
                     let host_line_text = host_lines.get(host_row).unwrap_or(&"");
                     let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
 
-                    let continuation_offset = prefix_widths.get(row).copied().unwrap_or(0);
+                    let continuation_offset = if token_uses_prefix {
+                        prefix_widths.get(row).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
                     let (line_start_byte, line_end_byte) = calculate_line_byte_offsets(
                         row,
                         start_pos,

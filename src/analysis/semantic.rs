@@ -1381,22 +1381,27 @@ foo
             line2_string_leaks
         );
 
-        // The `> ` prefix at col 0 should HAVE a host string token
-        let line1_prefix: Vec<_> = line1_tokens
+        // With default_capture_mappings, `markup.quote` maps to "" (suppressed),
+        // so the `> ` prefix at col 0 has NO host token. The `fenced_code_block`
+        // (markup.raw.block → "string") correctly starts at col 2 (after `> `),
+        // NOT at col 0 — which would be a prefix leak.
+        let line1_string_at_0: Vec<_> = line1_tokens
             .iter()
             .filter(|t| t.1 == 0 && t.3 == string_type)
             .collect();
-        let line2_prefix: Vec<_> = line2_tokens
+        let line2_string_at_0: Vec<_> = line2_tokens
             .iter()
             .filter(|t| t.1 == 0 && t.3 == string_type)
             .collect();
         assert!(
-            !line1_prefix.is_empty(),
-            "Line 1 should have host `string` for `> ` prefix"
+            line1_string_at_0.is_empty(),
+            "Line 1 should NOT have `string` at col 0 (would be fenced_code_block leak). Got: {:?}",
+            line1_string_at_0
         );
         assert!(
-            !line2_prefix.is_empty(),
-            "Line 2 should have host `string` for `> ` prefix"
+            line2_string_at_0.is_empty(),
+            "Line 2 should NOT have `string` at col 0 (would be fenced_code_block leak). Got: {:?}",
+            line2_string_at_0
         );
     }
 }

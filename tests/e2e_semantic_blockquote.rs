@@ -451,13 +451,13 @@ fn test_blockquote_heading_host_token_preservation() {
         tokens
     );
 
-    // The `> ` prefix should have a host token at col 0, length 2.
-    // The type may be "keyword" (from markup.quote) or "class" (from markup.heading.1)
-    // depending on capture priority — the key property is the prefix is covered.
-    let line1_has_prefix = line1_tokens.iter().any(|t| t.start == 0 && t.length == 2);
+    // Without multilineTokenSupport, the heading is single-line (trailing newline case),
+    // so it doesn't extend to line 1. The blockquote `markup.quote → "keyword"` covers
+    // the entire line including the `> ` prefix.
+    let line1_has_prefix = line1_tokens.iter().any(|t| t.start == 0);
     assert!(
         line1_has_prefix,
-        "Line 1 should have a host token at col 0 with length 2 for `> ` prefix. Tokens: {:?}",
+        "Line 1 should have a host token at col 0 for `> ` prefix. Tokens: {:?}",
         line1_tokens
     );
 }
