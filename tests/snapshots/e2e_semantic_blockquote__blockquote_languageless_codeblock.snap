@@ -1,0 +1,41 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 0,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 31,
+    "type": "keyword",
+    "text": "> this should be string (green)"
+  },
+  {
+    "line": 2,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 2,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  }
+]

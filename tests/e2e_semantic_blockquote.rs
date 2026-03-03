@@ -11,6 +11,7 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
+use kakehashi::text::convert_utf16_to_byte_in_line;
 use serde_json::json;
 use std::time::Duration;
 
@@ -53,10 +54,7 @@ fn decode_semantic_tokens(data: &[u32]) -> Vec<DecodedToken> {
     result
 }
 
-/// Get token type name from index (partial mapping of LEGEND_TYPES).
-///
-/// This covers only 9 of the 23 entries in `LEGEND_TYPES` (see `legend.rs`) —
-/// the subset asserted in this test. Unmapped indices return `"other"`.
+/// Get token type name from index (full mapping of LEGEND_TYPES from `legend.rs`).
 fn token_type_name(index: u32) -> &'static str {
     match index {
         0 => "comment",
@@ -67,10 +65,52 @@ fn token_type_name(index: u32) -> &'static str {
         5 => "operator",
         6 => "namespace",
         7 => "type",
+        8 => "struct",
         9 => "class",
+        10 => "interface",
+        11 => "enum",
+        12 => "enumMember",
+        13 => "typeParameter",
+        14 => "function",
+        15 => "method",
+        16 => "macro",
         17 => "variable",
-        _ => "other",
+        18 => "parameter",
+        19 => "property",
+        20 => "event",
+        21 => "modifier",
+        22 => "decorator",
+        _ => "unknown",
     }
+}
+
+/// Build a JSON snapshot of decoded tokens with human-readable text slices.
+///
+/// Each token entry includes: line, start, length, type name, and the source text
+/// that the token covers. This makes before/after diffs highly informative.
+fn build_token_snapshot(tokens: &[DecodedToken], content: &str) -> Vec<serde_json::Value> {
+    let lines: Vec<&str> = content.lines().collect();
+    tokens
+        .iter()
+        .map(|t| {
+            let text = lines
+                .get(t.line as usize)
+                .and_then(|line| {
+                    let start_byte = convert_utf16_to_byte_in_line(line, t.start as usize)?;
+                    let end_byte =
+                        convert_utf16_to_byte_in_line(line, (t.start + t.length) as usize)?;
+                    line.get(start_byte..end_byte)
+                })
+                .unwrap_or("<out-of-range>");
+            json!({
+                "line": t.line,
+                "start": t.start,
+                "length": t.length,
+                "type": token_type_name(t.token_type),
+                "text": text,
+            })
+        })
+        .collect()
 }
 
 /// E2E test: blockquote multiline injection with full captureMappings.
@@ -775,4 +815,150 @@ fn test_blockquote_injection_tokens() {
         "Line 2 should have host `string` for `> ` prefix. Line 2 tokens: {:?}",
         line2_tokens
     );
+}
+
+// ─── Snapshot tests for observing token output before/after fixes ────────────
+
+/// Helper: initialize client with full captureMappings config and multilineTokenSupport.
+fn init_client_with_full_config(client: &mut LspClient) {
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "string", "number", "operator"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"],
+                        "multilineTokenSupport": true
+                    }
+                }
+            },
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.heading": "class",
+                            "markup.heading.1": "class",
+                            "markup.heading.2": "class",
+                            "markup.heading.3": "class",
+                            "markup.heading.4": "class",
+                            "markup.heading.5": "class",
+                            "markup.heading.6": "class",
+                            "markup.italic": "keyword",
+                            "markup.link.label": "keyword",
+                            "markup.link.url": "",
+                            "markup.link": "",
+                            "markup.list.checked": "property",
+                            "markup.list.unchecked": "property",
+                            "markup.list": "property",
+                            "markup.math": "",
+                            "markup.quote": "keyword",
+                            "markup.raw.block": "string",
+                            "markup.raw": "string",
+                            "markup.strikethrough": "keyword.deprecated",
+                            "markup.strong": "keyword",
+                            "markup.underline": "keyword"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+}
+
+/// Helper: open a markdown document and request semantic tokens.
+fn open_and_get_tokens(client: &mut LspClient, content: &str) -> Vec<DecodedToken> {
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    decode_semantic_tokens(&data_u32)
+}
+
+/// Snapshot: language-less fenced code block inside blockquote.
+///
+/// A ` ``` ` block without a language specifier produces no injection — the entire
+/// `fenced_code_block` node becomes a host-level `markup.raw.block` token.
+/// This snapshot captures whether the `> ` prefix is correctly handled.
+///
+/// ```markdown
+/// > ```
+/// > this should be string (green)
+/// > ```
+/// ```
+#[test]
+fn test_snapshot_blockquote_languageless_codeblock() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = "> ```\n> this should be string (green)\n> ```\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    let snapshot = build_token_snapshot(&tokens, content);
+
+    insta::assert_json_snapshot!("blockquote_languageless_codeblock", snapshot);
+}
+
+/// Snapshot: deeply nested injection (blockquote > markdown codeblock > python codeblock).
+///
+/// Tests the injection chain: host markdown → markdown injection → python injection.
+/// The `> ` prefix from the blockquote must not leak into the nested python tokens.
+///
+/// ```markdown
+/// > ``````markdown
+/// > ```python
+/// > y = 1 + 2
+/// > x = f"""
+/// >   foo{1 + 2}
+/// > """
+/// > ```
+/// > ``````
+/// ```
+#[test]
+fn test_snapshot_blockquote_nested_markdown_python() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = "> ``````markdown\n> ```python\n> y = 1 + 2\n> x = f\"\"\"\n>   foo{1 + 2}\n> \"\"\"\n> ```\n> ``````\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    let snapshot = build_token_snapshot(&tokens, content);
+
+    insta::assert_json_snapshot!("blockquote_nested_markdown_python", snapshot);
 }
