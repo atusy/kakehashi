@@ -72,6 +72,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             0,
             supports_multiline,
             &[],
+            None, // No included_ranges for host-level call
             &mut all_tokens,
         );
 

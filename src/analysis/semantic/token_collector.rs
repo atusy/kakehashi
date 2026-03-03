@@ -109,6 +109,43 @@ pub(super) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
     })
 }
 
+/// Compute per-line prefix widths from `included_ranges`.
+///
+/// When tree-sitter parses with `set_included_ranges` (e.g., for blockquote injections),
+/// each range's `start_point.column` represents the byte offset where actual content
+/// begins on that line — i.e., the width of the structural prefix (like `> `).
+///
+/// Returns a Vec where `result[row] = prefix_width_in_bytes` for each row covered by
+/// the included ranges. Returns an empty Vec when `included_ranges` is `None` (non-blockquote).
+fn compute_per_line_prefix_widths(included_ranges: Option<&[tree_sitter::Range]>) -> Vec<usize> {
+    let Some(ranges) = included_ranges else {
+        return Vec::new();
+    };
+
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let max_row = ranges
+        .iter()
+        .map(|r| r.start_point.row.max(r.end_point.row))
+        .max()
+        .unwrap_or(0);
+    let mut widths = vec![0usize; max_row + 1];
+
+    for range in ranges {
+        // A range can span multiple rows. The start_point.column gives the prefix
+        // width for the first row. For continuation rows within the same range,
+        // the prefix is the same (the `> ` pattern repeats on each line).
+        let prefix_col = range.start_point.column;
+        for w in &mut widths[range.start_point.row..=range.end_point.row] {
+            *w = (*w).max(prefix_col);
+        }
+    }
+
+    widths
+}
+
 /// Calculate byte offsets for a line within a multiline token.
 ///
 /// This helper computes the start and end byte positions for a specific line (row)
@@ -120,6 +157,7 @@ pub(super) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
 /// * `end_pos` - Token end position in content coordinates
 /// * `content_start_col` - Column offset where injection starts in host line (0 for host content)
 /// * `content_line_len` - Length of the content line at this row
+/// * `continuation_col_offset` - Column offset for continuation lines (prefix width, e.g., 2 for `> `)
 ///
 /// # Returns
 /// Tuple of (line_start_byte, line_end_byte) in host document coordinates
@@ -129,6 +167,7 @@ fn calculate_line_byte_offsets(
     end_pos: tree_sitter::Point,
     content_start_col: usize,
     content_line_len: usize,
+    continuation_col_offset: usize,
 ) -> (usize, usize) {
     // Calculate start byte offset for this line
     let line_start = if row == start_pos.row {
@@ -138,8 +177,9 @@ fn calculate_line_byte_offsets(
             start_pos.column
         }
     } else {
-        // Continuation lines start at column 0
-        0
+        // Continuation lines start at the prefix width (0 for non-blockquote,
+        // e.g., 2 for `> ` in blockquotes)
+        continuation_col_offset
     };
 
     // Calculate end byte offset for this line
@@ -187,6 +227,7 @@ pub(super) fn collect_host_tokens(
     depth: usize,
     supports_multiline: bool,
     exclusion_ranges: &[(usize, usize)],
+    included_ranges: Option<&[tree_sitter::Range]>,
     all_tokens: &mut Vec<RawToken>,
 ) {
     // Validate content_start_byte is within bounds to prevent slice panics
@@ -194,6 +235,10 @@ pub(super) fn collect_host_tokens(
     if content_start_byte > host_text.len() {
         return;
     }
+
+    // Compute per-line prefix widths from included_ranges (e.g., 2 for `> ` in blockquotes).
+    // Used to offset continuation lines of multiline tokens correctly.
+    let prefix_widths = compute_per_line_prefix_widths(included_ranges);
 
     // Calculate position mapping from content-local to host document
     let content_start_line = if content_start_byte == 0 {
@@ -306,12 +351,14 @@ pub(super) fn collect_host_tokens(
                     let line_text = host_lines.get(host_row).unwrap_or(&"");
                     let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
 
+                    let continuation_offset = prefix_widths.get(row).copied().unwrap_or(0);
                     let (line_start, line_end) = calculate_line_byte_offsets(
                         row,
                         start_pos,
                         end_pos,
                         content_start_col,
                         content_line_len,
+                        continuation_offset,
                     );
 
                     let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
@@ -347,12 +394,14 @@ pub(super) fn collect_host_tokens(
                     let host_line_text = host_lines.get(host_row).unwrap_or(&"");
                     let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
 
+                    let continuation_offset = prefix_widths.get(row).copied().unwrap_or(0);
                     let (line_start_byte, line_end_byte) = calculate_line_byte_offsets(
                         row,
                         start_pos,
                         end_pos,
                         content_start_col,
                         content_line_len,
+                        continuation_offset,
                     );
 
                     let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
@@ -519,6 +568,7 @@ mod tests {
             0,
             false,
             &[],
+            None,
             &mut tokens_no_excl,
         );
         assert!(
@@ -540,6 +590,7 @@ mod tests {
             0,
             false,
             &[(0, code.len())],
+            None,
             &mut tokens_excl,
         );
         assert!(
@@ -573,6 +624,7 @@ mod tests {
             0,
             false,
             &[(3, 7)],
+            None,
             &mut tokens,
         );
         assert!(
@@ -606,6 +658,7 @@ mod tests {
             0,
             false,
             &[(0, code.len())],
+            None,
             &mut tokens,
         );
 
@@ -630,6 +683,7 @@ mod tests {
             0,
             false,
             &[(2, 8)],
+            None,
             &mut tokens2,
         );
 
@@ -654,15 +708,17 @@ mod tests {
         let content_start_col = 0; // not row 0, so unused for this row
         let content_line_len = 10; // arbitrary line length
 
-        // Row 1 is a continuation line — currently returns (0, content_line_len)
-        // but should return (prefix_width, content_line_len) when prefix > 0.
-        let (line_start, line_end) =
-            calculate_line_byte_offsets(1, start_pos, end_pos, content_start_col, content_line_len);
+        // Row 1 is a continuation line — with continuation_col_offset=2 (prefix `> `),
+        // should return (2, content_line_len) instead of (0, content_line_len).
+        let (line_start, line_end) = calculate_line_byte_offsets(
+            1,
+            start_pos,
+            end_pos,
+            content_start_col,
+            content_line_len,
+            2, // continuation_col_offset: prefix width for `> `
+        );
 
-        // The bug: line_start is 0 but should be 2 (prefix width for `> `)
-        // For now, this test documents the expected behavior WITH the fix.
-        // We pass continuation_col_offset=2 once the parameter is added.
-        // Until then, this assertion will FAIL (line_start == 0, not 2).
         assert_eq!(
             line_start, 2,
             "Continuation line should start at prefix width (2 for `> `), not 0"

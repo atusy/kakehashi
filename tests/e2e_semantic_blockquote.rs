@@ -196,7 +196,8 @@ fn test_blockquote_multiline_injection_token_prefix() {
         assert!(
             bad_injection_tokens.is_empty(),
             "Line {} should have no injection 'string' tokens before col 2. Bad tokens: {:?}",
-            line_num, bad_injection_tokens
+            line_num,
+            bad_injection_tokens
         );
     }
 }

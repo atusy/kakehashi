@@ -253,6 +253,7 @@ pub(crate) fn process_injection_sync(
         depth,
         supports_multiline,
         &nested_exclusion_ranges,
+        ctx.included_ranges.as_deref(),
         &mut tokens,
     );
 
