@@ -208,6 +208,7 @@ fn test_selection_range_parent_chain() {
 
     let result = response.get("result").unwrap();
     let ranges = result.as_array().unwrap();
+    assert!(!ranges.is_empty(), "Expected at least one selection range");
     let first_range = &ranges[0];
 
     // Verify parent chain exists
