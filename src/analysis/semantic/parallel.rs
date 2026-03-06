@@ -19,7 +19,8 @@ use super::token_collector::{InjectionRegion, RawToken, byte_to_utf16_col, colle
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    compute_included_ranges, parse_with_ranges, sub_select_included_ranges,
+    compute_included_ranges, intersect_included_ranges, parse_with_ranges,
+    sub_select_included_ranges,
 };
 
 /// Maximum number of parsers to cache per Rayon worker thread.
@@ -366,13 +367,23 @@ fn collect_injection_contexts_sync<'a>(
         let included_ranges = if offset.is_some() {
             None
         } else {
-            compute_included_ranges(&injection.content_node, injection.include_children).or_else(
-                || {
-                    parent_included_ranges.and_then(|parent_ranges| {
-                        sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
-                    })
-                },
-            )
+            let from_children =
+                compute_included_ranges(&injection.content_node, injection.include_children);
+            let from_parent = parent_included_ranges.and_then(|parent_ranges| {
+                sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
+            });
+            match (from_children, from_parent) {
+                (Some(child_ranges), Some(parent_ranges)) => {
+                    let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
+                    if intersected.is_empty() {
+                        None
+                    } else {
+                        Some(intersected)
+                    }
+                }
+                (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
+                (None, None) => None,
+            }
         };
 
         // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).

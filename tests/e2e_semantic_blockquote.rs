@@ -1007,6 +1007,31 @@ fn test_snapshot_blockquote_nested_markdown_python() {
     insta::assert_json_snapshot!("blockquote_nested_markdown_python", snapshot);
 }
 
+/// Snapshot: double-nested blockquote (blockquote > markdown codeblock > blockquote > python).
+///
+/// Tests the injection chain: host markdown → markdown injection (inner blockquote) → python.
+/// The `> > ` prefix from the double blockquote must not leak into the nested python tokens.
+/// Specifically, the inner `> ` must not be parsed as a Python comparison operator.
+///
+/// ```markdown
+/// > ``````markdown
+/// > > ```python
+/// > > y = 1 + 2
+/// > > ```
+/// > ``````
+/// ```
+#[test]
+fn test_snapshot_blockquote_double_nested_markdown_python() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = "> ``````markdown\n> > ```python\n> > y = 1 + 2\n> > ```\n> ``````\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    let snapshot = build_token_snapshot(&tokens, content);
+
+    insta::assert_json_snapshot!("blockquote_double_nested_markdown_python", snapshot);
+}
+
 /// Snapshot: heading in blockquote with multilineTokenSupport.
 ///
 /// The `atx_heading` node in markdown spans from `# foo` to the next line's

@@ -366,6 +366,62 @@ pub(crate) fn sub_select_included_ranges(
     }
 }
 
+/// Intersect two sets of included ranges, keeping only byte regions present in both.
+///
+/// Both range sets must be in the same coordinate space (e.g., both relative
+/// to `content_node.start_byte()`). The result contains only byte regions
+/// that appear in BOTH inputs.
+///
+/// This is needed when a tree parsed with parent `included_ranges` produces
+/// `compute_included_ranges()` gap ranges that inadvertently span parent-excluded
+/// bytes. Intersecting with the parent's `sub_select_included_ranges()` output
+/// ensures previously-excluded bytes stay excluded.
+pub(crate) fn intersect_included_ranges(
+    a: &[tree_sitter::Range],
+    b: &[tree_sitter::Range],
+) -> Vec<tree_sitter::Range> {
+    let mut result = Vec::new();
+    let mut j = 0;
+
+    for ar in a {
+        // Advance b past ranges that end before ar starts
+        while j < b.len() && b[j].end_byte <= ar.start_byte {
+            j += 1;
+        }
+
+        // Check all b ranges that overlap with ar
+        let mut k = j;
+        while k < b.len() && b[k].start_byte < ar.end_byte {
+            let start_byte = ar.start_byte.max(b[k].start_byte);
+            let end_byte = ar.end_byte.min(b[k].end_byte);
+
+            if start_byte < end_byte {
+                // Use point from whichever boundary is more restrictive
+                let start_point = if start_byte == ar.start_byte {
+                    ar.start_point
+                } else {
+                    b[k].start_point
+                };
+                let end_point = if end_byte == ar.end_byte {
+                    ar.end_point
+                } else {
+                    b[k].end_point
+                };
+
+                result.push(tree_sitter::Range {
+                    start_byte,
+                    end_byte,
+                    start_point,
+                    end_point,
+                });
+            }
+            k += 1;
+        }
+    }
+
+    result
+}
+
 /// Extract clean injection content, stripping child node bytes when included_ranges present.
 ///
 /// When `included_ranges` is `Some`, only the gap bytes (actual code content) are
