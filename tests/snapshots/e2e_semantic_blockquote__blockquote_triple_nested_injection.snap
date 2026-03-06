@@ -1,0 +1,132 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 0,
+    "start": 2,
+    "length": 5,
+    "type": "string",
+    "text": "`````"
+  },
+  {
+    "line": 0,
+    "start": 7,
+    "length": 8,
+    "type": "variable",
+    "text": "markdown"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 2,
+    "length": 4,
+    "type": "string",
+    "text": "````"
+  },
+  {
+    "line": 1,
+    "start": 6,
+    "length": 3,
+    "type": "variable",
+    "text": "lua"
+  },
+  {
+    "line": 2,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 2,
+    "start": 2,
+    "length": 5,
+    "type": "keyword",
+    "text": "local"
+  },
+  {
+    "line": 2,
+    "start": 7,
+    "length": 1,
+    "type": "string",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 8,
+    "length": 1,
+    "type": "variable",
+    "text": "x"
+  },
+  {
+    "line": 2,
+    "start": 9,
+    "length": 1,
+    "type": "string",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 10,
+    "length": 1,
+    "type": "operator",
+    "text": "="
+  },
+  {
+    "line": 2,
+    "start": 11,
+    "length": 1,
+    "type": "string",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 12,
+    "length": 1,
+    "type": "number",
+    "text": "1"
+  },
+  {
+    "line": 3,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 3,
+    "start": 2,
+    "length": 4,
+    "type": "string",
+    "text": "````"
+  },
+  {
+    "line": 4,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 4,
+    "start": 2,
+    "length": 5,
+    "type": "string",
+    "text": "`````"
+  }
+]

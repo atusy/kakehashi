@@ -871,6 +871,50 @@ fn init_client_with_full_config(client: &mut LspClient) {
     client.send_notification("initialized", json!({}));
 }
 
+/// Helper: open a markdown document and return raw delta-encoded `[u32]` data.
+///
+/// Returns the raw LSP semantic token data without decoding — useful for
+/// binary-level snapshot tests that track exact delta-encoded changes.
+fn open_and_get_raw_data(client: &mut LspClient, content: &str) -> Vec<u32> {
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    data.iter().map(|v| v.as_u64().unwrap() as u32).collect()
+}
+
 /// Helper: open a markdown document and request semantic tokens.
 fn open_and_get_tokens(client: &mut LspClient, content: &str) -> Vec<DecodedToken> {
     let temp_file = tempfile::Builder::new()
@@ -1021,4 +1065,61 @@ fn test_snapshot_blockquote_python_multiline_string_leak() {
     let snapshot = build_token_snapshot(&tokens, content);
 
     insta::assert_json_snapshot!("blockquote_python_multiline_string_leak", snapshot);
+}
+
+// ─── Binary-level snapshot tests for tracking raw delta-encoded data ─────────
+
+/// Binary snapshot: nested injection (blockquote > markdown > python).
+///
+/// Captures the raw delta-encoded `[u32]` data for the nested injection case.
+/// This makes the exact impact of fixes visible in snapshot diffs without
+/// needing to decode the tokens.
+#[test]
+fn test_snapshot_blockquote_nested_markdown_python_binary() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = "> ``````markdown\n> ```python\n> y = 1 + 2\n> x = f\"\"\"\n>   foo{1 + 2}\n> \"\"\"\n> ```\n> ``````\n";
+    let data = open_and_get_raw_data(&mut client, content);
+
+    insta::assert_json_snapshot!("blockquote_nested_markdown_python_binary", data);
+}
+
+/// Snapshot: triple-nested injection (blockquote > markdown > lua).
+///
+/// Tests the injection chain: host markdown → markdown injection → lua injection.
+/// After the fix, `sub_select_included_ranges` should compose recursively
+/// to skip `> ` prefixes at each nesting depth.
+///
+/// ```markdown
+/// > `````markdown
+/// > ````lua
+/// > local x = 1
+/// > ````
+/// > `````
+/// ```
+#[test]
+fn test_snapshot_blockquote_triple_nested_injection() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = "> `````markdown\n> ````lua\n> local x = 1\n> ````\n> `````\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    let snapshot = build_token_snapshot(&tokens, content);
+
+    insta::assert_json_snapshot!("blockquote_triple_nested_injection", snapshot);
+}
+
+/// Binary snapshot: triple-nested injection (blockquote > markdown > lua).
+///
+/// Raw delta-encoded `[u32]` data for the triple-nested case.
+#[test]
+fn test_snapshot_blockquote_triple_nested_injection_binary() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = "> `````markdown\n> ````lua\n> local x = 1\n> ````\n> `````\n";
+    let data = open_and_get_raw_data(&mut client, content);
+
+    insta::assert_json_snapshot!("blockquote_triple_nested_injection_binary", data);
 }
