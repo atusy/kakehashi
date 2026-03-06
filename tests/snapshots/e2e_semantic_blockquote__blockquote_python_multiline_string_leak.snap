@@ -1,0 +1,69 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 0,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 0,
+    "start": 5,
+    "length": 2,
+    "type": "variable",
+    "text": "py"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "\"\"\""
+  },
+  {
+    "line": 2,
+    "start": 0,
+    "length": 7,
+    "type": "string",
+    "text": ">   foo"
+  },
+  {
+    "line": 3,
+    "start": 0,
+    "length": 5,
+    "type": "string",
+    "text": "> \"\"\""
+  },
+  {
+    "line": 4,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 4,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  }
+]
