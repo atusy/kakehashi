@@ -2180,4 +2180,97 @@ mod tests {
             "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
         );
     }
+
+    // ─── Tests for sub_select_included_ranges ────────────────────────────
+
+    /// Helper to build a tree_sitter::Range for test fixtures.
+    fn make_range(
+        start_byte: usize,
+        end_byte: usize,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> tree_sitter::Range {
+        tree_sitter::Range {
+            start_byte,
+            end_byte,
+            start_point: tree_sitter::Point {
+                row: start_row,
+                column: start_col,
+            },
+            end_point: tree_sitter::Point {
+                row: end_row,
+                column: end_col,
+            },
+        }
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_basic() {
+        // Parent has 3 ranges spanning 3 rows (simulating "> " prefix on each line).
+        // Each line is ">" (1 byte) + " " (1 byte) + content.
+        // Line 0: "> abc\n"  → bytes 0..6, gap at 2..6, row 0 col 2
+        // Line 1: "> def\n"  → bytes 6..12, gap at 8..12, row 1 col 2
+        // Line 2: "> ghi\n"  → bytes 12..18, gap at 14..18, row 2 col 2
+        let parent_ranges = vec![
+            make_range(2, 6, 0, 2, 0, 6),
+            make_range(8, 12, 1, 2, 1, 6),
+            make_range(14, 18, 2, 2, 2, 6),
+        ];
+
+        // Nested region covers rows 1-2 (bytes 8..18 in parent coordinates)
+        let result = sub_select_included_ranges(&parent_ranges, 8, 18);
+
+        assert!(result.is_some(), "Should return Some for overlapping ranges");
+        let ranges = result.unwrap();
+        assert_eq!(ranges.len(), 2, "Should have 2 ranges for rows 1-2");
+
+        // First range: re-relativized from parent byte 8..12 → nested byte 0..4
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, 4);
+        assert_eq!(ranges[0].start_point.row, 0);
+        assert_eq!(ranges[0].start_point.column, 2); // column preserved
+        assert_eq!(ranges[0].end_point.row, 0);
+        assert_eq!(ranges[0].end_point.column, 6);
+
+        // Second range: re-relativized from parent byte 14..18 → nested byte 6..10
+        assert_eq!(ranges[1].start_byte, 6);
+        assert_eq!(ranges[1].end_byte, 10);
+        assert_eq!(ranges[1].start_point.row, 1);
+        assert_eq!(ranges[1].start_point.column, 2);
+        assert_eq!(ranges[1].end_point.row, 1);
+        assert_eq!(ranges[1].end_point.column, 6);
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_no_overlap() {
+        // Parent ranges span bytes 0..6
+        let parent_ranges = vec![make_range(2, 6, 0, 2, 0, 6)];
+
+        // Nested region is completely outside parent ranges
+        let result = sub_select_included_ranges(&parent_ranges, 10, 20);
+
+        assert!(result.is_none(), "Should return None for non-overlapping ranges");
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_partial_overlap() {
+        // Parent range: bytes 2..10 on row 0
+        let parent_ranges = vec![make_range(2, 10, 0, 2, 0, 10)];
+
+        // Nested region starts at byte 5 (mid-range) and ends at byte 15 (past range)
+        let result = sub_select_included_ranges(&parent_ranges, 5, 15);
+
+        assert!(result.is_some(), "Should return Some for partially overlapping range");
+        let ranges = result.unwrap();
+        assert_eq!(ranges.len(), 1);
+
+        // Clipped: start clamped to 5, end clamped to 10
+        // Re-relativized: 5-5=0 start, 10-5=5 end
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, 5);
+        assert_eq!(ranges[0].start_point.row, 0);
+        assert_eq!(ranges[0].start_point.column, 2); // column preserved from parent
+    }
 }
