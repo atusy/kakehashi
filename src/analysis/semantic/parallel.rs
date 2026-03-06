@@ -18,7 +18,9 @@ use super::injection::{InjectionContext, MAX_INJECTION_DEPTH};
 use super::token_collector::{InjectionRegion, RawToken, byte_to_utf16_col, collect_host_tokens};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
-use crate::language::injection::{compute_included_ranges, parse_with_ranges};
+use crate::language::injection::{
+    compute_included_ranges, parse_with_ranges, sub_select_included_ranges,
+};
 
 /// Maximum number of parsers to cache per Rayon worker thread.
 ///
@@ -235,6 +237,7 @@ pub(crate) fn process_injection_sync(
         Some(&ctx.resolved_lang),
         coordinator,
         ctx.host_start_byte,
+        ctx.included_ranges.as_deref(),
     );
 
     let mut tokens = Vec::new();
@@ -291,6 +294,7 @@ fn collect_injection_contexts_sync<'a>(
     filetype: Option<&str>,
     coordinator: &LanguageCoordinator,
     content_start_byte: usize,
+    parent_included_ranges: Option<&[tree_sitter::Range]>,
 ) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>) {
     use crate::language::{collect_all_injections, injection::parse_offset_directive_for_pattern};
 
@@ -362,7 +366,13 @@ fn collect_injection_contexts_sync<'a>(
         let included_ranges = if offset.is_some() {
             None
         } else {
-            compute_included_ranges(&injection.content_node, injection.include_children)
+            compute_included_ranges(&injection.content_node, injection.include_children).or_else(
+                || {
+                    parent_included_ranges.and_then(|parent_ranges| {
+                        sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
+                    })
+                },
+            )
         };
 
         // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).
@@ -455,7 +465,7 @@ pub(crate) fn collect_injection_tokens_parallel(
 
     // Collect top-level injection contexts and their byte ranges
     let (contexts, exclusion_byte_ranges) =
-        collect_injection_contexts_sync(host_text, host_tree, host_filetype, coordinator, 0);
+        collect_injection_contexts_sync(host_text, host_tree, host_filetype, coordinator, 0, None);
 
     if contexts.is_empty() {
         return (Vec::new(), Vec::new());

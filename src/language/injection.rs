@@ -219,6 +219,20 @@ pub(crate) fn compute_included_ranges(
         return None;
     }
 
+    // Check if all named children are zero-width (ghost nodes from
+    // tree-sitter parsing with included_ranges). If so, treat as if
+    // there are no children — the gap computation would produce a
+    // trivial single range covering the entire node.
+    let has_nonzero_children = {
+        let mut cursor = content_node.walk();
+        content_node
+            .named_children(&mut cursor)
+            .any(|c| c.start_byte() != c.end_byte())
+    };
+    if !has_nonzero_children {
+        return None;
+    }
+
     let node_start_byte = content_node.start_byte();
     let node_start_pos = content_node.start_position();
     let node_end_byte = content_node.end_byte();
@@ -246,6 +260,14 @@ pub(crate) fn compute_included_ranges(
     for child in content_node.named_children(&mut tree_cursor) {
         let child_start_byte = child.start_byte();
         let child_end_byte = child.end_byte();
+
+        // Skip zero-width children. Tree-sitter-markdown creates zero-width
+        // block_continuation nodes when parsing with included_ranges that
+        // already excluded the `> ` prefix bytes. These ghost nodes don't
+        // span any bytes, so they don't define meaningful gaps.
+        if child_start_byte == child_end_byte {
+            continue;
+        }
 
         // Gap before this child
         if cursor_byte < child_start_byte {
@@ -275,6 +297,61 @@ pub(crate) fn compute_included_ranges(
         None
     } else {
         Some(ranges)
+    }
+}
+
+/// Sub-select parent `included_ranges` for a nested injection byte region.
+///
+/// When a nested injection has no `block_continuation` children of its own
+/// (because its tree was parsed with `included_ranges`), we inherit the parent's
+/// ranges by clipping them to the nested content region and re-relativizing.
+///
+/// Both `nested_start_byte` and `nested_end_byte` are relative to the same
+/// base as `parent_ranges` (the parent's `content_text` start).
+///
+/// Returns `Some(clipped_ranges)` if any parent ranges overlap the nested region,
+/// `None` otherwise.
+pub(crate) fn sub_select_included_ranges(
+    parent_ranges: &[tree_sitter::Range],
+    nested_start_byte: usize,
+    nested_end_byte: usize,
+) -> Option<Vec<tree_sitter::Range>> {
+    // Find the base row from the first overlapping range
+    let first_overlap = parent_ranges
+        .iter()
+        .find(|r| r.end_byte > nested_start_byte && r.start_byte < nested_end_byte)?;
+    let base_row = first_overlap.start_point.row;
+
+    let mut clipped = Vec::new();
+
+    for r in parent_ranges {
+        // Skip non-overlapping ranges
+        if r.end_byte <= nested_start_byte || r.start_byte >= nested_end_byte {
+            continue;
+        }
+
+        // Clip to nested region
+        let clip_start = r.start_byte.max(nested_start_byte);
+        let clip_end = r.end_byte.min(nested_end_byte);
+
+        clipped.push(tree_sitter::Range {
+            start_byte: clip_start - nested_start_byte,
+            end_byte: clip_end - nested_start_byte,
+            start_point: tree_sitter::Point {
+                row: r.start_point.row - base_row,
+                column: r.start_point.column,
+            },
+            end_point: tree_sitter::Point {
+                row: r.end_point.row - base_row,
+                column: r.end_point.column,
+            },
+        });
+    }
+
+    if clipped.is_empty() {
+        None
+    } else {
+        Some(clipped)
     }
 }
 
@@ -2222,7 +2299,10 @@ mod tests {
         // Nested region covers rows 1-2 (bytes 8..18 in parent coordinates)
         let result = sub_select_included_ranges(&parent_ranges, 8, 18);
 
-        assert!(result.is_some(), "Should return Some for overlapping ranges");
+        assert!(
+            result.is_some(),
+            "Should return Some for overlapping ranges"
+        );
         let ranges = result.unwrap();
         assert_eq!(ranges.len(), 2, "Should have 2 ranges for rows 1-2");
 
@@ -2251,7 +2331,10 @@ mod tests {
         // Nested region is completely outside parent ranges
         let result = sub_select_included_ranges(&parent_ranges, 10, 20);
 
-        assert!(result.is_none(), "Should return None for non-overlapping ranges");
+        assert!(
+            result.is_none(),
+            "Should return None for non-overlapping ranges"
+        );
     }
 
     #[test]
@@ -2262,7 +2345,10 @@ mod tests {
         // Nested region starts at byte 5 (mid-range) and ends at byte 15 (past range)
         let result = sub_select_included_ranges(&parent_ranges, 5, 15);
 
-        assert!(result.is_some(), "Should return Some for partially overlapping range");
+        assert!(
+            result.is_some(),
+            "Should return Some for partially overlapping range"
+        );
         let ranges = result.unwrap();
         assert_eq!(ranges.len(), 1);
 
