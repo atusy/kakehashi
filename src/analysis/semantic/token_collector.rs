@@ -174,25 +174,57 @@ fn calculate_line_byte_offsets(
 
 /// Compute effective per-line byte prefix widths for a multiline token.
 ///
-/// For injection-level tokens, `prefix_byte_widths` is already computed from
-/// `included_ranges` and returned as-is. For HOST-level tokens, detects
-/// **structural prefix children** — named children that start at column 0,
-/// span a single line, and end exactly at the node's start column — to prevent
-/// tokens from spanning line-leading prefixes (e.g., blockquote `> ` markers).
+/// For both host-level and injection-level tokens, detects **structural prefix
+/// children** — named children that start at the line-leading prefix boundary,
+/// span a single line, and end after the boundary — to prevent tokens from spanning
+/// line-leading prefixes (e.g., blockquote `> ` markers).
+///
+/// For host-level tokens (`prefix_byte_widths` is empty), the prefix boundary is
+/// column 0. For injection-level tokens (`prefix_byte_widths` is non-empty), the
+/// boundary is the outer prefix width for each row.
+///
+/// On the node's **start row**, structural prefix children must end at or before
+/// `node.start_position().column` to avoid false positives (non-prefix named children
+/// that happen to start at the boundary). On **continuation rows**, this constraint is
+/// relaxed — the node's start column does not constrain what constitutes a prefix on a
+/// different row (e.g., in a doubly-nested blockquote the inner `> ` on row 1 ends at
+/// col 5, while the section node started at col 2 on row 0).
 fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usize> {
-    if !prefix_byte_widths.is_empty() {
-        return prefix_byte_widths.to_vec();
-    }
-
     let start_col = node.start_position().column;
-    if start_col == 0 {
+    let start_row = node.start_position().row;
+
+    // For host-level tokens starting at col 0 with no outer prefix: no prefix to detect.
+    if start_col == 0 && prefix_byte_widths.is_empty() {
         return Vec::new();
     }
 
-    // Walk ALL named descendants (not just direct children) to find
-    // structural prefix nodes. In Markdown, block_continuation nodes
-    // may be nested inside intermediate nodes like code_fence_content.
-    let mut widths = Vec::new();
+    // Start with the outer prefix widths (empty for host-level tokens).
+    let mut widths = prefix_byte_widths.to_vec();
+
+    // The maximum inner-prefix width (relative to the outer prefix boundary) is
+    // determined by the node's start row: `start_col - outer_at_start_row`.
+    // Structural prefix children on ALL rows (start and continuation) must have
+    // inner width ≤ this bound. This prevents content nodes that happen to start
+    // at the outer prefix boundary (e.g., Python `string_end """`) from being
+    // mistaken for structural prefixes.
+    let row_0_outer = prefix_byte_widths.get(start_row).copied().unwrap_or(0);
+    let inner_prefix_max = start_col.saturating_sub(row_0_outer);
+
+    if inner_prefix_max == 0 {
+        // No inner prefix possible (node starts exactly at the outer prefix boundary).
+        return widths;
+    }
+
+    // Walk ALL named descendants (not just direct children) to find structural
+    // prefix nodes. In Markdown, block_continuation nodes may be nested inside
+    // intermediate nodes like code_fence_content or atx_heading.
+    //
+    // A structural prefix child on row R must:
+    //   - start at or before the outer prefix boundary for row R
+    //   - span exactly one line
+    //   - end after the outer prefix boundary
+    //   - have inner width (ce.column - row_outer) ≤ inner_prefix_max
+    //     (guards against content nodes starting at the boundary on any row)
     let mut cursor = node.walk();
     let mut descended = cursor.goto_first_child();
     while descended {
@@ -200,12 +232,17 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
         if child.is_named() {
             let cs = child.start_position();
             let ce = child.end_position();
-            if cs.column == 0 && ce.row == cs.row && ce.column > 0 && ce.column <= start_col {
+            let row_outer = prefix_byte_widths.get(cs.row).copied().unwrap_or(0);
+            if cs.column <= row_outer
+                && ce.row == cs.row
+                && ce.column > row_outer
+                && (ce.column - row_outer) <= inner_prefix_max
+            {
                 let row = cs.row;
                 if row >= widths.len() {
                     widths.resize(row + 1, 0);
                 }
-                if widths[row] == 0 {
+                if widths[row] < ce.column {
                     widths[row] = ce.column;
                 }
             }
@@ -838,21 +875,19 @@ mod tests {
         // Find the multiline node with start_col > 0.
         let mut target_node = None;
         let mut cursor = root.walk();
-        fn find_multiline_heading_parent<'a>(
+        // Find the atx_heading node (which contains block_continuation as a child)
+        fn find_atx_heading<'a>(
             cursor: &mut tree_sitter::TreeCursor<'a>,
             target: &mut Option<tree_sitter::Node<'a>>,
         ) {
             let node = cursor.node();
-            if node.start_position().column > 0
-                && node.end_position().row > node.start_position().row
-                && (node.kind() == "section" || node.kind() == "atx_heading")
-            {
+            if node.kind() == "atx_heading" {
                 *target = Some(node);
                 return;
             }
             if cursor.goto_first_child() {
                 loop {
-                    find_multiline_heading_parent(cursor, target);
+                    find_atx_heading(cursor, target);
                     if target.is_some() {
                         return;
                     }
@@ -863,15 +898,8 @@ mod tests {
                 cursor.goto_parent();
             }
         }
-        find_multiline_heading_parent(&mut cursor, &mut target_node);
-        let node =
-            target_node.expect("Should find a multiline section/heading node with start_col > 0");
-
-        assert!(
-            node.start_position().column > 0,
-            "Node should start at col > 0. Got: {:?}",
-            node.start_position()
-        );
+        find_atx_heading(&mut cursor, &mut target_node);
+        let node = target_node.expect("Should find atx_heading node");
 
         // Outer prefix widths: ">> " = 3 bytes on each line
         let outer_prefix_widths = vec![3, 3];

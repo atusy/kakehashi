@@ -55,16 +55,9 @@ expression: snapshot
   {
     "line": 2,
     "start": 3,
-    "length": 2,
-    "type": "class",
-    "text": "> "
-  },
-  {
-    "line": 2,
-    "start": 5,
-    "length": 3,
+    "length": 5,
     "type": "keyword",
-    "text": "bar"
+    "text": "> bar"
   },
   {
     "line": 3,
