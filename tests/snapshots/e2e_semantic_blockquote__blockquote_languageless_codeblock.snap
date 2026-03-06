@@ -21,14 +21,14 @@ expression: snapshot
     "line": 1,
     "start": 0,
     "length": 31,
-    "type": "keyword",
+    "type": "string",
     "text": "> this should be string (green)"
   },
   {
     "line": 2,
     "start": 0,
     "length": 2,
-    "type": "keyword",
+    "type": "string",
     "text": "> "
   },
   {

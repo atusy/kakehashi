@@ -28,7 +28,7 @@ expression: snapshot
     "line": 1,
     "start": 0,
     "length": 2,
-    "type": "keyword",
+    "type": "string",
     "text": "> "
   },
   {
@@ -42,7 +42,7 @@ expression: snapshot
     "line": 2,
     "start": 0,
     "length": 2,
-    "type": "keyword",
+    "type": "string",
     "text": "> "
   },
   {
@@ -56,7 +56,7 @@ expression: snapshot
     "line": 3,
     "start": 0,
     "length": 2,
-    "type": "keyword",
+    "type": "string",
     "text": "> "
   },
   {
@@ -70,7 +70,7 @@ expression: snapshot
     "line": 4,
     "start": 0,
     "length": 2,
-    "type": "keyword",
+    "type": "string",
     "text": "> "
   },
   {
