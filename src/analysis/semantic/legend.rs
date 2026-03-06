@@ -215,6 +215,7 @@ mod tests {
     #[case::known_comment("comment", Some("comment"))]
     #[case::known_keyword("keyword", Some("keyword"))]
     #[case::known_variable_with_modifier("variable.readonly", Some("variable.readonly"))]
+    #[case::none_is_recognized("none", Some("none"))]
     fn apply_capture_mapping_known_and_unknown_types(
         #[case] capture_name: &str,
         #[case] expected: Option<&str>,

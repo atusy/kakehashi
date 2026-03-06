@@ -1324,6 +1324,115 @@ mod tests {
     }
 
     #[test]
+    fn sweep_line_prefers_smaller_node_over_larger() {
+        // @string (node_byte_len=40) covers [0, 20)
+        // @number (node_byte_len=1) covers [5, 6)
+        // @number should win in [5, 6) because it's more specific (smaller node)
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 20,
+                mapped_name: "string".to_string(),
+                depth: 0,
+                pattern_index: 25,
+                priority: 100,
+                node_byte_len: 40,
+            },
+            RawToken {
+                line: 0,
+                column: 5,
+                length: 1,
+                mapped_name: "number".to_string(),
+                depth: 0,
+                pattern_index: 20,
+                priority: 100,
+                node_byte_len: 1,
+            },
+        ];
+        let result = finalize_tokens(tokens, &[], &["12345678901234567890"]);
+        let SemanticTokensResult::Tokens(st) = result.expect("should produce tokens") else {
+            panic!("Expected Tokens variant");
+        };
+        let (string_type, _) = map_capture_to_token_type_and_modifiers("string").unwrap();
+        let (number_type, _) = map_capture_to_token_type_and_modifiers("number").unwrap();
+        let types: Vec<(u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| (t.delta_start, t.length, t.token_type))
+            .collect();
+        // string[0,5), number[5,6), string[6,20)
+        assert_eq!(
+            types,
+            vec![
+                (0, 5, string_type),
+                (5, 1, number_type),
+                (1, 14, string_type),
+            ]
+        );
+    }
+
+    #[test]
+    fn finalize_filters_none_tokens_after_sweep() {
+        // @string (node_byte_len=40) covers [0, 20)
+        // @none (node_byte_len=10) covers [5, 15) — punches a hole in @string
+        // @number (node_byte_len=1) covers [6, 7) — inside the hole
+        // Result: string[0,5), number[6,7), string[15,20)
+        // The @none intervals [5,6) and [7,15) should be empty (no token)
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 20,
+                mapped_name: "string".to_string(),
+                depth: 0,
+                pattern_index: 25,
+                priority: 100,
+                node_byte_len: 40,
+            },
+            RawToken {
+                line: 0,
+                column: 5,
+                length: 10,
+                mapped_name: "none".to_string(),
+                depth: 0,
+                pattern_index: 1,
+                priority: 100,
+                node_byte_len: 10,
+            },
+            RawToken {
+                line: 0,
+                column: 6,
+                length: 1,
+                mapped_name: "number".to_string(),
+                depth: 0,
+                pattern_index: 20,
+                priority: 100,
+                node_byte_len: 1,
+            },
+        ];
+        let result = finalize_tokens(tokens, &[], &["12345678901234567890"]);
+        let SemanticTokensResult::Tokens(st) = result.expect("should produce tokens") else {
+            panic!("Expected Tokens variant");
+        };
+        let (string_type, _) = map_capture_to_token_type_and_modifiers("string").unwrap();
+        let (number_type, _) = map_capture_to_token_type_and_modifiers("number").unwrap();
+        let types: Vec<(u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| (t.delta_start, t.length, t.token_type))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                (0, 5, string_type),   // string[0,5)
+                (6, 1, number_type),   // number[6,7)
+                (1, 5, string_type),   // string[15,20)
+            ]
+        );
+    }
+
+    #[test]
     fn finalize_preserves_host_token_exactly_matching_active_injection_region() {
         // Reproduces the fish comment bug: a host `comment` token (depth=0)
         // exactly matches an active injection region because `(comment) @comment`
