@@ -344,14 +344,14 @@ pub(crate) fn sub_select_included_ranges(
         let start_column = if is_first { 0 } else { r.start_point.column };
 
         clipped.push(tree_sitter::Range {
-            start_byte: clip_start - nested_start_byte,
-            end_byte: clip_end - nested_start_byte,
+            start_byte: clip_start.saturating_sub(nested_start_byte),
+            end_byte: clip_end.saturating_sub(nested_start_byte),
             start_point: tree_sitter::Point {
-                row: r.start_point.row - base_row,
+                row: r.start_point.row.saturating_sub(base_row),
                 column: start_column,
             },
             end_point: tree_sitter::Point {
-                row: r.end_point.row - base_row,
+                row: r.end_point.row.saturating_sub(base_row),
                 column: r.end_point.column,
             },
         });
