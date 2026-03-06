@@ -505,13 +505,20 @@ pub(super) fn finalize_tokens(
     for token in all_tokens {
         // Unknown types are already filtered at collection time (apply_capture_mapping returns None),
         // so map_capture_to_token_type_and_modifiers should always return Some here.
-        let (token_type, token_modifiers_bitset) =
+        let Some((token_type, token_modifiers_bitset)) =
             map_capture_to_token_type_and_modifiers(&token.mapped_name)
-                .expect("all tokens should have known types after apply_capture_mapping filtering");
+        else {
+            log::warn!(
+                target: "kakehashi::semantic",
+                "Skipping token with unknown type '{}' at line {} col {}",
+                token.mapped_name, token.line, token.column
+            );
+            continue;
+        };
 
-        let delta_line = token.line - last_line;
+        let delta_line = token.line.saturating_sub(last_line);
         let delta_start = if delta_line == 0 {
-            token.column - last_start
+            token.column.saturating_sub(last_start)
         } else {
             token.column
         };
