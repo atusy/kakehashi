@@ -1381,7 +1381,10 @@ foo
             line2_string_leaks
         );
 
-        // The `> ` prefix at col 0 should HAVE a host string token
+        // With generic prefix detection, the `> ` prefix is stripped from the
+        // host fenced_code_block token (it's structural markup, not code content).
+        // The `> ` area has no semantic token since @punctuation.special is not
+        // in LEGEND_TYPES.
         let line1_prefix: Vec<_> = line1_tokens
             .iter()
             .filter(|t| t.1 == 0 && t.3 == string_type)
@@ -1391,12 +1394,14 @@ foo
             .filter(|t| t.1 == 0 && t.3 == string_type)
             .collect();
         assert!(
-            !line1_prefix.is_empty(),
-            "Line 1 should have host `string` for `> ` prefix"
+            line1_prefix.is_empty(),
+            "Line 1 should NOT have host `string` for `> ` prefix (stripped by prefix detection). Got: {:?}",
+            line1_prefix
         );
         assert!(
-            !line2_prefix.is_empty(),
-            "Line 2 should have host `string` for `> ` prefix"
+            line2_prefix.is_empty(),
+            "Line 2 should NOT have host `string` for `> ` prefix (stripped by prefix detection). Got: {:?}",
+            line2_prefix
         );
     }
 }

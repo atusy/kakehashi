@@ -175,39 +175,52 @@ fn calculate_line_byte_offsets(
 /// Compute effective per-line byte prefix widths for a multiline token.
 ///
 /// For injection-level tokens, `prefix_byte_widths` is already computed from
-/// `included_ranges`. For HOST-level tokens, detects `block_continuation`
-/// children in heading nodes to prevent heading tokens from spanning blockquote
-/// `> ` prefixes on continuation lines.
-///
-/// Only applies to heading node types (`atx_heading`, `setext_heading`) where
-/// `block_continuation` is incidental structural markup. Container nodes like
-/// `fenced_code_block` and `block_quote` legitimately cover the full block
-/// including `> ` prefixes and are left unchanged.
+/// `included_ranges` and returned as-is. For HOST-level tokens, detects
+/// **structural prefix children** — named children that start at column 0,
+/// span a single line, and end exactly at the node's start column — to prevent
+/// tokens from spanning line-leading prefixes (e.g., blockquote `> ` markers).
 fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usize> {
     if !prefix_byte_widths.is_empty() {
         return prefix_byte_widths.to_vec();
     }
 
-    // Only detect block_continuation for heading nodes where `> ` is incidental.
-    if !matches!(node.kind(), "atx_heading" | "setext_heading") {
+    let start_col = node.start_position().column;
+    if start_col == 0 {
         return Vec::new();
     }
 
+    // Walk ALL named descendants (not just direct children) to find
+    // structural prefix nodes. In Markdown, block_continuation nodes
+    // may be nested inside intermediate nodes like code_fence_content.
     let mut widths = Vec::new();
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "block_continuation" {
-            let row = child.start_position().row;
-            let width = child.end_position().column;
-            if row >= widths.len() {
-                widths.resize(row + 1, 0);
+    let mut descended = cursor.goto_first_child();
+    while descended {
+        let child = cursor.node();
+        if child.is_named() {
+            let cs = child.start_position();
+            let ce = child.end_position();
+            if cs.column == 0 && ce.row == cs.row && ce.column == start_col {
+                let row = cs.row;
+                if row >= widths.len() {
+                    widths.resize(row + 1, 0);
+                }
+                if widths[row] == 0 {
+                    widths[row] = start_col;
+                }
             }
-            if widths[row] == 0 {
-                widths[row] = width;
+        }
+        // Depth-first traversal: try child, then sibling, then backtrack
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                descended = false;
+                break;
             }
         }
     }
-
     widths
 }
 
@@ -336,8 +349,8 @@ pub(super) fn collect_host_tokens(
                 });
             } else {
                 // Compute effective prefix widths: injection-level widths
-                // are passed in; HOST-level heading nodes derive widths from
-                // block_continuation children to avoid spanning `> ` prefixes.
+                // are passed in; HOST-level nodes detect structural prefix
+                // children to avoid spanning line-leading prefixes.
                 let eff_widths = effective_prefix_widths(&node, prefix_byte_widths);
 
                 if supports_multiline && eff_widths.is_empty() {
