@@ -19,18 +19,9 @@ use super::token_collector::{InjectionRegion, RawToken};
 /// Priority key for token comparison. Higher values win.
 ///
 /// Comparison order: `priority` (from `#set! priority N`, default 100),
-/// then `depth` (injection depth), then `node_specificity` (inverse of
-/// `node_byte_len` — smaller nodes are more specific and win), then
-/// `pattern_index` (later patterns win).
-///
-/// Node specificity mirrors Neovim's treesitter behavior: captures on child
-/// nodes (smaller byte ranges) override captures on parent nodes (larger
-/// byte ranges). This is critical for `@none` support, where an `@none`
-/// capture on a child node (e.g., `(interpolation)`) must override a
-/// `@string` capture on the parent `(string)` node.
-fn token_priority(t: &RawToken) -> (u32, usize, usize, usize) {
-    let node_specificity = usize::MAX - t.node_byte_len;
-    (t.priority, t.depth, node_specificity, t.pattern_index)
+/// then `depth` (injection depth), then `pattern_index` (later patterns win).
+fn token_priority(t: &RawToken) -> (u32, usize, usize) {
+    (t.priority, t.depth, t.pattern_index)
 }
 
 /// Compute the UTF-16 width of a string.
@@ -437,18 +428,70 @@ pub(super) fn finalize_tokens(
         all_tokens = filtered;
     }
 
+    // @none pre-processing: split parent tokens around @none regions.
+    //
+    // @none is a nvim-treesitter convention that resets parent highlighting
+    // within a region (e.g., `(interpolation) @none` punches holes in @string
+    // for f-string interpolation). We handle this by:
+    // 1. Extracting @none token positions
+    // 2. Splitting tokens whose node strictly contains the @none node
+    //    (parent tokens with larger node_byte_len)
+    // 3. Discarding the @none tokens themselves
+    //
+    // This preserves child tokens (e.g., @number inside interpolation) that
+    // have smaller node_byte_len than @none, while removing the parent @string
+    // coverage from the @none region.
+    let (none_tokens, mut all_tokens): (Vec<_>, Vec<_>) = all_tokens
+        .into_iter()
+        .partition(|t| t.mapped_name == "none");
+
+    if !none_tokens.is_empty() {
+        // Build per-line @none intervals with their node sizes
+        let mut none_intervals: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+        for t in &none_tokens {
+            none_intervals.entry(t.line).or_default().push((
+                t.column,
+                t.column + t.length,
+                t.node_byte_len,
+            ));
+        }
+        for intervals in none_intervals.values_mut() {
+            intervals.sort_unstable();
+        }
+
+        // Split parent tokens around @none intervals
+        let mut result = Vec::with_capacity(all_tokens.len());
+        for token in all_tokens {
+            if let Some(line_intervals) = none_intervals.get(&token.line) {
+                // Find @none intervals that are within this token AND have
+                // smaller node_byte_len (meaning @none is on a child node)
+                let dominated: Vec<(usize, usize)> = line_intervals
+                    .iter()
+                    .filter(|(start, end, none_len)| {
+                        *none_len < token.node_byte_len
+                            && *start >= token.column
+                            && *end <= token.column + token.length
+                    })
+                    .map(|(start, end, _)| (*start, *end))
+                    .collect();
+
+                if !dominated.is_empty() {
+                    let fragments = split_host_token_around_regions(&token, &dominated);
+                    result.extend(fragments);
+                } else {
+                    result.push(token);
+                }
+            } else {
+                result.push(token);
+            }
+        }
+        all_tokens = result;
+    }
+
     // Split overlapping tokens using sweep line algorithm.
     // This replaces the old sort + dedup approach, producing non-overlapping
     // fragments that preserve both parent and child semantics.
     let all_tokens = split_overlapping_tokens(all_tokens);
-
-    // Filter out @none tokens after the sweep line. @none captures (from
-    // nvim-treesitter convention) punch holes in parent tokens by winning
-    // their intervals via node specificity, then being removed here.
-    let all_tokens: Vec<_> = all_tokens
-        .into_iter()
-        .filter(|t| t.mapped_name != "none")
-        .collect();
 
     if all_tokens.is_empty() {
         return None;
@@ -1347,56 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_line_prefers_smaller_node_over_larger() {
-        // @string (node_byte_len=40) covers [0, 20)
-        // @number (node_byte_len=1) covers [5, 6)
-        // @number should win in [5, 6) because it's more specific (smaller node)
-        let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 20,
-                mapped_name: "string".to_string(),
-                depth: 0,
-                pattern_index: 25,
-                priority: 100,
-                node_byte_len: 40,
-            },
-            RawToken {
-                line: 0,
-                column: 5,
-                length: 1,
-                mapped_name: "number".to_string(),
-                depth: 0,
-                pattern_index: 20,
-                priority: 100,
-                node_byte_len: 1,
-            },
-        ];
-        let result = finalize_tokens(tokens, &[], &["12345678901234567890"]);
-        let SemanticTokensResult::Tokens(st) = result.expect("should produce tokens") else {
-            panic!("Expected Tokens variant");
-        };
-        let (string_type, _) = map_capture_to_token_type_and_modifiers("string").unwrap();
-        let (number_type, _) = map_capture_to_token_type_and_modifiers("number").unwrap();
-        let types: Vec<(u32, u32, u32)> = st
-            .data
-            .iter()
-            .map(|t| (t.delta_start, t.length, t.token_type))
-            .collect();
-        // string[0,5), number[5,6), string[6,20)
-        assert_eq!(
-            types,
-            vec![
-                (0, 5, string_type),
-                (5, 1, number_type),
-                (1, 14, string_type),
-            ]
-        );
-    }
-
-    #[test]
-    fn finalize_filters_none_tokens_after_sweep() {
+    fn none_splits_parent_string_and_preserves_child_number() {
         // @string (node_byte_len=40) covers [0, 20)
         // @none (node_byte_len=10) covers [5, 15) — punches a hole in @string
         // @number (node_byte_len=1) covers [6, 7) — inside the hole

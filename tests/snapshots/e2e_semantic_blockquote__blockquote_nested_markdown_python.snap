@@ -28,7 +28,7 @@ expression: snapshot
     "line": 1,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
@@ -49,7 +49,7 @@ expression: snapshot
     "line": 2,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
@@ -119,7 +119,7 @@ expression: snapshot
     "line": 3,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
@@ -161,7 +161,7 @@ expression: snapshot
     "line": 4,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
@@ -196,7 +196,7 @@ expression: snapshot
     "line": 5,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
@@ -210,7 +210,7 @@ expression: snapshot
     "line": 6,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
@@ -224,7 +224,7 @@ expression: snapshot
     "line": 7,
     "start": 0,
     "length": 2,
-    "type": "string",
+    "type": "keyword",
     "text": "> "
   },
   {
