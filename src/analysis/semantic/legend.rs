@@ -84,6 +84,15 @@ pub(super) fn apply_capture_mapping(
         }
     }
 
+    // @none is a special nvim-treesitter convention: it resets parent
+    // highlighting within a region (e.g., `(interpolation) @none` punches
+    // holes in `@string` for f-string interpolation). Recognized here so
+    // it participates in sweep line overlap resolution, then filtered out
+    // before delta encoding in finalize_tokens().
+    if capture_name == "none" {
+        return Some("none".to_string());
+    }
+
     // No mapping found - check if the base type is in SemanticTokensLegend.
     // If not, return None to skip adding to all_tokens.
     // This prevents unknown captures (e.g., @spell) from blocking meaningful

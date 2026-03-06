@@ -19,9 +19,18 @@ use super::token_collector::{InjectionRegion, RawToken};
 /// Priority key for token comparison. Higher values win.
 ///
 /// Comparison order: `priority` (from `#set! priority N`, default 100),
-/// then `depth` (injection depth), then `pattern_index` (later patterns win).
-fn token_priority(t: &RawToken) -> (u32, usize, usize) {
-    (t.priority, t.depth, t.pattern_index)
+/// then `depth` (injection depth), then `node_specificity` (inverse of
+/// `node_byte_len` — smaller nodes are more specific and win), then
+/// `pattern_index` (later patterns win).
+///
+/// Node specificity mirrors Neovim's treesitter behavior: captures on child
+/// nodes (smaller byte ranges) override captures on parent nodes (larger
+/// byte ranges). This is critical for `@none` support, where an `@none`
+/// capture on a child node (e.g., `(interpolation)`) must override a
+/// `@string` capture on the parent `(string)` node.
+fn token_priority(t: &RawToken) -> (u32, usize, usize, usize) {
+    let node_specificity = usize::MAX - t.node_byte_len;
+    (t.priority, t.depth, node_specificity, t.pattern_index)
 }
 
 /// Compute the UTF-16 width of a string.
@@ -71,6 +80,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
                 depth: token.depth,
                 pattern_index: token.pattern_index,
                 priority: token.priority,
+                node_byte_len: token.node_byte_len,
             });
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
@@ -145,6 +155,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                     depth: winner.depth,
                     pattern_index: winner.pattern_index,
                     priority: winner.priority,
+                    node_byte_len: winner.node_byte_len,
                 });
             }
         }
@@ -338,6 +349,7 @@ fn split_host_token_around_regions(
                     depth: token.depth,
                     pattern_index: token.pattern_index,
                     priority: token.priority,
+                    node_byte_len: token.node_byte_len,
                 });
             }
         }
@@ -354,6 +366,7 @@ fn split_host_token_around_regions(
             depth: token.depth,
             pattern_index: token.pattern_index,
             priority: token.priority,
+            node_byte_len: token.node_byte_len,
         });
     }
 
@@ -429,6 +442,14 @@ pub(super) fn finalize_tokens(
     // fragments that preserve both parent and child semantics.
     let all_tokens = split_overlapping_tokens(all_tokens);
 
+    // Filter out @none tokens after the sweep line. @none captures (from
+    // nvim-treesitter convention) punch holes in parent tokens by winning
+    // their intervals via node specificity, then being removed here.
+    let all_tokens: Vec<_> = all_tokens
+        .into_iter()
+        .filter(|t| t.mapped_name != "none")
+        .collect();
+
     if all_tokens.is_empty() {
         return None;
     }
@@ -475,7 +496,7 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    /// Helper to create a RawToken for testing (priority defaults to 100)
+    /// Helper to create a RawToken for testing (priority defaults to 100, node_byte_len to 0)
     fn make_token(
         line: usize,
         column: usize,
@@ -492,6 +513,7 @@ mod tests {
             depth,
             pattern_index,
             priority: 100,
+            node_byte_len: 0,
         }
     }
 
@@ -513,6 +535,7 @@ mod tests {
             depth,
             pattern_index,
             priority,
+            node_byte_len: 0,
         }
     }
 
@@ -1422,12 +1445,16 @@ mod tests {
             .iter()
             .map(|t| (t.delta_start, t.length, t.token_type))
             .collect();
+        // Delta encoding: all on line 0, so delta_start = col - prev_col
+        // string at col 0: delta_start=0
+        // number at col 6: delta_start=6-0=6
+        // string at col 15: delta_start=15-6=9
         assert_eq!(
             types,
             vec![
-                (0, 5, string_type),   // string[0,5)
-                (6, 1, number_type),   // number[6,7)
-                (1, 5, string_type),   // string[15,20)
+                (0, 5, string_type), // string[0,5)
+                (6, 1, number_type), // number[6,7)
+                (9, 5, string_type), // string[15,20)
             ]
         );
     }

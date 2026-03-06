@@ -72,6 +72,12 @@ pub(crate) struct RawToken {
     /// Priority from `#set! priority N` directive (default 100).
     /// Higher values win during overlap resolution.
     pub priority: u32,
+    /// Byte length of the tree-sitter node that produced this token.
+    /// Used for node specificity: smaller nodes are more specific and win
+    /// over larger parent nodes in the sweep line overlap resolution.
+    /// This mirrors Neovim's treesitter behavior where child node captures
+    /// override parent node captures.
+    pub node_byte_len: usize,
 }
 
 /// Represents the line/column boundaries of an injection region in the host document.
@@ -276,6 +282,9 @@ pub(super) fn collect_host_tokens(
             let start_pos = node.start_position();
             let end_pos = node.end_position();
 
+            // Node byte length for specificity: smaller nodes win in sweep line
+            let node_byte_len = node.end_byte() - node.start_byte();
+
             // Check if this is a single-line token or trailing newline case
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
@@ -323,6 +332,7 @@ pub(super) fn collect_host_tokens(
                     depth,
                     pattern_index: m.pattern_index,
                     priority,
+                    node_byte_len,
                 });
             } else {
                 // Compute effective prefix widths: injection-level widths
@@ -383,6 +393,7 @@ pub(super) fn collect_host_tokens(
                         depth,
                         pattern_index: m.pattern_index,
                         priority,
+                        node_byte_len,
                     });
                 } else {
                     // Either no multiline support OR prefix widths present:
@@ -413,6 +424,7 @@ pub(super) fn collect_host_tokens(
                                 depth,
                                 pattern_index: m.pattern_index,
                                 priority,
+                                node_byte_len,
                             });
                         }
                     }
