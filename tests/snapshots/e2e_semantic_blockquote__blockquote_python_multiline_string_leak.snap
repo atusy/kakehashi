@@ -41,16 +41,30 @@ expression: snapshot
   {
     "line": 2,
     "start": 0,
-    "length": 7,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 2,
+    "start": 2,
+    "length": 5,
     "type": "string",
-    "text": ">   foo"
+    "text": "  foo"
   },
   {
     "line": 3,
     "start": 0,
-    "length": 5,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 3,
+    "start": 2,
+    "length": 3,
     "type": "string",
-    "text": "> \"\"\""
+    "text": "\"\"\""
   },
   {
     "line": 4,

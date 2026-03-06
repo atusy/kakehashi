@@ -129,8 +129,12 @@ fn calculate_line_byte_offsets(
     end_pos: tree_sitter::Point,
     content_start_col: usize,
     content_line_len: usize,
-    _prefix_byte_widths: &[usize],
+    prefix_byte_widths: &[usize],
 ) -> (usize, usize) {
+    // For blockquote injections, continuation lines have a byte prefix (e.g., "> ")
+    // that shifts the actual content start. For normal injections this is 0.
+    let prefix_width = prefix_byte_widths.get(row).copied().unwrap_or(0);
+
     // Calculate start byte offset for this line
     let line_start = if row == start_pos.row {
         if row == 0 {
@@ -139,8 +143,8 @@ fn calculate_line_byte_offsets(
             start_pos.column
         }
     } else {
-        // Continuation lines start at column 0
-        0
+        // Continuation lines start after the prefix (e.g., after "> ")
+        prefix_width
     };
 
     // Calculate end byte offset for this line
@@ -160,6 +164,45 @@ fn calculate_line_byte_offsets(
     };
 
     (line_start, line_end)
+}
+
+/// Compute effective per-line byte prefix widths for a multiline token.
+///
+/// For injection-level tokens, `prefix_byte_widths` is already computed from
+/// `included_ranges`. For HOST-level tokens, detects `block_continuation`
+/// children in heading nodes to prevent heading tokens from spanning blockquote
+/// `> ` prefixes on continuation lines.
+///
+/// Only applies to heading node types (`atx_heading`, `setext_heading`) where
+/// `block_continuation` is incidental structural markup. Container nodes like
+/// `fenced_code_block` and `block_quote` legitimately cover the full block
+/// including `> ` prefixes and are left unchanged.
+fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usize> {
+    if !prefix_byte_widths.is_empty() {
+        return prefix_byte_widths.to_vec();
+    }
+
+    // Only detect block_continuation for heading nodes where `> ` is incidental.
+    if !matches!(node.kind(), "atx_heading" | "setext_heading") {
+        return Vec::new();
+    }
+
+    let mut widths = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "block_continuation" {
+            let row = child.start_position().row;
+            let width = child.end_position().column;
+            if row >= widths.len() {
+                widths.resize(row + 1, 0);
+            }
+            if widths[row] == 0 {
+                widths[row] = width;
+            }
+        }
+    }
+
+    widths
 }
 
 /// Collect tokens from a single document's highlight query (no injection processing).
@@ -281,98 +324,97 @@ pub(super) fn collect_host_tokens(
                     pattern_index: m.pattern_index,
                     priority,
                 });
-            } else if supports_multiline {
-                // Multiline token with client support: emit a single token spanning multiple lines.
-                // LSP semantic tokens use line-relative positions, so the token naturally starts on
-                // the first line (start_pos.row), and its length spans across all lines in UTF-16
-                // code units (including newline characters) up to the end position on end_pos.row.
-                //
-                // The length is calculated by summing UTF-16 lengths across all lines of the token,
-                // plus 1 for each newline character between lines.
-                let host_start_line = content_start_line + start_pos.row;
-                let host_end_line = content_start_line + end_pos.row;
-
-                // Calculate start position
-                let host_start_line_text = host_lines.get(host_start_line).unwrap_or(&"");
-                let start_byte_offset = if start_pos.row == 0 {
-                    content_start_col + start_pos.column
-                } else {
-                    start_pos.column
-                };
-                let start_utf16 = byte_to_utf16_col(host_start_line_text, start_byte_offset);
-
-                // Calculate total length in UTF-16 code units across all lines
-                let mut total_length_utf16 = 0usize;
-                for row in start_pos.row..=end_pos.row {
-                    let host_row = content_start_line + row;
-                    let line_text = host_lines.get(host_row).unwrap_or(&"");
-                    let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
-
-                    let (line_start, line_end) = calculate_line_byte_offsets(
-                        row,
-                        start_pos,
-                        end_pos,
-                        content_start_col,
-                        content_line_len,
-                        prefix_byte_widths,
-                    );
-
-                    let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
-                    let line_end_utf16 = byte_to_utf16_col(line_text, line_end);
-                    total_length_utf16 += line_end_utf16 - line_start_utf16;
-
-                    // Add 1 for newline character between lines (except last line)
-                    if row < end_pos.row {
-                        total_length_utf16 += 1;
-                    }
-                }
-
-                log::trace!(
-                    target: "kakehashi::semantic",
-                    "[MULTILINE_TOKEN] capture={} lines={}..{} host_lines={}..{} length={}",
-                    capture_name, start_pos.row, end_pos.row,
-                    host_start_line, host_end_line, total_length_utf16
-                );
-
-                all_tokens.push(RawToken {
-                    line: host_start_line,
-                    column: start_utf16,
-                    length: total_length_utf16,
-                    mapped_name,
-                    depth,
-                    pattern_index: m.pattern_index,
-                    priority,
-                });
             } else {
-                // Multiline token without client support: split into per-line tokens
-                for row in start_pos.row..=end_pos.row {
-                    let host_row = content_start_line + row;
-                    let host_line_text = host_lines.get(host_row).unwrap_or(&"");
-                    let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
+                // Compute effective prefix widths: injection-level widths
+                // are passed in; HOST-level heading nodes derive widths from
+                // block_continuation children to avoid spanning `> ` prefixes.
+                let eff_widths = effective_prefix_widths(&node, prefix_byte_widths);
 
-                    let (line_start_byte, line_end_byte) = calculate_line_byte_offsets(
-                        row,
-                        start_pos,
-                        end_pos,
-                        content_start_col,
-                        content_line_len,
-                        prefix_byte_widths,
+                if supports_multiline && eff_widths.is_empty() {
+                    // Multiline token with client support AND no prefix widths:
+                    // emit a single token spanning multiple lines.
+                    let host_start_line = content_start_line + start_pos.row;
+                    let host_end_line = content_start_line + end_pos.row;
+
+                    let host_start_line_text = host_lines.get(host_start_line).unwrap_or(&"");
+                    let start_byte_offset = if start_pos.row == 0 {
+                        content_start_col + start_pos.column
+                    } else {
+                        start_pos.column
+                    };
+                    let start_utf16 = byte_to_utf16_col(host_start_line_text, start_byte_offset);
+
+                    let mut total_length_utf16 = 0usize;
+                    for row in start_pos.row..=end_pos.row {
+                        let host_row = content_start_line + row;
+                        let line_text = host_lines.get(host_row).unwrap_or(&"");
+                        let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
+
+                        let (line_start, line_end) = calculate_line_byte_offsets(
+                            row,
+                            start_pos,
+                            end_pos,
+                            content_start_col,
+                            content_line_len,
+                            &eff_widths,
+                        );
+
+                        let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
+                        let line_end_utf16 = byte_to_utf16_col(line_text, line_end);
+                        total_length_utf16 += line_end_utf16 - line_start_utf16;
+
+                        if row < end_pos.row {
+                            total_length_utf16 += 1;
+                        }
+                    }
+
+                    log::trace!(
+                        target: "kakehashi::semantic",
+                        "[MULTILINE_TOKEN] capture={} lines={}..{} host_lines={}..{} length={}",
+                        capture_name, start_pos.row, end_pos.row,
+                        host_start_line, host_end_line, total_length_utf16
                     );
 
-                    let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
-                    let end_utf16 = byte_to_utf16_col(host_line_text, line_end_byte);
+                    all_tokens.push(RawToken {
+                        line: host_start_line,
+                        column: start_utf16,
+                        length: total_length_utf16,
+                        mapped_name,
+                        depth,
+                        pattern_index: m.pattern_index,
+                        priority,
+                    });
+                } else {
+                    // Either no multiline support OR prefix widths present:
+                    // split into per-line tokens.
+                    for row in start_pos.row..=end_pos.row {
+                        let host_row = content_start_line + row;
+                        let host_line_text = host_lines.get(host_row).unwrap_or(&"");
+                        let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
 
-                    // Skip empty tokens
-                    if end_utf16 > start_utf16 {
-                        all_tokens.push(RawToken {
-                            line: host_row,
-                            column: start_utf16,
-                            length: end_utf16 - start_utf16,
-                            mapped_name: mapped_name.clone(),
-                            depth,
-                            pattern_index: m.pattern_index,
-                            priority,
-                        });
+                        let (line_start_byte, line_end_byte) = calculate_line_byte_offsets(
+                            row,
+                            start_pos,
+                            end_pos,
+                            content_start_col,
+                            content_line_len,
+                            &eff_widths,
+                        );
+
+                        let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
+                        let end_utf16 = byte_to_utf16_col(host_line_text, line_end_byte);
+
+                        if end_utf16 > start_utf16 {
+                            all_tokens.push(RawToken {
+                                line: host_row,
+                                column: start_utf16,
+                                length: end_utf16 - start_utf16,
+                                mapped_name: mapped_name.clone(),
+                                depth,
+                                pattern_index: m.pattern_index,
+                                priority,
+                            });
+                        }
                     }
                 }
             }

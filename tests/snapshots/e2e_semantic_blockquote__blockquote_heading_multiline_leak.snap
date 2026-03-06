@@ -20,15 +20,8 @@ expression: snapshot
   {
     "line": 1,
     "start": 0,
-    "length": 2,
-    "type": "class",
-    "text": "> "
-  },
-  {
-    "line": 1,
-    "start": 2,
-    "length": 3,
+    "length": 5,
     "type": "keyword",
-    "text": "bar"
+    "text": "> bar"
   }
 ]
