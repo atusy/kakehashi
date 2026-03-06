@@ -55,16 +55,23 @@ expression: snapshot
   {
     "line": 2,
     "start": 2,
-    "length": 2,
-    "type": "string",
-    "text": "lo"
+    "length": 5,
+    "type": "keyword",
+    "text": "local"
   },
   {
     "line": 2,
-    "start": 4,
-    "length": 5,
-    "type": "keyword",
-    "text": "cal x"
+    "start": 7,
+    "length": 1,
+    "type": "string",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 8,
+    "length": 1,
+    "type": "variable",
+    "text": "x"
   },
   {
     "line": 2,
@@ -77,7 +84,7 @@ expression: snapshot
     "line": 2,
     "start": 10,
     "length": 1,
-    "type": "variable",
+    "type": "operator",
     "text": "="
   },
   {
@@ -91,7 +98,7 @@ expression: snapshot
     "line": 2,
     "start": 12,
     "length": 1,
-    "type": "operator",
+    "type": "number",
     "text": "1"
   },
   {

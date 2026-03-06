@@ -323,6 +323,7 @@ pub(crate) fn sub_select_included_ranges(
     let base_row = first_overlap.start_point.row;
 
     let mut clipped = Vec::new();
+    let mut is_first = true;
 
     for r in parent_ranges {
         // Skip non-overlapping ranges
@@ -334,18 +335,28 @@ pub(crate) fn sub_select_included_ranges(
         let clip_start = r.start_byte.max(nested_start_byte);
         let clip_end = r.end_byte.min(nested_end_byte);
 
+        // The first sub-selected range's column must be 0 because the prefix
+        // bytes (e.g., "> ") preceding this range are NOT in the nested
+        // content_text — they come before nested_start_byte. Without this,
+        // the column would double-count with content_start_col in the token
+        // collector. Subsequent ranges keep the parent's column because their
+        // prefix bytes ARE within the nested content_text.
+        let start_column = if is_first { 0 } else { r.start_point.column };
+
         clipped.push(tree_sitter::Range {
             start_byte: clip_start - nested_start_byte,
             end_byte: clip_end - nested_start_byte,
             start_point: tree_sitter::Point {
                 row: r.start_point.row - base_row,
-                column: r.start_point.column,
+                column: start_column,
             },
             end_point: tree_sitter::Point {
                 row: r.end_point.row - base_row,
                 column: r.end_point.column,
             },
         });
+
+        is_first = false;
     }
 
     if clipped.is_empty() {
@@ -2307,10 +2318,11 @@ mod tests {
         assert_eq!(ranges.len(), 2, "Should have 2 ranges for rows 1-2");
 
         // First range: re-relativized from parent byte 8..12 → nested byte 0..4
+        // First range column is 0 (prefix bytes are outside nested content_text)
         assert_eq!(ranges[0].start_byte, 0);
         assert_eq!(ranges[0].end_byte, 4);
         assert_eq!(ranges[0].start_point.row, 0);
-        assert_eq!(ranges[0].start_point.column, 2); // column preserved
+        assert_eq!(ranges[0].start_point.column, 0); // first range: no prefix in nested content
         assert_eq!(ranges[0].end_point.row, 0);
         assert_eq!(ranges[0].end_point.column, 6);
 
@@ -2357,6 +2369,6 @@ mod tests {
         assert_eq!(ranges[0].start_byte, 0);
         assert_eq!(ranges[0].end_byte, 5);
         assert_eq!(ranges[0].start_point.row, 0);
-        assert_eq!(ranges[0].start_point.column, 2); // column preserved from parent
+        assert_eq!(ranges[0].start_point.column, 0); // first range: column zeroed
     }
 }
