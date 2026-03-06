@@ -705,6 +705,63 @@ mod tests {
         );
     }
 
+    // ── effective_prefix_widths tests ──────────────────────────────
+
+    #[test]
+    fn effective_prefix_widths_returns_empty_for_indented_multiline_rust_node() {
+        // A multiline struct field list starts at col > 0 but has no structural
+        // prefix children (no named child at col 0 ending at the node's start col).
+        // This must return empty to avoid false-positive prefix trimming.
+        let code = "struct S {\n    x: i32,\n    y: bool,\n}";
+        let tree = parse_rust_tree(code);
+        let root = tree.root_node();
+        // The struct body `{ x: i32, y: bool, }` is a field_declaration_list
+        // starting at col 9 on line 0, spanning multiple lines.
+        let item = root.child(0).expect("struct item");
+        let field_list = item
+            .child_by_field_name("body")
+            .expect("field_declaration_list");
+        assert!(
+            field_list.start_position().column > 0,
+            "field_declaration_list should start at col > 0"
+        );
+        assert!(
+            field_list.end_position().row > field_list.start_position().row,
+            "field_declaration_list should span multiple lines"
+        );
+
+        let widths = effective_prefix_widths(&field_list, &[]);
+        assert!(
+            widths.is_empty(),
+            "Indented multiline Rust node with no structural prefix children \
+             should return empty prefix widths, got: {:?}",
+            widths
+        );
+    }
+
+    #[test]
+    fn effective_prefix_widths_passthrough_when_already_provided() {
+        // When prefix_byte_widths is non-empty (injection-level), it should
+        // be returned as-is regardless of node shape.
+        let code = "fn main() {}";
+        let tree = parse_rust_tree(code);
+        let root = tree.root_node();
+        let provided = vec![0, 2, 2];
+        let widths = effective_prefix_widths(&root, &provided);
+        assert_eq!(widths, provided);
+    }
+
+    #[test]
+    fn effective_prefix_widths_returns_empty_for_col_zero_node() {
+        // A node starting at column 0 has no prefix to strip.
+        let code = "struct S {\n    x: i32,\n}";
+        let tree = parse_rust_tree(code);
+        let root = tree.root_node();
+        assert_eq!(root.start_position().column, 0);
+        let widths = effective_prefix_widths(&root, &[]);
+        assert!(widths.is_empty());
+    }
+
     #[test]
     fn byte_to_utf16_col_ascii() {
         let line = "hello world";
