@@ -787,14 +787,106 @@ mod tests {
 
     #[test]
     fn effective_prefix_widths_passthrough_when_already_provided() {
-        // When prefix_byte_widths is non-empty (injection-level), it should
-        // be returned as-is regardless of node shape.
+        // When prefix_byte_widths is non-empty (injection-level) and the node
+        // has no inner structural prefix children, return as-is.
         let code = "fn main() {}";
         let tree = parse_rust_tree(code);
         let root = tree.root_node();
         let provided = vec![0, 2, 2];
         let widths = effective_prefix_widths(&root, &provided);
         assert_eq!(widths, provided);
+    }
+
+    #[test]
+    fn effective_prefix_widths_combines_outer_and_inner_prefix() {
+        // Simulate injection: markdown parsed with included_ranges that exclude
+        // the outer ">> " prefix. The inner "> " prefix inside the blockquote
+        // must be detected and combined with the outer prefix widths.
+        //
+        // Content: ">> > # foo\n>> > bar\n"
+        // Included ranges skip ">> " (bytes 0-2) on each line.
+        // The injection parser sees "> # foo\n" and "> bar\n".
+        // The heading/section node starts at col 5 (after ">> > ").
+        // The block_continuation "> " at (1, 3)-(1, 5) is an inner prefix.
+        let mut parser = tree_sitter::Parser::new();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+
+        let text = ">> > # foo\n>> > bar\n";
+        parser
+            .set_included_ranges(&[
+                tree_sitter::Range {
+                    start_byte: 3,
+                    end_byte: 11,
+                    start_point: tree_sitter::Point { row: 0, column: 3 },
+                    end_point: tree_sitter::Point { row: 1, column: 0 },
+                },
+                tree_sitter::Range {
+                    start_byte: 14,
+                    end_byte: 20,
+                    start_point: tree_sitter::Point { row: 1, column: 3 },
+                    end_point: tree_sitter::Point { row: 2, column: 0 },
+                },
+            ])
+            .unwrap();
+
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // Navigate to the section or heading node that spans multiple lines.
+        // Tree structure: document > (section >) block_quote > section > atx_heading
+        // Find the multiline node with start_col > 0.
+        let mut target_node = None;
+        let mut cursor = root.walk();
+        fn find_multiline_heading_parent<'a>(
+            cursor: &mut tree_sitter::TreeCursor<'a>,
+            target: &mut Option<tree_sitter::Node<'a>>,
+        ) {
+            let node = cursor.node();
+            if node.start_position().column > 0
+                && node.end_position().row > node.start_position().row
+                && (node.kind() == "section" || node.kind() == "atx_heading")
+            {
+                *target = Some(node);
+                return;
+            }
+            if cursor.goto_first_child() {
+                loop {
+                    find_multiline_heading_parent(cursor, target);
+                    if target.is_some() {
+                        return;
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+                cursor.goto_parent();
+            }
+        }
+        find_multiline_heading_parent(&mut cursor, &mut target_node);
+        let node =
+            target_node.expect("Should find a multiline section/heading node with start_col > 0");
+
+        assert!(
+            node.start_position().column > 0,
+            "Node should start at col > 0. Got: {:?}",
+            node.start_position()
+        );
+
+        // Outer prefix widths: ">> " = 3 bytes on each line
+        let outer_prefix_widths = vec![3, 3];
+        let widths = effective_prefix_widths(&node, &outer_prefix_widths);
+
+        // Row 1 should have width >= 5 (3 for ">> " outer + 2 for "> " inner)
+        // because the block_continuation "> " at (1, 3)-(1, 5) is a structural
+        // prefix child that extends the effective prefix beyond the outer width.
+        assert!(
+            widths.len() > 1 && widths[1] >= 5,
+            "Row 1 effective prefix should be >= 5 (outer 3 + inner 2). \
+             Got widths: {:?}. The inner '> ' prefix must be detected even \
+             when outer prefix_byte_widths is provided.",
+            widths
+        );
     }
 
     #[test]

@@ -1135,6 +1135,34 @@ fn test_snapshot_blockquote_triple_nested_injection() {
     insta::assert_json_snapshot!("blockquote_triple_nested_injection", snapshot);
 }
 
+/// Snapshot: heading inside double-nested blockquote (>> > markdown injection > heading).
+///
+/// Tests the injection chain: host markdown → markdown injection (via `>> `````markdown`)
+/// → inner blockquote (`> `) → heading (`# foo`).
+///
+/// The heading `# foo\n` in markdown's tree-sitter grammar includes the trailing newline,
+/// making it a multiline token. When `split_multiline_tokens` processes this inside the
+/// nested injection, the continuation line should NOT have the heading "class" token leak
+/// into the `>> > ` prefix region.
+///
+/// ```markdown
+/// >> `````markdown
+/// >> > # foo
+/// >> > bar
+/// >> `````
+/// ```
+#[test]
+fn test_snapshot_blockquote_double_nested_heading_leak() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content = ">> `````markdown\n>> > # foo\n>> > bar\n>> `````\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    let snapshot = build_token_snapshot(&tokens, content);
+
+    insta::assert_json_snapshot!("blockquote_double_nested_heading_leak", snapshot);
+}
+
 /// Binary snapshot: triple-nested injection (blockquote > markdown > lua).
 ///
 /// Raw delta-encoded `[u32]` data for the triple-nested case.
