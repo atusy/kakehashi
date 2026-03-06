@@ -129,6 +129,7 @@ fn calculate_line_byte_offsets(
     end_pos: tree_sitter::Point,
     content_start_col: usize,
     content_line_len: usize,
+    _prefix_byte_widths: &[usize],
 ) -> (usize, usize) {
     // Calculate start byte offset for this line
     let line_start = if row == start_pos.row {
@@ -187,6 +188,7 @@ pub(super) fn collect_host_tokens(
     depth: usize,
     supports_multiline: bool,
     exclusion_ranges: &[(usize, usize)],
+    prefix_byte_widths: &[usize],
     all_tokens: &mut Vec<RawToken>,
 ) {
     // Validate content_start_byte is within bounds to prevent slice panics
@@ -312,6 +314,7 @@ pub(super) fn collect_host_tokens(
                         end_pos,
                         content_start_col,
                         content_line_len,
+                        prefix_byte_widths,
                     );
 
                     let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
@@ -353,6 +356,7 @@ pub(super) fn collect_host_tokens(
                         end_pos,
                         content_start_col,
                         content_line_len,
+                        prefix_byte_widths,
                     );
 
                     let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
@@ -519,6 +523,7 @@ mod tests {
             0,
             false,
             &[],
+            &[],
             &mut tokens_no_excl,
         );
         assert!(
@@ -540,6 +545,7 @@ mod tests {
             0,
             false,
             &[(0, code.len())],
+            &[],
             &mut tokens_excl,
         );
         assert!(
@@ -573,6 +579,7 @@ mod tests {
             0,
             false,
             &[(3, 7)],
+            &[],
             &mut tokens,
         );
         assert!(
@@ -606,6 +613,7 @@ mod tests {
             0,
             false,
             &[(0, code.len())],
+            &[],
             &mut tokens,
         );
 
@@ -630,6 +638,7 @@ mod tests {
             0,
             false,
             &[(2, 8)],
+            &[],
             &mut tokens2,
         );
 

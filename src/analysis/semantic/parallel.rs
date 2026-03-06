@@ -253,6 +253,7 @@ pub(crate) fn process_injection_sync(
         depth,
         supports_multiline,
         &nested_exclusion_ranges,
+        &ctx.prefix_byte_widths,
         &mut tokens,
     );
 
@@ -382,12 +383,33 @@ fn collect_injection_contexts_sync<'a>(
             exclusion_ranges.push((inj_start_byte, inj_end_byte));
         }
 
+        // Derive per-line byte prefix widths from included_ranges.
+        // Each range's start_point.column tells us how many bytes of prefix
+        // (e.g., "> ") precede the actual content on that line.
+        let prefix_byte_widths = match &included_ranges {
+            Some(ranges) => {
+                let mut widths = Vec::new();
+                for r in ranges {
+                    let row = r.start_point.row;
+                    if row >= widths.len() {
+                        widths.resize(row + 1, 0);
+                    }
+                    if widths[row] == 0 {
+                        widths[row] = r.start_point.column;
+                    }
+                }
+                widths
+            }
+            None => Vec::new(),
+        };
+
         contexts.push(InjectionContext {
             resolved_lang,
             highlight_query,
             content_text: &text[inj_start_byte..inj_end_byte],
             host_start_byte: content_start_byte + inj_start_byte,
             included_ranges,
+            prefix_byte_widths,
         });
     }
 
@@ -695,6 +717,7 @@ mod tests {
             content_text: "fn main() {}",
             host_start_byte: 100,
             included_ranges: None,
+            prefix_byte_widths: Vec::new(),
         };
 
         assert_eq!(ctx.resolved_lang, "rust");
@@ -773,6 +796,7 @@ mod tests {
             content_text: code,
             host_start_byte: 0,
             included_ranges: None,
+            prefix_byte_widths: Vec::new(),
         };
 
         let tokens = process_injection_sync(
@@ -828,6 +852,7 @@ mod tests {
             content_text: code,
             host_start_byte: 0,
             included_ranges: None,
+            prefix_byte_widths: Vec::new(),
         };
 
         // Process at MAX_INJECTION_DEPTH should return empty
