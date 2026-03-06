@@ -489,6 +489,39 @@ mod tests {
     }
 
     #[test]
+    fn effective_prefix_widths_variable_width_block_continuation() {
+        // In `> # foo\n>\n`, the atx_heading spans [0,2]-[1,1].
+        // The block_continuation on line 1 is just `>` (no trailing space),
+        // ending at col 1 — shorter than the heading's start_col of 2.
+        // The prefix detection must still recognize this as a structural prefix
+        // to prevent the heading token from leaking onto the empty `>` line.
+        let mut parser = tree_sitter::Parser::new();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let text = "> # foo\n>\n> bar\n>\n";
+        let tree = parser.parse(text, None).unwrap();
+        // Navigate: document > section > block_quote > section > atx_heading
+        let root = tree.root_node();
+        let block_quote = root.child(0).unwrap().child(0).unwrap();
+        assert_eq!(block_quote.kind(), "block_quote");
+        let section = block_quote.named_child(1).unwrap();
+        assert_eq!(section.kind(), "section");
+        let heading = section.named_child(0).unwrap();
+        assert_eq!(heading.kind(), "atx_heading");
+        assert_eq!(heading.start_position().column, 2);
+        assert_eq!(heading.end_position().row, 1);
+
+        let widths = effective_prefix_widths(&heading, &[]);
+        // Row 1 must have a non-zero width to prevent the heading from leaking
+        assert!(
+            widths.len() > 1 && widths[1] > 0,
+            "Variable-width block_continuation (`>` without space) must still be \
+             detected as structural prefix. Got widths: {:?}",
+            widths
+        );
+    }
+
+    #[test]
     fn is_in_exclusion_range_strictly_contained() {
         // "fn" keyword node spans bytes [0, 2), which is strictly inside [0, 12)
         let tree = parse_rust_tree("fn main() {}");
