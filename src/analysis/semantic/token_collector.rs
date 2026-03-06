@@ -175,20 +175,20 @@ fn calculate_line_byte_offsets(
 /// Compute effective per-line byte prefix widths for a multiline token.
 ///
 /// For both host-level and injection-level tokens, detects **structural prefix
-/// children** — named children that start at the line-leading prefix boundary,
-/// span a single line, and end after the boundary — to prevent tokens from spanning
-/// line-leading prefixes (e.g., blockquote `> ` markers).
+/// children** — named descendants that start at or before the line-leading prefix
+/// boundary, span a single line, and end after the boundary — to prevent tokens
+/// from spanning line-leading prefixes (e.g., blockquote `> ` markers).
 ///
 /// For host-level tokens (`prefix_byte_widths` is empty), the prefix boundary is
 /// column 0. For injection-level tokens (`prefix_byte_widths` is non-empty), the
 /// boundary is the outer prefix width for each row.
 ///
-/// On the node's **start row**, structural prefix children must end at or before
-/// `node.start_position().column` to avoid false positives (non-prefix named children
-/// that happen to start at the boundary). On **continuation rows**, this constraint is
-/// relaxed — the node's start column does not constrain what constitutes a prefix on a
-/// different row (e.g., in a doubly-nested blockquote the inner `> ` on row 1 ends at
-/// col 5, while the section node started at col 2 on row 0).
+/// A **relative inner-prefix width bound** (`inner_prefix_max = start_col - outer_at_start_row`)
+/// is applied uniformly to all rows to prevent false positives. A candidate structural
+/// prefix on row R is accepted only when its inner width `(ce.column - row_outer)`
+/// does not exceed this bound. This correctly identifies blockquote `> ` continuations
+/// (same inner width as the start row's inner prefix) while rejecting content nodes
+/// like Python `string_end """` that end further past the outer boundary.
 fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usize> {
     let start_col = node.start_position().column;
     let start_row = node.start_position().row;
