@@ -200,13 +200,13 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
         if child.is_named() {
             let cs = child.start_position();
             let ce = child.end_position();
-            if cs.column == 0 && ce.row == cs.row && ce.column == start_col {
+            if cs.column == 0 && ce.row == cs.row && ce.column > 0 && ce.column <= start_col {
                 let row = cs.row;
                 if row >= widths.len() {
                     widths.resize(row + 1, 0);
                 }
                 if widths[row] == 0 {
-                    widths[row] = start_col;
+                    widths[row] = ce.column;
                 }
             }
         }
