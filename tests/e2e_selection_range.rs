@@ -17,6 +17,7 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
+use helpers::lsp_polling::poll_for_selection_range;
 use helpers::sanitization::sanitize_selection_range_response;
 use helpers::test_fixtures::{
     create_selection_range_lua_fixture, create_selection_range_md_fixture,
@@ -110,22 +111,10 @@ fn test_selection_range_lua_no_injection() {
         }),
     );
 
-    // Give server time to process
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Request selection range at line 0, col 0 (on "local" keyword)
-    let response = client.send_request(
-        "textDocument/selectionRange",
-        json!({
-            "textDocument": {
-                "uri": uri
-            },
-            "positions": [{
-                "line": 0,
-                "character": 0
-            }]
-        }),
-    );
+    let positions = vec![json!({"line": 0, "character": 0})];
+    let response = poll_for_selection_range(&mut client, &uri, &positions, 20, 100)
+        .expect("Should receive selection range");
 
     // Verify response
     assert!(
@@ -195,16 +184,9 @@ fn test_selection_range_parent_chain() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Request selection range
-    let response = client.send_request(
-        "textDocument/selectionRange",
-        json!({
-            "textDocument": { "uri": uri },
-            "positions": [{ "line": 0, "character": 0 }]
-        }),
-    );
+    let positions = vec![json!({"line": 0, "character": 0})];
+    let response = poll_for_selection_range(&mut client, &uri, &positions, 20, 100)
+        .expect("Should receive selection range");
 
     let result = response.get("result").unwrap();
     let ranges = result.as_array().unwrap();
@@ -284,16 +266,10 @@ fn test_selection_range_markdown_with_injections() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Test YAML frontmatter: line 1 (0-indexed), col 0 - "title" keyword
-    let response = client.send_request(
-        "textDocument/selectionRange",
-        json!({
-            "textDocument": { "uri": uri },
-            "positions": [{ "line": 1, "character": 0 }]
-        }),
-    );
+    let positions = vec![json!({"line": 1, "character": 0})];
+    let response = poll_for_selection_range(&mut client, &uri, &positions, 20, 100)
+        .expect("Should receive selection range");
 
     let result = response.get("result").unwrap();
     let ranges = result.as_array().unwrap();
@@ -368,16 +344,9 @@ fn test_selection_range_snapshot() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Request selection range
-    let response = client.send_request(
-        "textDocument/selectionRange",
-        json!({
-            "textDocument": { "uri": uri },
-            "positions": [{ "line": 0, "character": 0 }]
-        }),
-    );
+    let positions = vec![json!({"line": 0, "character": 0})];
+    let response = poll_for_selection_range(&mut client, &uri, &positions, 20, 100)
+        .expect("Should receive selection range");
 
     let result = response.get("result").unwrap();
 
@@ -420,19 +389,13 @@ fn test_selection_range_multiple_positions() {
         }),
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
     // Request selection ranges for multiple positions
-    let response = client.send_request(
-        "textDocument/selectionRange",
-        json!({
-            "textDocument": { "uri": uri },
-            "positions": [
-                { "line": 0, "character": 0 },  // "local" on line 1
-                { "line": 2, "character": 0 },  // "function" on line 3
-            ]
-        }),
-    );
+    let positions = vec![
+        json!({"line": 0, "character": 0}), // "local" on line 1
+        json!({"line": 2, "character": 0}), // "function" on line 3
+    ];
+    let response = poll_for_selection_range(&mut client, &uri, &positions, 20, 100)
+        .expect("Should receive selection range");
 
     let result = response.get("result").unwrap();
     let ranges = result.as_array().unwrap();
