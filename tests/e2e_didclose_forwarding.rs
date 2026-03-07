@@ -12,6 +12,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_hover;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -53,17 +54,9 @@ More text.
         }),
     );
 
-    // Give lua-ls time to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Hover to trigger virtual document opening
-    let hover_response_1 = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri_1 },
-            "position": { "line": 3, "character": 6 }
-        }),
-    );
+    let hover_response_1 = poll_for_hover(&mut client, markdown_uri_1, 3, 6, 20, 500)
+        .expect("Hover should succeed on first document");
 
     assert!(
         hover_response_1.get("error").is_none(),
@@ -108,17 +101,9 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process the new document
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Hover in second document - this should work if connection remained open
-    let hover_response_2 = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri_2 },
-            "position": { "line": 3, "character": 6 }
-        }),
-    );
+    let hover_response_2 = poll_for_hover(&mut client, markdown_uri_2, 3, 6, 20, 500)
+        .expect("Hover should succeed on second document");
 
     assert!(
         hover_response_2.get("error").is_none(),
@@ -174,17 +159,9 @@ More text.
         }),
     );
 
-    // Give lua-ls time to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Hover on first Lua block
-    let hover_1 = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 3, "character": 6 }
-        }),
-    );
+    let hover_1 = poll_for_hover(&mut client, markdown_uri, 3, 6, 20, 500)
+        .expect("Hover should succeed on first Lua block");
     assert!(
         hover_1.get("error").is_none(),
         "Hover 1 failed: {:?}",
