@@ -73,10 +73,12 @@ pub(crate) struct RawToken {
     /// Higher values win during overlap resolution.
     pub priority: u32,
     /// Byte length of the tree-sitter node that produced this token.
-    /// Used for node specificity: smaller nodes are more specific and win
-    /// over larger parent nodes in the sweep line overlap resolution.
-    /// This mirrors Neovim's treesitter behavior where child node captures
-    /// override parent node captures.
+    ///
+    /// Encodes node specificity (smaller nodes are more specific than larger
+    /// ancestor nodes) and is used during `@none` pre-processing in
+    /// `finalize_tokens()` to determine parent/child relationships when
+    /// splitting tokens around `@none` regions. It is *not* consulted by
+    /// the sweep-line overlap resolution.
     pub node_byte_len: usize,
 }
 
