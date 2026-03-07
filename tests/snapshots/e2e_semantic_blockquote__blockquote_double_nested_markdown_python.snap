@@ -1,0 +1,167 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 0,
+    "start": 2,
+    "length": 6,
+    "type": "string",
+    "text": "``````"
+  },
+  {
+    "line": 0,
+    "start": 8,
+    "length": 8,
+    "type": "variable",
+    "text": "markdown"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 2,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 4,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 1,
+    "start": 7,
+    "length": 6,
+    "type": "variable",
+    "text": "python"
+  },
+  {
+    "line": 2,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 2,
+    "start": 2,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 2,
+    "start": 4,
+    "length": 1,
+    "type": "variable",
+    "text": "y"
+  },
+  {
+    "line": 2,
+    "start": 5,
+    "length": 1,
+    "type": "keyword",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 6,
+    "length": 1,
+    "type": "operator",
+    "text": "="
+  },
+  {
+    "line": 2,
+    "start": 7,
+    "length": 1,
+    "type": "keyword",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 8,
+    "length": 1,
+    "type": "number",
+    "text": "1"
+  },
+  {
+    "line": 2,
+    "start": 9,
+    "length": 1,
+    "type": "keyword",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 10,
+    "length": 1,
+    "type": "operator",
+    "text": "+"
+  },
+  {
+    "line": 2,
+    "start": 11,
+    "length": 1,
+    "type": "keyword",
+    "text": " "
+  },
+  {
+    "line": 2,
+    "start": 12,
+    "length": 1,
+    "type": "number",
+    "text": "2"
+  },
+  {
+    "line": 3,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 3,
+    "start": 2,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 3,
+    "start": 4,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 4,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 4,
+    "start": 2,
+    "length": 6,
+    "type": "string",
+    "text": "``````"
+  }
+]

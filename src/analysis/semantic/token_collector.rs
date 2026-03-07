@@ -72,6 +72,14 @@ pub(crate) struct RawToken {
     /// Priority from `#set! priority N` directive (default 100).
     /// Higher values win during overlap resolution.
     pub priority: u32,
+    /// Byte length of the tree-sitter node that produced this token.
+    ///
+    /// Encodes node specificity (smaller nodes are more specific than larger
+    /// ancestor nodes) and is used during `@none` pre-processing in
+    /// `finalize_tokens()` to determine parent/child relationships when
+    /// splitting tokens around `@none` regions. It is *not* consulted by
+    /// the sweep-line overlap resolution.
+    pub node_byte_len: usize,
 }
 
 /// Represents the line/column boundaries of an injection region in the host document.
@@ -129,7 +137,12 @@ fn calculate_line_byte_offsets(
     end_pos: tree_sitter::Point,
     content_start_col: usize,
     content_line_len: usize,
+    prefix_byte_widths: &[usize],
 ) -> (usize, usize) {
+    // For blockquote injections, continuation lines have a byte prefix (e.g., "> ")
+    // that shifts the actual content start. For normal injections this is 0.
+    let prefix_width = prefix_byte_widths.get(row).copied().unwrap_or(0);
+
     // Calculate start byte offset for this line
     let line_start = if row == start_pos.row {
         if row == 0 {
@@ -138,8 +151,8 @@ fn calculate_line_byte_offsets(
             start_pos.column
         }
     } else {
-        // Continuation lines start at column 0
-        0
+        // Continuation lines start after the prefix (e.g., after "> ")
+        prefix_width
     };
 
     // Calculate end byte offset for this line
@@ -159,6 +172,95 @@ fn calculate_line_byte_offsets(
     };
 
     (line_start, line_end)
+}
+
+/// Compute effective per-line byte prefix widths for a multiline token.
+///
+/// For both host-level and injection-level tokens, detects **structural prefix
+/// children** — named descendants that start at or before the line-leading prefix
+/// boundary, span a single line, and end after the boundary — to prevent tokens
+/// from spanning line-leading prefixes (e.g., blockquote `> ` markers).
+///
+/// For host-level tokens (`prefix_byte_widths` is empty), the prefix boundary is
+/// column 0. For injection-level tokens (`prefix_byte_widths` is non-empty), the
+/// boundary is the outer prefix width for each row.
+///
+/// A **relative inner-prefix width bound** (`inner_prefix_max = start_col - outer_at_start_row`)
+/// is applied uniformly to all rows to prevent false positives. A candidate structural
+/// prefix on row R is accepted only when its inner width `(ce.column - row_outer)`
+/// does not exceed this bound. This correctly identifies blockquote `> ` continuations
+/// (same inner width as the start row's inner prefix) while rejecting content nodes
+/// like Python `string_end """` that end further past the outer boundary.
+fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usize> {
+    let start_col = node.start_position().column;
+    let start_row = node.start_position().row;
+
+    // For host-level tokens starting at col 0 with no outer prefix: no prefix to detect.
+    if start_col == 0 && prefix_byte_widths.is_empty() {
+        return Vec::new();
+    }
+
+    // Start with the outer prefix widths (empty for host-level tokens).
+    let mut widths = prefix_byte_widths.to_vec();
+
+    // The maximum inner-prefix width (relative to the outer prefix boundary) is
+    // determined by the node's start row: `start_col - outer_at_start_row`.
+    // Structural prefix children on ALL rows (start and continuation) must have
+    // inner width ≤ this bound. This prevents content nodes that happen to start
+    // at the outer prefix boundary (e.g., Python `string_end """`) from being
+    // mistaken for structural prefixes.
+    let row_0_outer = prefix_byte_widths.get(start_row).copied().unwrap_or(0);
+    let inner_prefix_max = start_col.saturating_sub(row_0_outer);
+
+    if inner_prefix_max == 0 {
+        // No inner prefix possible (node starts exactly at the outer prefix boundary).
+        return widths;
+    }
+
+    // Walk ALL named descendants (not just direct children) to find structural
+    // prefix nodes. In Markdown, block_continuation nodes may be nested inside
+    // intermediate nodes like code_fence_content or atx_heading.
+    //
+    // A structural prefix child on row R must:
+    //   - start at or before the outer prefix boundary for row R
+    //   - span exactly one line
+    //   - end after the outer prefix boundary
+    //   - have inner width (ce.column - row_outer) ≤ inner_prefix_max
+    //     (guards against content nodes starting at the boundary on any row)
+    let mut cursor = node.walk();
+    let mut descended = cursor.goto_first_child();
+    while descended {
+        let child = cursor.node();
+        if child.is_named() {
+            let cs = child.start_position();
+            let ce = child.end_position();
+            let row_outer = prefix_byte_widths.get(cs.row).copied().unwrap_or(0);
+            if cs.column <= row_outer
+                && ce.row == cs.row
+                && ce.column > row_outer
+                && (ce.column - row_outer) <= inner_prefix_max
+            {
+                let row = cs.row;
+                if row >= widths.len() {
+                    widths.resize(row + 1, 0);
+                }
+                if widths[row] < ce.column {
+                    widths[row] = ce.column;
+                }
+            }
+        }
+        // Depth-first traversal: try child, then sibling, then backtrack
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                descended = false;
+                break;
+            }
+        }
+    }
+    widths
 }
 
 /// Collect tokens from a single document's highlight query (no injection processing).
@@ -187,6 +289,7 @@ pub(super) fn collect_host_tokens(
     depth: usize,
     supports_multiline: bool,
     exclusion_ranges: &[(usize, usize)],
+    prefix_byte_widths: &[usize],
     all_tokens: &mut Vec<RawToken>,
 ) {
     // Validate content_start_byte is within bounds to prevent slice panics
@@ -230,6 +333,9 @@ pub(super) fn collect_host_tokens(
             let node = c.node;
             let start_pos = node.start_position();
             let end_pos = node.end_position();
+
+            // Node byte length for specificity: smaller nodes win in sweep line
+            let node_byte_len = node.end_byte() - node.start_byte();
 
             // Check if this is a single-line token or trailing newline case
             let is_single_line = start_pos.row == end_pos.row;
@@ -278,97 +384,101 @@ pub(super) fn collect_host_tokens(
                     depth,
                     pattern_index: m.pattern_index,
                     priority,
-                });
-            } else if supports_multiline {
-                // Multiline token with client support: emit a single token spanning multiple lines.
-                // LSP semantic tokens use line-relative positions, so the token naturally starts on
-                // the first line (start_pos.row), and its length spans across all lines in UTF-16
-                // code units (including newline characters) up to the end position on end_pos.row.
-                //
-                // The length is calculated by summing UTF-16 lengths across all lines of the token,
-                // plus 1 for each newline character between lines.
-                let host_start_line = content_start_line + start_pos.row;
-                let host_end_line = content_start_line + end_pos.row;
-
-                // Calculate start position
-                let host_start_line_text = host_lines.get(host_start_line).unwrap_or(&"");
-                let start_byte_offset = if start_pos.row == 0 {
-                    content_start_col + start_pos.column
-                } else {
-                    start_pos.column
-                };
-                let start_utf16 = byte_to_utf16_col(host_start_line_text, start_byte_offset);
-
-                // Calculate total length in UTF-16 code units across all lines
-                let mut total_length_utf16 = 0usize;
-                for row in start_pos.row..=end_pos.row {
-                    let host_row = content_start_line + row;
-                    let line_text = host_lines.get(host_row).unwrap_or(&"");
-                    let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
-
-                    let (line_start, line_end) = calculate_line_byte_offsets(
-                        row,
-                        start_pos,
-                        end_pos,
-                        content_start_col,
-                        content_line_len,
-                    );
-
-                    let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
-                    let line_end_utf16 = byte_to_utf16_col(line_text, line_end);
-                    total_length_utf16 += line_end_utf16 - line_start_utf16;
-
-                    // Add 1 for newline character between lines (except last line)
-                    if row < end_pos.row {
-                        total_length_utf16 += 1;
-                    }
-                }
-
-                log::trace!(
-                    target: "kakehashi::semantic",
-                    "[MULTILINE_TOKEN] capture={} lines={}..{} host_lines={}..{} length={}",
-                    capture_name, start_pos.row, end_pos.row,
-                    host_start_line, host_end_line, total_length_utf16
-                );
-
-                all_tokens.push(RawToken {
-                    line: host_start_line,
-                    column: start_utf16,
-                    length: total_length_utf16,
-                    mapped_name,
-                    depth,
-                    pattern_index: m.pattern_index,
-                    priority,
+                    node_byte_len,
                 });
             } else {
-                // Multiline token without client support: split into per-line tokens
-                for row in start_pos.row..=end_pos.row {
-                    let host_row = content_start_line + row;
-                    let host_line_text = host_lines.get(host_row).unwrap_or(&"");
-                    let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
+                // Compute effective prefix widths: injection-level widths
+                // are passed in; HOST-level nodes detect structural prefix
+                // children to avoid spanning line-leading prefixes.
+                let eff_widths = effective_prefix_widths(&node, prefix_byte_widths);
 
-                    let (line_start_byte, line_end_byte) = calculate_line_byte_offsets(
-                        row,
-                        start_pos,
-                        end_pos,
-                        content_start_col,
-                        content_line_len,
+                if supports_multiline && eff_widths.is_empty() {
+                    // Multiline token with client support AND no prefix widths:
+                    // emit a single token spanning multiple lines.
+                    let host_start_line = content_start_line + start_pos.row;
+                    let host_end_line = content_start_line + end_pos.row;
+
+                    let host_start_line_text = host_lines.get(host_start_line).unwrap_or(&"");
+                    let start_byte_offset = if start_pos.row == 0 {
+                        content_start_col + start_pos.column
+                    } else {
+                        start_pos.column
+                    };
+                    let start_utf16 = byte_to_utf16_col(host_start_line_text, start_byte_offset);
+
+                    let mut total_length_utf16 = 0usize;
+                    for row in start_pos.row..=end_pos.row {
+                        let host_row = content_start_line + row;
+                        let line_text = host_lines.get(host_row).unwrap_or(&"");
+                        let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
+
+                        let (line_start, line_end) = calculate_line_byte_offsets(
+                            row,
+                            start_pos,
+                            end_pos,
+                            content_start_col,
+                            content_line_len,
+                            &eff_widths,
+                        );
+
+                        let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
+                        let line_end_utf16 = byte_to_utf16_col(line_text, line_end);
+                        total_length_utf16 += line_end_utf16 - line_start_utf16;
+
+                        if row < end_pos.row {
+                            total_length_utf16 += 1;
+                        }
+                    }
+
+                    log::trace!(
+                        target: "kakehashi::semantic",
+                        "[MULTILINE_TOKEN] capture={} lines={}..{} host_lines={}..{} length={}",
+                        capture_name, start_pos.row, end_pos.row,
+                        host_start_line, host_end_line, total_length_utf16
                     );
 
-                    let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
-                    let end_utf16 = byte_to_utf16_col(host_line_text, line_end_byte);
+                    all_tokens.push(RawToken {
+                        line: host_start_line,
+                        column: start_utf16,
+                        length: total_length_utf16,
+                        mapped_name,
+                        depth,
+                        pattern_index: m.pattern_index,
+                        priority,
+                        node_byte_len,
+                    });
+                } else {
+                    // Either no multiline support OR prefix widths present:
+                    // split into per-line tokens.
+                    for row in start_pos.row..=end_pos.row {
+                        let host_row = content_start_line + row;
+                        let host_line_text = host_lines.get(host_row).unwrap_or(&"");
+                        let content_line_len = content_lines.get(row).map(|l| l.len()).unwrap_or(0);
 
-                    // Skip empty tokens
-                    if end_utf16 > start_utf16 {
-                        all_tokens.push(RawToken {
-                            line: host_row,
-                            column: start_utf16,
-                            length: end_utf16 - start_utf16,
-                            mapped_name: mapped_name.clone(),
-                            depth,
-                            pattern_index: m.pattern_index,
-                            priority,
-                        });
+                        let (line_start_byte, line_end_byte) = calculate_line_byte_offsets(
+                            row,
+                            start_pos,
+                            end_pos,
+                            content_start_col,
+                            content_line_len,
+                            &eff_widths,
+                        );
+
+                        let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
+                        let end_utf16 = byte_to_utf16_col(host_line_text, line_end_byte);
+
+                        if end_utf16 > start_utf16 {
+                            all_tokens.push(RawToken {
+                                line: host_row,
+                                column: start_utf16,
+                                length: end_utf16 - start_utf16,
+                                mapped_name: mapped_name.clone(),
+                                depth,
+                                pattern_index: m.pattern_index,
+                                priority,
+                                node_byte_len,
+                            });
+                        }
                     }
                 }
             }
@@ -414,6 +524,39 @@ mod tests {
         assert!(
             !is_in_exclusion_range(&root, &[(0, 12)]),
             "Exact match should NOT be excluded"
+        );
+    }
+
+    #[test]
+    fn effective_prefix_widths_variable_width_block_continuation() {
+        // In `> # foo\n>\n`, the atx_heading spans [0,2]-[1,1].
+        // The block_continuation on line 1 is just `>` (no trailing space),
+        // ending at col 1 — shorter than the heading's start_col of 2.
+        // The prefix detection must still recognize this as a structural prefix
+        // to prevent the heading token from leaking onto the empty `>` line.
+        let mut parser = tree_sitter::Parser::new();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+        let text = "> # foo\n>\n> bar\n>\n";
+        let tree = parser.parse(text, None).unwrap();
+        // Navigate: document > section > block_quote > section > atx_heading
+        let root = tree.root_node();
+        let block_quote = root.child(0).unwrap().child(0).unwrap();
+        assert_eq!(block_quote.kind(), "block_quote");
+        let section = block_quote.named_child(1).unwrap();
+        assert_eq!(section.kind(), "section");
+        let heading = section.named_child(0).unwrap();
+        assert_eq!(heading.kind(), "atx_heading");
+        assert_eq!(heading.start_position().column, 2);
+        assert_eq!(heading.end_position().row, 1);
+
+        let widths = effective_prefix_widths(&heading, &[]);
+        // Row 1 must have a non-zero width to prevent the heading from leaking
+        assert!(
+            widths.len() > 1 && widths[1] > 0,
+            "Variable-width block_continuation (`>` without space) must still be \
+             detected as structural prefix. Got widths: {:?}",
+            widths
         );
     }
 
@@ -519,6 +662,7 @@ mod tests {
             0,
             false,
             &[],
+            &[],
             &mut tokens_no_excl,
         );
         assert!(
@@ -540,6 +684,7 @@ mod tests {
             0,
             false,
             &[(0, code.len())],
+            &[],
             &mut tokens_excl,
         );
         assert!(
@@ -573,6 +718,7 @@ mod tests {
             0,
             false,
             &[(3, 7)],
+            &[],
             &mut tokens,
         );
         assert!(
@@ -606,6 +752,7 @@ mod tests {
             0,
             false,
             &[(0, code.len())],
+            &[],
             &mut tokens,
         );
 
@@ -630,6 +777,7 @@ mod tests {
             0,
             false,
             &[(2, 8)],
+            &[],
             &mut tokens2,
         );
 
@@ -640,6 +788,146 @@ mod tests {
             !has_variable,
             "main identifier strictly inside exclusion should be dropped"
         );
+    }
+
+    // ── effective_prefix_widths tests ──────────────────────────────
+
+    #[test]
+    fn effective_prefix_widths_returns_empty_for_indented_multiline_rust_node() {
+        // A multiline struct field list starts at col > 0 but has no structural
+        // prefix children (no named child at col 0 ending at the node's start col).
+        // This must return empty to avoid false-positive prefix trimming.
+        let code = "struct S {\n    x: i32,\n    y: bool,\n}";
+        let tree = parse_rust_tree(code);
+        let root = tree.root_node();
+        // The struct body `{ x: i32, y: bool, }` is a field_declaration_list
+        // starting at col 9 on line 0, spanning multiple lines.
+        let item = root.child(0).expect("struct item");
+        let field_list = item
+            .child_by_field_name("body")
+            .expect("field_declaration_list");
+        assert!(
+            field_list.start_position().column > 0,
+            "field_declaration_list should start at col > 0"
+        );
+        assert!(
+            field_list.end_position().row > field_list.start_position().row,
+            "field_declaration_list should span multiple lines"
+        );
+
+        let widths = effective_prefix_widths(&field_list, &[]);
+        assert!(
+            widths.is_empty(),
+            "Indented multiline Rust node with no structural prefix children \
+             should return empty prefix widths, got: {:?}",
+            widths
+        );
+    }
+
+    #[test]
+    fn effective_prefix_widths_passthrough_when_already_provided() {
+        // When prefix_byte_widths is non-empty (injection-level) and the node
+        // has no inner structural prefix children, return as-is.
+        let code = "fn main() {}";
+        let tree = parse_rust_tree(code);
+        let root = tree.root_node();
+        let provided = vec![0, 2, 2];
+        let widths = effective_prefix_widths(&root, &provided);
+        assert_eq!(widths, provided);
+    }
+
+    #[test]
+    fn effective_prefix_widths_combines_outer_and_inner_prefix() {
+        // Simulate injection: markdown parsed with included_ranges that exclude
+        // the outer ">> " prefix. The inner "> " prefix inside the blockquote
+        // must be detected and combined with the outer prefix widths.
+        //
+        // Content: ">> > # foo\n>> > bar\n"
+        // Included ranges skip ">> " (bytes 0-2) on each line.
+        // The injection parser sees "> # foo\n" and "> bar\n".
+        // The heading/section node starts at col 5 (after ">> > ").
+        // The block_continuation "> " at (1, 3)-(1, 5) is an inner prefix.
+        let mut parser = tree_sitter::Parser::new();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&language).unwrap();
+
+        let text = ">> > # foo\n>> > bar\n";
+        parser
+            .set_included_ranges(&[
+                tree_sitter::Range {
+                    start_byte: 3,
+                    end_byte: 11,
+                    start_point: tree_sitter::Point { row: 0, column: 3 },
+                    end_point: tree_sitter::Point { row: 1, column: 0 },
+                },
+                tree_sitter::Range {
+                    start_byte: 14,
+                    end_byte: 20,
+                    start_point: tree_sitter::Point { row: 1, column: 3 },
+                    end_point: tree_sitter::Point { row: 2, column: 0 },
+                },
+            ])
+            .unwrap();
+
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // Navigate to the section or heading node that spans multiple lines.
+        // Tree structure: document > (section >) block_quote > section > atx_heading
+        // Find the multiline node with start_col > 0.
+        let mut target_node = None;
+        let mut cursor = root.walk();
+        // Find the atx_heading node (which contains block_continuation as a child)
+        fn find_atx_heading<'a>(
+            cursor: &mut tree_sitter::TreeCursor<'a>,
+            target: &mut Option<tree_sitter::Node<'a>>,
+        ) {
+            let node = cursor.node();
+            if node.kind() == "atx_heading" {
+                *target = Some(node);
+                return;
+            }
+            if cursor.goto_first_child() {
+                loop {
+                    find_atx_heading(cursor, target);
+                    if target.is_some() {
+                        return;
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
+                }
+                cursor.goto_parent();
+            }
+        }
+        find_atx_heading(&mut cursor, &mut target_node);
+        let node = target_node.expect("Should find atx_heading node");
+
+        // Outer prefix widths: ">> " = 3 bytes on each line
+        let outer_prefix_widths = vec![3, 3];
+        let widths = effective_prefix_widths(&node, &outer_prefix_widths);
+
+        // Row 1 should have width >= 5 (3 for ">> " outer + 2 for "> " inner)
+        // because the block_continuation "> " at (1, 3)-(1, 5) is a structural
+        // prefix child that extends the effective prefix beyond the outer width.
+        assert!(
+            widths.len() > 1 && widths[1] >= 5,
+            "Row 1 effective prefix should be >= 5 (outer 3 + inner 2). \
+             Got widths: {:?}. The inner '> ' prefix must be detected even \
+             when outer prefix_byte_widths is provided.",
+            widths
+        );
+    }
+
+    #[test]
+    fn effective_prefix_widths_returns_empty_for_col_zero_node() {
+        // A node starting at column 0 has no prefix to strip.
+        let code = "struct S {\n    x: i32,\n}";
+        let tree = parse_rust_tree(code);
+        let root = tree.root_node();
+        assert_eq!(root.start_position().column, 0);
+        let widths = effective_prefix_widths(&root, &[]);
+        assert!(widths.is_empty());
     }
 
     #[test]

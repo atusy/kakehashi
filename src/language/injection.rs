@@ -219,6 +219,20 @@ pub(crate) fn compute_included_ranges(
         return None;
     }
 
+    // Check if all named children are zero-width (ghost nodes from
+    // tree-sitter parsing with included_ranges). If so, treat as if
+    // there are no children — the gap computation would produce a
+    // trivial single range covering the entire node.
+    let has_nonzero_children = {
+        let mut cursor = content_node.walk();
+        content_node
+            .named_children(&mut cursor)
+            .any(|c| c.start_byte() != c.end_byte())
+    };
+    if !has_nonzero_children {
+        return None;
+    }
+
     let node_start_byte = content_node.start_byte();
     let node_start_pos = content_node.start_position();
     let node_end_byte = content_node.end_byte();
@@ -246,6 +260,14 @@ pub(crate) fn compute_included_ranges(
     for child in content_node.named_children(&mut tree_cursor) {
         let child_start_byte = child.start_byte();
         let child_end_byte = child.end_byte();
+
+        // Skip zero-width children. Tree-sitter-markdown creates zero-width
+        // block_continuation nodes when parsing with included_ranges that
+        // already excluded the `> ` prefix bytes. These ghost nodes don't
+        // span any bytes, so they don't define meaningful gaps.
+        if child_start_byte == child_end_byte {
+            continue;
+        }
 
         // Gap before this child
         if cursor_byte < child_start_byte {
@@ -276,6 +298,139 @@ pub(crate) fn compute_included_ranges(
     } else {
         Some(ranges)
     }
+}
+
+/// Sub-select parent `included_ranges` for a nested injection byte region.
+///
+/// When a nested injection has no `block_continuation` children of its own
+/// (because its tree was parsed with `included_ranges`), we inherit the parent's
+/// ranges by clipping them to the nested content region and re-relativizing.
+///
+/// Both `nested_start_byte` and `nested_end_byte` are relative to the same
+/// base as `parent_ranges` (the parent's `content_text` start).
+///
+/// Returns `Some(clipped_ranges)` if any parent ranges overlap the nested region,
+/// `None` otherwise.
+///
+/// # Known Limitation
+///
+/// When a range is clipped (byte boundaries adjusted by `max`/`min`), the
+/// `start_point`/`end_point` are NOT adjusted to match the clipped bytes.
+/// Tree-sitter's `set_included_ranges` validates only byte ordering, not
+/// point/byte consistency, so this does not cause errors. However, nodes
+/// parsed from clipped ranges may report slightly wrong column positions.
+/// In practice, nested injection boundaries almost always align with parent
+/// gap boundaries (both derived from tree-sitter node boundaries), so
+/// partial clipping is rare.
+pub(crate) fn sub_select_included_ranges(
+    parent_ranges: &[tree_sitter::Range],
+    nested_start_byte: usize,
+    nested_end_byte: usize,
+) -> Option<Vec<tree_sitter::Range>> {
+    // Find the base row from the first overlapping range
+    let first_overlap = parent_ranges
+        .iter()
+        .find(|r| r.end_byte > nested_start_byte && r.start_byte < nested_end_byte)?;
+    let base_row = first_overlap.start_point.row;
+
+    let mut clipped = Vec::new();
+    let mut is_first = true;
+
+    for r in parent_ranges {
+        // Skip non-overlapping ranges
+        if r.end_byte <= nested_start_byte || r.start_byte >= nested_end_byte {
+            continue;
+        }
+
+        // Clip to nested region
+        let clip_start = r.start_byte.max(nested_start_byte);
+        let clip_end = r.end_byte.min(nested_end_byte);
+
+        // The first sub-selected range's column must be 0 because the prefix
+        // bytes (e.g., "> ") preceding this range are NOT in the nested
+        // content_text — they come before nested_start_byte. Without this,
+        // the column would double-count with content_start_col in the token
+        // collector. Subsequent ranges keep the parent's column because their
+        // prefix bytes ARE within the nested content_text.
+        let start_column = if is_first { 0 } else { r.start_point.column };
+
+        clipped.push(tree_sitter::Range {
+            start_byte: clip_start.saturating_sub(nested_start_byte),
+            end_byte: clip_end.saturating_sub(nested_start_byte),
+            start_point: tree_sitter::Point {
+                row: r.start_point.row.saturating_sub(base_row),
+                column: start_column,
+            },
+            end_point: tree_sitter::Point {
+                row: r.end_point.row.saturating_sub(base_row),
+                column: r.end_point.column,
+            },
+        });
+
+        is_first = false;
+    }
+
+    if clipped.is_empty() {
+        None
+    } else {
+        Some(clipped)
+    }
+}
+
+/// Intersect two sets of included ranges, keeping only byte regions present in both.
+///
+/// Both range sets must be in the same coordinate space (e.g., both relative
+/// to `content_node.start_byte()`). The result contains only byte regions
+/// that appear in BOTH inputs.
+///
+/// This is needed when a tree parsed with parent `included_ranges` produces
+/// `compute_included_ranges()` gap ranges that inadvertently span parent-excluded
+/// bytes. Intersecting with the parent's `sub_select_included_ranges()` output
+/// ensures previously-excluded bytes stay excluded.
+pub(crate) fn intersect_included_ranges(
+    a: &[tree_sitter::Range],
+    b: &[tree_sitter::Range],
+) -> Vec<tree_sitter::Range> {
+    let mut result = Vec::new();
+    let mut j = 0;
+
+    for ar in a {
+        // Advance b past ranges that end before ar starts
+        while j < b.len() && b[j].end_byte <= ar.start_byte {
+            j += 1;
+        }
+
+        // Check all b ranges that overlap with ar
+        let mut k = j;
+        while k < b.len() && b[k].start_byte < ar.end_byte {
+            let start_byte = ar.start_byte.max(b[k].start_byte);
+            let end_byte = ar.end_byte.min(b[k].end_byte);
+
+            if start_byte < end_byte {
+                // Use point from whichever boundary is more restrictive
+                let start_point = if start_byte == ar.start_byte {
+                    ar.start_point
+                } else {
+                    b[k].start_point
+                };
+                let end_point = if end_byte == ar.end_byte {
+                    ar.end_point
+                } else {
+                    b[k].end_point
+                };
+
+                result.push(tree_sitter::Range {
+                    start_byte,
+                    end_byte,
+                    start_point,
+                    end_point,
+                });
+            }
+            k += 1;
+        }
+    }
+
+    result
 }
 
 /// Extract clean injection content, stripping child node bytes when included_ranges present.
@@ -2179,5 +2334,192 @@ mod tests {
             vec![2, 2],
             "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
         );
+    }
+
+    // ─── Tests for sub_select_included_ranges ────────────────────────────
+
+    /// Helper to build a tree_sitter::Range for test fixtures.
+    fn make_range(
+        start_byte: usize,
+        end_byte: usize,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> tree_sitter::Range {
+        tree_sitter::Range {
+            start_byte,
+            end_byte,
+            start_point: tree_sitter::Point {
+                row: start_row,
+                column: start_col,
+            },
+            end_point: tree_sitter::Point {
+                row: end_row,
+                column: end_col,
+            },
+        }
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_basic() {
+        // Parent has 3 ranges spanning 3 rows (simulating "> " prefix on each line).
+        // Each line is ">" (1 byte) + " " (1 byte) + content.
+        // Line 0: "> abc\n"  → bytes 0..6, gap at 2..6, row 0 col 2
+        // Line 1: "> def\n"  → bytes 6..12, gap at 8..12, row 1 col 2
+        // Line 2: "> ghi\n"  → bytes 12..18, gap at 14..18, row 2 col 2
+        let parent_ranges = vec![
+            make_range(2, 6, 0, 2, 0, 6),
+            make_range(8, 12, 1, 2, 1, 6),
+            make_range(14, 18, 2, 2, 2, 6),
+        ];
+
+        // Nested region covers rows 1-2 (bytes 8..18 in parent coordinates)
+        let result = sub_select_included_ranges(&parent_ranges, 8, 18);
+
+        assert!(
+            result.is_some(),
+            "Should return Some for overlapping ranges"
+        );
+        let ranges = result.unwrap();
+        assert_eq!(ranges.len(), 2, "Should have 2 ranges for rows 1-2");
+
+        // First range: re-relativized from parent byte 8..12 → nested byte 0..4
+        // First range column is 0 (prefix bytes are outside nested content_text)
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, 4);
+        assert_eq!(ranges[0].start_point.row, 0);
+        assert_eq!(ranges[0].start_point.column, 0); // first range: no prefix in nested content
+        assert_eq!(ranges[0].end_point.row, 0);
+        assert_eq!(ranges[0].end_point.column, 6);
+
+        // Second range: re-relativized from parent byte 14..18 → nested byte 6..10
+        assert_eq!(ranges[1].start_byte, 6);
+        assert_eq!(ranges[1].end_byte, 10);
+        assert_eq!(ranges[1].start_point.row, 1);
+        assert_eq!(ranges[1].start_point.column, 2);
+        assert_eq!(ranges[1].end_point.row, 1);
+        assert_eq!(ranges[1].end_point.column, 6);
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_no_overlap() {
+        // Parent ranges span bytes 0..6
+        let parent_ranges = vec![make_range(2, 6, 0, 2, 0, 6)];
+
+        // Nested region is completely outside parent ranges
+        let result = sub_select_included_ranges(&parent_ranges, 10, 20);
+
+        assert!(
+            result.is_none(),
+            "Should return None for non-overlapping ranges"
+        );
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_partial_overlap() {
+        // Parent range: bytes 2..10 on row 0
+        let parent_ranges = vec![make_range(2, 10, 0, 2, 0, 10)];
+
+        // Nested region starts at byte 5 (mid-range) and ends at byte 15 (past range)
+        let result = sub_select_included_ranges(&parent_ranges, 5, 15);
+
+        assert!(
+            result.is_some(),
+            "Should return Some for partially overlapping range"
+        );
+        let ranges = result.unwrap();
+        assert_eq!(ranges.len(), 1);
+
+        // Clipped: start clamped to 5, end clamped to 10
+        // Re-relativized: 5-5=0 start, 10-5=5 end
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, 5);
+        assert_eq!(ranges[0].start_point.row, 0);
+        assert_eq!(ranges[0].start_point.column, 0); // first range: column zeroed
+    }
+
+    // ─── Tests for intersect_included_ranges ─────────────────────────────
+
+    #[test]
+    fn test_intersect_included_ranges_identical() {
+        let ranges = vec![make_range(0, 4, 0, 0, 0, 4), make_range(6, 10, 1, 2, 1, 6)];
+        let result = intersect_included_ranges(&ranges, &ranges);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start_byte, 0);
+        assert_eq!(result[0].end_byte, 4);
+        assert_eq!(result[1].start_byte, 6);
+        assert_eq!(result[1].end_byte, 10);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_no_overlap() {
+        let a = vec![make_range(0, 4, 0, 0, 0, 4)];
+        let b = vec![make_range(6, 10, 1, 2, 1, 6)];
+        let result = intersect_included_ranges(&a, &b);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_partial_overlap() {
+        // a: [2..8], b: [5..12]
+        // intersection: [5..8]
+        let a = vec![make_range(2, 8, 0, 2, 0, 8)];
+        let b = vec![make_range(5, 12, 0, 5, 0, 12)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 8);
+        // start_byte == b's start → use b's start_point
+        assert_eq!(result[0].start_point.column, 5);
+        // end_byte == a's end → use a's end_point
+        assert_eq!(result[0].end_point.column, 8);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_one_contains_other() {
+        // a: [0..20], b: [5..10]
+        // intersection: [5..10]
+        let a = vec![make_range(0, 20, 0, 0, 0, 20)];
+        let b = vec![make_range(5, 10, 0, 5, 0, 10)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 10);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_multiple_overlaps() {
+        // a: [0..10, 20..30]
+        // b: [5..25]
+        // intersections: [5..10, 20..25]
+        let a = vec![
+            make_range(0, 10, 0, 0, 0, 10),
+            make_range(20, 30, 2, 0, 2, 10),
+        ];
+        let b = vec![make_range(5, 25, 0, 5, 2, 5)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 10);
+        assert_eq!(result[1].start_byte, 20);
+        assert_eq!(result[1].end_byte, 25);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_empty_inputs() {
+        let ranges = vec![make_range(0, 4, 0, 0, 0, 4)];
+        assert!(intersect_included_ranges(&[], &ranges).is_empty());
+        assert!(intersect_included_ranges(&ranges, &[]).is_empty());
+        assert!(intersect_included_ranges(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_adjacent_non_overlapping() {
+        // a: [0..5], b: [5..10] — touching but not overlapping
+        let a = vec![make_range(0, 5, 0, 0, 0, 5)];
+        let b = vec![make_range(5, 10, 0, 5, 0, 10)];
+        let result = intersect_included_ranges(&a, &b);
+        assert!(result.is_empty(), "Adjacent ranges should not intersect");
     }
 }

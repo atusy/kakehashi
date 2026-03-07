@@ -1,0 +1,27 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 0,
+    "start": 2,
+    "length": 5,
+    "type": "class",
+    "text": "# foo"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 5,
+    "type": "keyword",
+    "text": "> bar"
+  }
+]

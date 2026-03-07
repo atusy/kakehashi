@@ -1,0 +1,76 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 3,
+    "type": "keyword",
+    "text": ">> "
+  },
+  {
+    "line": 0,
+    "start": 3,
+    "length": 5,
+    "type": "string",
+    "text": "`````"
+  },
+  {
+    "line": 0,
+    "start": 8,
+    "length": 8,
+    "type": "variable",
+    "text": "markdown"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 3,
+    "type": "keyword",
+    "text": ">> "
+  },
+  {
+    "line": 1,
+    "start": 3,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 5,
+    "length": 5,
+    "type": "class",
+    "text": "# foo"
+  },
+  {
+    "line": 2,
+    "start": 0,
+    "length": 3,
+    "type": "keyword",
+    "text": ">> "
+  },
+  {
+    "line": 2,
+    "start": 3,
+    "length": 5,
+    "type": "keyword",
+    "text": "> bar"
+  },
+  {
+    "line": 3,
+    "start": 0,
+    "length": 3,
+    "type": "keyword",
+    "text": ">> "
+  },
+  {
+    "line": 3,
+    "start": 3,
+    "length": 5,
+    "type": "string",
+    "text": "`````"
+  }
+]

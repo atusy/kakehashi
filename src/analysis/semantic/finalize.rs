@@ -71,6 +71,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
                 depth: token.depth,
                 pattern_index: token.pattern_index,
                 priority: token.priority,
+                node_byte_len: token.node_byte_len,
             });
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
@@ -145,6 +146,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                     depth: winner.depth,
                     pattern_index: winner.pattern_index,
                     priority: winner.priority,
+                    node_byte_len: winner.node_byte_len,
                 });
             }
         }
@@ -338,6 +340,7 @@ fn split_host_token_around_regions(
                     depth: token.depth,
                     pattern_index: token.pattern_index,
                     priority: token.priority,
+                    node_byte_len: token.node_byte_len,
                 });
             }
         }
@@ -354,6 +357,7 @@ fn split_host_token_around_regions(
             depth: token.depth,
             pattern_index: token.pattern_index,
             priority: token.priority,
+            node_byte_len: token.node_byte_len,
         });
     }
 
@@ -424,6 +428,66 @@ pub(super) fn finalize_tokens(
         all_tokens = filtered;
     }
 
+    // @none pre-processing: split parent tokens around @none regions.
+    //
+    // @none is a nvim-treesitter convention that resets parent highlighting
+    // within a region (e.g., `(interpolation) @none` punches holes in @string
+    // for f-string interpolation). We handle this by:
+    // 1. Extracting @none token positions
+    // 2. Splitting tokens whose node strictly contains the @none node
+    //    (parent tokens with larger node_byte_len)
+    // 3. Discarding the @none tokens themselves
+    //
+    // This preserves child tokens (e.g., @number inside interpolation) that
+    // have smaller node_byte_len than @none, while removing the parent @string
+    // coverage from the @none region.
+    let (none_tokens, mut all_tokens): (Vec<_>, Vec<_>) = all_tokens
+        .into_iter()
+        .partition(|t| t.mapped_name == "none");
+
+    if !none_tokens.is_empty() {
+        // Build per-line @none intervals with their node sizes
+        let mut none_intervals: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+        for t in &none_tokens {
+            none_intervals.entry(t.line).or_default().push((
+                t.column,
+                t.column + t.length,
+                t.node_byte_len,
+            ));
+        }
+        for intervals in none_intervals.values_mut() {
+            intervals.sort_unstable();
+        }
+
+        // Split parent tokens around @none intervals
+        let mut result = Vec::with_capacity(all_tokens.len());
+        for token in all_tokens {
+            if let Some(line_intervals) = none_intervals.get(&token.line) {
+                // Find @none intervals that are within this token AND have
+                // smaller node_byte_len (meaning @none is on a child node)
+                let dominated: Vec<(usize, usize)> = line_intervals
+                    .iter()
+                    .filter(|(start, end, none_len)| {
+                        *none_len < token.node_byte_len
+                            && *start >= token.column
+                            && *end <= token.column + token.length
+                    })
+                    .map(|(start, end, _)| (*start, *end))
+                    .collect();
+
+                if !dominated.is_empty() {
+                    let fragments = split_host_token_around_regions(&token, &dominated);
+                    result.extend(fragments);
+                } else {
+                    result.push(token);
+                }
+            } else {
+                result.push(token);
+            }
+        }
+        all_tokens = result;
+    }
+
     // Split overlapping tokens using sweep line algorithm.
     // This replaces the old sort + dedup approach, producing non-overlapping
     // fragments that preserve both parent and child semantics.
@@ -441,13 +505,20 @@ pub(super) fn finalize_tokens(
     for token in all_tokens {
         // Unknown types are already filtered at collection time (apply_capture_mapping returns None),
         // so map_capture_to_token_type_and_modifiers should always return Some here.
-        let (token_type, token_modifiers_bitset) =
+        let Some((token_type, token_modifiers_bitset)) =
             map_capture_to_token_type_and_modifiers(&token.mapped_name)
-                .expect("all tokens should have known types after apply_capture_mapping filtering");
+        else {
+            log::warn!(
+                target: "kakehashi::semantic",
+                "Skipping token with unknown type '{}' at line {} col {}",
+                token.mapped_name, token.line, token.column
+            );
+            continue;
+        };
 
-        let delta_line = token.line - last_line;
+        let delta_line = token.line.saturating_sub(last_line);
         let delta_start = if delta_line == 0 {
-            token.column - last_start
+            token.column.saturating_sub(last_start)
         } else {
             token.column
         };
@@ -475,7 +546,7 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    /// Helper to create a RawToken for testing (priority defaults to 100)
+    /// Helper to create a RawToken for testing (priority defaults to 100, node_byte_len to 0)
     fn make_token(
         line: usize,
         column: usize,
@@ -492,6 +563,7 @@ mod tests {
             depth,
             pattern_index,
             priority: 100,
+            node_byte_len: 0,
         }
     }
 
@@ -513,6 +585,7 @@ mod tests {
             depth,
             pattern_index,
             priority,
+            node_byte_len: 0,
         }
     }
 
@@ -1320,6 +1393,70 @@ mod tests {
         assert_eq!(
             (result[1].line, result[1].column, result[1].length),
             (1, 0, 2)
+        );
+    }
+
+    #[test]
+    fn none_splits_parent_string_and_preserves_child_number() {
+        // @string (node_byte_len=40) covers [0, 20)
+        // @none (node_byte_len=10) covers [5, 15) — punches a hole in @string
+        // @number (node_byte_len=1) covers [6, 7) — inside the hole
+        // Result: string[0,5), number[6,7), string[15,20)
+        // The @none intervals [5,6) and [7,15) should be empty (no token)
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 20,
+                mapped_name: "string".to_string(),
+                depth: 0,
+                pattern_index: 25,
+                priority: 100,
+                node_byte_len: 40,
+            },
+            RawToken {
+                line: 0,
+                column: 5,
+                length: 10,
+                mapped_name: "none".to_string(),
+                depth: 0,
+                pattern_index: 1,
+                priority: 100,
+                node_byte_len: 10,
+            },
+            RawToken {
+                line: 0,
+                column: 6,
+                length: 1,
+                mapped_name: "number".to_string(),
+                depth: 0,
+                pattern_index: 20,
+                priority: 100,
+                node_byte_len: 1,
+            },
+        ];
+        let result = finalize_tokens(tokens, &[], &["12345678901234567890"]);
+        let SemanticTokensResult::Tokens(st) = result.expect("should produce tokens") else {
+            panic!("Expected Tokens variant");
+        };
+        let (string_type, _) = map_capture_to_token_type_and_modifiers("string").unwrap();
+        let (number_type, _) = map_capture_to_token_type_and_modifiers("number").unwrap();
+        let types: Vec<(u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| (t.delta_start, t.length, t.token_type))
+            .collect();
+        // Delta encoding: all on line 0, so delta_start = col - prev_col
+        // string at col 0: delta_start=0
+        // number at col 6: delta_start=6-0=6
+        // string at col 15: delta_start=15-6=9
+        assert_eq!(
+            types,
+            vec![
+                (0, 5, string_type), // string[0,5)
+                (6, 1, number_type), // number[6,7)
+                (9, 5, string_type), // string[15,20)
+            ]
         );
     }
 

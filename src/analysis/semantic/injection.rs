@@ -27,4 +27,7 @@ pub(super) struct InjectionContext<'a> {
     /// When `Some`, `Parser::set_included_ranges()` restricts parsing to these
     /// byte ranges, excluding named children like `block_continuation`.
     pub included_ranges: Option<Vec<tree_sitter::Range>>,
+    /// Per-content-line byte prefix widths (e.g., `[0, 2, 2, 2]` for blockquote).
+    /// Empty when no `included_ranges` (non-blockquote injections).
+    pub prefix_byte_widths: Vec<usize>,
 }
