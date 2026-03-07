@@ -120,11 +120,15 @@ fn test_did_change_configuration_preserves_initialization_options_languages() {
         }),
     );
 
-    // Small delay to let the server process the notification
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Verify languages from initializationOptions are preserved
-    let response = client.send_request("kakehashi/internal/effectiveConfiguration", json!({}));
+    let response = helpers::lsp_polling::poll_for_request(
+        &mut client,
+        "kakehashi/internal/effectiveConfiguration",
+        json!({}),
+        20,
+        200,
+    )
+    .expect("Should receive effectiveConfiguration response");
     let result = response
         .get("result")
         .expect("effectiveConfiguration should return a result");

@@ -62,9 +62,6 @@ fn e2e_incremental_sync_preserves_region_tracking() {
         }),
     );
 
-    // Give lua-ls time to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Phase 2: Poll for hover to establish the virtual document and confirm lua-ls is
     // indexed. A non-null result proves (a) the bridge routes to the Lua injection
     // region, and (b) lua-ls has the virtual document open — a prerequisite for
@@ -106,7 +103,6 @@ fn e2e_incremental_sync_preserves_region_tracking() {
     );
 
     println!("Phase 3: Sent incremental didChange (insert at end of line 3)");
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Phase 4: Verify hover still works on `print` at line 4 (unchanged by the edit).
     // Using poll_for_hover to detect ULID over-invalidation:
@@ -175,9 +171,6 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
             }
         }),
     );
-
-    // Give lua-ls time to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Poll for hover on first Lua block to establish its virtual document and confirm
     // lua-ls has indexed it. Non-null result is required as a baseline for detecting
@@ -248,7 +241,6 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
         }),
     );
     println!("Sent edit 2: Insert '0' making 'local a = 10'");
-    std::thread::sleep(std::time::Duration::from_millis(300));
 
     // Verify first Lua block still works (after both edits).
     // Line 4: "print(a)" - unchanged (edit 2 modified line 3, not line 4).

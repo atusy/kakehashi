@@ -15,6 +15,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -70,18 +71,18 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
     // Request implementation on "speak" method call at line 19 (dog:speak())
     // The speak method is at character 4 on line 19
-    let impl_response = client.send_request(
+    let impl_response = poll_for_lsp_result(
+        &mut client,
         "textDocument/implementation",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 19, "character": 4 }
-        }),
-    );
+        markdown_uri,
+        19,
+        4,
+        20,
+        500,
+    )
+    .expect("Should receive implementation response");
 
     println!("Implementation response: {:?}", impl_response);
 

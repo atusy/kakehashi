@@ -15,6 +15,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -60,13 +61,11 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(2000));
-
     // Request inlay hints for the Lua code block area
     // The code block is at lines 2-11 (0-indexed: line 2 is "```lua", line 11 is "```")
     // Content starts at line 3
-    let inlay_hint_response = client.send_request(
+    let inlay_hint_response = poll_for_request(
+        &mut client,
         "textDocument/inlayHint",
         json!({
             "textDocument": { "uri": markdown_uri },
@@ -75,7 +74,10 @@ More text.
                 "end": { "line": 11, "character": 0 }
             }
         }),
-    );
+        20,
+        500,
+    )
+    .expect("Should receive inlay hint response");
 
     println!("Inlay hint response: {:?}", inlay_hint_response);
 

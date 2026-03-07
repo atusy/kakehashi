@@ -17,6 +17,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
 
@@ -57,16 +58,17 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(2000));
-
     // Request document color for the file
-    let color_response = client.send_request(
+    let color_response = poll_for_request(
+        &mut client,
         "textDocument/documentColor",
         json!({
             "textDocument": { "uri": markdown_uri }
         }),
-    );
+        20,
+        500,
+    )
+    .expect("Should receive document color response");
 
     println!("Document color response: {:?}", color_response);
 

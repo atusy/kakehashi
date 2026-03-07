@@ -17,11 +17,11 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
+use helpers::lsp_polling::poll_for_semantic_tokens;
 use helpers::test_fixtures::{
     create_selection_range_lua_fixture, create_selection_range_md_fixture,
 };
 use serde_json::{Value, json};
-use std::time::Duration;
 
 /// Represents a decoded semantic token with absolute positions.
 ///
@@ -147,18 +147,8 @@ fn test_semantic_tokens_lua_keyword() {
         }),
     );
 
-    // Give server time to process
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Request semantic tokens
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": {
-                "uri": uri
-            }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     // Verify response
     assert!(
@@ -244,18 +234,8 @@ fn test_semantic_tokens_markdown_injection() {
         }),
     );
 
-    // Give server time to process
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Request semantic tokens
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": {
-                "uri": uri
-            }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     // Verify response
     assert!(
@@ -328,17 +308,8 @@ fn test_semantic_tokens_snapshot() {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Request semantic tokens
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": {
-                "uri": uri
-            }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response.get("result").unwrap();
     let data = result.get("data").unwrap().as_array().unwrap();
@@ -395,17 +366,8 @@ fn test_semantic_tokens_result_id() {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Request semantic tokens
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": {
-                "uri": uri
-            }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response.get("result").unwrap();
 
@@ -482,18 +444,8 @@ fn test_semantic_tokens_markdown_inline_bold() {
         }),
     );
 
-    // Give server time to process (including auto-install if needed)
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // Request semantic tokens
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": {
-                "uri": uri
-            }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     // Verify response
     assert!(

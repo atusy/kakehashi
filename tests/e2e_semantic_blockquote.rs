@@ -11,9 +11,9 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
+use helpers::lsp_polling::poll_for_semantic_tokens;
 use kakehashi::text::convert_utf16_to_byte_in_line;
 use serde_json::json;
-use std::time::Duration;
 
 /// Decoded semantic token with absolute positions.
 #[derive(Debug, Clone, PartialEq)]
@@ -194,14 +194,8 @@ fn test_blockquote_multiline_support_with_full_config() {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": { "uri": uri }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
@@ -331,14 +325,8 @@ fn test_blockquote_multiline_injection_token_prefix() {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": { "uri": uri }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
@@ -453,14 +441,8 @@ fn test_blockquote_heading_host_token_preservation() {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": { "uri": uri }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
@@ -571,14 +553,8 @@ fn test_blockquote_heading_multiline_support_prefix_type() {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": { "uri": uri }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
@@ -683,16 +659,8 @@ fn test_blockquote_injection_tokens() {
         }),
     );
 
-    // Give server time to load parsers and process
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // Request semantic tokens
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": { "uri": uri }
-        }),
-    );
+    let response = poll_for_semantic_tokens(&mut client, &uri, 20, 200)
+        .expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
@@ -897,12 +865,8 @@ fn open_and_get_raw_data(client: &mut LspClient, content: &str) -> Vec<u32> {
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
+    let response =
+        poll_for_semantic_tokens(client, &uri, 20, 200).expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
@@ -938,12 +902,8 @@ fn open_and_get_tokens(client: &mut LspClient, content: &str) -> Vec<DecodedToke
         }),
     );
 
-    std::thread::sleep(Duration::from_millis(1000));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
+    let response =
+        poll_for_semantic_tokens(client, &uri, 20, 200).expect("Should receive semantic tokens");
 
     let result = response
         .get("result")
