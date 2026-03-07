@@ -16,6 +16,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
 
@@ -50,16 +51,17 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-
     // Request document link for the file
-    let link_response = client.send_request(
+    let link_response = poll_for_request(
+        &mut client,
         "textDocument/documentLink",
         json!({
             "textDocument": { "uri": markdown_uri }
         }),
-    );
+        20,
+        500,
+    )
+    .expect("Should receive document link response");
 
     println!("Document link response: {:?}", link_response);
 
