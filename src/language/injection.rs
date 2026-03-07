@@ -311,6 +311,17 @@ pub(crate) fn compute_included_ranges(
 ///
 /// Returns `Some(clipped_ranges)` if any parent ranges overlap the nested region,
 /// `None` otherwise.
+///
+/// # Known Limitation
+///
+/// When a range is clipped (byte boundaries adjusted by `max`/`min`), the
+/// `start_point`/`end_point` are NOT adjusted to match the clipped bytes.
+/// Tree-sitter's `set_included_ranges` validates only byte ordering, not
+/// point/byte consistency, so this does not cause errors. However, nodes
+/// parsed from clipped ranges may report slightly wrong column positions.
+/// In practice, nested injection boundaries almost always align with parent
+/// gap boundaries (both derived from tree-sitter node boundaries), so
+/// partial clipping is rare.
 pub(crate) fn sub_select_included_ranges(
     parent_ranges: &[tree_sitter::Range],
     nested_start_byte: usize,
@@ -2426,5 +2437,89 @@ mod tests {
         assert_eq!(ranges[0].end_byte, 5);
         assert_eq!(ranges[0].start_point.row, 0);
         assert_eq!(ranges[0].start_point.column, 0); // first range: column zeroed
+    }
+
+    // ─── Tests for intersect_included_ranges ─────────────────────────────
+
+    #[test]
+    fn test_intersect_included_ranges_identical() {
+        let ranges = vec![make_range(0, 4, 0, 0, 0, 4), make_range(6, 10, 1, 2, 1, 6)];
+        let result = intersect_included_ranges(&ranges, &ranges);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start_byte, 0);
+        assert_eq!(result[0].end_byte, 4);
+        assert_eq!(result[1].start_byte, 6);
+        assert_eq!(result[1].end_byte, 10);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_no_overlap() {
+        let a = vec![make_range(0, 4, 0, 0, 0, 4)];
+        let b = vec![make_range(6, 10, 1, 2, 1, 6)];
+        let result = intersect_included_ranges(&a, &b);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_partial_overlap() {
+        // a: [2..8], b: [5..12]
+        // intersection: [5..8]
+        let a = vec![make_range(2, 8, 0, 2, 0, 8)];
+        let b = vec![make_range(5, 12, 0, 5, 0, 12)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 8);
+        // start_byte == b's start → use b's start_point
+        assert_eq!(result[0].start_point.column, 5);
+        // end_byte == a's end → use a's end_point
+        assert_eq!(result[0].end_point.column, 8);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_one_contains_other() {
+        // a: [0..20], b: [5..10]
+        // intersection: [5..10]
+        let a = vec![make_range(0, 20, 0, 0, 0, 20)];
+        let b = vec![make_range(5, 10, 0, 5, 0, 10)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 10);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_multiple_overlaps() {
+        // a: [0..10, 20..30]
+        // b: [5..25]
+        // intersections: [5..10, 20..25]
+        let a = vec![
+            make_range(0, 10, 0, 0, 0, 10),
+            make_range(20, 30, 2, 0, 2, 10),
+        ];
+        let b = vec![make_range(5, 25, 0, 5, 2, 5)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 10);
+        assert_eq!(result[1].start_byte, 20);
+        assert_eq!(result[1].end_byte, 25);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_empty_inputs() {
+        let ranges = vec![make_range(0, 4, 0, 0, 0, 4)];
+        assert!(intersect_included_ranges(&[], &ranges).is_empty());
+        assert!(intersect_included_ranges(&ranges, &[]).is_empty());
+        assert!(intersect_included_ranges(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_adjacent_non_overlapping() {
+        // a: [0..5], b: [5..10] — touching but not overlapping
+        let a = vec![make_range(0, 5, 0, 0, 0, 5)];
+        let b = vec![make_range(5, 10, 0, 5, 0, 10)];
+        let result = intersect_included_ranges(&a, &b);
+        assert!(result.is_empty(), "Adjacent ranges should not intersect");
     }
 }
