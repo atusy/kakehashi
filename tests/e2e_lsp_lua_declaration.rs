@@ -15,6 +15,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -58,18 +59,18 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
     // Request declaration on "greet" function call at line 7 (message = greet("World"))
     // The greet call is at character 16 on line 7
-    let decl_response = client.send_request(
+    let decl_response = poll_for_lsp_result(
+        &mut client,
         "textDocument/declaration",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 7, "character": 16 }
-        }),
-    );
+        markdown_uri,
+        7,
+        16,
+        20,
+        500,
+    )
+    .expect("Should receive declaration response");
 
     println!("Declaration response: {:?}", decl_response);
 

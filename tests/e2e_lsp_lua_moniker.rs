@@ -18,6 +18,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -75,18 +76,18 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Request moniker on "greeting" variable at line 4, character 6 (on the 'g' of greeting)
     // Line 4 (0-indexed from markdown), character 6 (print(greeting))
-    let moniker_response = client.send_request(
+    let moniker_response = poll_for_lsp_result(
+        &mut client,
         "textDocument/moniker",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 4, "character": 6 }
-        }),
-    );
+        markdown_uri,
+        4,
+        6,
+        20,
+        500,
+    )
+    .expect("Should receive moniker response");
 
     println!("Moniker response: {:?}", moniker_response);
 
@@ -164,17 +165,17 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Request moniker on "string" (line 3, character 15 - on 'string')
-    let moniker_response = client.send_request(
+    let moniker_response = poll_for_lsp_result(
+        &mut client,
         "textDocument/moniker",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 3, "character": 15 }
-        }),
-    );
+        markdown_uri,
+        3,
+        15,
+        20,
+        500,
+    )
+    .expect("Should receive moniker response");
 
     println!("Moniker on built-in response: {:?}", moniker_response);
 

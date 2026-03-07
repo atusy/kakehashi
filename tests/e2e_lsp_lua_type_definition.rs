@@ -15,6 +15,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -61,18 +62,18 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
     // Request type definition on "p" at line 9 (the variable with type annotation)
     // The variable p is at line 9 in the markdown (0-indexed)
-    let type_def_response = client.send_request(
+    let type_def_response = poll_for_lsp_result(
+        &mut client,
         "textDocument/typeDefinition",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 9, "character": 6 }
-        }),
-    );
+        markdown_uri,
+        9,
+        6,
+        20,
+        500,
+    )
+    .expect("Should receive type definition response");
 
     println!("Type definition response: {:?}", type_def_response);
 
@@ -166,17 +167,17 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
     // Request type definition on "config" usage at line 9 (print(config.debug))
-    let type_def_response = client.send_request(
+    let type_def_response = poll_for_lsp_result(
+        &mut client,
         "textDocument/typeDefinition",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 9, "character": 6 }
-        }),
-    );
+        markdown_uri,
+        9,
+        6,
+        20,
+        500,
+    )
+    .expect("Should receive type definition response");
 
     println!(
         "Type definition on typed variable response: {:?}",
