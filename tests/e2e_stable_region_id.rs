@@ -24,6 +24,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_hover;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -68,19 +69,11 @@ More text.
         }),
     );
 
-    // Give lua-ls time to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // FIRST ACCESS: Hover on "greeting" variable (line 3, inside Lua block)
     // Line 3: "local greeting = ..."
     // Character 10 is on "greeting"
-    let hover_response = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 3, "character": 10 }
-        }),
-    );
+    let hover_response = poll_for_hover(&mut client, markdown_uri, 3, 10, 20, 500)
+        .expect("Should receive hover response");
 
     println!("First access (hover) response: {:?}", hover_response);
 
@@ -175,18 +168,10 @@ More text.
         }),
     );
 
-    // Give lua-ls time to initialize
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Hover on first Lua block (line 5: "local x = 1")
     // This should use region_id "lua-0"
-    let hover_first = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 5, "character": 7 }
-        }),
-    );
+    let hover_first = poll_for_hover(&mut client, markdown_uri, 5, 7, 20, 500)
+        .expect("Should receive hover response");
 
     assert!(
         hover_first.get("error").is_none(),

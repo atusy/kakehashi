@@ -15,6 +15,7 @@
 
 mod helpers;
 
+use helpers::lsp_polling::poll_for_hover;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
     verify_hover_has_content,
@@ -56,17 +57,9 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Hover over "greet" on line 3 (character 9-14)
-    let hover_response = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 3, "character": 11 }
-        }),
-    );
+    let hover_response = poll_for_hover(&mut client, markdown_uri, 3, 11, 20, 500)
+        .expect("Should receive hover response");
 
     println!("Hover on function response: {:?}", hover_response);
 
@@ -131,18 +124,10 @@ More text.
         }),
     );
 
-    // Give lua-ls time to process
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     // Hover over "x" on line 3 (local x = 1)
     // Line 3 in markdown, character 6 is on "x"
-    let hover_response = client.send_request(
-        "textDocument/hover",
-        json!({
-            "textDocument": { "uri": markdown_uri },
-            "position": { "line": 3, "character": 6 }
-        }),
-    );
+    let hover_response = poll_for_hover(&mut client, markdown_uri, 3, 6, 20, 500)
+        .expect("Should receive hover response");
 
     println!("Hover on local variable response: {:?}", hover_response);
 
