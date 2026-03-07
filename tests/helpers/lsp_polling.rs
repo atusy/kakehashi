@@ -158,6 +158,124 @@ pub fn poll_for_completions(
     )
 }
 
+/// Poll for semantic tokens with retries.
+///
+/// Sends `textDocument/semanticTokens/full` and retries until a non-null result
+/// with a `data` array is returned. This replaces fixed `thread::sleep` after
+/// `didOpen` — the server may still be parsing when the first request arrives.
+///
+/// # Returns
+/// * `Some(response)` - The full JSON-RPC response with semantic token data
+/// * `None` - If max_attempts reached without a valid response
+pub fn poll_for_semantic_tokens(
+    client: &mut LspClient,
+    uri: &str,
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Option<serde_json::Value> {
+    for attempt in 1..=max_attempts {
+        let response = client.send_request(
+            "textDocument/semanticTokens/full",
+            json!({
+                "textDocument": { "uri": uri }
+            }),
+        );
+
+        if response.get("error").is_some() {
+            eprintln!(
+                "semanticTokens/full attempt {}/{}: Error: {:?}",
+                attempt,
+                max_attempts,
+                response.get("error")
+            );
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            continue;
+        }
+
+        if let Some(result) = response.get("result")
+            && !result.is_null()
+            && result.get("data").is_some()
+        {
+            eprintln!(
+                "semanticTokens/full succeeded on attempt {}/{}",
+                attempt, max_attempts
+            );
+            return Some(response);
+        }
+
+        eprintln!(
+            "semanticTokens/full attempt {}/{}: no data yet, retrying...",
+            attempt, max_attempts
+        );
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+
+    eprintln!(
+        "semanticTokens/full exhausted {} attempts without data",
+        max_attempts
+    );
+    None
+}
+
+/// Poll for selection ranges with retries.
+///
+/// Sends `textDocument/selectionRange` and retries until a non-null result
+/// is returned. This replaces fixed `thread::sleep` after `didOpen`.
+///
+/// # Returns
+/// * `Some(response)` - The full JSON-RPC response with selection range data
+/// * `None` - If max_attempts reached without a valid response
+pub fn poll_for_selection_range(
+    client: &mut LspClient,
+    uri: &str,
+    positions: &[serde_json::Value],
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Option<serde_json::Value> {
+    for attempt in 1..=max_attempts {
+        let response = client.send_request(
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": uri },
+                "positions": positions
+            }),
+        );
+
+        if response.get("error").is_some() {
+            eprintln!(
+                "selectionRange attempt {}/{}: Error: {:?}",
+                attempt,
+                max_attempts,
+                response.get("error")
+            );
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            continue;
+        }
+
+        if let Some(result) = response.get("result")
+            && !result.is_null()
+        {
+            eprintln!(
+                "selectionRange succeeded on attempt {}/{}",
+                attempt, max_attempts
+            );
+            return Some(response);
+        }
+
+        eprintln!(
+            "selectionRange attempt {}/{}: null result, retrying...",
+            attempt, max_attempts
+        );
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+
+    eprintln!(
+        "selectionRange exhausted {} attempts without result",
+        max_attempts
+    );
+    None
+}
+
 /// Poll for diagnostic results with exponential backoff.
 ///
 /// This is used for textDocument/diagnostic requests which may need time
