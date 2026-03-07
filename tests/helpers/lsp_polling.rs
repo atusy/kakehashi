@@ -43,6 +43,60 @@ where
     None
 }
 
+/// Poll for any LSP request result with retries and arbitrary params.
+///
+/// Sends the given method with the given params and retries until a non-null,
+/// non-error result is returned. This is the most general polling helper.
+///
+/// # Returns
+/// * `Some(response)` - The full JSON-RPC response if a non-null result was received
+/// * `None` - If max_attempts reached without a successful non-null response
+pub fn poll_for_request(
+    client: &mut LspClient,
+    method: &str,
+    params: serde_json::Value,
+    max_attempts: u32,
+    delay_ms: u64,
+) -> Option<serde_json::Value> {
+    for attempt in 1..=max_attempts {
+        let response = client.send_request(method, params.clone());
+
+        if response.get("error").is_some() {
+            eprintln!(
+                "{} attempt {}/{}: Error: {:?}",
+                method,
+                attempt,
+                max_attempts,
+                response.get("error")
+            );
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            continue;
+        }
+
+        if let Some(result) = response.get("result")
+            && !result.is_null()
+        {
+            eprintln!(
+                "{} succeeded on attempt {}/{}",
+                method, attempt, max_attempts
+            );
+            return Some(response);
+        }
+
+        eprintln!(
+            "{} attempt {}/{}: null result, retrying...",
+            method, attempt, max_attempts
+        );
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+
+    eprintln!(
+        "{} exhausted {} attempts without non-null result",
+        method, max_attempts
+    );
+    None
+}
+
 /// Poll for LSP position-based request results with retries.
 ///
 /// Many LSP requests (hover, completion, definition, etc.) need time for the downstream
