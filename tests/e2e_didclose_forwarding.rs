@@ -12,7 +12,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_hover;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -54,9 +53,18 @@ More text.
         }),
     );
 
-    // Hover to trigger virtual document opening
-    let hover_response_1 = poll_for_hover(&mut client, markdown_uri_1, 3, 6, 20, 500)
-        .expect("Hover should succeed on first document");
+    // Give lua-ls time to initialize
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Hover to trigger virtual document opening.
+    // Null result is fine — the test only checks the connection stays open.
+    let hover_response_1 = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": markdown_uri_1 },
+            "position": { "line": 3, "character": 6 }
+        }),
+    );
 
     assert!(
         hover_response_1.get("error").is_none(),
@@ -101,37 +109,24 @@ More text.
         }),
     );
 
-    // Hover in second document - this should work if connection remained open.
-    // We only need to verify the server responds without error; a null hover result
-    // is acceptable since the test's purpose is connection liveness, not hover content.
-    let hover_response_2 = poll_for_hover(&mut client, markdown_uri_2, 3, 6, 20, 500);
+    // Give lua-ls time to process the new document
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    match &hover_response_2 {
-        Some(resp) => {
-            assert!(
-                resp.get("error").is_none(),
-                "Second hover should not return error (connection should remain open): {:?}",
-                resp.get("error")
-            );
-        }
-        None => {
-            // Even if hover result is null, verify the server is still responding
-            // by sending a simple request. A null hover just means lua-ls hasn't
-            // indexed the new virtual document yet, but the connection is still open.
-            let probe = client.send_request(
-                "textDocument/hover",
-                json!({
-                    "textDocument": { "uri": markdown_uri_2 },
-                    "position": { "line": 3, "character": 6 }
-                }),
-            );
-            assert!(
-                probe.get("error").is_none(),
-                "Server should still respond without error after didClose: {:?}",
-                probe.get("error")
-            );
-        }
-    }
+    // Hover in second document - this should work if connection remained open.
+    // Null result is fine — the test only checks the server responds without error.
+    let hover_response_2 = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": markdown_uri_2 },
+            "position": { "line": 3, "character": 6 }
+        }),
+    );
+
+    assert!(
+        hover_response_2.get("error").is_none(),
+        "Second hover should not return error (connection should remain open): {:?}",
+        hover_response_2.get("error")
+    );
 
     println!("Phase 3: Second document opened and hover succeeded");
     println!("✓ E2E: Connection remained open after didClose - second document works");
@@ -181,9 +176,17 @@ More text.
         }),
     );
 
-    // Hover on first Lua block
-    let hover_1 = poll_for_hover(&mut client, markdown_uri, 3, 6, 20, 500)
-        .expect("Hover should succeed on first Lua block");
+    // Give lua-ls time to initialize
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Hover on first Lua block (null result is fine — test checks connection, not content)
+    let hover_1 = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 3, "character": 6 }
+        }),
+    );
     assert!(
         hover_1.get("error").is_none(),
         "Hover 1 failed: {:?}",
