@@ -12,7 +12,7 @@
 
 mod helpers;
 
-use helpers::lsp_polling::{poll_for_completions, poll_for_hover};
+use helpers::lsp_polling::poll_for_completions;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -58,11 +58,19 @@ More text.
         }),
     );
 
+    // Give lua-ls time to initialize
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     // Phase 2: Trigger hover on "foo" to open the virtual document
     // This sends didOpen to lua-language-server
     // Line 3 is "local foo = 1", position 6 is on "foo"
-    let hover_response =
-        poll_for_hover(&mut client, markdown_uri, 3, 6, 20, 500).expect("Hover should succeed");
+    let hover_response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 3, "character": 6 }
+        }),
+    );
 
     println!("Phase 2: Hover response: {:?}", hover_response);
     assert!(
