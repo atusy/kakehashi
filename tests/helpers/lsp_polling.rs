@@ -168,22 +168,75 @@ pub fn poll_for_completions(
 
 /// Poll for semantic tokens with retries.
 ///
-/// Convenience wrapper around [`poll_for_request`] for `textDocument/semanticTokens/full`.
+/// Convenience wrapper that polls `textDocument/semanticTokens/full` until
+/// a response with non-empty `data` is received. This is stricter than
+/// [`poll_for_request`] because the server may return `{"data": []}` during
+/// a race window where the language hasn't been loaded yet (e.g., before
+/// `didOpen` finishes processing).
 pub fn poll_for_semantic_tokens(
     client: &mut LspClient,
     uri: &str,
     max_attempts: u32,
     delay_ms: u64,
 ) -> Option<serde_json::Value> {
-    poll_for_request(
-        client,
-        "textDocument/semanticTokens/full",
-        json!({
-            "textDocument": { "uri": uri }
-        }),
-        max_attempts,
-        delay_ms,
-    )
+    let method = "textDocument/semanticTokens/full";
+    let params = json!({
+        "textDocument": { "uri": uri }
+    });
+
+    for attempt in 1..=max_attempts {
+        let response = client.send_request(method, params.clone());
+
+        if response.get("error").is_some() {
+            eprintln!(
+                "{} attempt {}/{}: Error: {:?}",
+                method,
+                attempt,
+                max_attempts,
+                response.get("error")
+            );
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            continue;
+        }
+
+        if let Some(result) = response.get("result")
+            && !result.is_null()
+        {
+            // Check for non-empty data to avoid accepting early-exit responses
+            // where the server returns {"data": []} because the language isn't loaded yet.
+            if let Some(data) = result.get("data")
+                && data.as_array().is_some_and(|a| !a.is_empty())
+            {
+                eprintln!(
+                    "{} succeeded on attempt {}/{} with {} tokens",
+                    method,
+                    attempt,
+                    max_attempts,
+                    data.as_array().map_or(0, |a| a.len() / 5)
+                );
+                return Some(response);
+            }
+
+            eprintln!(
+                "{} attempt {}/{}: empty data, retrying...",
+                method, attempt, max_attempts
+            );
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            continue;
+        }
+
+        eprintln!(
+            "{} attempt {}/{}: null result, retrying...",
+            method, attempt, max_attempts
+        );
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+
+    eprintln!(
+        "{} exhausted {} attempts without non-empty data",
+        method, max_attempts
+    );
+    None
 }
 
 /// Poll for selection ranges with retries.
