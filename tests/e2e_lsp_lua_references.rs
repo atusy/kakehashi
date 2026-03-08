@@ -15,7 +15,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{
     create_lua_configured_client, is_lua_ls_available, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -62,20 +61,19 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     // Request references on "name" parameter at line 3 (function greet(name))
     // The parameter 'name' starts at character 21 on line 3
-    let refs_response = poll_for_request(
-        &mut client,
+    let refs_response = client.send_request(
         "textDocument/references",
         json!({
             "textDocument": { "uri": markdown_uri },
             "position": { "line": 3, "character": 23 },
             "context": { "includeDeclaration": true }
         }),
-        20,
-        500,
-    )
-    .expect("Should receive references response");
+    );
 
     println!("References response: {:?}", refs_response);
 
@@ -164,21 +162,20 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     // Request references on "x" with includeDeclaration=false
     // Line 3: local x = 42 (declaration)
     // Line 4: print(x) (usage)
-    let refs_response = poll_for_request(
-        &mut client,
+    let refs_response = client.send_request(
         "textDocument/references",
         json!({
             "textDocument": { "uri": markdown_uri },
             "position": { "line": 4, "character": 7 },  // On 'x' in print(x)
             "context": { "includeDeclaration": false }
         }),
-        20,
-        500,
-    )
-    .expect("Should receive references response");
+    );
 
     println!("References (no decl) response: {:?}", refs_response);
 

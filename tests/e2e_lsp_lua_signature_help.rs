@@ -15,7 +15,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -73,18 +72,18 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     // Request signature help right after "string.format("
     // Line 3 (0-indexed), character 24 (after the opening paren)
-    let sig_help_response = poll_for_lsp_result(
-        &mut client,
+    let sig_help_response = client.send_request(
         "textDocument/signatureHelp",
-        markdown_uri,
-        3,
-        24,
-        20,
-        500,
-    )
-    .expect("Should receive signature help response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 3, "character": 24 }
+        }),
+    );
 
     println!("Signature help response: {:?}", sig_help_response);
 
@@ -157,18 +156,18 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     // Request signature help right after "print("
     // Line 3 (0-indexed), character 6 (after the opening paren)
-    let sig_help_response = poll_for_lsp_result(
-        &mut client,
+    let sig_help_response = client.send_request(
         "textDocument/signatureHelp",
-        markdown_uri,
-        3,
-        6,
-        20,
-        500,
-    )
-    .expect("Should receive signature help response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 3, "character": 6 }
+        }),
+    );
 
     println!("Signature help on print response: {:?}", sig_help_response);
 
@@ -237,18 +236,18 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process - need more time for type analysis
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
     // Request signature help right after "greet("
     // Line 10 (0-indexed), character 6 (after the opening paren)
-    let sig_help_response = poll_for_lsp_result(
-        &mut client,
+    let sig_help_response = client.send_request(
         "textDocument/signatureHelp",
-        markdown_uri,
-        10,
-        6,
-        20,
-        500,
-    )
-    .expect("Should receive signature help response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 10, "character": 6 }
+        }),
+    );
 
     println!(
         "Signature help on custom function response: {:?}",

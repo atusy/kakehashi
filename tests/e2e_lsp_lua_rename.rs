@@ -15,7 +15,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{
     create_lua_configured_client, is_lua_ls_available, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -58,20 +57,19 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     // Request rename on "x" at line 3 (local x = 42)
     // The variable 'x' starts at character 6 on line 3
-    let rename_response = poll_for_request(
-        &mut client,
+    let rename_response = client.send_request(
         "textDocument/rename",
         json!({
             "textDocument": { "uri": markdown_uri },
             "position": { "line": 3, "character": 7 },
             "newName": "counter"
         }),
-        20,
-        500,
-    )
-    .expect("Should receive rename response");
+    );
 
     println!("Rename response: {:?}", rename_response);
 
@@ -207,20 +205,19 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     // Request rename on "name" parameter at line 3
     // The parameter 'name' starts at character 21 on line 3
-    let rename_response = poll_for_request(
-        &mut client,
+    let rename_response = client.send_request(
         "textDocument/rename",
         json!({
             "textDocument": { "uri": markdown_uri },
             "position": { "line": 3, "character": 23 },
             "newName": "personName"
         }),
-        20,
-        500,
-    )
-    .expect("Should receive rename response");
+    );
 
     println!(
         "Rename multiple occurrences response: {:?}",

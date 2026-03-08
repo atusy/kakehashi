@@ -15,7 +15,6 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
-use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
 
@@ -97,17 +96,16 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
     // Request document symbol for the file
-    let symbol_response = poll_for_request(
-        &mut client,
+    let symbol_response = client.send_request(
         "textDocument/documentSymbol",
         json!({
             "textDocument": { "uri": markdown_uri }
         }),
-        20,
-        500,
-    )
-    .expect("Should receive document symbol response");
+    );
 
     println!("Document symbol response: {:?}", symbol_response);
 

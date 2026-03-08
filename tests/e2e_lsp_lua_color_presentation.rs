@@ -17,7 +17,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_request;
 use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
 use serde_json::json;
 
@@ -55,11 +54,13 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+
     // Send colorPresentation request with mock color and range
     // The range points to line 3 (0-indexed) which is inside the Lua code block
     // In host coordinates: line 3 is `local color = "#ff0000"`
-    let color_presentation_response = poll_for_request(
-        &mut client,
+    let color_presentation_response = client.send_request(
         "textDocument/colorPresentation",
         json!({
             "textDocument": { "uri": markdown_uri },
@@ -74,10 +75,7 @@ More text.
                 "end": { "line": 3, "character": 23 }
             }
         }),
-        20,
-        500,
-    )
-    .expect("Should receive color presentation response");
+    );
 
     println!(
         "Color presentation response: {:?}",

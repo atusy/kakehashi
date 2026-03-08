@@ -15,7 +15,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, is_lua_ls_available, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -62,18 +61,18 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     // Request document highlight on "name" parameter at line 3 (function greet(name))
     // The parameter 'name' starts at character 21 on line 3
-    let highlight_response = poll_for_lsp_result(
-        &mut client,
+    let highlight_response = client.send_request(
         "textDocument/documentHighlight",
-        markdown_uri,
-        3,
-        23,
-        20,
-        500,
-    )
-    .expect("Should receive document highlight response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 3, "character": 23 }
+        }),
+    );
 
     println!("Document highlight response: {:?}", highlight_response);
 
@@ -157,22 +156,22 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
     // Request document highlight on "x" at line 3
     // x appears at:
     // - Line 3: local x = 42 (declaration)
     // - Line 4: print(x) (read)
     // - Line 5: local y = x + 1 (read)
     // - Line 6: print(x + y) (read)
-    let highlight_response = poll_for_lsp_result(
-        &mut client,
+    let highlight_response = client.send_request(
         "textDocument/documentHighlight",
-        markdown_uri,
-        3,
-        7,
-        20,
-        500,
-    )
-    .expect("Should receive document highlight response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 3, "character": 7 }  // On 'x' in "local x = 42"
+        }),
+    );
 
     println!(
         "Document highlight multiple occurrences response: {:?}",

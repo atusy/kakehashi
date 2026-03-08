@@ -15,7 +15,6 @@
 
 mod helpers;
 
-use helpers::lsp_polling::poll_for_lsp_result;
 use helpers::lua_bridge::{
     create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
 };
@@ -59,18 +58,18 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
     // Request definition on "greet" at line 7 (function call: greet("World"))
     // The call is at line 7 in the markdown (0-indexed), character 0-5 is "greet"
-    let definition_response = poll_for_lsp_result(
-        &mut client,
+    let definition_response = client.send_request(
         "textDocument/definition",
-        markdown_uri,
-        7,
-        2,
-        20,
-        500,
-    )
-    .expect("Should receive definition response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 7, "character": 2 }
+        }),
+    );
 
     println!("Definition response: {:?}", definition_response);
 
@@ -161,17 +160,17 @@ More text.
         }),
     );
 
+    // Give lua-ls time to process
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
     // Request definition on "x" in print(x) at line 4, character 6
-    let definition_response = poll_for_lsp_result(
-        &mut client,
+    let definition_response = client.send_request(
         "textDocument/definition",
-        markdown_uri,
-        4,
-        6,
-        20,
-        500,
-    )
-    .expect("Should receive definition response");
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 4, "character": 6 }
+        }),
+    );
 
     println!(
         "Definition on local variable response: {:?}",
