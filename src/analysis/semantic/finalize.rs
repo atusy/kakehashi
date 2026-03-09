@@ -238,7 +238,8 @@ fn is_exact_match_active_injection_region(token: &RawToken, regions: &[Injection
 /// line-end or start from column 0 as appropriate.
 ///
 /// Used in tests as a helper to produce precomputed intervals for
-/// `split_host_token_around_regions`.
+/// `split_host_token_around_regions`. Production code uses
+/// `build_region_intervals_map` which precomputes intervals for all lines in one pass.
 #[cfg(test)]
 fn region_intervals_on_line(
     token_line: usize,
