@@ -380,7 +380,7 @@ fn split_host_token_around_regions(
 /// Post-process and delta-encode raw tokens into SemanticTokensResult.
 ///
 /// This shared helper:
-/// 1. Excludes host tokens inside active injection regions
+/// 1. Removes host tokens fully inside active injection regions
 /// 2. Splits overlapping tokens via sweep line
 /// 3. Delta-encodes for LSP protocol
 pub(super) fn finalize_tokens(
