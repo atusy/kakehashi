@@ -19,9 +19,15 @@ use super::token_collector::{InjectionRegion, RawToken};
 /// Priority key for token comparison. Higher values win.
 ///
 /// Comparison order: `priority` (from `#set! priority N`, default 100),
-/// then `depth` (injection depth), then `pattern_index` (later patterns win).
-fn token_priority(t: &RawToken) -> (u32, usize, usize) {
-    (t.priority, t.depth, t.pattern_index)
+/// then `depth` (injection depth), then inverse `node_byte_len` (smaller
+/// nodes are more specific and win), then `pattern_index` (later patterns win).
+fn token_priority(t: &RawToken) -> (u32, usize, usize, usize) {
+    (
+        t.priority,
+        t.depth,
+        usize::MAX - t.node_byte_len,
+        t.pattern_index,
+    )
 }
 
 /// Compute the UTF-16 width of a string.
@@ -87,7 +93,8 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
 ///
 /// For each line, collects breakpoints (start/end columns of all tokens),
 /// then for each interval picks the highest-priority token as the winner.
-/// Priority is determined by `(priority DESC, depth DESC, pattern_index DESC)`.
+/// Priority is determined by `(priority DESC, depth DESC, node_byte_len ASC, pattern_index DESC)`.
+/// Transparent tokens (empty `mapped_name`) are excluded from winner selection.
 ///
 /// This replaces the previous dedup-at-same-position approach, producing
 /// non-overlapping fragments that preserve both parent and child semantics.

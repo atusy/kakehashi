@@ -75,10 +75,11 @@ pub(crate) struct RawToken {
     /// Byte length of the tree-sitter node that produced this token.
     ///
     /// Encodes node specificity (smaller nodes are more specific than larger
-    /// ancestor nodes) and is used during `@none` pre-processing in
-    /// `finalize_tokens()` to determine parent/child relationships when
-    /// splitting tokens around `@none` regions. It is *not* consulted by
-    /// the sweep-line overlap resolution.
+    /// ancestor nodes). Used in two places:
+    /// 1. Sweep-line overlap resolution: smaller nodes win over larger nodes
+    ///    at the same priority and depth (via inverse comparison in `token_priority`)
+    /// 2. `@none` pre-processing: determines parent/child relationships when
+    ///    splitting tokens around `@none` regions
     pub node_byte_len: usize,
 }
 

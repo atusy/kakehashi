@@ -1197,8 +1197,7 @@ fn test_snapshot_blockquote_codeblock_priority() {
     let mut client = LspClient::new();
     init_client_with_full_config(&mut client);
 
-    let content =
-        "> ```\n> codeblock without language\n> ```\n> \n> ```unknown\n> codeblock with unknown language\n> ```\n";
+    let content = "> ```\n> codeblock without language\n> ```\n> \n> ```unknown\n> codeblock with unknown language\n> ```\n";
     let tokens = open_and_get_tokens(&mut client, content);
     let snapshot = build_token_snapshot(&tokens, content);
 
@@ -1211,8 +1210,7 @@ fn test_snapshot_blockquote_codeblock_priority_binary() {
     let mut client = LspClient::new();
     init_client_with_full_config(&mut client);
 
-    let content =
-        "> ```\n> codeblock without language\n> ```\n> \n> ```unknown\n> codeblock with unknown language\n> ```\n";
+    let content = "> ```\n> codeblock without language\n> ```\n> \n> ```unknown\n> codeblock with unknown language\n> ```\n";
     let data = open_and_get_raw_data(&mut client, content);
 
     insta::assert_json_snapshot!("blockquote_codeblock_priority_binary", data);
