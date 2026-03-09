@@ -1176,3 +1176,44 @@ fn test_snapshot_blockquote_triple_nested_injection_binary() {
 
     insta::assert_json_snapshot!("blockquote_triple_nested_injection_binary", data);
 }
+
+/// Snapshot: fenced code block inside blockquote with and without language specifier.
+///
+/// Tests the priority tiebreak between `block_quote` and `fenced_code_block` —
+/// both at `#set! priority 90`. The content lines should show `string`
+/// (from `markup.raw.block`) not `keyword` (from `markup.quote`).
+///
+/// ```markdown
+/// > ```
+/// > codeblock without language
+/// > ```
+///
+/// > ```unknown
+/// > codeblock with unknown language
+/// > ```
+/// ```
+#[test]
+fn test_snapshot_blockquote_codeblock_priority() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content =
+        "> ```\n> codeblock without language\n> ```\n> \n> ```unknown\n> codeblock with unknown language\n> ```\n";
+    let tokens = open_and_get_tokens(&mut client, content);
+    let snapshot = build_token_snapshot(&tokens, content);
+
+    insta::assert_json_snapshot!("blockquote_codeblock_priority", snapshot);
+}
+
+/// Binary snapshot: fenced code block priority inside blockquote.
+#[test]
+fn test_snapshot_blockquote_codeblock_priority_binary() {
+    let mut client = LspClient::new();
+    init_client_with_full_config(&mut client);
+
+    let content =
+        "> ```\n> codeblock without language\n> ```\n> \n> ```unknown\n> codeblock with unknown language\n> ```\n";
+    let data = open_and_get_raw_data(&mut client, content);
+
+    insta::assert_json_snapshot!("blockquote_codeblock_priority_binary", data);
+}
