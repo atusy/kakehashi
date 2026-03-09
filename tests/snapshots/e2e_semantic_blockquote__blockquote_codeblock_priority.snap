@@ -1,0 +1,104 @@
+---
+source: tests/e2e_semantic_blockquote.rs
+expression: snapshot
+---
+[
+  {
+    "line": 0,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 0,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 1,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 2,
+    "length": 26,
+    "type": "string",
+    "text": "codeblock without language"
+  },
+  {
+    "line": 2,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 2,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 3,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 4,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 4,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  },
+  {
+    "line": 4,
+    "start": 5,
+    "length": 7,
+    "type": "variable",
+    "text": "unknown"
+  },
+  {
+    "line": 5,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 5,
+    "start": 2,
+    "length": 31,
+    "type": "string",
+    "text": "codeblock with unknown language"
+  },
+  {
+    "line": 6,
+    "start": 0,
+    "length": 2,
+    "type": "keyword",
+    "text": "> "
+  },
+  {
+    "line": 6,
+    "start": 2,
+    "length": 3,
+    "type": "string",
+    "text": "```"
+  }
+]

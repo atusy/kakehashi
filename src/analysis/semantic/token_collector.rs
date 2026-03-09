@@ -67,7 +67,7 @@ pub(crate) struct RawToken {
     pub depth: usize,
     /// Index of the query pattern that produced this token.
     /// Within a single query, later patterns (higher index) are more specific
-    /// and should override earlier ones at the same position and depth.
+    /// and override earlier ones when priority, depth, and node_byte_len all tie.
     pub pattern_index: usize,
     /// Priority from `#set! priority N` directive (default 100).
     /// Higher values win during overlap resolution.
@@ -75,10 +75,11 @@ pub(crate) struct RawToken {
     /// Byte length of the tree-sitter node that produced this token.
     ///
     /// Encodes node specificity (smaller nodes are more specific than larger
-    /// ancestor nodes) and is used during `@none` pre-processing in
-    /// `finalize_tokens()` to determine parent/child relationships when
-    /// splitting tokens around `@none` regions. It is *not* consulted by
-    /// the sweep-line overlap resolution.
+    /// ancestor nodes). Used in two places:
+    /// 1. Sweep-line overlap resolution: smaller nodes win over larger nodes
+    ///    at the same priority and depth (via inverse comparison in `token_priority`)
+    /// 2. `@none` pre-processing: determines parent/child relationships when
+    ///    splitting tokens around `@none` regions
     pub node_byte_len: usize,
 }
 
@@ -345,7 +346,7 @@ pub(super) fn collect_host_tokens(
             let capture_name = &query.capture_names()[c.index as usize];
             let Some(mapped_name) = apply_capture_mapping(capture_name, filetype, capture_mappings)
             else {
-                // Skip unknown captures (None)
+                // Skip captures explicitly suppressed by user mapping (None)
                 continue;
             };
 

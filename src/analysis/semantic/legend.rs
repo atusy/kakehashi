@@ -58,8 +58,10 @@ pub const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
 /// * `capture_mappings` - The full capture mappings configuration
 ///
 /// # Returns
-/// `Some(mapped_name)` for known token types, `None` for unknown types.
-/// Unknown types (not in LEGEND_TYPES) should not produce semantic tokens.
+/// - `Some(mapped_name)` for known token types (base type in LEGEND_TYPES)
+/// - `Some("")` for unknown types — transparent breakpoint-only tokens
+/// - `Some("none")` for `@none` captures — handled by @none pre-processing
+/// - `None` when user explicitly maps a capture to `""` (suppress entirely)
 pub(super) fn apply_capture_mapping(
     capture_name: &str,
     filetype: Option<&str>,
@@ -94,14 +96,16 @@ pub(super) fn apply_capture_mapping(
     }
 
     // No mapping found - check if the base type is in SemanticTokensLegend.
-    // If not, return None to skip adding to all_tokens.
-    // This prevents unknown captures (e.g., @spell) from blocking meaningful
-    // tokens at the same position during sweep line overlap resolution.
+    // Known types are returned as-is; unknown types return Some("") to create
+    // transparent tokens that generate sweep-line breakpoints without competing
+    // for winner selection.
     let base_type = capture_name.split('.').next().unwrap_or("");
     if LEGEND_TYPES.iter().any(|t| t.as_str() == base_type) {
         Some(capture_name.to_string())
     } else {
-        None
+        // Transparent token: participates in sweep line as a breakpoint
+        // generator but is excluded from winner selection (no token emitted).
+        Some(String::new())
     }
 }
 
@@ -216,11 +220,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::unknown_spell("spell", None)]
-    #[case::unknown_nospell("nospell", None)]
-    #[case::unknown_conceal("conceal", None)]
-    #[case::unknown_markup("markup", None)]
-    #[case::unknown_other("unknown", None)]
+    #[case::unknown_spell("spell", Some(""))]
+    #[case::unknown_nospell("nospell", Some(""))]
+    #[case::unknown_conceal("conceal", Some(""))]
+    #[case::unknown_markup("markup", Some(""))]
+    #[case::unknown_other("unknown", Some(""))]
     #[case::known_comment("comment", Some("comment"))]
     #[case::known_keyword("keyword", Some("keyword"))]
     #[case::known_variable_with_modifier("variable.readonly", Some("variable.readonly"))]

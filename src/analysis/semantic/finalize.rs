@@ -19,9 +19,15 @@ use super::token_collector::{InjectionRegion, RawToken};
 /// Priority key for token comparison. Higher values win.
 ///
 /// Comparison order: `priority` (from `#set! priority N`, default 100),
-/// then `depth` (injection depth), then `pattern_index` (later patterns win).
-fn token_priority(t: &RawToken) -> (u32, usize, usize) {
-    (t.priority, t.depth, t.pattern_index)
+/// then `depth` (injection depth), then inverse `node_byte_len` (smaller
+/// nodes are more specific and win), then `pattern_index` (later patterns win).
+fn token_priority(t: &RawToken) -> (u32, usize, usize, usize) {
+    (
+        t.priority,
+        t.depth,
+        usize::MAX - t.node_byte_len,
+        t.pattern_index,
+    )
 }
 
 /// Compute the UTF-16 width of a string.
@@ -87,7 +93,8 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
 ///
 /// For each line, collects breakpoints (start/end columns of all tokens),
 /// then for each interval picks the highest-priority token as the winner.
-/// Priority is determined by `(priority DESC, depth DESC, pattern_index DESC)`.
+/// Priority is determined by `(priority DESC, depth DESC, node_byte_len ASC, pattern_index DESC)`.
+/// Transparent tokens (empty `mapped_name`) are excluded from winner selection.
 ///
 /// This replaces the previous dedup-at-same-position approach, producing
 /// non-overlapping fragments that preserve both parent and child semantics.
@@ -130,14 +137,20 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                 continue; // zero-length interval
             }
 
-            // Find the highest-priority token covering this interval
+            // Find the highest-priority *visible* token covering this interval.
+            // Transparent tokens (empty mapped_name) only serve as breakpoint
+            // generators — they split intervals at their boundaries but don't
+            // compete for winning.
             let winner = line_tokens
                 .iter()
-                .filter(|t| t.column <= interval_start && t.column + t.length >= interval_end)
+                .filter(|t| {
+                    t.column <= interval_start
+                        && t.column + t.length >= interval_end
+                        && !t.mapped_name.is_empty()
+                })
                 .max_by_key(|t| token_priority(t));
 
             if let Some(winner) = winner {
-                // Emit a fragment with the winner's properties for this interval
                 result.push(RawToken {
                     line: current_line,
                     column: interval_start,
@@ -503,8 +516,9 @@ pub(super) fn finalize_tokens(
     let mut last_start = 0usize;
 
     for token in all_tokens {
-        // Unknown types are already filtered at collection time (apply_capture_mapping returns None),
-        // so map_capture_to_token_type_and_modifiers should always return Some here.
+        // Transparent tokens (empty mapped_name from apply_capture_mapping) may reach here
+        // after sweep-line processing; they are filtered when map_capture_to_token_type_and_modifiers
+        // returns None for the empty string.
         let Some((token_type, token_modifiers_bitset)) =
             map_capture_to_token_type_and_modifiers(&token.mapped_name)
         else {
@@ -1457,6 +1471,126 @@ mod tests {
                 (6, 1, number_type), // number[6,7)
                 (9, 5, string_type), // string[15,20)
             ]
+        );
+    }
+
+    #[test]
+    fn split_transparent_token_creates_breakpoint_only() {
+        // A transparent token (empty mapped_name) creates breakpoints but does
+        // not compete for winning — the best visible token wins each interval.
+        //
+        // Simulates: block_continuation `> ` at col 0-2 (transparent, p=100, nbl=3)
+        //            fenced_code_block at col 0-10 (visible "string", p=90, nbl=50)
+        //            block_quote at col 0-10 (visible "keyword", p=90, nbl=200)
+        //
+        // Expected: fenced_code_block wins both intervals (smaller nbl at same priority)
+        //           → merged into single [0,10) "string" token
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 2,
+                mapped_name: String::new(), // transparent
+                depth: 0,
+                pattern_index: 50,
+                priority: 100,
+                node_byte_len: 3,
+            },
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "string".to_string(), // fenced_code_block
+                depth: 0,
+                pattern_index: 47,
+                priority: 90,
+                node_byte_len: 50,
+            },
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "keyword".to_string(), // block_quote
+                depth: 0,
+                pattern_index: 107,
+                priority: 90,
+                node_byte_len: 200,
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![(0, 10, "string".to_string())],
+            "Transparent tokens are breakpoint-only; best visible token wins"
+        );
+    }
+
+    #[test]
+    fn split_transparent_only_interval_produces_no_token() {
+        // When ALL tokens covering an interval are transparent,
+        // no token is emitted for that interval.
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 5,
+                mapped_name: String::new(), // transparent
+                depth: 0,
+                pattern_index: 10,
+                priority: 100,
+                node_byte_len: 5,
+            },
+            RawToken {
+                line: 0,
+                column: 5,
+                length: 5,
+                mapped_name: "keyword".to_string(), // visible
+                depth: 0,
+                pattern_index: 10,
+                priority: 100,
+                node_byte_len: 5,
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![(5, 5, "keyword".to_string())],
+            "Transparent-only interval [0,5) should produce no token"
+        );
+    }
+
+    #[test]
+    fn split_smaller_node_byte_len_wins_at_same_priority_and_depth() {
+        // Two overlapping tokens at same priority (90) and depth (0), but different node_byte_len.
+        // The smaller node (fenced_code_block, nbl=50) should win over the larger node
+        // (block_quote, nbl=200) because it's more specific.
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "keyword".to_string(), // block_quote → markup.quote
+                depth: 0,
+                pattern_index: 107, // later in query file
+                priority: 90,
+                node_byte_len: 200, // larger node
+            },
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "string".to_string(), // fenced_code_block → markup.raw.block
+                depth: 0,
+                pattern_index: 47, // earlier in query file
+                priority: 90,
+                node_byte_len: 50, // smaller, more specific node
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![(0, 10, "string".to_string())],
+            "Smaller node_byte_len (more specific) should win at same priority/depth"
         );
     }
 
