@@ -67,7 +67,7 @@ pub(crate) struct RawToken {
     pub depth: usize,
     /// Index of the query pattern that produced this token.
     /// Within a single query, later patterns (higher index) are more specific
-    /// and should override earlier ones at the same position and depth.
+    /// and override earlier ones when priority, depth, and node_byte_len all tie.
     pub pattern_index: usize,
     /// Priority from `#set! priority N` directive (default 100).
     /// Higher values win during overlap resolution.

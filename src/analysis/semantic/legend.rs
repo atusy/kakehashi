@@ -104,7 +104,7 @@ pub(super) fn apply_capture_mapping(
         Some(capture_name.to_string())
     } else {
         // Transparent token: participates in sweep line as a breakpoint
-        // but falls back to the most general visible token when it wins.
+        // generator but is excluded from winner selection (no token emitted).
         Some(String::new())
     }
 }
