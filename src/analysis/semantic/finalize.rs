@@ -137,14 +137,20 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                 continue; // zero-length interval
             }
 
-            // Find the highest-priority token covering this interval
+            // Find the highest-priority *visible* token covering this interval.
+            // Transparent tokens (empty mapped_name) only serve as breakpoint
+            // generators — they split intervals at their boundaries but don't
+            // compete for winning.
             let winner = line_tokens
                 .iter()
-                .filter(|t| t.column <= interval_start && t.column + t.length >= interval_end)
+                .filter(|t| {
+                    t.column <= interval_start
+                        && t.column + t.length >= interval_end
+                        && !t.mapped_name.is_empty()
+                })
                 .max_by_key(|t| token_priority(t));
 
             if let Some(winner) = winner {
-                // Emit a fragment with the winner's properties for this interval
                 result.push(RawToken {
                     line: current_line,
                     column: interval_start,
@@ -510,8 +516,9 @@ pub(super) fn finalize_tokens(
     let mut last_start = 0usize;
 
     for token in all_tokens {
-        // Unknown types are already filtered at collection time (apply_capture_mapping returns None),
-        // so map_capture_to_token_type_and_modifiers should always return Some here.
+        // Transparent tokens (empty mapped_name from apply_capture_mapping) may reach here
+        // after sweep-line processing; they are filtered when map_capture_to_token_type_and_modifiers
+        // returns None for the empty string.
         let Some((token_type, token_modifiers_bitset)) =
             map_capture_to_token_type_and_modifiers(&token.mapped_name)
         else {
@@ -1468,16 +1475,16 @@ mod tests {
     }
 
     #[test]
-    fn split_transparent_token_falls_back_to_most_general_visible() {
-        // A transparent token (empty mapped_name) wins an interval at high priority,
-        // but should fall back to the visible token with the largest node_byte_len.
+    fn split_transparent_token_creates_breakpoint_only() {
+        // A transparent token (empty mapped_name) creates breakpoints but does
+        // not compete for winning — the best visible token wins each interval.
         //
         // Simulates: block_continuation `> ` at col 0-2 (transparent, p=100, nbl=3)
         //            fenced_code_block at col 0-10 (visible "string", p=90, nbl=50)
         //            block_quote at col 0-10 (visible "keyword", p=90, nbl=200)
         //
-        // Expected: [0,2) → "keyword" (fallback to largest visible: block_quote)
-        //           [2,10) → "string" (fenced_code_block wins via smaller nbl)
+        // Expected: fenced_code_block wins both intervals (smaller nbl at same priority)
+        //           → merged into single [0,10) "string" token
         let tokens = vec![
             RawToken {
                 line: 0,
@@ -1513,11 +1520,42 @@ mod tests {
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![
-                (0, 2, "keyword".to_string()), // transparent fallback to largest visible
-                (2, 8, "string".to_string()),   // smaller nbl wins
-            ],
-            "Transparent token should fall back to most general visible token"
+            vec![(0, 10, "string".to_string())],
+            "Transparent tokens are breakpoint-only; best visible token wins"
+        );
+    }
+
+    #[test]
+    fn split_transparent_only_interval_produces_no_token() {
+        // When ALL tokens covering an interval are transparent,
+        // no token is emitted for that interval.
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 5,
+                mapped_name: String::new(), // transparent
+                depth: 0,
+                pattern_index: 10,
+                priority: 100,
+                node_byte_len: 5,
+            },
+            RawToken {
+                line: 0,
+                column: 5,
+                length: 5,
+                mapped_name: "keyword".to_string(), // visible
+                depth: 0,
+                pattern_index: 10,
+                priority: 100,
+                node_byte_len: 5,
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![(5, 5, "keyword".to_string())],
+            "Transparent-only interval [0,5) should produce no token"
         );
     }
 

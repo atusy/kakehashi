@@ -346,7 +346,7 @@ pub(super) fn collect_host_tokens(
             let capture_name = &query.capture_names()[c.index as usize];
             let Some(mapped_name) = apply_capture_mapping(capture_name, filetype, capture_mappings)
             else {
-                // Skip unknown captures (None)
+                // Skip captures explicitly suppressed by user mapping (None)
                 continue;
             };
 
