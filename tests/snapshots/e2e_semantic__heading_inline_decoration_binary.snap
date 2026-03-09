@@ -1,0 +1,21 @@
+---
+source: tests/e2e_semantic.rs
+expression: data_u32
+---
+[
+  0,
+  0,
+  11,
+  9,
+  0,
+  0,
+  11,
+  8,
+  1,
+  0,
+  0,
+  8,
+  12,
+  9,
+  0
+]

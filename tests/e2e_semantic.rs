@@ -545,3 +545,85 @@ fn test_semantic_tokens_markdown_inline_bold() {
         token_info
     );
 }
+
+/// Binary snapshot: heading with inline decorations.
+///
+/// Captures the raw delta-encoded `[u32]` data for a heading that contains
+/// both plain text and inline formatting (`**bold**`). This guards against
+/// regressions where non-decorated parts of headings lose their semantic token
+/// because the host heading token is incorrectly excluded from the
+/// markdown_inline injection region.
+///
+/// ```text
+/// ## heading **with** decorations
+/// ---------- -------- -----------
+/// ^             ^     ^@class
+/// |             |
+/// -- @class     -- @keyword
+/// ```
+#[test]
+fn test_snapshot_heading_inline_decoration_binary() {
+    let mut client = LspClient::new();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "captureMappings": {
+                    "_": {
+                        "highlights": {
+                            "markup.heading": "class",
+                            "markup.heading.1": "class",
+                            "markup.heading.2": "class",
+                            "markup.strong": "keyword"
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let content = "## heading **with** decorations\n";
+    let temp_file = tempfile::Builder::new()
+        .suffix(".md")
+        .tempfile()
+        .expect("Failed to create temp file");
+    std::fs::write(temp_file.path(), content).expect("Failed to write temp file");
+    let uri = url::Url::from_file_path(temp_file.path())
+        .expect("Failed to construct URI")
+        .to_string();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+
+    std::thread::sleep(Duration::from_millis(1000));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    let result = response
+        .get("result")
+        .expect("Should have result in response");
+    let data = result
+        .get("data")
+        .expect("Result should have data")
+        .as_array()
+        .expect("Data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+
+    insta::assert_json_snapshot!("heading_inline_decoration_binary", data_u32);
+}
