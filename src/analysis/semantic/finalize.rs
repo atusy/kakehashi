@@ -1468,6 +1468,60 @@ mod tests {
     }
 
     #[test]
+    fn split_transparent_token_falls_back_to_most_general_visible() {
+        // A transparent token (empty mapped_name) wins an interval at high priority,
+        // but should fall back to the visible token with the largest node_byte_len.
+        //
+        // Simulates: block_continuation `> ` at col 0-2 (transparent, p=100, nbl=3)
+        //            fenced_code_block at col 0-10 (visible "string", p=90, nbl=50)
+        //            block_quote at col 0-10 (visible "keyword", p=90, nbl=200)
+        //
+        // Expected: [0,2) → "keyword" (fallback to largest visible: block_quote)
+        //           [2,10) → "string" (fenced_code_block wins via smaller nbl)
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 2,
+                mapped_name: String::new(), // transparent
+                depth: 0,
+                pattern_index: 50,
+                priority: 100,
+                node_byte_len: 3,
+            },
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "string".to_string(), // fenced_code_block
+                depth: 0,
+                pattern_index: 47,
+                priority: 90,
+                node_byte_len: 50,
+            },
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "keyword".to_string(), // block_quote
+                depth: 0,
+                pattern_index: 107,
+                priority: 90,
+                node_byte_len: 200,
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![
+                (0, 2, "keyword".to_string()), // transparent fallback to largest visible
+                (2, 8, "string".to_string()),   // smaller nbl wins
+            ],
+            "Transparent token should fall back to most general visible token"
+        );
+    }
+
+    #[test]
     fn split_smaller_node_byte_len_wins_at_same_priority_and_depth() {
         // Two overlapping tokens at same priority (90) and depth (0), but different node_byte_len.
         // The smaller node (fenced_code_block, nbl=50) should win over the larger node
