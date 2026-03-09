@@ -1461,6 +1461,41 @@ mod tests {
     }
 
     #[test]
+    fn split_smaller_node_byte_len_wins_at_same_priority_and_depth() {
+        // Two overlapping tokens at same priority (90) and depth (0), but different node_byte_len.
+        // The smaller node (fenced_code_block, nbl=50) should win over the larger node
+        // (block_quote, nbl=200) because it's more specific.
+        let tokens = vec![
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "keyword".to_string(), // block_quote → markup.quote
+                depth: 0,
+                pattern_index: 107, // later in query file
+                priority: 90,
+                node_byte_len: 200, // larger node
+            },
+            RawToken {
+                line: 0,
+                column: 0,
+                length: 10,
+                mapped_name: "string".to_string(), // fenced_code_block → markup.raw.block
+                depth: 0,
+                pattern_index: 47, // earlier in query file
+                priority: 90,
+                node_byte_len: 50, // smaller, more specific node
+            },
+        ];
+        let fragments = extract_fragments(tokens);
+        assert_eq!(
+            fragments,
+            vec![(0, 10, "string".to_string())],
+            "Smaller node_byte_len (more specific) should win at same priority/depth"
+        );
+    }
+
+    #[test]
     fn finalize_preserves_host_token_exactly_matching_active_injection_region() {
         // Reproduces the fish comment bug: a host `comment` token (depth=0)
         // exactly matches an active injection region because `(comment) @comment`
