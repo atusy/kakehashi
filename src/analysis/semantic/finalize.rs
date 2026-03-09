@@ -396,47 +396,56 @@ pub(super) fn finalize_tokens(
     // Unknown captures are already filtered at collection time (apply_capture_mapping returns None).
     all_tokens.retain(|token| token.length > 0);
 
-    // Injection region exclusion: remove or split host tokens (depth=0) that
-    // overlap with active injection regions.
+    // Injection region handling for host tokens (depth=0):
     //
-    // Host tokens fully inside a region are removed entirely — UNLESS the
-    // token exactly matches a region's bounds. Exact matches occur when a
-    // host capture and injection content share the same tree-sitter node
-    // (e.g., fish `(comment) @comment` + `(comment) @injection.content`).
-    // In that case the sweep-line algorithm resolves the overlap, preserving
-    // the host token in gaps not covered by injection tokens.
-    //
-    // Host tokens that partially overlap (e.g., a `@markup.raw.block` token
-    // covering both `> ` prefix and code content in a blockquote) are split,
-    // keeping only the fragments outside the injection regions.
+    // - Fully inside a region → remove (prevents code block host token leaks)
+    // - Exact match → keep for sweep line (fish comment pattern)
+    // - Partial overlap with single-line region → keep entire token so the
+    //   sweep line can fill gaps with the host token as fallback (e.g., a
+    //   heading token covers plain text that markdown_inline doesn't capture)
+    // - Partial overlap with multiline region → split, keep outside fragments
+    //   only (e.g., blockquote `> ` prefix survives but content is removed)
     if !active_injection_regions.is_empty() {
         let region_map = build_region_intervals_map(active_injection_regions, lines);
         let mut filtered = Vec::with_capacity(all_tokens.len());
         for token in all_tokens {
             if token.depth > 0 {
-                // Non-host tokens (injection tokens) are always kept
                 filtered.push(token);
                 continue;
             }
-            // Exact-match exception: when a host token's bounds match a region
-            // exactly, keep it so the sweep-line can split it around injection
-            // tokens. This mirrors the is_in_exclusion_range() exact-match
-            // exception in token_collector.rs.
             if is_exact_match_active_injection_region(&token, active_injection_regions) {
                 filtered.push(token);
                 continue;
             }
             if is_fully_in_active_injection_region(&token, active_injection_regions) {
-                // Fully contained (strictly) → remove entirely (fast path)
                 continue;
             }
-            // Check for partial overlap and split if needed.
-            let intervals = region_map
-                .get(&token.line)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            let fragments = split_host_token_around_regions(&token, intervals);
-            filtered.extend(fragments);
+            // Partial overlap: check if any overlapping region is single-line.
+            // Single-line regions indicate a direct child injection (e.g.,
+            // markdown_inline within a heading) where the host token should
+            // fill gaps. Multiline regions indicate container injections
+            // (e.g., blockquote content) where the host should not leak.
+            //
+            // Note: a token overlapping both single-line and multiline regions
+            // simultaneously is not a practical concern — the hierarchical
+            // injection architecture processes each depth level separately,
+            // so a given depth's active regions are homogeneous in nature.
+            let token_end = token.column + token.length;
+            let overlaps_single_line_region = active_injection_regions.iter().any(|r| {
+                r.start_line == r.end_line
+                    && r.start_line == token.line
+                    && r.start_col < token_end
+                    && r.end_col > token.column
+            });
+            if overlaps_single_line_region {
+                filtered.push(token);
+            } else {
+                let intervals = region_map
+                    .get(&token.line)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                filtered.extend(split_host_token_around_regions(&token, intervals));
+            }
         }
         all_tokens = filtered;
     }
@@ -1591,6 +1600,138 @@ mod tests {
             fragments,
             vec![(0, 10, "string".to_string())],
             "Smaller node_byte_len (more specific) should win at same priority/depth"
+        );
+    }
+
+    #[test]
+    fn finalize_host_token_fills_gaps_in_active_injection_region() {
+        // Reproduces the heading bug: `## heading **with** decorations`
+        // The host heading token covers the full line, and the injection region
+        // covers everything after `## `. Only **with** gets an injection token.
+        // The host token should fill gaps where injection produces nothing.
+        //
+        // Input:  "## heading **with** decorations"
+        //          0         1         2         3
+        //          0123456789012345678901234567890
+        //
+        // Host:   class [0, 31) depth=0
+        // Inj:    keyword [11, 19) depth=1  (**with**)
+        // Region: [3, 31)
+        let line_text = "## heading **with** decorations";
+        let lines: Vec<&str> = vec![line_text];
+        let tokens = vec![
+            make_token(0, 0, 31, "class", 0, 0),   // host heading (full line)
+            make_token(0, 11, 8, "keyword", 1, 0), // injection emphasis (**with**)
+        ];
+        let regions = vec![InjectionRegion {
+            start_line: 0,
+            start_col: 3,
+            end_line: 0,
+            end_col: 31,
+        }];
+
+        let result = finalize_tokens(tokens, &regions, &lines);
+        assert!(result.is_some());
+
+        let SemanticTokensResult::Tokens(st) = result.unwrap() else {
+            panic!("Expected Tokens");
+        };
+
+        let (class_type, _) = map_capture_to_token_type_and_modifiers("class").unwrap();
+        let (keyword_type, _) = map_capture_to_token_type_and_modifiers("keyword").unwrap();
+
+        let positions: Vec<(u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| (t.delta_start, t.length, t.token_type))
+            .collect();
+
+        // Expected: class[0,11) + keyword[11,19) + class[19,31)
+        assert_eq!(
+            positions,
+            vec![
+                (0, 11, class_type),   // class [0, 11)  "## heading "
+                (11, 8, keyword_type), // keyword [11, 19)  "**with**"  delta=11
+                (8, 12, class_type),   // class [19, 31)  " decorations" delta=19-11=8
+            ],
+            "Host heading should fill gaps in injection region"
+        );
+    }
+
+    #[test]
+    fn finalize_preserves_host_token_when_injection_region_inactive() {
+        // Heading without inline decorations: `## plain heading`
+        // The markdown_inline injection region exists but produces no tokens
+        // (plain text has no captures), so it's INACTIVE. Host token survives
+        // because inactive regions don't trigger exclusion at all.
+        let line_text = "## plain heading";
+        let lines: Vec<&str> = vec![line_text];
+        let tokens = vec![
+            make_token(0, 0, 16, "class", 0, 0), // host heading (full line)
+        ];
+        // No active injection regions (markdown_inline produced nothing)
+        let regions: Vec<InjectionRegion> = vec![];
+
+        let result = finalize_tokens(tokens, &regions, &lines);
+        assert!(result.is_some());
+
+        let SemanticTokensResult::Tokens(st) = result.unwrap() else {
+            panic!("Expected Tokens");
+        };
+
+        let (class_type, _) = map_capture_to_token_type_and_modifiers("class").unwrap();
+        assert_eq!(st.data.len(), 1, "Single heading token should survive");
+        assert_eq!(st.data[0].delta_line, 0);
+        assert_eq!(st.data[0].delta_start, 0);
+        assert_eq!(st.data[0].length, 16);
+        assert_eq!(st.data[0].token_type, class_type);
+    }
+
+    #[test]
+    fn finalize_splits_host_token_for_multiline_region_partial_overlap() {
+        // Host token (depth=0) on line 0 partially overlaps a multiline
+        // injection region starting at (line 0, col 3). The prefix [0,3)
+        // survives; the content [3,10) inside the region is removed.
+        //
+        // This exercises the multiline split path: when the overlapping
+        // region is multiline, the host token is split (not kept whole).
+        let line_text = ">> foo bar";
+        let lines: Vec<&str> = vec![line_text, ">> baz", ">> end"];
+        let tokens = vec![
+            make_token(0, 0, 10, "string", 0, 0), // host container token
+            make_token(0, 3, 3, "keyword", 1, 0), // injection token
+        ];
+        let regions = vec![InjectionRegion {
+            start_line: 0,
+            start_col: 3,
+            end_line: 2,
+            end_col: 6,
+        }];
+
+        let result = finalize_tokens(tokens, &regions, &lines);
+        assert!(result.is_some());
+
+        let SemanticTokensResult::Tokens(st) = result.unwrap() else {
+            panic!("Expected Tokens");
+        };
+
+        let (string_type, _) = map_capture_to_token_type_and_modifiers("string").unwrap();
+        let (keyword_type, _) = map_capture_to_token_type_and_modifiers("keyword").unwrap();
+
+        let positions: Vec<(u32, u32, u32, u32)> = st
+            .data
+            .iter()
+            .map(|t| (t.delta_line, t.delta_start, t.length, t.token_type))
+            .collect();
+
+        // Only prefix survives from host; injection keyword kept
+        assert_eq!(
+            positions,
+            vec![
+                (0, 0, 3, string_type),  // string [0,3)  ">> "
+                (0, 3, 3, keyword_type), // keyword [3,6) "foo"
+            ],
+            "Host token should be split for multiline region, keeping only prefix"
         );
     }
 
