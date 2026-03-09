@@ -238,8 +238,7 @@ fn is_exact_match_active_injection_region(token: &RawToken, regions: &[Injection
 /// line-end or start from column 0 as appropriate.
 ///
 /// Used in tests as a helper to produce precomputed intervals for
-/// `split_host_token_around_regions`. Production code uses
-/// `build_region_intervals_map` which precomputes intervals for all lines in one pass.
+/// `split_host_token_around_regions`.
 #[cfg(test)]
 fn region_intervals_on_line(
     token_line: usize,
@@ -315,13 +314,8 @@ fn build_region_intervals_map(
 /// Split a host token around injection region intervals, keeping only the
 /// fragments that fall outside all regions.
 ///
-/// This handles the case where a host token (e.g., `@markup.raw.block` covering
-/// the full fenced_code_block including `> ` prefix) partially overlaps with an
-/// injection region. The overlapping part is removed; non-overlapping fragments
-/// (like the `> ` prefix) survive.
-///
-/// `intervals` should be the precomputed sorted intervals for the token's line,
-/// obtained from `build_region_intervals_map`.
+/// Used by both injection region exclusion (multiline partial overlaps) and
+/// `@none` pre-processing to punch holes in parent tokens.
 fn split_host_token_around_regions(
     token: &RawToken,
     intervals: &[(usize, usize)],
