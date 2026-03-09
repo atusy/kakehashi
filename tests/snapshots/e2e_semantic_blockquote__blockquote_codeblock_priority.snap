@@ -20,9 +20,16 @@ expression: snapshot
   {
     "line": 1,
     "start": 0,
-    "length": 28,
+    "length": 2,
     "type": "keyword",
-    "text": "> codeblock without language"
+    "text": "> "
+  },
+  {
+    "line": 1,
+    "start": 2,
+    "length": 26,
+    "type": "string",
+    "text": "codeblock without language"
   },
   {
     "line": 2,
@@ -69,9 +76,16 @@ expression: snapshot
   {
     "line": 5,
     "start": 0,
-    "length": 33,
+    "length": 2,
     "type": "keyword",
-    "text": "> codeblock with unknown language"
+    "text": "> "
+  },
+  {
+    "line": 5,
+    "start": 2,
+    "length": 31,
+    "type": "string",
+    "text": "codeblock with unknown language"
   },
   {
     "line": 6,

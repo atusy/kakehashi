@@ -41,9 +41,16 @@ expression: snapshot
   {
     "line": 1,
     "start": 5,
-    "length": 5,
+    "length": 2,
     "type": "class",
-    "text": "# foo"
+    "text": "# "
+  },
+  {
+    "line": 1,
+    "start": 7,
+    "length": 3,
+    "type": "keyword",
+    "text": "foo"
   },
   {
     "line": 2,
