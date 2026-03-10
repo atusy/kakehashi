@@ -132,7 +132,7 @@ There is no special case for `_` — it terminates the chain simply because its 
 
 | Condition | Behavior |
 |---|---|
-| **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected via visited set. Chain terminates at the cycle point. Logged as warning. |
+| **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected via visited set. Chain terminates at the cycle point. `_` is **not** appended to the truncated chain — the language loses wildcard defaults. Logged as warning. This is intentional: circular configs are user errors, and the degraded behavior (plus warning log) signals the need to fix the config. |
 | **Self-reference** (`a.base = "a"`) | Special case of circular reference. Same behavior. |
 | **Undefined base language** | Treated as empty config with `base = None` (see "Undefined Languages in the Chain" above). Not an error. |
 
@@ -140,7 +140,9 @@ Circular detection follows the same pattern as query `; inherits:` resolution (v
 
 ### Nested Wildcard Resolution (Phase 3)
 
-Base chain resolution (Phase 2) generalizes ADR-0011's wildcard resolution for the outer `languages` map. After the chain produces an effective config, inner wildcards (e.g., `bridge._`) are still resolved per ADR-0011 in Phase 3:
+Base chain resolution (Phase 2) **subsumes** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 resolved `effective[python] = merge(languages["_"], languages["python"])` at access time. With base chains, `_` is already included as the root of the chain (since every chain terminates at `_` via `base = ""`), so the outer wildcard merge is no longer needed — it is replaced entirely by the base chain walk. The existing `resolve_language_settings_with_wildcard()` for the outer `languages` map is removed; Phase 2 handles it.
+
+Phase 3 applies only to **nested** wildcards (e.g., `bridge._`) within the effective config produced by Phase 2:
 
 ```
 effective_config[rmd].bridge[python] = merge(
@@ -219,6 +221,12 @@ try_with_base_fallback("rmd"):
 The key difference: with `base`, the language `rmd` is a first-class entry in the config, not a reverse lookup in an alias map. Detection finds `rmd` directly, and the base chain handles parser resolution.
 
 Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged — it operates before the base chain.
+
+**Concrete function changes in `LanguageCoordinator`:**
+
+- `try_with_alias_fallback()` is removed. Its callers (`detect_language_with_method()`, `resolve_injection_language()`) no longer need alias lookup — any language name that exists as a key in the `languages` config (including derived languages like `rmd`) is resolved directly via the base chain.
+- `resolve_injection_language()` currently falls back through syntect normalization → alias lookup. With `base`, the fallback becomes: syntect normalization → direct config lookup (the base chain handles parser resolution for any configured language).
+- `build_alias_map()` and `alias_map` are removed entirely.
 
 ### Configuration Examples
 
