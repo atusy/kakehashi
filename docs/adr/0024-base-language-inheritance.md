@@ -65,14 +65,7 @@ Configuration resolution proceeds in three phases:
 
 The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageConfig` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (overlay semantics per ADR-0010).
 
-Every language config gains an optional `base` field:
-
-```rust
-pub struct LanguageConfig {
-    pub base: Option<String>,  // default: None (implicitly "_")
-    // ... existing fields
-}
-```
+Every language config gains an optional `base` field (default: not set, implicitly `"_"`):
 
 | `base` value | Meaning | Typical use |
 |---|---|---|
@@ -84,7 +77,7 @@ pub struct LanguageConfig {
 - When `base` is `None` (or omitted), the language inherits from `_` (wildcard), preserving current ADR-0011 behavior. `base = "_"` is equivalent to `None`.
 - When `base` is `""` (empty string), the language has **no base** — it does not inherit from `_` or any other language. This is useful for fully self-contained language configs that should not pick up wildcard defaults.
 - When `base` is explicitly set to a non-empty value (e.g., `"markdown"`), the language inherits from that language instead of directly from `_`.
-- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased in code; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`".
+- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`".
 - The chain always terminates at `base = ""`: `rmd -> markdown -> _` (where `_` has `base = ""`).
 
 ### Undefined Languages in the Chain
@@ -136,11 +129,11 @@ There is no special case for `_` — it terminates the chain simply because its 
 | **Self-reference** (`a.base = "a"`) | Special case of circular reference. Same behavior. |
 | **Undefined base language** | Treated as empty config with `base = None` (see "Undefined Languages in the Chain" above). Not an error. |
 
-Circular detection follows the same pattern as query `; inherits:` resolution (visited `HashSet`).
+Circular detection follows the same approach as query `; inherits:` resolution (tracking visited languages to detect cycles).
 
 ### Nested Wildcard Resolution (Phase 3)
 
-Base chain resolution (Phase 2) **subsumes** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 resolved `effective[python] = merge(languages["_"], languages["python"])` at access time. With base chains, `_` is already included as the root of the chain (since every chain terminates at `_` via `base = ""`), so the outer wildcard merge is no longer needed — it is replaced entirely by the base chain walk. The existing `resolve_language_settings_with_wildcard()` for the outer `languages` map is removed; Phase 2 handles it.
+Base chain resolution (Phase 2) **subsumes** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 resolved `effective[python] = merge(languages["_"], languages["python"])` at access time. With base chains, `_` is already included as the root of the chain (since every chain terminates at `_` via `base = ""`), so the outer `languages._` wildcard merge is no longer needed — it is replaced entirely by the base chain walk.
 
 Phase 3 applies only to **nested** wildcards (e.g., `bridge._`) within the effective config produced by Phase 2:
 
@@ -155,41 +148,21 @@ Note: `base = ""` on an intermediate language (e.g., `markdown.base = ""`) inten
 
 ### Parser Fallback Chain
 
-When loading a parser for a language, the `base` chain determines the search order:
+When loading a parser for a language, the `base` chain determines the search order. Resolution walks the chain from most-specific to least-specific. At each level, an explicit parser path in the config is checked before searching `searchPaths`:
 
-```
-load_parser("rmd"):
-    1. config["rmd"].parser           -- explicit parser path in rmd config
-    2. searchPaths/parser/rmd.{so,dylib,dll}  -- search paths with rmd name
-    3. config["markdown"].parser      -- explicit parser path in base config
-    4. searchPaths/parser/markdown.{so,dylib,dll}  -- search paths with base name
-    5. (continue up the chain until "_")
-```
+| Priority | Source | Example for `rmd` (base = `"markdown"`) |
+|---|---|---|
+| 1 | Derived language explicit config | `config["rmd"].parser` |
+| 2 | Derived language searchPaths | `searchPaths/parser/rmd.{so,dylib,dll}` |
+| 3 | Base language explicit config | `config["markdown"].parser` |
+| 4 | Base language searchPaths | `searchPaths/parser/markdown.{so,dylib,dll}` |
+| ... | Continue up the chain until `_` | |
 
-**Critical — parser symbol name**: When loading a parser library from a base language (e.g., `markdown.so` for `rmd`), the dynamic symbol lookup must use `tree_sitter_markdown`, not `tree_sitter_rmd`. The `load_language(path, lang_name)` API derives the symbol as `tree_sitter_{lang_name}`, so the call must pass the **base language name** that owns the `.so` file:
-
-```
-// Loading markdown.so for rmd:
-let language = load_language("markdown.so", "markdown");  // symbol: tree_sitter_markdown
-registry.register("rmd", language);                        // registered under derived name
-```
-
-The loaded `Language` grammar object is registered under the derived language name (`rmd`), ensuring all subsequent lookups by language name work correctly.
+**Critical — parser symbol name**: When a derived language resolves to a base language's parser library (e.g., `markdown.so` for `rmd`), the dynamic symbol lookup must use the base language's name (`tree_sitter_markdown`), not the derived language's name. The loaded grammar is then registered under the derived language name (`rmd`), ensuring all subsequent lookups by language name work correctly.
 
 ### Query Fallback Chain
 
-Query files (highlights.scm, locals.scm, injections.scm) follow the same chain:
-
-```
-load_queries("rmd"):
-    1. config["rmd"].queries          -- explicit query paths in rmd config
-    2. searchPaths/queries/rmd/*.scm  -- search paths with rmd name
-    3. config["markdown"].queries     -- explicit query paths in base config
-    4. searchPaths/queries/markdown/*.scm  -- search paths with base name
-    5. (continue up the chain)
-```
-
-The first level in the chain that provides queries wins (queries are replaced entirely, not merged, per ADR-0010).
+Query files (highlights.scm, locals.scm, injections.scm) follow the same chain as parser resolution — walking from most-specific to least-specific, checking explicit config then searchPaths at each level. The first level in the chain that provides queries wins (queries are replaced entirely, not merged, per ADR-0010).
 
 **Interaction with `; inherits:` in query files**: Query files can contain `; inherits: <language>` directives that trigger query-level inheritance (resolved by the query loader). This is a separate mechanism from the config-level `base` chain. Both can coexist:
 
@@ -202,31 +175,13 @@ For example, if `rmd` falls back to `markdown`'s queries via the base chain, and
 
 The language detection fallback chain from ADR-0005 changes:
 
-**Before** (alias-based):
-```
-try_with_alias_fallback("rmd"):
-    1. Is "rmd" a registered parser? -> No
-    2. Is "rmd" an alias? -> Yes, maps to "markdown"
-    3. Is "markdown" a registered parser? -> Yes, use it
-```
+**Before** (alias-based): Detection finds `"rmd"` is not a registered parser, looks up the alias map, discovers it maps to `"markdown"`, and uses the markdown parser.
 
-**After** (base-based):
-```
-try_with_base_fallback("rmd"):
-    1. Is "rmd" in languages config? -> Yes
-    2. Load parser for "rmd" via base chain -> finds markdown.so
-    3. Register as "rmd" parser -> use it
-```
+**After** (base-based): Detection finds `"rmd"` directly in the languages config. The base chain resolves its parser (finding `markdown.so`), and the parser is registered under `"rmd"`.
 
-The key difference: with `base`, the language `rmd` is a first-class entry in the config, not a reverse lookup in an alias map. Detection finds `rmd` directly, and the base chain handles parser resolution.
+The key difference: with `base`, the language `rmd` is a first-class entry in the config, not a reverse lookup in an alias map. Detection finds `rmd` directly, and the base chain handles parser resolution. This also applies to injection language resolution — injected language identifiers are looked up directly in the config, and the base chain handles parser fallback.
 
 Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged — it operates before the base chain.
-
-**Concrete function changes in `LanguageCoordinator`:**
-
-- `try_with_alias_fallback()` is removed. Its callers (`detect_language_with_method()`, `resolve_injection_language()`) no longer need alias lookup — any language name that exists as a key in the `languages` config (including derived languages like `rmd`) is resolved directly via the base chain.
-- `resolve_injection_language()` currently falls back through syntect normalization → alias lookup. With `base`, the fallback becomes: syntect normalization → direct config lookup (the base chain handles parser resolution for any configured language).
-- `build_alias_map()` and `alias_map` are removed entirely.
 
 ### Configuration Examples
 
@@ -285,7 +240,7 @@ queries = [{ path = "/path/to/highlights.scm" }]
 
 ### Removed: `aliases` Field
 
-The `aliases` field is removed from `LanguageConfig` and `LanguageSettings`. The `alias_map`, `build_alias_map()`, and `resolve_alias()` in `LanguageCoordinator` are also removed.
+The `aliases` field is removed from language configuration.
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
@@ -320,7 +275,7 @@ This is a breaking change. The project is in beta (per CLAUDE.md), so this is ac
 
 ### Neutral
 
-- **`_` is not special-cased in code**: It terminates the chain via `base = ""` (its default), not via name-based branching. However, `_` remains reserved as a key name (unchanged from ADR-0011)
+- **`_` is not special-cased**: It terminates the chain via `base = ""` (its default), not via name-based branching. However, `_` remains reserved as a key name (unchanged from ADR-0011)
 - **`base` chain is linear**: Single parent only — no multi-inheritance complexity
 - **Lazy resolution**: Chain resolved at access time, consistent with ADR-0011 wildcard pattern
 - **Auto-install interaction**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`)
