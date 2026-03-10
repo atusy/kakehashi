@@ -25,7 +25,7 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 rust-lapper = "1.1"
 serde = { version = "1", features = ["derive"] }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-onig"] }
-two-face = { version = "0.4", features = ["syntect-default-onig"] }
+two-face = { version = "0.5", features = ["syntect-default-onig"] }
 serde_json = "1"
 shellexpand = "3"
 similar = "2.7"
@@ -35,8 +35,8 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "process", "fs"] }
 tokio-util = "0.7"
-toml = "0.9"
-tower = { version = "0.4", default-features = false }
+toml = "1"
+tower = { version = "0.5", default-features = false }
 tower-lsp-server = "0.23"
 tree-sitter = "0.26"
 tree-sitter-loader = "0.26"
@@ -49,7 +49,7 @@ futures = "0.3.31"
 
 # Unix-only dependencies (signal handling)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [features]
 e2e = []

@@ -67,6 +67,7 @@ fn build_baseline_capabilities() -> ClientCapabilities {
         diagnostic: Some(DiagnosticClientCapabilities {
             dynamic_registration: Some(true),
             related_document_support: Some(true),
+            ..Default::default()
         }),
         moniker: Some(DynamicRegistrationClientCapabilities {
             dynamic_registration: Some(false),

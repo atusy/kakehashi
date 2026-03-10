@@ -1164,6 +1164,7 @@ impl LanguageServer for Kakehashi {
                 name: "kakehashi".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
+            offset_encoding: None,
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
