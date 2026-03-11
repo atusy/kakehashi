@@ -61,7 +61,7 @@ Each derived language declares its own parent and can override any configuration
 Configuration resolution proceeds in three phases. Each phase depends on the output of the previous one, so this ordering is mandatory:
 
 1. **Layer merge** (ADR-0010): programmed defaults → user config → project config → `initializationOptions`. Produces a single merged config per language, including `base` field values.
-2. **Base chain resolution** (this ADR): walk the `base` chain across languages, merge most-specific-wins. This merges configs *across languages* (vertical), whereas Phase 1 merges *within each language across layers* (horizontal). Produces the effective config for each language.
+2. **Base chain resolution** (this ADR): walk the `base` chain across languages, merge most-specific-wins. This merges configs *across languages* (vertical), whereas Phase 1 merges *within each language across layers* (horizontal). Merge order is lowest to highest priority: `_ ← markdown ← rmd`. For multi-level chains: `_ ← markdown ← markdown_custom ← rmd`. Produces the effective config for each language.
 3. **Nested wildcard resolution** (ADR-0011): resolve `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). Operates on the output of Phase 2.
 
 ### The `base` Field
@@ -86,14 +86,6 @@ Every language config gains an optional `base` field (default: not set, implicit
 ### Undefined Languages in the Chain
 
 Languages referenced in the `base` field do not need to be explicitly defined in configuration. If `base` points to an undefined language, the chain continues through it toward `_`, and parser/query resolution still searches `searchPaths` using that language's name. No error is raised — this is the normal case for languages discovered via `searchPaths` without explicit config.
-
-### Resolution Chain
-
-Configuration for a language is resolved by walking the `base` chain and merging, where later (more specific) entries override earlier (more general) entries — consistent with ADR-0011's "specific overrides wildcard" semantics.
-
-Merge order (lowest to highest priority): `_ ← markdown ← rmd`
-
-For multi-level chains: `_ ← markdown ← markdown_custom ← rmd`
 
 ### Chain Termination and Error Handling
 
