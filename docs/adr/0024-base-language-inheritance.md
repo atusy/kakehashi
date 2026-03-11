@@ -89,13 +89,15 @@ The **only** termination condition is `base = ""`. When `base` is `None`, the ch
 | **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected and terminated at the cycle point. `_` is **not** appended — the language loses wildcard defaults. The misconfiguration is reported to the user. |
 | **Self-reference** (`a.base = "a"`) | Special case of circular reference. Same behavior. |
 
-### Nested Wildcard Resolution (Phase 3)
+### How Phase 2 Subsumes ADR-0011's Outer Wildcard
 
 Base chain resolution (Phase 2) **replaces** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 unconditionally merged `_` with every language. With base chains, `_` is already the root of every default chain (since chains terminate at `base = ""`), producing the same result. Additionally, base chains introduce a new capability: a language can **opt out** of `_` inheritance by setting `base = ""`, which was not possible under ADR-0011's unconditional merge.
 
-Phase 3 applies only to **nested wildcards** — `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). After Phase 2 produces the effective config for a language, any nested `_` entries within that config are merged with their sibling entries, with the specific sibling overriding the wildcard.
+Note: `base = ""` on an intermediate language (e.g., `markdown.base = ""`) intentionally prevents `_` inheritance for all languages derived from it — derived languages respect that decision.
 
-Note: `base = ""` on an intermediate language (e.g., `markdown.base = ""`) intentionally prevents `_` inheritance for all languages derived from it. This is a deliberate design choice — if a language opts out of wildcard defaults, its derived languages respect that decision.
+### Nested Wildcard Resolution (Phase 3)
+
+Phase 3 applies only to **nested wildcards** — `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). After Phase 2 produces the effective config for a language, any nested `_` entries within that config are merged with their sibling entries, with the specific sibling overriding the wildcard.
 
 ### Parser Resolution
 
