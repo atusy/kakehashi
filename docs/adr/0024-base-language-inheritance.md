@@ -50,7 +50,6 @@ Each derived language declares its own parent and can override any configuration
 | **Effective config** | The result of merging all languages in the base chain using the most-specific-wins rule |
 | **Layer merge** | Cross-layer config merging (ADR-0010): programmed defaults → user → project → `initializationOptions` |
 | **Nested wildcard** | A `_` key within a sub-dictionary of the effective config (e.g., `bridge._`), resolved after base chain merging |
-| **Overlay semantics** | When merging configs, only fields present in the higher-priority layer override; absent fields are preserved from lower-priority layers (ADR-0010) |
 
 ## Decision
 
@@ -61,12 +60,12 @@ Each derived language declares its own parent and can override any configuration
 Configuration resolution proceeds in three phases. Each phase depends on the output of the previous one, so this ordering is mandatory:
 
 1. **Layer merge** (ADR-0010): programmed defaults → user config → project config → `initializationOptions`. Produces a single merged config per language, including `base` field values.
-2. **Base chain resolution** (this ADR): walk the `base` chain across languages, merge most-specific-wins. This merges configs *across languages* (vertical), whereas Phase 1 merges *within each language across layers* (horizontal). Merge order is lowest to highest priority: `_ ← markdown ← rmd`. For multi-level chains: `_ ← markdown ← markdown_custom ← rmd`. Produces the effective config for each language.
+2. **Base chain resolution** (this ADR): walk the `base` chain across languages, merge most-specific-wins. This merges configs *across languages* (vertical), whereas Phase 1 merges *within each language across layers* (horizontal). Merge order (lowest → highest priority, shown with `←`): `_ ← markdown ← rmd`. For multi-level chains: `_ ← markdown ← markdown_custom ← rmd`. Produces the effective config for each language.
 3. **Nested wildcard resolution** (ADR-0011): resolve `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). Operates on the output of Phase 2.
 
 ### The `base` Field
 
-The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageConfig` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (overlay semantics — see Terminology).
+The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageConfig` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (absent fields are preserved per ADR-0010).
 
 Every language config gains an optional `base` field (default: not set, implicitly `"_"`):
 
@@ -177,7 +176,7 @@ base = "L"
 
 ## Appendix: Configuration Examples
 
-#### Basic: rmd inherits from markdown
+### Basic: rmd inherits from markdown
 
 ```toml
 [languages.markdown]
@@ -193,7 +192,7 @@ base = "markdown"
 "textDocument/completion" = { priorities = ["basedpyright"] }
 ```
 
-#### Multi-level chain
+### Multi-level chain
 
 ```toml
 [languages._]
@@ -211,7 +210,7 @@ base = "markdown_custom"
 # rmd -> markdown_custom -> markdown -> _
 ```
 
-#### Override parser but inherit queries
+### Override parser but inherit queries
 
 ```toml
 [languages.rmd]
@@ -220,7 +219,7 @@ parser = "/custom/path/to/rmd_parser.so"
 # Uses custom parser but inherits markdown's queries
 ```
 
-#### Self-contained language (no inheritance)
+### Self-contained language (no inheritance)
 
 ```toml
 [languages.my_custom_lang]
@@ -230,7 +229,7 @@ queries = [{ path = "/path/to/highlights.scm" }]
 # Does NOT inherit from "_" — fully self-contained
 ```
 
-#### Circular reference (misconfiguration)
+### Circular reference (misconfiguration)
 
 ```toml
 # BAD: circular reference — both languages lose wildcard defaults
