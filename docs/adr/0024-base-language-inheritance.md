@@ -200,7 +200,7 @@ queries = [{ path = "/path/to/highlights.scm" }]
 
 ### Removed: `aliases` Field
 
-The `aliases` field is removed from language configuration.
+The `aliases` field is removed from language configuration. This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
@@ -212,7 +212,11 @@ base = "L"
 base = "L"
 ```
 
-This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
+**Key behavioral differences from aliases:**
+
+- **Language identity**: With aliases, `rmd` was transparent — only `markdown` appeared in the language registry. With `base`, `rmd` becomes a first-class config entry.
+- **Config inheritance**: With aliases, derived languages shared the parent's entire config. With `base`, derived languages inherit the parent's config via the base chain, and can selectively override any field (bridge settings, parser, queries).
+- **Bridge config**: Bridge settings defined on the base language are inherited automatically by derived languages (via base chain merging). No need to redeclare them unless overriding.
 
 ## Consequences
 
