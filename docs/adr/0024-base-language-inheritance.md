@@ -77,11 +77,7 @@ Every language config gains an optional `base` field (default: not set, implicit
 | `"_"` | Explicitly inherit from `_` | Equivalent to `None`; for clarity |
 | `"markdown"` etc. | Inherit from named language | Derived languages (`rmd`, `qmd`) |
 
-- When `base` is `None` (or omitted), the language inherits from `_` (wildcard), preserving current ADR-0011 behavior. `base = "_"` is equivalent to `None`.
-- When `base` is `""` (empty string), the language has **no base** — it does not inherit from `_` or any other language. This is useful for fully self-contained language configs that should not pick up wildcard defaults.
-- When `base` is explicitly set to a non-empty value (e.g., `"markdown"`), the language inherits from that language instead of directly from `_`.
 - **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`". Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
-- The chain always terminates at `base = ""`: `rmd -> markdown -> _` (where `_` has `base = ""`).
 
 ### Undefined Languages in the Chain
 
