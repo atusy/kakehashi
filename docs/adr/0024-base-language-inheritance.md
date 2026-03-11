@@ -143,7 +143,59 @@ The key difference: with `base`, the language `rmd` is a first-class entry in th
 
 Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged — it operates before the base chain.
 
-### Configuration Examples
+### Removed: `aliases` Field
+
+The `aliases` field is removed from language configuration. This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
+
+**Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
+
+```toml
+[languages.x]
+base = "L"
+
+[languages.y]
+base = "L"
+```
+
+**Key behavioral differences from aliases:**
+
+- **Language identity**: With aliases, `rmd` was transparent — only `markdown` appeared in the language registry. With `base`, `rmd` becomes a first-class config entry.
+- **Config inheritance**: With aliases, derived languages shared the parent's entire config. With `base`, derived languages inherit the parent's config via the base chain, and can selectively override any field (bridge settings, parser, queries).
+- **Bridge config**: Bridge settings defined on the base language are inherited automatically by derived languages (via base chain merging). No need to redeclare them unless overriding.
+
+## Consequences
+
+### Positive
+
+- **Per-language customization**: Each derived language (`rmd`, `qmd`) can override bridge settings, queries, or parser independently
+- **No conflict**: Each language name is unique in the config map — no duplicate alias ambiguity
+- **Correct ownership**: Derived languages declare their own parent, not the other way around
+- **Composable**: Multi-level chains enable layered customization (`rmd -> markdown_custom -> markdown -> _`)
+- **Consistent with ADR-0011**: Extends the wildcard pattern naturally — `_` is just the default base
+- **Simpler coordinator**: No reverse alias map to maintain; language names are direct keys
+
+### Negative
+
+- **Breaking change**: Existing `aliases` configurations must be migrated
+- **Circular reference risk**: Must detect and report cycles in the base chain
+- **Longer resolution chains**: Multi-level chains add resolution complexity at access time
+- **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the symbol lookup
+- **Verbose for pure aliases**: `[languages.rmd]\nbase = "markdown"` is more verbose than `aliases = ["rmd"]` when no customization is needed
+
+### Neutral
+
+- **`_` is not special-cased**: It terminates the chain via `base = ""` (its default), not via name-based branching. However, `_` remains reserved as a key name (unchanged from ADR-0011)
+- **`base` chain is linear**: Single parent only — no multi-inheritance complexity
+- **Lazy resolution**: Chain resolved at access time, consistent with ADR-0011 wildcard pattern
+- **Auto-install interaction**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`)
+
+## Related Decisions
+
+- [ADR-0005](0005-language-detection-fallback-chain.md): Language detection fallback chain (alias resolution replaced by base resolution)
+- [ADR-0010](0010-configuration-merging-strategy.md): Cross-layer configuration merging (base chain operates after layer merging)
+- [ADR-0011](0011-wildcard-config-inheritance.md): Wildcard config inheritance (`base` generalizes `_` inheritance)
+
+## Appendix: Configuration Examples
 
 #### Basic: rmd inherits from markdown
 
@@ -198,54 +250,13 @@ queries = [{ path = "/path/to/highlights.scm" }]
 # Does NOT inherit from "_" — fully self-contained
 ```
 
-### Removed: `aliases` Field
-
-The `aliases` field is removed from language configuration. This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
-
-**Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
+#### Circular reference (misconfiguration)
 
 ```toml
-[languages.x]
-base = "L"
+# BAD: circular reference — both languages lose wildcard defaults
+[languages.a]
+base = "b"
 
-[languages.y]
-base = "L"
+[languages.b]
+base = "a"
 ```
-
-**Key behavioral differences from aliases:**
-
-- **Language identity**: With aliases, `rmd` was transparent — only `markdown` appeared in the language registry. With `base`, `rmd` becomes a first-class config entry.
-- **Config inheritance**: With aliases, derived languages shared the parent's entire config. With `base`, derived languages inherit the parent's config via the base chain, and can selectively override any field (bridge settings, parser, queries).
-- **Bridge config**: Bridge settings defined on the base language are inherited automatically by derived languages (via base chain merging). No need to redeclare them unless overriding.
-
-## Consequences
-
-### Positive
-
-- **Per-language customization**: Each derived language (`rmd`, `qmd`) can override bridge settings, queries, or parser independently
-- **No conflict**: Each language name is unique in the config map — no duplicate alias ambiguity
-- **Correct ownership**: Derived languages declare their own parent, not the other way around
-- **Composable**: Multi-level chains enable layered customization (`rmd -> markdown_custom -> markdown -> _`)
-- **Consistent with ADR-0011**: Extends the wildcard pattern naturally — `_` is just the default base
-- **Simpler coordinator**: No reverse alias map to maintain; language names are direct keys
-
-### Negative
-
-- **Breaking change**: Existing `aliases` configurations must be migrated
-- **Circular reference risk**: Must detect and report cycles in the base chain
-- **Longer resolution chains**: Multi-level chains add resolution complexity at access time
-- **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the symbol lookup
-- **Verbose for pure aliases**: `[languages.rmd]\nbase = "markdown"` is more verbose than `aliases = ["rmd"]` when no customization is needed
-
-### Neutral
-
-- **`_` is not special-cased**: It terminates the chain via `base = ""` (its default), not via name-based branching. However, `_` remains reserved as a key name (unchanged from ADR-0011)
-- **`base` chain is linear**: Single parent only — no multi-inheritance complexity
-- **Lazy resolution**: Chain resolved at access time, consistent with ADR-0011 wildcard pattern
-- **Auto-install interaction**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`)
-
-## Related Decisions
-
-- [ADR-0005](0005-language-detection-fallback-chain.md): Language detection fallback chain (alias resolution replaced by base resolution)
-- [ADR-0010](0010-configuration-merging-strategy.md): Cross-layer configuration merging (base chain operates after layer merging)
-- [ADR-0011](0011-wildcard-config-inheritance.md): Wildcard config inheritance (`base` generalizes `_` inheritance)
