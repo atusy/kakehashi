@@ -190,7 +190,8 @@ base = "L"
 - Pro: No need for `base = ""` as a special sentinel value
 - Con: Special-cases `_` by name, making it magical rather than uniform
 - Con: Cannot express "self-contained language with no inheritance" without a separate mechanism
-- Decision: **Rejected**; value-based termination (`base = ""`) is uniform and enables the opt-out capability
+- Con: Prevents custom root templates — with value-based termination, users can create alternative roots (e.g., `base = ""` on a `_literate` template) that serve as chain terminators alongside `_`
+- Decision: **Rejected**; value-based termination (`base = ""`) is uniform and enables both opt-out and custom root templates
 
 ### 4. Hard error on circular references
 
