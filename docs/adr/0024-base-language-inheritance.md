@@ -146,27 +146,24 @@ base = "L"
 
 ### Positive
 
-- **Per-language customization**: Each derived language (`rmd`, `qmd`) can override bridge settings, queries, or parser independently
 - **No conflict**: Each language name is unique in the config map — no duplicate alias ambiguity
-- **Correct ownership**: Derived languages declare their own parent, not the other way around
 - **Composable**: Multi-level chains enable layered customization (`rmd -> markdown_custom -> markdown -> _`)
 - **Consistent with ADR-0011**: Extends the wildcard pattern naturally — `_` is just the default base
 - **Simpler coordinator**: No reverse alias map to maintain; language names are direct keys
+- **Opt-out capability**: Languages can set `base = ""` to avoid inheriting from `_`, which was not possible under ADR-0011's unconditional merge
 
 ### Negative
 
-- **Breaking change**: Existing `aliases` configurations must be migrated
-- **Circular reference risk**: Must detect and report cycles in the base chain
-- **Longer resolution chains**: Multi-level chains add resolution complexity at access time
+- **Silent breaking change**: Existing `aliases` fields are silently ignored — languages that relied on aliases will stop working without warning. Users must migrate to `base` declarations.
+- **Longer resolution chains**: Multi-level chains add resolution complexity and make it harder to debug "where did this config value come from?"
 - **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the `tree_sitter_<lang>` symbol lookup in the shared library
 - **Verbose for pure aliases**: `[languages.rmd]\nbase = "markdown"` is more verbose than `aliases = ["rmd"]` when no customization is needed
+- **Cumulative resolution complexity**: This adds a third resolution phase (after ADR-0010 layer merge and before ADR-0011 nested wildcards), increasing the total number of phases a reader must understand to predict effective config
 
 ### Neutral
 
 - **`_` is not special-cased**: It terminates the chain via `base = ""` (its default), not via name-based branching. However, `_` remains reserved as a key name (unchanged from ADR-0011)
-- **`base` chain is linear**: Single parent only — no multi-inheritance complexity
-- **Lazy resolution**: Chain resolved at access time, consistent with ADR-0011 wildcard pattern
-- **Auto-install interaction**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`)
+- **Auto-install chain walking**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`), which may add latency for deeply nested chains
 
 ## Alternatives Considered
 
