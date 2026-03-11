@@ -79,21 +79,15 @@ Every language config gains an optional `base` field (default: not set, implicit
 
 - **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`". Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
 
-### Undefined Languages in the Chain
-
-Languages referenced in the `base` field do not need to be explicitly defined in configuration. If `base` points to an undefined language, the chain continues through it toward `_`, and parser/query resolution still searches `searchPaths` using that language's name. No error is raised — this is the normal case for languages discovered via `searchPaths` without explicit config.
-
 ### Chain Termination and Error Handling
 
 The **only** termination condition is `base = ""`. When `base` is `None`, the chain does not terminate — it continues by resolving `None` to `"_"`, which itself has `base = ""` by default, terminating the chain there. There is no special case for `_`; it terminates simply because its default `base` is `""`.
 
-**Error conditions:**
-
 | Condition | Behavior |
 |---|---|
+| **Undefined base language** | Not an error. The chain continues through it toward `_`, and parser/query resolution still searches `searchPaths` using that language's name. This is the normal case for languages discovered via `searchPaths` without explicit config. |
 | **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected and terminated at the cycle point. `_` is **not** appended — the language loses wildcard defaults. The misconfiguration is reported to the user. |
 | **Self-reference** (`a.base = "a"`) | Special case of circular reference. Same behavior. |
-| **Undefined base language** | Chain continues through it (see "Undefined Languages in the Chain" above). Not an error. |
 
 ### Nested Wildcard Resolution (Phase 3)
 
