@@ -46,7 +46,11 @@ Each derived language declares its own parent and can override any configuration
 | **Base language** | The language named in the `base` field (e.g., `"markdown"` for `rmd`) |
 | **Derived language** | A language that declares a `base` (e.g., `rmd` with `base = "markdown"`) |
 | **Base chain** | The ordered list of languages from derived to root, following `base` links (e.g., `rmd -> markdown -> _`) |
-| **Effective config** | The result of merging all languages in the base chain (most specific wins) |
+| **Most-specific-wins** | Merge rule: later (more specific) entries in the base chain override earlier (more general) entries at the field level |
+| **Effective config** | The result of merging all languages in the base chain using the most-specific-wins rule |
+| **Layer merge** | Cross-layer config merging (ADR-0010): programmed defaults → user → project → `initializationOptions` |
+| **Nested wildcard** | A `_` key within a sub-dictionary of the effective config (e.g., `bridge._`), resolved after base chain merging |
+| **Overlay semantics** | When merging configs, only fields present in the higher-priority layer override; absent fields are preserved from lower-priority layers (ADR-0010) |
 
 ## Decision
 
