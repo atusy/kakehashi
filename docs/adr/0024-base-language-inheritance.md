@@ -46,7 +46,6 @@ Each derived language declares its own parent and can override any configuration
 | **Base language** | The language named in the `base` field (e.g., `"markdown"` for `rmd`) |
 | **Derived language** | A language that declares a `base` (e.g., `rmd` with `base = "markdown"`) |
 | **Base chain** | The ordered list of languages from derived to root, following `base` links (e.g., `rmd -> markdown -> _`) |
-| **Chain terminator** | A language with `base = ""`, which stops the chain walk |
 | **Effective config** | The result of merging all languages in the base chain (most specific wins) |
 
 ## Decision
@@ -77,16 +76,12 @@ Every language config gains an optional `base` field (default: not set, implicit
 - When `base` is `None` (or omitted), the language inherits from `_` (wildcard), preserving current ADR-0011 behavior. `base = "_"` is equivalent to `None`.
 - When `base` is `""` (empty string), the language has **no base** — it does not inherit from `_` or any other language. This is useful for fully self-contained language configs that should not pick up wildcard defaults.
 - When `base` is explicitly set to a non-empty value (e.g., `"markdown"`), the language inherits from that language instead of directly from `_`.
-- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`".
+- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`". Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
 - The chain always terminates at `base = ""`: `rmd -> markdown -> _` (where `_` has `base = ""`).
 
 ### Undefined Languages in the Chain
 
-When `base` points to a language not defined in the config (e.g., `base = "markdown"` but no `[languages.markdown]` exists), the undefined language is treated as an **empty config with `base = None`** — equivalent to `{ base: None }`. This means:
-
-- The chain continues through the undefined language to `_` (since `base = None` resolves to `"_"`)
-- Parser/query fallback still searches for `markdown.{so,dylib,dll}` and `queries/markdown/*.scm` in `searchPaths`
-- No error is raised — this is the normal case for languages discovered via `searchPaths` without explicit config
+Languages referenced in the `base` field do not need to be explicitly defined in configuration. If `base` points to an undefined language, the chain continues through it toward `_`, and parser/query resolution still searches `searchPaths` using that language's name. No error is raised — this is the normal case for languages discovered via `searchPaths` without explicit config.
 
 ### Resolution Chain
 
@@ -125,11 +120,9 @@ There is no special case for `_` — it terminates the chain simply because its 
 
 | Condition | Behavior |
 |---|---|
-| **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected via visited set. Chain terminates at the cycle point. `_` is **not** appended to the truncated chain — the language loses wildcard defaults. Logged as warning. This is intentional: circular configs are user errors, and the degraded behavior (plus warning log) signals the need to fix the config. |
+| **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected and terminated at the cycle point. `_` is **not** appended — the language loses wildcard defaults. The misconfiguration is reported to the user. |
 | **Self-reference** (`a.base = "a"`) | Special case of circular reference. Same behavior. |
-| **Undefined base language** | Treated as empty config with `base = None` (see "Undefined Languages in the Chain" above). Not an error. |
-
-Circular detection follows the same approach as query `; inherits:` resolution (tracking visited languages to detect cycles).
+| **Undefined base language** | Chain continues through it (see "Undefined Languages in the Chain" above). Not an error. |
 
 ### Nested Wildcard Resolution (Phase 3)
 
@@ -146,30 +139,17 @@ effective_config[rmd].bridge[python] = merge(
 
 Note: `base = ""` on an intermediate language (e.g., `markdown.base = ""`) intentionally prevents `_` inheritance for all languages derived from it. This is a deliberate design choice — if a language opts out of wildcard defaults, its derived languages respect that decision.
 
-### Parser Fallback Chain
+### Parser Resolution
 
-When loading a parser for a language, the `base` chain determines the search order. Resolution walks the chain from most-specific to least-specific. At each level, an explicit parser path in the config is checked before searching `searchPaths`:
+Parser resolution walks the base chain from most-specific to least-specific. At each level, an explicit parser path in the config is checked before searching `searchPaths`. The first match is used.
 
-| Priority | Source | Example for `rmd` (base = `"markdown"`) |
-|---|---|---|
-| 1 | Derived language explicit config | `config["rmd"].parser` |
-| 2 | Derived language searchPaths | `searchPaths/parser/rmd.{so,dylib,dll}` |
-| 3 | Base language explicit config | `config["markdown"].parser` |
-| 4 | Base language searchPaths | `searchPaths/parser/markdown.{so,dylib,dll}` |
-| ... | Continue up the chain until `_` | |
+When a derived language resolves to a base language's parser, the parser is registered under the derived language's name, ensuring all subsequent lookups by language name work correctly.
 
-**Critical — parser symbol name**: When a derived language resolves to a base language's parser library (e.g., `markdown.so` for `rmd`), the dynamic symbol lookup must use the base language's name (`tree_sitter_markdown`), not the derived language's name. The loaded grammar is then registered under the derived language name (`rmd`), ensuring all subsequent lookups by language name work correctly.
+### Query Resolution
 
-### Query Fallback Chain
+Query file discovery (highlights.scm, locals.scm, injections.scm) follows the same base chain pattern as parser resolution. The first level in the chain that provides queries wins (queries are replaced entirely, not merged, per ADR-0010).
 
-Query files (highlights.scm, locals.scm, injections.scm) follow the same chain as parser resolution — walking from most-specific to least-specific, checking explicit config then searchPaths at each level. The first level in the chain that provides queries wins (queries are replaced entirely, not merged, per ADR-0010).
-
-**Interaction with `; inherits:` in query files**: Query files can contain `; inherits: <language>` directives that trigger query-level inheritance (resolved by the query loader). This is a separate mechanism from the config-level `base` chain. Both can coexist:
-
-- **Config `base` chain**: Determines *which* query files to load (fallback search)
-- **Query `; inherits:`**: Determines *composition within* a query file (prepends parent queries)
-
-For example, if `rmd` falls back to `markdown`'s queries via the base chain, and `markdown`'s `highlights.scm` contains `; inherits: html`, the result is `markdown + html` highlights applied to `rmd`. These two inheritance mechanisms operate at different levels and do not conflict.
+Query files may also contain `; inherits: <language>` directives, which is a separate query-level composition mechanism independent from config-level `base` inheritance. These two mechanisms operate at different levels and do not conflict.
 
 ### Impact on Language Detection (ADR-0005)
 
@@ -268,9 +248,9 @@ This is a breaking change. The project is in beta (per CLAUDE.md), so this is ac
 ### Negative
 
 - **Breaking change**: Existing `aliases` configurations must be migrated
-- **Circular reference risk**: Must validate or detect cycles (mitigated by visited-set detection)
+- **Circular reference risk**: Must detect and report cycles in the base chain
 - **Longer resolution chains**: Multi-level chains add resolution complexity at access time
-- **Parser symbol name coupling**: Loading a base language's `.so` requires knowing the base language name for the symbol lookup
+- **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the symbol lookup
 - **Verbose for pure aliases**: `[languages.rmd]\nbase = "markdown"` is more verbose than `aliases = ["rmd"]` when no customization is needed
 
 ### Neutral
