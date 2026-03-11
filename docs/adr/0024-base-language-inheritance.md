@@ -58,11 +58,11 @@ Each derived language declares its own parent and can override any configuration
 
 ### Resolution Order (Three Phases)
 
-Configuration resolution proceeds in three phases:
+Configuration resolution proceeds in three phases. Each phase depends on the output of the previous one, so this ordering is mandatory:
 
-1. **Layer merge** (ADR-0010): programmed defaults → user config → project config → `initializationOptions`
-2. **Base chain resolution** (this ADR): walk the `base` chain, merge most-specific-wins
-3. **Nested wildcard resolution** (ADR-0011): resolve inner wildcards (e.g., `bridge._`) within the effective config
+1. **Layer merge** (ADR-0010): programmed defaults → user config → project config → `initializationOptions`. Produces a single merged config per language, including `base` field values.
+2. **Base chain resolution** (this ADR): walk the `base` chain across languages, merge most-specific-wins. This merges configs *across languages* (vertical), whereas Phase 1 merges *within each language across layers* (horizontal). Produces the effective config for each language.
+3. **Nested wildcard resolution** (ADR-0011): resolve `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). Operates on the output of Phase 2.
 
 ### The `base` Field
 
@@ -113,7 +113,7 @@ There is no special case for `_` — it terminates the chain simply because its 
 
 ### Nested Wildcard Resolution (Phase 3)
 
-Base chain resolution (Phase 2) **subsumes** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 resolved `effective[python] = merge(languages["_"], languages["python"])` at access time. With base chains, `_` is already included as the root of the chain (since every chain terminates at `_` via `base = ""`), so the outer `languages._` wildcard merge is no longer needed — it is replaced entirely by the base chain walk.
+Base chain resolution (Phase 2) **replaces** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 unconditionally merged `_` with every language. With base chains, `_` is already the root of every default chain (since chains terminate at `base = ""`), producing the same result. Additionally, base chains introduce a new capability: a language can **opt out** of `_` inheritance by setting `base = ""`, which was not possible under ADR-0011's unconditional merge.
 
 Phase 3 applies only to **nested wildcards** — `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). After Phase 2 produces the effective config for a language, any nested `_` entries within that config are merged with their sibling entries, with the specific sibling overriding the wildcard.
 
