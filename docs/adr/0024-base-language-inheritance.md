@@ -210,22 +210,6 @@ base = "L"
 
 ## Appendix: Configuration Examples
 
-### Basic: rmd inherits from markdown
-
-```toml
-[languages.markdown]
-# markdown config (parser auto-discovered or auto-installed)
-
-[languages.rmd]
-base = "markdown"
-# Uses markdown's parser and queries, but can override bridge settings
-
-[languages.qmd]
-base = "markdown"
-[languages.qmd.bridge.python.aggregation]
-"textDocument/completion" = { priorities = ["basedpyright"] }
-```
-
 ### Multi-level chain
 
 ```toml
@@ -244,15 +228,6 @@ base = "markdown_custom"
 # rmd -> markdown_custom -> markdown -> _
 ```
 
-### Override parser but inherit queries
-
-```toml
-[languages.rmd]
-base = "markdown"
-parser = "/custom/path/to/rmd_parser.so"
-# Uses custom parser but inherits markdown's queries
-```
-
 ### Self-contained language (no inheritance)
 
 ```toml
@@ -261,15 +236,4 @@ base = ""
 parser = "/path/to/my_parser.so"
 queries = [{ path = "/path/to/highlights.scm" }]
 # Does NOT inherit from "_" — fully self-contained
-```
-
-### Circular reference (misconfiguration)
-
-```toml
-# BAD: circular reference — both languages lose wildcard defaults
-[languages.a]
-base = "b"
-
-[languages.b]
-base = "a"
 ```
