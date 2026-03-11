@@ -157,7 +157,7 @@ base = "L"
 - **Breaking change**: Existing `aliases` configurations must be migrated
 - **Circular reference risk**: Must detect and report cycles in the base chain
 - **Longer resolution chains**: Multi-level chains add resolution complexity at access time
-- **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the symbol lookup
+- **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the `tree_sitter_<lang>` symbol lookup in the shared library
 - **Verbose for pure aliases**: `[languages.rmd]\nbase = "markdown"` is more verbose than `aliases = ["rmd"]` when no customization is needed
 
 ### Neutral
