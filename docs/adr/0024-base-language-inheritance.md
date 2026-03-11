@@ -85,28 +85,11 @@ Languages referenced in the `base` field do not need to be explicitly defined in
 
 ### Resolution Chain
 
-Configuration for a language is resolved by walking the `base` chain and merging (most specific wins):
+Configuration for a language is resolved by walking the `base` chain and merging, where later (more specific) entries override earlier (more general) entries — consistent with ADR-0011's "specific overrides wildcard" semantics.
 
-```
-effective_config[rmd] = merge_chain([
-    config["_"],        // wildcard defaults (base of chain)
-    config["markdown"], // rmd's base
-    config["rmd"],      // most specific
-])
-```
+Merge order (lowest to highest priority): `_ ← markdown ← rmd`
 
-For multi-level chains (`rmd -> markdown_custom -> markdown -> _`):
-
-```
-effective_config[rmd] = merge_chain([
-    config["_"],
-    config["markdown"],
-    config["markdown_custom"],
-    config["rmd"],
-])
-```
-
-Later entries in the chain override earlier entries, consistent with ADR-0011's "specific overrides wildcard" semantics.
+For multi-level chains: `_ ← markdown ← markdown_custom ← rmd`
 
 ### Chain Termination and Error Handling
 
@@ -128,14 +111,7 @@ There is no special case for `_` — it terminates the chain simply because its 
 
 Base chain resolution (Phase 2) **subsumes** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 resolved `effective[python] = merge(languages["_"], languages["python"])` at access time. With base chains, `_` is already included as the root of the chain (since every chain terminates at `_` via `base = ""`), so the outer `languages._` wildcard merge is no longer needed — it is replaced entirely by the base chain walk.
 
-Phase 3 applies only to **nested** wildcards (e.g., `bridge._`) within the effective config produced by Phase 2:
-
-```
-effective_config[rmd].bridge[python] = merge(
-    effective_config[rmd].bridge["_"],
-    effective_config[rmd].bridge["python"]
-)
-```
+Phase 3 applies only to **nested wildcards** — `_` keys within sub-dictionaries of the effective config (e.g., `bridge._`). After Phase 2 produces the effective config for a language, any nested `_` entries within that config are merged with their sibling entries, with the specific sibling overriding the wildcard.
 
 Note: `base = ""` on an intermediate language (e.g., `markdown.base = ""`) intentionally prevents `_` inheritance for all languages derived from it. This is a deliberate design choice — if a language opts out of wildcard defaults, its derived languages respect that decision.
 
