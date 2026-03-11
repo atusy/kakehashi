@@ -123,7 +123,7 @@ Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged —
 
 ### Removed: `aliases` Field
 
-The `aliases` field is removed from language configuration. This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
+The `aliases` field is removed from language configuration without a deprecation period — existing `aliases` fields in config are silently ignored. This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
