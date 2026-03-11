@@ -168,6 +168,40 @@ base = "L"
 - **Lazy resolution**: Chain resolved at access time, consistent with ADR-0011 wildcard pattern
 - **Auto-install interaction**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`)
 
+## Alternatives Considered
+
+### 1. Keep `aliases` alongside `base`
+
+- Pro: Non-breaking; `aliases` remains as syntactic sugar for the common case (pure identity mapping)
+- Pro: Less verbose when no customization is needed
+- Con: Two mechanisms for the same concept; users must learn when to use which
+- Con: Alias conflicts (the original problem #1) remain for languages still using `aliases`
+- Decision: **Rejected**; a single mechanism is simpler to reason about, and the project is in beta so breaking changes are acceptable
+
+### 2. Multi-inheritance (`base = ["markdown", "r"]`)
+
+- Pro: Languages with multiple conceptual parents (e.g., R Markdown is both Markdown and R) could inherit from both
+- Pro: More expressive for complex language relationships
+- Con: Significantly more complex merge semantics — field conflicts between parents require a resolution strategy (C3 linearization, explicit priority, etc.)
+- Con: Harder to debug; "where did this config value come from?" becomes a diamond-problem question
+- Con: No concrete use case requires it — bridge config already handles the "embedded language" dimension separately
+- Decision: **Rejected**; single inheritance with bridge config covers all current use cases without the complexity
+
+### 3. Name-based chain termination (stop at `_`)
+
+- Pro: Simpler mental model — `_` is the well-known root, chain stops when it reaches `_`
+- Pro: No need for `base = ""` as a special sentinel value
+- Con: Special-cases `_` by name, making it magical rather than uniform
+- Con: Cannot express "self-contained language with no inheritance" without a separate mechanism
+- Decision: **Rejected**; value-based termination (`base = ""`) is uniform and enables the opt-out capability
+
+### 4. Hard error on circular references
+
+- Pro: Fail-fast; misconfiguration is immediately visible
+- Con: A single circular reference in one language would prevent the entire server from starting
+- Con: Disproportionate impact — other languages unrelated to the cycle would be affected
+- Decision: **Rejected**; detect and report the cycle, but allow unaffected languages to function normally
+
 ## Related Decisions
 
 - [ADR-0005](0005-language-detection-fallback-chain.md): Language detection fallback chain (alias resolution replaced by base resolution)
