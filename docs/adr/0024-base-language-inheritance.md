@@ -76,7 +76,7 @@ Every language config gains an optional `base` field (default: not set, implicit
 | `"_"` | Explicitly inherit from `_` | Equivalent to `None`; for clarity |
 | `"markdown"` etc. | Inherit from named language | Derived languages (`rmd`, `qmd`) |
 
-- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is "stop when `base == ""`". Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
+- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is to stop when `base == ""`. Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
 
 ### Chain Termination and Error Handling
 
