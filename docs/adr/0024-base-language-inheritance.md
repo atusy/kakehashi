@@ -66,7 +66,7 @@ Configuration resolution proceeds in three phases. Each phase depends on the out
 
 ### The `base` Field
 
-The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageConfig` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (overlay semantics per ADR-0010).
+The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageConfig` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (overlay semantics — see Terminology).
 
 Every language config gains an optional `base` field (default: not set, implicitly `"_"`):
 
@@ -97,11 +97,7 @@ For multi-level chains: `_ ← markdown ← markdown_custom ← rmd`
 
 ### Chain Termination and Error Handling
 
-The chain terminates when:
-- `base` is `""` — no inheritance, chain stops here (this is the **only** termination condition)
-- `base` is `None` — implicitly resolves to `"_"`, so the chain continues to `_` (which has `base = ""` by default)
-
-There is no special case for `_` — it terminates the chain simply because its default `base` is `""`.
+The **only** termination condition is `base = ""`. When `base` is `None`, the chain does not terminate — it continues by resolving `None` to `"_"`, which itself has `base = ""` by default, terminating the chain there. There is no special case for `_`; it terminates simply because its default `base` is `""`.
 
 **Error conditions:**
 
