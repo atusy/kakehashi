@@ -89,7 +89,7 @@ queries = [
 The merge function should accept a slice of configs for flexibility:
 
 ```rust
-fn merge_all(configs: &[Option<TreeSitterSettings>]) -> Option<TreeSitterSettings>
+fn merge_all(configs: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings>
 ```
 
 Configs are applied in order (earlier = lower precedence, later = higher precedence):
@@ -205,7 +205,7 @@ This design allows adding new layers (e.g., workspace-level config) without chan
 
 **Config loading order:**
 ```rust
-fn load_configuration(cli_config_path: Option<&Path>) -> Option<TreeSitterSettings> {
+fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSettings> {
     let defaults = Some(default_settings());  // from src/config/defaults.rs
     let user_config = load_optional(xdg_config_path());
     let project_config = load_optional_project_config(cli_config_path);

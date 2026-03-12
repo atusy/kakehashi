@@ -1,4 +1,4 @@
-use crate::config::{CaptureMappings, LanguageConfig, TreeSitterSettings};
+use crate::config::{CaptureMappings, LanguageConfig, RawWorkspaceSettings};
 use log::warn;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -30,7 +30,7 @@ impl ConfigStore {
         }
     }
 
-    pub fn update_from_settings(&self, settings: &TreeSitterSettings) {
+    pub fn update_from_settings(&self, settings: &RawWorkspaceSettings) {
         self.set_language_configs(settings.languages.clone());
         self.set_capture_mappings(settings.capture_mappings.clone());
         self.set_search_paths(settings.search_paths.clone());
@@ -204,7 +204,7 @@ mod tests {
     fn test_config_store_update_from_settings() {
         let store = ConfigStore::new();
 
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             languages: {
                 let mut langs = HashMap::new();
                 langs.insert("python".to_string(), LanguageConfig::default());

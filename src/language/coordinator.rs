@@ -7,7 +7,7 @@ use super::query_loader::{ParseFailure, QueryLoader};
 use super::query_store::QueryStore;
 use super::registry::LanguageRegistry;
 use crate::config::settings::{LanguageConfig, QueryKind, infer_query_kind};
-use crate::config::{CaptureMappings, TreeSitterSettings, WorkspaceSettings};
+use crate::config::{CaptureMappings, RawWorkspaceSettings, WorkspaceSettings};
 use log::debug;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -73,11 +73,11 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub fn load_settings(&self, settings: WorkspaceSettings) -> LanguageLoadSummary {
-        let config_settings: TreeSitterSettings = settings.into();
+        let config_settings: RawWorkspaceSettings = settings.into();
         self.load_settings_from_config(&config_settings)
     }
 
-    fn load_settings_from_config(&self, settings: &TreeSitterSettings) -> LanguageLoadSummary {
+    fn load_settings_from_config(&self, settings: &RawWorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
         // build_from_settings removed in PBI-061 - filetypes no longer in config
 

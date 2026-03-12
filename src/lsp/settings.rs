@@ -1,5 +1,6 @@
 use crate::config::{
-    TreeSitterSettings, WorkspaceSettings, defaults::default_settings, load_user_config, merge_all,
+    RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
+    merge_all,
 };
 use serde_json::Value;
 use std::fs;
@@ -74,7 +75,7 @@ pub fn load_settings(
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let config_layers: Vec<Option<TreeSitterSettings>> =
+    let config_layers: Vec<Option<RawWorkspaceSettings>> =
         if let Some(files) = crate::config::expand::config_file_override() {
             events.push(SettingsEvent::info(format!(
                 "Using {} explicit config file(s); default config locations skipped",
@@ -121,7 +122,7 @@ pub fn load_settings(
 }
 
 /// Load user config and add appropriate events to the events vector.
-fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<TreeSitterSettings> {
+fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<RawWorkspaceSettings> {
     match load_user_config() {
         Ok(Some(settings)) => {
             events.push(SettingsEvent::info(
@@ -147,7 +148,7 @@ fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<TreeS
 ///
 /// Unlike `load_toml_settings`, non-existent files are treated as errors
 /// because explicit paths represent user intent (ADR-0010).
-fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<TreeSitterSettings> {
+fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<RawWorkspaceSettings> {
     if !path.exists() {
         events.push(SettingsEvent::error(format!(
             "Config file not found: {}",
@@ -162,7 +163,7 @@ fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<TreeSi
     )));
 
     match fs::read_to_string(path) {
-        Ok(contents) => match toml::from_str::<TreeSitterSettings>(&contents) {
+        Ok(contents) => match toml::from_str::<RawWorkspaceSettings>(&contents) {
             Ok(settings) => {
                 events.push(SettingsEvent::info(format!(
                     "Successfully loaded {}",
@@ -193,7 +194,7 @@ fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<TreeSi
 fn load_toml_settings(
     root_path: Option<&Path>,
     events: &mut Vec<SettingsEvent>,
-) -> Option<TreeSitterSettings> {
+) -> Option<RawWorkspaceSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
     if !config_path.exists() {
@@ -206,7 +207,7 @@ fn load_toml_settings(
     )));
 
     match fs::read_to_string(&config_path) {
-        Ok(contents) => match toml::from_str::<TreeSitterSettings>(&contents) {
+        Ok(contents) => match toml::from_str::<RawWorkspaceSettings>(&contents) {
             Ok(settings) => {
                 events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
                 Some(settings)
@@ -233,11 +234,11 @@ fn parse_override_settings(
     source: SettingsSource,
     value: Value,
     events: &mut Vec<SettingsEvent>,
-) -> Option<TreeSitterSettings> {
-    match serde_json::from_value::<TreeSitterSettings>(value) {
+) -> Option<RawWorkspaceSettings> {
+    match serde_json::from_value::<RawWorkspaceSettings>(value) {
         Ok(settings) => {
             events.push(SettingsEvent::info(format!(
-                "Parsed {} as TreeSitterSettings",
+                "Parsed {} as RawWorkspaceSettings",
                 source.description()
             )));
             Some(settings)

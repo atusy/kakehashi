@@ -9,7 +9,7 @@ pub(crate) mod user;
 pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
 pub use settings::{
     BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageConfig, LanguageSettings,
-    QueryItem, QueryKind, QueryTypeMappings, TreeSitterSettings, WorkspaceSettings,
+    QueryItem, QueryKind, QueryTypeMappings, RawWorkspaceSettings, WorkspaceSettings,
 };
 use std::collections::HashMap;
 pub(crate) use user::load_user_config;
@@ -218,24 +218,24 @@ pub(crate) fn default_search_paths() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Merge multiple TreeSitterSettings configs in order.
+/// Merge multiple RawWorkspaceSettings configs in order.
 /// Later configs in the slice have higher precedence (override earlier ones).
 /// Use this for layered config: `merge_all(&[defaults, user, project, session])`
-pub(crate) fn merge_all(configs: &[Option<TreeSitterSettings>]) -> Option<TreeSitterSettings> {
+pub(crate) fn merge_all(configs: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings> {
     configs.iter().cloned().reduce(merge_settings).flatten()
 }
 
-/// Merge two TreeSitterSettings, preferring values from `primary` over `fallback`
+/// Merge two RawWorkspaceSettings, preferring values from `primary` over `fallback`
 pub(crate) fn merge_settings(
-    fallback: Option<TreeSitterSettings>,
-    primary: Option<TreeSitterSettings>,
-) -> Option<TreeSitterSettings> {
+    fallback: Option<RawWorkspaceSettings>,
+    primary: Option<RawWorkspaceSettings>,
+) -> Option<RawWorkspaceSettings> {
     match (fallback, primary) {
         (None, None) => None,
         (Some(settings), None) => Some(settings),
         (None, Some(settings)) => Some(settings),
         (Some(fallback), Some(primary)) => {
-            let merged = TreeSitterSettings {
+            let merged = RawWorkspaceSettings {
                 // Prefer primary search_paths, fall back to fallback
                 search_paths: primary.search_paths.or(fallback.search_paths),
 
@@ -284,10 +284,10 @@ impl From<&LanguageSettings> for LanguageConfig {
     }
 }
 
-/// Convert `TreeSitterSettings` to `WorkspaceSettings` without expanding
+/// Convert `RawWorkspaceSettings` to `WorkspaceSettings` without expanding
 /// environment variables or tilde. This is the base conversion used
 /// internally by `try_from_settings`.
-fn base_convert(settings: &TreeSitterSettings) -> WorkspaceSettings {
+fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
     let languages = settings
         .languages
         .iter()
@@ -324,7 +324,7 @@ fn base_convert(settings: &TreeSitterSettings) -> WorkspaceSettings {
 }
 
 impl WorkspaceSettings {
-    /// Convert `TreeSitterSettings` to `WorkspaceSettings`, expanding environment
+    /// Convert `RawWorkspaceSettings` to `WorkspaceSettings`, expanding environment
     /// variables (`$VAR`, `${VAR}`) and tilde (`~`) in path fields.
     ///
     /// Path fields expanded: `search_paths`, `languages[*].parser`, `languages[*].queries[*].path`.
@@ -335,7 +335,7 @@ impl WorkspaceSettings {
     /// Uses `base_convert` for the structural conversion, then expands only the
     /// path fields. This avoids duplicating conversion logic.
     pub fn try_from_settings(
-        settings: &TreeSitterSettings,
+        settings: &RawWorkspaceSettings,
         home: Option<&str>,
         env_fn: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, expand::ExpandErrors> {
@@ -378,7 +378,7 @@ impl WorkspaceSettings {
     }
 }
 
-impl From<&WorkspaceSettings> for TreeSitterSettings {
+impl From<&WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: &WorkspaceSettings) -> Self {
         let languages = settings
             .languages
@@ -406,7 +406,7 @@ impl From<&WorkspaceSettings> for TreeSitterSettings {
             Some(settings.search_paths.clone())
         };
 
-        TreeSitterSettings {
+        RawWorkspaceSettings {
             search_paths,
             languages,
             capture_mappings,
@@ -416,9 +416,9 @@ impl From<&WorkspaceSettings> for TreeSitterSettings {
     }
 }
 
-impl From<WorkspaceSettings> for TreeSitterSettings {
+impl From<WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: WorkspaceSettings) -> Self {
-        TreeSitterSettings::from(&settings)
+        RawWorkspaceSettings::from(&settings)
     }
 }
 
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_merge_settings_fallback_only() {
-        let fallback = TreeSitterSettings {
+        let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_merge_settings_primary_only() {
-        let primary = TreeSitterSettings {
+        let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -675,7 +675,7 @@ mod tests {
             },
         );
 
-        let fallback = TreeSitterSettings {
+        let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
             languages: fallback_languages,
             capture_mappings: HashMap::new(),
@@ -692,7 +692,7 @@ mod tests {
             },
         );
 
-        let primary = TreeSitterSettings {
+        let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
             languages: primary_languages,
             capture_mappings: HashMap::new(),
@@ -737,7 +737,7 @@ mod tests {
             },
         );
 
-        let fallback = TreeSitterSettings {
+        let fallback = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: fallback_mappings,
@@ -762,7 +762,7 @@ mod tests {
             },
         );
 
-        let primary = TreeSitterSettings {
+        let primary = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: primary_mappings,
@@ -826,9 +826,9 @@ mod tests {
 
     #[test]
     fn test_default_search_paths_used_when_none_configured() {
-        // When search_paths is None in TreeSitterSettings, WorkspaceSettings
+        // When search_paths is None in RawWorkspaceSettings, WorkspaceSettings
         // should use the default data directory paths (not an empty vector)
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -856,7 +856,7 @@ mod tests {
     #[test]
     fn test_explicit_search_paths_override_default() {
         // When search_paths is explicitly set, it should be used as-is
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["/custom/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -877,7 +877,7 @@ mod tests {
         let mut paths = vec!["/custom/path".to_string()];
         paths.extend(default_paths.clone());
 
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(paths.clone()),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -902,7 +902,7 @@ mod tests {
     #[case::explicit_false(Some(false), false)]
     fn test_auto_install(#[case] auto_install: Option<bool>, #[case] expected: bool) {
         // PBI-019: autoInstall defaults to true for zero-config; explicit values honored
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn test_merge_all_single_some_returns_it() {
         // Single Some config should return that config
-        let config = TreeSitterSettings {
+        let config = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/one".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -982,14 +982,14 @@ mod tests {
     fn test_merge_all_scalar_later_wins() {
         // Later config's scalar values should override earlier ones
         // Simulates: user config has autoInstall=true, project has autoInstall=false
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/user/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: Some(true),
             language_servers: None,
         };
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/project/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1009,28 +1009,28 @@ mod tests {
     #[test]
     fn test_merge_all_four_layers() {
         // Test the full 4-layer merge: defaults < user < project < session
-        let defaults = TreeSitterSettings {
+        let defaults = RawWorkspaceSettings {
             search_paths: Some(vec!["/default/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: Some(true),
             language_servers: None,
         };
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None, // Not overriding, should inherit from defaults
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: Some(true),
             language_servers: None,
         };
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/project/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None, // Not overriding, should inherit
             language_servers: None,
         };
-        let session_config = TreeSitterSettings {
+        let session_config = RawWorkspaceSettings {
             search_paths: None, // Not overriding
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn test_merge_all_skips_none_configs() {
         // None configs in the slice should be skipped
-        let config = TreeSitterSettings {
+        let config = RawWorkspaceSettings {
             search_paths: Some(vec!["/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1137,7 +1137,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -1160,7 +1160,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -1202,7 +1202,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -1219,7 +1219,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -1267,7 +1267,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1287,7 +1287,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1336,7 +1336,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1355,7 +1355,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1412,7 +1412,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: user_mappings,
@@ -1437,7 +1437,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: project_mappings,
@@ -1478,7 +1478,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: user_mappings,
@@ -1499,7 +1499,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: project_mappings,
@@ -1549,7 +1549,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: user_mappings,
@@ -1576,7 +1576,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: project_mappings,
@@ -2844,7 +2844,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -2866,7 +2866,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -2913,7 +2913,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -2931,7 +2931,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -2970,7 +2970,7 @@ mod tests {
             "markup.heading.1" = "class"
         "#;
 
-        let user_settings: TreeSitterSettings =
+        let user_settings: RawWorkspaceSettings =
             toml::from_str(user_config_content).expect("should parse user config");
 
         // Get defaults (which have markup.strong = "")
@@ -3357,7 +3357,7 @@ mod try_from_settings_tests {
 
     #[test]
     fn expands_search_paths() {
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$TEST_VAR/parsers".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -3381,7 +3381,7 @@ mod try_from_settings_tests {
                 aliases: None,
             },
         );
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
             capture_mappings: HashMap::new(),
@@ -3411,7 +3411,7 @@ mod try_from_settings_tests {
                 aliases: None,
             },
         );
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
             capture_mappings: HashMap::new(),
@@ -3426,7 +3426,7 @@ mod try_from_settings_tests {
 
     #[test]
     fn undefined_var_returns_error() {
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$UNDEFINED/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -3456,7 +3456,7 @@ mod try_from_settings_tests {
                 aliases: None,
             },
         );
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$MISSING_ONE/parsers".to_string()]),
             languages,
             capture_mappings: HashMap::new(),
@@ -3474,7 +3474,7 @@ mod try_from_settings_tests {
 
     #[test]
     fn tilde_without_home_dir_returns_error() {
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["~/parsers".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),

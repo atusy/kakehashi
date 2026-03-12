@@ -219,7 +219,7 @@ pub struct LanguageConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
-pub struct TreeSitterSettings {
+pub struct RawWorkspaceSettings {
     // Editor-agnostic name exposed to JSON as `searchPaths`.
     #[serde(rename = "searchPaths")]
     pub search_paths: Option<Vec<String>>,
@@ -432,7 +432,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.search_paths.is_none());
         assert!(settings.languages.contains_key("rust"));
@@ -463,7 +463,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.languages.contains_key("rust"));
         let rust_config = &settings.languages["rust"];
@@ -487,7 +487,7 @@ mod tests {
             }
         }"#;
 
-        let result = serde_json::from_str::<TreeSitterSettings>(invalid_json);
+        let result = serde_json::from_str::<RawWorkspaceSettings>(invalid_json);
         assert!(result.is_err());
     }
 
@@ -497,7 +497,7 @@ mod tests {
             "languages": {}
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(empty_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(empty_json).unwrap();
         assert!(settings.languages.is_empty());
     }
 
@@ -506,7 +506,7 @@ mod tests {
         // This is crucial for zero-config: InitializationOptions = {} should work
         let completely_empty = r#"{}"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(completely_empty).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(completely_empty).unwrap();
         assert!(settings.languages.is_empty());
         assert!(settings.search_paths.is_none());
         assert!(settings.auto_install.is_none());
@@ -524,7 +524,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(json_without_languages).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(json_without_languages).unwrap();
         assert!(settings.languages.is_empty());
         assert_eq!(settings.search_paths, Some(vec!["/some/path".to_string()]));
     }
@@ -535,7 +535,7 @@ mod tests {
             [captureMappings._.highlights]
         "#;
 
-        let settings: TreeSitterSettings = toml::from_str(toml_without_languages).unwrap();
+        let settings: RawWorkspaceSettings = toml::from_str(toml_without_languages).unwrap();
         assert!(settings.languages.is_empty());
     }
 
@@ -553,7 +553,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.search_paths.is_some());
         assert_eq!(
@@ -579,7 +579,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.search_paths.is_some());
         assert_eq!(
@@ -611,7 +611,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert_eq!(
             settings.search_paths.unwrap(),
@@ -628,7 +628,7 @@ mod tests {
         ];
 
         for config in malformed_configs {
-            let result = serde_json::from_str::<TreeSitterSettings>(config);
+            let result = serde_json::from_str::<RawWorkspaceSettings>(config);
             assert!(result.is_err());
         }
     }
@@ -659,7 +659,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         // Check capture mappings are parsed correctly
         assert!(settings.capture_mappings.contains_key(WILDCARD_KEY));
@@ -703,7 +703,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.languages.contains_key("lua"));
         let lua_config = &settings.languages["lua"];
@@ -724,7 +724,7 @@ mod tests {
             "languages": {}
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
         assert_eq!(settings.auto_install, Some(true));
 
         // Test with false
@@ -732,20 +732,20 @@ mod tests {
             "autoInstall": false,
             "languages": {}
         }"#;
-        let settings_false: TreeSitterSettings = serde_json::from_str(config_false).unwrap();
+        let settings_false: RawWorkspaceSettings = serde_json::from_str(config_false).unwrap();
         assert_eq!(settings_false.auto_install, Some(false));
 
         // Test missing (should be None)
         let config_missing = r#"{
             "languages": {}
         }"#;
-        let settings_missing: TreeSitterSettings = serde_json::from_str(config_missing).unwrap();
+        let settings_missing: RawWorkspaceSettings = serde_json::from_str(config_missing).unwrap();
         assert_eq!(settings_missing.auto_install, None);
     }
 
     #[test]
     fn should_handle_complex_configurations_efficiently() {
-        let mut config = TreeSitterSettings {
+        let mut config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -774,7 +774,7 @@ mod tests {
 
         // Verify serialization/deserialization still works
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: TreeSitterSettings = serde_json::from_str(&json).unwrap();
+        let deserialized: RawWorkspaceSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.languages.len(), config.languages.len());
     }
 
@@ -890,7 +890,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.languages.contains_key("markdown"));
         let md_config = &settings.languages["markdown"];
@@ -1122,7 +1122,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.language_servers.is_some());
         let servers = settings.language_servers.as_ref().unwrap();
@@ -1152,7 +1152,7 @@ mod tests {
             "languageServers": {}
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.language_servers.is_some());
         assert!(settings.language_servers.as_ref().unwrap().is_empty());
@@ -1165,7 +1165,7 @@ mod tests {
             "searchPaths": ["/usr/local/lib"]
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.language_servers.is_none());
     }

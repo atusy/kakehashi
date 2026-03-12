@@ -4,7 +4,7 @@
 //! User config location: $XDG_CONFIG_HOME/kakehashi/kakehashi.toml
 //! Fallback: ~/.config/kakehashi/kakehashi.toml
 
-use crate::config::TreeSitterSettings;
+use crate::config::RawWorkspaceSettings;
 use log::warn;
 use std::path::PathBuf;
 
@@ -64,7 +64,7 @@ impl std::error::Error for UserConfigError {
 /// - `Ok(Some(settings))` if the file exists and is valid TOML
 /// - `Ok(None)` if the file does not exist (zero-config experience preserved)
 /// - `Err(UserConfigError)` if the file exists but contains invalid TOML
-pub fn load_user_config() -> UserConfigResult<Option<TreeSitterSettings>> {
+pub fn load_user_config() -> UserConfigResult<Option<RawWorkspaceSettings>> {
     let path = match user_config_path() {
         Some(p) => p,
         None => return Ok(None), // No home directory, silently ignore
@@ -81,7 +81,7 @@ pub fn load_user_config() -> UserConfigResult<Option<TreeSitterSettings>> {
         source: e,
     })?;
 
-    let settings = toml::from_str::<TreeSitterSettings>(&contents)
+    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
         .map_err(|e| UserConfigError::ParseError { path, source: e })?;
 
     Ok(Some(settings))

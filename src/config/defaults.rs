@@ -4,14 +4,14 @@
 //! to generate configuration templates.
 
 use super::WILDCARD_KEY;
-use super::settings::{CaptureMapping, CaptureMappings, QueryTypeMappings, TreeSitterSettings};
+use super::settings::{CaptureMapping, CaptureMappings, QueryTypeMappings, RawWorkspaceSettings};
 use std::collections::HashMap;
 
-/// Returns the default TreeSitterSettings for configuration generation.
+/// Returns the default RawWorkspaceSettings for configuration generation.
 ///
 /// This is used by `config init` to generate type-safe default configurations.
-pub fn default_settings() -> TreeSitterSettings {
-    TreeSitterSettings {
+pub fn default_settings() -> RawWorkspaceSettings {
+    RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: HashMap::new(),
         capture_mappings: default_capture_mappings(),
