@@ -224,6 +224,11 @@ pub struct RawWorkspaceSettings {
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
 }
 
+/// Generate JSON Schema for the workspace configuration.
+pub fn json_schema() -> schemars::Schema {
+    schemars::schema_for!(RawWorkspaceSettings)
+}
+
 // Domain types - used throughout the application and also exposed in JSON Schema
 // via RawWorkspaceSettings.
 

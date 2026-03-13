@@ -10,7 +10,7 @@ pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
 pub use settings::{
     AggregationConfig, AggregationStrategy, BridgeServerConfig, CaptureMapping, CaptureMappings,
     LanguageSettings, QueryItem, QueryKind, QueryTypeMappings, RawWorkspaceSettings,
-    WorkspaceSettings,
+    WorkspaceSettings, json_schema,
 };
 use std::collections::HashMap;
 pub(crate) use user::load_user_config;

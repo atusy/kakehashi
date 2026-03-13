@@ -435,8 +435,7 @@ fn test_config_schema_outputs_valid_json_to_stdout() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let schema: serde_json::Value =
-        serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let schema: serde_json::Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
     // Should have properties with camelCase names
     let props = schema.get("properties").expect("Should have properties");
     assert!(

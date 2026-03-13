@@ -98,6 +98,19 @@ enum ConfigAction {
         #[arg(long)]
         force: bool,
     },
+    /// Generate JSON Schema for the configuration format
+    ///
+    /// By default, outputs to stdout for piping or redirection.
+    /// Use --output to write directly to a file.
+    Schema {
+        /// Write to specified file instead of stdout. Use "-" for explicit stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Overwrite existing file (only applies with --output)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -140,6 +153,9 @@ fn main() {
         Some(Commands::Config { action }) => match action {
             ConfigAction::Init { output, force } => {
                 run_config_init(output, force);
+            }
+            ConfigAction::Schema { output, force } => {
+                run_config_schema(output, force);
             }
         },
         None => {
@@ -437,6 +453,53 @@ fn run_config_init(output: Option<PathBuf>, force: bool) {
                 }
                 Err(e) => {
                     eprintln!("Failed to write configuration file: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Run the config schema command
+fn run_config_schema(output: Option<PathBuf>, force: bool) {
+    use kakehashi::config::json_schema;
+
+    // Check for --force without --output (warn but continue)
+    if force && output.is_none() {
+        eprintln!("Warning: --force has no effect without --output");
+    }
+
+    let schema = json_schema();
+    let content = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&schema).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize schema: {}", e);
+            std::process::exit(1);
+        })
+    );
+
+    match output {
+        None => {
+            print!("{}", content);
+        }
+        Some(path) if path.as_os_str() == "-" => {
+            print!("{}", content);
+        }
+        Some(path) => {
+            if path.exists() && !force {
+                eprintln!(
+                    "Error: File '{}' already exists. Use --force to overwrite.",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+
+            match std::fs::write(&path, &content) {
+                Ok(()) => {
+                    eprintln!("Created schema file: {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("Failed to write schema file: {}", e);
                     std::process::exit(1);
                 }
             }
