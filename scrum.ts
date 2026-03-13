@@ -3,8 +3,8 @@
 // ============================================================
 
 const userStoryRoles = [
-  "developer using tree-sitter-ls with multiple embedded languages",
-  "editor plugin author integrating tree-sitter-ls",
+  "developer using kakehashi with multiple embedded languages",
+  "editor plugin author integrating kakehashi",
 ] as const satisfies readonly string[]; // Must have at least one role. Avoid generic roles like "user" or "admin". Remove obsolete roles freely.
 
 const scrum: ScrumDashboard = {
