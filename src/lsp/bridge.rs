@@ -36,32 +36,21 @@ pub(crate) use protocol::location_link_to_location;
 /// - `pool.rs` - LanguageServerPool lifecycle and state tests
 #[cfg(test)]
 mod tests {
+    use super::pool::test_helpers::{lua_ls_available, lua_ls_config};
     use super::pool::{LanguageServerPool, UpstreamId};
     use super::protocol::RegionOffset;
-    use crate::config::settings::BridgeServerConfig;
     use tower_lsp_server::ls_types::Position;
     use url::Url;
 
     /// Integration test: LanguageServerPool sends hover request to lua-language-server
     #[tokio::test]
     async fn pool_hover_request_succeeds_with_lua_server() {
-        // Skip test if lua-language-server is not available
-        if std::process::Command::new("lua-language-server")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("Skipping test: lua-language-server not found");
+        if !lua_ls_available() {
             return;
         }
 
         let pool = LanguageServerPool::new();
-        let server_config = BridgeServerConfig {
-            cmd: vec!["lua-language-server".to_string()],
-            languages: vec!["lua".to_string()],
-            initialization_options: None,
-            workspace_type: None,
-        };
+        let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let host_position = Position {
@@ -90,23 +79,12 @@ mod tests {
     /// Integration test: LanguageServerPool sends completion request to lua-language-server
     #[tokio::test]
     async fn pool_completion_request_succeeds_with_lua_server() {
-        // Skip test if lua-language-server is not available
-        if std::process::Command::new("lua-language-server")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("Skipping test: lua-language-server not found");
+        if !lua_ls_available() {
             return;
         }
 
         let pool = LanguageServerPool::new();
-        let server_config = BridgeServerConfig {
-            cmd: vec!["lua-language-server".to_string()],
-            languages: vec!["lua".to_string()],
-            initialization_options: None,
-            workspace_type: None,
-        };
+        let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let host_position = Position {
@@ -142,23 +120,12 @@ mod tests {
     /// we generate unique downstream IDs internally.
     #[tokio::test]
     async fn downstream_request_uses_unique_generated_id() {
-        // Skip test if lua-language-server is not available
-        if std::process::Command::new("lua-language-server")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("Skipping test: lua-language-server not found");
+        if !lua_ls_available() {
             return;
         }
 
         let pool = LanguageServerPool::new();
-        let server_config = BridgeServerConfig {
-            cmd: vec!["lua-language-server".to_string()],
-            languages: vec!["lua".to_string()],
-            initialization_options: None,
-            workspace_type: None,
-        };
+        let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let host_position = Position {
@@ -193,23 +160,12 @@ mod tests {
     /// when multiple upstream requests have the same ID.
     #[tokio::test]
     async fn completion_request_uses_unique_generated_id() {
-        // Skip test if lua-language-server is not available
-        if std::process::Command::new("lua-language-server")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("Skipping test: lua-language-server not found");
+        if !lua_ls_available() {
             return;
         }
 
         let pool = LanguageServerPool::new();
-        let server_config = BridgeServerConfig {
-            cmd: vec!["lua-language-server".to_string()],
-            languages: vec!["lua".to_string()],
-            initialization_options: None,
-            workspace_type: None,
-        };
+        let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let host_position = Position {
@@ -240,23 +196,12 @@ mod tests {
     /// Integration test: LanguageServerPool sends document link request to lua-language-server
     #[tokio::test]
     async fn pool_document_link_request_succeeds_with_lua_server() {
-        // Skip test if lua-language-server is not available
-        if std::process::Command::new("lua-language-server")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("Skipping test: lua-language-server not found");
+        if !lua_ls_available() {
             return;
         }
 
         let pool = LanguageServerPool::new();
-        let server_config = BridgeServerConfig {
-            cmd: vec!["lua-language-server".to_string()],
-            languages: vec!["lua".to_string()],
-            initialization_options: None,
-            workspace_type: None,
-        };
+        let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         // Lua code with require statement - lua-ls may return document links for requires
