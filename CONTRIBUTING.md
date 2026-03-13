@@ -408,7 +408,7 @@ fn test_with_real_parser() {
     // Use parsers from deps/tree-sitter directory
     let search_paths = vec!["deps/tree-sitter".to_string()];
     let settings = RawWorkspaceSettings {
-        searchPaths: Some(search_paths),
+        search_paths: Some(search_paths),
         languages: /* language config */,
     };
 
