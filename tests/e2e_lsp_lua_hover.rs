@@ -28,7 +28,7 @@ fn e2e_hover_on_lua_function_shows_signature() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing a function
     let markdown_content = r#"# Test Document
@@ -103,7 +103,7 @@ fn e2e_hover_on_lua_local_variable_shows_type() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing a local variable
     let markdown_content = r#"# Test Document

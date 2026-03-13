@@ -49,7 +49,7 @@ fn e2e_outside_injection_returns_null(
     #[case] method: &str,
     #[case] build_params: fn(&str) -> serde_json::Value,
 ) {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     let markdown_content = r#"# Test Document
 

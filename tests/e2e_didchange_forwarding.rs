@@ -32,7 +32,7 @@ fn e2e_didchange_forwarded_after_hover_opens_virtual_document() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Phase 1: Open markdown document with Lua code block
     let markdown_uri = "file:///test_didchange.md";

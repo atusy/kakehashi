@@ -27,7 +27,7 @@ fn e2e_rename_request_handled() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing local variable
     // The variable 'x' appears at:
@@ -176,7 +176,7 @@ fn e2e_rename_multiple_occurrences() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block with multiple variable occurrences
     let markdown_content = r#"# Test Document

@@ -22,7 +22,7 @@ use std::time::Duration;
 /// diagnostics from downstream servers and publish them.
 #[test]
 fn e2e_synthetic_push_on_did_open() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Markdown document with Lua code block
     let markdown_content = r#"# Test Document
@@ -100,7 +100,7 @@ print(x)
 /// diagnostics from downstream servers and publish them.
 #[test]
 fn e2e_synthetic_push_on_did_save() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // First open the document
     let markdown_content = r#"# Test Document
@@ -188,7 +188,7 @@ local x = 1
 #[test]
 #[ignore]
 fn e2e_synthetic_push_superseding_on_rapid_saves() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     let markdown_content = r#"# Test Document
 
@@ -286,7 +286,7 @@ local x = 1
 /// transformed to host document coordinates (same as pull diagnostics).
 #[test]
 fn e2e_synthetic_push_positions_transformed() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Document with syntax error in Lua code block
     // Line 0: "# Test Document"

@@ -23,7 +23,7 @@ use serde_json::json;
 /// E2E test: documentColor request is handled without error
 #[test]
 fn e2e_document_color_request_handled() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     // Note: lua-language-server typically doesn't provide colors for Lua code,
@@ -126,7 +126,7 @@ More text.
 /// E2E test: documentColor for markdown without code blocks returns empty or null
 #[test]
 fn e2e_document_color_no_injections_returns_empty() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document WITHOUT code blocks
     let markdown_content = r#"# Test Document

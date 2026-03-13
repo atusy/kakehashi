@@ -27,7 +27,7 @@ fn e2e_implementation_request_handled() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing class/method pattern
     // lua-language-server uses LuaCATS annotations for class definitions

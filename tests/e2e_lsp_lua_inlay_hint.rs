@@ -27,7 +27,7 @@ fn e2e_inlay_hint_request_handled() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     // lua-language-server provides type hints for variables

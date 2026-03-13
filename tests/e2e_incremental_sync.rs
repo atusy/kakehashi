@@ -34,7 +34,7 @@ fn e2e_incremental_sync_preserves_region_tracking() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Phase 1: Open markdown document with Lua code block
     let markdown_uri = "file:///test_incremental_sync.md";
@@ -144,7 +144,7 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown with two Lua blocks
     let markdown_uri = "file:///test_multi_incremental.md";

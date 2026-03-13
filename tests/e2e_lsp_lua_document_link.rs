@@ -22,7 +22,7 @@ use serde_json::json;
 /// E2E test: document link request is handled without error
 #[test]
 fn e2e_document_link_request_handled() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing require statement
     let markdown_content = r#"# Test Document
@@ -121,7 +121,7 @@ More text.
 /// E2E test: document link for markdown file without code blocks returns null
 #[test]
 fn e2e_document_link_no_injections_returns_null() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document WITHOUT code blocks
     let markdown_content = r#"# Test Document
