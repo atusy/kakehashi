@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (Supersedes [ADR-0002](0002-filetype-detection-via-extension-mapping.md))
+Accepted (Supersedes [ADR-0002](0002-filetype-detection-via-extension-mapping.md)). Alias resolution (`aliases` field, `build_alias_map()`, `resolve_alias()`) is superseded by [ADR-0024](0024-base-language-inheritance.md)'s `base` field. The detection fallback chain (languageId → token → first-line) and syntect normalization remain unchanged.
 
 ## Context
 
