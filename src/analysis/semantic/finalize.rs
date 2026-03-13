@@ -372,6 +372,61 @@ fn split_host_token_around_regions(
     fragments
 }
 
+/// Split parent tokens around `@none` regions (nvim-treesitter convention).
+///
+/// `@none` punches holes in parent highlighting (e.g., `(interpolation) @none`
+/// removes `@string` coverage from f-string interpolation slots). Tokens whose
+/// `node_byte_len` is strictly larger than the `@none` token (ancestor nodes)
+/// are split around `@none` intervals; child tokens (smaller `node_byte_len`)
+/// are preserved unchanged. `@none` tokens themselves are discarded.
+fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
+    let (none_tokens, tokens): (Vec<_>, Vec<_>) =
+        tokens.into_iter().partition(|t| t.mapped_name == "none");
+
+    if none_tokens.is_empty() {
+        return tokens;
+    }
+
+    // Build per-line @none intervals with their node sizes for O(1) lookup.
+    let mut none_intervals: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+    for t in &none_tokens {
+        none_intervals.entry(t.line).or_default().push((
+            t.column,
+            t.column + t.length,
+            t.node_byte_len,
+        ));
+    }
+    for intervals in none_intervals.values_mut() {
+        intervals.sort_unstable();
+    }
+
+    let mut result = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if let Some(line_intervals) = none_intervals.get(&token.line) {
+            // Find @none intervals that are within this token AND have
+            // smaller node_byte_len (meaning @none is on a child node).
+            let dominated: Vec<(usize, usize)> = line_intervals
+                .iter()
+                .filter(|(start, end, none_len)| {
+                    *none_len < token.node_byte_len
+                        && *start >= token.column
+                        && *end <= token.column + token.length
+                })
+                .map(|(start, end, _)| (*start, *end))
+                .collect();
+
+            if !dominated.is_empty() {
+                result.extend(split_host_token_around_regions(&token, &dominated));
+            } else {
+                result.push(token);
+            }
+        } else {
+            result.push(token);
+        }
+    }
+    result
+}
+
 /// Filter host tokens (depth=0) against active injection regions.
 ///
 /// - Depth > 0 tokens pass through unchanged.
@@ -455,65 +510,7 @@ pub(super) fn finalize_tokens(
 
     let all_tokens = filter_by_injection_regions(all_tokens, active_injection_regions, lines);
 
-    // @none pre-processing: split parent tokens around @none regions.
-    //
-    // @none is a nvim-treesitter convention that resets parent highlighting
-    // within a region (e.g., `(interpolation) @none` punches holes in @string
-    // for f-string interpolation). We handle this by:
-    // 1. Extracting @none token positions
-    // 2. Splitting tokens whose node strictly contains the @none node
-    //    (parent tokens with larger node_byte_len)
-    // 3. Discarding the @none tokens themselves
-    //
-    // This preserves child tokens (e.g., @number inside interpolation) that
-    // have smaller node_byte_len than @none, while removing the parent @string
-    // coverage from the @none region.
-    let (none_tokens, mut all_tokens): (Vec<_>, Vec<_>) = all_tokens
-        .into_iter()
-        .partition(|t| t.mapped_name == "none");
-
-    if !none_tokens.is_empty() {
-        // Build per-line @none intervals with their node sizes
-        let mut none_intervals: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
-        for t in &none_tokens {
-            none_intervals.entry(t.line).or_default().push((
-                t.column,
-                t.column + t.length,
-                t.node_byte_len,
-            ));
-        }
-        for intervals in none_intervals.values_mut() {
-            intervals.sort_unstable();
-        }
-
-        // Split parent tokens around @none intervals
-        let mut result = Vec::with_capacity(all_tokens.len());
-        for token in all_tokens {
-            if let Some(line_intervals) = none_intervals.get(&token.line) {
-                // Find @none intervals that are within this token AND have
-                // smaller node_byte_len (meaning @none is on a child node)
-                let dominated: Vec<(usize, usize)> = line_intervals
-                    .iter()
-                    .filter(|(start, end, none_len)| {
-                        *none_len < token.node_byte_len
-                            && *start >= token.column
-                            && *end <= token.column + token.length
-                    })
-                    .map(|(start, end, _)| (*start, *end))
-                    .collect();
-
-                if !dominated.is_empty() {
-                    let fragments = split_host_token_around_regions(&token, &dominated);
-                    result.extend(fragments);
-                } else {
-                    result.push(token);
-                }
-            } else {
-                result.push(token);
-            }
-        }
-        all_tokens = result;
-    }
+    let all_tokens = apply_none_preprocessing(all_tokens);
 
     // Split overlapping tokens using sweep line algorithm.
     // This replaces the old sort + dedup approach, producing non-overlapping
