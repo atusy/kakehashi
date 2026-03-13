@@ -997,36 +997,15 @@ impl InjectionResolver {
         injection_query: &Query,
         byte_offset: usize,
     ) -> Option<ResolvedInjection> {
-        // 1. Collect all injection regions
         let injections = collect_all_injections(&tree.root_node(), text, Some(injection_query))?;
-
-        // 2. Find injection region containing this position
         let (_region_index, region) = find_injection_at_position(&injections, byte_offset)?;
-
-        // 3. Calculate stable ULID-based region_id (Phase 2: position-based)
-        let region_id = Self::calculate_region_id(tracker, uri, region);
-        let region_id_str = region_id.to_string();
-
-        // 4. Build cacheable region with line range information
-        let cacheable_region =
-            CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
-
-        // 5. Extract clean virtual content and per-line column offsets
-        let (virtual_content, line_column_offsets) =
-            extract_virtual_content_and_offsets(region, &cacheable_region, text);
-
-        // 6. Resolve injection language using unified detection (ADR-0005)
-        // This normalizes tokens like "py" -> "python" for bridge server lookup
-        let resolved_language =
-            Self::resolve_language(coordinator, &region.language, &virtual_content);
-
-        Some(ResolvedInjection {
-            region: cacheable_region,
-            region_id: region_id_str,
-            injection_language: resolved_language,
-            virtual_content,
-            line_column_offsets,
-        })
+        Some(Self::build_resolved_injection(
+            coordinator,
+            tracker,
+            uri,
+            region,
+            text,
+        ))
     }
 
     /// Calculate a stable ULID-based region_id for an injection.
@@ -1075,6 +1054,35 @@ impl InjectionResolver {
             .unwrap_or_else(|| raw_identifier.to_string())
     }
 
+    /// Build a [`ResolvedInjection`] from a raw injection region.
+    ///
+    /// Shared by [`Self::resolve_at_byte_offset`] and [`Self::resolve_all`] to
+    /// avoid duplicating the region-id → cacheable-region → virtual-content →
+    /// language-resolution pipeline.
+    fn build_resolved_injection(
+        coordinator: &LanguageCoordinator,
+        tracker: &RegionIdTracker,
+        uri: &Url,
+        region: &InjectionRegionInfo,
+        text: &str,
+    ) -> ResolvedInjection {
+        let region_id = Self::calculate_region_id(tracker, uri, region);
+        let region_id_str = region_id.to_string();
+        let cacheable_region =
+            CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
+        let (virtual_content, line_column_offsets) =
+            extract_virtual_content_and_offsets(region, &cacheable_region, text);
+        let resolved_language =
+            Self::resolve_language(coordinator, &region.language, &virtual_content);
+        ResolvedInjection {
+            region: cacheable_region,
+            region_id: region_id_str,
+            injection_language: resolved_language,
+            virtual_content,
+            line_column_offsets,
+        }
+    }
+
     /// Resolve all injection regions in a document.
     ///
     /// This is used for whole-document operations like document_link that need
@@ -1102,37 +1110,15 @@ impl InjectionResolver {
         text: &str,
         injection_query: &Query,
     ) -> Vec<ResolvedInjection> {
-        // Collect all injection regions
         let Some(injections) =
             collect_all_injections(&tree.root_node(), text, Some(injection_query))
         else {
             return Vec::new();
         };
 
-        // Resolve each injection
         injections
             .iter()
-            .map(|region| {
-                let region_id = Self::calculate_region_id(tracker, uri, region);
-                let region_id_str = region_id.to_string();
-                let cacheable_region =
-                    CacheableInjectionRegion::from_region_info(region, &region_id_str, text);
-
-                let (virtual_content, line_column_offsets) =
-                    extract_virtual_content_and_offsets(region, &cacheable_region, text);
-
-                // Resolve injection language using unified detection (ADR-0005)
-                let resolved_language =
-                    Self::resolve_language(coordinator, &region.language, &virtual_content);
-
-                ResolvedInjection {
-                    region: cacheable_region,
-                    region_id: region_id_str,
-                    injection_language: resolved_language,
-                    virtual_content,
-                    line_column_offsets,
-                }
-            })
+            .map(|region| Self::build_resolved_injection(coordinator, tracker, uri, region, text))
             .collect()
     }
 }
