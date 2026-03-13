@@ -27,7 +27,7 @@ fn e2e_document_highlight_request_handled() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing local variable with multiple usages
     // The variable 'name' appears at:
@@ -127,7 +127,7 @@ fn e2e_document_highlight_multiple_occurrences() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing variable used multiple times
     let markdown_content = r#"# Test Document

@@ -27,7 +27,7 @@ fn test_lua_completion_in_markdown_code_block_via_binary() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     // Use simple Lua code that triggers completions

@@ -57,18 +57,14 @@ pub fn skip_if_lua_ls_unavailable() -> bool {
 /// restrictive bridge filter that blocks lua, causing all bridge tests to fail.
 ///
 /// # Returns
-/// An initialized `LspClient` ready for Lua bridge operations.
-pub fn create_lua_configured_client() -> LspClient {
-    // Create an empty config file for test isolation.
-    // This is leaked intentionally — temp files live for the process lifetime.
+/// A tuple of an initialized `LspClient` and the `TempDir` holding the config.
+/// Callers must keep the `TempDir` alive (e.g., `let (_client, _config_dir) = ...`)
+/// so the temp directory is not deleted while the server is running.
+pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let config_path = config_dir.path().join("empty.toml");
     std::fs::write(&config_path, "").expect("Failed to write empty config");
-    // Leak the TempDir so it lives for the duration of the test
-    let config_dir = Box::leak(Box::new(config_dir));
-    let config_path_str = config_dir
-        .path()
-        .join("empty.toml")
+    let config_path_str = config_path
         .to_str()
         .expect("temp path should be valid UTF-8")
         .to_string();
@@ -96,7 +92,7 @@ pub fn create_lua_configured_client() -> LspClient {
         }),
     );
     client.send_notification("initialized", json!({}));
-    client
+    (client, config_dir)
 }
 
 /// Perform clean LSP shutdown sequence.

@@ -40,7 +40,7 @@ fn e2e_hover_then_completion_on_same_lua_block_shares_uri() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with a Lua code block containing a variable
     // We'll hover on and complete from this variable
@@ -139,7 +139,7 @@ fn e2e_multiple_lua_blocks_have_distinct_region_ids() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with TWO Lua code blocks
     let markdown_content = r#"# Test Document

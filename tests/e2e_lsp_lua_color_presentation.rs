@@ -27,7 +27,7 @@ use serde_json::json;
 /// that the bridge infrastructure correctly handles the request.
 #[test]
 fn e2e_color_presentation_request_handled() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     let markdown_content = r##"# Test Document

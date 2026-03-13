@@ -48,7 +48,7 @@ fn e2e_moniker_request_on_lua_variable() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     let markdown_content = r#"# Test Document
@@ -138,7 +138,7 @@ fn e2e_moniker_request_on_lua_builtin() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block calling a built-in
     let markdown_content = r#"# Test Document

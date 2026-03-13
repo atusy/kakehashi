@@ -27,7 +27,7 @@ fn e2e_definition_on_lua_function_call_returns_location() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing a function definition and call
     // Function defined at line 3 (0-indexed), called at line 6
@@ -133,7 +133,7 @@ fn e2e_definition_on_lua_local_variable_returns_declaration() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block with local variable
     let markdown_content = r#"# Test Document

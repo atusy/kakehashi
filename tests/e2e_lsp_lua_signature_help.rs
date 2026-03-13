@@ -45,7 +45,7 @@ fn e2e_signature_help_on_string_format_shows_parameters() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing string.format call
     // Position cursor right after the '(' to trigger signature help
@@ -130,7 +130,7 @@ fn e2e_signature_help_on_print_shows_parameter() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing print call
     let markdown_content = r#"# Test Document
@@ -204,7 +204,7 @@ fn e2e_signature_help_on_custom_function_shows_parameters() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing custom function definition and call
     let markdown_content = r#"# Test Document

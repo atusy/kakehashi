@@ -74,7 +74,7 @@ fn e2e_diagnostic_capability_advertised() {
 /// Position transformation correctness is tested separately in unit tests.
 #[test]
 fn e2e_diagnostic_response_structure_is_valid() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     let markdown_content = r#"# Test Document
 
@@ -129,7 +129,7 @@ local x = 1
 /// which is acceptable - position transformation is also tested in unit tests.
 #[test]
 fn e2e_diagnostic_positions_transformed_to_host_coordinates() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing a syntax error
     // Document structure (0-indexed lines):
@@ -243,7 +243,7 @@ More text.
 /// are aggregated into a single response.
 #[test]
 fn e2e_diagnostic_multi_region_aggregation() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with MULTIPLE Lua code blocks
     // This tests the Sprint 17 multi-region aggregation

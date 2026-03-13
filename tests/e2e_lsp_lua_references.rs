@@ -27,7 +27,7 @@ fn e2e_references_request_handled() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing local variable with multiple references
     // The variable 'name' appears at:
@@ -135,7 +135,7 @@ fn e2e_references_include_declaration_false() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block
     let markdown_content = r#"# Test Document

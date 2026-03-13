@@ -27,7 +27,7 @@ fn e2e_connection_remains_open_after_didclose() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // === Phase 1: Open first markdown document and trigger hover ===
     let markdown_uri_1 = "file:///test_didclose_1.md";
@@ -143,7 +143,7 @@ fn e2e_didclose_forwarded_to_downstream_server() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with multiple Lua code blocks
     let markdown_uri = "file:///test_multi_lua.md";

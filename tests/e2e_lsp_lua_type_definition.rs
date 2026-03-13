@@ -27,7 +27,7 @@ fn e2e_type_definition_request_handled() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code block containing type annotations
     // Using LuaCATS style type annotations that lua-language-server understands
@@ -134,7 +134,7 @@ fn e2e_type_definition_on_typed_variable() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document with Lua code using type annotations
     let markdown_content = r#"# Test Document

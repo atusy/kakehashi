@@ -120,7 +120,7 @@ fn e2e_native_selection_range_works_in_markdown_with_injection() {
         return;
     }
 
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown with Lua code block
     let markdown_content = r#"# Test Document

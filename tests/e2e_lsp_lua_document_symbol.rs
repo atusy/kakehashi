@@ -179,7 +179,7 @@ More text.
 /// E2E test: document symbol for markdown file without code blocks returns null
 #[test]
 fn e2e_document_symbol_no_injections_returns_null() {
-    let mut client = create_lua_configured_client();
+    let (mut client, _config_dir) = create_lua_configured_client();
 
     // Open markdown document WITHOUT code blocks
     let markdown_content = r#"# Test Document
