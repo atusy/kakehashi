@@ -202,7 +202,7 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
     }
 
     // Start with the outer prefix widths (empty for host-level tokens).
-    let mut widths = prefix_byte_widths.to_vec();
+    let mut prefix_widths = prefix_byte_widths.to_vec();
 
     // The maximum inner-prefix width (relative to the outer prefix boundary) is
     // determined by the node's start row: `start_col - outer_at_start_row`.
@@ -215,7 +215,7 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
 
     if inner_prefix_max == 0 {
         // No inner prefix possible (node starts exactly at the outer prefix boundary).
-        return widths;
+        return prefix_widths;
     }
 
     // Walk ALL named descendants (not just direct children) to find structural
@@ -242,11 +242,11 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
                 && (ce.column - row_outer) <= inner_prefix_max
             {
                 let row = cs.row;
-                if row >= widths.len() {
-                    widths.resize(row + 1, 0);
+                if row >= prefix_widths.len() {
+                    prefix_widths.resize(row + 1, 0);
                 }
-                if widths[row] < ce.column {
-                    widths[row] = ce.column;
+                if prefix_widths[row] < ce.column {
+                    prefix_widths[row] = ce.column;
                 }
             }
         }
@@ -261,7 +261,7 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
             }
         }
     }
-    widths
+    prefix_widths
 }
 
 /// Collect tokens from a single document's highlight query (no injection processing).
@@ -391,9 +391,9 @@ pub(super) fn collect_host_tokens(
                 // Compute effective prefix widths: injection-level widths
                 // are passed in; HOST-level nodes detect structural prefix
                 // children to avoid spanning line-leading prefixes.
-                let eff_widths = effective_prefix_widths(&node, prefix_byte_widths);
+                let prefix_widths = effective_prefix_widths(&node, prefix_byte_widths);
 
-                if supports_multiline && eff_widths.is_empty() {
+                if supports_multiline && prefix_widths.is_empty() {
                     // Multiline token with client support AND no prefix widths:
                     // emit a single token spanning multiple lines.
                     let host_start_line = content_start_line + start_pos.row;
@@ -419,7 +419,7 @@ pub(super) fn collect_host_tokens(
                             end_pos,
                             content_start_col,
                             content_line_len,
-                            &eff_widths,
+                            &prefix_widths,
                         );
 
                         let line_start_utf16 = byte_to_utf16_col(line_text, line_start);
@@ -462,7 +462,7 @@ pub(super) fn collect_host_tokens(
                             end_pos,
                             content_start_col,
                             content_line_len,
-                            &eff_widths,
+                            &prefix_widths,
                         );
 
                         let start_utf16 = byte_to_utf16_col(host_line_text, line_start_byte);
