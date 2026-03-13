@@ -410,34 +410,20 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
     if path.exists() { Some(path) } else { None }
 }
 
-/// Run the config init command
-fn run_config_init(output: Option<PathBuf>, force: bool) {
-    use kakehashi::config::defaults::default_settings;
-
+/// Write content to stdout or a file, with --force / --output semantics.
+fn write_content_to_output(content: &str, output: Option<PathBuf>, force: bool, label: &str) {
     // Check for --force without --output (warn but continue)
     if force && output.is_none() {
         eprintln!("Warning: --force has no effect without --output");
     }
 
-    // Generate config from typed defaults
-    let settings = default_settings();
-    let config_toml = toml::to_string_pretty(&settings).unwrap_or_else(|e| {
-        eprintln!("Failed to serialize configuration: {}", e);
-        std::process::exit(1);
-    });
-
-    // Prepend documentation link
-    let config_with_doc = format!("{}\n{}", DOC_LINK, config_toml);
-
     match output {
-        // No output specified or explicit "-" means stdout
         None => {
-            print!("{}", config_with_doc);
+            print!("{}", content);
         }
         Some(path) if path.as_os_str() == "-" => {
-            print!("{}", config_with_doc);
+            print!("{}", content);
         }
-        // Write to specified file
         Some(path) => {
             if path.exists() && !force {
                 eprintln!(
@@ -447,12 +433,12 @@ fn run_config_init(output: Option<PathBuf>, force: bool) {
                 std::process::exit(1);
             }
 
-            match std::fs::write(&path, &config_with_doc) {
+            match std::fs::write(&path, content) {
                 Ok(()) => {
-                    eprintln!("Created configuration file: {}", path.display());
+                    eprintln!("Created {label} file: {}", path.display());
                 }
                 Err(e) => {
-                    eprintln!("Failed to write configuration file: {}", e);
+                    eprintln!("Failed to write {label} file: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -460,14 +446,25 @@ fn run_config_init(output: Option<PathBuf>, force: bool) {
     }
 }
 
+/// Run the config init command
+fn run_config_init(output: Option<PathBuf>, force: bool) {
+    use kakehashi::config::defaults::default_settings;
+
+    let settings = default_settings();
+    let config_toml = toml::to_string_pretty(&settings).unwrap_or_else(|e| {
+        eprintln!("Failed to serialize configuration: {}", e);
+        std::process::exit(1);
+    });
+
+    // Prepend documentation link
+    let content = format!("{}\n{}", DOC_LINK, config_toml);
+
+    write_content_to_output(&content, output, force, "configuration");
+}
+
 /// Run the config schema command
 fn run_config_schema(output: Option<PathBuf>, force: bool) {
     use kakehashi::config::json_schema;
-
-    // Check for --force without --output (warn but continue)
-    if force && output.is_none() {
-        eprintln!("Warning: --force has no effect without --output");
-    }
 
     let schema = json_schema();
     let content = format!(
@@ -478,33 +475,7 @@ fn run_config_schema(output: Option<PathBuf>, force: bool) {
         })
     );
 
-    match output {
-        None => {
-            print!("{}", content);
-        }
-        Some(path) if path.as_os_str() == "-" => {
-            print!("{}", content);
-        }
-        Some(path) => {
-            if path.exists() && !force {
-                eprintln!(
-                    "Error: File '{}' already exists. Use --force to overwrite.",
-                    path.display()
-                );
-                std::process::exit(1);
-            }
-
-            match std::fs::write(&path, &content) {
-                Ok(()) => {
-                    eprintln!("Created schema file: {}", path.display());
-                }
-                Err(e) => {
-                    eprintln!("Failed to write schema file: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
+    write_content_to_output(&content, output, force, "schema");
 }
 
 /// Run the install command (synchronous - no tokio runtime)
