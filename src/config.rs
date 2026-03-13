@@ -8,7 +8,7 @@ pub(crate) mod user;
 
 pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
 pub use settings::{
-    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageConfig, LanguageSettings,
+    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageSettings,
     QueryItem, QueryKind, QueryTypeMappings, RawWorkspaceSettings, WorkspaceSettings,
 };
 use std::collections::HashMap;
@@ -262,37 +262,11 @@ pub(crate) fn merge_settings(
     }
 }
 
-impl From<&LanguageConfig> for LanguageSettings {
-    fn from(config: &LanguageConfig) -> Self {
-        LanguageSettings {
-            parser: config.parser.clone(),
-            queries: config.queries.clone(),
-            bridge: config.bridge.clone(),
-            aliases: config.aliases.clone(),
-        }
-    }
-}
-
-impl From<&LanguageSettings> for LanguageConfig {
-    fn from(settings: &LanguageSettings) -> Self {
-        LanguageConfig {
-            parser: settings.parser.clone(),
-            queries: settings.queries.clone(),
-            bridge: settings.bridge.clone(),
-            aliases: settings.aliases.clone(),
-        }
-    }
-}
-
 /// Convert `RawWorkspaceSettings` to `WorkspaceSettings` without expanding
 /// environment variables or tilde. This is the base conversion used
 /// internally by `try_from_settings`.
 fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
-    let languages = settings
-        .languages
-        .iter()
-        .map(|(name, config)| (name.clone(), LanguageSettings::from(config)))
-        .collect();
+    let languages = settings.languages.clone();
     let capture_mappings = settings
         .capture_mappings
         .iter()
@@ -380,11 +354,7 @@ impl WorkspaceSettings {
 
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: &WorkspaceSettings) -> Self {
-        let languages = settings
-            .languages
-            .iter()
-            .map(|(name, config)| (name.clone(), LanguageConfig::from(config)))
-            .collect();
+        let languages = settings.languages.clone();
         let capture_mappings = settings
             .capture_mappings
             .iter()
@@ -423,9 +393,9 @@ impl From<WorkspaceSettings> for RawWorkspaceSettings {
 }
 
 fn merge_languages(
-    mut base: HashMap<String, LanguageConfig>,
-    overlay: HashMap<String, LanguageConfig>,
-) -> HashMap<String, LanguageConfig> {
+    mut base: HashMap<String, LanguageSettings>,
+    overlay: HashMap<String, LanguageSettings>,
+) -> HashMap<String, LanguageSettings> {
     // Deep merge: overlay values override base values for the same key
     for (key, overlay_config) in overlay {
         base.entry(key)
@@ -568,19 +538,19 @@ pub(crate) fn resolve_with_wildcard(map: &CaptureMappings, key: &str) -> Option<
 /// - If only specific key exists: return specific key
 /// - If neither exists: return None
 ///
-/// The merge creates a new LanguageConfig where specific values override wildcard values.
+/// The merge creates a new LanguageSettings where specific values override wildcard values.
 #[cfg(test)]
 pub(crate) fn resolve_language_with_wildcard(
-    map: &HashMap<String, LanguageConfig>,
+    map: &HashMap<String, LanguageSettings>,
     key: &str,
-) -> Option<LanguageConfig> {
+) -> Option<LanguageSettings> {
     let wildcard = map.get(WILDCARD_KEY);
     let specific = map.get(key);
 
     match (wildcard, specific) {
         (Some(w), Some(s)) => {
             // Merge: start with wildcard, override with specific
-            Some(LanguageConfig {
+            Some(LanguageSettings {
                 parser: s.parser.clone().or_else(|| w.parser.clone()),
                 queries: s.queries.clone().or_else(|| w.queries.clone()),
                 // Deep merge bridge HashMaps: wildcard + specific
@@ -669,7 +639,7 @@ mod tests {
         let mut fallback_languages = HashMap::new();
         fallback_languages.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/fallback/rust.so".to_string()),
                 ..Default::default()
             },
@@ -686,7 +656,7 @@ mod tests {
         let mut primary_languages = HashMap::new();
         primary_languages.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/primary/rust.so".to_string()),
                 ..Default::default()
             },
@@ -1071,35 +1041,6 @@ mod tests {
         assert_eq!(result.search_paths, Some(vec!["/path".to_string()]));
     }
 
-    #[test]
-    fn test_language_settings_from_config_preserves_queries() {
-        let config = LanguageConfig {
-            parser: Some("/path/to/parser.so".to_string()),
-            queries: Some(vec![
-                settings::QueryItem {
-                    path: "/path/to/highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                },
-                settings::QueryItem {
-                    path: "/path/to/injections.scm".to_string(),
-                    kind: Some(settings::QueryKind::Injections),
-                },
-            ]),
-            ..Default::default()
-        };
-
-        let settings: LanguageSettings = LanguageSettings::from(&config);
-
-        // Verify queries is preserved
-        assert!(settings.queries.is_some());
-        let queries = settings.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[0].path, "/path/to/highlights.scm");
-        assert_eq!(queries[0].kind, Some(settings::QueryKind::Highlights));
-        assert_eq!(queries[1].path, "/path/to/injections.scm");
-        assert_eq!(queries[1].kind, Some(settings::QueryKind::Injections));
-    }
-
     // PBI-150 Subtask 2: Deep merge for languages HashMap
 
     #[test]
@@ -1120,7 +1061,7 @@ mod tests {
 
         user_languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/usr/lib/python.so".to_string()),
                 queries: Some(vec![
                     settings::QueryItem {
@@ -1149,7 +1090,7 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // parser: None - Not specified - should inherit from user
                 queries: Some(vec![settings::QueryItem {
                     path: "./queries/python-highlights.scm".to_string(),
@@ -1196,7 +1137,7 @@ mod tests {
         let mut user_languages = HashMap::new();
         user_languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/usr/lib/python.so".to_string()),
                 ..Default::default()
             },
@@ -1213,7 +1154,7 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/project/rust.so".to_string()),
                 ..Default::default()
             },
@@ -1725,7 +1666,7 @@ mod tests {
         // ADR-0011: languages['rust'] inherits from languages['_']
         // When languages only has "_" and we ask for "rust",
         // we should get the wildcard's settings
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard has parser and bridge settings
         let mut wildcard_bridge = HashMap::new();
@@ -1739,7 +1680,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 queries: Some(vec![settings::QueryItem {
                     path: "/default/highlights.scm".to_string(),
@@ -1779,7 +1720,7 @@ mod tests {
         // - languages.python has bridge.javascript with enabled = false (override)
         // - We ask for bridge setting for "javascript" in "python" -> should get enabled = false
         // - We ask for bridge setting for "rust" in "python" -> should get enabled = true (from _)
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard language with wildcard bridge (default enabled = true)
         let mut wildcard_bridge = HashMap::new();
@@ -1793,7 +1734,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 queries: Some(vec![settings::QueryItem {
                     path: "/default/highlights.scm".to_string(),
@@ -1816,7 +1757,7 @@ mod tests {
 
         languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // parser: None - Should inherit from _
                 // queries: None - Should inherit from _
                 bridge: Some(python_bridge),
@@ -1867,7 +1808,7 @@ mod tests {
         // - languages.python.bridge._ = enabled: true (python-specific default)
         // - languages.python.bridge.javascript = enabled: false (override)
         // - rust should inherit from python.bridge._ (enabled = true)
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Python with its own wildcard bridge
         let mut python_bridge = HashMap::new();
@@ -1888,7 +1829,7 @@ mod tests {
 
         languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/python/path.so".to_string()),
                 bridge: Some(python_bridge),
                 ..Default::default()
@@ -1928,7 +1869,7 @@ mod tests {
         // languages._ has bridge._ with enabled = true
         // languages.python is NOT defined (should inherit from _)
         // We ask for bridge setting for "rust" in "python" -> should get enabled = true
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard language with wildcard bridge
         let mut wildcard_bridge = HashMap::new();
@@ -1942,7 +1883,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 bridge: Some(wildcard_bridge),
                 ..Default::default()
@@ -1988,7 +1929,7 @@ mod tests {
         //
         // This tests that python inherits rust/go from wildcard while adding
         // its own javascript setting.
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard has default bridge settings for rust and go
         let mut wildcard_bridge = HashMap::new();
@@ -2009,7 +1950,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 bridge: Some(wildcard_bridge),
                 ..Default::default()
@@ -2028,7 +1969,7 @@ mod tests {
 
         languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // parser: None - Inherits from wildcard
                 bridge: Some(python_bridge),
                 ..Default::default()
@@ -2525,13 +2466,13 @@ mod tests {
     fn test_language_config_inherits_from_wildcard() {
         use settings::BridgeLanguageConfig;
 
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard language: disable bridging by default (empty bridge filter)
         let wildcard_bridge = HashMap::new(); // Empty = disable all bridging
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 queries: Some(vec![settings::QueryItem {
                     path: "/default/highlights.scm".to_string(),
                     kind: Some(settings::QueryKind::Highlights),
@@ -2552,7 +2493,7 @@ mod tests {
         );
         languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // highlights: None - Should inherit from wildcard
                 bridge: Some(markdown_bridge),
                 ..Default::default()
@@ -2825,7 +2766,7 @@ mod tests {
     }
 
     // Regression test: aliases must be merged in merge_languages()
-    // Bug: When aliases field was added to LanguageConfig, merge_languages() was not
+    // Bug: When aliases field was added to LanguageSettings, merge_languages() was not
     // updated to merge it. This caused aliases from user config to be lost when
     // project config also defined the same language.
 
@@ -2837,7 +2778,7 @@ mod tests {
         let mut user_languages = HashMap::new();
         user_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/usr/lib/markdown.so".to_string()),
                 aliases: Some(vec!["rmd".to_string(), "qmd".to_string()]),
                 ..Default::default()
@@ -2856,7 +2797,7 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 queries: Some(vec![settings::QueryItem {
                     path: "./queries/markdown-highlights.scm".to_string(),
                     kind: Some(settings::QueryKind::Highlights),
@@ -2907,7 +2848,7 @@ mod tests {
         let mut user_languages = HashMap::new();
         user_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 aliases: Some(vec!["rmd".to_string()]),
                 ..Default::default()
             },
@@ -2925,7 +2866,7 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 aliases: Some(vec!["qmd".to_string(), "mdx".to_string()]),
                 ..Default::default()
             },
@@ -3374,7 +3315,7 @@ mod try_from_settings_tests {
         let mut languages = HashMap::new();
         languages.insert(
             "lua".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("$TEST_VAR/lua.so".to_string()),
                 queries: None,
                 bridge: None,
@@ -3401,7 +3342,7 @@ mod try_from_settings_tests {
         let mut languages = HashMap::new();
         languages.insert(
             "lua".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: None,
                 queries: Some(vec![QueryItem {
                     path: "${TEST_VAR}/highlights.scm".to_string(),
@@ -3449,7 +3390,7 @@ mod try_from_settings_tests {
         let mut languages = HashMap::new();
         languages.insert(
             "lua".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("$ALSO_MISSING/lua.so".to_string()),
                 queries: None,
                 bridge: None,

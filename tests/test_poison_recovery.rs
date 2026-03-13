@@ -105,7 +105,7 @@ fn test_query_store_recovers_from_poisoned_write_lock() {
 #[test]
 #[serial(poison)]
 fn test_config_store_recovers_from_poisoned_lock() {
-    use kakehashi::config::settings::LanguageConfig;
+    use kakehashi::config::settings::LanguageSettings;
 
     let store = Arc::new(ConfigStore::new());
     let store_clone = store.clone();
@@ -122,7 +122,7 @@ fn test_config_store_recovers_from_poisoned_lock() {
     let mut new_configs = std::collections::HashMap::new();
     new_configs.insert(
         "rust".to_string(),
-        LanguageConfig {
+        LanguageSettings {
             parser: Some("/path/to/rust.so".to_string()),
             ..Default::default()
         },

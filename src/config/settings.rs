@@ -202,29 +202,12 @@ pub fn infer_query_kind(path: &str) -> Option<QueryKind> {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
-pub struct LanguageConfig {
-    pub parser: Option<String>,
-    /// Unified query file configuration.
-    /// Each entry has a path and optional kind (inferred from filename if omitted).
-    pub queries: Option<Vec<QueryItem>>,
-    /// Languages to bridge for this host filetype (map format).
-    /// - None (omitted): Bridge ALL configured languages (default behavior)
-    /// - Some({}): Bridge NOTHING (disable bridging for this host)
-    /// - Some({ python: { enabled: true } }): Bridge only enabled languages
-    pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
-    /// Alternative languageId values that map to this language.
-    /// Example: `[languages.markdown]` with `aliases = ["rmd", "qmd"]`
-    /// allows editors sending languageId "rmd" or "qmd" to use the markdown parser.
-    pub aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct RawWorkspaceSettings {
     // Editor-agnostic name exposed to JSON as `searchPaths`.
     #[serde(rename = "searchPaths")]
     pub search_paths: Option<Vec<String>>,
     #[serde(default)]
-    pub languages: HashMap<String, LanguageConfig>,
+    pub languages: HashMap<String, LanguageSettings>,
     #[serde(rename = "captureMappings", default)]
     pub capture_mappings: CaptureMappings,
     #[serde(rename = "autoInstall")]
@@ -759,7 +742,7 @@ mod tests {
         for lang in languages {
             config.languages.insert(
                 lang.to_string(),
-                LanguageConfig {
+                LanguageSettings {
                     parser: Some(format!("/usr/lib/libtree-sitter-{}.so", lang)),
                     queries: Some(vec![QueryItem {
                         path: format!("/etc/tree-sitter/{}/highlights.scm", lang),
@@ -780,9 +763,9 @@ mod tests {
 
     #[test]
     fn should_not_have_legacy_fields_in_language_config() {
-        // Legacy highlights/locals/injections fields have been removed from LanguageConfig
+        // Legacy highlights/locals/injections fields have been removed from LanguageSettings
         // All query configuration now uses the unified queries field
-        let config = LanguageConfig {
+        let config = LanguageSettings {
             parser: Some("/path/to/parser.so".to_string()),
             queries: Some(vec![QueryItem {
                 path: "/path/to/highlights.scm".to_string(),
@@ -795,17 +778,17 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(
             !json.contains("\"highlights\":"),
-            "LanguageConfig should not have highlights field, but found in JSON: {}",
+            "LanguageSettings should not have highlights field, but found in JSON: {}",
             json
         );
         assert!(
             !json.contains("\"locals\":"),
-            "LanguageConfig should not have locals field, but found in JSON: {}",
+            "LanguageSettings should not have locals field, but found in JSON: {}",
             json
         );
         assert!(
             !json.contains("\"injections\":"),
-            "LanguageConfig should not have injections field, but found in JSON: {}",
+            "LanguageSettings should not have injections field, but found in JSON: {}",
             json
         );
     }
@@ -922,7 +905,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_bridge_map_enabled() {
-        // PBI-120: LanguageConfig should parse bridge field as HashMap<String, BridgeLanguageConfig>
+        // PBI-120: LanguageSettings should parse bridge field as HashMap<String, BridgeLanguageConfig>
         // Example: bridge = { python = { enabled = true }, r = { enabled = true } }
         let config_json = r#"{
             "parser": "/path/to/parser.so",
@@ -933,7 +916,7 @@ mod tests {
             }
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(config.bridge.is_some(), "bridge field should be Some");
         let bridge = config.bridge.unwrap();
@@ -952,7 +935,7 @@ mod tests {
             "bridge": {}
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(
             config.bridge.is_some(),
@@ -971,7 +954,7 @@ mod tests {
             "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(
             config.bridge.is_none(),
@@ -1191,7 +1174,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_bridge_map() {
-        // PBI-120: LanguageConfig.bridge should be HashMap<String, BridgeLanguageConfig>
+        // PBI-120: LanguageSettings.bridge should be HashMap<String, BridgeLanguageConfig>
         // Example: bridge = { python = { enabled = true }, r = { enabled = false } }
         let config_json = r#"{
             "parser": "/path/to/parser.so",
@@ -1202,7 +1185,7 @@ mod tests {
             }
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(config.bridge.is_some(), "bridge field should be Some");
         let bridge = config.bridge.unwrap();
@@ -1259,7 +1242,7 @@ kind = "injections""#;
 
     #[test]
     fn should_parse_queries_array_in_language_config() {
-        // LanguageConfig should have queries: Option<Vec<QueryItem>>
+        // LanguageSettings should have queries: Option<Vec<QueryItem>>
         let config_toml = r#"
             parser ="/path/to/parser.so"
             [[queries]]
@@ -1270,7 +1253,7 @@ kind = "injections""#;
             kind = "locals"
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
         assert!(config.queries.is_some());
         let queries = config.queries.unwrap();
         assert_eq!(queries.len(), 2);
@@ -1711,7 +1694,7 @@ kind = "injections""#;
             kind = "highlights"
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.aliases.is_some(), "aliases field should be present");
         let aliases = config.aliases.unwrap();
@@ -1732,7 +1715,7 @@ kind = "injections""#;
             kind = "highlights"
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.aliases.is_none(), "omitted aliases should be None");
     }
@@ -1745,7 +1728,7 @@ kind = "injections""#;
             aliases = []
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.aliases.is_some(), "empty aliases should be Some");
         assert!(
