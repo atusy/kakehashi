@@ -238,7 +238,7 @@ pub struct RawWorkspaceSettings {
 // Domain types - internal representations used throughout the application
 
 /// Per-language Tree-sitter language configuration surfaced to the domain.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct LanguageSettings {
     /// Path to the parser library (.so/.dylib/.dll)
     pub parser: Option<String>,
