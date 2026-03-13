@@ -8,8 +8,9 @@ pub(crate) mod user;
 
 pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
 pub use settings::{
-    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageSettings, QueryItem, QueryKind,
-    QueryTypeMappings, RawWorkspaceSettings, WorkspaceSettings,
+    AggregationConfig, AggregationStrategy, BridgeServerConfig, CaptureMapping, CaptureMappings,
+    LanguageSettings, QueryItem, QueryKind, QueryTypeMappings, RawWorkspaceSettings,
+    WorkspaceSettings,
 };
 use std::collections::HashMap;
 pub(crate) use user::load_user_config;
