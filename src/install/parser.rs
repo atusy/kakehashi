@@ -409,6 +409,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const TREE_SITTER_JSON_URL: &str =
+        "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
+
     #[test]
     fn test_dll_extension_is_valid() {
         let ext = std::env::consts::DLL_EXTENSION;
@@ -441,13 +444,7 @@ mod tests {
     #[test]
     fn test_github_archive_url_from_standard_repo() {
         let url = github_archive_url("https://github.com/tree-sitter/tree-sitter-json", "v0.24.8");
-        assert_eq!(
-            url,
-            Some(
-                "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz"
-                    .to_string()
-            )
-        );
+        assert_eq!(url, Some(TREE_SITTER_JSON_URL.to_string()));
     }
 
     #[test]
@@ -471,13 +468,7 @@ mod tests {
             "https://github.com/tree-sitter/tree-sitter-json.git",
             "v0.24.8",
         );
-        assert_eq!(
-            url,
-            Some(
-                "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz"
-                    .to_string()
-            )
-        );
+        assert_eq!(url, Some(TREE_SITTER_JSON_URL.to_string()));
     }
 
     #[test]
@@ -498,13 +489,7 @@ mod tests {
             "https://github.com/tree-sitter/tree-sitter-json/",
             "v0.24.8",
         );
-        assert_eq!(
-            url,
-            Some(
-                "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz"
-                    .to_string()
-            )
-        );
+        assert_eq!(url, Some(TREE_SITTER_JSON_URL.to_string()));
     }
 
     #[test]
