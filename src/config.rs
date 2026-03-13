@@ -288,13 +288,13 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
         .clone()
         .unwrap_or_else(default_search_paths);
 
-    WorkspaceSettings::with_language_servers(
+    WorkspaceSettings {
         search_paths,
         languages,
         capture_mappings,
-        settings.auto_install.unwrap_or(true), // Default to true for zero-config
-        settings.language_servers.clone(),
-    )
+        auto_install: settings.auto_install.unwrap_or(true),
+        language_servers: settings.language_servers.clone(),
+    }
 }
 
 impl WorkspaceSettings {

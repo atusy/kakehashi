@@ -705,13 +705,10 @@ impl Kakehashi {
         }
 
         // Create updated settings
-        let updated_settings = WorkspaceSettings::with_language_servers(
-            new_search_paths,
-            current_settings.languages.clone(),
-            current_settings.capture_mappings.clone(),
-            current_settings.auto_install,
-            current_settings.language_servers.clone(),
-        );
+        let updated_settings = WorkspaceSettings {
+            search_paths: new_search_paths,
+            ..(*current_settings).clone()
+        };
 
         // Apply the updated settings
         self.apply_settings(updated_settings).await;

@@ -309,53 +309,6 @@ impl Default for WorkspaceSettings {
     }
 }
 
-impl WorkspaceSettings {
-    pub fn new(
-        search_paths: Vec<String>,
-        languages: HashMap<String, LanguageSettings>,
-        capture_mappings: CaptureMappings,
-    ) -> Self {
-        Self {
-            search_paths,
-            languages,
-            capture_mappings,
-            auto_install: true, // Default to true for zero-config experience
-            language_servers: None,
-        }
-    }
-
-    pub fn with_auto_install(
-        search_paths: Vec<String>,
-        languages: HashMap<String, LanguageSettings>,
-        capture_mappings: CaptureMappings,
-        auto_install: bool,
-    ) -> Self {
-        Self {
-            search_paths,
-            languages,
-            capture_mappings,
-            auto_install,
-            language_servers: None,
-        }
-    }
-
-    pub fn with_language_servers(
-        search_paths: Vec<String>,
-        languages: HashMap<String, LanguageSettings>,
-        capture_mappings: CaptureMappings,
-        auto_install: bool,
-        language_servers: Option<HashMap<String, BridgeServerConfig>>,
-    ) -> Self {
-        Self {
-            search_paths,
-            languages,
-            capture_mappings,
-            auto_install,
-            language_servers,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
