@@ -372,6 +372,68 @@ fn split_host_token_around_regions(
     fragments
 }
 
+/// Filter host tokens (depth=0) against active injection regions.
+///
+/// - Depth > 0 tokens pass through unchanged.
+/// - Exact-match tokens are kept for sweep-line resolution (fish comment pattern).
+/// - Fully-contained tokens are removed (prevents code block host token leaks).
+/// - Single-line partial overlaps are kept whole so the sweep line can use the
+///   host token as a gap filler (e.g., a heading token covering plain text that
+///   markdown_inline doesn't capture).
+/// - Multiline partial overlaps are split; only fragments outside the region
+///   are kept (e.g., blockquote `> ` prefix survives, content is removed).
+fn filter_by_injection_regions(
+    tokens: Vec<RawToken>,
+    regions: &[InjectionRegion],
+    lines: &[&str],
+) -> Vec<RawToken> {
+    if regions.is_empty() {
+        return tokens;
+    }
+    let region_map = build_region_intervals_map(regions, lines);
+    let mut filtered = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if token.depth > 0 {
+            filtered.push(token);
+            continue;
+        }
+        if is_exact_match_active_injection_region(&token, regions) {
+            filtered.push(token);
+            continue;
+        }
+        if is_fully_in_active_injection_region(&token, regions) {
+            continue;
+        }
+        // Partial overlap: check if any overlapping region is single-line.
+        // Single-line regions indicate a direct child injection (e.g.,
+        // markdown_inline within a heading) where the host token should
+        // fill gaps. Multiline regions indicate container injections
+        // (e.g., blockquote content) where the host should not leak.
+        //
+        // Note: a token overlapping both single-line and multiline regions
+        // simultaneously is not a practical concern — the hierarchical
+        // injection architecture processes each depth level separately,
+        // so a given depth's active regions are homogeneous in nature.
+        let token_end = token.column + token.length;
+        let overlaps_single_line_region = regions.iter().any(|r| {
+            r.start_line == r.end_line
+                && r.start_line == token.line
+                && r.start_col < token_end
+                && r.end_col > token.column
+        });
+        if overlaps_single_line_region {
+            filtered.push(token);
+        } else {
+            let intervals = region_map
+                .get(&token.line)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            filtered.extend(split_host_token_around_regions(&token, intervals));
+        }
+    }
+    filtered
+}
+
 /// Post-process and delta-encode raw tokens into SemanticTokensResult.
 ///
 /// This shared helper:
@@ -391,59 +453,7 @@ pub(super) fn finalize_tokens(
     // Unknown captures are already filtered at collection time (apply_capture_mapping returns None).
     all_tokens.retain(|token| token.length > 0);
 
-    // Injection region handling for host tokens (depth=0):
-    //
-    // - Fully inside a region → remove (prevents code block host token leaks)
-    // - Exact match → keep for sweep line (fish comment pattern)
-    // - Partial overlap with single-line region → keep entire token so the
-    //   sweep line can fill gaps with the host token as fallback (e.g., a
-    //   heading token covers plain text that markdown_inline doesn't capture)
-    // - Partial overlap with multiline region → split, keep outside fragments
-    //   only (e.g., blockquote `> ` prefix survives but content is removed)
-    if !active_injection_regions.is_empty() {
-        let region_map = build_region_intervals_map(active_injection_regions, lines);
-        let mut filtered = Vec::with_capacity(all_tokens.len());
-        for token in all_tokens {
-            if token.depth > 0 {
-                filtered.push(token);
-                continue;
-            }
-            if is_exact_match_active_injection_region(&token, active_injection_regions) {
-                filtered.push(token);
-                continue;
-            }
-            if is_fully_in_active_injection_region(&token, active_injection_regions) {
-                continue;
-            }
-            // Partial overlap: check if any overlapping region is single-line.
-            // Single-line regions indicate a direct child injection (e.g.,
-            // markdown_inline within a heading) where the host token should
-            // fill gaps. Multiline regions indicate container injections
-            // (e.g., blockquote content) where the host should not leak.
-            //
-            // Note: a token overlapping both single-line and multiline regions
-            // simultaneously is not a practical concern — the hierarchical
-            // injection architecture processes each depth level separately,
-            // so a given depth's active regions are homogeneous in nature.
-            let token_end = token.column + token.length;
-            let overlaps_single_line_region = active_injection_regions.iter().any(|r| {
-                r.start_line == r.end_line
-                    && r.start_line == token.line
-                    && r.start_col < token_end
-                    && r.end_col > token.column
-            });
-            if overlaps_single_line_region {
-                filtered.push(token);
-            } else {
-                let intervals = region_map
-                    .get(&token.line)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                filtered.extend(split_host_token_around_regions(&token, intervals));
-            }
-        }
-        all_tokens = filtered;
-    }
+    let all_tokens = filter_by_injection_regions(all_tokens, active_injection_regions, lines);
 
     // @none pre-processing: split parent tokens around @none regions.
     //
