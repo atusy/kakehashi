@@ -410,6 +410,7 @@ fn test_with_real_parser() {
     let settings = RawWorkspaceSettings {
         search_paths: Some(search_paths),
         languages: /* language config */,
+        ..Default::default()
     };
 
     // Test with actual Tree-sitter parsers
