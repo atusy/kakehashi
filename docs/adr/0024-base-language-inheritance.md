@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (Supersedes `aliases` field from [ADR-0005](0005-language-detection-fallback-chain.md))
+Accepted (Supersedes `aliases` field from [ADR-0005](0005-language-detection-fallback-chain.md))
 
 ## Context
 
