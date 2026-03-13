@@ -272,9 +272,9 @@ mod tests {
         // Create settings from defaults — use with_kakehashi_defaults so that
         // ${KAKEHASHI_DATA_DIR} in searchPaths resolves to the platform default.
         use crate::config::expand::with_kakehashi_defaults;
-        let ts_settings = default_settings();
+        let raw_settings = default_settings();
         let ws_settings = WorkspaceSettings::try_from_settings(
-            &ts_settings,
+            &raw_settings,
             None,
             with_kakehashi_defaults(|_| None),
         )

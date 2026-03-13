@@ -18,8 +18,8 @@ impl Kakehashi {
         _params: EffectiveConfigurationParams,
     ) -> Result<Value> {
         let settings = self.settings_manager.load_settings();
-        let ts_settings = RawWorkspaceSettings::from(settings.as_ref());
-        let settings_value = serde_json::to_value(ts_settings).map_err(|e| {
+        let raw_settings = RawWorkspaceSettings::from(settings.as_ref());
+        let settings_value = serde_json::to_value(raw_settings).map_err(|e| {
             log::error!(
                 target: "kakehashi::effective_configuration",
                 "Failed to serialize effective configuration: {}",
