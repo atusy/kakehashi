@@ -450,6 +450,172 @@ fn test_config_schema_outputs_valid_json_to_stdout() {
     );
 }
 
+/// Test that config --help shows schema action
+#[test]
+fn test_config_help_shows_schema() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "--help"])
+        .output()
+        .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "Config help should exit with success"
+    );
+
+    assert!(
+        stdout.contains("schema"),
+        "Config help should show schema action. Got: {}",
+        stdout
+    );
+}
+
+/// Test that config schema --output creates a file
+#[test]
+fn test_config_schema_output_creates_file() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let schema_path = test_dir.path().join("schema.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema", "--output", "schema.json"])
+        .current_dir(test_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Config schema --output should exit with success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        schema_path.exists(),
+        "Schema file should be created at {}",
+        schema_path.display()
+    );
+
+    let content = fs::read_to_string(&schema_path).expect("Failed to read schema");
+    let _: serde_json::Value =
+        serde_json::from_str(&content).expect("File should contain valid JSON");
+}
+
+/// Test that config schema --output does not overwrite existing file without --force
+#[test]
+fn test_config_schema_output_no_overwrite_without_force() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let schema_path = test_dir.path().join("schema.json");
+
+    fs::write(&schema_path, "existing").expect("Failed to write existing file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema", "--output", "schema.json"])
+        .current_dir(test_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "Config schema --output should fail when file exists"
+    );
+
+    let content = fs::read_to_string(&schema_path).expect("Failed to read schema");
+    assert_eq!(content, "existing", "Original content should be preserved");
+}
+
+/// Test that config schema --output --force overwrites existing file
+#[test]
+fn test_config_schema_output_force_overwrites() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let schema_path = test_dir.path().join("schema.json");
+
+    fs::write(&schema_path, "existing").expect("Failed to write existing file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema", "--output", "schema.json", "--force"])
+        .current_dir(test_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Config schema --output --force should exit with success"
+    );
+
+    let content = fs::read_to_string(&schema_path).expect("Failed to read schema");
+    assert!(
+        !content.contains("existing"),
+        "Content should be overwritten"
+    );
+    let _: serde_json::Value =
+        serde_json::from_str(&content).expect("Overwritten file should be valid JSON");
+}
+
+/// Test that config schema --force without --output warns to stderr
+#[test]
+fn test_config_schema_force_without_output_warns() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema", "--force"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Config schema --force should exit with success"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Warning") && stderr.contains("--force"),
+        "Should warn about --force without --output. Got: {}",
+        stderr
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _: serde_json::Value =
+        serde_json::from_str(&stdout).expect("Should still output valid JSON to stdout");
+}
+
+/// Test that config schema --output - outputs to stdout
+#[test]
+fn test_config_schema_output_dash_outputs_to_stdout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema", "--output", "-"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Config schema --output - should exit with success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _: serde_json::Value =
+        serde_json::from_str(&stdout).expect("Stdout should contain valid JSON");
+}
+
+/// Test that config schema output ends with a trailing newline
+#[test]
+fn test_config_schema_ends_with_trailing_newline() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema"])
+        .output()
+        .expect("Failed to execute command");
+    assert!(output.status.success());
+    assert!(
+        output.stdout.ends_with(b"\n"),
+        "Schema output should end with a trailing newline"
+    );
+}
+
 /// Test that language status --help shows expected options
 #[test]
 fn test_language_status_help() {
