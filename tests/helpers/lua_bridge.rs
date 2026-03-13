@@ -47,14 +47,36 @@ pub fn skip_if_lua_ls_unavailable() -> bool {
 /// Create an LspClient initialized with lua-language-server configuration.
 ///
 /// This helper encapsulates the common initialization pattern for Lua bridge tests:
-/// - Spawn kakehashi binary
+/// - Spawn kakehashi binary with an empty config file for test isolation
 /// - Send initialize request with lua-language-server bridge configuration
 /// - Send initialized notification to complete handshake
+///
+/// Test isolation: Uses `--config-file` with an empty temp file to prevent
+/// the user's `~/.config/kakehashi/kakehashi.toml` from interfering with tests.
+/// For example, a user config with `[languages._.bridge.python]` would create a
+/// restrictive bridge filter that blocks lua, causing all bridge tests to fail.
 ///
 /// # Returns
 /// An initialized `LspClient` ready for Lua bridge operations.
 pub fn create_lua_configured_client() -> LspClient {
-    let mut client = LspClient::new();
+    // Create an empty config file for test isolation.
+    // This is leaked intentionally — temp files live for the process lifetime.
+    let config_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let config_path = config_dir.path().join("empty.toml");
+    std::fs::write(&config_path, "").expect("Failed to write empty config");
+    // Leak the TempDir so it lives for the duration of the test
+    let config_dir = Box::leak(Box::new(config_dir));
+    let config_path_str = config_dir
+        .path()
+        .join("empty.toml")
+        .to_str()
+        .expect("temp path should be valid UTF-8")
+        .to_string();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(&config_path_str)
+        .build();
 
     // Initialize handshake with language server configuration
     let _init_response = client.send_request(
