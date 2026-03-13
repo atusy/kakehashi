@@ -696,19 +696,13 @@ impl Kakehashi {
 
         // Update settings to include the new paths
         let current_settings = self.settings_manager.load_settings();
-        let mut new_search_paths = current_settings.search_paths.clone();
+        let mut updated_settings = (*current_settings).clone();
 
         // Add data_dir as a base search path (not subdirectories)
         let data_dir_str = data_dir.to_string_lossy().to_string();
-        if !new_search_paths.contains(&data_dir_str) {
-            new_search_paths.push(data_dir_str);
+        if !updated_settings.search_paths.contains(&data_dir_str) {
+            updated_settings.search_paths.push(data_dir_str);
         }
-
-        // Create updated settings
-        let updated_settings = WorkspaceSettings {
-            search_paths: new_search_paths,
-            ..(*current_settings).clone()
-        };
 
         // Apply the updated settings
         self.apply_settings(updated_settings).await;
