@@ -242,29 +242,6 @@ pub struct LanguageSettings {
 }
 
 impl LanguageSettings {
-    pub fn new(parser: Option<String>, queries: Option<Vec<QueryItem>>) -> Self {
-        Self {
-            parser,
-            queries,
-            bridge: None,
-            aliases: None,
-        }
-    }
-
-    /// Create LanguageSettings with bridge filter configuration.
-    pub fn with_bridge(
-        parser: Option<String>,
-        queries: Option<Vec<QueryItem>>,
-        bridge: Option<HashMap<String, BridgeLanguageConfig>>,
-    ) -> Self {
-        Self {
-            parser,
-            queries,
-            bridge,
-            aliases: None,
-        }
-    }
-
     /// Check if a language is allowed for bridging based on the bridge filter.
     ///
     /// Returns:
@@ -323,7 +300,7 @@ mod tests {
 
         // Case 1: queries not specified (should be None)
         // User didn't specify queries - should inherit from wildcard/defaults
-        let unspecified = LanguageSettings::new(None, None);
+        let unspecified = LanguageSettings::default();
         assert!(
             unspecified.queries.is_none(),
             "Unspecified queries should be None"
@@ -331,7 +308,10 @@ mod tests {
 
         // Case 2: queries explicitly empty (should be Some([]))
         // User explicitly set queries to empty - should override wildcard with empty list
-        let explicitly_empty = LanguageSettings::new(None, Some(vec![]));
+        let explicitly_empty = LanguageSettings {
+            queries: Some(vec![]),
+            ..Default::default()
+        };
         assert!(
             explicitly_empty.queries.is_some(),
             "Explicitly empty should be Some"
@@ -342,13 +322,13 @@ mod tests {
         );
 
         // Case 3: queries with items
-        let with_items = LanguageSettings::new(
-            None,
-            Some(vec![QueryItem {
+        let with_items = LanguageSettings {
+            queries: Some(vec![QueryItem {
                 path: "/path/to/highlights.scm".to_string(),
                 kind: Some(QueryKind::Highlights),
             }]),
-        );
+            ..Default::default()
+        };
         assert!(with_items.queries.is_some());
         assert_eq!(with_items.queries.as_ref().unwrap().len(), 1);
     }
@@ -749,13 +729,14 @@ mod tests {
     #[test]
     fn should_create_language_settings_with_parser_and_queries() {
         // PBI-156: LanguageSettings uses parser (not library) and unified queries
-        let settings = LanguageSettings::new(
-            Some("/path/to/parser.so".to_string()),
-            Some(vec![QueryItem {
+        let settings = LanguageSettings {
+            parser: Some("/path/to/parser.so".to_string()),
+            queries: Some(vec![QueryItem {
                 path: "/path/to/highlights.scm".to_string(),
                 kind: Some(QueryKind::Highlights),
             }]),
-        );
+            ..Default::default()
+        };
 
         assert_eq!(settings.parser, Some("/path/to/parser.so".to_string()));
         assert_eq!(settings.queries.as_ref().unwrap().len(), 1);
@@ -919,7 +900,7 @@ mod tests {
     fn test_bridge_filter_null_bridges_all_languages() {
         // PBI-108 AC3: bridge omitted or null bridges all configured languages
         // When bridge is None (default), all languages should be bridgeable
-        let settings = LanguageSettings::new(None, None);
+        let settings = LanguageSettings::default();
 
         // Default (None) should bridge all languages
         assert!(
@@ -943,11 +924,10 @@ mod tests {
     #[test]
     fn test_bridge_filter_empty_disables_bridging() {
         // PBI-120: Empty bridge map disables all bridging for that host filetype
-        let settings = LanguageSettings::with_bridge(
-            None,
-            None,
-            Some(HashMap::new()), // Empty map disables all bridging
-        );
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::new()), // Empty map disables all bridging
+            ..Default::default()
+        };
 
         // Empty map should disable all bridging
         assert!(
@@ -983,7 +963,10 @@ mod tests {
             },
         );
 
-        let settings = LanguageSettings::with_bridge(None, None, Some(bridge));
+        let settings = LanguageSettings {
+            bridge: Some(bridge),
+            ..Default::default()
+        };
 
         // Enabled languages should be allowed
         assert!(
@@ -1025,7 +1008,10 @@ mod tests {
             },
         );
 
-        let settings = LanguageSettings::with_bridge(None, None, Some(bridge));
+        let settings = LanguageSettings {
+            bridge: Some(bridge),
+            ..Default::default()
+        };
 
         // python with enabled: true should be allowed
         assert!(

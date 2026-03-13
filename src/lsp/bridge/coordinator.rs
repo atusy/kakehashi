@@ -697,7 +697,10 @@ mod tests {
         );
         languages.insert(
             "markdown".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(bridge_filter)),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
         );
 
         // Create language server config for rust
@@ -825,7 +828,10 @@ mod tests {
         );
         languages.insert(
             "markdown".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(bridge_filter)),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
         );
 
         // Create language server config for rust (which is NOT in the filter)
@@ -966,7 +972,10 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "_".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(HashMap::new())), // empty = block all
+            LanguageSettings {
+                bridge: Some(HashMap::new()),
+                ..Default::default()
+            }, // empty = block all
         );
 
         // Create language server config for rust

@@ -8,8 +8,8 @@ pub(crate) mod user;
 
 pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
 pub use settings::{
-    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageSettings,
-    QueryItem, QueryKind, QueryTypeMappings, RawWorkspaceSettings, WorkspaceSettings,
+    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageSettings, QueryItem, QueryKind,
+    QueryTypeMappings, RawWorkspaceSettings, WorkspaceSettings,
 };
 use std::collections::HashMap;
 pub(crate) use user::load_user_config;
@@ -2545,7 +2545,10 @@ mod tests {
         // Wildcard: block all bridging with empty filter
         languages.insert(
             "_".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(HashMap::new())),
+            LanguageSettings {
+                bridge: Some(HashMap::new()),
+                ..Default::default()
+            },
         );
 
         // Look up "quarto" which doesn't exist - should inherit from wildcard
@@ -2718,7 +2721,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let markdown_settings = LanguageSettings::with_bridge(None, None, Some(bridge_filter));
+        let markdown_settings = LanguageSettings {
+            bridge: Some(bridge_filter),
+            ..Default::default()
+        };
 
         // Router should allow python (enabled in filter)
         assert!(
@@ -2739,7 +2745,7 @@ mod tests {
         );
 
         // Host quarto with no bridge filter (default: all)
-        let quarto_settings = LanguageSettings::new(None, None);
+        let quarto_settings = LanguageSettings::default();
 
         // Router should allow all languages
         assert!(
@@ -2752,7 +2758,10 @@ mod tests {
         );
 
         // Host rmd with empty bridge filter (disable all)
-        let rmd_settings = LanguageSettings::with_bridge(None, None, Some(HashMap::new()));
+        let rmd_settings = LanguageSettings {
+            bridge: Some(HashMap::new()),
+            ..Default::default()
+        };
 
         // Router should block all languages
         assert!(
