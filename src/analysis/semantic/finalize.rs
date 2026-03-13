@@ -417,12 +417,10 @@ fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
 
             if !dominated.is_empty() {
                 result.extend(split_host_token_around_regions(&token, &dominated));
-            } else {
-                result.push(token);
+                continue;
             }
-        } else {
-            result.push(token);
         }
+        result.push(token);
     }
     result
 }
@@ -571,28 +569,7 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    /// Helper to create a RawToken for testing (priority defaults to 100, node_byte_len to 0)
-    fn make_token(
-        line: usize,
-        column: usize,
-        length: usize,
-        name: &str,
-        depth: usize,
-        pattern_index: usize,
-    ) -> RawToken {
-        RawToken {
-            line,
-            column,
-            length,
-            mapped_name: name.to_string(),
-            depth,
-            pattern_index,
-            priority: 100,
-            node_byte_len: 0,
-        }
-    }
-
-    /// Helper to create a RawToken with explicit priority
+    /// Helper to create a RawToken with explicit priority (node_byte_len defaults to 0)
     fn make_token_with_priority(
         line: usize,
         column: usize,
@@ -612,6 +589,18 @@ mod tests {
             priority,
             node_byte_len: 0,
         }
+    }
+
+    /// Helper to create a RawToken for testing (priority defaults to 100, node_byte_len to 0)
+    fn make_token(
+        line: usize,
+        column: usize,
+        length: usize,
+        name: &str,
+        depth: usize,
+        pattern_index: usize,
+    ) -> RawToken {
+        make_token_with_priority(line, column, length, name, depth, pattern_index, 100)
     }
 
     #[test]
