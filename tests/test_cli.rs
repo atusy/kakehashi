@@ -420,6 +420,37 @@ fn test_config_init_output_dash_outputs_to_stdout() {
     );
 }
 
+/// Test that config schema outputs valid JSON to stdout
+#[test]
+fn test_config_schema_outputs_valid_json_to_stdout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "Config schema should exit with success. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let schema: serde_json::Value =
+        serde_json::from_str(&stdout).expect("Should be valid JSON");
+    // Should have properties with camelCase names
+    let props = schema.get("properties").expect("Should have properties");
+    assert!(
+        props.get("searchPaths").is_some(),
+        "Should have searchPaths property. Got: {}",
+        stdout
+    );
+    assert!(
+        props.get("autoInstall").is_some(),
+        "Should have autoInstall property. Got: {}",
+        stdout
+    );
+}
+
 /// Test that language status --help shows expected options
 #[test]
 fn test_language_status_help() {
