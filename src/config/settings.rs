@@ -293,6 +293,59 @@ mod tests {
     use rstest::rstest;
 
     #[test]
+    fn test_json_schema_generation() {
+        let schema = schemars::schema_for!(RawWorkspaceSettings);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Top-level properties should use camelCase (from serde renames)
+        let props = value.get("properties").expect("should have properties");
+        assert!(props.get("searchPaths").is_some(), "missing searchPaths");
+        assert!(props.get("autoInstall").is_some(), "missing autoInstall");
+        assert!(
+            props.get("captureMappings").is_some(),
+            "missing captureMappings"
+        );
+        assert!(
+            props.get("languageServers").is_some(),
+            "missing languageServers"
+        );
+
+        // snake_case variants must NOT appear
+        assert!(
+            props.get("search_paths").is_none(),
+            "snake_case leak: search_paths"
+        );
+        assert!(
+            props.get("auto_install").is_none(),
+            "snake_case leak: auto_install"
+        );
+        assert!(
+            props.get("capture_mappings").is_none(),
+            "snake_case leak: capture_mappings"
+        );
+        assert!(
+            props.get("language_servers").is_none(),
+            "snake_case leak: language_servers"
+        );
+
+        // $defs should contain key referenced types
+        let defs = value.get("$defs").expect("should have $defs");
+        for expected in [
+            "LanguageSettings",
+            "BridgeServerConfig",
+            "BridgeLanguageConfig",
+            "QueryItem",
+            "AggregationConfig",
+        ] {
+            assert!(
+                defs.get(expected).is_some(),
+                "missing $defs entry: {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn should_distinguish_between_unspecified_and_empty_queries() {
         // This test demonstrates the need for Option<Vec<QueryItem>>
         // to distinguish between "not specified" and "explicitly empty"
