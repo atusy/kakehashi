@@ -8,8 +8,8 @@ pub(crate) mod user;
 
 pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
 pub use settings::{
-    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageConfig, LanguageSettings,
-    QueryItem, QueryKind, QueryTypeMappings, TreeSitterSettings, WorkspaceSettings,
+    BridgeServerConfig, CaptureMapping, CaptureMappings, LanguageSettings, QueryItem, QueryKind,
+    QueryTypeMappings, RawWorkspaceSettings, WorkspaceSettings,
 };
 use std::collections::HashMap;
 pub(crate) use user::load_user_config;
@@ -218,24 +218,24 @@ pub(crate) fn default_search_paths() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Merge multiple TreeSitterSettings configs in order.
+/// Merge multiple RawWorkspaceSettings configs in order.
 /// Later configs in the slice have higher precedence (override earlier ones).
 /// Use this for layered config: `merge_all(&[defaults, user, project, session])`
-pub(crate) fn merge_all(configs: &[Option<TreeSitterSettings>]) -> Option<TreeSitterSettings> {
+pub(crate) fn merge_all(configs: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings> {
     configs.iter().cloned().reduce(merge_settings).flatten()
 }
 
-/// Merge two TreeSitterSettings, preferring values from `primary` over `fallback`
+/// Merge two RawWorkspaceSettings, preferring values from `primary` over `fallback`
 pub(crate) fn merge_settings(
-    fallback: Option<TreeSitterSettings>,
-    primary: Option<TreeSitterSettings>,
-) -> Option<TreeSitterSettings> {
+    fallback: Option<RawWorkspaceSettings>,
+    primary: Option<RawWorkspaceSettings>,
+) -> Option<RawWorkspaceSettings> {
     match (fallback, primary) {
         (None, None) => None,
         (Some(settings), None) => Some(settings),
         (None, Some(settings)) => Some(settings),
         (Some(fallback), Some(primary)) => {
-            let merged = TreeSitterSettings {
+            let merged = RawWorkspaceSettings {
                 // Prefer primary search_paths, fall back to fallback
                 search_paths: primary.search_paths.or(fallback.search_paths),
 
@@ -262,37 +262,11 @@ pub(crate) fn merge_settings(
     }
 }
 
-impl From<&LanguageConfig> for LanguageSettings {
-    fn from(config: &LanguageConfig) -> Self {
-        LanguageSettings {
-            parser: config.parser.clone(),
-            queries: config.queries.clone(),
-            bridge: config.bridge.clone(),
-            aliases: config.aliases.clone(),
-        }
-    }
-}
-
-impl From<&LanguageSettings> for LanguageConfig {
-    fn from(settings: &LanguageSettings) -> Self {
-        LanguageConfig {
-            parser: settings.parser.clone(),
-            queries: settings.queries.clone(),
-            bridge: settings.bridge.clone(),
-            aliases: settings.aliases.clone(),
-        }
-    }
-}
-
-/// Convert `TreeSitterSettings` to `WorkspaceSettings` without expanding
+/// Convert `RawWorkspaceSettings` to `WorkspaceSettings` without expanding
 /// environment variables or tilde. This is the base conversion used
 /// internally by `try_from_settings`.
-fn base_convert(settings: &TreeSitterSettings) -> WorkspaceSettings {
-    let languages = settings
-        .languages
-        .iter()
-        .map(|(name, config)| (name.clone(), LanguageSettings::from(config)))
-        .collect();
+fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
+    let languages = settings.languages.clone();
     let capture_mappings = settings
         .capture_mappings
         .iter()
@@ -314,17 +288,17 @@ fn base_convert(settings: &TreeSitterSettings) -> WorkspaceSettings {
         .clone()
         .unwrap_or_else(default_search_paths);
 
-    WorkspaceSettings::with_language_servers(
+    WorkspaceSettings {
         search_paths,
         languages,
         capture_mappings,
-        settings.auto_install.unwrap_or(true), // Default to true for zero-config
-        settings.language_servers.clone(),
-    )
+        auto_install: settings.auto_install.unwrap_or(true),
+        language_servers: settings.language_servers.clone(),
+    }
 }
 
 impl WorkspaceSettings {
-    /// Convert `TreeSitterSettings` to `WorkspaceSettings`, expanding environment
+    /// Convert `RawWorkspaceSettings` to `WorkspaceSettings`, expanding environment
     /// variables (`$VAR`, `${VAR}`) and tilde (`~`) in path fields.
     ///
     /// Path fields expanded: `search_paths`, `languages[*].parser`, `languages[*].queries[*].path`.
@@ -335,7 +309,7 @@ impl WorkspaceSettings {
     /// Uses `base_convert` for the structural conversion, then expands only the
     /// path fields. This avoids duplicating conversion logic.
     pub fn try_from_settings(
-        settings: &TreeSitterSettings,
+        settings: &RawWorkspaceSettings,
         home: Option<&str>,
         env_fn: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, expand::ExpandErrors> {
@@ -378,13 +352,9 @@ impl WorkspaceSettings {
     }
 }
 
-impl From<&WorkspaceSettings> for TreeSitterSettings {
+impl From<&WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: &WorkspaceSettings) -> Self {
-        let languages = settings
-            .languages
-            .iter()
-            .map(|(name, config)| (name.clone(), LanguageConfig::from(config)))
-            .collect();
+        let languages = settings.languages.clone();
         let capture_mappings = settings
             .capture_mappings
             .iter()
@@ -406,7 +376,7 @@ impl From<&WorkspaceSettings> for TreeSitterSettings {
             Some(settings.search_paths.clone())
         };
 
-        TreeSitterSettings {
+        RawWorkspaceSettings {
             search_paths,
             languages,
             capture_mappings,
@@ -416,16 +386,16 @@ impl From<&WorkspaceSettings> for TreeSitterSettings {
     }
 }
 
-impl From<WorkspaceSettings> for TreeSitterSettings {
+impl From<WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: WorkspaceSettings) -> Self {
-        TreeSitterSettings::from(&settings)
+        RawWorkspaceSettings::from(&settings)
     }
 }
 
 fn merge_languages(
-    mut base: HashMap<String, LanguageConfig>,
-    overlay: HashMap<String, LanguageConfig>,
-) -> HashMap<String, LanguageConfig> {
+    mut base: HashMap<String, LanguageSettings>,
+    overlay: HashMap<String, LanguageSettings>,
+) -> HashMap<String, LanguageSettings> {
     // Deep merge: overlay values override base values for the same key
     for (key, overlay_config) in overlay {
         base.entry(key)
@@ -568,19 +538,19 @@ pub(crate) fn resolve_with_wildcard(map: &CaptureMappings, key: &str) -> Option<
 /// - If only specific key exists: return specific key
 /// - If neither exists: return None
 ///
-/// The merge creates a new LanguageConfig where specific values override wildcard values.
+/// The merge creates a new LanguageSettings where specific values override wildcard values.
 #[cfg(test)]
 pub(crate) fn resolve_language_with_wildcard(
-    map: &HashMap<String, LanguageConfig>,
+    map: &HashMap<String, LanguageSettings>,
     key: &str,
-) -> Option<LanguageConfig> {
+) -> Option<LanguageSettings> {
     let wildcard = map.get(WILDCARD_KEY);
     let specific = map.get(key);
 
     match (wildcard, specific) {
         (Some(w), Some(s)) => {
             // Merge: start with wildcard, override with specific
-            Some(LanguageConfig {
+            Some(LanguageSettings {
                 parser: s.parser.clone().or_else(|| w.parser.clone()),
                 queries: s.queries.clone().or_else(|| w.queries.clone()),
                 // Deep merge bridge HashMaps: wildcard + specific
@@ -634,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_merge_settings_fallback_only() {
-        let fallback = TreeSitterSettings {
+        let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -650,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_merge_settings_primary_only() {
-        let primary = TreeSitterSettings {
+        let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -669,13 +639,13 @@ mod tests {
         let mut fallback_languages = HashMap::new();
         fallback_languages.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/fallback/rust.so".to_string()),
                 ..Default::default()
             },
         );
 
-        let fallback = TreeSitterSettings {
+        let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
             languages: fallback_languages,
             capture_mappings: HashMap::new(),
@@ -686,13 +656,13 @@ mod tests {
         let mut primary_languages = HashMap::new();
         primary_languages.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/primary/rust.so".to_string()),
                 ..Default::default()
             },
         );
 
-        let primary = TreeSitterSettings {
+        let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
             languages: primary_languages,
             capture_mappings: HashMap::new(),
@@ -737,7 +707,7 @@ mod tests {
             },
         );
 
-        let fallback = TreeSitterSettings {
+        let fallback = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: fallback_mappings,
@@ -762,7 +732,7 @@ mod tests {
             },
         );
 
-        let primary = TreeSitterSettings {
+        let primary = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: primary_mappings,
@@ -826,9 +796,9 @@ mod tests {
 
     #[test]
     fn test_default_search_paths_used_when_none_configured() {
-        // When search_paths is None in TreeSitterSettings, WorkspaceSettings
+        // When search_paths is None in RawWorkspaceSettings, WorkspaceSettings
         // should use the default data directory paths (not an empty vector)
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -856,7 +826,7 @@ mod tests {
     #[test]
     fn test_explicit_search_paths_override_default() {
         // When search_paths is explicitly set, it should be used as-is
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["/custom/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -877,7 +847,7 @@ mod tests {
         let mut paths = vec!["/custom/path".to_string()];
         paths.extend(default_paths.clone());
 
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(paths.clone()),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -902,7 +872,7 @@ mod tests {
     #[case::explicit_false(Some(false), false)]
     fn test_auto_install(#[case] auto_install: Option<bool>, #[case] expected: bool) {
         // PBI-019: autoInstall defaults to true for zero-config; explicit values honored
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -964,7 +934,7 @@ mod tests {
     #[test]
     fn test_merge_all_single_some_returns_it() {
         // Single Some config should return that config
-        let config = TreeSitterSettings {
+        let config = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/one".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -982,14 +952,14 @@ mod tests {
     fn test_merge_all_scalar_later_wins() {
         // Later config's scalar values should override earlier ones
         // Simulates: user config has autoInstall=true, project has autoInstall=false
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/user/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: Some(true),
             language_servers: None,
         };
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/project/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1009,28 +979,28 @@ mod tests {
     #[test]
     fn test_merge_all_four_layers() {
         // Test the full 4-layer merge: defaults < user < project < session
-        let defaults = TreeSitterSettings {
+        let defaults = RawWorkspaceSettings {
             search_paths: Some(vec!["/default/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: Some(true),
             language_servers: None,
         };
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None, // Not overriding, should inherit from defaults
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: Some(true),
             language_servers: None,
         };
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/project/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
             auto_install: None, // Not overriding, should inherit
             language_servers: None,
         };
-        let session_config = TreeSitterSettings {
+        let session_config = RawWorkspaceSettings {
             search_paths: None, // Not overriding
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1057,7 +1027,7 @@ mod tests {
     #[test]
     fn test_merge_all_skips_none_configs() {
         // None configs in the slice should be skipped
-        let config = TreeSitterSettings {
+        let config = RawWorkspaceSettings {
             search_paths: Some(vec!["/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1069,35 +1039,6 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(result.search_paths, Some(vec!["/path".to_string()]));
-    }
-
-    #[test]
-    fn test_language_settings_from_config_preserves_queries() {
-        let config = LanguageConfig {
-            parser: Some("/path/to/parser.so".to_string()),
-            queries: Some(vec![
-                settings::QueryItem {
-                    path: "/path/to/highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                },
-                settings::QueryItem {
-                    path: "/path/to/injections.scm".to_string(),
-                    kind: Some(settings::QueryKind::Injections),
-                },
-            ]),
-            ..Default::default()
-        };
-
-        let settings: LanguageSettings = LanguageSettings::from(&config);
-
-        // Verify queries is preserved
-        assert!(settings.queries.is_some());
-        let queries = settings.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[0].path, "/path/to/highlights.scm");
-        assert_eq!(queries[0].kind, Some(settings::QueryKind::Highlights));
-        assert_eq!(queries[1].path, "/path/to/injections.scm");
-        assert_eq!(queries[1].kind, Some(settings::QueryKind::Injections));
     }
 
     // PBI-150 Subtask 2: Deep merge for languages HashMap
@@ -1120,7 +1061,7 @@ mod tests {
 
         user_languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/usr/lib/python.so".to_string()),
                 queries: Some(vec![
                     settings::QueryItem {
@@ -1137,7 +1078,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -1149,7 +1090,7 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // parser: None - Not specified - should inherit from user
                 queries: Some(vec![settings::QueryItem {
                     path: "./queries/python-highlights.scm".to_string(),
@@ -1160,7 +1101,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -1196,13 +1137,13 @@ mod tests {
         let mut user_languages = HashMap::new();
         user_languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/usr/lib/python.so".to_string()),
                 ..Default::default()
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -1213,13 +1154,13 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/project/rust.so".to_string()),
                 ..Default::default()
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -1267,7 +1208,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1287,7 +1228,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1336,7 +1277,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1355,7 +1296,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -1412,7 +1353,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: user_mappings,
@@ -1437,7 +1378,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: project_mappings,
@@ -1478,7 +1419,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: user_mappings,
@@ -1499,7 +1440,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: project_mappings,
@@ -1549,7 +1490,7 @@ mod tests {
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: user_mappings,
@@ -1576,7 +1517,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: project_mappings,
@@ -1725,7 +1666,7 @@ mod tests {
         // ADR-0011: languages['rust'] inherits from languages['_']
         // When languages only has "_" and we ask for "rust",
         // we should get the wildcard's settings
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard has parser and bridge settings
         let mut wildcard_bridge = HashMap::new();
@@ -1739,7 +1680,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 queries: Some(vec![settings::QueryItem {
                     path: "/default/highlights.scm".to_string(),
@@ -1779,7 +1720,7 @@ mod tests {
         // - languages.python has bridge.javascript with enabled = false (override)
         // - We ask for bridge setting for "javascript" in "python" -> should get enabled = false
         // - We ask for bridge setting for "rust" in "python" -> should get enabled = true (from _)
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard language with wildcard bridge (default enabled = true)
         let mut wildcard_bridge = HashMap::new();
@@ -1793,7 +1734,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 queries: Some(vec![settings::QueryItem {
                     path: "/default/highlights.scm".to_string(),
@@ -1816,7 +1757,7 @@ mod tests {
 
         languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // parser: None - Should inherit from _
                 // queries: None - Should inherit from _
                 bridge: Some(python_bridge),
@@ -1867,7 +1808,7 @@ mod tests {
         // - languages.python.bridge._ = enabled: true (python-specific default)
         // - languages.python.bridge.javascript = enabled: false (override)
         // - rust should inherit from python.bridge._ (enabled = true)
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Python with its own wildcard bridge
         let mut python_bridge = HashMap::new();
@@ -1888,7 +1829,7 @@ mod tests {
 
         languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/python/path.so".to_string()),
                 bridge: Some(python_bridge),
                 ..Default::default()
@@ -1928,7 +1869,7 @@ mod tests {
         // languages._ has bridge._ with enabled = true
         // languages.python is NOT defined (should inherit from _)
         // We ask for bridge setting for "rust" in "python" -> should get enabled = true
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard language with wildcard bridge
         let mut wildcard_bridge = HashMap::new();
@@ -1942,7 +1883,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 bridge: Some(wildcard_bridge),
                 ..Default::default()
@@ -1988,7 +1929,7 @@ mod tests {
         //
         // This tests that python inherits rust/go from wildcard while adding
         // its own javascript setting.
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard has default bridge settings for rust and go
         let mut wildcard_bridge = HashMap::new();
@@ -2009,7 +1950,7 @@ mod tests {
 
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
                 bridge: Some(wildcard_bridge),
                 ..Default::default()
@@ -2028,7 +1969,7 @@ mod tests {
 
         languages.insert(
             "python".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // parser: None - Inherits from wildcard
                 bridge: Some(python_bridge),
                 ..Default::default()
@@ -2525,13 +2466,13 @@ mod tests {
     fn test_language_config_inherits_from_wildcard() {
         use settings::BridgeLanguageConfig;
 
-        let mut languages: HashMap<String, LanguageConfig> = HashMap::new();
+        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
 
         // Wildcard language: disable bridging by default (empty bridge filter)
         let wildcard_bridge = HashMap::new(); // Empty = disable all bridging
         languages.insert(
             "_".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 queries: Some(vec![settings::QueryItem {
                     path: "/default/highlights.scm".to_string(),
                     kind: Some(settings::QueryKind::Highlights),
@@ -2552,7 +2493,7 @@ mod tests {
         );
         languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 // highlights: None - Should inherit from wildcard
                 bridge: Some(markdown_bridge),
                 ..Default::default()
@@ -2604,7 +2545,10 @@ mod tests {
         // Wildcard: block all bridging with empty filter
         languages.insert(
             "_".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(HashMap::new())),
+            LanguageSettings {
+                bridge: Some(HashMap::new()),
+                ..Default::default()
+            },
         );
 
         // Look up "quarto" which doesn't exist - should inherit from wildcard
@@ -2777,7 +2721,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let markdown_settings = LanguageSettings::with_bridge(None, None, Some(bridge_filter));
+        let markdown_settings = LanguageSettings {
+            bridge: Some(bridge_filter),
+            ..Default::default()
+        };
 
         // Router should allow python (enabled in filter)
         assert!(
@@ -2798,7 +2745,7 @@ mod tests {
         );
 
         // Host quarto with no bridge filter (default: all)
-        let quarto_settings = LanguageSettings::new(None, None);
+        let quarto_settings = LanguageSettings::default();
 
         // Router should allow all languages
         assert!(
@@ -2811,7 +2758,10 @@ mod tests {
         );
 
         // Host rmd with empty bridge filter (disable all)
-        let rmd_settings = LanguageSettings::with_bridge(None, None, Some(HashMap::new()));
+        let rmd_settings = LanguageSettings {
+            bridge: Some(HashMap::new()),
+            ..Default::default()
+        };
 
         // Router should block all languages
         assert!(
@@ -2825,7 +2775,7 @@ mod tests {
     }
 
     // Regression test: aliases must be merged in merge_languages()
-    // Bug: When aliases field was added to LanguageConfig, merge_languages() was not
+    // Bug: When aliases field was added to LanguageSettings, merge_languages() was not
     // updated to merge it. This caused aliases from user config to be lost when
     // project config also defined the same language.
 
@@ -2837,14 +2787,14 @@ mod tests {
         let mut user_languages = HashMap::new();
         user_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/usr/lib/markdown.so".to_string()),
                 aliases: Some(vec!["rmd".to_string(), "qmd".to_string()]),
                 ..Default::default()
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -2856,7 +2806,7 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 queries: Some(vec![settings::QueryItem {
                     path: "./queries/markdown-highlights.scm".to_string(),
                     kind: Some(settings::QueryKind::Highlights),
@@ -2866,7 +2816,7 @@ mod tests {
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -2907,13 +2857,13 @@ mod tests {
         let mut user_languages = HashMap::new();
         user_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 aliases: Some(vec!["rmd".to_string()]),
                 ..Default::default()
             },
         );
 
-        let user_config = TreeSitterSettings {
+        let user_config = RawWorkspaceSettings {
             search_paths: None,
             languages: user_languages,
             capture_mappings: HashMap::new(),
@@ -2925,13 +2875,13 @@ mod tests {
         let mut project_languages = HashMap::new();
         project_languages.insert(
             "markdown".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 aliases: Some(vec!["qmd".to_string(), "mdx".to_string()]),
                 ..Default::default()
             },
         );
 
-        let project_config = TreeSitterSettings {
+        let project_config = RawWorkspaceSettings {
             search_paths: None,
             languages: project_languages,
             capture_mappings: HashMap::new(),
@@ -2970,7 +2920,7 @@ mod tests {
             "markup.heading.1" = "class"
         "#;
 
-        let user_settings: TreeSitterSettings =
+        let user_settings: RawWorkspaceSettings =
             toml::from_str(user_config_content).expect("should parse user config");
 
         // Get defaults (which have markup.strong = "")
@@ -3357,7 +3307,7 @@ mod try_from_settings_tests {
 
     #[test]
     fn expands_search_paths() {
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$TEST_VAR/parsers".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -3374,14 +3324,14 @@ mod try_from_settings_tests {
         let mut languages = HashMap::new();
         languages.insert(
             "lua".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("$TEST_VAR/lua.so".to_string()),
                 queries: None,
                 bridge: None,
                 aliases: None,
             },
         );
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
             capture_mappings: HashMap::new(),
@@ -3401,7 +3351,7 @@ mod try_from_settings_tests {
         let mut languages = HashMap::new();
         languages.insert(
             "lua".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: None,
                 queries: Some(vec![QueryItem {
                     path: "${TEST_VAR}/highlights.scm".to_string(),
@@ -3411,7 +3361,7 @@ mod try_from_settings_tests {
                 aliases: None,
             },
         );
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
             capture_mappings: HashMap::new(),
@@ -3426,7 +3376,7 @@ mod try_from_settings_tests {
 
     #[test]
     fn undefined_var_returns_error() {
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$UNDEFINED/path".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -3449,14 +3399,14 @@ mod try_from_settings_tests {
         let mut languages = HashMap::new();
         languages.insert(
             "lua".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("$ALSO_MISSING/lua.so".to_string()),
                 queries: None,
                 bridge: None,
                 aliases: None,
             },
         );
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$MISSING_ONE/parsers".to_string()]),
             languages,
             capture_mappings: HashMap::new(),
@@ -3474,7 +3424,7 @@ mod try_from_settings_tests {
 
     #[test]
     fn tilde_without_home_dir_returns_error() {
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["~/parsers".to_string()]),
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),

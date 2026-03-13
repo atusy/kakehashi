@@ -65,7 +65,7 @@ Configuration resolution proceeds in three phases. Each phase depends on the out
 
 ### The `base` Field
 
-The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageConfig` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (absent fields are preserved per ADR-0010).
+The `base` field participates in cross-layer merging (Phase 1) like any other `LanguageSettings` field: a later layer's `base` value overrides an earlier layer's value. If a layer defines `[languages.rmd]` without specifying `base`, the `base` from a lower-priority layer survives the merge (absent fields are preserved per ADR-0010).
 
 Every language config gains an optional `base` field (default: not set, implicitly `"_"`):
 

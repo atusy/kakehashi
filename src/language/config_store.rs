@@ -1,11 +1,11 @@
-use crate::config::{CaptureMappings, LanguageConfig, TreeSitterSettings};
+use crate::config::{CaptureMappings, LanguageSettings, RawWorkspaceSettings};
 use log::warn;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Stores and manages language configurations
 pub struct ConfigStore {
-    language_configs: RwLock<HashMap<String, LanguageConfig>>,
+    language_configs: RwLock<HashMap<String, LanguageSettings>>,
     capture_mappings: RwLock<CaptureMappings>,
     search_paths: RwLock<Option<Vec<String>>>,
 }
@@ -20,7 +20,7 @@ impl ConfigStore {
     }
 
     // ========== Language Configs ==========
-    pub fn set_language_configs(&self, configs: HashMap<String, LanguageConfig>) {
+    pub fn set_language_configs(&self, configs: HashMap<String, LanguageSettings>) {
         match self.language_configs.write() {
             Ok(mut guard) => *guard = configs,
             Err(poisoned) => {
@@ -30,13 +30,13 @@ impl ConfigStore {
         }
     }
 
-    pub fn update_from_settings(&self, settings: &TreeSitterSettings) {
+    pub fn update_from_settings(&self, settings: &RawWorkspaceSettings) {
         self.set_language_configs(settings.languages.clone());
         self.set_capture_mappings(settings.capture_mappings.clone());
         self.set_search_paths(settings.search_paths.clone());
     }
 
-    pub fn get_language_config(&self, lang_name: &str) -> Option<LanguageConfig> {
+    pub fn get_language_config(&self, lang_name: &str) -> Option<LanguageSettings> {
         match self.language_configs.read() {
             Ok(guard) => guard.get(lang_name).cloned(),
             Err(poisoned) => {
@@ -46,7 +46,7 @@ impl ConfigStore {
         }
     }
 
-    pub fn get_all_language_configs(&self) -> HashMap<String, LanguageConfig> {
+    pub fn get_all_language_configs(&self) -> HashMap<String, LanguageSettings> {
         match self.language_configs.read() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => {
@@ -154,7 +154,7 @@ mod tests {
         let mut configs = HashMap::new();
         configs.insert(
             "rust".to_string(),
-            LanguageConfig {
+            LanguageSettings {
                 parser: Some("/path/to/rust.so".to_string()),
                 queries: Some(vec![QueryItem {
                     path: "/path/to/highlights.scm".to_string(),
@@ -204,10 +204,10 @@ mod tests {
     fn test_config_store_update_from_settings() {
         let store = ConfigStore::new();
 
-        let settings = TreeSitterSettings {
+        let settings = RawWorkspaceSettings {
             languages: {
                 let mut langs = HashMap::new();
-                langs.insert("python".to_string(), LanguageConfig::default());
+                langs.insert("python".to_string(), LanguageSettings::default());
                 langs
             },
             search_paths: Some(vec!["/search/path".to_string()]),
@@ -230,7 +230,7 @@ mod tests {
         let store = ConfigStore::new();
 
         let mut configs = HashMap::new();
-        configs.insert("go".to_string(), LanguageConfig::default());
+        configs.insert("go".to_string(), LanguageSettings::default());
         store.set_language_configs(configs);
         store.set_search_paths(Some(vec!["/path".to_string()]));
 

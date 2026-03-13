@@ -6,8 +6,8 @@ use super::parser_pool::{DocumentParserPool, ParserFactory};
 use super::query_loader::{ParseFailure, QueryLoader};
 use super::query_store::QueryStore;
 use super::registry::LanguageRegistry;
-use crate::config::settings::{LanguageConfig, QueryKind, infer_query_kind};
-use crate::config::{CaptureMappings, TreeSitterSettings, WorkspaceSettings};
+use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
+use crate::config::{CaptureMappings, RawWorkspaceSettings, WorkspaceSettings};
 use log::debug;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -73,11 +73,11 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub fn load_settings(&self, settings: WorkspaceSettings) -> LanguageLoadSummary {
-        let config_settings: TreeSitterSettings = settings.into();
+        let config_settings: RawWorkspaceSettings = settings.into();
         self.load_settings_from_config(&config_settings)
     }
 
-    fn load_settings_from_config(&self, settings: &TreeSitterSettings) -> LanguageLoadSummary {
+    fn load_settings_from_config(&self, settings: &RawWorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
         // build_from_settings removed in PBI-061 - filetypes no longer in config
 
@@ -97,7 +97,7 @@ impl LanguageCoordinator {
     /// For each language with `aliases = ["a", "b"]`, maps "a" → language_name
     /// and "b" → language_name. This enables editors sending languageId "rmd"
     /// to use the "markdown" parser configuration.
-    fn build_alias_map(&self, languages: &HashMap<String, LanguageConfig>) {
+    fn build_alias_map(&self, languages: &HashMap<String, LanguageSettings>) {
         let mut alias_map = self.alias_map.write().unwrap_or_else(|poisoned| {
             log::warn!(
                 target: "kakehashi::lock_recovery",
@@ -731,7 +731,7 @@ impl LanguageCoordinator {
     fn load_single_language(
         &self,
         lang_name: &str,
-        config: &LanguageConfig,
+        config: &LanguageSettings,
         search_paths: &Option<Vec<String>>,
     ) -> LanguageLoadResult {
         let library_path =
@@ -774,7 +774,7 @@ impl LanguageCoordinator {
     fn load_queries_for_language(
         &self,
         lang_name: &str,
-        config: &LanguageConfig,
+        config: &LanguageSettings,
         search_paths: &Option<Vec<String>>,
         language: &Language,
     ) -> Vec<LanguageEvent> {
@@ -1030,7 +1030,7 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["rmd".to_string()]),
                 ..Default::default()
             },
@@ -1505,7 +1505,7 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["rmd".to_string(), "qmd".to_string()]),
                 ..Default::default()
             },
@@ -1542,7 +1542,7 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["rmd".to_string()]),
                 ..Default::default()
             },
@@ -1569,7 +1569,7 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["rmd".to_string()]),
                 ..Default::default()
             },
@@ -1593,7 +1593,7 @@ mod tests {
         let mut languages1 = HashMap::new();
         languages1.insert(
             "markdown".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["rmd".to_string()]),
                 ..Default::default()
             },
@@ -1610,7 +1610,7 @@ mod tests {
         let mut languages2 = HashMap::new();
         languages2.insert(
             "javascript".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["jsx".to_string()]),
                 ..Default::default()
             },
@@ -1645,7 +1645,7 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "javascript".to_string(),
-            crate::config::settings::LanguageConfig {
+            crate::config::settings::LanguageSettings {
                 aliases: Some(vec!["jsx".to_string(), "mjs".to_string()]),
                 ..Default::default()
             },

@@ -407,9 +407,10 @@ fn test_semantic_tokens() {
 fn test_with_real_parser() {
     // Use parsers from deps/tree-sitter directory
     let search_paths = vec!["deps/tree-sitter".to_string()];
-    let settings = TreeSitterSettings {
-        searchPaths: Some(search_paths),
+    let settings = RawWorkspaceSettings {
+        search_paths: Some(search_paths),
         languages: /* language config */,
+        ..Default::default()
     };
 
     // Test with actual Tree-sitter parsers

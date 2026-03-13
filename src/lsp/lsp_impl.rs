@@ -40,7 +40,7 @@ use tree_sitter::InputEdit;
 use url::Url;
 
 use crate::analysis::{LEGEND_MODIFIERS, LEGEND_TYPES};
-use crate::config::{TreeSitterSettings, WorkspaceSettings, merge_settings};
+use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_settings};
 use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
@@ -696,22 +696,13 @@ impl Kakehashi {
 
         // Update settings to include the new paths
         let current_settings = self.settings_manager.load_settings();
-        let mut new_search_paths = current_settings.search_paths.clone();
+        let mut updated_settings = (*current_settings).clone();
 
         // Add data_dir as a base search path (not subdirectories)
         let data_dir_str = data_dir.to_string_lossy().to_string();
-        if !new_search_paths.contains(&data_dir_str) {
-            new_search_paths.push(data_dir_str);
+        if !updated_settings.search_paths.contains(&data_dir_str) {
+            updated_settings.search_paths.push(data_dir_str);
         }
-
-        // Create updated settings
-        let updated_settings = WorkspaceSettings::with_language_servers(
-            new_search_paths,
-            current_settings.languages.clone(),
-            current_settings.capture_mappings.clone(),
-            current_settings.auto_install,
-            current_settings.language_servers.clone(),
-        );
 
         // Apply the updated settings
         self.apply_settings(updated_settings).await;
@@ -1145,7 +1136,7 @@ impl LanguageServer for Kakehashi {
 
         // Always apply settings (use defaults if none were loaded)
         // This ensures auto_install=true, default capture_mappings, and other defaults are active
-        // for zero-config experience. Use default_settings() instead of TreeSitterSettings::default()
+        // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()
         // because the derived Default creates empty capture_mappings while default_settings() includes
         // the full default capture_mappings (markup.strong → "", etc.)
         let settings = settings_outcome.settings.unwrap_or_else(|| {
@@ -1536,7 +1527,7 @@ impl LanguageServer for Kakehashi {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         // Parse the incoming settings
-        let parsed = match serde_json::from_value::<TreeSitterSettings>(params.settings) {
+        let parsed = match serde_json::from_value::<RawWorkspaceSettings>(params.settings) {
             Ok(settings) => settings,
             Err(err) => {
                 self.notifier()
@@ -1550,7 +1541,7 @@ impl LanguageServer for Kakehashi {
         // The current settings already reflect defaults < user < project < initializationOptions,
         // so merging preserves languages and other fields set during initialize.
         let current = self.settings_manager.load_settings();
-        let current_ts = TreeSitterSettings::from(current.as_ref());
+        let current_ts = RawWorkspaceSettings::from(current.as_ref());
         let merged = merge_settings(Some(current_ts), Some(parsed));
 
         if let Some(merged_ts) = merged {

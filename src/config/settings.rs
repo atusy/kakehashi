@@ -202,29 +202,12 @@ pub fn infer_query_kind(path: &str) -> Option<QueryKind> {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
-pub struct LanguageConfig {
-    pub parser: Option<String>,
-    /// Unified query file configuration.
-    /// Each entry has a path and optional kind (inferred from filename if omitted).
-    pub queries: Option<Vec<QueryItem>>,
-    /// Languages to bridge for this host filetype (map format).
-    /// - None (omitted): Bridge ALL configured languages (default behavior)
-    /// - Some({}): Bridge NOTHING (disable bridging for this host)
-    /// - Some({ python: { enabled: true } }): Bridge only enabled languages
-    pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
-    /// Alternative languageId values that map to this language.
-    /// Example: `[languages.markdown]` with `aliases = ["rmd", "qmd"]`
-    /// allows editors sending languageId "rmd" or "qmd" to use the markdown parser.
-    pub aliases: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
-pub struct TreeSitterSettings {
+pub struct RawWorkspaceSettings {
     // Editor-agnostic name exposed to JSON as `searchPaths`.
     #[serde(rename = "searchPaths")]
     pub search_paths: Option<Vec<String>>,
     #[serde(default)]
-    pub languages: HashMap<String, LanguageConfig>,
+    pub languages: HashMap<String, LanguageSettings>,
     #[serde(rename = "captureMappings", default)]
     pub capture_mappings: CaptureMappings,
     #[serde(rename = "autoInstall")]
@@ -238,7 +221,7 @@ pub struct TreeSitterSettings {
 // Domain types - internal representations used throughout the application
 
 /// Per-language Tree-sitter language configuration surfaced to the domain.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct LanguageSettings {
     /// Path to the parser library (.so/.dylib/.dll)
     pub parser: Option<String>,
@@ -259,29 +242,6 @@ pub struct LanguageSettings {
 }
 
 impl LanguageSettings {
-    pub fn new(parser: Option<String>, queries: Option<Vec<QueryItem>>) -> Self {
-        Self {
-            parser,
-            queries,
-            bridge: None,
-            aliases: None,
-        }
-    }
-
-    /// Create LanguageSettings with bridge filter configuration.
-    pub fn with_bridge(
-        parser: Option<String>,
-        queries: Option<Vec<QueryItem>>,
-        bridge: Option<HashMap<String, BridgeLanguageConfig>>,
-    ) -> Self {
-        Self {
-            parser,
-            queries,
-            bridge,
-            aliases: None,
-        }
-    }
-
     /// Check if a language is allowed for bridging based on the bridge filter.
     ///
     /// Returns:
@@ -326,53 +286,6 @@ impl Default for WorkspaceSettings {
     }
 }
 
-impl WorkspaceSettings {
-    pub fn new(
-        search_paths: Vec<String>,
-        languages: HashMap<String, LanguageSettings>,
-        capture_mappings: CaptureMappings,
-    ) -> Self {
-        Self {
-            search_paths,
-            languages,
-            capture_mappings,
-            auto_install: true, // Default to true for zero-config experience
-            language_servers: None,
-        }
-    }
-
-    pub fn with_auto_install(
-        search_paths: Vec<String>,
-        languages: HashMap<String, LanguageSettings>,
-        capture_mappings: CaptureMappings,
-        auto_install: bool,
-    ) -> Self {
-        Self {
-            search_paths,
-            languages,
-            capture_mappings,
-            auto_install,
-            language_servers: None,
-        }
-    }
-
-    pub fn with_language_servers(
-        search_paths: Vec<String>,
-        languages: HashMap<String, LanguageSettings>,
-        capture_mappings: CaptureMappings,
-        auto_install: bool,
-        language_servers: Option<HashMap<String, BridgeServerConfig>>,
-    ) -> Self {
-        Self {
-            search_paths,
-            languages,
-            capture_mappings,
-            auto_install,
-            language_servers,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,7 +300,7 @@ mod tests {
 
         // Case 1: queries not specified (should be None)
         // User didn't specify queries - should inherit from wildcard/defaults
-        let unspecified = LanguageSettings::new(None, None);
+        let unspecified = LanguageSettings::default();
         assert!(
             unspecified.queries.is_none(),
             "Unspecified queries should be None"
@@ -395,7 +308,10 @@ mod tests {
 
         // Case 2: queries explicitly empty (should be Some([]))
         // User explicitly set queries to empty - should override wildcard with empty list
-        let explicitly_empty = LanguageSettings::new(None, Some(vec![]));
+        let explicitly_empty = LanguageSettings {
+            queries: Some(vec![]),
+            ..Default::default()
+        };
         assert!(
             explicitly_empty.queries.is_some(),
             "Explicitly empty should be Some"
@@ -406,13 +322,13 @@ mod tests {
         );
 
         // Case 3: queries with items
-        let with_items = LanguageSettings::new(
-            None,
-            Some(vec![QueryItem {
+        let with_items = LanguageSettings {
+            queries: Some(vec![QueryItem {
                 path: "/path/to/highlights.scm".to_string(),
                 kind: Some(QueryKind::Highlights),
             }]),
-        );
+            ..Default::default()
+        };
         assert!(with_items.queries.is_some());
         assert_eq!(with_items.queries.as_ref().unwrap().len(), 1);
     }
@@ -432,7 +348,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.search_paths.is_none());
         assert!(settings.languages.contains_key("rust"));
@@ -463,7 +379,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.languages.contains_key("rust"));
         let rust_config = &settings.languages["rust"];
@@ -487,7 +403,7 @@ mod tests {
             }
         }"#;
 
-        let result = serde_json::from_str::<TreeSitterSettings>(invalid_json);
+        let result = serde_json::from_str::<RawWorkspaceSettings>(invalid_json);
         assert!(result.is_err());
     }
 
@@ -497,7 +413,7 @@ mod tests {
             "languages": {}
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(empty_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(empty_json).unwrap();
         assert!(settings.languages.is_empty());
     }
 
@@ -506,7 +422,7 @@ mod tests {
         // This is crucial for zero-config: InitializationOptions = {} should work
         let completely_empty = r#"{}"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(completely_empty).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(completely_empty).unwrap();
         assert!(settings.languages.is_empty());
         assert!(settings.search_paths.is_none());
         assert!(settings.auto_install.is_none());
@@ -524,7 +440,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(json_without_languages).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(json_without_languages).unwrap();
         assert!(settings.languages.is_empty());
         assert_eq!(settings.search_paths, Some(vec!["/some/path".to_string()]));
     }
@@ -535,7 +451,7 @@ mod tests {
             [captureMappings._.highlights]
         "#;
 
-        let settings: TreeSitterSettings = toml::from_str(toml_without_languages).unwrap();
+        let settings: RawWorkspaceSettings = toml::from_str(toml_without_languages).unwrap();
         assert!(settings.languages.is_empty());
     }
 
@@ -553,7 +469,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.search_paths.is_some());
         assert_eq!(
@@ -579,7 +495,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.search_paths.is_some());
         assert_eq!(
@@ -611,7 +527,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert_eq!(
             settings.search_paths.unwrap(),
@@ -628,7 +544,7 @@ mod tests {
         ];
 
         for config in malformed_configs {
-            let result = serde_json::from_str::<TreeSitterSettings>(config);
+            let result = serde_json::from_str::<RawWorkspaceSettings>(config);
             assert!(result.is_err());
         }
     }
@@ -659,7 +575,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         // Check capture mappings are parsed correctly
         assert!(settings.capture_mappings.contains_key(WILDCARD_KEY));
@@ -703,7 +619,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.languages.contains_key("lua"));
         let lua_config = &settings.languages["lua"];
@@ -724,7 +640,7 @@ mod tests {
             "languages": {}
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
         assert_eq!(settings.auto_install, Some(true));
 
         // Test with false
@@ -732,20 +648,20 @@ mod tests {
             "autoInstall": false,
             "languages": {}
         }"#;
-        let settings_false: TreeSitterSettings = serde_json::from_str(config_false).unwrap();
+        let settings_false: RawWorkspaceSettings = serde_json::from_str(config_false).unwrap();
         assert_eq!(settings_false.auto_install, Some(false));
 
         // Test missing (should be None)
         let config_missing = r#"{
             "languages": {}
         }"#;
-        let settings_missing: TreeSitterSettings = serde_json::from_str(config_missing).unwrap();
+        let settings_missing: RawWorkspaceSettings = serde_json::from_str(config_missing).unwrap();
         assert_eq!(settings_missing.auto_install, None);
     }
 
     #[test]
     fn should_handle_complex_configurations_efficiently() {
-        let mut config = TreeSitterSettings {
+        let mut config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
             capture_mappings: HashMap::new(),
@@ -759,7 +675,7 @@ mod tests {
         for lang in languages {
             config.languages.insert(
                 lang.to_string(),
-                LanguageConfig {
+                LanguageSettings {
                     parser: Some(format!("/usr/lib/libtree-sitter-{}.so", lang)),
                     queries: Some(vec![QueryItem {
                         path: format!("/etc/tree-sitter/{}/highlights.scm", lang),
@@ -774,15 +690,15 @@ mod tests {
 
         // Verify serialization/deserialization still works
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: TreeSitterSettings = serde_json::from_str(&json).unwrap();
+        let deserialized: RawWorkspaceSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.languages.len(), config.languages.len());
     }
 
     #[test]
     fn should_not_have_legacy_fields_in_language_config() {
-        // Legacy highlights/locals/injections fields have been removed from LanguageConfig
+        // Legacy highlights/locals/injections fields have been removed from LanguageSettings
         // All query configuration now uses the unified queries field
-        let config = LanguageConfig {
+        let config = LanguageSettings {
             parser: Some("/path/to/parser.so".to_string()),
             queries: Some(vec![QueryItem {
                 path: "/path/to/highlights.scm".to_string(),
@@ -795,17 +711,17 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(
             !json.contains("\"highlights\":"),
-            "LanguageConfig should not have highlights field, but found in JSON: {}",
+            "LanguageSettings should not have highlights field, but found in JSON: {}",
             json
         );
         assert!(
             !json.contains("\"locals\":"),
-            "LanguageConfig should not have locals field, but found in JSON: {}",
+            "LanguageSettings should not have locals field, but found in JSON: {}",
             json
         );
         assert!(
             !json.contains("\"injections\":"),
-            "LanguageConfig should not have injections field, but found in JSON: {}",
+            "LanguageSettings should not have injections field, but found in JSON: {}",
             json
         );
     }
@@ -813,13 +729,14 @@ mod tests {
     #[test]
     fn should_create_language_settings_with_parser_and_queries() {
         // PBI-156: LanguageSettings uses parser (not library) and unified queries
-        let settings = LanguageSettings::new(
-            Some("/path/to/parser.so".to_string()),
-            Some(vec![QueryItem {
+        let settings = LanguageSettings {
+            parser: Some("/path/to/parser.so".to_string()),
+            queries: Some(vec![QueryItem {
                 path: "/path/to/highlights.scm".to_string(),
                 kind: Some(QueryKind::Highlights),
             }]),
-        );
+            ..Default::default()
+        };
 
         assert_eq!(settings.parser, Some("/path/to/parser.so".to_string()));
         assert_eq!(settings.queries.as_ref().unwrap().len(), 1);
@@ -890,7 +807,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.languages.contains_key("markdown"));
         let md_config = &settings.languages["markdown"];
@@ -922,7 +839,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_bridge_map_enabled() {
-        // PBI-120: LanguageConfig should parse bridge field as HashMap<String, BridgeLanguageConfig>
+        // PBI-120: LanguageSettings should parse bridge field as HashMap<String, BridgeLanguageConfig>
         // Example: bridge = { python = { enabled = true }, r = { enabled = true } }
         let config_json = r#"{
             "parser": "/path/to/parser.so",
@@ -933,7 +850,7 @@ mod tests {
             }
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(config.bridge.is_some(), "bridge field should be Some");
         let bridge = config.bridge.unwrap();
@@ -952,7 +869,7 @@ mod tests {
             "bridge": {}
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(
             config.bridge.is_some(),
@@ -971,7 +888,7 @@ mod tests {
             "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(
             config.bridge.is_none(),
@@ -983,7 +900,7 @@ mod tests {
     fn test_bridge_filter_null_bridges_all_languages() {
         // PBI-108 AC3: bridge omitted or null bridges all configured languages
         // When bridge is None (default), all languages should be bridgeable
-        let settings = LanguageSettings::new(None, None);
+        let settings = LanguageSettings::default();
 
         // Default (None) should bridge all languages
         assert!(
@@ -1007,11 +924,10 @@ mod tests {
     #[test]
     fn test_bridge_filter_empty_disables_bridging() {
         // PBI-120: Empty bridge map disables all bridging for that host filetype
-        let settings = LanguageSettings::with_bridge(
-            None,
-            None,
-            Some(HashMap::new()), // Empty map disables all bridging
-        );
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::new()), // Empty map disables all bridging
+            ..Default::default()
+        };
 
         // Empty map should disable all bridging
         assert!(
@@ -1047,7 +963,10 @@ mod tests {
             },
         );
 
-        let settings = LanguageSettings::with_bridge(None, None, Some(bridge));
+        let settings = LanguageSettings {
+            bridge: Some(bridge),
+            ..Default::default()
+        };
 
         // Enabled languages should be allowed
         assert!(
@@ -1089,7 +1008,10 @@ mod tests {
             },
         );
 
-        let settings = LanguageSettings::with_bridge(None, None, Some(bridge));
+        let settings = LanguageSettings {
+            bridge: Some(bridge),
+            ..Default::default()
+        };
 
         // python with enabled: true should be allowed
         assert!(
@@ -1122,7 +1044,7 @@ mod tests {
             }
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.language_servers.is_some());
         let servers = settings.language_servers.as_ref().unwrap();
@@ -1152,7 +1074,7 @@ mod tests {
             "languageServers": {}
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.language_servers.is_some());
         assert!(settings.language_servers.as_ref().unwrap().is_empty());
@@ -1165,7 +1087,7 @@ mod tests {
             "searchPaths": ["/usr/local/lib"]
         }"#;
 
-        let settings: TreeSitterSettings = serde_json::from_str(config_json).unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(settings.language_servers.is_none());
     }
@@ -1191,7 +1113,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_bridge_map() {
-        // PBI-120: LanguageConfig.bridge should be HashMap<String, BridgeLanguageConfig>
+        // PBI-120: LanguageSettings.bridge should be HashMap<String, BridgeLanguageConfig>
         // Example: bridge = { python = { enabled = true }, r = { enabled = false } }
         let config_json = r#"{
             "parser": "/path/to/parser.so",
@@ -1202,7 +1124,7 @@ mod tests {
             }
         }"#;
 
-        let config: LanguageConfig = serde_json::from_str(config_json).unwrap();
+        let config: LanguageSettings = serde_json::from_str(config_json).unwrap();
 
         assert!(config.bridge.is_some(), "bridge field should be Some");
         let bridge = config.bridge.unwrap();
@@ -1259,7 +1181,7 @@ kind = "injections""#;
 
     #[test]
     fn should_parse_queries_array_in_language_config() {
-        // LanguageConfig should have queries: Option<Vec<QueryItem>>
+        // LanguageSettings should have queries: Option<Vec<QueryItem>>
         let config_toml = r#"
             parser ="/path/to/parser.so"
             [[queries]]
@@ -1270,7 +1192,7 @@ kind = "injections""#;
             kind = "locals"
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
         assert!(config.queries.is_some());
         let queries = config.queries.unwrap();
         assert_eq!(queries.len(), 2);
@@ -1711,7 +1633,7 @@ kind = "injections""#;
             kind = "highlights"
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.aliases.is_some(), "aliases field should be present");
         let aliases = config.aliases.unwrap();
@@ -1732,7 +1654,7 @@ kind = "injections""#;
             kind = "highlights"
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.aliases.is_none(), "omitted aliases should be None");
     }
@@ -1745,7 +1667,7 @@ kind = "injections""#;
             aliases = []
         "#;
 
-        let config: LanguageConfig = toml::from_str(config_toml).unwrap();
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.aliases.is_some(), "empty aliases should be Some");
         assert!(

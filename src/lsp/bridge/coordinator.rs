@@ -697,7 +697,10 @@ mod tests {
         );
         languages.insert(
             "markdown".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(bridge_filter)),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
         );
 
         // Create language server config for rust
@@ -712,13 +715,12 @@ mod tests {
             },
         );
 
-        let settings = WorkspaceSettings::with_language_servers(
-            vec![],
+        let settings = WorkspaceSettings {
             languages,
-            HashMap::new(),
-            false,
-            Some(servers),
-        );
+            auto_install: false,
+            language_servers: Some(servers),
+            ..Default::default()
+        };
 
         // rust should be blocked by markdown's bridge filter
         let result = coordinator.get_config_for_language(&settings, "markdown", "rust");
@@ -747,13 +749,12 @@ mod tests {
             },
         );
 
-        let settings = WorkspaceSettings::with_language_servers(
-            vec![],
+        let settings = WorkspaceSettings {
             languages,
-            HashMap::new(),
-            false,
-            Some(servers),
-        );
+            auto_install: false,
+            language_servers: Some(servers),
+            ..Default::default()
+        };
 
         // rust should be allowed (no filter)
         let result = coordinator.get_config_for_language(&settings, "markdown", "rust");
@@ -794,13 +795,12 @@ mod tests {
             },
         );
 
-        let settings = WorkspaceSettings::with_language_servers(
-            vec![],
+        let settings = WorkspaceSettings {
             languages,
-            HashMap::new(),
-            false,
-            Some(servers),
-        );
+            auto_install: false,
+            language_servers: Some(servers),
+            ..Default::default()
+        };
 
         let result = coordinator.get_all_configs_for_language(&settings, "markdown", "python");
         assert_eq!(result.len(), 2, "should return both pyright and ruff");
@@ -828,7 +828,10 @@ mod tests {
         );
         languages.insert(
             "markdown".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(bridge_filter)),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
         );
 
         // Create language server config for rust (which is NOT in the filter)
@@ -843,13 +846,12 @@ mod tests {
             },
         );
 
-        let settings = WorkspaceSettings::with_language_servers(
-            vec![],
+        let settings = WorkspaceSettings {
             languages,
-            HashMap::new(),
-            false,
-            Some(servers),
-        );
+            auto_install: false,
+            language_servers: Some(servers),
+            ..Default::default()
+        };
 
         // rust should be blocked by markdown's bridge filter
         let result = coordinator.get_all_configs_for_language(&settings, "markdown", "rust");
@@ -878,13 +880,12 @@ mod tests {
             },
         );
 
-        let settings = WorkspaceSettings::with_language_servers(
-            vec![],
+        let settings = WorkspaceSettings {
             languages,
-            HashMap::new(),
-            false,
-            Some(servers),
-        );
+            auto_install: false,
+            language_servers: Some(servers),
+            ..Default::default()
+        };
 
         let result = coordinator.get_all_configs_for_language(&settings, "markdown", "rust");
         assert_eq!(result.len(), 1, "should return exactly one server");
@@ -971,7 +972,10 @@ mod tests {
         let mut languages = HashMap::new();
         languages.insert(
             "_".to_string(),
-            LanguageSettings::with_bridge(None, None, Some(HashMap::new())), // empty = block all
+            LanguageSettings {
+                bridge: Some(HashMap::new()),
+                ..Default::default()
+            }, // empty = block all
         );
 
         // Create language server config for rust
@@ -986,13 +990,12 @@ mod tests {
             },
         );
 
-        let settings = WorkspaceSettings::with_language_servers(
-            vec![],
+        let settings = WorkspaceSettings {
             languages,
-            HashMap::new(),
-            false,
-            Some(servers),
-        );
+            auto_install: false,
+            language_servers: Some(servers),
+            ..Default::default()
+        };
 
         // "quarto" is not defined, so it inherits from wildcard which blocks all
         let result = coordinator.get_config_for_language(&settings, "quarto", "rust");

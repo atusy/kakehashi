@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tower_lsp_server::jsonrpc::Result;
 
-use crate::config::TreeSitterSettings;
+use crate::config::RawWorkspaceSettings;
 use crate::lsp::lsp_impl::Kakehashi;
 
 #[derive(Deserialize)]
@@ -11,15 +11,15 @@ pub struct EffectiveConfigurationParams {}
 impl Kakehashi {
     /// Handler for `kakehashi/internal/effectiveConfiguration`.
     ///
-    /// Returns `{ settings: <TreeSitterSettings> }` where the settings value
+    /// Returns `{ settings: <RawWorkspaceSettings> }` where the settings value
     /// matches the `kakehashi.toml` schema.
     pub async fn effective_configuration(
         &self,
         _params: EffectiveConfigurationParams,
     ) -> Result<Value> {
         let settings = self.settings_manager.load_settings();
-        let ts_settings = TreeSitterSettings::from(settings.as_ref());
-        let settings_value = serde_json::to_value(ts_settings).map_err(|e| {
+        let raw_settings = RawWorkspaceSettings::from(settings.as_ref());
+        let settings_value = serde_json::to_value(raw_settings).map_err(|e| {
             log::error!(
                 target: "kakehashi::effective_configuration",
                 "Failed to serialize effective configuration: {}",

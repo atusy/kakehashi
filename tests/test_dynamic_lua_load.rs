@@ -1,6 +1,6 @@
 //! Integration test for dynamically loading Lua from searchPaths
 
-use kakehashi::config::{TreeSitterSettings, WorkspaceSettings};
+use kakehashi::config::{RawWorkspaceSettings, WorkspaceSettings};
 use kakehashi::language::LanguageCoordinator;
 use std::collections::HashMap;
 
@@ -13,7 +13,7 @@ fn test_dynamic_lua_load_from_search_paths() {
     let cwd = std::env::current_dir().expect("cwd");
     let search_path = cwd.join("deps/tree-sitter").to_string_lossy().to_string();
 
-    let settings = TreeSitterSettings {
+    let settings = RawWorkspaceSettings {
         search_paths: Some(vec![search_path.clone()]),
         languages: HashMap::new(),
         capture_mappings: HashMap::new(),

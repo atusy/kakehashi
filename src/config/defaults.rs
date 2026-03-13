@@ -4,14 +4,14 @@
 //! to generate configuration templates.
 
 use super::WILDCARD_KEY;
-use super::settings::{CaptureMapping, CaptureMappings, QueryTypeMappings, TreeSitterSettings};
+use super::settings::{CaptureMapping, CaptureMappings, QueryTypeMappings, RawWorkspaceSettings};
 use std::collections::HashMap;
 
-/// Returns the default TreeSitterSettings for configuration generation.
+/// Returns the default RawWorkspaceSettings for configuration generation.
 ///
 /// This is used by `config init` to generate type-safe default configurations.
-pub fn default_settings() -> TreeSitterSettings {
-    TreeSitterSettings {
+pub fn default_settings() -> RawWorkspaceSettings {
+    RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: HashMap::new(),
         capture_mappings: default_capture_mappings(),
@@ -272,9 +272,9 @@ mod tests {
         // Create settings from defaults — use with_kakehashi_defaults so that
         // ${KAKEHASHI_DATA_DIR} in searchPaths resolves to the platform default.
         use crate::config::expand::with_kakehashi_defaults;
-        let ts_settings = default_settings();
+        let raw_settings = default_settings();
         let ws_settings = WorkspaceSettings::try_from_settings(
-            &ts_settings,
+            &raw_settings,
             None,
             with_kakehashi_defaults(|_| None),
         )
