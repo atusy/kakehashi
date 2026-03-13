@@ -153,7 +153,7 @@ local y = "duplicate"
 
     for lang in &unique_languages {
         if tracker.try_start_install(lang) {
-            install_triggered.push(lang.clone());
+            install_triggered.push(lang.to_string());
         }
     }
 
@@ -170,7 +170,7 @@ local y = "duplicate"
     let mut second_file_install_triggered: Vec<String> = Vec::new();
     for lang in &unique_languages {
         if tracker.try_start_install(lang) {
-            second_file_install_triggered.push(lang.clone());
+            second_file_install_triggered.push(lang.to_string());
         }
     }
 
@@ -537,7 +537,7 @@ class Foo:
 
     for lang in &unique_languages {
         if tracker.try_start_install(lang) {
-            installed.push(lang.clone());
+            installed.push(lang.to_string());
         }
     }
 
@@ -552,7 +552,7 @@ class Foo:
     let mut second_file_installed: Vec<String> = Vec::new();
     for lang in &unique_languages {
         if tracker.try_start_install(lang) {
-            second_file_installed.push(lang.clone());
+            second_file_installed.push(lang.to_string());
         }
     }
 

@@ -38,7 +38,7 @@ pub const DEFAULT_OFFSET: InjectionOffset = InjectionOffset {
 
 /// Parses offset directive for a specific pattern in the query.
 /// Returns None if the specified pattern has no #offset! directive for @injection.content.
-pub fn parse_offset_directive_for_pattern(
+pub(crate) fn parse_offset_directive_for_pattern(
     query: &Query,
     pattern_index: usize,
 ) -> Option<InjectionOffset> {
@@ -825,7 +825,7 @@ pub fn collect_all_injections<'a>(
 
 /// Detects injection and returns both the language and the content node
 /// Also returns the pattern index of the innermost injection for offset lookups
-pub fn detect_injection<'a>(
+pub(crate) fn detect_injection<'a>(
     node: &Node<'a>,
     root: &Node<'a>,
     text: &str,
@@ -937,7 +937,7 @@ fn extract_content_and_language<'a>(
 ///
 /// # Returns
 /// Option of (index, reference to region) for use with calculate_region_id
-pub fn find_injection_at_position<'a>(
+pub(crate) fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
 ) -> Option<(usize, &'a InjectionRegionInfo<'a>)> {
