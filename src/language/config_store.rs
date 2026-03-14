@@ -147,6 +147,52 @@ mod tests {
     }
 
     #[test]
+    fn test_poison_recovery_on_read() {
+        let store = Arc::new(ConfigStore::new());
+        let mut configs = HashMap::new();
+        configs.insert("rust".to_string(), LanguageSettings::default());
+        store.set_language_configs(configs);
+
+        // Poison the RwLock by panicking while holding a write guard
+        let store_clone = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            let _guard = store_clone.language_configs.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(store.language_configs.read().is_err());
+
+        // get_language_config should recover from the poisoned lock
+        assert!(store.get_language_config("rust").is_some());
+    }
+
+    #[test]
+    fn test_poison_recovery_on_write() {
+        let store = Arc::new(ConfigStore::new());
+
+        // Poison the RwLock by panicking while holding a write guard
+        let store_clone = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            let _guard = store_clone.language_configs.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(store.language_configs.write().is_err());
+
+        // set_language_configs should recover from the poisoned lock
+        let mut configs = HashMap::new();
+        configs.insert("rust".to_string(), LanguageSettings::default());
+        store.set_language_configs(configs);
+
+        // Verify the config was stored despite the poisoned lock
+        assert!(store.get_language_config("rust").is_some());
+    }
+
+    #[test]
     fn test_config_store_capture_mappings() {
         let store = ConfigStore::new();
 

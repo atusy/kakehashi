@@ -390,9 +390,6 @@ impl LanguageCoordinator {
     }
 
     /// Get language for a file extension.
-    ///
-    /// Visibility: Public - used in integration tests (test_poison_recovery)
-    /// and internally for extension-based detection.
     pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
         self.filetype_resolver.get_language_for_extension(extension)
     }

@@ -169,6 +169,53 @@ mod tests {
     }
 
     #[test]
+    fn test_poison_recovery_on_read() {
+        let store = Arc::new(QueryStore::new());
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = Arc::new(Query::new(&lang, "(identifier) @variable").unwrap());
+        store.insert_highlight_query("rust".to_string(), query.clone());
+
+        // Poison the RwLock by panicking while holding a write guard
+        let store_clone = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            let _guard = store_clone.highlight_queries.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(store.highlight_queries.read().is_err());
+
+        // get_highlight_query should recover from the poisoned lock
+        let retrieved = store.get_highlight_query("rust");
+        assert_eq!(retrieved.unwrap(), query);
+    }
+
+    #[test]
+    fn test_poison_recovery_on_write() {
+        let store = Arc::new(QueryStore::new());
+
+        // Poison the RwLock by panicking while holding a write guard
+        let store_clone = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            let _guard = store_clone.highlight_queries.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(store.highlight_queries.write().is_err());
+
+        // insert_highlight_query should recover from the poisoned lock
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = Arc::new(Query::new(&lang, "(identifier) @variable").unwrap());
+        store.insert_highlight_query("rust".to_string(), query.clone());
+
+        // Verify the query was stored despite the poisoned lock
+        assert!(store.has_highlight_query("rust"));
+    }
+
+    #[test]
     fn test_query_store_clear_all() {
         let store = QueryStore::new();
         let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
