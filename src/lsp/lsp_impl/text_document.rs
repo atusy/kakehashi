@@ -7,6 +7,10 @@ mod completion_item;
 mod declaration;
 mod definition;
 pub(crate) mod diagnostic;
+mod did_change;
+mod did_close;
+mod did_open;
+mod did_save;
 #[cfg(feature = "experimental")]
 mod document_color;
 mod document_highlight;
