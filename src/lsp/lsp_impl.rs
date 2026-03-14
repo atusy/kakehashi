@@ -536,14 +536,14 @@ impl Kakehashi {
             .get_all_configs_for_language(&settings, host_language, injection_language)
     }
 
-    pub(super) async fn apply_settings(&self, settings: WorkspaceSettings) {
+    async fn apply_settings(&self, settings: WorkspaceSettings) {
         // Store settings via SettingsManager for auto_install check
         self.settings_manager.apply_settings(settings.clone());
         let summary = self.language.load_settings(settings);
         self.notifier().log_language_events(&summary.events).await;
     }
 
-    pub(super) async fn report_settings_events(&self, events: &[crate::lsp::SettingsEvent]) {
+    async fn report_settings_events(&self, events: &[crate::lsp::SettingsEvent]) {
         self.notifier().log_settings_events(events).await;
     }
 
