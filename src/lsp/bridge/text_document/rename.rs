@@ -290,9 +290,8 @@ mod tests {
             test_request_id(),
         );
 
+        assert_position_request(&request, "textDocument/rename", 2);
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["params"]["position"]["line"], 2);
-        assert_eq!(json["params"]["position"]["character"], 10);
         assert_eq!(json["params"]["newName"], "renamedVariable");
     }
 
