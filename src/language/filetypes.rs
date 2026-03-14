@@ -116,6 +116,7 @@ impl Default for FiletypeResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_filetype_resolver_basic() {
@@ -137,6 +138,54 @@ mod tests {
 
     // test_filetype_resolver_from_settings removed in PBI-061 S48.4
     // Method build_from_settings no longer exists
+
+    #[test]
+    fn test_poison_recovery_on_read() {
+        let resolver = Arc::new(FiletypeResolver::new());
+        resolver.add_mapping("rs".to_string(), "rust".to_string());
+
+        // Poison the RwLock by panicking while holding a write guard
+        let resolver_clone = Arc::clone(&resolver);
+        let handle = std::thread::spawn(move || {
+            let _guard = resolver_clone.filetype_map.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(resolver.filetype_map.read().is_err());
+
+        // get_language_for_extension should recover from the poisoned lock
+        assert_eq!(
+            resolver.get_language_for_extension("rs"),
+            Some("rust".to_string())
+        );
+    }
+
+    #[test]
+    fn test_poison_recovery_on_write() {
+        let resolver = Arc::new(FiletypeResolver::new());
+
+        // Poison the RwLock by panicking while holding a write guard
+        let resolver_clone = Arc::clone(&resolver);
+        let handle = std::thread::spawn(move || {
+            let _guard = resolver_clone.filetype_map.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(resolver.filetype_map.write().is_err());
+
+        // add_mapping should recover from the poisoned lock
+        resolver.add_mapping("rs".to_string(), "rust".to_string());
+
+        // Verify the mapping was stored despite the poisoned lock
+        assert_eq!(
+            resolver.get_language_for_extension("rs"),
+            Some("rust".to_string())
+        );
+    }
 
     #[test]
     fn test_filetype_resolver_document_path() {
