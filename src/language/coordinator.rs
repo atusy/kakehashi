@@ -418,7 +418,7 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer (lsp_impl) to check parser
     /// availability before attempting language operations.
     pub fn has_parser_available(&self, language_name: &str) -> bool {
-        self.language_registry.has_parser_available(language_name)
+        self.language_registry.contains(language_name)
     }
 
     /// ADR-0005: Unified detection fallback chain for both host documents and injections.
