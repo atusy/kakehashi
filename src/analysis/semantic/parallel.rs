@@ -298,7 +298,7 @@ fn collect_injection_contexts_sync<'a>(
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
 ) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>) {
-    use crate::language::{collect_all_injections, injection::parse_offset_directive_for_pattern};
+    use crate::language::injection::{collect_all_injections, parse_offset_directive_for_pattern};
 
     let current_lang = filetype.unwrap_or("unknown");
     let Some(injection_query) = coordinator.get_injection_query(current_lang) else {

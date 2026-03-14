@@ -1,4 +1,4 @@
-use tree_sitter::{Query, QueryMatch, QueryPredicate, QueryProperty};
+use tree_sitter::{Query, QueryPredicate, QueryProperty};
 
 /// Get all predicates for a pattern, including both general predicates and property settings
 pub fn get_all_predicates(query: &Query, pattern_index: usize) -> PredicateIterator<'_> {
@@ -8,11 +8,6 @@ pub fn get_all_predicates(query: &Query, pattern_index: usize) -> PredicateItera
         general_index: 0,
         property_index: 0,
     }
-}
-
-/// Get all predicates for a match
-pub fn get_match_predicates<'a>(query: &'a Query, match_: &QueryMatch) -> PredicateIterator<'a> {
-    get_all_predicates(query, match_.pattern_index)
 }
 
 /// Iterator over all predicates (both general and property-based)
@@ -37,16 +32,6 @@ impl<'a> UnifiedPredicate<'a> {
             UnifiedPredicate::General(p) => p.operator.as_ref(),
             UnifiedPredicate::Property(p) => p.key.as_ref(),
         }
-    }
-
-    /// Check if this is a property setting (like #set!)
-    pub fn is_property(&self) -> bool {
-        matches!(self, UnifiedPredicate::Property(_))
-    }
-
-    /// Check if this is a general predicate
-    pub fn is_general(&self) -> bool {
-        matches!(self, UnifiedPredicate::General(_))
     }
 }
 

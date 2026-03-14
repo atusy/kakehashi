@@ -6,12 +6,9 @@ pub mod settings;
 pub(crate) use expand::make_env;
 pub(crate) mod user;
 
-pub use expand::{ExpandErrors, set_config_file_override, set_data_dir_override};
-pub use settings::{
-    AggregationConfig, AggregationStrategy, BridgeServerConfig, CaptureMapping, CaptureMappings,
-    LanguageSettings, QueryItem, QueryKind, QueryTypeMappings, RawWorkspaceSettings,
-    WorkspaceSettings, json_schema,
-};
+pub use expand::{set_config_file_override, set_data_dir_override};
+pub(crate) use settings::{CaptureMappings, QueryTypeMappings};
+pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};
 use std::collections::HashMap;
 pub(crate) use user::load_user_config;
 
@@ -3304,6 +3301,7 @@ mod tests {
 mod try_from_settings_tests {
     use super::*;
     use expand::make_env;
+    use settings::{QueryItem, QueryKind};
     use std::collections::HashMap;
 
     #[test]

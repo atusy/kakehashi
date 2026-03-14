@@ -84,7 +84,7 @@ use super::connection::AsyncBridgeConnection;
 /// This type ensures we can forward cancel requests for clients using either ID type.
 ///
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum UpstreamId {
+pub(crate) enum UpstreamId {
     /// Numeric request ID (most common)
     Number(i64),
     /// String request ID (less common but valid per LSP spec)

@@ -176,14 +176,15 @@ impl FailedParserRegistry {
         }
         Ok(())
     }
+}
 
-    /// Get list of all failed parsers.
-    pub fn failed_parsers(&self) -> Vec<String> {
+#[cfg(test)]
+impl FailedParserRegistry {
+    fn failed_parsers(&self) -> Vec<String> {
         self.failed.iter().map(|r| r.clone()).collect()
     }
 
-    /// Clear all failed parsers (reset state).
-    pub fn clear_all(&self) -> io::Result<()> {
+    fn clear_all(&self) -> io::Result<()> {
         self.failed.clear();
         let path = self.failed_parsers_path();
         if path.exists() {
