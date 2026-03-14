@@ -389,7 +389,7 @@ fn collect_injection_contexts_sync<'a>(
 
         // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).
         // When we have per-gap included ranges, push EACH gap as a separate exclusion entry
-        // so that compute_active_injection_regions() produces per-line ActiveInjectionBoundss.
+        // so that compute_active_injection_regions() produces per-line ActiveInjectionBounds values.
         // Otherwise, push the single full content range as before.
         if let Some(ref ranges) = included_ranges {
             // compute_included_ranges returns ranges relative to content_node.start_byte().
@@ -529,7 +529,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Sort tokens by position (line, then column)
     all_tokens.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column)));
 
-    // Convert byte ranges to line/column ActiveInjectionBoundss, but only for
+    // Convert byte ranges to line/column ActiveInjectionBounds values, but only for
     // regions that actually produced tokens (= "active" injection regions).
     let active_regions = compute_active_injection_regions(
         host_text,
