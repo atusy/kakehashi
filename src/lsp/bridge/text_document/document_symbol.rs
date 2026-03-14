@@ -252,10 +252,10 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &Region
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use rstest::rstest;
     use serde_json::json;
-    use tower_lsp_server::ls_types::Uri;
 
     // ==========================================================================
     // Document symbol request tests
@@ -263,36 +263,15 @@ mod tests {
 
     #[test]
     fn document_symbol_request_uses_virtual_uri() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_document_symbol_request(&virtual_uri, RequestId::new(42));
 
-        let json = serde_json::to_value(&request).unwrap();
-        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
-        assert!(
-            VirtualDocumentUri::is_virtual_uri(uri_str),
-            "Request should use a virtual URI: {}",
-            uri_str
-        );
-        assert!(
-            uri_str.ends_with(".lua"),
-            "Virtual URI should have .lua extension: {}",
-            uri_str
-        );
+        assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]
     fn document_symbol_request_has_correct_method_and_no_position() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
-        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_document_symbol_request(&virtual_uri, RequestId::new(123));
 
         let json = serde_json::to_value(&request).unwrap();

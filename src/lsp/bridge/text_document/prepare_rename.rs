@@ -132,29 +132,10 @@ fn transform_prepare_rename_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use rstest::rstest;
     use serde_json::json;
-
-    // ==========================================================================
-    // Test helpers
-    // ==========================================================================
-
-    fn test_request_id() -> RequestId {
-        RequestId::new(42)
-    }
-
-    fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
-        let url = Url::parse("file:///project/doc.md").unwrap();
-        crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
-    }
-
-    fn test_position() -> Position {
-        Position {
-            line: 5,
-            character: 10,
-        }
-    }
 
     // ==========================================================================
     // Request builder tests
@@ -169,14 +150,8 @@ mod tests {
             &RegionOffset::new(3, 0),
             test_request_id(),
         );
-        let json = serde_json::to_value(&request).unwrap();
 
-        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
-        assert!(
-            VirtualDocumentUri::is_virtual_uri(uri_str),
-            "Request should use a virtual URI: {}",
-            uri_str
-        );
+        assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]
@@ -188,14 +163,8 @@ mod tests {
             &RegionOffset::new(3, 0),
             test_request_id(),
         );
-        let json = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(json["jsonrpc"], "2.0");
-        assert_eq!(json["id"], 42);
-        assert_eq!(json["method"], "textDocument/prepareRename");
-        // Position translated: line 5 - 3 = 2
-        assert_eq!(json["params"]["position"]["line"], 2);
-        assert_eq!(json["params"]["position"]["character"], 10);
+        assert_position_request(&request, "textDocument/prepareRename", 2);
     }
 
     // ==========================================================================

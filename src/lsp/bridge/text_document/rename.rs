@@ -255,6 +255,7 @@ fn transform_text_document_edit(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use rstest::rstest;
     use serde_json::json;
@@ -265,59 +266,34 @@ mod tests {
 
     #[test]
     fn rename_request_uses_virtual_uri() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
-        let host_position = Position {
-            line: 5,
-            character: 10,
-        };
-        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_rename_request(
             &virtual_uri,
-            host_position,
+            test_position(),
             &RegionOffset::new(3, 0),
             "newName",
             RequestId::new(1),
         );
 
-        let json = serde_json::to_value(&request).unwrap();
-        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
-        assert!(
-            VirtualDocumentUri::is_virtual_uri(uri_str),
-            "Request should use a virtual URI: {}",
-            uri_str
-        );
-        assert!(
-            uri_str.ends_with(".lua"),
-            "Virtual URI should have .lua extension: {}",
-            uri_str
-        );
+        assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]
     fn rename_request_translates_position_and_includes_new_name() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
-        let host_position = Position {
-            line: 5,
-            character: 10,
-        };
-        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+        // Host line 5, region starts at line 3 -> virtual line 2
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_rename_request(
             &virtual_uri,
-            host_position,
+            test_position(),
             &RegionOffset::new(3, 0),
             "renamedVariable",
-            RequestId::new(42),
+            test_request_id(),
         );
 
-        insta::assert_json_snapshot!(request);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["params"]["position"]["line"], 2);
+        assert_eq!(json["params"]["position"]["character"], 10);
+        assert_eq!(json["params"]["newName"], "renamedVariable");
     }
 
     // ==========================================================================

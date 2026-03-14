@@ -188,6 +188,7 @@ fn transform_inlay_hint_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use rstest::rstest;
     use serde_json::json;
@@ -198,11 +199,7 @@ mod tests {
 
     #[test]
     fn inlay_hint_request_uses_virtual_uri() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
+        let host_uri = test_host_uri();
         let host_range = Range {
             start: tower_lsp_server::ls_types::Position {
                 line: 10,
@@ -221,27 +218,12 @@ mod tests {
             RequestId::new(1),
         );
 
-        let json = serde_json::to_value(&request).unwrap();
-        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
-        assert!(
-            VirtualDocumentUri::is_virtual_uri(uri_str),
-            "Request should use a virtual URI: {}",
-            uri_str
-        );
-        assert!(
-            uri_str.ends_with(".lua"),
-            "Virtual URI should have .lua extension: {}",
-            uri_str
-        );
+        assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]
     fn inlay_hint_request_translates_range_to_virtual_coordinates() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
+        let host_uri = test_host_uri();
         let host_range = Range {
             start: tower_lsp_server::ls_types::Position {
                 line: 10,
@@ -274,11 +256,7 @@ mod tests {
 
     #[test]
     fn inlay_hint_request_first_line_applies_column_offset() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
+        let host_uri = test_host_uri();
         // Host range starts on first line of region (line 5), region starts at col 4
         let host_range = Range {
             start: tower_lsp_server::ls_types::Position {
@@ -309,11 +287,7 @@ mod tests {
 
     #[test]
     fn inlay_hint_request_non_first_line_ignores_column_offset() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
+        let host_uri = test_host_uri();
         // Host range starts on non-first line of region
         let host_range = Range {
             start: tower_lsp_server::ls_types::Position {
@@ -344,11 +318,7 @@ mod tests {
 
     #[test]
     fn inlay_hint_request_range_saturates_at_zero() {
-        use url::Url;
-
-        let host_uri: Uri =
-            crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///project/doc.md").unwrap())
-                .unwrap();
+        let host_uri = test_host_uri();
         // Range starts before region_start_line (race condition scenario)
         let host_range = Range {
             start: tower_lsp_server::ls_types::Position {
