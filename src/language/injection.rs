@@ -7,6 +7,9 @@ use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingI
 use ulid::Ulid;
 use url::Url;
 
+/// Maximum recursion depth for nested injections to prevent stack overflow.
+pub(crate) const MAX_INJECTION_DEPTH: usize = 10;
+
 /// Represents offset adjustments for injection content boundaries
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InjectionOffset {
