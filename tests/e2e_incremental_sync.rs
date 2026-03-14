@@ -205,9 +205,8 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
     // Poll for hover on first Lua block to establish its virtual document.
     // lua-ls may return null during workspace loading (non-deterministic).
     // Line 4: "print(a)", character 0 is inside the first Lua injection region.
-    let hover1 = poll_for_hover(&mut client, &markdown_uri, 4, 0, 20, 500);
-    let lua_ls_ready = hover1.is_some();
-    if lua_ls_ready {
+    let block1_ready = poll_for_hover(&mut client, &markdown_uri, 4, 0, 20, 500).is_some();
+    if block1_ready {
         println!("Established first Lua block virtual document");
     } else {
         eprintln!("Note: lua-ls returned null for first block hover (may still be loading).");
@@ -215,14 +214,17 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
 
     // Poll for hover on second Lua block to establish its virtual document.
     // Line 11: "print(b)", character 0 is inside the second Lua injection region.
-    if lua_ls_ready {
-        let hover2 = poll_for_hover(&mut client, &markdown_uri, 11, 0, 20, 500);
-        if hover2.is_some() {
+    let block2_ready = if block1_ready {
+        let ready = poll_for_hover(&mut client, &markdown_uri, 11, 0, 20, 500).is_some();
+        if ready {
             println!("Established second Lua block virtual document");
         } else {
             eprintln!("Note: lua-ls returned null for second block hover.");
         }
-    }
+        ready
+    } else {
+        false
+    };
 
     // Send multiple incremental edits in sequence.
     // Edit 1: Insert newline after "Middle text." (shifts second Lua block down by 1 line).
@@ -304,8 +306,8 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
         hover2_response.get("error")
     );
 
-    if lua_ls_ready {
-        // lua-ls was ready before edits — verify ULID stability (content still available).
+    if block1_ready {
+        // lua-ls was ready for block 1 — verify ULID stability (content still available).
         let hover1_after = poll_for_hover(&mut client, &markdown_uri, 4, 0, 5, 500);
         assert!(
             hover1_after.is_some(),
@@ -313,7 +315,10 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
              A persistent null result indicates ULID over-invalidation."
         );
         println!("First Lua block ULID stability verified");
+    }
 
+    if block2_ready {
+        // lua-ls was ready for block 2 — verify ULID stability at shifted position.
         let hover2_after = poll_for_hover(&mut client, &markdown_uri, 12, 0, 5, 500);
         assert!(
             hover2_after.is_some(),
@@ -321,12 +326,15 @@ fn e2e_multiple_incremental_edits_maintain_positions() {
              A persistent null result indicates ULID over-invalidation or incorrect position shift."
         );
         println!("Second Lua block ULID stability verified at shifted position");
+    }
+
+    if block1_ready && block2_ready {
         println!(
             "E2E: Multiple incremental edits maintain correct region positions (full verification)"
         );
     } else {
         println!(
-            "E2E: Multiple incremental edits processed without error (lua-ls not yet ready for ULID check)."
+            "E2E: Multiple incremental edits processed without error (lua-ls not fully ready for ULID check)."
         );
     }
 
