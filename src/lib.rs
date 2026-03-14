@@ -5,4 +5,4 @@ pub(crate) mod error;
 pub mod install;
 pub mod language;
 pub mod lsp;
-pub mod text;
+pub(crate) mod text;

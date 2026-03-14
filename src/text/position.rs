@@ -193,6 +193,37 @@ mod tests {
     }
 
     #[test]
+    fn utf16_to_byte_column_for_multibyte() {
+        // "あいうx" — each hiragana is 3 bytes UTF-8, 1 code unit UTF-16
+        // UTF-16 col 3 (after 3 hiragana) → byte col 9
+        let text = "あいうx\n";
+        let mapper = PositionMapper::new(text);
+        let point = mapper
+            .position_to_point(tower_lsp_server::ls_types::Position::new(0, 3))
+            .expect("valid position");
+        assert_eq!(point.row, 0);
+        assert_eq!(point.column, 9);
+    }
+
+    #[test]
+    fn position_to_byte_for_multibyte() {
+        // "let x = \"あいう\";" — ASCII prefix then 3 hiragana (3 bytes each)
+        let text = "let x = \"あいう\";\n";
+        let mapper = PositionMapper::new(text);
+
+        // UTF-16 col 9 → byte 9 (all ASCII up to the opening quote content)
+        assert_eq!(
+            mapper.position_to_byte(tower_lsp_server::ls_types::Position::new(0, 9)),
+            Some(9)
+        );
+        // UTF-16 col 12 → byte 18 (9 ASCII + 3 hiragana × 3 bytes)
+        assert_eq!(
+            mapper.position_to_byte(tower_lsp_server::ls_types::Position::new(0, 12)),
+            Some(18)
+        );
+    }
+
+    #[test]
     fn byte_to_utf16_col_emoji() {
         // Emoji (4 bytes in UTF-8, 2 code units in UTF-16)
         let line = "hello 👋 world";
