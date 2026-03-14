@@ -15,13 +15,14 @@ use std::collections::HashMap;
 use tree_sitter::{Parser, Tree};
 
 use super::injection::{InjectionContext, MAX_INJECTION_DEPTH};
-use super::token_collector::{InjectionRegion, RawToken, byte_to_utf16_col, collect_host_tokens};
+use super::token_collector::{InjectionRegion, RawToken, collect_host_tokens};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     compute_included_ranges, intersect_included_ranges, parse_with_ranges,
     sub_select_included_ranges,
 };
+use crate::text::position::byte_to_utf16_col;
 
 /// Maximum number of parsers to cache per Rayon worker thread.
 ///
