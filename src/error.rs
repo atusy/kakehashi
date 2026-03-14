@@ -25,11 +25,14 @@ pub trait LockResultExt<T> {
     /// Recover from a poisoned lock, logging a warning with the given context.
     ///
     /// Always succeeds — `PoisonError::into_inner()` is infallible.
-    fn recover_poison(self, context: &str) -> T;
+    ///
+    /// Accepts any `Display` value as context: pass a `&str` for static context,
+    /// or `format_args!(…)` for dynamic context without heap allocation.
+    fn recover_poison(self, context: impl std::fmt::Display) -> T;
 }
 
 impl<T> LockResultExt<T> for Result<T, PoisonError<T>> {
-    fn recover_poison(self, context: &str) -> T {
+    fn recover_poison(self, context: impl std::fmt::Display) -> T {
         match self {
             Ok(guard) => guard,
             Err(poisoned) => {

@@ -23,14 +23,20 @@ impl QueryStore {
     pub fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
         self.highlight_queries
             .write()
-            .recover_poison("QueryStore::insert_highlight_query")
+            .recover_poison(format_args!(
+                "QueryStore::insert_highlight_query({})",
+                lang_name
+            ))
             .insert(lang_name, query);
     }
 
     pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.highlight_queries
             .read()
-            .recover_poison("QueryStore::get_highlight_query")
+            .recover_poison(format_args!(
+                "QueryStore::get_highlight_query({})",
+                lang_name
+            ))
             .get(lang_name)
             .cloned()
     }
@@ -38,7 +44,10 @@ impl QueryStore {
     pub fn has_highlight_query(&self, lang_name: &str) -> bool {
         self.highlight_queries
             .read()
-            .recover_poison("QueryStore::has_highlight_query")
+            .recover_poison(format_args!(
+                "QueryStore::has_highlight_query({})",
+                lang_name
+            ))
             .contains_key(lang_name)
     }
 
@@ -46,14 +55,17 @@ impl QueryStore {
     pub fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
         self.locals_queries
             .write()
-            .recover_poison("QueryStore::insert_locals_query")
+            .recover_poison(format_args!(
+                "QueryStore::insert_locals_query({})",
+                lang_name
+            ))
             .insert(lang_name, query);
     }
 
     pub fn get_locals_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.locals_queries
             .read()
-            .recover_poison("QueryStore::get_locals_query")
+            .recover_poison(format_args!("QueryStore::get_locals_query({})", lang_name))
             .get(lang_name)
             .cloned()
     }
@@ -62,14 +74,20 @@ impl QueryStore {
     pub fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
         self.injection_queries
             .write()
-            .recover_poison("QueryStore::insert_injection_query")
+            .recover_poison(format_args!(
+                "QueryStore::insert_injection_query({})",
+                lang_name
+            ))
             .insert(lang_name, query);
     }
 
     pub fn get_injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.injection_queries
             .read()
-            .recover_poison("QueryStore::get_injection_query")
+            .recover_poison(format_args!(
+                "QueryStore::get_injection_query({})",
+                lang_name
+            ))
             .get(lang_name)
             .cloned()
     }
@@ -78,15 +96,24 @@ impl QueryStore {
     pub fn clear_language(&self, lang_name: &str) {
         self.highlight_queries
             .write()
-            .recover_poison("QueryStore::clear_language(highlight)")
+            .recover_poison(format_args!(
+                "QueryStore::clear_language(highlight, {})",
+                lang_name
+            ))
             .remove(lang_name);
         self.locals_queries
             .write()
-            .recover_poison("QueryStore::clear_language(locals)")
+            .recover_poison(format_args!(
+                "QueryStore::clear_language(locals, {})",
+                lang_name
+            ))
             .remove(lang_name);
         self.injection_queries
             .write()
-            .recover_poison("QueryStore::clear_language(injection)")
+            .recover_poison(format_args!(
+                "QueryStore::clear_language(injection, {})",
+                lang_name
+            ))
             .remove(lang_name);
     }
 
