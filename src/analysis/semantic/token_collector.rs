@@ -7,7 +7,7 @@ use crate::config::CaptureMappings;
 use crate::text::position::byte_to_utf16_col;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
-use super::legend::{CaptureResult, apply_capture_mapping};
+use super::legend::{CaptureResult, resolve_capture};
 
 /// Check whether a node is strictly contained within any exclusion range.
 ///
@@ -346,7 +346,7 @@ pub(super) fn collect_host_tokens(
 
             // Get the mapped capture name early to avoid repeated mapping
             let capture_name = &query.capture_names()[c.index as usize];
-            let kind = match apply_capture_mapping(capture_name, filetype, capture_mappings) {
+            let kind = match resolve_capture(capture_name, filetype, capture_mappings) {
                 CaptureResult::Suppressed => continue,
                 CaptureResult::Mapped(s) => TokenKind::Mapped(s),
                 CaptureResult::Transparent => TokenKind::Transparent,

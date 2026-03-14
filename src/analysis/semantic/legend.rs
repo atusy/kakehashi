@@ -60,10 +60,10 @@ pub(super) enum CaptureResult {
     Suppressed,
 }
 
-/// Apply capture mappings to transform a capture name
+/// Resolve a tree-sitter capture name to its semantic token role.
 ///
-/// Looks up the capture name in the provided mappings and returns the mapped value if found,
-/// or the original capture name if no mapping exists.
+/// Looks up the capture name in user-configured mappings (filetype-specific,
+/// then wildcard), and falls back to the built-in legend.
 ///
 /// # Arguments
 /// * `capture_name` - The original capture name from the tree-sitter query
@@ -75,7 +75,7 @@ pub(super) enum CaptureResult {
 /// - `CaptureResult::Transparent` for unknown types — breakpoint-only tokens
 /// - `CaptureResult::NoneCapture` for `@none` captures — handled by @none pre-processing
 /// - `CaptureResult::Suppressed` when user explicitly maps a capture to `""` (suppress entirely)
-pub(super) fn apply_capture_mapping(
+pub(super) fn resolve_capture(
     capture_name: &str,
     filetype: Option<&str>,
     capture_mappings: Option<&CaptureMappings>,
@@ -182,9 +182,9 @@ mod tests {
     // PBI-152: Wildcard Config Inheritance for captureMappings
 
     #[test]
-    fn apply_capture_mapping_uses_wildcard_merge() {
+    fn resolve_capture_uses_wildcard_merge() {
         // ADR-0011: When both wildcard and specific key exist, merge them
-        // This test verifies that apply_capture_mapping correctly inherits
+        // This test verifies that resolve_capture correctly inherits
         // mappings from wildcard when the specific key doesn't have them
         let mut mappings = CaptureMappings::new();
 
@@ -219,7 +219,7 @@ mod tests {
         );
 
         // Test: "variable" should be inherited from wildcard for "rust"
-        let result = apply_capture_mapping("variable", Some("rust"), Some(&mappings));
+        let result = resolve_capture("variable", Some("rust"), Some(&mappings));
         assert_eq!(
             result,
             CaptureResult::Mapped("variable".to_string()),
@@ -227,7 +227,7 @@ mod tests {
         );
 
         // Test: "type.builtin" should use rust-specific mapping
-        let result = apply_capture_mapping("type.builtin", Some("rust"), Some(&mappings));
+        let result = resolve_capture("type.builtin", Some("rust"), Some(&mappings));
         assert_eq!(
             result,
             CaptureResult::Mapped("type.defaultLibrary".to_string()),
@@ -235,7 +235,7 @@ mod tests {
         );
 
         // Test: "function" should be inherited from wildcard for "rust"
-        let result = apply_capture_mapping("function", Some("rust"), Some(&mappings));
+        let result = resolve_capture("function", Some("rust"), Some(&mappings));
         assert_eq!(
             result,
             CaptureResult::Mapped("function".to_string()),
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_capture_mapping_explicit_empty_string_suppresses() {
+    fn resolve_capture_explicit_empty_string_suppresses() {
         // User maps "variable" → "" in their config — must return Suppressed, not Transparent
         let mut highlights = HashMap::new();
         highlights.insert("variable".to_string(), String::new());
@@ -258,7 +258,7 @@ mod tests {
             },
         );
         assert_eq!(
-            apply_capture_mapping("variable", Some("rust"), Some(&mappings)),
+            resolve_capture("variable", Some("rust"), Some(&mappings)),
             CaptureResult::Suppressed,
         );
     }
@@ -273,11 +273,11 @@ mod tests {
     #[case::known_keyword("keyword", CaptureResult::Mapped("keyword".to_string()))]
     #[case::known_variable_with_modifier("variable.readonly", CaptureResult::Mapped("variable.readonly".to_string()))]
     #[case::none_is_recognized("none", CaptureResult::NoneCapture)]
-    fn apply_capture_mapping_known_and_unknown_types(
+    fn resolve_capture_known_and_unknown_types(
         #[case] capture_name: &str,
         #[case] expected: CaptureResult,
     ) {
-        assert_eq!(apply_capture_mapping(capture_name, None, None), expected);
+        assert_eq!(resolve_capture(capture_name, None, None), expected);
     }
 
     #[rstest]
