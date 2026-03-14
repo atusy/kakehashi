@@ -1698,4 +1698,49 @@ mod tests {
         assert_eq!(result.chars().count(), 8); // 5 chars + "..."
         assert_eq!(result, "abc日本...");
     }
+
+    #[test]
+    fn dynamic_lua_load_from_search_paths() {
+        use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
+
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let search_path = cwd.join("deps/tree-sitter").to_string_lossy().to_string();
+
+        let settings = RawWorkspaceSettings {
+            search_paths: Some(vec![search_path.clone()]),
+            languages: std::collections::HashMap::new(),
+            capture_mappings: std::collections::HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+
+        let workspace_settings = WorkspaceSettings::try_from_settings(&settings, None, |_| None)
+            .expect("test settings should expand without errors");
+        let _summary = coordinator.load_settings(workspace_settings);
+
+        let paths = coordinator.get_search_paths();
+        assert!(
+            paths.is_some(),
+            "Search paths should be set after load_settings"
+        );
+
+        let result = coordinator.ensure_language_loaded("lua");
+
+        assert!(
+            result.success,
+            "Lua should load successfully from {}",
+            search_path
+        );
+
+        assert!(
+            coordinator.has_parser_available("lua"),
+            "Lua should be registered in language registry"
+        );
+        assert!(
+            coordinator.has_queries("lua"),
+            "Lua should have highlight queries"
+        );
+    }
 }

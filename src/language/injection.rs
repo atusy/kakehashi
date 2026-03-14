@@ -2507,4 +2507,55 @@ mod tests {
         let result = intersect_included_ranges(&a, &b);
         assert!(result.is_empty(), "Adjacent ranges should not intersect");
     }
+
+    #[test]
+    fn collects_injected_languages_from_markdown_code_blocks() {
+        use std::collections::HashSet;
+        use tree_sitter::Query;
+
+        let markdown_text = r#"# Example
+
+```lua
+print("Hello from Lua")
+local x = 42
+```
+
+Some text.
+
+```python
+def hello():
+    print("Hello from Python")
+```
+
+```lua
+local y = "duplicate"
+```
+"#;
+
+        let mut parser = Parser::new();
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&md_language).expect("set markdown");
+        let tree = parser.parse(markdown_text, None).expect("parse markdown");
+        let root = tree.root_node();
+
+        let injection_query_str = r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+        "#;
+        let injection_query =
+            Query::new(&md_language, injection_query_str).expect("valid injection query");
+
+        let injections = collect_all_injections(&root, markdown_text, Some(&injection_query))
+            .unwrap_or_default();
+
+        let unique_languages: HashSet<String> =
+            injections.iter().map(|i| i.language.clone()).collect();
+
+        assert_eq!(unique_languages.len(), 2);
+        assert!(unique_languages.contains("lua"));
+        assert!(unique_languages.contains("python"));
+        assert_eq!(injections.len(), 3, "2 lua + 1 python");
+    }
 }
