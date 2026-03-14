@@ -212,6 +212,7 @@ fn transform_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, host_uri: 
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use serde_json::json;
 
@@ -529,23 +530,15 @@ mod tests {
 
     #[test]
     fn diagnostic_request_uses_virtual_uri() {
-        let virtual_uri = VirtualDocumentUri::new(
-            &super::super::test_helpers::test_host_uri(),
-            "lua",
-            "region-0",
-        );
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_diagnostic_request(&virtual_uri, RequestId::new(42), None);
 
-        super::super::test_helpers::assert_uses_virtual_uri(&request, "lua");
+        assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]
     fn diagnostic_request_has_correct_method_and_structure() {
-        let virtual_uri = VirtualDocumentUri::new(
-            &super::super::test_helpers::test_host_uri(),
-            "lua",
-            "region-0",
-        );
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_diagnostic_request(&virtual_uri, RequestId::new(123), None);
 
         let json = serde_json::to_value(&request).unwrap();
@@ -566,11 +559,7 @@ mod tests {
 
     #[test]
     fn diagnostic_request_includes_previous_result_id_when_provided() {
-        let virtual_uri = VirtualDocumentUri::new(
-            &super::super::test_helpers::test_host_uri(),
-            "lua",
-            "region-0",
-        );
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request =
             build_diagnostic_request(&virtual_uri, RequestId::new(123), Some("prev-result-123"));
 
