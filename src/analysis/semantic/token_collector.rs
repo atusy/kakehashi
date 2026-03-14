@@ -493,14 +493,16 @@ mod tests {
 
     // ── is_in_exclusion_range tests ──────────────────────────────────
 
+    fn parse_with_language(text: &str, language: tree_sitter::Language) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
     /// Helper: parse `text` with the given language and return the root node's
     /// first child (or root itself) for exclusion-range testing.
     fn parse_rust_tree(text: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        parser.parse(text, None).unwrap()
+        parse_with_language(text, tree_sitter_rust::LANGUAGE.into())
     }
 
     #[test]
@@ -535,11 +537,8 @@ mod tests {
         // ending at col 1 — shorter than the heading's start_col of 2.
         // The prefix detection must still recognize this as a structural prefix
         // to prevent the heading token from leaking onto the empty `>` line.
-        let mut parser = tree_sitter::Parser::new();
-        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
-        parser.set_language(&language).unwrap();
         let text = "> # foo\n>\n> bar\n>\n";
-        let tree = parser.parse(text, None).unwrap();
+        let tree = parse_with_language(text, tree_sitter_md::LANGUAGE.into());
         // Navigate: document > section > block_quote > section > atx_heading
         let root = tree.root_node();
         let block_quote = root.child(0).unwrap().child(0).unwrap();
