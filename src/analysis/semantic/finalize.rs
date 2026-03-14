@@ -591,6 +591,30 @@ mod tests {
         }
     }
 
+    /// Helper to create a RawToken with all fields explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn make_token_full(
+        line: usize,
+        column: usize,
+        length: usize,
+        name: &str,
+        depth: usize,
+        pattern_index: usize,
+        priority: u32,
+        node_byte_len: usize,
+    ) -> RawToken {
+        RawToken {
+            line,
+            column,
+            length,
+            mapped_name: name.to_string(),
+            depth,
+            pattern_index,
+            priority,
+            node_byte_len,
+        }
+    }
+
     /// Helper to create a RawToken for testing (priority defaults to 100, node_byte_len to 0)
     fn make_token(
         line: usize,
@@ -1418,36 +1442,9 @@ mod tests {
         // Result: string[0,5), number[6,7), string[15,20)
         // The @none intervals [5,6) and [7,15) should be empty (no token)
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 20,
-                mapped_name: "string".to_string(),
-                depth: 0,
-                pattern_index: 25,
-                priority: 100,
-                node_byte_len: 40,
-            },
-            RawToken {
-                line: 0,
-                column: 5,
-                length: 10,
-                mapped_name: "none".to_string(),
-                depth: 0,
-                pattern_index: 1,
-                priority: 100,
-                node_byte_len: 10,
-            },
-            RawToken {
-                line: 0,
-                column: 6,
-                length: 1,
-                mapped_name: "number".to_string(),
-                depth: 0,
-                pattern_index: 20,
-                priority: 100,
-                node_byte_len: 1,
-            },
+            make_token_full(0, 0, 20, "string", 0, 25, 100, 40),
+            make_token_full(0, 5, 10, "none", 0, 1, 100, 10),
+            make_token_full(0, 6, 1, "number", 0, 20, 100, 1),
         ];
         let result = finalize_tokens(tokens, &[], &["12345678901234567890"]);
         let SemanticTokensResult::Tokens(st) = result.expect("should produce tokens") else {
@@ -1486,36 +1483,9 @@ mod tests {
         // Expected: fenced_code_block wins both intervals (smaller nbl at same priority)
         //           → merged into single [0,10) "string" token
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 2,
-                mapped_name: String::new(), // transparent
-                depth: 0,
-                pattern_index: 50,
-                priority: 100,
-                node_byte_len: 3,
-            },
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "string".to_string(), // fenced_code_block
-                depth: 0,
-                pattern_index: 47,
-                priority: 90,
-                node_byte_len: 50,
-            },
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "keyword".to_string(), // block_quote
-                depth: 0,
-                pattern_index: 107,
-                priority: 90,
-                node_byte_len: 200,
-            },
+            make_token_full(0, 0, 2, "", 0, 50, 100, 3), // transparent
+            make_token_full(0, 0, 10, "string", 0, 47, 90, 50), // fenced_code_block
+            make_token_full(0, 0, 10, "keyword", 0, 107, 90, 200), // block_quote
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -1530,26 +1500,8 @@ mod tests {
         // When ALL tokens covering an interval are transparent,
         // no token is emitted for that interval.
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 5,
-                mapped_name: String::new(), // transparent
-                depth: 0,
-                pattern_index: 10,
-                priority: 100,
-                node_byte_len: 5,
-            },
-            RawToken {
-                line: 0,
-                column: 5,
-                length: 5,
-                mapped_name: "keyword".to_string(), // visible
-                depth: 0,
-                pattern_index: 10,
-                priority: 100,
-                node_byte_len: 5,
-            },
+            make_token_full(0, 0, 5, "", 0, 10, 100, 5), // transparent
+            make_token_full(0, 5, 5, "keyword", 0, 10, 100, 5), // visible
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
@@ -1565,26 +1517,8 @@ mod tests {
         // The smaller node (fenced_code_block, nbl=50) should win over the larger node
         // (block_quote, nbl=200) because it's more specific.
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "keyword".to_string(), // block_quote → markup.quote
-                depth: 0,
-                pattern_index: 107, // later in query file
-                priority: 90,
-                node_byte_len: 200, // larger node
-            },
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "string".to_string(), // fenced_code_block → markup.raw.block
-                depth: 0,
-                pattern_index: 47, // earlier in query file
-                priority: 90,
-                node_byte_len: 50, // smaller, more specific node
-            },
+            make_token_full(0, 0, 10, "keyword", 0, 107, 90, 200), // block_quote → markup.quote (larger node)
+            make_token_full(0, 0, 10, "string", 0, 47, 90, 50), // fenced_code_block → markup.raw.block (smaller node)
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
