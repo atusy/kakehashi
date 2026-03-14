@@ -202,7 +202,7 @@ The sweep line operates **per-line**. Before running the sweep line, `finalize_t
 ### Negative
 
 - **O(n*b) sweep line complexity**: For each line, the algorithm iterates all tokens on that line for each breakpoint interval. With many overlapping tokens on a single line, this could be slow. In practice, typical lines have fewer than 10 tokens, so this is not a concern.
-- **Additional memory for `node_depth`**: Each `RawToken` carries a `node_depth` field (one `usize`), increasing per-token memory. The cost is negligible relative to the `mapped_name: String` already present.
+- **Additional memory for `node_depth`**: Each `RawToken` carries a `node_depth` field (one `usize`), increasing per-token memory. The cost is negligible relative to the `kind: TokenKind` already present.
 - **Multiline splitting is basic**: `split_multiline_tokens` decomposes multiline tokens into per-line fragments, which is sufficient for overlap resolution. More advanced heuristics (e.g., cross-line fragment merging) are deferred.
 - **Adjacent fragment merging adds a post-processing pass**: After splitting, adjacent fragments with the same type are merged. This is an O(n) pass on the already-split tokens.
 
