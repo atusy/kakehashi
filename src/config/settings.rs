@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -9,7 +10,7 @@ pub type CaptureMapping = HashMap<String, String>;
 /// Determines the project structure created in the temp directory:
 /// - Cargo: Creates Cargo.toml and src/main.rs (for rust-analyzer)
 /// - Generic: Creates only a virtual.<ext> file (for language servers that don't need project structure)
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceType {
     /// Cargo workspace with Cargo.toml and src/main.rs
@@ -24,9 +25,9 @@ pub enum WorkspaceType {
 ///   This is the default for most LSP methods.
 /// - `Concatenated`: Collect and merge responses from all servers.
 ///   This is the default for `textDocument/diagnostic`.
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum AggregationStrategy {
+pub enum AggregationStrategy {
     Preferred,
     Concatenated,
 }
@@ -37,18 +38,17 @@ pub(crate) enum AggregationStrategy {
 /// specific LSP method. The `priorities` list determines server preference
 /// order — the first server in the list that returns a non-empty result wins.
 /// Empty priorities degrades to first-win (arrival-order) behavior.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
-pub(crate) struct AggregationConfig {
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
+pub struct AggregationConfig {
     /// Server names in priority order (highest first). Empty = pure first-win behavior.
     #[serde(default)]
-    pub(crate) priorities: Vec<String>,
-    /// Aggregation strategy override. `None` = use handler default.
+    pub priorities: Vec<String>,
+    /// Aggregation strategy override. Omit to use the handler default.
     #[serde(default)]
-    pub(crate) strategy: Option<AggregationStrategy>,
-    /// Maximum number of servers to fan out to. `None` = no limit.
-    /// `Some(0)` disables fan-out. Negative values are treated as no limit.
+    pub strategy: Option<AggregationStrategy>,
+    /// Maximum number of servers to fan out to. Omit for no limit. Set to `0` to disable fan-out. Negative values are treated as no limit.
     #[serde(default, rename = "maxFanOut")]
-    pub(crate) max_fan_out: Option<i64>,
+    pub max_fan_out: Option<i64>,
 }
 
 /// Configuration for a single bridged language within a host filetype.
@@ -57,15 +57,14 @@ pub(crate) struct AggregationConfig {
 /// should be bridged and how results are aggregated.
 /// Example: `{ python = { enabled = true, aggregation = { "_" = { priorities = ["pyright"] } } } }`.
 ///
-/// All fields are `Option` to support wildcard inheritance (ADR-0011):
-/// `None` means "inherit from wildcard `_` key".
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq, Default)]
+/// Omitted fields inherit from the wildcard `_` entry (see ADR-0011).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
 pub struct BridgeLanguageConfig {
     /// Whether bridging is enabled for this language.
-    /// `None` = inherit from wildcard (defaults to `true`).
-    pub(crate) enabled: Option<bool>,
+    /// Omit to inherit from wildcard (defaults to true).
+    pub enabled: Option<bool>,
     /// Per-method aggregation config. Key = LSP method name or "_" for default.
-    pub(crate) aggregation: Option<HashMap<String, AggregationConfig>>,
+    pub aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 
 impl BridgeLanguageConfig {
@@ -119,7 +118,7 @@ impl BridgeLanguageConfig {
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
 /// that kakehashi can redirect requests to for injection regions.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"]
@@ -134,12 +133,16 @@ pub struct BridgeServerConfig {
     pub workspace_type: Option<WorkspaceType>,
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize, Default, PartialEq, Eq)]
+/// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema)]
 pub struct QueryTypeMappings {
+    /// Capture mappings for highlights queries.
     #[serde(default)]
     pub highlights: CaptureMapping,
+    /// Capture mappings for locals queries.
     #[serde(default)]
     pub locals: CaptureMapping,
+    /// Capture mappings for folds queries.
     #[serde(default)]
     pub folds: CaptureMapping,
 }
@@ -150,7 +153,7 @@ pub type CaptureMappings = HashMap<String, QueryTypeMappings>;
 ///
 /// Used in the unified `queries` field to specify what kind of query a file contains.
 /// When not specified, the kind is inferred from the filename pattern.
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QueryKind {
     /// Syntax highlighting queries
@@ -165,7 +168,7 @@ pub enum QueryKind {
 ///
 /// Used in the unified `queries` array to specify query files with optional type.
 /// Example: `{ path = "./highlights.scm", kind = "highlights" }`
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct QueryItem {
     /// Path to the query file (required)
     pub path: String,
@@ -201,15 +204,18 @@ pub fn infer_query_kind(path: &str) -> Option<QueryKind> {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 pub struct RawWorkspaceSettings {
-    // Editor-agnostic name exposed to JSON as `searchPaths`.
+    /// Directories to search for Tree-sitter parser libraries and query files.
     #[serde(rename = "searchPaths")]
     pub search_paths: Option<Vec<String>>,
+    /// Per-language configuration (parser paths, queries, bridge filters, aliases).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
+    /// Custom mappings from Tree-sitter capture names to semantic token types.
     #[serde(rename = "captureMappings", default)]
     pub capture_mappings: CaptureMappings,
+    /// Whether to automatically install missing parsers and queries.
     #[serde(rename = "autoInstall")]
     pub auto_install: Option<bool>,
     /// Language servers for bridging LSP requests to injection regions.
@@ -218,22 +224,22 @@ pub struct RawWorkspaceSettings {
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
 }
 
-// Domain types - internal representations used throughout the application
+/// Generate JSON Schema for the workspace configuration.
+pub fn json_schema() -> schemars::Schema {
+    schemars::schema_for!(RawWorkspaceSettings)
+}
 
-/// Per-language Tree-sitter language configuration surfaced to the domain.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+// Domain types - used throughout the application and also exposed in JSON Schema
+// via RawWorkspaceSettings.
+
+/// Per-language Tree-sitter configuration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct LanguageSettings {
     /// Path to the parser library (.so/.dylib/.dll)
     pub parser: Option<String>,
-    /// Unified query file configuration
-    /// - None: Not specified (inherit from wildcard/defaults)
-    /// - Some([]): Explicitly empty (override wildcard with no queries)
-    /// - Some([...]): Specified queries
+    /// Omit to inherit from wildcard/defaults. Use an empty array `[]` to explicitly clear queries.
     pub queries: Option<Vec<QueryItem>>,
-    /// Languages to bridge for this host filetype (map format).
-    /// - None (omitted): Bridge ALL configured languages (default behavior)
-    /// - Some({}): Bridge NOTHING (disable bridging for this host)
-    /// - Some({ python: { enabled: true } }): Bridge only enabled languages
+    /// Omit to bridge all configured languages (default). Use an empty object `{}` to disable bridging. Use `{ "python": { "enabled": true } }` to bridge specific languages.
     pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
     /// Alternative languageId values that should use this parser.
     /// E.g., `aliases = ["rmd", "qmd"]` for markdown allows editors sending
@@ -291,6 +297,59 @@ mod tests {
     use super::*;
     use crate::config::WILDCARD_KEY;
     use rstest::rstest;
+
+    #[test]
+    fn test_json_schema_generation() {
+        let schema = schemars::schema_for!(RawWorkspaceSettings);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Top-level properties should use camelCase (from serde renames)
+        let props = value.get("properties").expect("should have properties");
+        assert!(props.get("searchPaths").is_some(), "missing searchPaths");
+        assert!(props.get("autoInstall").is_some(), "missing autoInstall");
+        assert!(
+            props.get("captureMappings").is_some(),
+            "missing captureMappings"
+        );
+        assert!(
+            props.get("languageServers").is_some(),
+            "missing languageServers"
+        );
+
+        // snake_case variants must NOT appear
+        assert!(
+            props.get("search_paths").is_none(),
+            "snake_case leak: search_paths"
+        );
+        assert!(
+            props.get("auto_install").is_none(),
+            "snake_case leak: auto_install"
+        );
+        assert!(
+            props.get("capture_mappings").is_none(),
+            "snake_case leak: capture_mappings"
+        );
+        assert!(
+            props.get("language_servers").is_none(),
+            "snake_case leak: language_servers"
+        );
+
+        // $defs should contain key referenced types
+        let defs = value.get("$defs").expect("should have $defs");
+        for expected in [
+            "LanguageSettings",
+            "BridgeServerConfig",
+            "BridgeLanguageConfig",
+            "QueryItem",
+            "AggregationConfig",
+        ] {
+            assert!(
+                defs.get(expected).is_some(),
+                "missing $defs entry: {expected}"
+            );
+        }
+    }
 
     #[test]
     fn should_distinguish_between_unspecified_and_empty_queries() {

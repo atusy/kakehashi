@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use kakehashi::install::{default_data_dir, metadata, parser, queries};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 /// A Language Server Protocol (LSP) server using Tree-sitter for parsing
 #[derive(Parser)]
@@ -98,9 +99,22 @@ enum ConfigAction {
         #[arg(long)]
         force: bool,
     },
+    /// Generate JSON Schema for the configuration format
+    ///
+    /// By default, outputs to stdout for piping or redirection.
+    /// Use --output to write directly to a file.
+    Schema {
+        /// Write to specified file instead of stdout. Use "-" for explicit stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Overwrite existing file (only applies with --output)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
-fn main() {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Set data directory override so default_data_dir() and config expansion
@@ -113,45 +127,42 @@ fn main() {
         kakehashi::config::set_config_file_override(cli.config_file);
     }
 
-    match cli.command {
+    let result = match cli.command {
         Some(Commands::Language { action }) => match action {
             LanguageAction::Install {
                 language,
                 force,
                 verbose,
                 no_cache,
-            } => {
-                run_install(&language, force, verbose, no_cache);
-            }
-            LanguageAction::List { no_cache } => {
-                run_list_languages(no_cache);
-            }
-            LanguageAction::Status { verbose } => {
-                run_language_status(verbose);
-            }
+            } => run_install(&language, force, verbose, no_cache),
+            LanguageAction::List { no_cache } => run_list_languages(no_cache),
+            LanguageAction::Status { verbose } => run_language_status(verbose),
             LanguageAction::Uninstall {
                 language,
                 force,
                 all,
-            } => {
-                run_language_uninstall(language, force, all);
-            }
+            } => run_language_uninstall(language, force, all),
         },
         Some(Commands::Config { action }) => match action {
-            ConfigAction::Init { output, force } => {
-                run_config_init(output, force);
-            }
+            ConfigAction::Init { output, force } => run_config_init(output, force),
+            ConfigAction::Schema { output, force } => run_config_schema(output, force),
         },
         None => {
             // Start LSP server (backward compatible default behavior)
             // Only create tokio runtime for LSP mode to avoid conflicts with reqwest::blocking
             run_lsp_server();
+            Ok(())
         }
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
     }
 }
 
 /// Run the list-languages command
-fn run_list_languages(no_cache: bool) {
+fn run_list_languages(no_cache: bool) -> Result<(), ExitCode> {
     let data_dir = default_data_dir();
     let options = metadata::FetchOptions {
         data_dir: data_dir.as_deref(),
@@ -170,10 +181,11 @@ fn run_list_languages(no_cache: bool) {
             for lang in languages {
                 println!("  {}", lang);
             }
+            Ok(())
         }
         Err(e) => {
             eprintln!("Failed to fetch language list: {}", e);
-            std::process::exit(1);
+            Err(ExitCode::FAILURE)
         }
     }
 }
@@ -183,14 +195,14 @@ const DOC_LINK: &str =
     "# Documentation: https://github.com/atusy/kakehashi/blob/main/docs/README.md\n";
 
 /// Run the language status command
-fn run_language_status(verbose: bool) {
+fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     use std::collections::BTreeSet;
     use std::fs;
 
-    let data_dir = default_data_dir().unwrap_or_else(|| {
+    let data_dir = default_data_dir().ok_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
-        std::process::exit(1);
-    });
+        ExitCode::FAILURE
+    })?;
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
@@ -227,7 +239,7 @@ fn run_language_status(verbose: bool) {
     if languages.is_empty() {
         eprintln!("No languages installed in {}", data_dir.display());
         eprintln!("Use 'kakehashi language install <language>' to install one.");
-        return;
+        return Ok(());
     }
 
     eprintln!("Installed languages (data dir: {}):", data_dir.display());
@@ -262,18 +274,24 @@ fn run_language_status(verbose: bool) {
             }
         }
     }
+
+    Ok(())
 }
 
 /// Run the language uninstall command
-fn run_language_uninstall(language: Option<String>, force: bool, all: bool) {
+fn run_language_uninstall(
+    language: Option<String>,
+    force: bool,
+    all: bool,
+) -> Result<(), ExitCode> {
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{self, Write};
 
-    let data_dir = default_data_dir().unwrap_or_else(|| {
+    let data_dir = default_data_dir().ok_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
-        std::process::exit(1);
-    });
+        ExitCode::FAILURE
+    })?;
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
@@ -314,7 +332,7 @@ fn run_language_uninstall(language: Option<String>, force: bool, all: bool) {
 
     if languages_to_uninstall.is_empty() {
         eprintln!("No languages installed to uninstall.");
-        return;
+        return Ok(());
     }
 
     // Confirmation prompt unless --force
@@ -332,7 +350,7 @@ fn run_language_uninstall(language: Option<String>, force: bool, all: bool) {
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
             eprintln!("Cancelled.");
-            std::process::exit(0);
+            return Ok(());
         }
     }
 
@@ -386,6 +404,8 @@ fn run_language_uninstall(language: Option<String>, force: bool, all: bool) {
             eprintln!("\nUninstalled '{}'.", languages_to_uninstall[0]);
         }
     }
+
+    Ok(())
 }
 
 /// Find the parser file for a language.
@@ -394,62 +414,79 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
     if path.exists() { Some(path) } else { None }
 }
 
-/// Run the config init command
-fn run_config_init(output: Option<PathBuf>, force: bool) {
-    use kakehashi::config::defaults::default_settings;
-
+/// Write content to stdout or a file, with --force / --output semantics.
+fn write_content_to_output(
+    content: &str,
+    output: Option<PathBuf>,
+    force: bool,
+    label: &str,
+) -> Result<(), ExitCode> {
     // Check for --force without --output (warn but continue)
     if force && output.is_none() {
         eprintln!("Warning: --force has no effect without --output");
     }
 
-    // Generate config from typed defaults
+    if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
+        if path.exists() && !force {
+            eprintln!(
+                "Error: File '{}' already exists. Use --force to overwrite.",
+                path.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+
+        match std::fs::write(path, content) {
+            Ok(()) => {
+                eprintln!("Created {label} file: {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("Failed to write {label} file: {}", e);
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        print!("{}", content);
+    }
+
+    Ok(())
+}
+
+/// Run the config init command
+fn run_config_init(output: Option<PathBuf>, force: bool) -> Result<(), ExitCode> {
+    use kakehashi::config::defaults::default_settings;
+
     let settings = default_settings();
-    let config_toml = toml::to_string_pretty(&settings).unwrap_or_else(|e| {
+    let config_toml = toml::to_string_pretty(&settings).map_err(|e| {
         eprintln!("Failed to serialize configuration: {}", e);
-        std::process::exit(1);
-    });
+        ExitCode::FAILURE
+    })?;
 
     // Prepend documentation link
-    let config_with_doc = format!("{}\n{}", DOC_LINK, config_toml);
+    let content = format!("{}\n{}", DOC_LINK, config_toml);
 
-    match output {
-        // No output specified or explicit "-" means stdout
-        None => {
-            print!("{}", config_with_doc);
-        }
-        Some(path) if path.as_os_str() == "-" => {
-            print!("{}", config_with_doc);
-        }
-        // Write to specified file
-        Some(path) => {
-            if path.exists() && !force {
-                eprintln!(
-                    "Error: File '{}' already exists. Use --force to overwrite.",
-                    path.display()
-                );
-                std::process::exit(1);
-            }
+    write_content_to_output(&content, output, force, "configuration")
+}
 
-            match std::fs::write(&path, &config_with_doc) {
-                Ok(()) => {
-                    eprintln!("Created configuration file: {}", path.display());
-                }
-                Err(e) => {
-                    eprintln!("Failed to write configuration file: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
+/// Run the config schema command
+fn run_config_schema(output: Option<PathBuf>, force: bool) -> Result<(), ExitCode> {
+    use kakehashi::config::json_schema;
+
+    let schema = json_schema();
+    let schema_json = serde_json::to_string_pretty(&schema).map_err(|e| {
+        eprintln!("Failed to serialize schema: {}", e);
+        ExitCode::FAILURE
+    })?;
+    let content = format!("{}\n", schema_json);
+
+    write_content_to_output(&content, output, force, "schema")
 }
 
 /// Run the install command (synchronous - no tokio runtime)
-fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) {
-    let data_dir = default_data_dir().unwrap_or_else(|| {
+fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Result<(), ExitCode> {
+    let data_dir = default_data_dir().ok_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
-        std::process::exit(1);
-    });
+        ExitCode::FAILURE
+    })?;
 
     // Track success/failure for exit code
     let mut parser_success = true;
@@ -497,12 +534,13 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) {
     // Summary
     if parser_success && queries_success {
         eprintln!("\nSuccessfully installed '{}' language support.", language);
+        Ok(())
     } else if !parser_success && !queries_success {
         eprintln!("\nFailed to install '{}' language support.", language);
-        std::process::exit(1);
+        Err(ExitCode::FAILURE)
     } else {
         eprintln!("\nPartially installed '{}' language support.", language);
-        std::process::exit(1);
+        Err(ExitCode::FAILURE)
     }
 }
 
