@@ -94,10 +94,10 @@ pub fn convert_utf16_to_byte_in_line(line_text: &str, utf16_pos: usize) -> Optio
 
 /// Convert byte column position to UTF-16 column position within a line.
 ///
-/// If the byte position is in the middle of a multi-byte character, walks back
-/// to the nearest valid byte boundary and returns that UTF-16 column instead.
-/// This can occur when tree-sitter byte offsets from injection coordinate
-/// mapping land inside a multi-byte character boundary.
+/// If the byte position is invalid (mid-character or past end of line), walks
+/// back to the nearest valid byte boundary and returns that UTF-16 column
+/// instead. This can occur when tree-sitter byte offsets from injection
+/// coordinate mapping land inside a multi-byte character boundary.
 #[inline]
 pub(crate) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
     convert_byte_to_utf16_in_line(line, byte_col).unwrap_or_else(|| {
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(byte_to_utf16_col(line, 8), 8); // Before '"'
         assert_eq!(byte_to_utf16_col(line, 9), 9); // Before "あ"
         assert_eq!(byte_to_utf16_col(line, 12), 10); // After "あ" (3 bytes -> 1 UTF-16)
-        assert_eq!(byte_to_utf16_col(line, 24), 14); // After "あいうえお\"" (15 bytes + 1 quote)
+        assert_eq!(byte_to_utf16_col(line, 24), 14); // At closing '"' (after "あいうえお")
     }
 
     #[test]
