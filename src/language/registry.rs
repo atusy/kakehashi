@@ -1,4 +1,3 @@
-use crate::error::LspResult;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tree_sitter::Language;
@@ -23,14 +22,8 @@ impl LanguageRegistry {
     }
 
     /// Register a language with the given ID
-    pub fn register(&self, language_id: String, language: Language) -> LspResult<()> {
+    pub fn register(&self, language_id: String, language: Language) {
         self.languages.insert(language_id, language);
-        Ok(())
-    }
-
-    /// Register a language with the given ID (compatibility version)
-    pub fn register_unchecked(&self, language_id: String, language: Language) {
-        let _ = self.register(language_id, language);
     }
 
     /// Get a language by ID
@@ -59,7 +52,7 @@ mod tests {
     #[test]
     fn test_contains_when_loaded() {
         let registry = LanguageRegistry::new();
-        registry.register_unchecked("rust".to_string(), dummy_language());
+        registry.register("rust".to_string(), dummy_language());
 
         assert!(registry.contains("rust"));
     }

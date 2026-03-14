@@ -17,7 +17,7 @@ fn test_registry_recovers_from_poisoned_lock() {
     // Spawn a thread that will panic and poison the lock
     let handle = thread::spawn(move || {
         // This will panic inside the lock, poisoning it
-        registry_clone.register_unchecked("panic_lang".to_string(), {
+        registry_clone.register("panic_lang".to_string(), {
             // Create a dummy language that will cause issues
             panic!("Intentional panic to poison the lock");
             #[allow(unreachable_code)]
@@ -174,7 +174,7 @@ fn test_concurrent_access_after_poison_recovery() {
     // First poison the lock
     let registry_panic = registry.clone();
     let panic_handle = thread::spawn(move || {
-        registry_panic.register_unchecked("panic".to_string(), tree_sitter_rust::LANGUAGE.into());
+        registry_panic.register("panic".to_string(), tree_sitter_rust::LANGUAGE.into());
         panic!("Poison the lock");
     });
     let _ = panic_handle.join();
@@ -186,7 +186,7 @@ fn test_concurrent_access_after_poison_recovery() {
         let handle = thread::spawn(move || {
             // Each thread should recover from poison and work
             let lang_id = format!("lang_{}", i);
-            reg.register_unchecked(lang_id.clone(), tree_sitter_rust::LANGUAGE.into());
+            reg.register(lang_id.clone(), tree_sitter_rust::LANGUAGE.into());
 
             // Verify it was registered
             assert!(

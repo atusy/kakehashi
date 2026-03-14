@@ -615,7 +615,7 @@ mod tests {
 
     fn create_test_registry() -> LanguageRegistry {
         let registry = LanguageRegistry::new();
-        registry.register_unchecked("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        registry.register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
         registry
     }
 

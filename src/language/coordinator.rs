@@ -204,7 +204,7 @@ impl LanguageCoordinator {
         };
 
         self.language_registry
-            .register_unchecked(language_id.to_string(), language.clone());
+            .register(language_id.to_string(), language.clone());
 
         let mut events = Vec::new();
 
@@ -756,7 +756,7 @@ impl LanguageCoordinator {
         };
 
         self.language_registry
-            .register_unchecked(lang_name.to_string(), language.clone());
+            .register(lang_name.to_string(), language.clone());
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
         events.push(LanguageEvent::log(
@@ -912,7 +912,7 @@ impl LanguageCoordinator {
         language: tree_sitter::Language,
     ) {
         self.language_registry
-            .register_unchecked(language_id.to_string(), language);
+            .register(language_id.to_string(), language);
     }
 
     /// Register an injection query directly for testing purposes.
