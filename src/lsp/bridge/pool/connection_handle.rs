@@ -19,7 +19,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use log::warn;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
@@ -30,6 +29,7 @@ use tower_lsp_server::ls_types::{
 use super::connection_action::BridgeError;
 use super::dynamic_capability_registry::DynamicCapabilityRegistry;
 use super::{ConnectionState, UpstreamId};
+use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::{
     OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ReaderTaskHandle, ResponseRouter, WriterTaskHandle,
 };
@@ -361,16 +361,7 @@ impl ConnectionHandle {
     /// Uses std::sync::RwLock for fast, non-blocking read access.
     /// Recovers from poisoned locks with logging per project convention.
     pub(crate) fn state(&self) -> ConnectionState {
-        match self.state.read() {
-            Ok(guard) => *guard,
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned state lock in ConnectionHandle::state()"
-                );
-                *poisoned.into_inner()
-            }
-        }
+        *self.state.read().recover_poison("ConnectionHandle::state")
     }
 
     /// Wait for the connection to reach Ready state with timeout.
@@ -434,16 +425,10 @@ impl ConnectionHandle {
     /// Recovers from poisoned locks with logging per project convention.
     /// Also notifies all watchers of the state change via the watch channel.
     pub(super) fn set_state(&self, new_state: ConnectionState) {
-        match self.state.write() {
-            Ok(mut guard) => *guard = new_state,
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned state lock in ConnectionHandle::set_state()"
-                );
-                *poisoned.into_inner() = new_state;
-            }
-        }
+        *self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::set_state") = new_state;
         // Notify watchers of state change. send_replace() is non-blocking and
         // always succeeds (it replaces the current value regardless of receivers).
         self.state_watch.send_replace(new_state);
