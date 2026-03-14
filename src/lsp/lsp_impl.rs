@@ -135,27 +135,7 @@ impl std::fmt::Debug for Kakehashi {
 
 impl Kakehashi {
     pub fn new(client: Client) -> Self {
-        let language = std::sync::Arc::new(LanguageCoordinator::new());
-        let parser_pool = language.create_document_parser_pool();
-
-        // Initialize auto-install manager with crash detection
-        let failed_parsers = AutoInstallManager::init_failed_parser_registry();
-        let auto_install = AutoInstallManager::new(InstallingLanguages::new(), failed_parsers);
-
-        Self {
-            client,
-            language,
-            parser_pool: Mutex::new(parser_pool),
-            documents: DocumentStore::new(),
-            cache: CacheCoordinator::new(),
-            settings_manager: SettingsManager::new(),
-            auto_install,
-            bridge: BridgeCoordinator::new(),
-            synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
-            debounced_diagnostics: DebouncedDiagnosticsManager::new(),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
-        }
+        Self::build(client, BridgeCoordinator::new())
     }
 
     /// Create a Kakehashi instance with an externally-provided pool and cancel forwarder.
@@ -170,6 +150,13 @@ impl Kakehashi {
         pool: std::sync::Arc<super::bridge::LanguageServerPool>,
         cancel_forwarder: super::request_id::CancelForwarder,
     ) -> Self {
+        Self::build(
+            client,
+            BridgeCoordinator::with_cancel_forwarder(pool, cancel_forwarder),
+        )
+    }
+
+    fn build(client: Client, bridge: BridgeCoordinator) -> Self {
         let language = std::sync::Arc::new(LanguageCoordinator::new());
         let parser_pool = language.create_document_parser_pool();
 
@@ -185,7 +172,7 @@ impl Kakehashi {
             cache: CacheCoordinator::new(),
             settings_manager: SettingsManager::new(),
             auto_install,
-            bridge: BridgeCoordinator::with_cancel_forwarder(pool, cancel_forwarder),
+            bridge,
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             debounced_diagnostics: DebouncedDiagnosticsManager::new(),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
