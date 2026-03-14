@@ -29,15 +29,19 @@ pub(in crate::lsp::bridge) const TEST_ULID_PYTHON_0: &str = "01JPMQ8ZYYQA1W3AVPW
 /// if !lua_ls_available() { return; }
 /// ```
 pub(in crate::lsp::bridge) fn lua_ls_available() -> bool {
-    if std::process::Command::new("lua-language-server")
+    match std::process::Command::new("lua-language-server")
         .arg("--version")
         .output()
-        .is_err()
     {
-        eprintln!("Skipping test: lua-language-server not found");
-        false
-    } else {
-        true
+        Ok(output) if output.status.success() => true,
+        Ok(_) => {
+            eprintln!("Skipping test: lua-language-server exited unsuccessfully");
+            false
+        }
+        Err(_) => {
+            eprintln!("Skipping test: lua-language-server not found");
+            false
+        }
     }
 }
 

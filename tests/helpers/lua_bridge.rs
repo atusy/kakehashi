@@ -10,21 +10,22 @@
 use super::lsp_client::LspClient;
 use serde_json::json;
 
-/// Check if lua-language-server is available in PATH.
+/// Check if lua-language-server is available and working.
 ///
 /// # Returns
-/// `true` if lua-language-server can be executed, `false` otherwise.
+/// `true` if `lua-language-server --version` runs successfully, `false` otherwise.
 pub fn is_lua_ls_available() -> bool {
     std::process::Command::new("lua-language-server")
         .arg("--version")
         .output()
-        .is_ok()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Print skip message and return early guard for tests requiring lua-ls.
 ///
 /// # Returns
-/// `true` if lua-ls is NOT available (test should skip), `false` if available (test can run).
+/// `true` if lua-ls is not available or not working (test should skip), `false` if available (test can run).
 ///
 /// # Example
 /// ```
@@ -35,7 +36,7 @@ pub fn is_lua_ls_available() -> bool {
 /// ```
 pub fn skip_if_lua_ls_unavailable() -> bool {
     if !is_lua_ls_available() {
-        eprintln!("SKIP: lua-language-server not found in PATH");
+        eprintln!("SKIP: lua-language-server is not available or failed to run successfully");
         eprintln!("Install lua-language-server to run this test:");
         eprintln!("  brew install lua-language-server");
         true
