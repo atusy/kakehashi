@@ -1,4 +1,4 @@
-use log::warn;
+use crate::error::LockResultExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tree_sitter::Query;
@@ -21,190 +21,116 @@ impl QueryStore {
 
     // ========== Highlight Queries ==========
     pub fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
-        match self.highlight_queries.write() {
-            Ok(mut queries) => {
-                queries.insert(lang_name, query);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::insert_highlight_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().insert(lang_name, query);
-            }
-        }
+        self.highlight_queries
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::insert_highlight_query({})",
+                lang_name
+            ))
+            .insert(lang_name, query);
     }
 
     pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
-        match self.highlight_queries.read() {
-            Ok(queries) => queries.get(lang_name).cloned(),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::get_highlight_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().get(lang_name).cloned()
-            }
-        }
+        self.highlight_queries
+            .read()
+            .recover_poison(format_args!(
+                "QueryStore::get_highlight_query({})",
+                lang_name
+            ))
+            .get(lang_name)
+            .cloned()
     }
 
     pub fn has_highlight_query(&self, lang_name: &str) -> bool {
-        match self.highlight_queries.read() {
-            Ok(queries) => queries.contains_key(lang_name),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::has_highlight_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().contains_key(lang_name)
-            }
-        }
+        self.highlight_queries
+            .read()
+            .recover_poison(format_args!(
+                "QueryStore::has_highlight_query({})",
+                lang_name
+            ))
+            .contains_key(lang_name)
     }
 
     // ========== Locals Queries ==========
     pub fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
-        match self.locals_queries.write() {
-            Ok(mut queries) => {
-                queries.insert(lang_name, query);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::insert_locals_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().insert(lang_name, query);
-            }
-        }
+        self.locals_queries
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::insert_locals_query({})",
+                lang_name
+            ))
+            .insert(lang_name, query);
     }
 
     pub fn get_locals_query(&self, lang_name: &str) -> Option<Arc<Query>> {
-        match self.locals_queries.read() {
-            Ok(queries) => queries.get(lang_name).cloned(),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::get_locals_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().get(lang_name).cloned()
-            }
-        }
+        self.locals_queries
+            .read()
+            .recover_poison(format_args!("QueryStore::get_locals_query({})", lang_name))
+            .get(lang_name)
+            .cloned()
     }
 
     // ========== Injection Queries ==========
     pub fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
-        match self.injection_queries.write() {
-            Ok(mut queries) => {
-                queries.insert(lang_name, query);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::insert_injection_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().insert(lang_name, query);
-            }
-        }
+        self.injection_queries
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::insert_injection_query({})",
+                lang_name
+            ))
+            .insert(lang_name, query);
     }
 
     pub fn get_injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
-        match self.injection_queries.read() {
-            Ok(queries) => queries.get(lang_name).cloned(),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::get_injection_query for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().get(lang_name).cloned()
-            }
-        }
+        self.injection_queries
+            .read()
+            .recover_poison(format_args!(
+                "QueryStore::get_injection_query({})",
+                lang_name
+            ))
+            .get(lang_name)
+            .cloned()
     }
 
     /// Clear all queries for a specific language
     pub fn clear_language(&self, lang_name: &str) {
-        match self.highlight_queries.write() {
-            Ok(mut queries) => {
-                queries.remove(lang_name);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::clear_language (highlight) for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().remove(lang_name);
-            }
-        }
-
-        match self.locals_queries.write() {
-            Ok(mut queries) => {
-                queries.remove(lang_name);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::clear_language (locals) for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().remove(lang_name);
-            }
-        }
-
-        match self.injection_queries.write() {
-            Ok(mut queries) => {
-                queries.remove(lang_name);
-            }
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::clear_language (injection) for language: {}",
-                    lang_name
-                );
-                poisoned.into_inner().remove(lang_name);
-            }
-        }
+        self.highlight_queries
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::clear_language(highlight, {})",
+                lang_name
+            ))
+            .remove(lang_name);
+        self.locals_queries
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::clear_language(locals, {})",
+                lang_name
+            ))
+            .remove(lang_name);
+        self.injection_queries
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::clear_language(injection, {})",
+                lang_name
+            ))
+            .remove(lang_name);
     }
 
     /// Clear all queries
     pub fn clear_all(&self) {
-        match self.highlight_queries.write() {
-            Ok(mut queries) => queries.clear(),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::clear_all (highlight)"
-                );
-                poisoned.into_inner().clear();
-            }
-        }
-
-        match self.locals_queries.write() {
-            Ok(mut queries) => queries.clear(),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::clear_all (locals)"
-                );
-                poisoned.into_inner().clear();
-            }
-        }
-
-        match self.injection_queries.write() {
-            Ok(mut queries) => queries.clear(),
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in query_store::clear_all (injection)"
-                );
-                poisoned.into_inner().clear();
-            }
-        }
+        self.highlight_queries
+            .write()
+            .recover_poison("QueryStore::clear_all(highlight)")
+            .clear();
+        self.locals_queries
+            .write()
+            .recover_poison("QueryStore::clear_all(locals)")
+            .clear();
+        self.injection_queries
+            .write()
+            .recover_poison("QueryStore::clear_all(injection)")
+            .clear();
     }
 }
 

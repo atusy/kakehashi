@@ -46,7 +46,6 @@ impl<T: Eq + Hash + Clone> InProgressSet<T> {
         self.items
             .lock()
             .recover_poison("InProgressSet::try_start")
-            .unwrap()
             .insert(item.clone())
     }
 
@@ -55,7 +54,6 @@ impl<T: Eq + Hash + Clone> InProgressSet<T> {
         self.items
             .lock()
             .recover_poison("InProgressSet::finish")
-            .unwrap()
             .remove(item);
     }
 }
@@ -76,7 +74,6 @@ mod tests {
             self.items
                 .lock()
                 .recover_poison("InProgressSet::is_in_progress")
-                .unwrap()
                 .contains(item)
         }
     }

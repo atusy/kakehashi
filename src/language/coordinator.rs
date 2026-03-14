@@ -8,6 +8,7 @@ use super::query_store::QueryStore;
 use super::registry::LanguageRegistry;
 use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
 use crate::config::{CaptureMappings, RawWorkspaceSettings, WorkspaceSettings};
+use crate::error::LockResultExt;
 use log::debug;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -98,13 +99,10 @@ impl LanguageCoordinator {
     /// and "b" → language_name. This enables editors sending languageId "rmd"
     /// to use the "markdown" parser configuration.
     fn build_alias_map(&self, languages: &HashMap<String, LanguageSettings>) {
-        let mut alias_map = self.alias_map.write().unwrap_or_else(|poisoned| {
-            log::warn!(
-                target: "kakehashi::lock_recovery",
-                "Recovered from poisoned alias_map lock in build_alias_map"
-            );
-            poisoned.into_inner()
-        });
+        let mut alias_map = self
+            .alias_map
+            .write()
+            .recover_poison("LanguageCoordinator::build_alias_map");
 
         alias_map.clear();
 
@@ -137,13 +135,10 @@ impl LanguageCoordinator {
     /// Returns the canonical name if the input is an alias, otherwise returns None.
     /// Example: "rmd" → Some("markdown") if markdown has aliases = ["rmd"]
     fn resolve_alias(&self, language_id: &str) -> Option<String> {
-        let alias_map = self.alias_map.read().unwrap_or_else(|poisoned| {
-            log::warn!(
-                target: "kakehashi::lock_recovery",
-                "Recovered from poisoned alias_map lock in resolve_alias"
-            );
-            poisoned.into_inner()
-        });
+        let alias_map = self
+            .alias_map
+            .read()
+            .recover_poison("LanguageCoordinator::resolve_alias");
 
         alias_map.get(language_id).cloned()
     }

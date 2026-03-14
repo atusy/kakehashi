@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
+use crate::error::LockResultExt;
 use regex::Regex;
 use tree_sitter::{Query, QueryCapture, QueryMatch};
 
@@ -110,16 +111,9 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
 /// Get a cached compiled regex for a Lua pattern, or compile and cache it.
 /// Returns `None` if the pattern cannot be compiled (parse/convert/compile error).
 fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Regex> {
-    let mut cache = match LUA_REGEX_CACHE.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            log::warn!(
-                target: "kakehashi::query",
-                "Recovered from poisoned lua regex cache lock"
-            );
-            poisoned.into_inner()
-        }
-    };
+    let mut cache = LUA_REGEX_CACHE
+        .lock()
+        .recover_poison("get_or_compile_lua_regex");
 
     if let Some(cached) = cache.get(pattern_str) {
         return cached.clone();

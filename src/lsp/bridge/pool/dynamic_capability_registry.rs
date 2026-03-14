@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use log::warn;
 use tower_lsp_server::ls_types::{Registration, Unregistration};
+
+use crate::error::LockResultExt;
 
 /// Thread-safe store for dynamically registered LSP capabilities.
 ///
@@ -26,49 +27,31 @@ impl DynamicCapabilityRegistry {
     }
 
     pub(crate) fn register(&self, registrations: Vec<Registration>) {
-        let mut guard = match self.registrations.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in DynamicCapabilityRegistry::register()"
-                );
-                poisoned.into_inner()
-            }
-        };
+        let mut guard = self
+            .registrations
+            .write()
+            .recover_poison("DynamicCapabilityRegistry::register");
         for reg in registrations {
             guard.insert(reg.id.clone(), reg);
         }
     }
 
     pub(crate) fn unregister(&self, unregistrations: Vec<Unregistration>) {
-        let mut guard = match self.registrations.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in DynamicCapabilityRegistry::unregister()"
-                );
-                poisoned.into_inner()
-            }
-        };
+        let mut guard = self
+            .registrations
+            .write()
+            .recover_poison("DynamicCapabilityRegistry::unregister");
         for unreg in unregistrations {
             guard.remove(&unreg.id);
         }
     }
 
     pub(crate) fn has_registration(&self, method: &str) -> bool {
-        let guard = match self.registrations.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!(
-                    target: "kakehashi::lock_recovery",
-                    "Recovered from poisoned lock in DynamicCapabilityRegistry::has_registration()"
-                );
-                poisoned.into_inner()
-            }
-        };
-        guard.values().any(|r| r.method == method)
+        self.registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::has_registration")
+            .values()
+            .any(|r| r.method == method)
     }
 }
 
