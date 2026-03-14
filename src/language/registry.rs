@@ -44,13 +44,6 @@ impl LanguageRegistry {
     pub fn contains(&self, language_id: &str) -> bool {
         self.languages.contains_key(language_id)
     }
-
-    /// Check if a parser is available for a given language name.
-    /// Used by the detection fallback chain to determine whether to accept
-    /// a detection result or continue to the next method.
-    pub fn has_parser_available(&self, language_name: &str) -> bool {
-        self.contains(language_name)
-    }
 }
 
 #[cfg(test)]
@@ -64,18 +57,18 @@ mod tests {
     }
 
     #[test]
-    fn test_has_parser_available_when_loaded() {
+    fn test_contains_when_loaded() {
         let registry = LanguageRegistry::new();
         registry.register_unchecked("rust".to_string(), dummy_language());
 
-        assert!(registry.has_parser_available("rust"));
+        assert!(registry.contains("rust"));
     }
 
     #[test]
-    fn test_has_parser_available_when_not_loaded() {
+    fn test_contains_when_not_loaded() {
         let registry = LanguageRegistry::new();
         // Don't register anything
 
-        assert!(!registry.has_parser_available("nonexistent"));
+        assert!(!registry.contains("nonexistent"));
     }
 }
