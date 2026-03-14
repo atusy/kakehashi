@@ -46,8 +46,8 @@ pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -235,21 +235,21 @@ pub struct LanguageServerPool {
     consecutive_panic_counts: std::sync::Mutex<HashMap<String, u32>>,
     /// Workspace root URI forwarded from upstream client.
     ///
-    /// Set via `set_root_uri()` after receiving the upstream initialize request.
+    /// Set once via `set_root_uri()` after receiving the upstream initialize request.
     /// Passed to downstream servers during LSP handshake so they can provide
     /// workspace-aware features (diagnostics, go-to-definition, etc.).
-    root_uri: std::sync::Mutex<Option<String>>,
+    root_uri: OnceLock<Option<String>>,
     /// Workspace folders forwarded from upstream client.
     ///
-    /// Set via `set_workspace_folders()` after receiving the upstream initialize request.
+    /// Set once via `set_workspace_folders()` after receiving the upstream initialize request.
     /// Passed to downstream servers during LSP handshake.
-    workspace_folders: std::sync::Mutex<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    workspace_folders: OnceLock<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
     /// Client capabilities forwarded from upstream client.
     ///
-    /// Set via `set_client_capabilities()` after receiving the upstream initialize request.
+    /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
     /// Merged into bridge defaults during downstream LSP handshake so servers
     /// can provide richer responses (e.g., markdown docs, resolve support).
-    client_capabilities: std::sync::Mutex<Option<tower_lsp_server::ls_types::ClientCapabilities>>,
+    client_capabilities: OnceLock<tower_lsp_server::ls_types::ClientCapabilities>,
     /// Sender for forwarding downstream server notifications to the upstream editor.
     ///
     /// Cloned into each reader task so they can signal events like
@@ -291,9 +291,9 @@ impl LanguageServerPool {
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
-            root_uri: std::sync::Mutex::new(None),
-            workspace_folders: std::sync::Mutex::new(None),
-            client_capabilities: std::sync::Mutex::new(None),
+            root_uri: OnceLock::new(),
+            workspace_folders: OnceLock::new(),
+            client_capabilities: OnceLock::new(),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
         }
@@ -301,62 +301,47 @@ impl LanguageServerPool {
 
     /// Set the workspace root URI.
     ///
-    /// Called during upstream initialize to forward the root URI to downstream servers.
+    /// Called once during upstream initialize to forward the root URI to downstream servers.
+    /// Subsequent calls are ignored (OnceLock semantics).
     pub(crate) fn set_root_uri(&self, uri: Option<String>) {
-        let mut root_uri = self.root_uri.lock().unwrap_or_else(|e| e.into_inner());
-        *root_uri = uri;
+        let _ = self.root_uri.set(uri);
     }
 
     /// Get the workspace root URI.
     fn root_uri(&self) -> Option<String> {
-        let root_uri = self.root_uri.lock().unwrap_or_else(|e| e.into_inner());
-        root_uri.clone()
+        self.root_uri.get().and_then(|v| v.clone())
     }
 
     /// Set the workspace folders.
     ///
-    /// Called during upstream initialize to forward workspace folders to downstream servers.
+    /// Called once during upstream initialize to forward workspace folders to downstream servers.
+    /// Subsequent calls are ignored (OnceLock semantics).
     pub(crate) fn set_workspace_folders(
         &self,
         folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
     ) {
-        let mut workspace_folders = self
-            .workspace_folders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *workspace_folders = folders;
+        let _ = self.workspace_folders.set(folders);
     }
 
     /// Get the workspace folders.
     fn workspace_folders(&self) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
-        let workspace_folders = self
-            .workspace_folders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        workspace_folders.clone()
+        self.workspace_folders.get().and_then(|v| v.clone())
     }
 
     /// Set the upstream client capabilities.
     ///
-    /// Called during upstream initialize to forward capabilities to downstream servers.
+    /// Called once during upstream initialize to forward capabilities to downstream servers.
+    /// Subsequent calls are ignored (OnceLock semantics).
     pub(crate) fn set_client_capabilities(
         &self,
         caps: tower_lsp_server::ls_types::ClientCapabilities,
     ) {
-        let mut client_capabilities = self
-            .client_capabilities
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *client_capabilities = Some(caps);
+        let _ = self.client_capabilities.set(caps);
     }
 
     /// Get the upstream client capabilities.
     fn client_capabilities(&self) -> Option<tower_lsp_server::ls_types::ClientCapabilities> {
-        let client_capabilities = self
-            .client_capabilities
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        client_capabilities.clone()
+        self.client_capabilities.get().cloned()
     }
 
     /// Take the upstream notification receiver for forwarding to the editor.
