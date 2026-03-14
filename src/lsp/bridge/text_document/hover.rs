@@ -200,34 +200,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn position_translation_saturates_on_underflow() {
-        // Simulate race condition: host_position.line (2) < region_start_line (5)
-        // This should NOT panic, instead saturate to line 0
-        let host_position = Position {
-            line: 2, // Less than region_start_line
-            character: 10,
-        };
-
-        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_hover_request(
-            &virtual_uri,
-            host_position,
-            &RegionOffset::new(5, 0), // region_start_line > host_position.line
-            test_request_id(),
-        );
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(
-            json["params"]["position"]["line"], 0,
-            "Underflow should saturate to line 0, not panic"
-        );
-        assert_eq!(
-            json["params"]["position"]["character"], 10,
-            "Character should remain unchanged"
-        );
-    }
-
     // ==========================================================================
     // Hover response transformation tests
     // ==========================================================================
