@@ -31,7 +31,7 @@ use super::LanguageServerPool;
 /// Represents a single code block embedded in a host document (e.g., a Lua
 /// code fence in a markdown file) along with its stable region ID (ADR-0019).
 #[derive(Debug, Clone)]
-pub(crate) struct InjectionRegion {
+pub(crate) struct BridgeInjection {
     /// The injection language (e.g., "lua", "python", "rust")
     pub(crate) language: String,
     /// Stable ULID-based region ID (ADR-0019)
@@ -399,7 +399,7 @@ impl BridgeCoordinator {
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         uri: &Url,
-        injections: &[InjectionRegion],
+        injections: &[BridgeInjection],
     ) {
         self.pool
             .forward_didchange_to_opened_docs(uri, injections)
@@ -431,7 +431,7 @@ impl BridgeCoordinator {
         settings: &WorkspaceSettings,
         host_language: &str,
         host_uri: &Url,
-        injections: Vec<InjectionRegion>,
+        injections: Vec<BridgeInjection>,
     ) {
         // Convert host_uri to ls_types::Uri for VirtualDocumentUri construction
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {
@@ -448,7 +448,7 @@ impl BridgeCoordinator {
 
         // Group injections by server name
         // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
-        type ServerGroup = (Arc<BridgeServerConfig>, Vec<InjectionRegion>);
+        type ServerGroup = (Arc<BridgeServerConfig>, Vec<BridgeInjection>);
         let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
 
         for injection in injections {

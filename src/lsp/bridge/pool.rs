@@ -1850,8 +1850,8 @@ mod tests {
             .insert("lua".to_string(), Arc::clone(&handle));
 
         // ADR-0015: No need to hold a writer lock - sends are channel-based and non-blocking
-        use crate::lsp::bridge::coordinator::InjectionRegion;
-        let injections = vec![InjectionRegion {
+        use crate::lsp::bridge::coordinator::BridgeInjection;
+        let injections = vec![BridgeInjection {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "local x = 42".to_string(),
@@ -3508,7 +3508,7 @@ mod tests {
         }
 
         // Forward didChange
-        let injections = vec![crate::lsp::bridge::coordinator::InjectionRegion {
+        let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
@@ -3563,7 +3563,7 @@ mod tests {
         }
 
         // Forward didChange
-        let injections = vec![crate::lsp::bridge::coordinator::InjectionRegion {
+        let injections = vec![crate::lsp::bridge::coordinator::BridgeInjection {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
