@@ -26,9 +26,9 @@ pub(in crate::lsp::bridge) const TEST_ULID_PYTHON_0: &str = "01JPMQ8ZYYQA1W3AVPW
 ///
 /// Use at the beginning of tests that require a real LSP server:
 /// ```ignore
-/// if !lua_ls_available() { return; }
+/// if !is_lua_ls_available() { return; }
 /// ```
-pub(in crate::lsp::bridge) fn lua_ls_available() -> bool {
+pub(in crate::lsp::bridge) fn is_lua_ls_available() -> bool {
     match std::process::Command::new("lua-language-server")
         .arg("--version")
         .output()
