@@ -16,26 +16,6 @@ pub struct InjectionOffset {
     pub end_column: i32,
 }
 
-impl InjectionOffset {
-    /// Create a new InjectionOffset
-    pub fn new(start_row: i32, start_column: i32, end_row: i32, end_column: i32) -> Self {
-        Self {
-            start_row,
-            start_column,
-            end_row,
-            end_column,
-        }
-    }
-}
-
-/// Default offset with no adjustments
-pub const DEFAULT_OFFSET: InjectionOffset = InjectionOffset {
-    start_row: 0,
-    start_column: 0,
-    end_row: 0,
-    end_column: 0,
-};
-
 /// Parses offset directive for a specific pattern in the query.
 /// Returns None if the specified pattern has no #offset! directive for @injection.content.
 pub(crate) fn parse_offset_directive_for_pattern(
@@ -81,7 +61,7 @@ pub(crate) fn parse_offset_directive_for_pattern(
                 pattern_index,
                 arg_count - 1 // Subtract 1 for the capture argument
             );
-            return Some(DEFAULT_OFFSET);
+            return Some(InjectionOffset::default());
         }
 
         // Try to parse each argument as i32
@@ -109,9 +89,12 @@ pub(crate) fn parse_offset_directive_for_pattern(
             ("end_col", Ok(end_col)),
         ] = parse_results.as_slice()
         {
-            return Some(InjectionOffset::new(
-                *start_row, *start_col, *end_row, *end_col,
-            ));
+            return Some(InjectionOffset {
+                start_row: *start_row,
+                start_column: *start_col,
+                end_row: *end_row,
+                end_column: *end_col,
+            });
         }
 
         // Log which values failed to parse
@@ -129,7 +112,7 @@ pub(crate) fn parse_offset_directive_for_pattern(
             error_details.join(", ")
         );
 
-        return Some(DEFAULT_OFFSET);
+        return Some(InjectionOffset::default());
     }
     None
 }
@@ -1157,7 +1140,12 @@ mod tests {
         let offset_pattern_1 = parse_offset_directive_for_pattern(&query, 1);
         assert_eq!(
             offset_pattern_1,
-            Some(InjectionOffset::new(1, 0, -1, 0)),
+            Some(InjectionOffset {
+                start_row: 1,
+                start_column: 0,
+                end_row: -1,
+                end_column: 0
+            }),
             "Pattern 1 should have offset (1, 0, -1, 0)"
         );
     }
@@ -1383,11 +1371,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::non_numeric_values("foo bar baz qux", Some(super::DEFAULT_OFFSET))]
-    #[case::missing_arguments("1 0", Some(super::DEFAULT_OFFSET))]
-    #[case::extra_arguments("1 0 -1 0 5", Some(InjectionOffset::new(1, 0, -1, 0)))]
-    #[case::mixed_valid_invalid("1 invalid -1 0", Some(super::DEFAULT_OFFSET))]
-    #[case::empty_args("", Some(super::DEFAULT_OFFSET))]
+    #[case::non_numeric_values("foo bar baz qux", Some(InjectionOffset::default()))]
+    #[case::missing_arguments("1 0", Some(InjectionOffset::default()))]
+    #[case::extra_arguments("1 0 -1 0 5", Some(InjectionOffset { start_row: 1, start_column: 0, end_row: -1, end_column: 0 }))]
+    #[case::mixed_valid_invalid("1 invalid -1 0", Some(InjectionOffset::default()))]
+    #[case::empty_args("", Some(InjectionOffset::default()))]
     #[trace]
     fn test_offset_directive_edge_cases(
         #[case] offset_args: &str,
