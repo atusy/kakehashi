@@ -105,6 +105,19 @@ pub(crate) struct RawToken {
     pub node_byte_len: usize,
 }
 
+impl RawToken {
+    /// Create a new token with the same identity (kind, depth, pattern_index,
+    /// priority, node_byte_len) but at a different position and length.
+    pub(crate) fn with_span(&self, line: usize, column: usize, length: usize) -> Self {
+        Self {
+            line,
+            column,
+            length,
+            ..self.clone()
+        }
+    }
+}
+
 /// Represents the line/column boundaries of an injection region in the host document.
 ///
 /// Used to exclude host tokens that fall inside active injection regions during finalization.
