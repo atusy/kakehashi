@@ -426,32 +426,26 @@ fn write_content_to_output(
         eprintln!("Warning: --force has no effect without --output");
     }
 
-    match output {
-        None => {
-            print!("{}", content);
+    if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
+        if path.exists() && !force {
+            eprintln!(
+                "Error: File '{}' already exists. Use --force to overwrite.",
+                path.display()
+            );
+            return Err(ExitCode::FAILURE);
         }
-        Some(path) if path.as_os_str() == "-" => {
-            print!("{}", content);
-        }
-        Some(path) => {
-            if path.exists() && !force {
-                eprintln!(
-                    "Error: File '{}' already exists. Use --force to overwrite.",
-                    path.display()
-                );
+
+        match std::fs::write(path, content) {
+            Ok(()) => {
+                eprintln!("Created {label} file: {}", path.display());
+            }
+            Err(e) => {
+                eprintln!("Failed to write {label} file: {}", e);
                 return Err(ExitCode::FAILURE);
             }
-
-            match std::fs::write(&path, content) {
-                Ok(()) => {
-                    eprintln!("Created {label} file: {}", path.display());
-                }
-                Err(e) => {
-                    eprintln!("Failed to write {label} file: {}", e);
-                    return Err(ExitCode::FAILURE);
-                }
-            }
         }
+    } else {
+        print!("{}", content);
     }
 
     Ok(())
