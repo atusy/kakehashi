@@ -57,7 +57,7 @@ impl Kakehashi {
         result
             .handle(&self.client, "declaration", None, |value| match value {
                 Some(links) => {
-                    if self.supports_declaration_link() {
+                    if self.settings_manager.supports_declaration_link() {
                         Ok(Some(GotoDeclarationResponse::Link(links)))
                     } else {
                         let locations: Vec<Location> =

@@ -56,7 +56,7 @@ impl Kakehashi {
         result
             .handle(&self.client, "definition", None, |value| match value {
                 Some(links) => {
-                    if self.supports_definition_link() {
+                    if self.settings_manager.supports_definition_link() {
                         Ok(Some(GotoDefinitionResponse::Link(links)))
                     } else {
                         let locations: Vec<Location> =

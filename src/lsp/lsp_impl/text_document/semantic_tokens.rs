@@ -281,7 +281,7 @@ impl Kakehashi {
             // Use Rayon-based parallel injection processing.
             // This uses thread-local parser caching instead of the shared parser pool,
             // avoiding lock contention during parallel processing.
-            let supports_multiline = self.supports_multiline_tokens();
+            let supports_multiline = self.settings_manager.supports_multiline_tokens();
             let coordinator = std::sync::Arc::clone(&self.language);
 
             // Compute tokens, racing against cancel notification if provided
@@ -506,7 +506,7 @@ impl Kakehashi {
             let capture_mappings = self.language.get_capture_mappings();
 
             // Use Rayon-based parallel injection processing (SAME as semanticTokens/full)
-            let supports_multiline = self.supports_multiline_tokens();
+            let supports_multiline = self.settings_manager.supports_multiline_tokens();
             let coordinator = std::sync::Arc::clone(&self.language);
 
             // Compute tokens, racing against cancel notification if provided
@@ -682,7 +682,7 @@ impl Kakehashi {
         let capture_mappings = self.language.get_capture_mappings();
 
         // Use Rayon-based parallel injection processing
-        let supports_multiline = self.supports_multiline_tokens();
+        let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
 
         let result = handle_semantic_tokens_range_parallel_async(

@@ -165,7 +165,8 @@ impl Kakehashi {
         Ok(format_document_symbol_response(
             all_symbols,
             &lsp_uri,
-            self.supports_hierarchical_document_symbol(),
+            self.settings_manager
+                .supports_hierarchical_document_symbol(),
         ))
     }
 }
