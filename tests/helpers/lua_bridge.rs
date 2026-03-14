@@ -62,37 +62,7 @@ pub fn skip_if_lua_ls_unavailable() -> bool {
 /// Callers must keep the `TempDir` alive (e.g., `let (_client, _config_dir) = ...`)
 /// so the temp directory is not deleted while the server is running.
 pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
-    let config_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
-    let config_path = config_dir.path().join("empty.toml");
-    std::fs::write(&config_path, "").expect("Failed to write empty config");
-    let config_path_str = config_path
-        .to_str()
-        .expect("temp path should be valid UTF-8")
-        .to_string();
-
-    let mut client = LspClient::builder()
-        .arg("--config-file")
-        .arg(&config_path_str)
-        .build();
-
-    // Initialize handshake with language server configuration
-    let _init_response = client.send_request(
-        "initialize",
-        json!({
-            "processId": std::process::id(),
-            "rootUri": null,
-            "capabilities": {},
-            "initializationOptions": {
-                "languageServers": {
-                    "lua-language-server": {
-                        "cmd": ["lua-language-server"],
-                        "languages": ["lua"]
-                    }
-                }
-            }
-        }),
-    );
-    client.send_notification("initialized", json!({}));
+    let (client, config_dir) = init_lua_client(None);
     (client, config_dir)
 }
 
@@ -111,6 +81,16 @@ pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
 /// Callers must keep both `TempDir` values alive for the duration of the test.
 pub fn create_lua_configured_client_with_workspace()
 -> (LspClient, tempfile::TempDir, tempfile::TempDir) {
+    let workspace_dir = tempfile::TempDir::new().expect("Failed to create workspace temp dir");
+    let (client, config_dir) = init_lua_client(Some(&workspace_dir));
+    (client, workspace_dir, config_dir)
+}
+
+/// Shared initialization logic for lua-language-server client setup.
+///
+/// When `workspace_dir` is `Some`, sets `rootUri` and `workspaceFolders` so lua-ls
+/// can index virtual documents. When `None`, uses `rootUri: null`.
+fn init_lua_client(workspace_dir: Option<&tempfile::TempDir>) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("empty.toml");
     std::fs::write(&config_path, "").expect("Failed to write empty config");
@@ -119,13 +99,19 @@ pub fn create_lua_configured_client_with_workspace()
         .expect("temp path should be valid UTF-8")
         .to_string();
 
-    let workspace_dir = tempfile::TempDir::new().expect("Failed to create workspace temp dir");
-    let root_uri = format!("file://{}", workspace_dir.path().display());
-
     let mut client = LspClient::builder()
         .arg("--config-file")
         .arg(&config_path_str)
         .build();
+
+    let (root_uri, workspace_folders) = match workspace_dir {
+        Some(dir) => {
+            let uri = format!("file://{}", dir.path().display());
+            let folders = json!([{ "uri": uri, "name": "test" }]);
+            (json!(uri), folders)
+        }
+        None => (json!(null), json!(null)),
+    };
 
     let _init_response = client.send_request(
         "initialize",
@@ -133,12 +119,7 @@ pub fn create_lua_configured_client_with_workspace()
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {},
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": "test"
-                }
-            ],
+            "workspaceFolders": workspace_folders,
             "initializationOptions": {
                 "languageServers": {
                     "lua-language-server": {
@@ -150,7 +131,7 @@ pub fn create_lua_configured_client_with_workspace()
         }),
     );
     client.send_notification("initialized", json!({}));
-    (client, workspace_dir, config_dir)
+    (client, config_dir)
 }
 
 /// Perform clean LSP shutdown sequence.
