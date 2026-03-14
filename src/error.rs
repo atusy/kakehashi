@@ -20,26 +20,25 @@ pub enum LspError {
 /// Result type for LSP operations
 pub type LspResult<T> = Result<T, LspError>;
 
-/// Helper trait to convert PoisonError to LspError
+/// Helper trait to recover from poisoned locks with logging.
 pub trait LockResultExt<T> {
-    /// Convert a PoisonError to LspError with recovery and logging.
+    /// Recover from a poisoned lock, logging a warning with the given context.
     ///
-    /// The context parameter identifies which operation triggered lock recovery,
-    /// helping developers debug thread safety issues.
-    fn recover_poison(self, context: &str) -> Result<T, LspError>;
+    /// Always succeeds — `PoisonError::into_inner()` is infallible.
+    fn recover_poison(self, context: &str) -> T;
 }
 
 impl<T> LockResultExt<T> for Result<T, PoisonError<T>> {
-    fn recover_poison(self, context: &str) -> Result<T, LspError> {
+    fn recover_poison(self, context: &str) -> T {
         match self {
-            Ok(guard) => Ok(guard),
+            Ok(guard) => guard,
             Err(poisoned) => {
                 log::warn!(
                     target: "kakehashi::lock_recovery",
                     "Recovered from poisoned lock in {}",
                     context
                 );
-                Ok(poisoned.into_inner())
+                poisoned.into_inner()
             }
         }
     }
