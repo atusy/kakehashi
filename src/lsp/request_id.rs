@@ -47,7 +47,7 @@ tokio::task_local! {
 /// notification when the request is cancelled. The receiver completes when:
 /// - A `$/cancelRequest` notification arrives for this request ID
 /// - The sender is dropped (e.g., the request completes normally)
-pub type CancelReceiver = oneshot::Receiver<()>;
+pub(crate) type CancelReceiver = oneshot::Receiver<()>;
 
 /// Error returned when attempting to subscribe to a request ID that already has a subscriber.
 ///
@@ -67,7 +67,7 @@ pub type CancelReceiver = oneshot::Receiver<()>;
 /// ```
 /// and update `notify_cancel()` to iterate and send to all subscribers.
 #[derive(Debug, Clone)]
-pub struct AlreadySubscribedError(pub UpstreamId);
+pub(crate) struct AlreadySubscribedError(pub(crate) UpstreamId);
 
 impl std::fmt::Display for AlreadySubscribedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -132,7 +132,7 @@ impl CancelForwarder {
     ///
     /// Per LSP spec, `$/cancelRequest` uses best-effort semantics, so most
     /// "not forwardable" cases return `Ok(())` rather than an error.
-    pub async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
+    pub(crate) async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
         self.pool.forward_cancel_by_upstream_id(upstream_id).await
     }
 
@@ -170,7 +170,7 @@ impl CancelForwarder {
     ///   documentation for future enhancement notes on supporting multiple subscribers.
     /// - The subscriber is automatically removed when the cancel is received or
     ///   when `unsubscribe()` is called.
-    pub fn subscribe(
+    pub(crate) fn subscribe(
         &self,
         upstream_id: UpstreamId,
     ) -> Result<CancelReceiver, AlreadySubscribedError> {
@@ -195,7 +195,7 @@ impl CancelForwarder {
     /// - The `CancelForwarder` is dropped
     ///
     /// Calling this after receiving a cancel notification is harmless (no-op).
-    pub fn unsubscribe(&self, upstream_id: &UpstreamId) {
+    pub(crate) fn unsubscribe(&self, upstream_id: &UpstreamId) {
         let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         subscribers.remove(upstream_id);
     }
@@ -242,14 +242,14 @@ impl CancelForwarder {
 /// };
 /// // _guard is dropped here, automatically unsubscribing
 /// ```
-pub struct CancelSubscriptionGuard<'a> {
+pub(crate) struct CancelSubscriptionGuard<'a> {
     cancel_forwarder: &'a CancelForwarder,
     upstream_id: UpstreamId,
 }
 
 impl<'a> CancelSubscriptionGuard<'a> {
     /// Create a new guard that will unsubscribe on drop.
-    pub fn new(cancel_forwarder: &'a CancelForwarder, upstream_id: UpstreamId) -> Self {
+    pub(crate) fn new(cancel_forwarder: &'a CancelForwarder, upstream_id: UpstreamId) -> Self {
         Self {
             cancel_forwarder,
             upstream_id,

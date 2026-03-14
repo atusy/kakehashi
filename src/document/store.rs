@@ -225,7 +225,7 @@ impl DocumentStore {
     }
 
     // Lock safety: Single remove() call - no read lock held before or during write
-    pub fn remove(&self, uri: &Url) -> Option<Document> {
+    pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
         self.documents.remove(uri).map(|(_, doc)| doc)
     }

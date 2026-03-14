@@ -3,7 +3,7 @@
 //! This module provides functionality to download and install Tree-sitter
 //! query files and compile parser shared libraries.
 
-pub mod cache;
+pub(crate) mod cache;
 pub mod metadata;
 pub mod parser;
 pub mod queries;
