@@ -96,6 +96,63 @@ pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
     (client, config_dir)
 }
 
+/// Create an LspClient with a real workspace directory for lua-language-server.
+///
+/// Unlike [`create_lua_configured_client`], this provides a real `rootUri` and
+/// `workspaceFolders` so that lua-ls can properly index virtual documents and
+/// return non-null hover/completion results.
+///
+/// # Returns
+/// A tuple of:
+/// - An initialized `LspClient`
+/// - The workspace `TempDir` (callers should write test files here)
+/// - The `TempDir` holding the config file
+///
+/// Callers must keep both `TempDir` values alive for the duration of the test.
+pub fn create_lua_configured_client_with_workspace()
+-> (LspClient, tempfile::TempDir, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("empty.toml");
+    std::fs::write(&config_path, "").expect("Failed to write empty config");
+    let config_path_str = config_path
+        .to_str()
+        .expect("temp path should be valid UTF-8")
+        .to_string();
+
+    let workspace_dir = tempfile::TempDir::new().expect("Failed to create workspace temp dir");
+    let root_uri = format!("file://{}", workspace_dir.path().display());
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(&config_path_str)
+        .build();
+
+    let _init_response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {},
+            "workspaceFolders": [
+                {
+                    "uri": root_uri,
+                    "name": "test"
+                }
+            ],
+            "initializationOptions": {
+                "languageServers": {
+                    "lua-language-server": {
+                        "cmd": ["lua-language-server"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, workspace_dir, config_dir)
+}
+
 /// Perform clean LSP shutdown sequence.
 ///
 /// Sends shutdown request followed by exit notification as required by LSP protocol.
