@@ -1645,7 +1645,15 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         let cwd = std::env::current_dir().expect("cwd");
-        let search_path = cwd.join("deps/tree-sitter").to_string_lossy().to_string();
+        let search_path = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        if !std::path::Path::new(&search_path).exists() {
+            eprintln!(
+                "skipping dynamic_lua_load_from_search_paths: grammar path '{}' does not exist",
+                search_path
+            );
+            return;
+        }
 
         let settings = RawWorkspaceSettings {
             search_paths: Some(vec![search_path.clone()]),
