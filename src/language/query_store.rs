@@ -217,16 +217,10 @@ impl Default for QueryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::Language;
-
-    unsafe extern "C" {
-        fn tree_sitter_rust() -> Language;
-    }
-
     #[test]
     fn test_query_store_operations() {
         let store = QueryStore::new();
-        let lang = unsafe { tree_sitter_rust() };
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
 
         // Create a simple query
         let query_str = "(identifier) @variable";
@@ -251,7 +245,7 @@ mod tests {
     #[test]
     fn test_query_store_clear_all() {
         let store = QueryStore::new();
-        let lang = unsafe { tree_sitter_rust() };
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
 
         let query = Arc::new(Query::new(&lang, "(identifier) @variable").unwrap());
 
