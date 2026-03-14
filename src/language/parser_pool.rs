@@ -60,26 +60,20 @@ impl DocumentParserPool {
     pub fn release(&mut self, language_id: String, parser: Parser) {
         self.available.entry(language_id).or_default().push(parser);
     }
-
-    /// Clear all cached parsers
-    #[cfg(test)]
-    pub fn clear(&mut self) {
-        self.available.clear();
-    }
-
-    /// Get the number of cached parsers for a language
-    #[cfg(test)]
-    pub fn pool_size(&self, language_id: &str) -> usize {
-        self.available
-            .get(language_id)
-            .map(|v| v.len())
-            .unwrap_or(0)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl DocumentParserPool {
+        fn pool_size(&self, language_id: &str) -> usize {
+            self.available
+                .get(language_id)
+                .map(|v| v.len())
+                .unwrap_or(0)
+        }
+    }
 
     fn create_test_language_registry() -> LanguageRegistry {
         let registry = LanguageRegistry::new();
@@ -120,22 +114,6 @@ mod tests {
         // Second acquire should get from pool
         let parser2 = pool.acquire("rust");
         assert!(parser2.is_some());
-        assert_eq!(pool.pool_size("rust"), 0);
-    }
-
-    #[test]
-    fn test_document_parser_pool_clear() {
-        let language_registry = create_test_language_registry();
-        let factory = ParserFactory::new(language_registry);
-        let mut pool = DocumentParserPool::new(factory);
-
-        // Add parsers to pool
-        let parser = pool.acquire("rust").unwrap();
-        pool.release("rust".to_string(), parser);
-        assert_eq!(pool.pool_size("rust"), 1);
-
-        // Clear should remove all cached parsers
-        pool.clear();
         assert_eq!(pool.pool_size("rust"), 0);
     }
 }

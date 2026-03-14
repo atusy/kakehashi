@@ -389,18 +389,6 @@ impl LanguageCoordinator {
         self.filetype_resolver.get_language_for_path(path)
     }
 
-    /// Get language for a file extension.
-    #[cfg(test)]
-    pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
-        self.filetype_resolver.get_language_for_extension(extension)
-    }
-
-    /// Get configured search paths (primarily for testing and diagnostics).
-    #[cfg(test)]
-    pub fn get_search_paths(&self) -> Option<Vec<String>> {
-        self.config_store.get_search_paths()
-    }
-
     /// Check if a parser is available for a given language name.
     ///
     /// Used by the detection fallback chain (ADR-0005) to determine whether
@@ -689,13 +677,6 @@ impl LanguageCoordinator {
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
     pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store.get_highlight_query(lang_name)
-    }
-
-    /// Get locals query for a language.
-    ///
-    #[cfg(test)]
-    pub fn get_locals_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
-        self.query_store.get_locals_query(lang_name)
     }
 
     /// Get injection query for a language.
@@ -1122,36 +1103,6 @@ mod tests {
     // These verify the API surface exists and basic functionality works
 
     #[test]
-    fn coordinator_should_resolve_filetype() {
-        let coordinator = LanguageCoordinator::new();
-        let _lang = coordinator.get_language_for_extension("rs");
-    }
-
-    #[test]
-    fn coordinator_should_expose_query_state_checks() {
-        let coordinator = LanguageCoordinator::new();
-        let _has_queries: bool = coordinator.has_queries("rust");
-    }
-
-    #[test]
-    fn coordinator_should_expose_highlight_queries() {
-        let coordinator = LanguageCoordinator::new();
-        let _query = coordinator.get_highlight_query("rust");
-    }
-
-    #[test]
-    fn coordinator_should_expose_locals_queries() {
-        let coordinator = LanguageCoordinator::new();
-        let _query = coordinator.get_locals_query("rust");
-    }
-
-    #[test]
-    fn coordinator_should_provide_capture_mappings() {
-        let coordinator = LanguageCoordinator::new();
-        let _mappings = coordinator.get_capture_mappings();
-    }
-
-    #[test]
     fn test_coordinator_has_parser_available() {
         let coordinator = LanguageCoordinator::new();
 
@@ -1393,10 +1344,6 @@ mod tests {
             coordinator.get_highlight_query("rust").is_none(),
             "No highlight query should be loaded for unknown pattern"
         );
-        assert!(
-            coordinator.get_locals_query("rust").is_none(),
-            "No locals query should be loaded for unknown pattern"
-        );
     }
 
     #[test]
@@ -1467,17 +1414,11 @@ mod tests {
             );
         }
 
-        // Verify each query type was loaded separately
+        // Verify highlight query was loaded (locals and injections confirmed by events)
         assert!(
             coordinator.get_highlight_query("rust").is_some(),
             "Highlight query should be loaded"
         );
-        assert!(
-            coordinator.get_locals_query("rust").is_some(),
-            "Locals query should be loaded"
-        );
-        // Note: We can't directly check injection queries through the coordinator API
-        // but the events confirm they were processed
     }
 
     // Tests for alias resolution
@@ -1718,9 +1659,8 @@ mod tests {
             .expect("test settings should expand without errors");
         let _summary = coordinator.load_settings(workspace_settings);
 
-        let paths = coordinator.get_search_paths();
         assert!(
-            paths.is_some(),
+            coordinator.config_store.get_search_paths().is_some(),
             "Search paths should be set after load_settings"
         );
 

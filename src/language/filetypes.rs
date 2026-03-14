@@ -24,79 +24,6 @@ impl FiletypeResolver {
             .cloned()
     }
 
-    /// Get language for a file extension
-    #[cfg(test)]
-    pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
-        self.filetype_map
-            .read()
-            .recover_poison("FiletypeResolver::get_language_for_extension")
-            .get(extension)
-            .cloned()
-    }
-
-    /// Get a copy of the entire filetype map
-    #[cfg(test)]
-    pub fn get_filetype_map(&self) -> HashMap<String, String> {
-        self.filetype_map
-            .read()
-            .recover_poison("FiletypeResolver::get_filetype_map")
-            .clone()
-    }
-
-    /// Add a single filetype mapping
-    #[cfg(test)]
-    pub fn add_mapping(&self, extension: String, language: String) {
-        self.filetype_map
-            .write()
-            .recover_poison("FiletypeResolver::add_mapping")
-            .insert(extension, language);
-    }
-
-    /// Remove a filetype mapping
-    #[cfg(test)]
-    pub fn remove_mapping(&self, extension: &str) -> Option<String> {
-        self.filetype_map
-            .write()
-            .recover_poison("FiletypeResolver::remove_mapping")
-            .remove(extension)
-    }
-
-    /// Clear all mappings
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.filetype_map
-            .write()
-            .recover_poison("FiletypeResolver::clear")
-            .clear();
-    }
-
-    /// Check if a language is registered for any extension
-    #[cfg(test)]
-    pub fn has_language(&self, language: &str) -> bool {
-        self.filetype_map
-            .read()
-            .recover_poison("FiletypeResolver::has_language")
-            .values()
-            .any(|l| l == language)
-    }
-
-    /// Get all extensions for a language
-    #[cfg(test)]
-    pub fn get_extensions_for_language(&self, language: &str) -> Vec<String> {
-        self.filetype_map
-            .read()
-            .recover_poison("FiletypeResolver::get_extensions_for_language")
-            .iter()
-            .filter_map(|(ext, lang)| {
-                if lang == language {
-                    Some(ext.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Extract file extension from a path
     fn extract_extension(path: &str) -> &str {
         path.split('.').next_back().unwrap_or("")
@@ -113,6 +40,23 @@ impl Default for FiletypeResolver {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    impl FiletypeResolver {
+        fn add_mapping(&self, extension: String, language: String) {
+            self.filetype_map
+                .write()
+                .recover_poison("FiletypeResolver::add_mapping")
+                .insert(extension, language);
+        }
+
+        fn get_language_for_extension(&self, extension: &str) -> Option<String> {
+            self.filetype_map
+                .read()
+                .recover_poison("FiletypeResolver::get_language_for_extension")
+                .get(extension)
+                .cloned()
+        }
+    }
 
     #[test]
     fn test_filetype_resolver_basic() {
@@ -131,9 +75,6 @@ mod tests {
         );
         assert_eq!(resolver.get_language_for_extension("txt"), None);
     }
-
-    // test_filetype_resolver_from_settings removed in PBI-061 S48.4
-    // Method build_from_settings no longer exists
 
     #[test]
     fn test_poison_recovery_on_read() {
@@ -194,38 +135,5 @@ mod tests {
         );
 
         assert_eq!(resolver.get_language_for_path("/path/to/file"), None);
-    }
-
-    #[test]
-    fn test_filetype_resolver_reverse_lookup() {
-        let resolver = FiletypeResolver::new();
-
-        resolver.add_mapping("rs".to_string(), "rust".to_string());
-        resolver.add_mapping("rust".to_string(), "rust".to_string());
-        resolver.add_mapping("py".to_string(), "python".to_string());
-
-        assert!(resolver.has_language("rust"));
-        assert!(resolver.has_language("python"));
-        assert!(!resolver.has_language("javascript"));
-
-        let rust_exts = resolver.get_extensions_for_language("rust");
-        assert_eq!(rust_exts.len(), 2);
-        assert!(rust_exts.contains(&"rs".to_string()));
-        assert!(rust_exts.contains(&"rust".to_string()));
-    }
-
-    #[test]
-    fn test_filetype_resolver_remove_and_clear() {
-        let resolver = FiletypeResolver::new();
-
-        resolver.add_mapping("rs".to_string(), "rust".to_string());
-        resolver.add_mapping("py".to_string(), "python".to_string());
-
-        assert_eq!(resolver.remove_mapping("rs"), Some("rust".to_string()));
-        assert_eq!(resolver.get_language_for_extension("rs"), None);
-
-        resolver.clear();
-        assert_eq!(resolver.get_language_for_extension("py"), None);
-        assert_eq!(resolver.get_filetype_map().len(), 0);
     }
 }
