@@ -147,8 +147,8 @@ mod tests {
     fn test_document_creation() {
         let doc = Document::new("hello world".to_string());
         assert_eq!(doc.text(), "hello world");
-        assert_eq!(doc.text.len(), 11);
-        assert!(!doc.text.is_empty());
+        assert_eq!(doc.text().len(), 11);
+        assert!(!doc.text().is_empty());
     }
 
     #[test]
