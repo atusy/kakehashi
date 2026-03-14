@@ -69,16 +69,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
             let current_line_width = utf16_width(lines[current_line]);
             let per_line_len = remaining.min(current_line_width.saturating_sub(start_col));
 
-            result.push(RawToken {
-                line: current_line,
-                column: start_col,
-                length: per_line_len,
-                kind: token.kind.clone(),
-                depth: token.depth,
-                pattern_index: token.pattern_index,
-                priority: token.priority,
-                node_byte_len: token.node_byte_len,
-            });
+            result.push(token.with_span(current_line, start_col, per_line_len));
 
             // Subtract per_line_len + 1 (the +1 accounts for the newline between lines)
             remaining = remaining.saturating_sub(per_line_len + 1);
@@ -150,16 +141,11 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                 .max_by_key(|t| token_priority(t));
 
             if let Some(winner) = winner {
-                result.push(RawToken {
-                    line: current_line,
-                    column: interval_start,
-                    length: interval_end - interval_start,
-                    kind: winner.kind.clone(),
-                    depth: winner.depth,
-                    pattern_index: winner.pattern_index,
-                    priority: winner.priority,
-                    node_byte_len: winner.node_byte_len,
-                });
+                result.push(winner.with_span(
+                    current_line,
+                    interval_start,
+                    interval_end - interval_start,
+                ));
             }
         }
 
@@ -339,16 +325,7 @@ fn split_host_token_around_regions(
         if cursor < *region_start {
             let frag_end = (*region_start).min(token_end);
             if cursor < frag_end {
-                fragments.push(RawToken {
-                    line: token.line,
-                    column: cursor,
-                    length: frag_end - cursor,
-                    kind: token.kind.clone(),
-                    depth: token.depth,
-                    pattern_index: token.pattern_index,
-                    priority: token.priority,
-                    node_byte_len: token.node_byte_len,
-                });
+                fragments.push(token.with_span(token.line, cursor, frag_end - cursor));
             }
         }
         cursor = (*region_end).max(cursor);
@@ -356,16 +333,7 @@ fn split_host_token_around_regions(
 
     // Fragment after all regions
     if cursor < token_end {
-        fragments.push(RawToken {
-            line: token.line,
-            column: cursor,
-            length: token_end - cursor,
-            kind: token.kind.clone(),
-            depth: token.depth,
-            pattern_index: token.pattern_index,
-            priority: token.priority,
-            node_byte_len: token.node_byte_len,
-        });
+        fragments.push(token.with_span(token.line, cursor, token_end - cursor));
     }
 
     fragments
