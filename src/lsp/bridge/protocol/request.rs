@@ -139,9 +139,7 @@ pub(crate) fn virtual_uri_to_lsp_uri(virtual_uri: &VirtualDocumentUri) -> Uri {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::text_document::test_helpers::{
-        assert_uses_virtual_uri, test_host_uri,
-    };
+    use super::super::super::text_document::test_helpers::test_host_uri;
     use super::*;
     use tower_lsp_server::ls_types::Position;
 
