@@ -1,5 +1,5 @@
 use crate::config::{CaptureMappings, LanguageSettings, RawWorkspaceSettings};
-use log::warn;
+use crate::error::LockResultExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -21,13 +21,10 @@ impl ConfigStore {
 
     // ========== Language Configs ==========
     pub fn set_language_configs(&self, configs: HashMap<String, LanguageSettings>) {
-        match self.language_configs.write() {
-            Ok(mut guard) => *guard = configs,
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::set_language_configs");
-                *poisoned.into_inner() = configs;
-            }
-        }
+        *self
+            .language_configs
+            .write()
+            .recover_poison("ConfigStore::set_language_configs") = configs;
     }
 
     pub fn update_from_settings(&self, settings: &RawWorkspaceSettings) {
@@ -37,101 +34,74 @@ impl ConfigStore {
     }
 
     pub fn get_language_config(&self, lang_name: &str) -> Option<LanguageSettings> {
-        match self.language_configs.read() {
-            Ok(guard) => guard.get(lang_name).cloned(),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::get_language_config");
-                poisoned.into_inner().get(lang_name).cloned()
-            }
-        }
+        self.language_configs
+            .read()
+            .recover_poison("ConfigStore::get_language_config")
+            .get(lang_name)
+            .cloned()
     }
 
     pub fn get_all_language_configs(&self) -> HashMap<String, LanguageSettings> {
-        match self.language_configs.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::get_all_language_configs");
-                poisoned.into_inner().clone()
-            }
-        }
+        self.language_configs
+            .read()
+            .recover_poison("ConfigStore::get_all_language_configs")
+            .clone()
     }
 
     // ========== Capture Mappings ==========
     pub fn set_capture_mappings(&self, mappings: CaptureMappings) {
-        match self.capture_mappings.write() {
-            Ok(mut guard) => *guard = mappings,
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::set_capture_mappings");
-                *poisoned.into_inner() = mappings;
-            }
-        }
+        *self
+            .capture_mappings
+            .write()
+            .recover_poison("ConfigStore::set_capture_mappings") = mappings;
     }
 
     pub fn get_capture_mappings(&self) -> CaptureMappings {
-        match self.capture_mappings.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::get_capture_mappings");
-                poisoned.into_inner().clone()
-            }
-        }
+        self.capture_mappings
+            .read()
+            .recover_poison("ConfigStore::get_capture_mappings")
+            .clone()
     }
 
     // ========== Search Paths ==========
     pub fn set_search_paths(&self, paths: Option<Vec<String>>) {
-        match self.search_paths.write() {
-            Ok(mut guard) => *guard = paths,
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::set_search_paths");
-                *poisoned.into_inner() = paths;
-            }
-        }
+        *self
+            .search_paths
+            .write()
+            .recover_poison("ConfigStore::set_search_paths") = paths;
     }
 
     pub fn get_search_paths(&self) -> Option<Vec<String>> {
-        match self.search_paths.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::get_search_paths");
-                poisoned.into_inner().clone()
-            }
-        }
+        self.search_paths
+            .read()
+            .recover_poison("ConfigStore::get_search_paths")
+            .clone()
     }
 
     /// Get search paths as a shared reference
     pub fn get_search_paths_ref(&self) -> Arc<Option<Vec<String>>> {
-        match self.search_paths.read() {
-            Ok(guard) => Arc::new(guard.clone()),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::get_search_paths_ref");
-                Arc::new(poisoned.into_inner().clone())
-            }
-        }
+        Arc::new(
+            self.search_paths
+                .read()
+                .recover_poison("ConfigStore::get_search_paths_ref")
+                .clone(),
+        )
     }
 
     /// Clear all configurations
     pub fn clear(&self) {
-        match self.language_configs.write() {
-            Ok(mut guard) => guard.clear(),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::clear (language_configs)");
-                poisoned.into_inner().clear();
-            }
-        }
-        match self.capture_mappings.write() {
-            Ok(mut guard) => *guard = CaptureMappings::default(),
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::clear (capture_mappings)");
-                *poisoned.into_inner() = CaptureMappings::default();
-            }
-        }
-        match self.search_paths.write() {
-            Ok(mut guard) => *guard = None,
-            Err(poisoned) => {
-                warn!(target: "kakehashi::lock_recovery", "Recovered from poisoned lock in config_store::clear (search_paths)");
-                *poisoned.into_inner() = None;
-            }
-        }
+        self.language_configs
+            .write()
+            .recover_poison("ConfigStore::clear(language_configs)")
+            .clear();
+        *self
+            .capture_mappings
+            .write()
+            .recover_poison("ConfigStore::clear(capture_mappings)") = CaptureMappings::default();
+        *self
+            .search_paths
+            .write()
+            .recover_poison("ConfigStore::clear(search_paths)") = None;
     }
 }
 
