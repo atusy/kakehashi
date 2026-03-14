@@ -36,7 +36,7 @@ pub(crate) use protocol::location_link_to_location;
 /// - `pool.rs` - LanguageServerPool lifecycle and state tests
 #[cfg(test)]
 mod tests {
-    use super::pool::test_helpers::{lua_ls_available, lua_ls_config};
+    use super::pool::test_helpers::{is_lua_ls_available, lua_ls_config};
     use super::pool::{LanguageServerPool, UpstreamId};
     use super::protocol::RegionOffset;
     use tower_lsp_server::ls_types::Position;
@@ -45,7 +45,7 @@ mod tests {
     /// Integration test: LanguageServerPool sends hover request to lua-language-server
     #[tokio::test]
     async fn pool_hover_request_succeeds_with_lua_server() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -79,7 +79,7 @@ mod tests {
     /// Integration test: LanguageServerPool sends completion request to lua-language-server
     #[tokio::test]
     async fn pool_completion_request_succeeds_with_lua_server() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -120,7 +120,7 @@ mod tests {
     /// we generate unique downstream IDs internally.
     #[tokio::test]
     async fn downstream_request_uses_unique_generated_id() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -160,7 +160,7 @@ mod tests {
     /// when multiple upstream requests have the same ID.
     #[tokio::test]
     async fn completion_request_uses_unique_generated_id() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -196,7 +196,7 @@ mod tests {
     /// Integration test: LanguageServerPool sends document link request to lua-language-server
     #[tokio::test]
     async fn pool_document_link_request_succeeds_with_lua_server() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 

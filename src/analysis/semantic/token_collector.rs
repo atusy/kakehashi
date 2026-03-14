@@ -4,10 +4,10 @@
 //! highlight query, including multiline token handling and byte-to-UTF16 conversion.
 
 use crate::config::CaptureMappings;
-use crate::text::convert_byte_to_utf16_in_line;
+use crate::text::position::byte_to_utf16_col;
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator, Tree};
 
-use super::legend::apply_capture_mapping;
+use super::legend::{CaptureResult, resolve_capture};
 
 /// Check whether a node is strictly contained within any exclusion range.
 ///
@@ -52,6 +52,28 @@ fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
     DEFAULT_PRIORITY
 }
 
+/// The semantic role of a collected token.
+///
+/// Mirrors the relevant variants of [`CaptureResult`] but lives on the
+/// collected token, encoding token roles as distinct variants rather than
+/// magic-string conventions.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TokenKind {
+    /// Normal semantic token with a mapped type name (e.g., "keyword", "variable.readonly").
+    Mapped(String),
+    /// Transparent breakpoint-only token — not emitted as a semantic token.
+    Transparent,
+    /// `@none` capture — punches holes in parent tokens during pre-processing.
+    NoneCapture,
+}
+
+impl TokenKind {
+    /// Returns `true` for tokens that will be emitted as semantic tokens in the LSP response.
+    pub(crate) fn is_emitted(&self) -> bool {
+        matches!(self, TokenKind::Mapped(_))
+    }
+}
+
 /// Represents a token before delta encoding with all position information.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RawToken {
@@ -61,8 +83,8 @@ pub(crate) struct RawToken {
     pub column: usize,
     /// Length in UTF-16 code units
     pub length: usize,
-    /// Mapped capture name (e.g., "keyword", "variable.readonly")
-    pub mapped_name: String,
+    /// The semantic role of this token.
+    pub kind: TokenKind,
     /// Injection depth (0 = host document)
     pub depth: usize,
     /// Index of the query pattern that produced this token.
@@ -96,26 +118,6 @@ pub(crate) struct InjectionRegion {
     pub end_line: usize,
     /// End column (UTF-16)
     pub end_col: usize,
-}
-
-/// Convert byte column position to UTF-16 column position within a line
-/// This is a wrapper around the common utility for backward compatibility
-pub(super) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
-    // The common utility returns Option, but we need to handle the case where
-    // byte_col is beyond the end of the line or in the middle of a character
-    convert_byte_to_utf16_in_line(line, byte_col).unwrap_or_else(|| {
-        // If conversion fails (e.g., byte_col is in the middle of a multi-byte char),
-        // find the nearest valid position
-        let mut valid_col = byte_col;
-        while valid_col > 0 {
-            if let Some(utf16) = convert_byte_to_utf16_in_line(line, valid_col) {
-                return utf16;
-            }
-            valid_col -= 1;
-        }
-        // Fallback to 0 if no valid position found
-        0
-    })
 }
 
 /// Calculate byte offsets for a line within a multiline token.
@@ -344,10 +346,11 @@ pub(super) fn collect_host_tokens(
 
             // Get the mapped capture name early to avoid repeated mapping
             let capture_name = &query.capture_names()[c.index as usize];
-            let Some(mapped_name) = apply_capture_mapping(capture_name, filetype, capture_mappings)
-            else {
-                // Skip captures explicitly suppressed by user mapping (None)
-                continue;
+            let kind = match resolve_capture(capture_name, filetype, capture_mappings) {
+                CaptureResult::Suppressed => continue,
+                CaptureResult::Mapped(s) => TokenKind::Mapped(s),
+                CaptureResult::Transparent => TokenKind::Transparent,
+                CaptureResult::NoneCapture => TokenKind::NoneCapture,
             };
 
             // Skip captures that fall within a child injection region
@@ -381,7 +384,7 @@ pub(super) fn collect_host_tokens(
                     line: host_line,
                     column: start_utf16,
                     length: end_utf16 - start_utf16,
-                    mapped_name,
+                    kind,
                     depth,
                     pattern_index: m.pattern_index,
                     priority,
@@ -442,7 +445,7 @@ pub(super) fn collect_host_tokens(
                         line: host_start_line,
                         column: start_utf16,
                         length: total_length_utf16,
-                        mapped_name,
+                        kind,
                         depth,
                         pattern_index: m.pattern_index,
                         priority,
@@ -473,7 +476,7 @@ pub(super) fn collect_host_tokens(
                                 line: host_row,
                                 column: start_utf16,
                                 length: end_utf16 - start_utf16,
-                                mapped_name: mapped_name.clone(),
+                                kind: kind.clone(),
                                 depth,
                                 pattern_index: m.pattern_index,
                                 priority,
@@ -491,16 +494,35 @@ pub(super) fn collect_host_tokens(
 mod tests {
     use super::*;
 
+    // ── TokenKind::is_emitted tests ──────────────────────────────────
+
+    #[test]
+    fn is_emitted_returns_true_for_mapped() {
+        assert!(TokenKind::Mapped("keyword".to_string()).is_emitted());
+    }
+
+    #[test]
+    fn is_emitted_returns_false_for_transparent() {
+        assert!(!TokenKind::Transparent.is_emitted());
+    }
+
+    #[test]
+    fn is_emitted_returns_false_for_none_capture() {
+        assert!(!TokenKind::NoneCapture.is_emitted());
+    }
+
     // ── is_in_exclusion_range tests ──────────────────────────────────
+
+    fn parse_with_language(text: &str, language: tree_sitter::Language) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        parser.parse(text, None).unwrap()
+    }
 
     /// Helper: parse `text` with the given language and return the root node's
     /// first child (or root itself) for exclusion-range testing.
     fn parse_rust_tree(text: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .unwrap();
-        parser.parse(text, None).unwrap()
+        parse_with_language(text, tree_sitter_rust::LANGUAGE.into())
     }
 
     #[test]
@@ -535,11 +557,8 @@ mod tests {
         // ending at col 1 — shorter than the heading's start_col of 2.
         // The prefix detection must still recognize this as a structural prefix
         // to prevent the heading token from leaking onto the empty `>` line.
-        let mut parser = tree_sitter::Parser::new();
-        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
-        parser.set_language(&language).unwrap();
         let text = "> # foo\n>\n> bar\n>\n";
-        let tree = parser.parse(text, None).unwrap();
+        let tree = parse_with_language(text, tree_sitter_md::LANGUAGE.into());
         // Navigate: document > section > block_quote > section > atx_heading
         let root = tree.root_node();
         let block_quote = root.child(0).unwrap().child(0).unwrap();
@@ -782,8 +801,12 @@ mod tests {
             &mut tokens2,
         );
 
-        let has_keyword = tokens2.iter().any(|t| t.mapped_name == "keyword");
-        let has_variable = tokens2.iter().any(|t| t.mapped_name == "variable");
+        let has_keyword = tokens2
+            .iter()
+            .any(|t| t.kind == TokenKind::Mapped("keyword".to_string()));
+        let has_variable = tokens2
+            .iter()
+            .any(|t| t.kind == TokenKind::Mapped("variable".to_string()));
         assert!(has_keyword, "fn keyword outside exclusion should be kept");
         assert!(
             !has_variable,
@@ -929,42 +952,5 @@ mod tests {
         assert_eq!(root.start_position().column, 0);
         let widths = effective_prefix_widths(&root, &[]);
         assert!(widths.is_empty());
-    }
-
-    #[test]
-    fn byte_to_utf16_col_ascii() {
-        let line = "hello world";
-        assert_eq!(byte_to_utf16_col(line, 0), 0);
-        assert_eq!(byte_to_utf16_col(line, 5), 5);
-        assert_eq!(byte_to_utf16_col(line, 11), 11);
-    }
-
-    #[test]
-    fn byte_to_utf16_col_japanese() {
-        // Japanese text (3 bytes per char in UTF-8, 1 code unit in UTF-16)
-        let line = "こんにちは";
-        assert_eq!(byte_to_utf16_col(line, 0), 0);
-        assert_eq!(byte_to_utf16_col(line, 3), 1); // After "こ"
-        assert_eq!(byte_to_utf16_col(line, 6), 2); // After "こん"
-        assert_eq!(byte_to_utf16_col(line, 15), 5); // After all 5 chars
-    }
-
-    #[test]
-    fn byte_to_utf16_col_mixed_ascii_and_japanese() {
-        let line = "let x = \"あいうえお\"";
-        assert_eq!(byte_to_utf16_col(line, 0), 0);
-        assert_eq!(byte_to_utf16_col(line, 8), 8); // Before '"'
-        assert_eq!(byte_to_utf16_col(line, 9), 9); // Before "あ"
-        assert_eq!(byte_to_utf16_col(line, 12), 10); // After "あ" (3 bytes -> 1 UTF-16)
-        assert_eq!(byte_to_utf16_col(line, 24), 14); // After "あいうえお\"" (15 bytes + 1 quote)
-    }
-
-    #[test]
-    fn byte_to_utf16_col_emoji() {
-        // Emoji (4 bytes in UTF-8, 2 code units in UTF-16)
-        let line = "hello 👋 world";
-        assert_eq!(byte_to_utf16_col(line, 0), 0);
-        assert_eq!(byte_to_utf16_col(line, 6), 6); // After "hello "
-        assert_eq!(byte_to_utf16_col(line, 10), 8); // After emoji (4 bytes -> 2 UTF-16)
     }
 }

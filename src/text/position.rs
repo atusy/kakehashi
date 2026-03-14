@@ -92,6 +92,26 @@ pub fn convert_utf16_to_byte_in_line(line_text: &str, utf16_pos: usize) -> Optio
     }
 }
 
+/// Convert byte column position to UTF-16 column position within a line.
+///
+/// If the byte position is invalid (mid-character or past end of line), walks
+/// back to the nearest valid byte boundary and returns that UTF-16 column
+/// instead. This can occur when tree-sitter byte offsets from injection
+/// coordinate mapping land inside a multi-byte character boundary.
+#[inline]
+pub(crate) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
+    convert_byte_to_utf16_in_line(line, byte_col).unwrap_or_else(|| {
+        let mut valid_col = byte_col;
+        while valid_col > 0 {
+            valid_col -= 1;
+            if let Some(utf16) = convert_byte_to_utf16_in_line(line, valid_col) {
+                return utf16;
+            }
+        }
+        0
+    })
+}
+
 /// Convert byte position to UTF-16 position within a line
 /// Returns None if the byte position is invalid (e.g., in the middle of a multi-byte character)
 #[inline(always)]
@@ -118,5 +138,66 @@ pub fn convert_byte_to_utf16_in_line(line_text: &str, byte_pos: usize) -> Option
     } else {
         // Position is beyond the end of the line
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_to_utf16_col_ascii() {
+        let line = "hello world";
+        assert_eq!(byte_to_utf16_col(line, 0), 0);
+        assert_eq!(byte_to_utf16_col(line, 5), 5);
+        assert_eq!(byte_to_utf16_col(line, 11), 11);
+    }
+
+    #[test]
+    fn byte_to_utf16_col_japanese() {
+        // Japanese text (3 bytes per char in UTF-8, 1 code unit in UTF-16)
+        let line = "こんにちは";
+        assert_eq!(byte_to_utf16_col(line, 0), 0);
+        assert_eq!(byte_to_utf16_col(line, 3), 1); // After "こ"
+        assert_eq!(byte_to_utf16_col(line, 6), 2); // After "こん"
+        assert_eq!(byte_to_utf16_col(line, 15), 5); // After all 5 chars
+    }
+
+    #[test]
+    fn byte_to_utf16_col_mixed_ascii_and_japanese() {
+        let line = "let x = \"あいうえお\"";
+        assert_eq!(byte_to_utf16_col(line, 0), 0);
+        assert_eq!(byte_to_utf16_col(line, 8), 8); // Before '"'
+        assert_eq!(byte_to_utf16_col(line, 9), 9); // Before "あ"
+        assert_eq!(byte_to_utf16_col(line, 12), 10); // After "あ" (3 bytes -> 1 UTF-16)
+        assert_eq!(byte_to_utf16_col(line, 24), 14); // At closing '"' (after "あいうえお")
+    }
+
+    #[test]
+    fn byte_to_utf16_col_mid_character_fallback() {
+        // Japanese text: each char is 3 bytes in UTF-8
+        let line = "こんにちは";
+        // byte 1 is mid-"こ" → falls back to 0 (start of "こ")
+        assert_eq!(byte_to_utf16_col(line, 1), 0);
+        // byte 2 is mid-"こ" → falls back to 0
+        assert_eq!(byte_to_utf16_col(line, 2), 0);
+        // byte 4 is mid-"ん" → falls back to 1 (start of "ん")
+        assert_eq!(byte_to_utf16_col(line, 4), 1);
+
+        // Emoji: 4 bytes in UTF-8
+        let line = "a👋b";
+        // byte 2 is mid-emoji → falls back to 1 (start of emoji)
+        assert_eq!(byte_to_utf16_col(line, 2), 1);
+        // byte 3 is mid-emoji → falls back to 1
+        assert_eq!(byte_to_utf16_col(line, 3), 1);
+    }
+
+    #[test]
+    fn byte_to_utf16_col_emoji() {
+        // Emoji (4 bytes in UTF-8, 2 code units in UTF-16)
+        let line = "hello 👋 world";
+        assert_eq!(byte_to_utf16_col(line, 0), 0);
+        assert_eq!(byte_to_utf16_col(line, 6), 6); // After "hello "
+        assert_eq!(byte_to_utf16_col(line, 10), 8); // After emoji (4 bytes -> 2 UTF-16)
     }
 }

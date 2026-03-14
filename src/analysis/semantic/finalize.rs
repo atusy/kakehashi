@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensResult};
 
 use super::legend::map_capture_to_token_type_and_modifiers;
-use super::token_collector::{InjectionRegion, RawToken};
+use super::token_collector::{InjectionRegion, RawToken, TokenKind};
 
 /// Priority key for token comparison. Higher values win.
 ///
@@ -73,7 +73,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
                 line: current_line,
                 column: start_col,
                 length: per_line_len,
-                mapped_name: token.mapped_name.clone(),
+                kind: token.kind.clone(),
                 depth: token.depth,
                 pattern_index: token.pattern_index,
                 priority: token.priority,
@@ -94,7 +94,7 @@ fn split_multiline_tokens(tokens: Vec<RawToken>, lines: &[&str]) -> Vec<RawToken
 /// For each line, collects breakpoints (start/end columns of all tokens),
 /// then for each interval picks the highest-priority token as the winner.
 /// Priority is determined by `(priority DESC, depth DESC, node_byte_len ASC, pattern_index DESC)`.
-/// Transparent tokens (empty `mapped_name`) are excluded from winner selection.
+/// Transparent tokens (`TokenKind::Transparent`) are excluded from winner selection.
 ///
 /// This replaces the previous dedup-at-same-position approach, producing
 /// non-overlapping fragments that preserve both parent and child semantics.
@@ -138,15 +138,14 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
             }
 
             // Find the highest-priority *visible* token covering this interval.
-            // Transparent tokens (empty mapped_name) only serve as breakpoint
-            // generators — they split intervals at their boundaries but don't
-            // compete for winning.
+            // Transparent tokens only serve as breakpoint generators — they
+            // split intervals at their boundaries but don't compete for winning.
             let winner = line_tokens
                 .iter()
                 .filter(|t| {
                     t.column <= interval_start
                         && t.column + t.length >= interval_end
-                        && !t.mapped_name.is_empty()
+                        && t.kind.is_emitted()
                 })
                 .max_by_key(|t| token_priority(t));
 
@@ -155,7 +154,7 @@ fn split_overlapping_tokens(mut tokens: Vec<RawToken>) -> Vec<RawToken> {
                     line: current_line,
                     column: interval_start,
                     length: interval_end - interval_start,
-                    mapped_name: winner.mapped_name.clone(),
+                    kind: winner.kind.clone(),
                     depth: winner.depth,
                     pattern_index: winner.pattern_index,
                     priority: winner.priority,
@@ -185,7 +184,7 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
     for read in 1..tokens.len() {
         let can_merge = tokens[write].line == tokens[read].line
             && tokens[write].column + tokens[write].length == tokens[read].column
-            && tokens[write].mapped_name == tokens[read].mapped_name
+            && tokens[write].kind == tokens[read].kind
             && tokens[write].depth == tokens[read].depth
             && tokens[write].pattern_index == tokens[read].pattern_index
             && tokens[write].priority == tokens[read].priority;
@@ -344,7 +343,7 @@ fn split_host_token_around_regions(
                     line: token.line,
                     column: cursor,
                     length: frag_end - cursor,
-                    mapped_name: token.mapped_name.clone(),
+                    kind: token.kind.clone(),
                     depth: token.depth,
                     pattern_index: token.pattern_index,
                     priority: token.priority,
@@ -361,7 +360,7 @@ fn split_host_token_around_regions(
             line: token.line,
             column: cursor,
             length: token_end - cursor,
-            mapped_name: token.mapped_name.clone(),
+            kind: token.kind.clone(),
             depth: token.depth,
             pattern_index: token.pattern_index,
             priority: token.priority,
@@ -380,8 +379,9 @@ fn split_host_token_around_regions(
 /// are split around `@none` intervals; child tokens (smaller `node_byte_len`)
 /// are preserved unchanged. `@none` tokens themselves are discarded.
 fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
-    let (none_tokens, tokens): (Vec<_>, Vec<_>) =
-        tokens.into_iter().partition(|t| t.mapped_name == "none");
+    let (none_tokens, tokens): (Vec<_>, Vec<_>) = tokens
+        .into_iter()
+        .partition(|t| t.kind == TokenKind::NoneCapture);
 
     if none_tokens.is_empty() {
         return tokens;
@@ -503,7 +503,7 @@ pub(super) fn finalize_tokens(
     let mut all_tokens = split_multiline_tokens(all_tokens, lines);
 
     // Filter out zero-length tokens before the sweep line overlap resolution.
-    // Unknown captures are already filtered at collection time (apply_capture_mapping returns None).
+    // Unknown captures are already filtered at collection time (CaptureResult::Suppressed → continue).
     all_tokens.retain(|token| token.length > 0);
 
     let all_tokens = filter_by_injection_regions(all_tokens, active_injection_regions, lines);
@@ -525,16 +525,18 @@ pub(super) fn finalize_tokens(
     let mut last_start = 0usize;
 
     for token in all_tokens {
-        // Transparent tokens (empty mapped_name from apply_capture_mapping) may reach here
-        // after sweep-line processing; they are filtered when map_capture_to_token_type_and_modifiers
-        // returns None for the empty string.
+        let TokenKind::Mapped(ref type_name) = token.kind else {
+            // Transparent or NoneCapture tokens should not reach delta encoding,
+            // but if they do, skip silently.
+            continue;
+        };
         let Some((token_type, token_modifiers_bitset)) =
-            map_capture_to_token_type_and_modifiers(&token.mapped_name)
+            map_capture_to_token_type_and_modifiers(type_name)
         else {
             log::warn!(
                 target: "kakehashi::semantic",
                 "Skipping token with unknown type '{}' at line {} col {}",
-                token.mapped_name, token.line, token.column
+                type_name, token.line, token.column
             );
             continue;
         };
@@ -569,6 +571,11 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// Shorthand for `TokenKind::Mapped(name.to_string())`.
+    fn mapped(name: &str) -> TokenKind {
+        TokenKind::Mapped(name.to_string())
+    }
+
     /// Helper to create a RawToken with explicit priority (node_byte_len defaults to 0)
     fn make_token_with_priority(
         line: usize,
@@ -583,11 +590,35 @@ mod tests {
             line,
             column,
             length,
-            mapped_name: name.to_string(),
+            kind: mapped(name),
             depth,
             pattern_index,
             priority,
             node_byte_len: 0,
+        }
+    }
+
+    /// Helper to create a RawToken with all fields explicit.
+    #[allow(clippy::too_many_arguments)]
+    fn make_token_full(
+        line: usize,
+        column: usize,
+        length: usize,
+        kind: TokenKind,
+        depth: usize,
+        pattern_index: usize,
+        priority: u32,
+        node_byte_len: usize,
+    ) -> RawToken {
+        RawToken {
+            line,
+            column,
+            length,
+            kind,
+            depth,
+            pattern_index,
+            priority,
+            node_byte_len,
         }
     }
 
@@ -714,12 +745,12 @@ mod tests {
     // ── sweep line (split_overlapping_tokens) tests ──────────────────
 
     /// Helper to extract RawTokens from split_overlapping_tokens output for assertion.
-    /// Returns (column, length, mapped_name) tuples sorted by position.
-    fn extract_fragments(tokens: Vec<RawToken>) -> Vec<(usize, usize, String)> {
+    /// Returns (column, length, kind) tuples sorted by position.
+    fn extract_fragments(tokens: Vec<RawToken>) -> Vec<(usize, usize, TokenKind)> {
         let result = split_overlapping_tokens(tokens);
         result
             .into_iter()
-            .map(|t| (t.column, t.length, t.mapped_name.clone()))
+            .map(|t| (t.column, t.length, t.kind))
             .collect()
     }
 
@@ -733,10 +764,7 @@ mod tests {
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![
-                (0, 3, "keyword".to_string()),
-                (5, 4, "variable".to_string()),
-            ]
+            vec![(0, 3, mapped("keyword")), (5, 4, mapped("variable")),]
         );
     }
 
@@ -752,9 +780,9 @@ mod tests {
         assert_eq!(
             fragments,
             vec![
-                (0, 3, "keyword".to_string()),
-                (3, 4, "variable".to_string()),
-                (7, 3, "keyword".to_string()),
+                (0, 3, mapped("keyword")),
+                (3, 4, mapped("variable")),
+                (7, 3, mapped("keyword")),
             ]
         );
     }
@@ -773,11 +801,11 @@ mod tests {
         assert_eq!(
             fragments,
             vec![
-                (0, 2, "keyword".to_string()),
-                (2, 3, "variable".to_string()),
-                (5, 3, "keyword".to_string()),
-                (8, 4, "string".to_string()),
-                (12, 3, "keyword".to_string()),
+                (0, 2, mapped("keyword")),
+                (2, 3, mapped("variable")),
+                (5, 3, mapped("keyword")),
+                (8, 4, mapped("string")),
+                (12, 3, mapped("keyword")),
             ]
         );
     }
@@ -795,7 +823,7 @@ mod tests {
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![(0, 5, "variable".to_string()), (5, 5, "string".to_string()),]
+            vec![(0, 5, mapped("variable")), (5, 5, mapped("string")),]
         );
     }
 
@@ -808,7 +836,7 @@ mod tests {
             make_token(0, 0, 5, "type.builtin", 0, 10),
         ];
         let fragments = extract_fragments(tokens);
-        assert_eq!(fragments, vec![(0, 5, "type.builtin".to_string())]);
+        assert_eq!(fragments, vec![(0, 5, mapped("type.builtin"))]);
     }
 
     #[test]
@@ -820,7 +848,7 @@ mod tests {
             make_token(0, 0, 5, "keyword", 1, 0),
         ];
         let fragments = extract_fragments(tokens);
-        assert_eq!(fragments, vec![(0, 5, "keyword".to_string())]);
+        assert_eq!(fragments, vec![(0, 5, mapped("keyword"))]);
     }
 
     #[test]
@@ -836,11 +864,11 @@ mod tests {
         assert_eq!(
             fragments,
             vec![
-                (0, 5, "keyword".to_string()),
-                (5, 3, "variable".to_string()),
-                (8, 4, "string".to_string()),
-                (12, 3, "variable".to_string()),
-                (15, 5, "keyword".to_string()),
+                (0, 5, mapped("keyword")),
+                (5, 3, mapped("variable")),
+                (8, 4, mapped("string")),
+                (12, 3, mapped("variable")),
+                (15, 5, mapped("keyword")),
             ]
         );
     }
@@ -854,7 +882,7 @@ mod tests {
             make_token(0, 0, 5, "variable", 0, 1),
         ];
         let fragments = extract_fragments(tokens);
-        assert_eq!(fragments, vec![(0, 5, "variable".to_string())]);
+        assert_eq!(fragments, vec![(0, 5, mapped("variable"))]);
     }
 
     #[test]
@@ -868,10 +896,7 @@ mod tests {
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![
-                (0, 5, "keyword".to_string()),
-                (5, 10, "variable".to_string()),
-            ]
+            vec![(0, 5, mapped("keyword")), (5, 10, mapped("variable")),]
         );
     }
 
@@ -889,22 +914,22 @@ mod tests {
         let line0: Vec<_> = result
             .iter()
             .filter(|t| t.line == 0)
-            .map(|t| (t.column, t.length, t.mapped_name.clone()))
+            .map(|t| (t.column, t.length, t.kind.clone()))
             .collect();
         let line1: Vec<_> = result
             .iter()
             .filter(|t| t.line == 1)
-            .map(|t| (t.column, t.length, t.mapped_name.clone()))
+            .map(|t| (t.column, t.length, t.kind.clone()))
             .collect();
         assert_eq!(
             line0,
             vec![
-                (0, 3, "keyword".to_string()),
-                (3, 4, "variable".to_string()),
-                (7, 3, "keyword".to_string()),
+                (0, 3, mapped("keyword")),
+                (3, 4, mapped("variable")),
+                (7, 3, mapped("keyword")),
             ]
         );
-        assert_eq!(line1, vec![(2, 3, "string".to_string())]);
+        assert_eq!(line1, vec![(2, 3, mapped("string"))]);
     }
 
     #[test]
@@ -918,7 +943,7 @@ mod tests {
             make_token(0, 0, 3, "comment", 0, 10), // later pattern — wins
         ];
         let fragments = extract_fragments(tokens);
-        assert_eq!(fragments, vec![(0, 3, "comment".to_string())]);
+        assert_eq!(fragments, vec![(0, 3, mapped("comment"))]);
     }
 
     // ── injection region exclusion tests ──────────────────────────────
@@ -1104,7 +1129,7 @@ mod tests {
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![(0, 10, "keyword".to_string())],
+            vec![(0, 10, mapped("keyword"))],
             "priority 100 should beat priority 90, regardless of pattern_index"
         );
     }
@@ -1308,7 +1333,7 @@ mod tests {
 
     #[test]
     fn split_around_preserves_token_metadata() {
-        // Verify fragments retain mapped_name, depth, pattern_index, priority
+        // Verify fragments retain kind, depth, pattern_index, priority
         let token = make_token(1, 0, 20, "markup.raw.block", 0, 5);
         let regions = vec![InjectionRegion {
             start_line: 1,
@@ -1320,7 +1345,7 @@ mod tests {
         let frags = split_host_token_around_regions(&token, &intervals);
         assert_eq!(frags.len(), 2);
         for frag in &frags {
-            assert_eq!(frag.mapped_name, "markup.raw.block");
+            assert_eq!(frag.kind, mapped("markup.raw.block"));
             assert_eq!(frag.depth, 0);
             assert_eq!(frag.pattern_index, 5);
             assert_eq!(frag.priority, 100);
@@ -1390,13 +1415,13 @@ mod tests {
 
     #[test]
     fn split_multiline_preserves_metadata() {
-        // Verify that split fragments retain depth, pattern_index, and mapped_name.
+        // Verify that split fragments retain depth, pattern_index, and kind.
         let lines = &["ab", "cd"];
         let tokens = vec![make_token(0, 0, 5, "string", 1, 42)];
         let result = split_multiline_tokens(tokens, lines);
         assert_eq!(result.len(), 2);
         for frag in &result {
-            assert_eq!(frag.mapped_name, "string");
+            assert_eq!(frag.kind, mapped("string"));
             assert_eq!(frag.depth, 1);
             assert_eq!(frag.pattern_index, 42);
         }
@@ -1418,36 +1443,9 @@ mod tests {
         // Result: string[0,5), number[6,7), string[15,20)
         // The @none intervals [5,6) and [7,15) should be empty (no token)
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 20,
-                mapped_name: "string".to_string(),
-                depth: 0,
-                pattern_index: 25,
-                priority: 100,
-                node_byte_len: 40,
-            },
-            RawToken {
-                line: 0,
-                column: 5,
-                length: 10,
-                mapped_name: "none".to_string(),
-                depth: 0,
-                pattern_index: 1,
-                priority: 100,
-                node_byte_len: 10,
-            },
-            RawToken {
-                line: 0,
-                column: 6,
-                length: 1,
-                mapped_name: "number".to_string(),
-                depth: 0,
-                pattern_index: 20,
-                priority: 100,
-                node_byte_len: 1,
-            },
+            make_token_full(0, 0, 20, mapped("string"), 0, 25, 100, 40),
+            make_token_full(0, 5, 10, TokenKind::NoneCapture, 0, 1, 100, 10),
+            make_token_full(0, 6, 1, mapped("number"), 0, 20, 100, 1),
         ];
         let result = finalize_tokens(tokens, &[], &["12345678901234567890"]);
         let SemanticTokensResult::Tokens(st) = result.expect("should produce tokens") else {
@@ -1476,8 +1474,8 @@ mod tests {
 
     #[test]
     fn split_transparent_token_creates_breakpoint_only() {
-        // A transparent token (empty mapped_name) creates breakpoints but does
-        // not compete for winning — the best visible token wins each interval.
+        // A transparent token (`TokenKind::Transparent`) creates breakpoints but
+        // does not compete for winning — the best visible token wins each interval.
         //
         // Simulates: block_continuation `> ` at col 0-2 (transparent, p=100, nbl=3)
         //            fenced_code_block at col 0-10 (visible "string", p=90, nbl=50)
@@ -1486,41 +1484,14 @@ mod tests {
         // Expected: fenced_code_block wins both intervals (smaller nbl at same priority)
         //           → merged into single [0,10) "string" token
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 2,
-                mapped_name: String::new(), // transparent
-                depth: 0,
-                pattern_index: 50,
-                priority: 100,
-                node_byte_len: 3,
-            },
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "string".to_string(), // fenced_code_block
-                depth: 0,
-                pattern_index: 47,
-                priority: 90,
-                node_byte_len: 50,
-            },
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "keyword".to_string(), // block_quote
-                depth: 0,
-                pattern_index: 107,
-                priority: 90,
-                node_byte_len: 200,
-            },
+            make_token_full(0, 0, 2, TokenKind::Transparent, 0, 50, 100, 3), // transparent
+            make_token_full(0, 0, 10, mapped("string"), 0, 47, 90, 50),      // fenced_code_block
+            make_token_full(0, 0, 10, mapped("keyword"), 0, 107, 90, 200),   // block_quote
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![(0, 10, "string".to_string())],
+            vec![(0, 10, mapped("string"))],
             "Transparent tokens are breakpoint-only; best visible token wins"
         );
     }
@@ -1530,31 +1501,13 @@ mod tests {
         // When ALL tokens covering an interval are transparent,
         // no token is emitted for that interval.
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 5,
-                mapped_name: String::new(), // transparent
-                depth: 0,
-                pattern_index: 10,
-                priority: 100,
-                node_byte_len: 5,
-            },
-            RawToken {
-                line: 0,
-                column: 5,
-                length: 5,
-                mapped_name: "keyword".to_string(), // visible
-                depth: 0,
-                pattern_index: 10,
-                priority: 100,
-                node_byte_len: 5,
-            },
+            make_token_full(0, 0, 5, TokenKind::Transparent, 0, 10, 100, 5), // transparent
+            make_token_full(0, 5, 5, mapped("keyword"), 0, 10, 100, 5),      // visible
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![(5, 5, "keyword".to_string())],
+            vec![(5, 5, mapped("keyword"))],
             "Transparent-only interval [0,5) should produce no token"
         );
     }
@@ -1565,31 +1518,13 @@ mod tests {
         // The smaller node (fenced_code_block, nbl=50) should win over the larger node
         // (block_quote, nbl=200) because it's more specific.
         let tokens = vec![
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "keyword".to_string(), // block_quote → markup.quote
-                depth: 0,
-                pattern_index: 107, // later in query file
-                priority: 90,
-                node_byte_len: 200, // larger node
-            },
-            RawToken {
-                line: 0,
-                column: 0,
-                length: 10,
-                mapped_name: "string".to_string(), // fenced_code_block → markup.raw.block
-                depth: 0,
-                pattern_index: 47, // earlier in query file
-                priority: 90,
-                node_byte_len: 50, // smaller, more specific node
-            },
+            make_token_full(0, 0, 10, mapped("keyword"), 0, 107, 90, 200), // block_quote → markup.quote (larger node)
+            make_token_full(0, 0, 10, mapped("string"), 0, 47, 90, 50), // fenced_code_block → markup.raw.block (smaller node)
         ];
         let fragments = extract_fragments(tokens);
         assert_eq!(
             fragments,
-            vec![(0, 10, "string".to_string())],
+            vec![(0, 10, mapped("string"))],
             "Smaller node_byte_len (more specific) should win at same priority/depth"
         );
     }

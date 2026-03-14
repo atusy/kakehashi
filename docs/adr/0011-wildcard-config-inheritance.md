@@ -174,30 +174,32 @@ fn resolve_with_wildcard<V: Merge>(
 }
 ```
 
-**2. Lazy Fallback (apply_capture_mapping pattern)**
+**2. Lazy Fallback (resolve_capture pattern)**
 ```rust
-fn apply_capture_mapping(
+fn resolve_capture(
     capture_name: &str,
     filetype: Option<&str>,
     capture_mappings: Option<&CaptureMappings>,
-) -> String {
+) -> CaptureResult {
     if let Some(mappings) = capture_mappings {
         // Try filetype-specific mapping first
         if let Some(ft) = filetype
             && let Some(lang_mappings) = mappings.get(ft)
             && let Some(mapped) = lang_mappings.highlights.get(capture_name)
         {
-            return mapped.clone();
+            return CaptureResult::Mapped(mapped.clone());
         }
 
         // Try wildcard mapping
         if let Some(wildcard_mappings) = mappings.get("_")
             && let Some(mapped) = wildcard_mappings.highlights.get(capture_name)
         {
-            return mapped.clone();
+            return CaptureResult::Mapped(mapped.clone());
         }
     }
-    capture_name.to_string()
+    // Falls through to NoneCapture / Transparent / Mapped based on
+    // capture_name (simplified — see legend.rs for full logic)
+    CaptureResult::Mapped(capture_name.to_string())
 }
 ```
 
@@ -210,13 +212,13 @@ Both approaches produce identical user-facing behavior:
 - **Eager merge**: Creates merged config upfront, single HashMap lookup per capture
 - **Lazy fallback**: Two HashMap lookups per capture (specific then wildcard), but avoids creating intermediate merged structure
 
-The existing `apply_capture_mapping()` in `semantic.rs` already implements lazy fallback for runtime semantic token resolution. The new `resolve_with_wildcard()` provides eager merge for configuration preprocessing when needed.
+The existing `resolve_capture()` in `legend.rs` already implements lazy fallback for runtime semantic token resolution. The new `resolve_with_wildcard()` provides eager merge for configuration preprocessing when needed.
 
 ## Implementation Phases
 
 ### Phase 1: captureMappings Wildcard (Completed - Sprint 121, PBI-152)
 - [x] Implement `resolve_with_wildcard()` function (commit 2c62805)
-- [x] Apply wildcard resolution to `captureMappings` lookup (existing `apply_capture_mapping()` already implements lazy fallback)
+- [x] Apply wildcard resolution to `captureMappings` lookup (existing `resolve_capture()` already implements lazy fallback)
 - [x] Unit tests for wildcard resolution with various combinations (3 tests: wildcard-only, merge, override)
 
 ### Phase 2: languages Wildcard (Completed - Sprint 122, PBI-153)

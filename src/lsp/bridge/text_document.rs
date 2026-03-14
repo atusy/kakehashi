@@ -28,4 +28,6 @@ mod prepare_rename;
 mod references;
 mod rename;
 mod signature_help;
+#[cfg(test)]
+pub(in crate::lsp::bridge) mod test_helpers;
 mod type_definition;

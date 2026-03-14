@@ -139,56 +139,11 @@ pub(crate) fn virtual_uri_to_lsp_uri(virtual_uri: &VirtualDocumentUri) -> Uri {
 
 #[cfg(test)]
 mod tests {
-    // ==========================================================================
-    // Test helpers
-    // ==========================================================================
-
-    /// Assert that a request uses a virtual URI with the expected extension.
-    fn assert_uses_virtual_uri(request: &impl serde::Serialize, extension: &str) {
-        let request = serde_json::to_value(request).unwrap();
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
-        // Use url crate for robust parsing (handles query strings with slashes, fragments, etc.)
-        let url = url::Url::parse(uri_str).expect("URI should be parseable");
-        let filename = url
-            .path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or("");
-        assert!(
-            filename.starts_with("kakehashi-virtual-uri-")
-                && filename.ends_with(&format!(".{}", extension)),
-            "Request should use virtual URI with .{} extension: {}",
-            extension,
-            uri_str
-        );
-    }
-
-    #[test]
-    fn assert_uses_virtual_uri_handles_fragments() {
-        // URIs with fragments (e.g., vscode-notebook-cell://) preserve the fragment
-        // The helper should correctly detect the extension before the fragment
-        let request = serde_json::json!({
-            "params": {
-                "textDocument": {
-                    "uri": "vscode-notebook-cell://authority/path/kakehashi-virtual-uri-REGION.py#cell-id"
-                }
-            }
-        });
-
-        // This should pass - the extension is .py even though URI ends with #cell-id
-        assert_uses_virtual_uri(&request, "py");
-    }
-
-    // ==========================================================================
-    // Column offset tests for build_position_based_request
-    // ==========================================================================
-
+    use super::super::super::text_document::test_helpers::{
+        assert_uses_virtual_uri, test_host_uri,
+    };
     use super::*;
     use tower_lsp_server::ls_types::Position;
-
-    fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
-        let url = url::Url::parse("file:///project/doc.md").unwrap();
-        crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
-    }
 
     #[test]
     fn position_request_first_line_applies_column_offset() {

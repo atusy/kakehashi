@@ -212,6 +212,7 @@ fn transform_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, host_uri: 
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use serde_json::json;
 
@@ -527,28 +528,12 @@ mod tests {
         assert!(related.is_empty());
     }
 
-    fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
-        let url = url::Url::parse("file:///project/doc.md").unwrap();
-        crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
-    }
-
     #[test]
     fn diagnostic_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request = build_diagnostic_request(&virtual_uri, RequestId::new(42), None);
 
-        let json = serde_json::to_value(&request).unwrap();
-        let uri_str = json["params"]["textDocument"]["uri"].as_str().unwrap();
-        let url = url::Url::parse(uri_str).expect("URI should be parseable");
-        let filename = url
-            .path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or("");
-        assert!(
-            filename.starts_with("kakehashi-virtual-uri-") && filename.ends_with(".lua"),
-            "Request should use virtual URI with .lua extension: {}",
-            uri_str
-        );
+        assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]

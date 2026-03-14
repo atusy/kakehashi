@@ -15,13 +15,14 @@ use std::collections::HashMap;
 use tree_sitter::{Parser, Tree};
 
 use super::injection::{InjectionContext, MAX_INJECTION_DEPTH};
-use super::token_collector::{InjectionRegion, RawToken, byte_to_utf16_col, collect_host_tokens};
+use super::token_collector::{InjectionRegion, RawToken, collect_host_tokens};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     compute_included_ranges, intersect_included_ranges, parse_with_ranges,
     sub_select_included_ranges,
 };
+use crate::text::position::byte_to_utf16_col;
 
 /// Maximum number of parsers to cache per Rayon worker thread.
 ///
@@ -1002,9 +1003,14 @@ local x = 42
         );
 
         // Look for the "local" keyword token (should be at line 3, col 0)
-        let has_local_keyword = tokens
-            .iter()
-            .any(|t| t.line == 3 && t.column == 0 && t.mapped_name == "keyword");
+        let has_local_keyword = tokens.iter().any(|t| {
+            t.line == 3
+                && t.column == 0
+                && t.kind
+                    == crate::analysis::semantic::token_collector::TokenKind::Mapped(
+                        "keyword".to_string(),
+                    )
+        });
 
         assert!(
             has_local_keyword,

@@ -1330,7 +1330,7 @@ mod tests {
         use std::sync::Arc;
         use tower_lsp_server::ls_types::Position;
 
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -1410,7 +1410,7 @@ mod tests {
         use std::sync::Arc;
         use tower_lsp_server::ls_types::Position;
 
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -1556,7 +1556,7 @@ mod tests {
     /// 3. Return success if the new server initializes correctly
     #[tokio::test]
     async fn failed_connection_retry_removes_cache_and_spawns_new_server() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -1623,7 +1623,7 @@ mod tests {
     /// and user's subsequent request triggers recovery with a working server.
     #[tokio::test]
     async fn recovery_works_after_initialization_timeout() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -1708,7 +1708,7 @@ mod tests {
     /// can be used for other requests.
     #[tokio::test]
     async fn send_didclose_notification_keeps_connection_open() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -1766,7 +1766,7 @@ mod tests {
     /// didClose notifications and be cleaned up from tracking structures.
     #[tokio::test]
     async fn close_host_document_sends_didclose_for_all_virtual_docs() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -2113,7 +2113,7 @@ mod tests {
     /// This test verifies the shutdown request is properly formatted and sent.
     #[tokio::test]
     async fn shutdown_sends_lsp_shutdown_request_and_waits_for_response() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -2347,7 +2347,7 @@ mod tests {
     async fn shutdown_with_pending_requests_fails_requests_then_completes() {
         use std::sync::Arc;
 
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -3188,7 +3188,7 @@ mod tests {
     /// Test that ensure_server_ready with a real server eventually transitions to Ready.
     #[tokio::test]
     async fn ensure_server_ready_with_real_server_transitions_to_ready() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 
@@ -3336,7 +3336,7 @@ mod tests {
     /// Test that get_or_create_connection_wait_ready returns immediately when Ready.
     #[tokio::test]
     async fn get_or_create_connection_wait_ready_returns_immediately_when_ready() {
-        if !lua_ls_available() {
+        if !is_lua_ls_available() {
             return;
         }
 

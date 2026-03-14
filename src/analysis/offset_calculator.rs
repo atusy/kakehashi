@@ -141,7 +141,7 @@ fn apply_offset_to_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::language::injection::DEFAULT_OFFSET;
+    use crate::language::injection::InjectionOffset;
     use rstest::rstest;
 
     /// Parameterized test for offset clamping edge cases
@@ -159,7 +159,7 @@ mod tests {
     #[case::end_column_past_eof(
         "hello",
         ByteRange::new(0, 5),
-        InjectionOffset::new(0, 0, 0, 5),
+        InjectionOffset { start_row: 0, start_column: 0, end_row: 0, end_column: 5 },
         "offsets extending past EOF don't cause panics - \
          a malformed query might specify #offset! @injection.content 0 0 0 1 \
          which extends the end past the buffer"
@@ -167,13 +167,13 @@ mod tests {
     #[case::start_past_end(
         "hello",
         ByteRange::new(0, 5),
-        InjectionOffset::new(0, 10, 0, 0),
+        InjectionOffset { start_row: 0, start_column: 10, end_row: 0, end_column: 0 },
         "offset makes start > end - should normalize to empty range"
     )]
     #[case::end_row_past_eof(
         "line 1\nline 2",
         ByteRange::new(0, 6),
-        InjectionOffset::new(0, 0, 5, 0),
+        InjectionOffset { start_row: 0, start_column: 0, end_row: 5, end_column: 0 },
         "row offset moving end beyond last line"
     )]
     fn test_offset_clamping_edge_cases(
@@ -212,7 +212,12 @@ mod tests {
         // Use text long enough to accommodate the range
         let text = "0123456789012345678901234567890";
         let byte_range = ByteRange::new(10, 20);
-        let offset = InjectionOffset::new(0, 5, 0, -3); // Column offsets: +5 start, -3 end
+        let offset = InjectionOffset {
+            start_row: 0,
+            start_column: 5,
+            end_row: 0,
+            end_column: -3,
+        }; // Column offsets: +5 start, -3 end
 
         let effective = calculate_effective_range(text, byte_range, offset);
 
@@ -225,7 +230,7 @@ mod tests {
         let text = "0123456789012345678901234567890";
         let byte_range = ByteRange::new(10, 20);
 
-        let effective = calculate_effective_range(text, byte_range, DEFAULT_OFFSET);
+        let effective = calculate_effective_range(text, byte_range, InjectionOffset::default());
 
         assert_eq!(effective.start, 10);
         assert_eq!(effective.end, 20);
@@ -235,7 +240,12 @@ mod tests {
     fn test_calculate_effective_range_column_only() {
         let text = "line 1\nline 2\nline 3";
         let byte_range = ByteRange::new(7, 13); // "line 2"
-        let offset = InjectionOffset::new(0, 3, 0, -1); // Column offsets only
+        let offset = InjectionOffset {
+            start_row: 0,
+            start_column: 3,
+            end_row: 0,
+            end_column: -1,
+        }; // Column offsets only
 
         let effective = calculate_effective_range(text, byte_range, offset);
 
@@ -248,7 +258,12 @@ mod tests {
         let text = "line 1\nline 2\nline 3 with content\nline 4";
         // Node starts at byte 7 (start of "line 2")
         let byte_range = ByteRange::new(7, 13); // "line 2"
-        let offset = InjectionOffset::new(1, 0, 0, 0); // Move start down 1 row
+        let offset = InjectionOffset {
+            start_row: 1,
+            start_column: 0,
+            end_row: 0,
+            end_column: 0,
+        }; // Move start down 1 row
 
         let effective = calculate_effective_range(text, byte_range, offset);
 
@@ -265,7 +280,12 @@ mod tests {
         let text = "line 1\nline 2\nline 3";
         // Node starts at byte 14 (start of "line 3")
         let byte_range = ByteRange::new(14, 20);
-        let offset = InjectionOffset::new(-1, 0, 0, 0); // Move start up 1 row
+        let offset = InjectionOffset {
+            start_row: -1,
+            start_column: 0,
+            end_row: 0,
+            end_column: 0,
+        }; // Move start up 1 row
 
         let effective = calculate_effective_range(text, byte_range, offset);
 
@@ -280,7 +300,12 @@ mod tests {
         // Node starts at byte 7 (start of "line 2")
         let byte_range = ByteRange::new(7, 13);
         // Move start down 1 row and 5 columns right
-        let offset = InjectionOffset::new(1, 5, 0, 0);
+        let offset = InjectionOffset {
+            start_row: 1,
+            start_column: 5,
+            end_row: 0,
+            end_column: 0,
+        };
 
         let effective = calculate_effective_range(text, byte_range, offset);
 
@@ -299,7 +324,12 @@ mod tests {
         // The offset (0, 3, 0, 0) means start at column 3 of the same row
         let text = "---@param x number\nfunction foo(x) end";
         let byte_range = ByteRange::new(0, 18); // The doc comment
-        let offset = InjectionOffset::new(0, 3, 0, 0); // Skip "---"
+        let offset = InjectionOffset {
+            start_row: 0,
+            start_column: 3,
+            end_row: 0,
+            end_column: 0,
+        }; // Skip "---"
 
         let effective = calculate_effective_range(text, byte_range, offset);
 
@@ -319,7 +349,12 @@ fn test_markdown_frontmatter_offset() {
     let byte_range = ByteRange::new(0, 41); // "---\ntitle...\n---\n"
 
     // Offset: start_row=1, start_col=0, end_row=-1, end_col=0
-    let offset = InjectionOffset::new(1, 0, -1, 0);
+    let offset = InjectionOffset {
+        start_row: 1,
+        start_column: 0,
+        end_row: -1,
+        end_column: 0,
+    };
 
     let effective = calculate_effective_range(text, byte_range, offset);
 

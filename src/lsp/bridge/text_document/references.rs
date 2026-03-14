@@ -149,14 +149,9 @@ fn transform_references_response_to_host(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::test_host_uri;
     use super::RegionOffset;
     use super::transform_references_response_to_host;
-
-    /// Standard test host URI used across most tests.
-    fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
-        let url = url::Url::parse("file:///project/doc.md").unwrap();
-        crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
-    }
 
     // ==========================================================================
     // References response transformation tests

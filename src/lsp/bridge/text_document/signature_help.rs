@@ -115,72 +115,9 @@ impl LanguageServerPool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::*;
     use super::*;
     use rstest::rstest;
-    use tower_lsp_server::ls_types::Position;
-    use url::Url;
-
-    // ==========================================================================
-    // Test helpers
-    // ==========================================================================
-
-    /// Standard test request ID used across most tests.
-    fn test_request_id() -> RequestId {
-        RequestId::new(42)
-    }
-
-    /// Standard test host URI used across most tests.
-    fn test_host_uri() -> tower_lsp_server::ls_types::Uri {
-        let url = Url::parse("file:///project/doc.md").unwrap();
-        crate::lsp::lsp_impl::url_to_uri(&url).expect("test URL should convert to URI")
-    }
-
-    /// Standard test position (line 5, character 10).
-    fn test_position() -> Position {
-        Position {
-            line: 5,
-            character: 10,
-        }
-    }
-
-    /// Assert that a request uses a virtual URI with the expected extension.
-    fn assert_uses_virtual_uri(request: &impl serde::Serialize, extension: &str) {
-        let request = serde_json::to_value(request).unwrap();
-        let uri_str = request["params"]["textDocument"]["uri"].as_str().unwrap();
-        // Use url crate for robust parsing (handles query strings with slashes, fragments, etc.)
-        let url = url::Url::parse(uri_str).expect("URI should be parseable");
-        let filename = url
-            .path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or("");
-        assert!(
-            filename.starts_with("kakehashi-virtual-uri-")
-                && filename.ends_with(&format!(".{}", extension)),
-            "Request should use virtual URI with .{} extension: {}",
-            extension,
-            uri_str
-        );
-    }
-
-    /// Assert that a position-based request has correct structure and translated coordinates.
-    fn assert_position_request(
-        request: &impl serde::Serialize,
-        expected_method: &str,
-        expected_virtual_line: u64,
-    ) {
-        let request = serde_json::to_value(request).unwrap();
-        assert_eq!(request["jsonrpc"], "2.0");
-        assert_eq!(request["id"], 42);
-        assert_eq!(request["method"], expected_method);
-        assert_eq!(
-            request["params"]["position"]["line"], expected_virtual_line,
-            "Position line should be translated"
-        );
-        assert_eq!(
-            request["params"]["position"]["character"], 10,
-            "Character should remain unchanged"
-        );
-    }
 
     // ==========================================================================
     // SignatureHelp request tests
@@ -211,34 +148,6 @@ mod tests {
         );
 
         assert_position_request(&request, "textDocument/signatureHelp", 2);
-    }
-
-    #[test]
-    fn position_translation_saturates_on_underflow() {
-        // Simulate race condition: host_position.line (2) < region_start_line (5)
-        // This should NOT panic, instead saturate to line 0
-        let host_position = Position {
-            line: 2, // Less than region_start_line
-            character: 10,
-        };
-
-        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_signature_help_request(
-            &virtual_uri,
-            host_position,
-            &RegionOffset::new(5, 0), // region_start_line > host_position.line
-            test_request_id(),
-        );
-
-        let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(
-            json["params"]["position"]["line"], 0,
-            "Underflow should saturate to line 0, not panic"
-        );
-        assert_eq!(
-            json["params"]["position"]["character"], 10,
-            "Character should remain unchanged"
-        );
     }
 
     // ==========================================================================
