@@ -826,32 +826,40 @@ pub(crate) fn detect_injection<'a>(
     sorted_injections.sort_by(|a, b| {
         // Sort by start byte (ascending), then by end byte (descending)
         // This ensures outer injections come before inner ones
-        a.0.cmp(&b.0).then(b.1.cmp(&a.1))
+        a.start_byte
+            .cmp(&b.start_byte)
+            .then(b.end_byte.cmp(&a.end_byte))
     });
 
     // Build the language hierarchy from outermost to innermost
     let mut hierarchy = vec![base_language.to_string()];
-    for (_, _, lang, _, _) in &sorted_injections {
-        hierarchy.push(lang.clone());
+    for region in &sorted_injections {
+        hierarchy.push(region.language.clone());
     }
 
     // Return the innermost content node and its pattern index
-    let (_, _, _, innermost_node, pattern_index) = sorted_injections.last().cloned()?;
+    let innermost = sorted_injections.last()?;
 
-    Some((hierarchy, innermost_node, pattern_index))
+    Some((hierarchy, innermost.content_node, innermost.pattern_index))
 }
 
-/// Represents an injection region with its metadata
-type InjectionRegion<'a> = (usize, usize, String, Node<'a>, usize);
+/// Represents an injection region with its metadata (unresolved intermediate data).
+struct RawInjectionRegion<'a> {
+    start_byte: usize,
+    end_byte: usize,
+    language: String,
+    content_node: Node<'a>,
+    pattern_index: usize,
+}
 
 /// Collects all injection regions that contain the given node
-/// Returns tuples of (start_byte, end_byte, language, content_node, pattern_index)
+/// Returns a list of `RawInjectionRegion` values for each injection containing the node.
 fn collect_injection_regions<'a>(
     node: &Node<'a>,
     root: &Node<'a>,
     text: &str,
     injection_query: Option<&Query>,
-) -> Option<Vec<InjectionRegion<'a>>> {
+) -> Option<Vec<RawInjectionRegion<'a>>> {
     let query = injection_query?;
 
     // Run the query on the entire tree
@@ -870,13 +878,13 @@ fn collect_injection_regions<'a>(
 
             // Only keep the first injection for each unique range
             // This handles cases where multiple patterns match the same node
-            injections_map.entry(key).or_insert((
-                content_node.start_byte(),
-                content_node.end_byte(),
+            injections_map.entry(key).or_insert(RawInjectionRegion {
+                start_byte: content_node.start_byte(),
+                end_byte: content_node.end_byte(),
                 language,
                 content_node,
                 pattern_index,
-            ));
+            });
         }
     }
 

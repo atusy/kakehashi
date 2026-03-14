@@ -37,7 +37,7 @@ use crate::language::LanguageEvent;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
-use crate::lsp::bridge::coordinator::InjectionRegion;
+use crate::lsp::bridge::coordinator::BridgeInjection;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::settings_manager::SettingsManager;
 use tokio::sync::Mutex;
@@ -648,7 +648,7 @@ impl Kakehashi {
     /// # Lock Safety
     /// The document store lock is held only to clone the tree and text, then
     /// released before the tree traversal. No DashMap deadlock risk.
-    fn resolve_injection_data(&self, uri: &Url) -> Vec<InjectionRegion> {
+    fn resolve_injection_data(&self, uri: &Url) -> Vec<BridgeInjection> {
         // Get the host language for this document
         let Some(host_language) = self.get_language_for_document(uri) else {
             return Vec::new();
@@ -684,7 +684,7 @@ impl Kakehashi {
             return Vec::new();
         }
 
-        // Build InjectionRegion for each injection
+        // Build BridgeInjection for each injection
         // ADR-0019: Use RegionIdTracker with position-based keys
         // No document lock held here - safe to access region_id_tracker
         regions
@@ -704,7 +704,7 @@ impl Kakehashi {
                     region.content_node.byte_range(),
                     included_ranges.as_deref(),
                 );
-                InjectionRegion {
+                BridgeInjection {
                     language: region.language.clone(),
                     region_id: region_id.to_string(),
                     content,
@@ -811,7 +811,7 @@ impl Kakehashi {
     /// This warms up language servers (spawn + handshake + didOpen) in the background
     /// for injection regions found in the document. Downstream servers receive
     /// document content immediately, enabling faster diagnostic responses.
-    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<InjectionRegion>) {
+    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<BridgeInjection>) {
         // Get the host language for this document
         let Some(host_language) = self.get_language_for_document(uri) else {
             return;

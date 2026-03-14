@@ -33,7 +33,7 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         host_uri: &url::Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
-        injections: Vec<crate::lsp::bridge::coordinator::InjectionRegion>,
+        injections: Vec<crate::lsp::bridge::coordinator::BridgeInjection>,
     ) {
         // Wait for the server to be ready (handshake complete)
         let handle = match self
@@ -108,14 +108,14 @@ mod tests {
         let host_uri = test_host_uri("eager_open");
         let host_uri_lsp = url_to_uri(&host_uri);
 
-        use super::super::super::coordinator::InjectionRegion;
+        use super::super::super::coordinator::BridgeInjection;
         let injections = vec![
-            InjectionRegion {
+            BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('hello')".to_string(),
             },
-            InjectionRegion {
+            BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_1.to_string(),
                 content: "print('world')".to_string(),
@@ -162,8 +162,8 @@ mod tests {
         let host_uri = test_host_uri("idempotent");
         let host_uri_lsp = url_to_uri(&host_uri);
 
-        use super::super::super::coordinator::InjectionRegion;
-        let injections = vec![InjectionRegion {
+        use super::super::super::coordinator::BridgeInjection;
+        let injections = vec![BridgeInjection {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),

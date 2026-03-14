@@ -46,7 +46,7 @@ impl LanguageServerPool {
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         host_uri: &Url,
-        injections: &[crate::lsp::bridge::coordinator::InjectionRegion],
+        injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
     ) {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
         let host_uri_lsp = match crate::lsp::lsp_impl::url_to_uri(host_uri) {

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensResult};
 
 use super::legend::map_capture_to_token_type_and_modifiers;
-use super::token_collector::{InjectionRegion, RawToken, TokenKind};
+use super::token_collector::{ActiveInjectionBounds, RawToken, TokenKind};
 
 /// Priority key for token comparison. Higher values win.
 ///
@@ -191,7 +191,10 @@ fn merge_adjacent_fragments(tokens: &mut Vec<RawToken>) {
 ///
 /// Uses lexicographic tuple comparison: `(line, col) >= (start_line, start_col)`
 /// covers all four cases (middle line, start line, end line, single-line region).
-fn is_fully_in_active_injection_region(token: &RawToken, regions: &[InjectionRegion]) -> bool {
+fn is_fully_in_active_injection_region(
+    token: &RawToken,
+    regions: &[ActiveInjectionBounds],
+) -> bool {
     let token_end = token.column + token.length;
     regions.iter().any(|r| {
         (token.line, token.column) >= (r.start_line, r.start_col)
@@ -206,7 +209,10 @@ fn is_fully_in_active_injection_region(token: &RawToken, regions: &[InjectionReg
 /// (e.g., fish `(comment) @comment` + `(comment) @injection.content`), the
 /// host token should survive to the sweep-line algorithm, which splits it
 /// around injection tokens and preserves the host type in uncovered gaps.
-fn is_exact_match_active_injection_region(token: &RawToken, regions: &[InjectionRegion]) -> bool {
+fn is_exact_match_active_injection_region(
+    token: &RawToken,
+    regions: &[ActiveInjectionBounds],
+) -> bool {
     let token_end = token.column + token.length;
     regions.iter().any(|r| {
         token.line == r.start_line
@@ -229,7 +235,7 @@ fn is_exact_match_active_injection_region(token: &RawToken, regions: &[Injection
 fn region_intervals_on_line(
     token_line: usize,
     line_width: usize,
-    regions: &[InjectionRegion],
+    regions: &[ActiveInjectionBounds],
 ) -> Vec<(usize, usize)> {
     let mut intervals = Vec::new();
     for r in regions {
@@ -265,7 +271,7 @@ fn region_intervals_on_line(
 /// so that `split_host_token_around_regions` can look up intervals in O(1)
 /// instead of scanning all regions per token.
 fn build_region_intervals_map(
-    regions: &[InjectionRegion],
+    regions: &[ActiveInjectionBounds],
     lines: &[&str],
 ) -> HashMap<usize, Vec<(usize, usize)>> {
     let mut map: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
@@ -405,7 +411,7 @@ fn apply_none_preprocessing(tokens: Vec<RawToken>) -> Vec<RawToken> {
 ///   are kept (e.g., blockquote `> ` prefix survives, content is removed).
 fn filter_by_injection_regions(
     tokens: Vec<RawToken>,
-    regions: &[InjectionRegion],
+    regions: &[ActiveInjectionBounds],
     lines: &[&str],
 ) -> Vec<RawToken> {
     if regions.is_empty() {
@@ -463,7 +469,7 @@ fn filter_by_injection_regions(
 /// 3. Delta-encodes for LSP protocol
 pub(super) fn finalize_tokens(
     all_tokens: Vec<RawToken>,
-    active_injection_regions: &[InjectionRegion],
+    active_injection_regions: &[ActiveInjectionBounds],
     lines: &[&str],
 ) -> Option<SemanticTokensResult> {
     // Split multiline tokens into per-line tokens before the sweep line,
@@ -924,7 +930,7 @@ mod tests {
             make_token(0, 0, 5, "keyword", 0, 0), // line 0 — outside region
             make_token(3, 0, 12, "string", 0, 0), // line 3 — inside region
         ];
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 2,
             start_col: 0,
             end_line: 4,
@@ -952,7 +958,7 @@ mod tests {
         let tokens = vec![
             make_token(3, 0, 5, "keyword", 1, 0), // injection token
         ];
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 2,
             start_col: 0,
             end_line: 4,
@@ -1107,7 +1113,7 @@ mod tests {
     #[test]
     fn region_intervals_no_overlap_returns_empty() {
         // Token on line 5, region on lines 0-2 → no overlap
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 0,
             start_col: 0,
             end_line: 2,
@@ -1120,7 +1126,7 @@ mod tests {
     #[test]
     fn region_intervals_single_line_region() {
         // Region entirely on line 3: cols 5..15
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 3,
             start_col: 5,
             end_line: 3,
@@ -1133,7 +1139,7 @@ mod tests {
     #[test]
     fn region_intervals_multiline_start_line() {
         // Region on lines 3..5, querying line 3 → start_col..line_width
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 3,
             start_col: 10,
             end_line: 5,
@@ -1146,7 +1152,7 @@ mod tests {
     #[test]
     fn region_intervals_multiline_middle_line() {
         // Region on lines 3..5, querying line 4 → 0..line_width
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 3,
             start_col: 10,
             end_line: 5,
@@ -1159,7 +1165,7 @@ mod tests {
     #[test]
     fn region_intervals_multiline_end_line() {
         // Region on lines 3..5, querying line 5 → 0..end_col
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 3,
             start_col: 10,
             end_line: 5,
@@ -1173,13 +1179,13 @@ mod tests {
     fn region_intervals_multiple_regions_sorted() {
         // Two regions on line 1: cols 5..10 and cols 2..4 → sorted by start
         let regions = vec![
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 5,
                 end_line: 1,
                 end_col: 10,
             },
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 2,
                 end_line: 1,
@@ -1196,7 +1202,7 @@ mod tests {
     fn split_around_no_overlap_token_survives() {
         // Token at cols 0..5, region at cols 10..20 → no overlap on token range
         let token = make_token(1, 0, 5, "string", 0, 0);
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 10,
             end_line: 1,
@@ -1212,7 +1218,7 @@ mod tests {
     fn split_around_partial_overlap_prefix_survives() {
         // Token at cols 0..15, region at cols 5..15 → prefix [0,5) survives
         let token = make_token(1, 0, 15, "string", 0, 0);
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 5,
             end_line: 1,
@@ -1228,7 +1234,7 @@ mod tests {
     fn split_around_partial_overlap_suffix_survives() {
         // Token at cols 5..20, region at cols 5..15 → suffix [15,20) survives
         let token = make_token(1, 5, 15, "string", 0, 0);
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 5,
             end_line: 1,
@@ -1244,7 +1250,7 @@ mod tests {
     fn split_around_region_in_middle_two_fragments() {
         // Token at cols 0..20, region at cols 5..15 → [0,5) and [15,20)
         let token = make_token(1, 0, 20, "string", 0, 0);
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 5,
             end_line: 1,
@@ -1263,13 +1269,13 @@ mod tests {
         // → [0,5), [10,15), [20,30)
         let token = make_token(1, 0, 30, "string", 0, 0);
         let regions = vec![
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 5,
                 end_line: 1,
                 end_col: 10,
             },
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 15,
                 end_line: 1,
@@ -1288,7 +1294,7 @@ mod tests {
     fn split_around_fully_covered_returns_empty() {
         // Token at cols 5..10, region at cols 0..20 → fully covered
         let token = make_token(1, 5, 5, "string", 0, 0);
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 0,
             end_line: 1,
@@ -1303,7 +1309,7 @@ mod tests {
     fn split_around_preserves_token_metadata() {
         // Verify fragments retain kind, depth, pattern_index, priority
         let token = make_token(1, 0, 20, "markup.raw.block", 0, 5);
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 5,
             end_line: 1,
@@ -1323,7 +1329,7 @@ mod tests {
     #[test]
     fn region_intervals_zero_width_region_filtered_out() {
         // A zero-width region (start_col == end_col) should produce no interval
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 1,
             start_col: 5,
             end_line: 1,
@@ -1338,13 +1344,13 @@ mod tests {
         // Two overlapping regions on the same line: (2,8) and (5,12)
         // Both are emitted sorted; the consumer's cursor handles overlap.
         let regions = vec![
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 2,
                 end_line: 1,
                 end_col: 8,
             },
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 5,
                 end_line: 1,
@@ -1361,13 +1367,13 @@ mod tests {
         // Cursor advancement merges overlaps: → [0,2) and [12,20)
         let token = make_token(1, 0, 20, "string", 0, 0);
         let regions = vec![
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 2,
                 end_line: 1,
                 end_col: 8,
             },
-            InjectionRegion {
+            ActiveInjectionBounds {
                 start_line: 1,
                 start_col: 5,
                 end_line: 1,
@@ -1517,7 +1523,7 @@ mod tests {
             make_token(0, 0, 31, "class", 0, 0),   // host heading (full line)
             make_token(0, 11, 8, "keyword", 1, 0), // injection emphasis (**with**)
         ];
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 0,
             start_col: 3,
             end_line: 0,
@@ -1564,7 +1570,7 @@ mod tests {
             make_token(0, 0, 16, "class", 0, 0), // host heading (full line)
         ];
         // No active injection regions (markdown_inline produced nothing)
-        let regions: Vec<InjectionRegion> = vec![];
+        let regions: Vec<ActiveInjectionBounds> = vec![];
 
         let result = finalize_tokens(tokens, &regions, &lines);
         assert!(result.is_some());
@@ -1595,7 +1601,7 @@ mod tests {
             make_token(0, 0, 10, "string", 0, 0), // host container token
             make_token(0, 3, 3, "keyword", 1, 0), // injection token
         ];
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 0,
             start_col: 3,
             end_line: 2,
@@ -1652,7 +1658,7 @@ mod tests {
             make_token(0, 15, 4, "number", 1, 0),  // injection number (#123)
         ];
         // The injection region exactly matches the host comment token
-        let regions = vec![InjectionRegion {
+        let regions = vec![ActiveInjectionBounds {
             start_line: 0,
             start_col: 0,
             end_line: 0,
