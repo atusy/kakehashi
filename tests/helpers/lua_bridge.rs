@@ -62,7 +62,36 @@ pub fn skip_if_lua_ls_unavailable() -> bool {
 /// Callers must keep the `TempDir` alive (e.g., `let (_client, _config_dir) = ...`)
 /// so the temp directory is not deleted while the server is running.
 pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
-    let config_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let (client, config_dir) = init_lua_client(None);
+    (client, config_dir)
+}
+
+/// Create an LspClient with a real workspace directory for lua-language-server.
+///
+/// Unlike [`create_lua_configured_client`], this provides a real `rootUri` and
+/// `workspaceFolders` so that lua-ls can properly index virtual documents and
+/// return non-null hover/completion results.
+///
+/// # Returns
+/// A tuple of:
+/// - An initialized `LspClient`
+/// - The workspace `TempDir` (callers should write test files here)
+/// - The `TempDir` holding the config file
+///
+/// Callers must keep both `TempDir` values alive for the duration of the test.
+pub fn create_lua_configured_client_with_workspace()
+-> (LspClient, tempfile::TempDir, tempfile::TempDir) {
+    let workspace_dir = tempfile::TempDir::new().expect("Failed to create workspace temp dir");
+    let (client, config_dir) = init_lua_client(Some(&workspace_dir));
+    (client, workspace_dir, config_dir)
+}
+
+/// Shared initialization logic for lua-language-server client setup.
+///
+/// When `workspace_dir` is `Some`, sets `rootUri` and `workspaceFolders` so lua-ls
+/// can index virtual documents. When `None`, uses `rootUri: null`.
+fn init_lua_client(workspace_dir: Option<&tempfile::TempDir>) -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("empty.toml");
     std::fs::write(&config_path, "").expect("Failed to write empty config");
     let config_path_str = config_path
@@ -75,13 +104,22 @@ pub fn create_lua_configured_client() -> (LspClient, tempfile::TempDir) {
         .arg(&config_path_str)
         .build();
 
-    // Initialize handshake with language server configuration
+    let (root_uri, workspace_folders) = match workspace_dir {
+        Some(dir) => {
+            let uri = format!("file://{}", dir.path().display());
+            let folders = json!([{ "uri": uri, "name": "test" }]);
+            (json!(uri), folders)
+        }
+        None => (json!(null), json!(null)),
+    };
+
     let _init_response = client.send_request(
         "initialize",
         json!({
             "processId": std::process::id(),
-            "rootUri": null,
+            "rootUri": root_uri,
             "capabilities": {},
+            "workspaceFolders": workspace_folders,
             "initializationOptions": {
                 "languageServers": {
                     "lua-language-server": {
