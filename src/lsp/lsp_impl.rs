@@ -663,28 +663,23 @@ impl Kakehashi {
     /// released before the tree traversal. No DashMap deadlock risk.
     fn resolve_injection_data(&self, uri: &Url) -> Vec<InjectionRegion> {
         // Get the host language for this document
-        let host_language = match self.get_language_for_document(uri) {
-            Some(lang) => lang,
-            None => return Vec::new(),
+        let Some(host_language) = self.get_language_for_document(uri) else {
+            return Vec::new();
         };
 
         // Get the injection query for this language
-        let injection_query = match self.language.get_injection_query(&host_language) {
-            Some(q) => q,
-            None => return Vec::new(),
+        let Some(injection_query) = self.language.get_injection_query(&host_language) else {
+            return Vec::new();
         };
 
         // Extract tree and text from document with minimal lock duration
         // IMPORTANT: Clone both to release document lock immediately
         let (tree, text) = {
-            let doc = match self.documents.get(uri) {
-                Some(d) => d,
-                None => return Vec::new(),
+            let Some(doc) = self.documents.get(uri) else {
+                return Vec::new();
             };
-
-            let tree = match doc.tree() {
-                Some(t) => t.clone(),
-                None => return Vec::new(),
+            let Some(tree) = doc.tree().cloned() else {
+                return Vec::new();
             };
             let text = doc.text().to_string();
             (tree, text)
@@ -692,13 +687,10 @@ impl Kakehashi {
         };
 
         // Collect all injection regions (no locks held)
-        let regions = match collect_all_injections(
-            &tree.root_node(),
-            &text,
-            Some(injection_query.as_ref()),
-        ) {
-            Some(r) => r,
-            None => return Vec::new(),
+        let Some(regions) =
+            collect_all_injections(&tree.root_node(), &text, Some(injection_query.as_ref()))
+        else {
+            return Vec::new();
         };
 
         if regions.is_empty() {
