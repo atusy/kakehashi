@@ -110,8 +110,8 @@ pub(super) fn resolve_capture(
     // @none is a special nvim-treesitter convention: it resets parent
     // highlighting within a region (e.g., `(interpolation) @none` punches
     // holes in `@string` for f-string interpolation). Recognized here so
-    // it participates in sweep line overlap resolution, then filtered out
-    // before delta encoding in finalize_tokens().
+    // apply_none_preprocessing() can split parent tokens around @none
+    // regions before the sweep line runs.
     if capture_name == "none" {
         return CaptureResult::NoneCapture;
     }
