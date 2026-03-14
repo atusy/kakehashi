@@ -47,6 +47,19 @@ pub const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
     SemanticTokenModifier::DEFAULT_LIBRARY,
 ];
 
+/// Result of mapping a tree-sitter capture name to a semantic token role.
+#[derive(Debug, PartialEq)]
+pub(super) enum CaptureResult {
+    /// Matched or user-mapped token type — emitted as a semantic token.
+    Mapped(String),
+    /// Unknown base type — transparent breakpoint-only token (not emitted).
+    Transparent,
+    /// `@none` capture — pre-processed to punch holes in parent tokens.
+    NoneCapture,
+    /// User explicitly suppressed via `""` mapping — filtered entirely.
+    Suppressed,
+}
+
 /// Apply capture mappings to transform a capture name
 ///
 /// Looks up the capture name in the provided mappings and returns the mapped value if found,
@@ -58,15 +71,15 @@ pub const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
 /// * `capture_mappings` - The full capture mappings configuration
 ///
 /// # Returns
-/// - `Some(mapped_name)` for known token types (base type in LEGEND_TYPES)
-/// - `Some("")` for unknown types — transparent breakpoint-only tokens
-/// - `Some("none")` for `@none` captures — handled by @none pre-processing
-/// - `None` when user explicitly maps a capture to `""` (suppress entirely)
+/// - `CaptureResult::Mapped(name)` for known token types (base type in LEGEND_TYPES)
+/// - `CaptureResult::Transparent` for unknown types — breakpoint-only tokens
+/// - `CaptureResult::NoneCapture` for `@none` captures — handled by @none pre-processing
+/// - `CaptureResult::Suppressed` when user explicitly maps a capture to `""` (suppress entirely)
 pub(super) fn apply_capture_mapping(
     capture_name: &str,
     filetype: Option<&str>,
     capture_mappings: Option<&CaptureMappings>,
-) -> Option<String> {
+) -> CaptureResult {
     if let Some(mappings) = capture_mappings {
         // Try filetype-specific mapping first
         if let Some(ft) = filetype
@@ -74,7 +87,11 @@ pub(super) fn apply_capture_mapping(
             && let Some(mapped) = lang_mappings.highlights.get(capture_name)
         {
             // Explicit mapping to empty string means "filter this capture"
-            return (!mapped.is_empty()).then(|| mapped.clone());
+            return if mapped.is_empty() {
+                CaptureResult::Suppressed
+            } else {
+                CaptureResult::Mapped(mapped.clone())
+            };
         }
 
         // Try wildcard mapping
@@ -82,7 +99,11 @@ pub(super) fn apply_capture_mapping(
             && let Some(mapped) = wildcard_mappings.highlights.get(capture_name)
         {
             // Explicit mapping to empty string means "filter this capture"
-            return (!mapped.is_empty()).then(|| mapped.clone());
+            return if mapped.is_empty() {
+                CaptureResult::Suppressed
+            } else {
+                CaptureResult::Mapped(mapped.clone())
+            };
         }
     }
 
@@ -92,20 +113,23 @@ pub(super) fn apply_capture_mapping(
     // it participates in sweep line overlap resolution, then filtered out
     // before delta encoding in finalize_tokens().
     if capture_name == "none" {
-        return Some("none".to_string());
+        return CaptureResult::NoneCapture;
     }
 
     // No mapping found - check if the base type is in SemanticTokensLegend.
-    // Known types are returned as-is; unknown types return Some("") to create
-    // transparent tokens that generate sweep-line breakpoints without competing
-    // for winner selection.
-    let base_type = capture_name.split('.').next().unwrap_or("");
+    // Known types are returned as-is; unknown types return Transparent to create
+    // tokens that generate sweep-line breakpoints without competing for winner selection.
+    // split('.') on a non-empty string always yields at least one element
+    let base_type = capture_name
+        .split('.')
+        .next()
+        .expect("split always yields at least one element");
     if LEGEND_TYPES.iter().any(|t| t.as_str() == base_type) {
-        Some(capture_name.to_string())
+        CaptureResult::Mapped(capture_name.to_string())
     } else {
         // Transparent token: participates in sweep line as a breakpoint
         // generator but is excluded from winner selection (no token emitted).
-        Some(String::new())
+        CaptureResult::Transparent
     }
 }
 
@@ -198,7 +222,7 @@ mod tests {
         let result = apply_capture_mapping("variable", Some("rust"), Some(&mappings));
         assert_eq!(
             result,
-            Some("variable".to_string()),
+            CaptureResult::Mapped("variable".to_string()),
             "Should inherit 'variable' mapping from wildcard for 'rust'"
         );
 
@@ -206,7 +230,7 @@ mod tests {
         let result = apply_capture_mapping("type.builtin", Some("rust"), Some(&mappings));
         assert_eq!(
             result,
-            Some("type.defaultLibrary".to_string()),
+            CaptureResult::Mapped("type.defaultLibrary".to_string()),
             "Should use rust-specific 'type.builtin' mapping"
         );
 
@@ -214,29 +238,46 @@ mod tests {
         let result = apply_capture_mapping("function", Some("rust"), Some(&mappings));
         assert_eq!(
             result,
-            Some("function".to_string()),
+            CaptureResult::Mapped("function".to_string()),
             "Should inherit 'function' mapping from wildcard for 'rust'"
         );
     }
 
+    #[test]
+    fn apply_capture_mapping_explicit_empty_string_suppresses() {
+        // User maps "variable" → "" in their config — must return Suppressed, not Transparent
+        let mut highlights = HashMap::new();
+        highlights.insert("variable".to_string(), String::new());
+        let mut mappings = CaptureMappings::new();
+        mappings.insert(
+            "rust".to_string(),
+            QueryTypeMappings {
+                highlights,
+                locals: HashMap::new(),
+                folds: HashMap::new(),
+            },
+        );
+        assert_eq!(
+            apply_capture_mapping("variable", Some("rust"), Some(&mappings)),
+            CaptureResult::Suppressed,
+        );
+    }
+
     #[rstest]
-    #[case::unknown_spell("spell", Some(""))]
-    #[case::unknown_nospell("nospell", Some(""))]
-    #[case::unknown_conceal("conceal", Some(""))]
-    #[case::unknown_markup("markup", Some(""))]
-    #[case::unknown_other("unknown", Some(""))]
-    #[case::known_comment("comment", Some("comment"))]
-    #[case::known_keyword("keyword", Some("keyword"))]
-    #[case::known_variable_with_modifier("variable.readonly", Some("variable.readonly"))]
-    #[case::none_is_recognized("none", Some("none"))]
+    #[case::unknown_spell("spell", CaptureResult::Transparent)]
+    #[case::unknown_nospell("nospell", CaptureResult::Transparent)]
+    #[case::unknown_conceal("conceal", CaptureResult::Transparent)]
+    #[case::unknown_markup("markup", CaptureResult::Transparent)]
+    #[case::unknown_other("unknown", CaptureResult::Transparent)]
+    #[case::known_comment("comment", CaptureResult::Mapped("comment".to_string()))]
+    #[case::known_keyword("keyword", CaptureResult::Mapped("keyword".to_string()))]
+    #[case::known_variable_with_modifier("variable.readonly", CaptureResult::Mapped("variable.readonly".to_string()))]
+    #[case::none_is_recognized("none", CaptureResult::NoneCapture)]
     fn apply_capture_mapping_known_and_unknown_types(
         #[case] capture_name: &str,
-        #[case] expected: Option<&str>,
+        #[case] expected: CaptureResult,
     ) {
-        assert_eq!(
-            apply_capture_mapping(capture_name, None, None),
-            expected.map(String::from),
-        );
+        assert_eq!(apply_capture_mapping(capture_name, None, None), expected);
     }
 
     #[rstest]

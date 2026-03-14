@@ -503,7 +503,7 @@ pub(super) fn finalize_tokens(
     let mut all_tokens = split_multiline_tokens(all_tokens, lines);
 
     // Filter out zero-length tokens before the sweep line overlap resolution.
-    // Unknown captures are already filtered at collection time (apply_capture_mapping returns None).
+    // Unknown captures are already filtered at collection time (CaptureResult::Suppressed → continue).
     all_tokens.retain(|token| token.length > 0);
 
     let all_tokens = filter_by_injection_regions(all_tokens, active_injection_regions, lines);
@@ -525,7 +525,7 @@ pub(super) fn finalize_tokens(
     let mut last_start = 0usize;
 
     for token in all_tokens {
-        // Transparent tokens (empty mapped_name from apply_capture_mapping) may reach here
+        // Transparent tokens (CaptureResult::Transparent → empty mapped_name) may reach here
         // after sweep-line processing; they are filtered when map_capture_to_token_type_and_modifiers
         // returns None for the empty string.
         let Some((token_type, token_modifiers_bitset)) =
