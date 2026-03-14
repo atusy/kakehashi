@@ -35,15 +35,12 @@ use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_settings};
 use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
-use crate::language::region_id_tracker::EditInfo;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::bridge::coordinator::InjectionRegion;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::settings_manager::SettingsManager;
 use tokio::sync::Mutex;
-
-use super::text_sync::apply_content_changes_with_edits;
 
 use super::auto_install::{AutoInstallManager, InstallEvent, InstallingLanguages};
 
@@ -887,254 +884,19 @@ impl LanguageServer for Kakehashi {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let language_id = params.text_document.language_id.clone();
-        let lsp_uri = params.text_document.uri.clone();
-        let text = params.text_document.text.clone();
-
-        // Convert ls_types::Uri to url::Url for internal use
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
-            log::warn!("Invalid URI in didOpen: {}", lsp_uri.as_str());
-            return;
-        };
-
-        // Try to determine the language
-        let language_name = self
-            .language
-            .get_language_for_path(uri.path())
-            .or_else(|| Some(language_id.clone()));
-
-        // Insert document immediately (without tree) so concurrent requests can find it.
-        // This handles race conditions where semanticTokens/full arrives before
-        // parse_document completes. The tree will be updated by parse_document.
-        self.documents
-            .insert(uri.clone(), text.clone(), language_name.clone(), None);
-
-        // Check if we need to auto-install
-        let mut deferred_events = Vec::new();
-        let mut skip_parse = false; // Track if auto-install was triggered
-
-        if let Some(ref lang) = language_name {
-            let load_result = self.language.ensure_language_loaded(lang);
-
-            // Defer SemanticTokensRefresh events until after parse_document completes
-            // to avoid race condition where tokens are requested before tree exists.
-            // Log events immediately but defer refresh.
-            for event in &load_result.events {
-                match event {
-                    crate::language::LanguageEvent::SemanticTokensRefresh { .. } => {
-                        deferred_events.push(event.clone());
-                    }
-                    _ => {
-                        self.handle_language_events(std::slice::from_ref(event))
-                            .await;
-                    }
-                }
-            }
-
-            if !load_result.success {
-                if self.settings_manager.is_auto_install_enabled() {
-                    // Language failed to load and auto-install is enabled
-                    // is_injection=false: This is the document's main language
-                    // If install is triggered, skip parse_document here - reload_language_after_install will handle it
-                    skip_parse = self
-                        .maybe_auto_install_language(lang, uri.clone(), text.clone(), false)
-                        .await;
-                } else {
-                    // Notify user that parser is missing and needs manual installation
-                    self.notify_parser_missing(lang).await;
-                }
-            }
-        }
-
-        // Only parse if auto-install was NOT triggered
-        // If auto-install was triggered, reload_language_after_install will call parse_document
-        // after the parser file is completely written, preventing race condition
-        if !skip_parse {
-            self.parse_document(
-                uri.clone(),
-                params.text_document.text,
-                Some(&language_id),
-                vec![], // No edits for initial document open
-            )
-            .await;
-        }
-
-        // Now handle deferred SemanticTokensRefresh events after document is parsed
-        if !deferred_events.is_empty() {
-            self.handle_language_events(&deferred_events).await;
-        }
-
-        // Process injected languages: auto-install missing parsers and spawn bridge servers.
-        // This must be called AFTER parse_document so we have access to the AST.
-        self.process_injections(&uri, false).await;
-
-        // ADR-0020 Phase 2: Trigger synthetic diagnostic push on didOpen
-        // This provides proactive diagnostics for clients that don't support pull diagnostics.
-        // Note: We use the already-cloned lsp_uri here (it was cloned at the start of the method).
-        self.spawn_synthetic_diagnostic_task(uri, lsp_uri);
-
-        // NOTE: No semantic_tokens_refresh() on didOpen.
-        // Capable LSP clients should request by themselves.
-        // Calling refresh would be redundant and can cause deadlocks with clients
-        // like vim-lsp that don't respond to workspace/semanticTokens/refresh requests.
-
-        self.notifier().log_info("file opened!").await;
+        self.did_open_impl(params).await
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let lsp_uri = params.text_document.uri;
-
-        // Convert ls_types::Uri to url::Url for internal use
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
-            log::warn!("Invalid URI in didClose: {}", lsp_uri.as_str());
-            return;
-        };
-
-        // Remove the document from the store when it's closed
-        // This ensures that reopening the file will properly reinitialize everything
-        self.documents.remove(&uri);
-
-        // Clean up all caches for this document (semantic tokens, injections, requests)
-        self.cache.remove_document(&uri);
-
-        // Clean up region ID mappings for this document (ADR-0019)
-        self.bridge.cleanup(&uri);
-
-        // Abort any in-progress synthetic diagnostic task for this document (ADR-0020 Phase 2)
-        self.synthetic_diagnostics.remove_document(&uri);
-
-        // Cancel any pending debounced diagnostic for this document (ADR-0020 Phase 3)
-        self.debounced_diagnostics.cancel(&uri);
-
-        // Cancel any eager-open tasks for this document (prevents orphaned didOpen)
-        self.bridge.cancel_eager_open(&uri);
-
-        // Close all virtual documents associated with this host document
-        // This sends didClose notifications to downstream language servers
-        let closed_docs = self.bridge.close_host_document(&uri).await;
-        if !closed_docs.is_empty() {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Closed {} virtual documents for host {}",
-                closed_docs.len(),
-                uri
-            );
-        }
-
-        self.notifier().log_info("file closed!").await;
+        self.did_close_impl(params).await
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let lsp_uri = params.text_document.uri;
-
-        // Convert ls_types::Uri to url::Url for internal use
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
-            log::warn!("Invalid URI in didChange: {}", lsp_uri.as_str());
-            return;
-        };
-
-        self.notifier()
-            .log_trace(format!("[DID_CHANGE] START uri={}", uri))
-            .await;
-
-        // Retrieve the stored document info
-        let (language_id, old_text) = {
-            let doc = self.documents.get(&uri);
-            match doc {
-                Some(d) => (d.language_id().map(|s| s.to_string()), d.text().to_string()),
-                None => {
-                    self.notifier()
-                        .log_warning("Document not found for change event")
-                        .await;
-                    return;
-                }
-            }
-        };
-
-        // Apply content changes and build tree-sitter edits
-        let (text, edits) = apply_content_changes_with_edits(&old_text, params.content_changes);
-
-        // ADR-0019: Apply START-priority invalidation to region ID tracker.
-        // Use InputEdits directly for precise invalidation when available,
-        // fall back to diff-based approach for full document sync.
-        //
-        // This must be called AFTER content changes are applied (so we have new text)
-        // but BEFORE parse_document (so position sync happens before new tree is built).
-        let invalidated_ulids = if edits.is_empty() {
-            // Full document sync: no InputEdits available, reconstruct from diff
-            self.bridge.apply_text_diff(&uri, &old_text, &text)
-        } else {
-            // Incremental sync: use InputEdits directly (precise, no over-invalidation)
-            let edit_infos: Vec<EditInfo> = edits.iter().map(EditInfo::from).collect();
-            self.bridge.apply_input_edits(&uri, &edit_infos)
-        };
-
-        // Invalidate injection caches for regions overlapping with edits (AC4/AC5)
-        // Must be called BEFORE parse_document which updates the injection_map
-        self.cache.invalidate_for_edits(&uri, &edits);
-
-        // Parse the updated document with edit information
-        self.parse_document(uri.clone(), text, language_id.as_deref(), edits)
-            .await;
-
-        // NOTE: We intentionally do NOT invalidate the semantic token cache here.
-        // The cached tokens (with their result_id) are needed for delta calculations.
-        // When semanticTokens/full/delta arrives with previousResultId, we look up
-        // the cached tokens to compute the delta. If we invalidated here, the delta
-        // request would always fall back to full tokenization.
-        //
-        // The cache is validated at lookup time via result_id matching, so stale
-        // tokens won't be returned for mismatched result_ids.
-
-        // ADR-0019: Close invalidated virtual documents.
-        // Send didClose notifications to downstream LSs for orphaned docs.
-        self.close_invalidated_virtual_docs(&uri, &invalidated_ulids)
-            .await;
-
-        // Forward didChange to opened virtual documents + process injected languages.
-        // Injection data is resolved once and reused for:
-        // 1. didChange forwarding to already-opened virtual documents
-        // 2. Auto-install missing parsers
-        // 3. Eager server spawn + didOpen for virtual documents
-        // Must be called AFTER parse_document so we have access to the updated AST.
-        self.process_injections(&uri, true).await;
-
-        // ADR-0020 Phase 3: Schedule debounced diagnostic push on didChange.
-        // After 500ms of no changes, diagnostics will be collected and published.
-        // This provides near-real-time feedback while avoiding excessive requests during typing.
-        self.schedule_debounced_diagnostic(uri, lsp_uri);
-
-        // NOTE: We intentionally do NOT call semantic_tokens_refresh() here.
-        // LSP clients already request new tokens after didChange (via semanticTokens/full/delta).
-        // Calling refresh would be redundant and can cause deadlocks with synchronous clients
-        // like vim-lsp on Vim, which cannot respond to server requests while processing.
-
-        self.notifier().log_info("file changed!").await;
+        self.did_change_impl(params).await
     }
 
-    /// Handle textDocument/didSave notification.
-    ///
-    /// ADR-0020 Phase 2: Triggers synthetic diagnostic push.
-    /// Collects diagnostics from downstream servers and publishes via publishDiagnostics.
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        let lsp_uri = params.text_document.uri;
-
-        // Convert ls_types::Uri to url::Url for internal use
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
-            log::warn!("Invalid URI in didSave: {}", lsp_uri.as_str());
-            return;
-        };
-
-        log::debug!(
-            target: "kakehashi::synthetic_diag",
-            "didSave received for {}",
-            uri
-        );
-
-        // Spawn background task for synthetic diagnostic collection
-        self.spawn_synthetic_diagnostic_task(uri, lsp_uri);
-
-        self.notifier().log_info("file saved!").await;
+        self.did_save_impl(params).await
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
