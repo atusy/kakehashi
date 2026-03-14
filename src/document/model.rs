@@ -21,7 +21,6 @@ impl DocumentSnapshot {
 /// Unified document structure combining text, parsing, and LSP state
 pub struct Document {
     text: String,
-    version: Option<i32>,
     language_id: Option<String>,
     tree: Option<Tree>,
     /// Previous tree for changed_ranges comparison during incremental parsing
@@ -32,22 +31,9 @@ pub struct Document {
 
 impl Document {
     /// Create a new document with just text
-    pub fn new(text: String) -> Self {
+    pub(crate) fn new(text: String) -> Self {
         Self {
             text,
-            version: None,
-            language_id: None,
-            tree: None,
-            previous_tree: None,
-            previous_text: None,
-        }
-    }
-
-    /// Create a new document with version
-    pub fn with_version(text: String, version: i32) -> Self {
-        Self {
-            text,
-            version: Some(version),
             language_id: None,
             tree: None,
             previous_tree: None,
@@ -56,10 +42,9 @@ impl Document {
     }
 
     /// Create with language but no tree yet (for early document registration)
-    pub fn with_language(text: String, language_id: String) -> Self {
+    pub(crate) fn with_language(text: String, language_id: String) -> Self {
         Self {
             text,
-            version: None,
             language_id: Some(language_id),
             tree: None,
             previous_tree: None,
@@ -68,10 +53,9 @@ impl Document {
     }
 
     /// Create with language and tree
-    pub fn with_tree(text: String, language_id: String, tree: Tree) -> Self {
+    pub(crate) fn with_tree(text: String, language_id: String, tree: Tree) -> Self {
         Self {
             text,
-            version: None,
             language_id: Some(language_id),
             tree: Some(tree),
             previous_tree: None,
@@ -80,27 +64,12 @@ impl Document {
     }
 
     /// Get the text content
-    pub fn text(&self) -> &str {
+    pub(crate) fn text(&self) -> &str {
         &self.text
     }
 
-    /// Get the text content as owned String
-    pub fn into_text(self) -> String {
-        self.text
-    }
-
-    /// Get the document version
-    pub fn version(&self) -> Option<i32> {
-        self.version
-    }
-
-    /// Set the document version
-    pub fn set_version(&mut self, version: Option<i32>) {
-        self.version = version;
-    }
-
     /// Get the language ID
-    pub fn language_id(&self) -> Option<&str> {
+    pub(crate) fn language_id(&self) -> Option<&str> {
         self.language_id.as_deref()
     }
 
@@ -110,7 +79,7 @@ impl Document {
     }
 
     /// Get a position mapper for this document
-    pub fn position_mapper(&self) -> crate::text::PositionMapper {
+    pub(crate) fn position_mapper(&self) -> crate::text::PositionMapper {
         crate::text::PositionMapper::new(self.text())
     }
 
@@ -125,30 +94,6 @@ impl Document {
         })
     }
 
-    /// Get mutable tree
-    pub fn tree_mut(&mut self) -> Option<&mut Tree> {
-        self.tree.as_mut()
-    }
-
-    /// Get the previous tree (used for changed_ranges comparison)
-    pub fn previous_tree(&self) -> Option<&Tree> {
-        self.previous_tree.as_ref()
-    }
-
-    /// Get the previous text for line delta calculation
-    pub fn previous_text(&self) -> Option<&str> {
-        self.previous_text.as_deref()
-    }
-
-    /// Update tree, moving current tree to previous_tree
-    ///
-    /// This preserves the previous tree for changed_ranges comparison
-    /// during incremental parsing optimization.
-    pub fn update_tree(&mut self, new_tree: Tree) {
-        self.previous_tree = self.tree.take();
-        self.tree = Some(new_tree);
-    }
-
     /// Update tree and text together for incremental tokenization support
     ///
     /// This preserves both previous tree and previous text for:
@@ -157,7 +102,7 @@ impl Document {
     ///
     /// Note: For proper `changed_ranges()` support, prefer `update_with_edited_tree`
     /// which accepts the edited previous tree (after `tree.edit()` was called).
-    pub fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
+    pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
         self.previous_tree = self.tree.take();
         self.previous_text = Some(std::mem::replace(&mut self.text, new_text));
         self.tree = Some(new_tree);
@@ -173,7 +118,7 @@ impl Document {
     /// * `new_tree` - The newly parsed tree
     /// * `new_text` - The new document text
     /// * `edited_previous_tree` - The previous tree after `tree.edit()` was applied
-    pub fn update_with_edited_tree(
+    pub(crate) fn update_with_edited_tree(
         &mut self,
         new_tree: Tree,
         new_text: String,
@@ -184,37 +129,13 @@ impl Document {
         self.tree = Some(new_tree);
     }
 
-    /// Set the tree and language
-    pub fn set_tree(&mut self, language_id: String, tree: Tree) {
-        self.language_id = Some(language_id);
-        self.tree = Some(tree);
-    }
-
-    /// Clear the tree and language
-    pub fn clear_tree(&mut self) {
-        self.language_id = None;
-        self.tree = None;
-        self.previous_tree = None;
-        self.previous_text = None;
-    }
-
     /// Update text and clear layers/state
-    pub fn update_text(&mut self, text: String) {
+    pub(crate) fn update_text(&mut self, text: String) {
         self.text = text;
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
         self.previous_tree = None;
         self.previous_text = None;
-    }
-
-    /// Get the length in bytes
-    pub fn len(&self) -> usize {
-        self.text.len()
-    }
-
-    /// Check if the document is empty
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
     }
 }
 
@@ -226,16 +147,8 @@ mod tests {
     fn test_document_creation() {
         let doc = Document::new("hello world".to_string());
         assert_eq!(doc.text(), "hello world");
-        assert_eq!(doc.version(), None);
-        assert_eq!(doc.len(), 11);
-        assert!(!doc.is_empty());
-    }
-
-    #[test]
-    fn test_document_with_version() {
-        let doc = Document::with_version("test".to_string(), 42);
-        assert_eq!(doc.text(), "test");
-        assert_eq!(doc.version(), Some(42));
+        assert_eq!(doc.text.len(), 11);
+        assert!(!doc.text.is_empty());
     }
 
     #[test]
@@ -263,7 +176,6 @@ mod tests {
 
     #[test]
     fn test_document_preserves_previous_tree() {
-        // Create document with initial tree
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -273,14 +185,14 @@ mod tests {
         let mut doc = Document::with_tree("fn main() {}".to_string(), "rust".to_string(), tree1);
 
         // Initially no previous tree
-        assert!(doc.previous_tree().is_none());
+        assert!(doc.previous_tree.is_none());
 
-        // Update tree - old should become previous
+        // Update tree and text - old should become previous
         let tree2 = parser.parse("fn main() { let x = 1; }", None).unwrap();
-        doc.update_tree(tree2);
+        doc.update_tree_and_text(tree2, "fn main() { let x = 1; }".to_string());
 
         // Now previous tree should exist
-        assert!(doc.previous_tree().is_some());
+        assert!(doc.previous_tree.is_some());
         // Current tree should be the new one
         assert!(doc.tree().is_some());
     }
@@ -299,18 +211,18 @@ mod tests {
         let mut doc = Document::with_tree(old_text.clone(), "rust".to_string(), tree1);
 
         // Initially no previous text
-        assert!(doc.previous_text().is_none());
+        assert!(doc.previous_text.is_none());
 
         // Update tree and text together
         let tree2 = parser.parse(&new_text, None).unwrap();
         doc.update_tree_and_text(tree2, new_text.clone());
 
         // Now previous text should exist and match old text
-        assert_eq!(doc.previous_text(), Some("fn main() {}"));
+        assert_eq!(doc.previous_text.as_deref(), Some("fn main() {}"));
         // Current text should be new text
         assert_eq!(doc.text(), "fn main() { let x = 1; }");
         // Previous tree should also exist
-        assert!(doc.previous_tree().is_some());
+        assert!(doc.previous_tree.is_some());
     }
 
     #[test]

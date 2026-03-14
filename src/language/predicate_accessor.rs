@@ -1,7 +1,7 @@
 use tree_sitter::{Query, QueryPredicate, QueryProperty};
 
 /// Get all predicates for a pattern, including both general predicates and property settings
-pub fn get_all_predicates(query: &Query, pattern_index: usize) -> PredicateIterator<'_> {
+pub(crate) fn get_all_predicates(query: &Query, pattern_index: usize) -> PredicateIterator<'_> {
     PredicateIterator {
         general_predicates: query.general_predicates(pattern_index),
         property_settings: query.property_settings(pattern_index),
@@ -11,7 +11,7 @@ pub fn get_all_predicates(query: &Query, pattern_index: usize) -> PredicateItera
 }
 
 /// Iterator over all predicates (both general and property-based)
-pub struct PredicateIterator<'a> {
+pub(crate) struct PredicateIterator<'a> {
     general_predicates: &'a [QueryPredicate],
     property_settings: &'a [QueryProperty],
     general_index: usize,
@@ -20,14 +20,14 @@ pub struct PredicateIterator<'a> {
 
 /// Unified predicate type that can represent both general predicates and property settings
 #[derive(Debug, Clone)]
-pub enum UnifiedPredicate<'a> {
+pub(crate) enum UnifiedPredicate<'a> {
     General(&'a QueryPredicate),
     Property(&'a QueryProperty),
 }
 
 impl<'a> UnifiedPredicate<'a> {
     /// Get the operator/key of the predicate
-    pub fn operator(&self) -> &str {
+    pub(crate) fn operator(&self) -> &str {
         match self {
             UnifiedPredicate::General(p) => p.operator.as_ref(),
             UnifiedPredicate::Property(p) => p.key.as_ref(),

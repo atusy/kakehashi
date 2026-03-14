@@ -23,7 +23,7 @@ use std::sync::Arc;
 /// Thread-safe registry that persists failed parser state to disk
 /// to survive process restarts.
 #[derive(Clone)]
-pub struct FailedParserRegistry {
+pub(crate) struct FailedParserRegistry {
     /// In-memory set of failed parsers for fast lookup
     failed: Arc<DashSet<String>>,
     /// Directory where state files are stored
