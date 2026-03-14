@@ -57,7 +57,7 @@ impl Kakehashi {
         result
             .handle(&self.client, "type definition", None, |value| match value {
                 Some(links) => {
-                    if self.supports_type_definition_link() {
+                    if self.settings_manager.supports_type_definition_link() {
                         Ok(Some(GotoTypeDefinitionResponse::Link(links)))
                     } else {
                         let locations: Vec<Location> =

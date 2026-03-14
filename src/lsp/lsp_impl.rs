@@ -232,62 +232,6 @@ impl Kakehashi {
         )
     }
 
-    /// Check if auto-install is enabled.
-    ///
-    /// Delegates to SettingsManager for the actual check.
-    fn is_auto_install_enabled(&self) -> bool {
-        self.settings_manager.is_auto_install_enabled()
-    }
-
-    /// Check if the client supports multiline semantic tokens.
-    ///
-    /// Delegates to SettingsManager for capability checking.
-    fn supports_multiline_tokens(&self) -> bool {
-        self.settings_manager.supports_multiline_tokens()
-    }
-
-    /// Check if the client supports definition link (LocationLink[]).
-    ///
-    /// Delegates to SettingsManager for capability checking.
-    fn supports_definition_link(&self) -> bool {
-        self.settings_manager.supports_definition_link()
-    }
-
-    /// Check if the client supports type definition link (LocationLink[]).
-    ///
-    /// Delegates to SettingsManager for capability checking.
-    fn supports_type_definition_link(&self) -> bool {
-        self.settings_manager.supports_type_definition_link()
-    }
-
-    /// Check if the client supports implementation link (LocationLink[]).
-    ///
-    /// Delegates to SettingsManager for capability checking.
-    fn supports_implementation_link(&self) -> bool {
-        self.settings_manager.supports_implementation_link()
-    }
-
-    /// Check if the client supports declaration link (LocationLink[]).
-    ///
-    /// Delegates to SettingsManager for capability checking.
-    fn supports_declaration_link(&self) -> bool {
-        self.settings_manager.supports_declaration_link()
-    }
-
-    /// Check if the client supports hierarchical document symbols (DocumentSymbol[]).
-    ///
-    /// Delegates to SettingsManager for capability checking.
-    fn supports_hierarchical_document_symbol(&self) -> bool {
-        self.settings_manager
-            .supports_hierarchical_document_symbol()
-    }
-
-    /// Check if the given search paths include the default data directory.
-    fn search_paths_include_default_data_dir(&self, search_paths: &[String]) -> bool {
-        self.settings_manager
-            .search_paths_include_default_data_dir(search_paths)
-    }
-
     /// Dispatch install events to ClientNotifier.
     ///
     /// This method bridges AutoInstallManager (isolated) with ClientNotifier.
@@ -319,7 +263,10 @@ impl Kakehashi {
         // Check why auto-install is disabled
         let reason = if !settings.auto_install {
             "autoInstall is disabled".to_string()
-        } else if !self.search_paths_include_default_data_dir(&settings.search_paths) {
+        } else if !self
+            .settings_manager
+            .search_paths_include_default_data_dir(&settings.search_paths)
+        {
             let default_dir = crate::install::default_data_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
@@ -861,7 +808,7 @@ impl Kakehashi {
     /// The InstallingLanguages tracker in maybe_auto_install_language prevents
     /// duplicate install attempts.
     async fn check_injected_languages_auto_install(&self, uri: &Url, languages: &HashSet<String>) {
-        let auto_install_enabled = self.is_auto_install_enabled();
+        let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
         // Get document text for auto-install (needed by maybe_auto_install_language)
         let text = if auto_install_enabled {
@@ -1320,7 +1267,7 @@ impl LanguageServer for Kakehashi {
             }
 
             if !load_result.success {
-                if self.is_auto_install_enabled() {
+                if self.settings_manager.is_auto_install_enabled() {
                     // Language failed to load and auto-install is enabled
                     // is_injection=false: This is the document's main language
                     // If install is triggered, skip parse_document here - reload_language_after_install will handle it

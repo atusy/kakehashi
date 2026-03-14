@@ -57,7 +57,7 @@ impl Kakehashi {
         result
             .handle(&self.client, "implementation", None, |value| match value {
                 Some(links) => {
-                    if self.supports_implementation_link() {
+                    if self.settings_manager.supports_implementation_link() {
                         Ok(Some(GotoImplementationResponse::Link(links)))
                     } else {
                         let locations: Vec<Location> =
