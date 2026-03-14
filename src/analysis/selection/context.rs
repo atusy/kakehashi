@@ -13,12 +13,10 @@
 //! 3. **Enable easier testing**: Contexts can be mocked or stubbed
 //! 4. **Improve code reuse**: Contexts can be passed through call chains
 
+use crate::language::injection::MAX_INJECTION_DEPTH;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::text::PositionMapper;
 use tree_sitter::Node;
-
-/// Maximum depth for nested injection recursion (prevents stack overflow).
-pub const MAX_INJECTION_DEPTH: usize = 10;
 
 /// Document-level context for SelectionRange building.
 ///

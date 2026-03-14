@@ -7,9 +7,6 @@ use std::sync::Arc;
 
 use tree_sitter::Query;
 
-/// Maximum recursion depth for nested injections to prevent stack overflow
-pub(super) const MAX_INJECTION_DEPTH: usize = 10;
-
 /// Data for processing a single injection (parser-agnostic).
 ///
 /// This struct captures all the information needed to process an injection
