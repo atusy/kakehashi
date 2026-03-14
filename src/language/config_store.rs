@@ -1,7 +1,7 @@
 use crate::config::{CaptureMappings, LanguageSettings, RawWorkspaceSettings};
 use crate::error::LockResultExt;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 /// Stores and manages language configurations
 pub struct ConfigStore {
@@ -33,6 +33,7 @@ impl ConfigStore {
         self.set_search_paths(settings.search_paths.clone());
     }
 
+    #[cfg(test)]
     pub fn get_language_config(&self, lang_name: &str) -> Option<LanguageSettings> {
         self.language_configs
             .read()
@@ -41,6 +42,7 @@ impl ConfigStore {
             .cloned()
     }
 
+    #[cfg(test)]
     pub fn get_all_language_configs(&self) -> HashMap<String, LanguageSettings> {
         self.language_configs
             .read()
@@ -78,17 +80,8 @@ impl ConfigStore {
             .clone()
     }
 
-    /// Get search paths as a shared reference
-    pub fn get_search_paths_ref(&self) -> Arc<Option<Vec<String>>> {
-        Arc::new(
-            self.search_paths
-                .read()
-                .recover_poison("ConfigStore::get_search_paths_ref")
-                .clone(),
-        )
-    }
-
     /// Clear all configurations
+    #[cfg(test)]
     pub fn clear(&self) {
         self.language_configs
             .write()
@@ -114,6 +107,7 @@ impl Default for ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_config_store_language_configs() {

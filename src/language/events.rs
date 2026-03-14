@@ -54,14 +54,6 @@ impl LanguageLoadResult {
             events,
         }
     }
-
-    pub fn push_event(&mut self, event: LanguageEvent) {
-        self.events.push(event);
-    }
-
-    pub fn log(&mut self, level: LanguageLogLevel, message: impl Into<String>) {
-        self.push_event(LanguageEvent::log(level, message));
-    }
 }
 
 /// Summary of applying configuration across multiple languages

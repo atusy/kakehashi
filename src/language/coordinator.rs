@@ -390,14 +390,13 @@ impl LanguageCoordinator {
     }
 
     /// Get language for a file extension.
+    #[cfg(test)]
     pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
         self.filetype_resolver.get_language_for_extension(extension)
     }
 
     /// Get configured search paths (primarily for testing and diagnostics).
-    ///
-    /// Visibility: Public - used in integration tests (test_dynamic_lua_load)
-    /// to verify settings configuration.
+    #[cfg(test)]
     pub fn get_search_paths(&self) -> Option<Vec<String>> {
         self.config_store.get_search_paths()
     }
@@ -694,8 +693,7 @@ impl LanguageCoordinator {
 
     /// Get locals query for a language.
     ///
-    /// Visibility: Public - called by analysis layer (refactor) for scope
-    /// and local variable analysis in injected languages.
+    #[cfg(test)]
     pub fn get_locals_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store.get_locals_query(lang_name)
     }

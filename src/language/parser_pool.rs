@@ -62,11 +62,13 @@ impl DocumentParserPool {
     }
 
     /// Clear all cached parsers
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.available.clear();
     }
 
     /// Get the number of cached parsers for a language
+    #[cfg(test)]
     pub fn pool_size(&self, language_id: &str) -> usize {
         self.available
             .get(language_id)

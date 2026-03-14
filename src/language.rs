@@ -15,15 +15,11 @@ pub(crate) mod query_store;
 pub(crate) mod region_id_tracker;
 pub(crate) mod registry;
 
-pub(crate) use config_store::ConfigStore;
 pub(crate) use coordinator::LanguageCoordinator;
 pub(crate) use events::{LanguageEvent, LanguageLogLevel};
 pub(crate) use failed_parsers::FailedParserRegistry;
-pub(crate) use filetypes::FiletypeResolver;
 pub(crate) use parser_pool::DocumentParserPool;
 pub(crate) use query_predicates::filter_captures;
-pub(crate) use query_store::QueryStore;
-pub(crate) use registry::LanguageRegistry;
 
 // Re-export injection types for semantic tokens
 pub(crate) use injection::InjectionResolver;

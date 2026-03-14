@@ -62,6 +62,7 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
+    #[cfg(test)]
     pub fn get_locals_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.locals_queries
             .read()
@@ -93,6 +94,7 @@ impl QueryStore {
     }
 
     /// Clear all queries for a specific language
+    #[cfg(test)]
     pub fn clear_language(&self, lang_name: &str) {
         self.highlight_queries
             .write()
@@ -118,6 +120,7 @@ impl QueryStore {
     }
 
     /// Clear all queries
+    #[cfg(test)]
     pub fn clear_all(&self) {
         self.highlight_queries
             .write()

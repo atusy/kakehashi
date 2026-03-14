@@ -747,6 +747,7 @@ impl CacheableInjectionRegion {
     /// Check if a byte offset falls within this injection region's byte range.
     ///
     /// Used for determining which injection regions overlap with an edit.
+    #[cfg(test)]
     pub fn contains_byte(&self, byte: usize) -> bool {
         self.byte_range.contains(&byte)
     }
@@ -755,6 +756,7 @@ impl CacheableInjectionRegion {
     ///
     /// Returns the substring of `host_text` corresponding to this region's byte range.
     /// This is the "virtual document" content that would be sent to a language server.
+    #[cfg(test)]
     pub fn extract_content<'a>(&self, host_text: &'a str) -> &'a str {
         &host_text[self.byte_range.clone()]
     }
@@ -947,6 +949,10 @@ pub struct ResolvedInjection {
     /// Cacheable injection region with line range information
     pub region: CacheableInjectionRegion,
     /// Stable region identifier (ULID format, 26 alphanumeric characters)
+    ///
+    /// Note: Redundant with `region.region_id` — kept for structural consistency
+    /// in `build_resolved_injection`. Reads go through `region.region_id`.
+    #[allow(dead_code)]
     pub region_id: String,
     /// Language of the injection content
     pub injection_language: String,

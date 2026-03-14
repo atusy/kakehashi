@@ -1,5 +1,5 @@
 use line_index::{LineIndex, WideEncoding, WideLineCol};
-use tower_lsp_server::ls_types::{Position, Range};
+use tower_lsp_server::ls_types::Position;
 
 /// Position mapper for converting between LSP positions and byte offsets
 pub struct PositionMapper {
@@ -42,13 +42,6 @@ impl PositionMapper {
         Some(Position::new(wide_line_col.line, wide_line_col.col))
     }
 
-    /// Convert byte range to LSP Range
-    pub fn byte_range_to_range(&self, start: usize, end: usize) -> Option<Range> {
-        let start_pos = self.byte_to_position(start)?;
-        let end_pos = self.byte_to_position(end)?;
-        Some(Range::new(start_pos, end_pos))
-    }
-
     /// Convert LSP Position to tree-sitter Point with proper byte column
     ///
     /// LSP Position uses UTF-16 code units for the character field.
@@ -65,30 +58,6 @@ impl PositionMapper {
             line_col.line as usize,
             line_col.col as usize,
         ))
-    }
-}
-
-/// Convert UTF-16 position to byte position within a line
-/// Returns None if the UTF-16 position is invalid
-#[inline(always)]
-pub fn convert_utf16_to_byte_in_line(line_text: &str, utf16_pos: usize) -> Option<usize> {
-    let mut byte_offset = 0;
-    let mut utf16_offset = 0;
-
-    for ch in line_text.chars() {
-        if utf16_offset >= utf16_pos {
-            return Some(byte_offset);
-        }
-        utf16_offset += ch.len_utf16();
-        byte_offset += ch.len_utf8();
-    }
-
-    // If we reached the end and the position matches exactly, return the end position
-    if utf16_offset == utf16_pos {
-        Some(byte_offset)
-    } else {
-        // Position is beyond the end of the line
-        None
     }
 }
 

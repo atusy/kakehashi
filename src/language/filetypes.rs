@@ -14,17 +14,6 @@ impl FiletypeResolver {
         }
     }
 
-    // build_from_settings and build_from_configs removed in PBI-061
-    // Language detection now relies on languageId from DidOpen, not config filetypes
-
-    /// Set the filetype map directly
-    pub fn set_filetype_map(&self, map: HashMap<String, String>) {
-        *self
-            .filetype_map
-            .write()
-            .recover_poison("FiletypeResolver::set_filetype_map") = map;
-    }
-
     /// Get language for a document path (URI path or file path)
     pub fn get_language_for_path(&self, path: &str) -> Option<String> {
         let extension = Self::extract_extension(path);
@@ -36,6 +25,7 @@ impl FiletypeResolver {
     }
 
     /// Get language for a file extension
+    #[cfg(test)]
     pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
         self.filetype_map
             .read()
@@ -45,6 +35,7 @@ impl FiletypeResolver {
     }
 
     /// Get a copy of the entire filetype map
+    #[cfg(test)]
     pub fn get_filetype_map(&self) -> HashMap<String, String> {
         self.filetype_map
             .read()
@@ -53,6 +44,7 @@ impl FiletypeResolver {
     }
 
     /// Add a single filetype mapping
+    #[cfg(test)]
     pub fn add_mapping(&self, extension: String, language: String) {
         self.filetype_map
             .write()
@@ -61,6 +53,7 @@ impl FiletypeResolver {
     }
 
     /// Remove a filetype mapping
+    #[cfg(test)]
     pub fn remove_mapping(&self, extension: &str) -> Option<String> {
         self.filetype_map
             .write()
@@ -69,6 +62,7 @@ impl FiletypeResolver {
     }
 
     /// Clear all mappings
+    #[cfg(test)]
     pub fn clear(&self) {
         self.filetype_map
             .write()
@@ -77,6 +71,7 @@ impl FiletypeResolver {
     }
 
     /// Check if a language is registered for any extension
+    #[cfg(test)]
     pub fn has_language(&self, language: &str) -> bool {
         self.filetype_map
             .read()
@@ -86,6 +81,7 @@ impl FiletypeResolver {
     }
 
     /// Get all extensions for a language
+    #[cfg(test)]
     pub fn get_extensions_for_language(&self, language: &str) -> Vec<String> {
         self.filetype_map
             .read()
