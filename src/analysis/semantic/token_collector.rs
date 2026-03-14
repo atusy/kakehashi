@@ -52,6 +52,28 @@ fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
     DEFAULT_PRIORITY
 }
 
+/// The semantic role of a collected token.
+///
+/// Mirrors the relevant variants of [`CaptureResult`] but lives on the
+/// collected token, encoding token roles as distinct variants rather than
+/// magic-string conventions.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TokenKind {
+    /// Normal semantic token with a mapped type name (e.g., "keyword", "variable.readonly").
+    Mapped(String),
+    /// Transparent breakpoint-only token — not emitted as a semantic token.
+    Transparent,
+    /// `@none` capture — punches holes in parent tokens during pre-processing.
+    NoneCapture,
+}
+
+impl TokenKind {
+    /// Returns `true` for tokens that will be emitted as semantic tokens in the LSP response.
+    pub(crate) fn is_emitted(&self) -> bool {
+        matches!(self, TokenKind::Mapped(_))
+    }
+}
+
 /// Represents a token before delta encoding with all position information.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RawToken {
@@ -61,8 +83,8 @@ pub(crate) struct RawToken {
     pub column: usize,
     /// Length in UTF-16 code units
     pub length: usize,
-    /// Mapped capture name (e.g., "keyword", "variable.readonly")
-    pub mapped_name: String,
+    /// The semantic role of this token.
+    pub kind: TokenKind,
     /// Injection depth (0 = host document)
     pub depth: usize,
     /// Index of the query pattern that produced this token.
@@ -324,12 +346,11 @@ pub(super) fn collect_host_tokens(
 
             // Get the mapped capture name early to avoid repeated mapping
             let capture_name = &query.capture_names()[c.index as usize];
-            let mapped_name = match apply_capture_mapping(capture_name, filetype, capture_mappings)
-            {
+            let kind = match apply_capture_mapping(capture_name, filetype, capture_mappings) {
                 CaptureResult::Suppressed => continue,
-                CaptureResult::Mapped(s) => s,
-                CaptureResult::Transparent => String::new(),
-                CaptureResult::NoneCapture => "none".to_string(),
+                CaptureResult::Mapped(s) => TokenKind::Mapped(s),
+                CaptureResult::Transparent => TokenKind::Transparent,
+                CaptureResult::NoneCapture => TokenKind::NoneCapture,
             };
 
             // Skip captures that fall within a child injection region
@@ -363,7 +384,7 @@ pub(super) fn collect_host_tokens(
                     line: host_line,
                     column: start_utf16,
                     length: end_utf16 - start_utf16,
-                    mapped_name,
+                    kind,
                     depth,
                     pattern_index: m.pattern_index,
                     priority,
@@ -424,7 +445,7 @@ pub(super) fn collect_host_tokens(
                         line: host_start_line,
                         column: start_utf16,
                         length: total_length_utf16,
-                        mapped_name,
+                        kind,
                         depth,
                         pattern_index: m.pattern_index,
                         priority,
@@ -455,7 +476,7 @@ pub(super) fn collect_host_tokens(
                                 line: host_row,
                                 column: start_utf16,
                                 length: end_utf16 - start_utf16,
-                                mapped_name: mapped_name.clone(),
+                                kind: kind.clone(),
                                 depth,
                                 pattern_index: m.pattern_index,
                                 priority,
@@ -472,6 +493,23 @@ pub(super) fn collect_host_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── TokenKind::is_emitted tests ──────────────────────────────────
+
+    #[test]
+    fn is_emitted_returns_true_for_mapped() {
+        assert!(TokenKind::Mapped("keyword".to_string()).is_emitted());
+    }
+
+    #[test]
+    fn is_emitted_returns_false_for_transparent() {
+        assert!(!TokenKind::Transparent.is_emitted());
+    }
+
+    #[test]
+    fn is_emitted_returns_false_for_none_capture() {
+        assert!(!TokenKind::NoneCapture.is_emitted());
+    }
 
     // ── is_in_exclusion_range tests ──────────────────────────────────
 
@@ -763,8 +801,12 @@ mod tests {
             &mut tokens2,
         );
 
-        let has_keyword = tokens2.iter().any(|t| t.mapped_name == "keyword");
-        let has_variable = tokens2.iter().any(|t| t.mapped_name == "variable");
+        let has_keyword = tokens2
+            .iter()
+            .any(|t| t.kind == TokenKind::Mapped("keyword".to_string()));
+        let has_variable = tokens2
+            .iter()
+            .any(|t| t.kind == TokenKind::Mapped("variable".to_string()));
         assert!(has_keyword, "fn keyword outside exclusion should be kept");
         assert!(
             !has_variable,

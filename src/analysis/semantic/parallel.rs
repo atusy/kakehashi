@@ -1003,9 +1003,14 @@ local x = 42
         );
 
         // Look for the "local" keyword token (should be at line 3, col 0)
-        let has_local_keyword = tokens
-            .iter()
-            .any(|t| t.line == 3 && t.column == 0 && t.mapped_name == "keyword");
+        let has_local_keyword = tokens.iter().any(|t| {
+            t.line == 3
+                && t.column == 0
+                && t.kind
+                    == crate::analysis::semantic::token_collector::TokenKind::Mapped(
+                        "keyword".to_string(),
+                    )
+        });
 
         assert!(
             has_local_keyword,
