@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use tree_sitter::{Parser, Tree};
 
 use super::injection::{InjectionContext, MAX_INJECTION_DEPTH};
-use super::token_collector::{InjectionRegion, RawToken, collect_host_tokens};
+use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_tokens};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
@@ -389,7 +389,7 @@ fn collect_injection_contexts_sync<'a>(
 
         // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).
         // When we have per-gap included ranges, push EACH gap as a separate exclusion entry
-        // so that compute_active_injection_regions() produces per-line InjectionRegions.
+        // so that compute_active_injection_regions() produces per-line ActiveInjectionBoundss.
         // Otherwise, push the single full content range as before.
         if let Some(ref ranges) = included_ranges {
             // compute_included_ranges returns ranges relative to content_node.start_byte().
@@ -469,7 +469,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     coordinator: &LanguageCoordinator,
     capture_mappings: Option<&CaptureMappings>,
     supports_multiline: bool,
-) -> (Vec<RawToken>, Vec<InjectionRegion>) {
+) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use rayon::prelude::*;
 
     // Pre-compute host lines for position calculations
@@ -529,7 +529,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Sort tokens by position (line, then column)
     all_tokens.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.column.cmp(&b.column)));
 
-    // Convert byte ranges to line/column InjectionRegions, but only for
+    // Convert byte ranges to line/column ActiveInjectionBoundss, but only for
     // regions that actually produced tokens (= "active" injection regions).
     let active_regions = compute_active_injection_regions(
         host_text,
@@ -541,14 +541,14 @@ pub(crate) fn collect_injection_tokens_parallel(
     (all_tokens, active_regions)
 }
 
-/// Convert byte-based exclusion ranges to line/column `InjectionRegion`s,
+/// Convert byte-based exclusion ranges to line/column `ActiveInjectionBounds`s,
 /// keeping only those regions that contain at least one injection token.
 fn compute_active_injection_regions(
     host_text: &str,
     host_lines: &[&str],
     byte_ranges: &[(usize, usize)],
     tokens: &[RawToken],
-) -> Vec<InjectionRegion> {
+) -> Vec<ActiveInjectionBounds> {
     byte_ranges
         .iter()
         .filter_map(|&(start_byte, end_byte)| {
@@ -564,7 +564,7 @@ fn compute_active_injection_regions(
             });
 
             if has_injection_tokens {
-                Some(InjectionRegion {
+                Some(ActiveInjectionBounds {
                     start_line,
                     start_col,
                     end_line,

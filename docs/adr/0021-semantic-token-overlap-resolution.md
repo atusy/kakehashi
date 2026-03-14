@@ -111,10 +111,10 @@ Key concepts:
 - **Active region**: An injection region that produced at least one token (depth >= 1). If a language was resolved but the highlight query produced no captures, the region is *inactive* and host tokens are preserved.
 - **Spanning nodes**: Host captures on nodes that *extend beyond* injection boundaries (e.g., `@markup.raw.block` on `fenced_code_block`) are excluded because they fall inside the active injection region.
 
-The `InjectionRegion` struct carries line/column boundaries converted from byte ranges:
+The `ActiveInjectionBounds` struct carries line/column boundaries converted from byte ranges:
 
 ```rust
-struct InjectionRegion {
+struct ActiveInjectionBounds {
     start_line: usize,
     start_col: usize,   // UTF-16
     end_line: usize,
@@ -166,7 +166,7 @@ semantic.rs::handle_semantic_tokens_full
   |     |     +-- process_injection_sync (recursive, same thread)
   |     |
   |     +-- compute_active_injection_regions
-  |           (byte ranges -> InjectionRegion, filtered by token presence)
+  |           (byte ranges -> ActiveInjectionBounds, filtered by token presence)
   |
   +-- finalize_tokens(all_tokens, &active_injection_regions, &lines)
         |

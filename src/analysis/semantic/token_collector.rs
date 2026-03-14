@@ -122,7 +122,7 @@ impl RawToken {
 ///
 /// Used to exclude host tokens that fall inside active injection regions during finalization.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct InjectionRegion {
+pub(crate) struct ActiveInjectionBounds {
     /// Start line (0-indexed)
     pub start_line: usize,
     /// Start column (UTF-16)
