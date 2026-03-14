@@ -11,7 +11,7 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
-use kakehashi::text::convert_utf16_to_byte_in_line;
+use helpers::text::convert_utf16_to_byte_in_line;
 use serde_json::json;
 use std::time::Duration;
 

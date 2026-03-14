@@ -389,19 +389,6 @@ impl LanguageCoordinator {
         self.filetype_resolver.get_language_for_path(path)
     }
 
-    /// Get language for a file extension.
-    pub fn get_language_for_extension(&self, extension: &str) -> Option<String> {
-        self.filetype_resolver.get_language_for_extension(extension)
-    }
-
-    /// Get configured search paths (primarily for testing and diagnostics).
-    ///
-    /// Visibility: Public - used in integration tests (test_dynamic_lua_load)
-    /// to verify settings configuration.
-    pub fn get_search_paths(&self) -> Option<Vec<String>> {
-        self.config_store.get_search_paths()
-    }
-
     /// Check if a parser is available for a given language name.
     ///
     /// Used by the detection fallback chain (ADR-0005) to determine whether
@@ -690,14 +677,6 @@ impl LanguageCoordinator {
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
     pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store.get_highlight_query(lang_name)
-    }
-
-    /// Get locals query for a language.
-    ///
-    /// Visibility: Public - called by analysis layer (refactor) for scope
-    /// and local variable analysis in injected languages.
-    pub fn get_locals_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
-        self.query_store.get_locals_query(lang_name)
     }
 
     /// Get injection query for a language.
@@ -1124,36 +1103,6 @@ mod tests {
     // These verify the API surface exists and basic functionality works
 
     #[test]
-    fn coordinator_should_resolve_filetype() {
-        let coordinator = LanguageCoordinator::new();
-        let _lang = coordinator.get_language_for_extension("rs");
-    }
-
-    #[test]
-    fn coordinator_should_expose_query_state_checks() {
-        let coordinator = LanguageCoordinator::new();
-        let _has_queries: bool = coordinator.has_queries("rust");
-    }
-
-    #[test]
-    fn coordinator_should_expose_highlight_queries() {
-        let coordinator = LanguageCoordinator::new();
-        let _query = coordinator.get_highlight_query("rust");
-    }
-
-    #[test]
-    fn coordinator_should_expose_locals_queries() {
-        let coordinator = LanguageCoordinator::new();
-        let _query = coordinator.get_locals_query("rust");
-    }
-
-    #[test]
-    fn coordinator_should_provide_capture_mappings() {
-        let coordinator = LanguageCoordinator::new();
-        let _mappings = coordinator.get_capture_mappings();
-    }
-
-    #[test]
     fn test_coordinator_has_parser_available() {
         let coordinator = LanguageCoordinator::new();
 
@@ -1395,10 +1344,6 @@ mod tests {
             coordinator.get_highlight_query("rust").is_none(),
             "No highlight query should be loaded for unknown pattern"
         );
-        assert!(
-            coordinator.get_locals_query("rust").is_none(),
-            "No locals query should be loaded for unknown pattern"
-        );
     }
 
     #[test]
@@ -1469,17 +1414,11 @@ mod tests {
             );
         }
 
-        // Verify each query type was loaded separately
+        // Verify highlight query was loaded (locals and injections confirmed by events)
         assert!(
             coordinator.get_highlight_query("rust").is_some(),
             "Highlight query should be loaded"
         );
-        assert!(
-            coordinator.get_locals_query("rust").is_some(),
-            "Locals query should be loaded"
-        );
-        // Note: We can't directly check injection queries through the coordinator API
-        // but the events confirm they were processed
     }
 
     // Tests for alias resolution
@@ -1697,5 +1636,57 @@ mod tests {
         assert!(result.ends_with("..."));
         assert_eq!(result.chars().count(), 8); // 5 chars + "..."
         assert_eq!(result, "abc日本...");
+    }
+
+    #[test]
+    fn dynamic_lua_load_from_search_paths() {
+        use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
+
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let search_path = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        if !std::path::Path::new(&search_path).exists() {
+            eprintln!(
+                "skipping dynamic_lua_load_from_search_paths: grammar path '{}' does not exist",
+                search_path
+            );
+            return;
+        }
+
+        let settings = RawWorkspaceSettings {
+            search_paths: Some(vec![search_path.clone()]),
+            languages: std::collections::HashMap::new(),
+            capture_mappings: std::collections::HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+
+        let workspace_settings = WorkspaceSettings::try_from_settings(&settings, None, |_| None)
+            .expect("test settings should expand without errors");
+        let _summary = coordinator.load_settings(workspace_settings);
+
+        assert!(
+            coordinator.config_store.get_search_paths().is_some(),
+            "Search paths should be set after load_settings"
+        );
+
+        let result = coordinator.ensure_language_loaded("lua");
+
+        assert!(
+            result.success,
+            "Lua should load successfully from {}",
+            search_path
+        );
+
+        assert!(
+            coordinator.has_parser_available("lua"),
+            "Lua should be registered in language registry"
+        );
+        assert!(
+            coordinator.has_queries("lua"),
+            "Lua should have highlight queries"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use crate::config::{CaptureMappings, LanguageSettings, RawWorkspaceSettings};
 use crate::error::LockResultExt;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 /// Stores and manages language configurations
 pub struct ConfigStore {
@@ -33,21 +33,6 @@ impl ConfigStore {
         self.set_search_paths(settings.search_paths.clone());
     }
 
-    pub fn get_language_config(&self, lang_name: &str) -> Option<LanguageSettings> {
-        self.language_configs
-            .read()
-            .recover_poison("ConfigStore::get_language_config")
-            .get(lang_name)
-            .cloned()
-    }
-
-    pub fn get_all_language_configs(&self) -> HashMap<String, LanguageSettings> {
-        self.language_configs
-            .read()
-            .recover_poison("ConfigStore::get_all_language_configs")
-            .clone()
-    }
-
     // ========== Capture Mappings ==========
     pub fn set_capture_mappings(&self, mappings: CaptureMappings) {
         *self
@@ -77,32 +62,6 @@ impl ConfigStore {
             .recover_poison("ConfigStore::get_search_paths")
             .clone()
     }
-
-    /// Get search paths as a shared reference
-    pub fn get_search_paths_ref(&self) -> Arc<Option<Vec<String>>> {
-        Arc::new(
-            self.search_paths
-                .read()
-                .recover_poison("ConfigStore::get_search_paths_ref")
-                .clone(),
-        )
-    }
-
-    /// Clear all configurations
-    pub fn clear(&self) {
-        self.language_configs
-            .write()
-            .recover_poison("ConfigStore::clear(language_configs)")
-            .clear();
-        *self
-            .capture_mappings
-            .write()
-            .recover_poison("ConfigStore::clear(capture_mappings)") = CaptureMappings::default();
-        *self
-            .search_paths
-            .write()
-            .recover_poison("ConfigStore::clear(search_paths)") = None;
-    }
 }
 
 impl Default for ConfigStore {
@@ -114,6 +73,17 @@ impl Default for ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    impl ConfigStore {
+        fn get_language_config(&self, lang_name: &str) -> Option<LanguageSettings> {
+            self.language_configs
+                .read()
+                .recover_poison("ConfigStore::get_language_config")
+                .get(lang_name)
+                .cloned()
+        }
+    }
 
     #[test]
     fn test_config_store_language_configs() {
@@ -136,14 +106,8 @@ mod tests {
 
         store.set_language_configs(configs.clone());
 
-        // Test get individual config
         let rust_config = store.get_language_config("rust").unwrap();
         assert_eq!(rust_config.parser, Some("/path/to/rust.so".to_string()));
-
-        // Test get all configs
-        let all_configs = store.get_all_language_configs();
-        assert_eq!(all_configs.len(), 1);
-        assert!(all_configs.contains_key("rust"));
     }
 
     #[test]
@@ -200,7 +164,6 @@ mod tests {
         store.set_capture_mappings(mappings.clone());
 
         let retrieved = store.get_capture_mappings();
-        // Just check that we can store and retrieve mappings
         assert_eq!(retrieved.len(), mappings.len());
     }
 
@@ -239,20 +202,5 @@ mod tests {
             store.get_search_paths(),
             Some(vec!["/search/path".to_string()])
         );
-    }
-
-    #[test]
-    fn test_config_store_clear() {
-        let store = ConfigStore::new();
-
-        let mut configs = HashMap::new();
-        configs.insert("go".to_string(), LanguageSettings::default());
-        store.set_language_configs(configs);
-        store.set_search_paths(Some(vec!["/path".to_string()]));
-
-        store.clear();
-
-        assert!(store.get_language_config("go").is_none());
-        assert!(store.get_search_paths().is_none());
     }
 }

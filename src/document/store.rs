@@ -219,11 +219,6 @@ impl DocumentStore {
         })
     }
 
-    // Lock safety: map() consumes Ref, returning owned String clone - no read lock held after return
-    pub fn get_document_text(&self, uri: &Url) -> Option<String> {
-        self.documents.get(uri).map(|doc| doc.text().to_string())
-    }
-
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);

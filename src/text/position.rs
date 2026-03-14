@@ -1,5 +1,5 @@
 use line_index::{LineIndex, WideEncoding, WideLineCol};
-use tower_lsp_server::ls_types::{Position, Range};
+use tower_lsp_server::ls_types::Position;
 
 /// Position mapper for converting between LSP positions and byte offsets
 pub struct PositionMapper {
@@ -42,13 +42,6 @@ impl PositionMapper {
         Some(Position::new(wide_line_col.line, wide_line_col.col))
     }
 
-    /// Convert byte range to LSP Range
-    pub fn byte_range_to_range(&self, start: usize, end: usize) -> Option<Range> {
-        let start_pos = self.byte_to_position(start)?;
-        let end_pos = self.byte_to_position(end)?;
-        Some(Range::new(start_pos, end_pos))
-    }
-
     /// Convert LSP Position to tree-sitter Point with proper byte column
     ///
     /// LSP Position uses UTF-16 code units for the character field.
@@ -65,30 +58,6 @@ impl PositionMapper {
             line_col.line as usize,
             line_col.col as usize,
         ))
-    }
-}
-
-/// Convert UTF-16 position to byte position within a line
-/// Returns None if the UTF-16 position is invalid
-#[inline(always)]
-pub fn convert_utf16_to_byte_in_line(line_text: &str, utf16_pos: usize) -> Option<usize> {
-    let mut byte_offset = 0;
-    let mut utf16_offset = 0;
-
-    for ch in line_text.chars() {
-        if utf16_offset >= utf16_pos {
-            return Some(byte_offset);
-        }
-        utf16_offset += ch.len_utf16();
-        byte_offset += ch.len_utf8();
-    }
-
-    // If we reached the end and the position matches exactly, return the end position
-    if utf16_offset == utf16_pos {
-        Some(byte_offset)
-    } else {
-        // Position is beyond the end of the line
-        None
     }
 }
 
@@ -190,6 +159,37 @@ mod tests {
         assert_eq!(byte_to_utf16_col(line, 2), 1);
         // byte 3 is mid-emoji → falls back to 1
         assert_eq!(byte_to_utf16_col(line, 3), 1);
+    }
+
+    #[test]
+    fn utf16_to_byte_column_for_multibyte() {
+        // "あいうx" — each hiragana is 3 bytes UTF-8, 1 code unit UTF-16
+        // UTF-16 col 3 (after 3 hiragana) → byte col 9
+        let text = "あいうx\n";
+        let mapper = PositionMapper::new(text);
+        let point = mapper
+            .position_to_point(tower_lsp_server::ls_types::Position::new(0, 3))
+            .expect("valid position");
+        assert_eq!(point.row, 0);
+        assert_eq!(point.column, 9);
+    }
+
+    #[test]
+    fn position_to_byte_for_multibyte() {
+        // "let x = \"あいう\";" — ASCII prefix then 3 hiragana (3 bytes each)
+        let text = "let x = \"あいう\";\n";
+        let mapper = PositionMapper::new(text);
+
+        // UTF-16 col 9 → byte 9 (all ASCII up to the opening quote content)
+        assert_eq!(
+            mapper.position_to_byte(tower_lsp_server::ls_types::Position::new(0, 9)),
+            Some(9)
+        );
+        // UTF-16 col 12 → byte 18 (9 ASCII + 3 hiragana × 3 bytes)
+        assert_eq!(
+            mapper.position_to_byte(tower_lsp_server::ls_types::Position::new(0, 12)),
+            Some(18)
+        );
     }
 
     #[test]

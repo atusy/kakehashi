@@ -9,3 +9,4 @@ pub mod lsp_polling;
 pub mod lua_bridge;
 pub mod sanitization;
 pub mod test_fixtures;
+pub mod text;

@@ -40,3 +40,23 @@ impl InstallingLanguagesExt for InstallingLanguages {
         self.finish(&language.to_string());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracker_prevents_duplicate_installs() {
+        let tracker = InstallingLanguages::new();
+
+        // First attempt succeeds
+        assert!(tracker.try_start_install("lua"));
+
+        // Second attempt while installing fails
+        assert!(!tracker.try_start_install("lua"));
+
+        // After finishing, can install again
+        tracker.finish_install("lua");
+        assert!(tracker.try_start_install("lua"));
+    }
+}

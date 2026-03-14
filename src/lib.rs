@@ -1,8 +1,8 @@
 pub(crate) mod analysis;
 pub mod config;
-pub mod document;
-pub mod error;
+pub(crate) mod document;
+pub(crate) mod error;
 pub mod install;
-pub mod language;
+pub(crate) mod language;
 pub mod lsp;
-pub mod text;
+pub(crate) mod text;

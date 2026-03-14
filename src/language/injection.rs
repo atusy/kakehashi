@@ -743,21 +743,6 @@ impl CacheableInjectionRegion {
     fn hash_content(content: &str) -> u64 {
         fnv1a_hash(content)
     }
-
-    /// Check if a byte offset falls within this injection region's byte range.
-    ///
-    /// Used for determining which injection regions overlap with an edit.
-    pub fn contains_byte(&self, byte: usize) -> bool {
-        self.byte_range.contains(&byte)
-    }
-
-    /// Extract the injection content from the host document text.
-    ///
-    /// Returns the substring of `host_text` corresponding to this region's byte range.
-    /// This is the "virtual document" content that would be sent to a language server.
-    pub fn extract_content<'a>(&self, host_text: &'a str) -> &'a str {
-        &host_text[self.byte_range.clone()]
-    }
 }
 
 /// Collects all injection regions in the document
@@ -946,8 +931,6 @@ pub(crate) fn find_injection_at_position<'a>(
 pub struct ResolvedInjection {
     /// Cacheable injection region with line range information
     pub region: CacheableInjectionRegion,
-    /// Stable region identifier (ULID format, 26 alphanumeric characters)
-    pub region_id: String,
     /// Language of the injection content
     pub injection_language: String,
     /// Extracted virtual document content (clean, with blockquote prefixes stripped)
@@ -1070,7 +1053,6 @@ impl InjectionResolver {
             Self::resolve_language(coordinator, &region.language, &virtual_content);
         ResolvedInjection {
             region: cacheable_region,
-            region_id: region_id_str,
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
@@ -1469,67 +1451,6 @@ mod tests {
         assert_eq!(cacheable.region_id, "test-result-id");
     }
 
-    #[test]
-    fn test_cacheable_injection_region_contains_byte() {
-        let region = CacheableInjectionRegion {
-            language: "lua".to_string(),
-            byte_range: 100..200,
-            line_range: 5..10,
-            start_column: 0,
-            region_id: "test-region".to_string(),
-            content_hash: 12345,
-        };
-
-        // Byte within range
-        assert!(
-            region.contains_byte(100),
-            "Start of range should be included"
-        );
-        assert!(
-            region.contains_byte(150),
-            "Middle of range should be included"
-        );
-        assert!(
-            region.contains_byte(199),
-            "End-1 of range should be included"
-        );
-
-        // Byte outside range
-        assert!(
-            !region.contains_byte(99),
-            "Before range should not be included"
-        );
-        assert!(
-            !region.contains_byte(200),
-            "End of range (exclusive) should not be included"
-        );
-        assert!(
-            !region.contains_byte(300),
-            "Far after range should not be included"
-        );
-    }
-
-    #[test]
-    fn test_cacheable_injection_region_extract_content() {
-        // Simulate a Markdown document with a Rust code block
-        let host_text =
-            "# Title\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nMore text";
-        //                0123456789...
-        // The code block content starts at byte 17 (after "```rust\n") and ends at byte 54
-
-        let region = CacheableInjectionRegion {
-            language: "rust".to_string(),
-            byte_range: 17..54, // "fn main() {\n    println!(\"hello\");\n}"
-            line_range: 3..6,
-            start_column: 0,
-            region_id: "test-region".to_string(),
-            content_hash: 12345,
-        };
-
-        let content = region.extract_content(host_text);
-        assert_eq!(content, "fn main() {\n    println!(\"hello\");\n}\n");
-    }
-
     // ============================================================
     // Tests for InjectionResolver region_id generation
     // ============================================================
@@ -1573,7 +1494,7 @@ mod tests {
             22,
         );
         assert!(resolved.is_some(), "Should resolve injection");
-        let region_id = resolved.unwrap().region_id;
+        let region_id = resolved.unwrap().region.region_id;
         assert_eq!(
             region_id.len(),
             26,
@@ -1640,9 +1561,9 @@ mod tests {
         );
 
         // Each should have different ULIDs (different ordinals)
-        let id1 = r1.unwrap().region_id;
-        let id2 = r2.unwrap().region_id;
-        let id3 = r3.unwrap().region_id;
+        let id1 = r1.unwrap().region.region_id;
+        let id2 = r2.unwrap().region.region_id;
+        let id3 = r3.unwrap().region.region_id;
         assert_ne!(id1, id2, "Different ordinals should have different ULIDs");
         assert_ne!(id2, id3, "Different ordinals should have different ULIDs");
         assert_ne!(id1, id3, "Different ordinals should have different ULIDs");
@@ -1688,8 +1609,8 @@ mod tests {
         );
 
         assert_eq!(
-            r1.unwrap().region_id,
-            r2.unwrap().region_id,
+            r1.unwrap().region.region_id,
+            r2.unwrap().region.region_id,
             "Same position should return same region_id"
         );
     }
@@ -2506,5 +2427,56 @@ mod tests {
         let b = vec![make_range(5, 10, 0, 5, 0, 10)];
         let result = intersect_included_ranges(&a, &b);
         assert!(result.is_empty(), "Adjacent ranges should not intersect");
+    }
+
+    #[test]
+    fn collects_injected_languages_from_markdown_code_blocks() {
+        use std::collections::HashSet;
+        use tree_sitter::Query;
+
+        let markdown_text = r#"# Example
+
+```lua
+print("Hello from Lua")
+local x = 42
+```
+
+Some text.
+
+```python
+def hello():
+    print("Hello from Python")
+```
+
+```lua
+local y = "duplicate"
+```
+"#;
+
+        let mut parser = Parser::new();
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&md_language).expect("set markdown");
+        let tree = parser.parse(markdown_text, None).expect("parse markdown");
+        let root = tree.root_node();
+
+        let injection_query_str = r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+        "#;
+        let injection_query =
+            Query::new(&md_language, injection_query_str).expect("valid injection query");
+
+        let injections = collect_all_injections(&root, markdown_text, Some(&injection_query))
+            .unwrap_or_default();
+
+        let unique_languages: HashSet<String> =
+            injections.iter().map(|i| i.language.clone()).collect();
+
+        assert_eq!(unique_languages.len(), 2);
+        assert!(unique_languages.contains("lua"));
+        assert!(unique_languages.contains("python"));
+        assert_eq!(injections.len(), 3, "2 lua + 1 python");
     }
 }

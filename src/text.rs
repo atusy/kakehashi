@@ -8,4 +8,4 @@ mod hash;
 pub(crate) mod position;
 
 pub(crate) use hash::fnv1a_hash;
-pub use position::{PositionMapper, convert_utf16_to_byte_in_line};
+pub(crate) use position::PositionMapper;
