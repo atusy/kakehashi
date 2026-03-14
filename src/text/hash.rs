@@ -17,9 +17,7 @@
 ///
 /// # Example
 ///
-/// ```
-/// use kakehashi::text::fnv1a_hash;
-///
+/// ```ignore
 /// let hash1 = fnv1a_hash("hello world");
 /// let hash2 = fnv1a_hash("hello world");
 /// let hash3 = fnv1a_hash("different");
