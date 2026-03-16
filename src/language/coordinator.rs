@@ -1690,8 +1690,6 @@ mod tests {
 
     #[test]
     fn dynamic_lua_load_from_search_paths() {
-        use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
-
         let coordinator = LanguageCoordinator::new();
 
         let cwd = std::env::current_dir().expect("cwd");
@@ -1705,17 +1703,11 @@ mod tests {
             return;
         }
 
-        let settings = RawWorkspaceSettings {
-            search_paths: Some(vec![search_path.clone()]),
-            languages: std::collections::HashMap::new(),
-            capture_mappings: std::collections::HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+        let settings = WorkspaceSettings {
+            search_paths: vec![search_path.clone()],
+            ..Default::default()
         };
-
-        let workspace_settings = WorkspaceSettings::try_from_settings(&settings, None, |_| None)
-            .expect("test settings should expand without errors");
-        let _summary = coordinator.load_settings(workspace_settings);
+        let _summary = coordinator.load_settings(settings);
 
         assert!(
             !coordinator.config_store.get_search_paths().is_empty(),
