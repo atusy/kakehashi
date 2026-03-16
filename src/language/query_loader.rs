@@ -515,6 +515,9 @@ mod tests {
         let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("parser/rust.so"));
+
+        // Empty search paths and no explicit library → None
+        assert!(QueryLoader::resolve_library_path(None, "rust", &[]).is_none());
     }
 
     // ============================================================
