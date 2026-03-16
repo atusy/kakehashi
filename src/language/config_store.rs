@@ -1,4 +1,4 @@
-use crate::config::{CaptureMappings, LanguageSettings, RawWorkspaceSettings};
+use crate::config::{CaptureMappings, LanguageSettings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -7,7 +7,7 @@ use std::sync::RwLock;
 pub struct ConfigStore {
     language_configs: RwLock<HashMap<String, LanguageSettings>>,
     capture_mappings: RwLock<CaptureMappings>,
-    search_paths: RwLock<Option<Vec<String>>>,
+    search_paths: RwLock<Vec<String>>,
 }
 
 impl ConfigStore {
@@ -15,7 +15,7 @@ impl ConfigStore {
         Self {
             language_configs: RwLock::new(HashMap::new()),
             capture_mappings: RwLock::new(CaptureMappings::default()),
-            search_paths: RwLock::new(None),
+            search_paths: RwLock::new(Vec::new()),
         }
     }
 
@@ -27,7 +27,7 @@ impl ConfigStore {
             .recover_poison("ConfigStore::set_language_configs") = configs;
     }
 
-    pub fn update_from_settings(&self, settings: &RawWorkspaceSettings) {
+    pub fn update_from_settings(&self, settings: &WorkspaceSettings) {
         self.set_language_configs(settings.languages.clone());
         self.set_capture_mappings(settings.capture_mappings.clone());
         self.set_search_paths(settings.search_paths.clone());
@@ -49,14 +49,14 @@ impl ConfigStore {
     }
 
     // ========== Search Paths ==========
-    pub fn set_search_paths(&self, paths: Option<Vec<String>>) {
+    pub fn set_search_paths(&self, paths: Vec<String>) {
         *self
             .search_paths
             .write()
             .recover_poison("ConfigStore::set_search_paths") = paths;
     }
 
-    pub fn get_search_paths(&self) -> Option<Vec<String>> {
+    pub fn get_search_paths(&self) -> Vec<String> {
         self.search_paths
             .read()
             .recover_poison("ConfigStore::get_search_paths")
@@ -172,9 +172,9 @@ mod tests {
         let store = ConfigStore::new();
 
         let paths = vec!["/path/one".to_string(), "/path/two".to_string()];
-        store.set_search_paths(Some(paths.clone()));
+        store.set_search_paths(paths.clone());
 
-        let retrieved = store.get_search_paths().unwrap();
+        let retrieved = store.get_search_paths();
         assert_eq!(retrieved.len(), 2);
         assert_eq!(retrieved[0], "/path/one");
     }
@@ -183,24 +183,21 @@ mod tests {
     fn test_config_store_update_from_settings() {
         let store = ConfigStore::new();
 
-        let settings = RawWorkspaceSettings {
+        let settings = WorkspaceSettings {
             languages: {
                 let mut langs = HashMap::new();
                 langs.insert("python".to_string(), LanguageSettings::default());
                 langs
             },
-            search_paths: Some(vec!["/search/path".to_string()]),
+            search_paths: vec!["/search/path".to_string()],
             capture_mappings: CaptureMappings::default(),
-            auto_install: None,
+            auto_install: true,
             language_servers: None,
         };
 
         store.update_from_settings(&settings);
 
         assert!(store.get_language_config("python").is_some());
-        assert_eq!(
-            store.get_search_paths(),
-            Some(vec!["/search/path".to_string()])
-        );
+        assert_eq!(store.get_search_paths(), vec!["/search/path".to_string()]);
     }
 }
