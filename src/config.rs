@@ -395,26 +395,13 @@ fn merge_languages(
     overlay: HashMap<String, LanguageSettings>,
 ) -> HashMap<String, LanguageSettings> {
     // Deep merge: overlay values override base values for the same key
-    for (key, overlay_config) in overlay {
+    for (key, mut overlay_config) in overlay {
         base.entry(key)
             .and_modify(|base_config| {
-                // For each field: use overlay if Some, otherwise keep base
-                base_config.parser = overlay_config
-                    .parser
-                    .clone()
-                    .or_else(|| base_config.parser.clone());
-                base_config.queries = overlay_config
-                    .queries
-                    .clone()
-                    .or_else(|| base_config.queries.clone());
-                base_config.bridge = overlay_config
-                    .bridge
-                    .clone()
-                    .or_else(|| base_config.bridge.clone());
-                base_config.aliases = overlay_config
-                    .aliases
-                    .clone()
-                    .or_else(|| base_config.aliases.clone());
+                base_config.parser = overlay_config.parser.take().or(base_config.parser.take());
+                base_config.queries = overlay_config.queries.take().or(base_config.queries.take());
+                base_config.bridge = overlay_config.bridge.take().or(base_config.bridge.take());
+                base_config.aliases = overlay_config.aliases.take().or(base_config.aliases.take());
             })
             .or_insert(overlay_config);
     }
