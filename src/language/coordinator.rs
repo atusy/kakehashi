@@ -86,8 +86,9 @@ impl LanguageCoordinator {
         self.build_alias_map(&settings.languages);
 
         let mut summary = LanguageLoadSummary::default();
+        let search_paths = settings.search_paths.as_deref().unwrap_or_default();
         for (lang_name, config) in &settings.languages {
-            let result = self.load_single_language(lang_name, config, &settings.search_paths);
+            let result = self.load_single_language(lang_name, config, search_paths);
             summary.record(lang_name, result);
         }
         summary
@@ -703,10 +704,10 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &Option<Vec<String>>,
+        search_paths: &[String],
     ) -> LanguageLoadResult {
         let library_path =
-            QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths.as_deref().unwrap_or_default());
+            QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths);
         let Some(lib_path) = library_path else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Error,
@@ -735,6 +736,7 @@ impl LanguageCoordinator {
             .register(lang_name.to_string(), language.clone());
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
+
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
             format!("Language {lang_name} loaded."),
@@ -746,7 +748,7 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &Option<Vec<String>>,
+        search_paths: &[String],
         language: &Language,
     ) -> Vec<LanguageEvent> {
         let mut events = Vec::new();
@@ -758,10 +760,10 @@ impl LanguageCoordinator {
         }
 
         // Fall back to search paths when queries field is not specified
-        if let Some(paths) = search_paths {
+        if !search_paths.is_empty() {
             self.load_query(
                 language,
-                paths,
+                search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type: "highlights",
@@ -773,7 +775,7 @@ impl LanguageCoordinator {
 
             self.load_query(
                 language,
-                paths,
+                search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type: "locals",
@@ -785,7 +787,7 @@ impl LanguageCoordinator {
 
             self.load_query(
                 language,
-                paths,
+                search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type: "injections",
