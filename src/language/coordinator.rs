@@ -1662,7 +1662,7 @@ mod tests {
             .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
         let parser_path = std::path::PathBuf::from(&grammar_dir)
             .join("parser")
-            .join("lua.dylib");
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
         if !parser_path.exists() {
             eprintln!(
                 "skipping load_single_language_with_empty_search_paths_skips_queries: parser '{}' does not exist",
