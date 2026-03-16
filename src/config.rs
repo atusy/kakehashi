@@ -398,23 +398,10 @@ fn merge_languages(
     for (key, mut overlay_config) in overlay {
         base.entry(key)
             .and_modify(|base_config| {
-                // move overlay value if Some, otherwise keep base
-                base_config.parser = overlay_config
-                    .parser
-                    .take()
-                    .or_else(|| base_config.parser.take());
-                base_config.queries = overlay_config
-                    .queries
-                    .take()
-                    .or_else(|| base_config.queries.take());
-                base_config.bridge = overlay_config
-                    .bridge
-                    .take()
-                    .or_else(|| base_config.bridge.take());
-                base_config.aliases = overlay_config
-                    .aliases
-                    .take()
-                    .or_else(|| base_config.aliases.take());
+                base_config.parser = overlay_config.parser.take().or(base_config.parser.take());
+                base_config.queries = overlay_config.queries.take().or(base_config.queries.take());
+                base_config.bridge = overlay_config.bridge.take().or(base_config.bridge.take());
+                base_config.aliases = overlay_config.aliases.take().or(base_config.aliases.take());
             })
             .or_insert(overlay_config);
     }
