@@ -7,7 +7,7 @@ use super::query_loader::{ParseFailure, QueryLoader};
 use super::query_store::QueryStore;
 use super::registry::LanguageRegistry;
 use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
-use crate::config::{CaptureMappings, RawWorkspaceSettings, WorkspaceSettings};
+use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use log::debug;
 use std::collections::HashMap;
@@ -74,13 +74,7 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub fn load_settings(&self, settings: WorkspaceSettings) -> LanguageLoadSummary {
-        let config_settings: RawWorkspaceSettings = settings.into();
-        self.load_settings_from_config(&config_settings)
-    }
-
-    fn load_settings_from_config(&self, settings: &RawWorkspaceSettings) -> LanguageLoadSummary {
-        self.config_store.update_from_settings(settings);
-        // build_from_settings removed in PBI-061 - filetypes no longer in config
+        self.config_store.update_from_settings(&settings);
 
         // Build alias map from language configs
         self.build_alias_map(&settings.languages);
@@ -171,12 +165,12 @@ impl LanguageCoordinator {
         }
 
         let search_paths = self.config_store.get_search_paths();
-        let Some(paths) = &search_paths else {
+        if search_paths.is_empty() {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Warning,
                 format!("No search paths configured, cannot load language '{language_id}'"),
             ));
-        };
+        }
 
         let library_path = QueryLoader::resolve_library_path(None, language_id, &search_paths);
         let Some(lib_path) = library_path else {
@@ -213,7 +207,7 @@ impl LanguageCoordinator {
         // and gracefully skips invalid patterns while preserving valid ones
         self.load_query(
             &language,
-            paths,
+            &search_paths,
             QueryLoadContext {
                 language_id,
                 query_type: "highlights",
@@ -224,7 +218,7 @@ impl LanguageCoordinator {
         );
         self.load_query(
             &language,
-            paths,
+            &search_paths,
             QueryLoadContext {
                 language_id,
                 query_type: "locals",
@@ -235,7 +229,7 @@ impl LanguageCoordinator {
         );
         self.load_query(
             &language,
-            paths,
+            &search_paths,
             QueryLoadContext {
                 language_id,
                 query_type: "injections",
@@ -703,7 +697,7 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &Option<Vec<String>>,
+        search_paths: &[String],
     ) -> LanguageLoadResult {
         let library_path =
             QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths);
@@ -735,6 +729,7 @@ impl LanguageCoordinator {
             .register(lang_name.to_string(), language.clone());
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
+
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
             format!("Language {lang_name} loaded."),
@@ -746,7 +741,7 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &Option<Vec<String>>,
+        search_paths: &[String],
         language: &Language,
     ) -> Vec<LanguageEvent> {
         let mut events = Vec::new();
@@ -758,10 +753,10 @@ impl LanguageCoordinator {
         }
 
         // Fall back to search paths when queries field is not specified
-        if let Some(paths) = search_paths {
+        if !search_paths.is_empty() {
             self.load_query(
                 language,
-                paths,
+                search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type: "highlights",
@@ -773,7 +768,7 @@ impl LanguageCoordinator {
 
             self.load_query(
                 language,
-                paths,
+                search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type: "locals",
@@ -785,7 +780,7 @@ impl LanguageCoordinator {
 
             self.load_query(
                 language,
-                paths,
+                search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type: "injections",
@@ -1639,9 +1634,62 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_lua_load_from_search_paths() {
-        use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
+    fn ensure_language_loaded_fails_with_empty_search_paths() {
+        let coordinator = LanguageCoordinator::new();
+        // No settings loaded → search_paths is empty Vec
+        let result = coordinator.ensure_language_loaded("lua");
+        assert!(!result.success, "Should fail when search paths are empty");
+        match &result.events[0] {
+            LanguageEvent::Log { level, message } => {
+                assert!(matches!(level, LanguageLogLevel::Warning));
+                assert!(
+                    message.contains("No search paths configured"),
+                    "Expected 'No search paths configured' warning, got: {message}"
+                );
+            }
+            other => panic!("Expected Log event, got: {other:?}"),
+        }
+    }
 
+    #[test]
+    fn load_single_language_with_empty_search_paths_skips_queries() {
+        use crate::config::settings::LanguageSettings;
+
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let parser_path = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join("lua.dylib");
+        if !parser_path.exists() {
+            eprintln!(
+                "skipping load_single_language_with_empty_search_paths_skips_queries: parser '{}' does not exist",
+                parser_path.display()
+            );
+            return;
+        }
+
+        let config = LanguageSettings {
+            parser: Some(parser_path.to_string_lossy().into_owned()),
+            queries: None,
+            ..Default::default()
+        };
+        let result = coordinator.load_single_language("lua", &config, &[]);
+        assert!(result.success, "Language should load with explicit parser");
+        assert!(
+            coordinator.has_parser_available("lua"),
+            "Parser should be registered"
+        );
+        assert!(
+            !coordinator.has_queries("lua"),
+            "No queries should be loaded when search_paths is empty and no queries field"
+        );
+    }
+
+    #[test]
+    fn dynamic_lua_load_from_search_paths() {
         let coordinator = LanguageCoordinator::new();
 
         let cwd = std::env::current_dir().expect("cwd");
@@ -1655,20 +1703,14 @@ mod tests {
             return;
         }
 
-        let settings = RawWorkspaceSettings {
-            search_paths: Some(vec![search_path.clone()]),
-            languages: std::collections::HashMap::new(),
-            capture_mappings: std::collections::HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+        let settings = WorkspaceSettings {
+            search_paths: vec![search_path.clone()],
+            ..Default::default()
         };
-
-        let workspace_settings = WorkspaceSettings::try_from_settings(&settings, None, |_| None)
-            .expect("test settings should expand without errors");
-        let _summary = coordinator.load_settings(workspace_settings);
+        let _summary = coordinator.load_settings(settings);
 
         assert!(
-            coordinator.config_store.get_search_paths().is_some(),
+            !coordinator.config_store.get_search_paths().is_empty(),
             "Search paths should be set after load_settings"
         );
 
