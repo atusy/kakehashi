@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
+use crate::error::LockResultExt;
+
 use super::super::pool::UpstreamId;
 use super::super::protocol::RequestId;
 
@@ -116,7 +118,7 @@ impl ResponseRouter {
         upstream_id: Option<UpstreamId>,
     ) -> Option<oneshot::Receiver<serde_json::Value>> {
         let (tx, rx) = oneshot::channel();
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().recover_poison("ResponseRouter::state");
 
         // Prevent duplicate registration
         if state.pending.contains_key(&downstream_id) {
@@ -143,7 +145,7 @@ impl ResponseRouter {
     ///
     /// Returns `None` if no mapping exists (request not found or already completed).
     pub(crate) fn lookup_downstream_id(&self, upstream_id: &UpstreamId) -> Option<RequestId> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().recover_poison("ResponseRouter::state");
         state.upstream_to_downstream.get(upstream_id).copied()
     }
 
@@ -164,7 +166,7 @@ impl ResponseRouter {
             None => return RouteResult::NotFound, // Not a response (notification), skip
         };
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().recover_poison("ResponseRouter::state");
         let tx = state.pending.remove(&id);
 
         // Clean up bidirectional cancel map entries in O(1)
@@ -200,7 +202,7 @@ impl ResponseRouter {
     /// - Timer starts when pending transitions 0 -> 1
     /// - Timer stops when pending transitions to 0
     pub(crate) fn pending_count(&self) -> usize {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().recover_poison("ResponseRouter::state");
         state.pending.len()
     }
 
@@ -211,7 +213,7 @@ impl ResponseRouter {
     ///
     /// Returns `true` if the request was removed, `false` if it wasn't pending.
     pub(crate) fn remove(&self, id: RequestId) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().recover_poison("ResponseRouter::state");
         let removed = state.pending.remove(&id).is_some();
 
         if removed {
@@ -238,7 +240,7 @@ impl ResponseRouter {
     /// critical for avoiding double-cleanup races between sender cleanup and writer
     /// task cleanup (see ADR-0015 Appendix A).
     pub(crate) fn fail_request(&self, id: RequestId, reason: &str) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().recover_poison("ResponseRouter::state");
 
         let tx = state.pending.remove(&id);
 
@@ -286,7 +288,7 @@ impl ResponseRouter {
     /// the per-connection router simplifies the architecture at the cost of
     /// temporarily stale entries that have no runtime impact.
     pub(crate) fn fail_all(&self, error_message: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().recover_poison("ResponseRouter::state");
         let entries: Vec<_> = state.pending.drain().collect();
 
         // Clear both cancel map directions

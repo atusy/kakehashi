@@ -667,7 +667,10 @@ impl ConnectionHandle {
         // 2. Stop writer task and reclaim the writer via 3-phase protocol
         // This ensures no concurrent writes to stdin during shutdown
         let writer_handle = {
-            let mut guard = self.writer_handle.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self
+                .writer_handle
+                .lock()
+                .recover_poison("ConnectionHandle::graceful_shutdown");
             guard.take()
         };
 

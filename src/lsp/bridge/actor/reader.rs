@@ -18,6 +18,8 @@ use std::time::Duration;
 
 use log::{debug, warn};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::error::LockResultExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
@@ -288,7 +290,7 @@ impl ReaderTaskHandle {
         let mut guard = self
             .liveness_failed_rx
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .recover_poison("ReaderTaskHandle::check_liveness_failed");
 
         if let Some(mut rx) = guard.take() {
             match rx.try_recv() {

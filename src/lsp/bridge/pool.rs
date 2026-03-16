@@ -55,6 +55,8 @@ use url::Url;
 
 use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
 
+use crate::error::LockResultExt;
+
 use super::protocol::{JsonRpcNotification, VirtualDocumentUri, build_didopen_notification};
 
 /// Timeout for LSP initialize handshake (ADR-0018 Tier 0: 30-60s recommended).
@@ -351,7 +353,10 @@ impl LanguageServerPool {
     pub(crate) fn take_upstream_rx(
         &self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<UpstreamNotification>> {
-        let mut guard = self.upstream_rx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .upstream_rx
+            .lock()
+            .recover_poison("LanguageServerPool::take_upstream_rx");
         guard.take()
     }
 
@@ -710,7 +715,7 @@ impl LanguageServerPool {
             let counts = self
                 .consecutive_panic_counts
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .recover_poison("LanguageServerPool::consecutive_panic_counts");
             counts.get(server_name).copied().unwrap_or(0)
         };
 
@@ -879,7 +884,7 @@ impl LanguageServerPool {
                 let mut counts = self
                     .consecutive_panic_counts
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .recover_poison("LanguageServerPool::consecutive_panic_counts");
                 counts.remove(server_name);
                 Ok(handle)
             }
@@ -894,7 +899,7 @@ impl LanguageServerPool {
                         let mut counts = self
                             .consecutive_panic_counts
                             .lock()
-                            .unwrap_or_else(|e| e.into_inner());
+                            .recover_poison("LanguageServerPool::consecutive_panic_counts");
                         let count = counts.entry(server_name.to_string()).or_insert(0);
                         *count += 1;
                         *count
@@ -1084,7 +1089,7 @@ impl LanguageServerPool {
             let registry = self
                 .upstream_request_registry
                 .lock()
-                .unwrap_or_else(|e| e.into_inner());
+                .recover_poison("LanguageServerPool::upstream_request_registry");
             match registry.get(&upstream_id) {
                 Some(servers) => servers.iter().cloned().collect(),
                 None => {
@@ -1163,7 +1168,7 @@ impl LanguageServerPool {
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .recover_poison("LanguageServerPool::upstream_request_registry");
         registry
             .entry(upstream_id)
             .or_default()
@@ -1183,7 +1188,7 @@ impl LanguageServerPool {
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .recover_poison("LanguageServerPool::upstream_request_registry");
         if let Some(servers) = registry.get_mut(upstream_id) {
             servers.remove(server_name);
             if servers.is_empty() {
@@ -1203,7 +1208,7 @@ impl LanguageServerPool {
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .recover_poison("LanguageServerPool::upstream_request_registry");
         registry.remove(upstream_id);
     }
 }

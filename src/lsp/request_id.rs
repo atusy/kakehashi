@@ -30,6 +30,8 @@ use tokio::sync::oneshot;
 use tower::Service;
 use tower_lsp_server::jsonrpc::{Id, Request, Response};
 
+use crate::error::LockResultExt;
+
 use super::bridge::LanguageServerPool;
 use super::bridge::UpstreamId;
 
@@ -176,7 +178,10 @@ impl CancelForwarder {
     ) -> Result<CancelReceiver, AlreadySubscribedError> {
         let (tx, rx) = oneshot::channel();
         {
-            let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut subscribers = self
+                .subscribers
+                .lock()
+                .recover_poison("CancelForwarder::subscribers");
             match subscribers.entry(upstream_id) {
                 Entry::Occupied(entry) => return Err(AlreadySubscribedError(entry.key().clone())),
                 Entry::Vacant(entry) => {
@@ -196,7 +201,10 @@ impl CancelForwarder {
     ///
     /// Calling this after receiving a cancel notification is harmless (no-op).
     pub(crate) fn unsubscribe(&self, upstream_id: &UpstreamId) {
-        let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .recover_poison("CancelForwarder::subscribers");
         subscribers.remove(upstream_id);
     }
 
@@ -210,7 +218,10 @@ impl CancelForwarder {
     /// - `false` if no subscriber existed for this ID
     pub(crate) fn notify_cancel(&self, upstream_id: &UpstreamId) -> bool {
         let sender = {
-            let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut subscribers = self
+                .subscribers
+                .lock()
+                .recover_poison("CancelForwarder::subscribers");
             subscribers.remove(upstream_id)
         };
         if let Some(tx) = sender {
