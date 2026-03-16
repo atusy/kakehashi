@@ -184,7 +184,7 @@ impl LanguageCoordinator {
             let result = self
                 .parser_loader
                 .write()
-                .unwrap()
+                .recover_poison("LanguageCoordinator::try_load_language_by_id")
                 .load_language(&lib_path, language_id);
             match result {
                 Ok(lang) => lang,
@@ -712,7 +712,7 @@ impl LanguageCoordinator {
             let result = self
                 .parser_loader
                 .write()
-                .unwrap()
+                .recover_poison("LanguageCoordinator::load_single_language")
                 .load_language(&lib_path, lang_name);
             match result {
                 Ok(lang) => lang,
