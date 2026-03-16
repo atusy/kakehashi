@@ -178,7 +178,7 @@ impl LanguageCoordinator {
             ));
         };
 
-        let library_path = QueryLoader::resolve_library_path(None, language_id, &search_paths);
+        let library_path = QueryLoader::resolve_library_path(None, language_id, search_paths.as_deref().unwrap_or_default());
         let Some(lib_path) = library_path else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Warning,
@@ -706,7 +706,7 @@ impl LanguageCoordinator {
         search_paths: &Option<Vec<String>>,
     ) -> LanguageLoadResult {
         let library_path =
-            QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths);
+            QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths.as_deref().unwrap_or_default());
         let Some(lib_path) = library_path else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Error,

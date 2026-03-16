@@ -403,7 +403,7 @@ impl QueryLoader {
     pub fn resolve_library_path(
         library: Option<&String>,
         language: &str,
-        search_paths: &Option<Vec<String>>,
+        search_paths: &[String],
     ) -> Option<String> {
         // If explicit library path is provided, normalize and use it
         if let Some(lib) = library {
@@ -412,16 +412,14 @@ impl QueryLoader {
         }
 
         // Otherwise, search in searchPaths: <base>/parser/
-        if let Some(paths) = search_paths {
-            for path in paths {
-                for ext in PARSER_EXTENSIONS {
-                    let parser_path = PathBuf::from(path)
-                        .join("parser")
-                        .join(format!("{language}.{ext}"))
-                        .clean();
-                    if parser_path.exists() {
-                        return Some(parser_path.to_string_lossy().into_owned());
-                    }
+        for path in search_paths {
+            for ext in PARSER_EXTENSIONS {
+                let parser_path = PathBuf::from(path)
+                    .join("parser")
+                    .join(format!("{language}.{ext}"))
+                    .clean();
+                if parser_path.exists() {
+                    return Some(parser_path.to_string_lossy().into_owned());
                 }
             }
         }
@@ -498,7 +496,7 @@ mod tests {
     fn test_resolve_library_path() {
         // Test explicit library path
         let explicit = Some(&"explicit/path.so".to_string());
-        let result = QueryLoader::resolve_library_path(explicit, "rust", &None);
+        let result = QueryLoader::resolve_library_path(explicit, "rust", &[]);
         assert_eq!(result, Some("explicit/path.so".to_string()));
 
         // Test search paths
@@ -513,7 +511,7 @@ mod tests {
         let so_file = parser_dir.join("rust.so");
         fs::write(&so_file, "").unwrap();
 
-        let search_paths = Some(vec![base_path]);
+        let search_paths = vec![base_path];
         let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("parser/rust.so"));
