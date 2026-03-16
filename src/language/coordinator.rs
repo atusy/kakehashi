@@ -1639,6 +1639,16 @@ mod tests {
         // No settings loaded → search_paths is empty Vec
         let result = coordinator.ensure_language_loaded("lua");
         assert!(!result.success, "Should fail when search paths are empty");
+        match &result.events[0] {
+            LanguageEvent::Log { level, message } => {
+                assert!(matches!(level, LanguageLogLevel::Warning));
+                assert!(
+                    message.contains("No search paths configured"),
+                    "Expected 'No search paths configured' warning, got: {message}"
+                );
+            }
+            other => panic!("Expected Log event, got: {other:?}"),
+        }
     }
 
     #[test]
