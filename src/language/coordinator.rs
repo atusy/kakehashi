@@ -1652,6 +1652,43 @@ mod tests {
     }
 
     #[test]
+    fn load_single_language_with_empty_search_paths_skips_queries() {
+        use crate::config::settings::LanguageSettings;
+
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let parser_path = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join("lua.dylib");
+        if !parser_path.exists() {
+            eprintln!(
+                "skipping load_single_language_with_empty_search_paths_skips_queries: parser '{}' does not exist",
+                parser_path.display()
+            );
+            return;
+        }
+
+        let config = LanguageSettings {
+            parser: Some(parser_path.to_string_lossy().into_owned()),
+            queries: None,
+            ..Default::default()
+        };
+        let result = coordinator.load_single_language("lua", &config, &[]);
+        assert!(result.success, "Language should load with explicit parser");
+        assert!(
+            coordinator.has_parser_available("lua"),
+            "Parser should be registered"
+        );
+        assert!(
+            !coordinator.has_queries("lua"),
+            "No queries should be loaded when search_paths is empty and no queries field"
+        );
+    }
+
+    #[test]
     fn dynamic_lua_load_from_search_paths() {
         use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
 
