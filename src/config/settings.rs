@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use super::WILDCARD_KEY;
+
 pub type CaptureMapping = HashMap<String, String>;
 
 /// Workspace type for bridge language server connections.
@@ -76,7 +78,7 @@ impl BridgeLanguageConfig {
             return vec![];
         };
         map.get(method)
-            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .or_else(|| map.get(WILDCARD_KEY))
             .map(|c| c.priorities.clone())
             .unwrap_or_default()
     }
@@ -91,7 +93,7 @@ impl BridgeLanguageConfig {
         let map = self.aggregation.as_ref()?;
         let raw = map
             .get(method)
-            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .or_else(|| map.get(WILDCARD_KEY))
             .and_then(|c| c.max_fan_out)?;
         usize::try_from(raw).ok()
     }
@@ -108,7 +110,7 @@ impl BridgeLanguageConfig {
             return default;
         };
         map.get(method)
-            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+            .or_else(|| map.get(WILDCARD_KEY))
             .and_then(|c| c.strategy)
             .unwrap_or(default)
     }
@@ -295,7 +297,6 @@ impl Default for WorkspaceSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WILDCARD_KEY;
     use rstest::rstest;
 
     #[test]
