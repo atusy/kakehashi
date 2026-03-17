@@ -1468,6 +1468,8 @@ kind = "injections""#;
 
         let agg = ResolvedAggregationConfig::with_defaults(AggregationStrategy::Preferred);
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
+        assert!(agg.priorities.is_empty());
+        assert_eq!(agg.max_fan_out, None);
     }
 
     #[test]
