@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams, MessageType};
+use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
 
 use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
@@ -27,27 +27,23 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!("documentLink called for {}", uri),
-            )
-            .await;
+        log::debug!("documentLink called for {}", uri);
 
         // Get document snapshot (minimizes lock duration)
-        let (snapshot, missing_message) = match self.documents.get(&uri) {
-            None => (None, Some("No document found")),
+        let snapshot = match self.documents.get(&uri) {
+            None => {
+                log::debug!("documentLink: No document found for {}", uri);
+                return Ok(None);
+            }
             Some(doc) => match doc.snapshot() {
-                None => (None, Some("Document not fully initialized")),
-                Some(snapshot) => (Some(snapshot), None),
+                None => {
+                    log::debug!("documentLink: Document not fully initialized for {}", uri);
+                    return Ok(None);
+                }
+                Some(snapshot) => snapshot,
             },
             // doc automatically dropped here, lock released
         };
-        if let Some(message) = missing_message {
-            self.client.log_message(MessageType::INFO, message).await;
-            return Ok(None);
-        }
-        let snapshot = snapshot.expect("snapshot set when missing_message is None");
 
         // Get the language for this document
         let Some(language_name) = self.get_language_for_document(&uri) else {
@@ -75,7 +71,7 @@ impl Kakehashi {
         }
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
-        let upstream_request_id = super::super::bridge_context::current_upstream_id();
+        let upstream_request_id = crate::lsp::current_upstream_id();
 
         // Subscribe to cancel notifications so we can abort early on $/cancelRequest.
         // _cancel_guard ensures automatic unsubscribe when this scope exits.
@@ -94,24 +90,20 @@ impl Kakehashi {
                 continue;
             }
 
-            let priorities = self.resolve_aggregation_priorities(
+            let agg = self.resolve_aggregation_config(
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/documentLink",
-            );
-            let max_fan_out = self.resolve_max_fan_out(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/documentLink",
+                AggregationStrategy::Preferred,
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
-                priorities,
-                strategy: AggregationStrategy::Preferred,
-                max_fan_out,
+                priorities: agg.priorities,
+                strategy: agg.strategy,
+                max_fan_out: agg.max_fan_out,
             };
             let pool = Arc::clone(&pool);
 

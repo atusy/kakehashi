@@ -8,7 +8,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::CompletionItem;
 
 use super::super::Kakehashi;
-use super::super::bridge_context::current_upstream_id;
+use crate::lsp::current_upstream_id;
 
 impl Kakehashi {
     /// Handle a `completionItem/resolve` request.

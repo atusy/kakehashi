@@ -153,21 +153,11 @@ impl Kakehashi {
                 continue;
             }
 
-            let priorities = self.resolve_aggregation_priorities(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/publishDiagnostics",
-            );
-            let strategy = self.resolve_aggregation_strategy(
+            let agg = self.resolve_aggregation_config(
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/publishDiagnostics",
                 AggregationStrategy::Concatenated,
-            );
-            let max_fan_out = self.resolve_max_fan_out(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/publishDiagnostics",
             );
 
             contexts.push(DocumentRequestContext {
@@ -175,9 +165,9 @@ impl Kakehashi {
                 resolved,
                 configs,
                 upstream_request_id: None, // Push diagnostics are synthetic
-                priorities,
-                strategy,
-                max_fan_out,
+                priorities: agg.priorities,
+                strategy: agg.strategy,
+                max_fan_out: agg.max_fan_out,
             });
         }
 

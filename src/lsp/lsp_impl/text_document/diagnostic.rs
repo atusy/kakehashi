@@ -23,7 +23,7 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
-    FullDocumentDiagnosticReport, MessageType, RelatedFullDocumentDiagnosticReport,
+    FullDocumentDiagnosticReport, RelatedFullDocumentDiagnosticReport,
 };
 
 use super::super::{Kakehashi, uri_to_url};
@@ -82,29 +82,26 @@ impl Kakehashi {
             return Ok(empty_diagnostic_report());
         };
 
-        // Use LOG level (lowest severity) for per-request logging in hot path
-        // to avoid flooding client with INFO messages on frequent diagnostic requests
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!("textDocument/diagnostic called for {}", uri),
-            )
-            .await;
+        log::trace!("textDocument/diagnostic called for {}", uri);
 
         // Get document snapshot (minimizes lock duration)
-        let (snapshot, missing_message) = match self.documents.get(&uri) {
-            None => (None, Some("No document found")),
+        let snapshot = match self.documents.get(&uri) {
+            None => {
+                log::debug!("textDocument/diagnostic: No document found for {}", uri);
+                return Ok(empty_diagnostic_report());
+            }
             Some(doc) => match doc.snapshot() {
-                None => (None, Some("Document not fully initialized")),
-                Some(snapshot) => (Some(snapshot), None),
+                None => {
+                    log::debug!(
+                        "textDocument/diagnostic: Document not fully initialized for {}",
+                        uri
+                    );
+                    return Ok(empty_diagnostic_report());
+                }
+                Some(snapshot) => snapshot,
             },
             // doc automatically dropped here, lock released
         };
-        if let Some(message) = missing_message {
-            self.client.log_message(MessageType::INFO, message).await;
-            return Ok(empty_diagnostic_report());
-        }
-        let snapshot = snapshot.expect("snapshot set when missing_message is None");
 
         // Get the language for this document
         let Some(language_name) = self.get_language_for_document(&uri) else {
@@ -132,7 +129,7 @@ impl Kakehashi {
         }
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
-        let upstream_request_id = super::super::bridge_context::current_upstream_id();
+        let upstream_request_id = crate::lsp::current_upstream_id();
 
         // Subscribe to cancel notifications for this request.
         // The guard ensures unsubscribe is called on all return paths (including early returns).
@@ -154,30 +151,21 @@ impl Kakehashi {
 
             // Resolve strategy per-region so different injection languages can use
             // different strategies (e.g., Python=Preferred, Lua=All in the same host).
-            let strategy = self.resolve_aggregation_strategy(
+            let agg = self.resolve_aggregation_config(
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/diagnostic",
                 AggregationStrategy::Concatenated,
             );
-            let priorities = self.resolve_aggregation_priorities(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/diagnostic",
-            );
-            let max_fan_out = self.resolve_max_fan_out(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/diagnostic",
-            );
+            let strategy = agg.strategy;
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
-                priorities,
-                strategy, // resolved per-region above; used in outer_join_set dispatch
-                max_fan_out,
+                priorities: agg.priorities,
+                strategy,
+                max_fan_out: agg.max_fan_out,
             };
             let pool = Arc::clone(&pool);
 

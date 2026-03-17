@@ -387,8 +387,20 @@ where
 ///
 /// Returns None if called outside of a request context or if the request was
 /// a notification (which has no ID).
-pub fn get_current_request_id() -> Option<Id> {
+fn get_current_request_id() -> Option<Id> {
     CURRENT_REQUEST_ID.try_with(|id| id.clone()).ok().flatten()
+}
+
+/// Extract the upstream request ID from task-local storage.
+///
+/// Converts the tower-lsp `Id` (set by RequestIdCapture middleware) into
+/// our domain `UpstreamId`. Returns `None` for null or missing IDs.
+pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
+    match get_current_request_id() {
+        Some(Id::Number(n)) => Some(UpstreamId::Number(n)),
+        Some(Id::String(s)) => Some(UpstreamId::String(s)),
+        None | Some(Id::Null) => None,
+    }
 }
 
 #[cfg(test)]
