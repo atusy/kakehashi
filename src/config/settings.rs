@@ -423,30 +423,31 @@ mod tests {
         assert_eq!(queries[1].kind, None); // Kind not specified - will be inferred later
     }
 
-    #[test]
-    fn should_parse_configuration_with_locals_query() {
-        // Configuration using unified queries field with locals
-        let config_json = r#"{
-            "languages": {
-                "rust": {
+    #[rstest]
+    #[case::locals("locals", QueryKind::Locals)]
+    #[case::injections("injections", QueryKind::Injections)]
+    fn should_parse_configuration_with_query_kind(
+        #[case] kind_str: &str,
+        #[case] expected: QueryKind,
+    ) {
+        let config_json = format!(
+            r#"{{
+            "languages": {{
+                "rust": {{
                     "queries": [
-                        {"path": "/path/to/highlights.scm", "kind": "highlights"},
-                        {"path": "/path/to/locals.scm", "kind": "locals"}
+                        {{"path": "/path/to/highlights.scm", "kind": "highlights"}},
+                        {{"path": "/path/to/{kind_str}.scm", "kind": "{kind_str}"}}
                     ]
-                }
-            }
-        }"#;
+                }}
+            }}
+        }}"#
+        );
 
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.languages.contains_key("rust"));
-        let rust_config = &settings.languages["rust"];
-
-        // Verify queries configuration is parsed
-        let queries = rust_config.queries.as_ref().unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(&config_json).unwrap();
+        let queries = settings.languages["rust"].queries.as_ref().unwrap();
         assert_eq!(queries.len(), 2);
-        assert_eq!(queries[1].path, "/path/to/locals.scm");
-        assert_eq!(queries[1].kind, Some(QueryKind::Locals));
+        assert_eq!(queries[1].path, format!("/path/to/{kind_str}.scm"));
+        assert_eq!(queries[1].kind, Some(expected));
     }
 
     #[test]
@@ -513,29 +514,29 @@ mod tests {
         assert!(settings.languages.is_empty());
     }
 
-    #[test]
-    fn should_parse_searchpaths_configuration_basic() {
-        let config_json = r#"{
-            "searchPaths": [
-                "/usr/local/lib/tree-sitter",
-                "/opt/tree-sitter/parsers"
-            ],
-            "languages": {
-                "rust": {
-                    "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
-                }
-            }
-        }"#;
-
+    #[rstest]
+    #[case::basic(
+        r#"{"searchPaths": ["/usr/local/lib/tree-sitter", "/opt/tree-sitter/parsers"],
+            "languages": {"rust": {"queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]}}}"#,
+        &["/usr/local/lib/tree-sitter", "/opt/tree-sitter/parsers"],
+    )]
+    #[case::different_paths(
+        r#"{"searchPaths": ["/data/tree-sitter", "/assets/ts"],
+            "languages": {"lua": {"queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]}}}"#,
+        &["/data/tree-sitter", "/assets/ts"],
+    )]
+    fn should_parse_searchpaths_configuration(
+        #[case] config_json: &str,
+        #[case] expected_paths: &[&str],
+    ) {
         let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.search_paths.is_some());
         assert_eq!(
             settings.search_paths.unwrap(),
-            vec!["/usr/local/lib/tree-sitter", "/opt/tree-sitter/parsers"]
+            expected_paths
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
-        assert!(settings.languages.contains_key("rust"));
-        assert_eq!(settings.languages["rust"].parser, None);
     }
 
     #[test]
@@ -569,29 +570,6 @@ mod tests {
 
         // python will use searchPaths
         assert_eq!(settings.languages["python"].parser, None);
-    }
-
-    #[test]
-    fn should_parse_searchpaths_configuration() {
-        let config_json = r#"{
-            "searchPaths": [
-                "/data/tree-sitter",
-                "/assets/ts"
-            ],
-            "languages": {
-                "lua": {
-                    "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
-                }
-            }
-        }"#;
-
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert_eq!(
-            settings.search_paths.unwrap(),
-            vec!["/data/tree-sitter", "/assets/ts"]
-        );
-        assert!(settings.languages.contains_key("lua"));
     }
 
     #[test]
@@ -634,61 +612,11 @@ mod tests {
         }"#;
 
         let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        // Check capture mappings are parsed correctly
-        assert!(settings.capture_mappings.contains_key(WILDCARD_KEY));
-        assert!(settings.capture_mappings.contains_key("rust"));
-
-        let wildcard_mappings = &settings.capture_mappings[WILDCARD_KEY].highlights;
-        assert_eq!(
-            wildcard_mappings.get("variable.builtin"),
-            Some(&"variable.defaultLibrary".to_string())
-        );
-        assert_eq!(
-            wildcard_mappings.get("function.builtin"),
-            Some(&"function.defaultLibrary".to_string())
-        );
-
-        let rust_mappings = &settings.capture_mappings["rust"].highlights;
-        assert_eq!(
-            rust_mappings.get("type.builtin"),
-            Some(&"type.defaultLibrary".to_string())
-        );
-
-        let rust_locals = &settings.capture_mappings["rust"].locals;
-        assert_eq!(
-            rust_locals.get("definition.var"),
-            Some(&"definition.variable".to_string())
-        );
-    }
-
-    #[test]
-    fn should_parse_queries_as_vec_query_item() {
-        // Unified queries field with multiple entries
-        let config_json = r#"{
-            "languages": {
-                "lua": {
-                    "parser": "/path/to/lua.so",
-                    "queries": [
-                        {"path": "/path/to/highlights.scm", "kind": "highlights"},
-                        {"path": "/path/to/custom.scm"}
-                    ]
-                }
-            }
-        }"#;
-
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.languages.contains_key("lua"));
-        let lua_config = &settings.languages["lua"];
-        assert_eq!(lua_config.parser, Some("/path/to/lua.so".to_string()));
-
-        let queries = lua_config.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[0].path, "/path/to/highlights.scm");
-        assert_eq!(queries[0].kind, Some(QueryKind::Highlights));
-        assert_eq!(queries[1].path, "/path/to/custom.scm");
-        assert_eq!(queries[1].kind, None);
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
+            insta::assert_json_snapshot!(settings.capture_mappings);
+        });
     }
 
     #[test]
@@ -851,32 +779,6 @@ mod tests {
         assert!(config.initialization_options.is_none());
     }
 
-    #[test]
-    fn should_parse_configuration_with_injections_query() {
-        // Test that injection queries can be specified in the unified queries field
-        let config_json = r#"{
-            "languages": {
-                "markdown": {
-                    "queries": [
-                        {"path": "/path/to/highlights.scm", "kind": "highlights"},
-                        {"path": "/path/to/injections.scm", "kind": "injections"}
-                    ]
-                }
-            }
-        }"#;
-
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.languages.contains_key("markdown"));
-        let md_config = &settings.languages["markdown"];
-
-        // Verify queries configuration is parsed
-        let queries = md_config.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[1].path, "/path/to/injections.scm");
-        assert_eq!(queries[1].kind, Some(QueryKind::Injections));
-    }
-
     #[rstest]
     #[case::cargo(
         r#"{"cmd": ["rust-analyzer"], "languages": ["rust"], "workspaceType": "cargo"}"#,
@@ -954,139 +856,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bridge_filter_null_bridges_all_languages() {
-        // PBI-108 AC3: bridge omitted or null bridges all configured languages
-        // When bridge is None (default), all languages should be bridgeable
-        let settings = LanguageSettings::default();
-
-        // Default (None) should bridge all languages
-        assert!(
-            settings.is_language_bridgeable("python"),
-            "None bridge should allow python"
-        );
-        assert!(
-            settings.is_language_bridgeable("r"),
-            "None bridge should allow r"
-        );
-        assert!(
-            settings.is_language_bridgeable("rust"),
-            "None bridge should allow rust"
-        );
-        assert!(
-            settings.is_language_bridgeable("any_language"),
-            "None bridge should allow any language"
-        );
-    }
-
-    #[test]
-    fn test_bridge_filter_empty_disables_bridging() {
-        // PBI-120: Empty bridge map disables all bridging for that host filetype
+    /// Bridge filter: None (default) bridges all, empty map bridges nothing,
+    /// explicit entries control per-language bridging.
+    #[rstest]
+    // None bridge → all languages bridgeable
+    #[case::null_allows_all(None, "python", true)]
+    #[case::null_allows_any(None, "any_language", true)]
+    // Empty map → nothing bridgeable
+    #[case::empty_blocks_all(Some(HashMap::new()), "python", false)]
+    #[case::empty_blocks_rust(Some(HashMap::new()), "rust", false)]
+    // Explicit enabled entries
+    #[case::enabled_language(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+        ])),
+        "python",
+        true
+    )]
+    #[case::unlisted_language(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+        ])),
+        "rust",
+        false
+    )]
+    #[case::disabled_language(
+        Some(HashMap::from([
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "r",
+        false
+    )]
+    // Multi-entry map: enabled + disabled coexist
+    #[case::multi_entry_enabled(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "python",
+        true
+    )]
+    #[case::multi_entry_disabled(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "r",
+        false
+    )]
+    #[case::multi_entry_unlisted(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "rust",
+        false
+    )]
+    fn test_bridge_filter(
+        #[case] bridge: Option<HashMap<String, BridgeLanguageConfig>>,
+        #[case] language: &str,
+        #[case] expected: bool,
+    ) {
         let settings = LanguageSettings {
-            bridge: Some(HashMap::new()), // Empty map disables all bridging
+            bridge,
             ..Default::default()
         };
-
-        // Empty map should disable all bridging
-        assert!(
-            !settings.is_language_bridgeable("python"),
-            "Empty bridge should not allow python"
-        );
-        assert!(
-            !settings.is_language_bridgeable("r"),
-            "Empty bridge should not allow r"
-        );
-        assert!(
-            !settings.is_language_bridgeable("rust"),
-            "Empty bridge should not allow rust"
-        );
-    }
-
-    #[test]
-    fn test_bridge_filter_allows_enabled_languages() {
-        // PBI-120: Only languages with enabled: true should be bridgeable
-        let mut bridge = HashMap::new();
-        bridge.insert(
-            "python".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-        bridge.insert(
-            "r".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        let settings = LanguageSettings {
-            bridge: Some(bridge),
-            ..Default::default()
-        };
-
-        // Enabled languages should be allowed
-        assert!(
-            settings.is_language_bridgeable("python"),
-            "python should be in bridge filter"
-        );
-        assert!(
-            settings.is_language_bridgeable("r"),
-            "r should be in bridge filter"
-        );
-
-        // Languages not in map should NOT be allowed
-        assert!(
-            !settings.is_language_bridgeable("rust"),
-            "rust should not be in bridge filter"
-        );
-        assert!(
-            !settings.is_language_bridgeable("javascript"),
-            "javascript should not be in bridge filter"
-        );
-    }
-
-    #[test]
-    fn test_bridge_filter_disabled_language() {
-        // PBI-120: Languages with enabled: false should not be bridgeable
-        let mut bridge = HashMap::new();
-        bridge.insert(
-            "python".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-        bridge.insert(
-            "r".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(false),
-                ..Default::default()
-            },
-        );
-
-        let settings = LanguageSettings {
-            bridge: Some(bridge),
-            ..Default::default()
-        };
-
-        // python with enabled: true should be allowed
-        assert!(
-            settings.is_language_bridgeable("python"),
-            "python should be bridgeable"
-        );
-        // r with enabled: false should NOT be allowed
-        assert!(
-            !settings.is_language_bridgeable("r"),
-            "r with enabled: false should not be bridgeable"
+        assert_eq!(
+            settings.is_language_bridgeable(language),
+            expected,
+            "is_language_bridgeable({language:?}) should be {expected}"
         );
     }
 
     #[test]
     fn should_parse_language_servers_at_root() {
-        // PBI-119: languageServers field should be at root level of InitializationOptions
-        // This replaces the nested bridge.servers structure with a flatter schema
         let config_json = r#"{
             "searchPaths": ["/usr/local/lib"],
             "languageServers": {
@@ -1103,26 +946,15 @@ mod tests {
         }"#;
 
         let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.language_servers.is_some());
-        let servers = settings.language_servers.as_ref().unwrap();
-        assert_eq!(servers.len(), 2);
-
-        // Check rust-analyzer config
-        assert!(servers.contains_key("rust-analyzer"));
-        let ra = &servers["rust-analyzer"];
-        assert_eq!(ra.cmd, vec!["rust-analyzer".to_string()]);
-        assert_eq!(ra.languages, vec!["rust".to_string()]);
-        assert_eq!(ra.workspace_type, Some(WorkspaceType::Cargo));
-
-        // Check pyright config
-        assert!(servers.contains_key("pyright"));
-        let py = &servers["pyright"];
-        assert_eq!(
-            py.cmd,
-            vec!["pyright-langserver".to_string(), "--stdio".to_string()]
+        assert!(
+            settings.language_servers.is_some(),
+            "languageServers should be parsed as Some"
         );
-        assert_eq!(py.languages, vec!["python".to_string()]);
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
+            insta::assert_json_snapshot!(settings.language_servers);
+        });
     }
 
     #[test]
