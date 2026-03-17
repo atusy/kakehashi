@@ -3,7 +3,7 @@ use crate::error::LockResultExt;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// Stores and manages language configurations
+/// Thread-safe cache of workspace settings for the language subsystem.
 pub struct ConfigStore {
     language_configs: RwLock<HashMap<String, LanguageSettings>>,
     capture_mappings: RwLock<CaptureMappings>,
