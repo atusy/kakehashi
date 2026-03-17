@@ -9,7 +9,7 @@ use tower_lsp_server::jsonrpc::Id;
 use tower_lsp_server::ls_types::{MessageType, Position, Range, Uri};
 use url::Url;
 
-use crate::config::settings::AggregationStrategy;
+use crate::config::settings::{AggregationStrategy, BridgeLanguageConfig};
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
 use crate::lsp::get_current_request_id;
@@ -288,7 +288,7 @@ impl Kakehashi {
         &self,
         host_language: &str,
         injection_language: &str,
-    ) -> Option<crate::config::settings::BridgeLanguageConfig> {
+    ) -> Option<BridgeLanguageConfig> {
         let settings = self.settings_manager.load_settings();
         crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
             .and_then(|lang_settings| lang_settings.bridge)
@@ -307,8 +307,8 @@ impl Kakehashi {
         host_language: &str,
         injection_language: &str,
         method_name: &str,
-        default: crate::config::settings::AggregationStrategy,
-    ) -> crate::config::settings::AggregationStrategy {
+        default: AggregationStrategy,
+    ) -> AggregationStrategy {
         self.resolve_bridge_language_config(host_language, injection_language)
             .map(|bridge_config| bridge_config.resolve_strategy(method_name, default))
             .unwrap_or(default)
