@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use super::WILDCARD_KEY;
 
-pub type CaptureMapping = HashMap<String, String>;
+pub(crate) type CaptureMapping = HashMap<String, String>;
 
 /// Workspace type for bridge language server connections.
 ///
@@ -184,7 +184,7 @@ pub struct QueryItem {
 /// - `injections.scm` -> matches
 /// - `rust-injections.scm` -> does NOT match (only exact filename matches)
 /// - `local-injections.scm` -> does NOT match (only exact filename matches)
-pub fn infer_query_kind(path: &str) -> Option<QueryKind> {
+pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
     // Extract filename from path using std::path for cross-platform support
     let filename = std::path::Path::new(path)
         .file_name()
