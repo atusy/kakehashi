@@ -19,7 +19,6 @@ use std::time::Duration;
 use log::{debug, warn};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::error::LockResultExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
@@ -28,6 +27,7 @@ use super::super::connection::BridgeReader;
 use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::RouteResult;
+use crate::error::LockResultExt;
 use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 
 /// Notification to forward from downstream server to upstream editor.
