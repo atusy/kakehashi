@@ -702,9 +702,13 @@ impl LanguageCoordinator {
         let library_path =
             QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths);
         let Some(lib_path) = library_path else {
+            let paths_display: Vec<_> = search_paths.iter().map(|p| p.display().to_string()).collect();
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Error,
-                format!("No parser path found for language {lang_name}"),
+                format!(
+                    "No parser path found for language {lang_name} in search paths: [{}]",
+                    paths_display.join(", ")
+                ),
             ));
         };
 
@@ -719,7 +723,7 @@ impl LanguageCoordinator {
                 Err(err) => {
                     return LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
-                        format!("Failed to load language {lang_name}: {err}"),
+                        format!("Failed to load language {lang_name} from {}: {err}", lib_path.display()),
                     ));
                 }
             }
