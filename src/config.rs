@@ -368,11 +368,7 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
             })
             .collect();
 
-        let search_paths = if settings.search_paths.is_empty() {
-            None
-        } else {
-            Some(settings.search_paths.clone())
-        };
+        let search_paths = Some(settings.search_paths.clone());
 
         RawWorkspaceSettings {
             search_paths,
