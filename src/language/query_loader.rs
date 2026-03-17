@@ -540,7 +540,12 @@ mod tests {
         let search_paths = vec![base_path];
         let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
         assert!(result.is_some());
-        assert!(result.unwrap().to_string_lossy().ends_with("parser/rust.so"));
+        assert!(
+            result
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("parser/rust.so")
+        );
 
         // Empty search paths and no explicit library → None
         assert!(QueryLoader::resolve_library_path(None, "rust", no_paths).is_none());
@@ -560,7 +565,12 @@ mod tests {
         let search_paths = vec![dir.path().to_path_buf()];
         let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
         assert!(result.is_some());
-        assert!(result.unwrap().to_string_lossy().ends_with("parser/rust.so"));
+        assert!(
+            result
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("parser/rust.so")
+        );
     }
 
     #[test]
@@ -601,7 +611,10 @@ mod tests {
 
         let search_paths = vec![non_utf8_base];
         let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
-        assert!(result.is_some(), "Should find query file under non-UTF-8 path");
+        assert!(
+            result.is_some(),
+            "Should find query file under non-UTF-8 path"
+        );
     }
 
     // macOS APFS enforces UTF-8 filenames at the kernel level, so non-UTF-8
@@ -618,7 +631,10 @@ mod tests {
 
         let search_paths = vec![non_utf8_base];
         let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
-        assert!(result.is_some(), "Should resolve parser under non-UTF-8 path");
+        assert!(
+            result.is_some(),
+            "Should resolve parser under non-UTF-8 path"
+        );
     }
 
     #[test]

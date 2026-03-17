@@ -55,8 +55,10 @@ impl ConfigStore {
         *self
             .search_paths
             .write()
-            .recover_poison("ConfigStore::set_search_paths") =
-            paths.into_iter().map(|p| PathBuf::from(p).clean()).collect();
+            .recover_poison("ConfigStore::set_search_paths") = paths
+            .into_iter()
+            .map(|p| PathBuf::from(p).clean())
+            .collect();
     }
 
     pub(crate) fn get_search_paths(&self) -> Vec<PathBuf> {
@@ -201,24 +203,21 @@ mod tests {
         store.update_from_settings(&settings);
 
         assert!(store.get_language_config("python").is_some());
-        assert_eq!(store.get_search_paths(), vec![PathBuf::from("/search/path")]);
+        assert_eq!(
+            store.get_search_paths(),
+            vec![PathBuf::from("/search/path")]
+        );
     }
 
     #[test]
     fn test_search_paths_string_to_pathbuf_round_trip() {
         let store = ConfigStore::new();
-        let input = vec![
-            "/path/one".to_string(),
-            "/path/with/../dots".to_string(),
-        ];
+        let input = vec!["/path/one".to_string(), "/path/with/../dots".to_string()];
         store.set_search_paths(input);
         let retrieved = store.get_search_paths();
         assert_eq!(
             retrieved,
-            vec![
-                PathBuf::from("/path/one"),
-                PathBuf::from("/path/dots"),
-            ]
+            vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots"),]
         );
     }
 }

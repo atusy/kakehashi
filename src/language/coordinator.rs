@@ -193,7 +193,10 @@ impl LanguageCoordinator {
                 Err(err) => {
                     return LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
-                        format!("Failed to load language {language_id} from {}: {err}", lib_path.display()),
+                        format!(
+                            "Failed to load language {language_id} from {}: {err}",
+                            lib_path.display()
+                        ),
                     ));
                 }
             }
@@ -243,7 +246,10 @@ impl LanguageCoordinator {
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!("Dynamically loaded language {language_id} from {}", lib_path.display()),
+            format!(
+                "Dynamically loaded language {language_id} from {}",
+                lib_path.display()
+            ),
         ));
         if self.has_queries(language_id) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -725,7 +731,10 @@ impl LanguageCoordinator {
                 Err(err) => {
                     return LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
-                        format!("Failed to load language {lang_name} from {}: {err}", lib_path.display()),
+                        format!(
+                            "Failed to load language {lang_name} from {}: {err}",
+                            lib_path.display()
+                        ),
                     ));
                 }
             }

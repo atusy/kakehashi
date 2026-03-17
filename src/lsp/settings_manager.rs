@@ -18,6 +18,7 @@
 //! - `settings`: Can be updated via `apply_settings()`
 
 use arc_swap::ArcSwap;
+use path_clean::PathClean;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tower_lsp_server::ls_types::{
@@ -205,14 +206,21 @@ impl SettingsManager {
     }
 
     /// Check if the given search paths include the default data directory.
-    pub(crate) fn search_paths_include_default_data_dir(&self, search_paths: &[String]) -> bool {
+    pub(crate) fn search_paths_include_default_data_dir<P: AsRef<std::path::Path>>(
+        &self,
+        search_paths: &[P],
+    ) -> bool {
         let Some(default_dir) = crate::install::default_data_dir() else {
             // Can't determine default dir - allow auto-install anyway
             return true;
         };
 
-        let default_str = default_dir.to_string_lossy();
-        search_paths.iter().any(|p| p == default_str.as_ref())
+        let default_dir = default_dir.clean();
+        // Clean each search path for comparison since callers may provide
+        // uncleaned paths via the generic AsRef<Path> parameter.
+        search_paths
+            .iter()
+            .any(|p| p.as_ref().clean() == default_dir)
     }
 
     /// Check if client supports LocationLink[] for a specific goto capability.
