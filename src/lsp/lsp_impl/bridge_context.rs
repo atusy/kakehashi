@@ -87,7 +87,6 @@ pub(crate) struct RangeRequestContext {
 /// Intermediate result from the shared preamble, before server config lookup.
 struct PreambleResult {
     uri: Url,
-    position: Position,
     resolved: ResolvedInjection,
     language_name: String,
     upstream_request_id: Option<UpstreamId>,
@@ -220,7 +219,6 @@ impl Kakehashi {
 
         Some(PreambleResult {
             uri,
-            position,
             resolved,
             language_name,
             upstream_request_id,
@@ -354,7 +352,6 @@ impl Kakehashi {
         let preamble = self
             .resolve_bridge_preamble(lsp_uri, position, method_name)
             .await?;
-        let position = preamble.position;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
