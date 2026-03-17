@@ -715,7 +715,7 @@ impl LanguageServerPool {
             let counts = self
                 .consecutive_panic_counts
                 .lock()
-                .recover_poison("LanguageServerPool::consecutive_panic_counts");
+                .recover_poison("LanguageServerPool::get_or_create_connection_with_timeout");
             counts.get(server_name).copied().unwrap_or(0)
         };
 
@@ -884,7 +884,7 @@ impl LanguageServerPool {
                 let mut counts = self
                     .consecutive_panic_counts
                     .lock()
-                    .recover_poison("LanguageServerPool::consecutive_panic_counts");
+                    .recover_poison("LanguageServerPool::get_or_create_connection_with_timeout");
                 counts.remove(server_name);
                 Ok(handle)
             }
@@ -896,10 +896,9 @@ impl LanguageServerPool {
                 if join_err.is_panic() {
                     // Task panicked - track consecutive panic count to avoid infinite retry
                     let new_count = {
-                        let mut counts = self
-                            .consecutive_panic_counts
-                            .lock()
-                            .recover_poison("LanguageServerPool::consecutive_panic_counts");
+                        let mut counts = self.consecutive_panic_counts.lock().recover_poison(
+                            "LanguageServerPool::get_or_create_connection_with_timeout",
+                        );
                         let count = counts.entry(server_name.to_string()).or_insert(0);
                         *count += 1;
                         *count
@@ -1089,7 +1088,7 @@ impl LanguageServerPool {
             let registry = self
                 .upstream_request_registry
                 .lock()
-                .recover_poison("LanguageServerPool::upstream_request_registry");
+                .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id");
             match registry.get(&upstream_id) {
                 Some(servers) => servers.iter().cloned().collect(),
                 None => {
@@ -1168,7 +1167,7 @@ impl LanguageServerPool {
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .recover_poison("LanguageServerPool::upstream_request_registry");
+            .recover_poison("LanguageServerPool::register_upstream_request");
         registry
             .entry(upstream_id)
             .or_default()
@@ -1188,7 +1187,7 @@ impl LanguageServerPool {
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .recover_poison("LanguageServerPool::upstream_request_registry");
+            .recover_poison("LanguageServerPool::unregister_upstream_request");
         if let Some(servers) = registry.get_mut(upstream_id) {
             servers.remove(server_name);
             if servers.is_empty() {
@@ -1208,7 +1207,7 @@ impl LanguageServerPool {
         let mut registry = self
             .upstream_request_registry
             .lock()
-            .recover_poison("LanguageServerPool::upstream_request_registry");
+            .recover_poison("LanguageServerPool::unregister_all_for_upstream_id");
         registry.remove(upstream_id);
     }
 }

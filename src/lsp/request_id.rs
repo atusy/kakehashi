@@ -181,7 +181,7 @@ impl CancelForwarder {
             let mut subscribers = self
                 .subscribers
                 .lock()
-                .recover_poison("CancelForwarder::subscribers");
+                .recover_poison("CancelForwarder::subscribe");
             match subscribers.entry(upstream_id) {
                 Entry::Occupied(entry) => return Err(AlreadySubscribedError(entry.key().clone())),
                 Entry::Vacant(entry) => {
@@ -204,7 +204,7 @@ impl CancelForwarder {
         let mut subscribers = self
             .subscribers
             .lock()
-            .recover_poison("CancelForwarder::subscribers");
+            .recover_poison("CancelForwarder::unsubscribe");
         subscribers.remove(upstream_id);
     }
 
@@ -221,7 +221,7 @@ impl CancelForwarder {
             let mut subscribers = self
                 .subscribers
                 .lock()
-                .recover_poison("CancelForwarder::subscribers");
+                .recover_poison("CancelForwarder::notify_cancel");
             subscribers.remove(upstream_id)
         };
         if let Some(tx) = sender {
