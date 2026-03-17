@@ -70,15 +70,17 @@ pub struct BridgeLanguageConfig {
 }
 
 impl BridgeLanguageConfig {
+    /// Look up the aggregation entry for a method, falling back to wildcard `"_"`.
+    fn resolve_aggregation_entry(&self, method: &str) -> Option<&AggregationConfig> {
+        let map = self.aggregation.as_ref()?;
+        map.get(method).or_else(|| map.get(WILDCARD_KEY))
+    }
+
     /// Resolve priorities for a specific LSP method.
     ///
     /// Falls back to wildcard `"_"` key, then empty slice.
     pub(crate) fn resolve_priorities(&self, method: &str) -> Vec<String> {
-        let Some(map) = self.aggregation.as_ref() else {
-            return vec![];
-        };
-        map.get(method)
-            .or_else(|| map.get(WILDCARD_KEY))
+        self.resolve_aggregation_entry(method)
             .map(|c| c.priorities.clone())
             .unwrap_or_default()
     }
@@ -90,11 +92,7 @@ impl BridgeLanguageConfig {
     /// the wildcard entry's `maxFanOut` is not consulted.
     /// Negative values are treated as no limit (`None`).
     pub(crate) fn resolve_max_fan_out(&self, method: &str) -> Option<usize> {
-        let map = self.aggregation.as_ref()?;
-        let raw = map
-            .get(method)
-            .or_else(|| map.get(WILDCARD_KEY))
-            .and_then(|c| c.max_fan_out)?;
+        let raw = self.resolve_aggregation_entry(method)?.max_fan_out?;
         usize::try_from(raw).ok()
     }
 
@@ -106,11 +104,7 @@ impl BridgeLanguageConfig {
         method: &str,
         default: AggregationStrategy,
     ) -> AggregationStrategy {
-        let Some(map) = self.aggregation.as_ref() else {
-            return default;
-        };
-        map.get(method)
-            .or_else(|| map.get(WILDCARD_KEY))
+        self.resolve_aggregation_entry(method)
             .and_then(|c| c.strategy)
             .unwrap_or(default)
     }
