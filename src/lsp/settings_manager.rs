@@ -462,8 +462,9 @@ mod tests {
     #[test]
     fn test_search_paths_include_default_data_dir_with_non_matching_path() {
         let manager = SettingsManager::new();
-        let _default_dir = crate::install::default_data_dir()
-            .expect("default_data_dir() must return Some for this test");
+        let Some(_default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
         let paths = vec!["/nonexistent/path".to_string()];
         assert!(!manager.search_paths_include_default_data_dir(&paths));
     }
@@ -471,8 +472,9 @@ mod tests {
     #[test]
     fn test_search_paths_include_default_data_dir_empty() {
         let manager = SettingsManager::new();
-        let _default_dir = crate::install::default_data_dir()
-            .expect("default_data_dir() must return Some for this test");
+        let Some(_default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
         let paths: Vec<String> = vec![];
         assert!(!manager.search_paths_include_default_data_dir(&paths));
     }
