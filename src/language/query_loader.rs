@@ -458,7 +458,7 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    const NO_SEARCH_PATHS: &[&Path] = &[];
+    const NO_SEARCH_PATHS: &[PathBuf] = &[];
 
     /// Test helper: resolve query without preloaded content
     fn resolve_query<P: AsRef<Path>>(

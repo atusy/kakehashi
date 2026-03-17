@@ -1691,8 +1691,8 @@ mod tests {
             queries: None,
             ..Default::default()
         };
-        let no_search_paths: &[PathBuf] = &[];
-        let result = coordinator.load_single_language("lua", &config, no_search_paths);
+        const NO_SEARCH_PATHS: &[PathBuf] = &[];
+        let result = coordinator.load_single_language("lua", &config, NO_SEARCH_PATHS);
         assert!(result.success, "Language should load with explicit parser");
         assert!(
             coordinator.has_parser_available("lua"),
