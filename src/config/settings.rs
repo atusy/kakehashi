@@ -144,6 +144,7 @@ pub struct QueryTypeMappings {
     #[serde(default)]
     pub locals: CaptureMapping,
     /// Capture mappings for folds queries.
+    /// Reserved for future folding range support — populated and merged but not yet consumed by analysis.
     #[serde(default)]
     pub folds: CaptureMapping,
 }
