@@ -450,6 +450,45 @@ mod tests {
     }
 
     #[test]
+    fn test_search_paths_include_default_data_dir_with_matching_string() {
+        let manager = SettingsManager::new();
+        let Some(default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
+        let paths = vec![default_dir.to_string_lossy().into_owned()];
+        assert!(manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_with_non_matching_path() {
+        let manager = SettingsManager::new();
+        let _default_dir = crate::install::default_data_dir()
+            .expect("default_data_dir() must return Some for this test");
+        let paths = vec!["/nonexistent/path".to_string()];
+        assert!(!manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_empty() {
+        let manager = SettingsManager::new();
+        let _default_dir = crate::install::default_data_dir()
+            .expect("default_data_dir() must return Some for this test");
+        let paths: Vec<String> = vec![];
+        assert!(!manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_with_path_ref() {
+        let manager = SettingsManager::new();
+        let Some(default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
+        // Exercise &Path (distinct from the String variant above)
+        let paths: Vec<&std::path::Path> = vec![default_dir.as_path()];
+        assert!(manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
     fn test_supports_definition_link_before_init() {
         // Before initialize() is called, capabilities are not set
         let manager = SettingsManager::new();
