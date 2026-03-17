@@ -32,7 +32,7 @@ use crate::analysis::{
     calculate_delta_or_full, handle_semantic_tokens_full,
     handle_semantic_tokens_range_parallel_async, next_result_id,
 };
-use crate::lsp::lsp_impl::bridge_context::current_upstream_id;
+use crate::lsp::current_upstream_id;
 
 use super::super::{Kakehashi, uri_to_url};
 

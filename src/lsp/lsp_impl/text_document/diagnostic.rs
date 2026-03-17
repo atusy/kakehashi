@@ -129,7 +129,7 @@ impl Kakehashi {
         }
 
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
-        let upstream_request_id = super::super::bridge_context::current_upstream_id();
+        let upstream_request_id = crate::lsp::current_upstream_id();
 
         // Subscribe to cancel notifications for this request.
         // The guard ensures unsubscribe is called on all return paths (including early returns).

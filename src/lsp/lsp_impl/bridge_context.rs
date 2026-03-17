@@ -5,30 +5,16 @@
 //! of resolving injection context before sending requests. This module extracts
 //! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
-use tower_lsp_server::jsonrpc::Id;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 use url::Url;
 
 use crate::config::settings::{AggregationStrategy, BridgeLanguageConfig};
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
-use crate::lsp::get_current_request_id;
-use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
+use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard, current_upstream_id};
 use crate::text::PositionMapper;
 
 use super::{Kakehashi, uri_to_url};
-
-/// Extract the upstream request ID from task-local storage.
-///
-/// Converts the tower-lsp `Id` (set by RequestIdCapture middleware) into
-/// our domain `UpstreamId`. Returns `None` for null or missing IDs.
-pub(crate) fn current_upstream_id() -> Option<UpstreamId> {
-    match get_current_request_id() {
-        Some(Id::Number(n)) => Some(UpstreamId::Number(n)),
-        Some(Id::String(s)) => Some(UpstreamId::String(s)),
-        None | Some(Id::Null) => None,
-    }
-}
 
 /// All resolved context needed to send bridge requests to multiple servers.
 ///
