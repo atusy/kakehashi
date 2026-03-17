@@ -11,6 +11,7 @@ use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use log::debug;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tree_sitter::Language;
 
@@ -80,8 +81,9 @@ impl LanguageCoordinator {
         self.build_alias_map(&settings.languages);
 
         let mut summary = LanguageLoadSummary::default();
+        let search_paths = self.config_store.get_search_paths();
         for (lang_name, config) in &settings.languages {
-            let result = self.load_single_language(lang_name, config, &settings.search_paths);
+            let result = self.load_single_language(lang_name, config, &search_paths);
             summary.record(lang_name, result);
         }
         summary
@@ -256,7 +258,7 @@ impl LanguageCoordinator {
     fn load_query(
         &self,
         language: &Language,
-        paths: &[String],
+        paths: &[PathBuf],
         ctx: QueryLoadContext<'_>,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
@@ -285,10 +287,10 @@ impl LanguageCoordinator {
     }
 
     /// Load a query from explicit paths (unified queries configuration).
-    fn load_query_from_paths(
+    fn load_query_from_paths<P: AsRef<Path>>(
         &self,
         language: &Language,
-        paths: &[String],
+        paths: &[P],
         ctx: QueryLoadContext<'_>,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
@@ -697,7 +699,7 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &[String],
+        search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
         let library_path =
             QueryLoader::resolve_library_path(config.parser.as_deref(), lang_name, search_paths);
@@ -745,7 +747,7 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &[String],
+        search_paths: &[PathBuf],
         language: &Language,
     ) -> Vec<LanguageEvent> {
         let mut events = Vec::new();
@@ -1680,7 +1682,8 @@ mod tests {
             queries: None,
             ..Default::default()
         };
-        let result = coordinator.load_single_language("lua", &config, &[]);
+        let no_search_paths: &[PathBuf] = &[];
+        let result = coordinator.load_single_language("lua", &config, no_search_paths);
         assert!(result.success, "Language should load with explicit parser");
         assert!(
             coordinator.has_parser_available("lua"),
