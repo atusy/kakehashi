@@ -291,7 +291,7 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
         languages,
         capture_mappings,
         auto_install: settings.auto_install.unwrap_or(true),
-        language_servers: settings.language_servers.clone(),
+        language_servers: settings.language_servers.clone().unwrap_or_default(),
     }
 }
 
@@ -368,18 +368,14 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
             })
             .collect();
 
-        let search_paths = if settings.search_paths.is_empty() {
-            None
-        } else {
-            Some(settings.search_paths.clone())
-        };
+        let search_paths = Some(settings.search_paths.clone());
 
         RawWorkspaceSettings {
             search_paths,
             languages,
             capture_mappings,
             auto_install: Some(settings.auto_install),
-            language_servers: settings.language_servers.clone(),
+            language_servers: Some(settings.language_servers.clone()),
         }
     }
 }

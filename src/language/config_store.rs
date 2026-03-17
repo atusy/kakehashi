@@ -192,7 +192,7 @@ mod tests {
             search_paths: vec!["/search/path".to_string()],
             capture_mappings: CaptureMappings::default(),
             auto_install: true,
-            language_servers: None,
+            language_servers: HashMap::new(),
         };
 
         store.update_from_settings(&settings);

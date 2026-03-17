@@ -55,10 +55,8 @@ impl LanguageServerPool {
         };
 
         // Look up the server config for the origin server
-        let config = settings
-            .language_servers
-            .as_ref()
-            .and_then(|servers| resolve_language_server_with_wildcard(servers, &envelope.origin));
+        let config =
+            resolve_language_server_with_wildcard(&settings.language_servers, &envelope.origin);
 
         let Some(config) = config else {
             // Server no longer configured — re-envelope and return as-is

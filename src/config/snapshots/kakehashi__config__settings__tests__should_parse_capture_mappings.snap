@@ -1,0 +1,23 @@
+---
+source: src/config/settings.rs
+expression: settings.capture_mappings
+---
+{
+  "_": {
+    "highlights": {
+      "function.builtin": "function.defaultLibrary",
+      "variable.builtin": "variable.defaultLibrary"
+    },
+    "locals": {},
+    "folds": {}
+  },
+  "rust": {
+    "highlights": {
+      "type.builtin": "type.defaultLibrary"
+    },
+    "locals": {
+      "definition.var": "definition.variable"
+    },
+    "folds": {}
+  }
+}

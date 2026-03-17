@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-pub type CaptureMapping = HashMap<String, String>;
+use super::WILDCARD_KEY;
+
+pub(crate) type CaptureMapping = HashMap<String, String>;
 
 /// Workspace type for bridge language server connections.
 ///
@@ -39,6 +41,7 @@ pub enum AggregationStrategy {
 /// order — the first server in the list that returns a non-empty result wins.
 /// Empty priorities degrades to first-win (arrival-order) behavior.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AggregationConfig {
     /// Server names in priority order (highest first). Empty = pure first-win behavior.
     #[serde(default)]
@@ -46,8 +49,13 @@ pub struct AggregationConfig {
     /// Aggregation strategy override. Omit to use the handler default.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
-    /// Maximum number of servers to fan out to. Omit for no limit. Set to `0` to disable fan-out. Negative values are treated as no limit.
-    #[serde(default, rename = "maxFanOut")]
+    /// Maximum number of servers to fan out to.
+    ///
+    /// - `None` / absent: no limit (fan out to all matching servers)
+    /// - `0`: disable fan-out entirely
+    /// - Positive: cap the number of concurrent server requests
+    /// - Negative: treated as no limit (silently ignored via `usize::try_from`)
+    #[serde(default)]
     pub max_fan_out: Option<i64>,
 }
 
@@ -68,15 +76,17 @@ pub struct BridgeLanguageConfig {
 }
 
 impl BridgeLanguageConfig {
+    /// Look up the aggregation entry for a method, falling back to wildcard `"_"`.
+    fn resolve_aggregation_entry(&self, method: &str) -> Option<&AggregationConfig> {
+        let map = self.aggregation.as_ref()?;
+        map.get(method).or_else(|| map.get(WILDCARD_KEY))
+    }
+
     /// Resolve priorities for a specific LSP method.
     ///
     /// Falls back to wildcard `"_"` key, then empty slice.
     pub(crate) fn resolve_priorities(&self, method: &str) -> Vec<String> {
-        let Some(map) = self.aggregation.as_ref() else {
-            return vec![];
-        };
-        map.get(method)
-            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+        self.resolve_aggregation_entry(method)
             .map(|c| c.priorities.clone())
             .unwrap_or_default()
     }
@@ -88,11 +98,7 @@ impl BridgeLanguageConfig {
     /// the wildcard entry's `maxFanOut` is not consulted.
     /// Negative values are treated as no limit (`None`).
     pub(crate) fn resolve_max_fan_out(&self, method: &str) -> Option<usize> {
-        let map = self.aggregation.as_ref()?;
-        let raw = map
-            .get(method)
-            .or_else(|| map.get(crate::config::WILDCARD_KEY))
-            .and_then(|c| c.max_fan_out)?;
+        let raw = self.resolve_aggregation_entry(method)?.max_fan_out?;
         usize::try_from(raw).ok()
     }
 
@@ -104,11 +110,7 @@ impl BridgeLanguageConfig {
         method: &str,
         default: AggregationStrategy,
     ) -> AggregationStrategy {
-        let Some(map) = self.aggregation.as_ref() else {
-            return default;
-        };
-        map.get(method)
-            .or_else(|| map.get(crate::config::WILDCARD_KEY))
+        self.resolve_aggregation_entry(method)
             .and_then(|c| c.strategy)
             .unwrap_or(default)
     }
@@ -119,6 +121,7 @@ impl BridgeLanguageConfig {
 /// This is used to configure external language servers (like rust-analyzer, pyright)
 /// that kakehashi can redirect requests to for injection regions.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"]
@@ -126,10 +129,8 @@ pub struct BridgeServerConfig {
     /// Languages this server handles (e.g., ["rust"], ["python"])
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
-    #[serde(rename = "initializationOptions")]
     pub initialization_options: Option<Value>,
     /// Workspace type for this server (defaults to None, meaning Generic)
-    #[serde(rename = "workspaceType")]
     pub workspace_type: Option<WorkspaceType>,
 }
 
@@ -143,6 +144,7 @@ pub struct QueryTypeMappings {
     #[serde(default)]
     pub locals: CaptureMapping,
     /// Capture mappings for folds queries.
+    /// Reserved for future folding range support — populated and merged but not yet consumed by analysis.
     #[serde(default)]
     pub folds: CaptureMapping,
 }
@@ -182,13 +184,13 @@ pub struct QueryItem {
 /// - Exact match `highlights.scm` -> `Some(Highlights)`
 /// - Exact match `locals.scm` -> `Some(Locals)`
 /// - Exact match `injections.scm` -> `Some(Injections)`
-/// - Otherwise -> `None` (unknown patterns are skipped by callers)
+/// - Otherwise -> `None`
 ///
 /// Examples:
 /// - `injections.scm` -> matches
 /// - `rust-injections.scm` -> does NOT match (only exact filename matches)
 /// - `local-injections.scm` -> does NOT match (only exact filename matches)
-pub fn infer_query_kind(path: &str) -> Option<QueryKind> {
+pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
     // Extract filename from path using std::path for cross-platform support
     let filename = std::path::Path::new(path)
         .file_name()
@@ -205,22 +207,20 @@ pub fn infer_query_kind(path: &str) -> Option<QueryKind> {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RawWorkspaceSettings {
     /// Directories to search for Tree-sitter parser libraries and query files.
-    #[serde(rename = "searchPaths")]
     pub search_paths: Option<Vec<String>>,
     /// Per-language configuration (parser paths, queries, bridge filters, aliases).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
     /// Custom mappings from Tree-sitter capture names to semantic token types.
-    #[serde(rename = "captureMappings", default)]
+    #[serde(default)]
     pub capture_mappings: CaptureMappings,
     /// Whether to automatically install missing parsers and queries.
-    #[serde(rename = "autoInstall")]
     pub auto_install: Option<bool>,
     /// Language servers for bridging LSP requests to injection regions.
     /// Map of server name to server configuration.
-    #[serde(rename = "languageServers")]
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
 }
 
@@ -277,7 +277,7 @@ pub struct WorkspaceSettings {
     pub languages: HashMap<String, LanguageSettings>,
     pub capture_mappings: CaptureMappings,
     pub auto_install: bool,
-    pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
+    pub language_servers: HashMap<String, BridgeServerConfig>,
 }
 
 impl Default for WorkspaceSettings {
@@ -287,7 +287,7 @@ impl Default for WorkspaceSettings {
             languages: HashMap::new(),
             capture_mappings: CaptureMappings::default(),
             auto_install: true, // Default to true for zero-config experience
-            language_servers: None,
+            language_servers: HashMap::new(),
         }
     }
 }
@@ -295,7 +295,6 @@ impl Default for WorkspaceSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WILDCARD_KEY;
     use rstest::rstest;
 
     #[test]
@@ -424,30 +423,31 @@ mod tests {
         assert_eq!(queries[1].kind, None); // Kind not specified - will be inferred later
     }
 
-    #[test]
-    fn should_parse_configuration_with_locals_query() {
-        // Configuration using unified queries field with locals
-        let config_json = r#"{
-            "languages": {
-                "rust": {
+    #[rstest]
+    #[case::locals("locals", QueryKind::Locals)]
+    #[case::injections("injections", QueryKind::Injections)]
+    fn should_parse_configuration_with_query_kind(
+        #[case] kind_str: &str,
+        #[case] expected: QueryKind,
+    ) {
+        let config_json = format!(
+            r#"{{
+            "languages": {{
+                "rust": {{
                     "queries": [
-                        {"path": "/path/to/highlights.scm", "kind": "highlights"},
-                        {"path": "/path/to/locals.scm", "kind": "locals"}
+                        {{"path": "/path/to/highlights.scm", "kind": "highlights"}},
+                        {{"path": "/path/to/{kind_str}.scm", "kind": "{kind_str}"}}
                     ]
-                }
-            }
-        }"#;
+                }}
+            }}
+        }}"#
+        );
 
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.languages.contains_key("rust"));
-        let rust_config = &settings.languages["rust"];
-
-        // Verify queries configuration is parsed
-        let queries = rust_config.queries.as_ref().unwrap();
+        let settings: RawWorkspaceSettings = serde_json::from_str(&config_json).unwrap();
+        let queries = settings.languages["rust"].queries.as_ref().unwrap();
         assert_eq!(queries.len(), 2);
-        assert_eq!(queries[1].path, "/path/to/locals.scm");
-        assert_eq!(queries[1].kind, Some(QueryKind::Locals));
+        assert_eq!(queries[1].path, format!("/path/to/{kind_str}.scm"));
+        assert_eq!(queries[1].kind, Some(expected));
     }
 
     #[test]
@@ -514,29 +514,29 @@ mod tests {
         assert!(settings.languages.is_empty());
     }
 
-    #[test]
-    fn should_parse_searchpaths_configuration_basic() {
-        let config_json = r#"{
-            "searchPaths": [
-                "/usr/local/lib/tree-sitter",
-                "/opt/tree-sitter/parsers"
-            ],
-            "languages": {
-                "rust": {
-                    "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
-                }
-            }
-        }"#;
-
+    #[rstest]
+    #[case::basic(
+        r#"{"searchPaths": ["/usr/local/lib/tree-sitter", "/opt/tree-sitter/parsers"],
+            "languages": {"rust": {"queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]}}}"#,
+        &["/usr/local/lib/tree-sitter", "/opt/tree-sitter/parsers"],
+    )]
+    #[case::different_paths(
+        r#"{"searchPaths": ["/data/tree-sitter", "/assets/ts"],
+            "languages": {"lua": {"queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]}}}"#,
+        &["/data/tree-sitter", "/assets/ts"],
+    )]
+    fn should_parse_searchpaths_configuration(
+        #[case] config_json: &str,
+        #[case] expected_paths: &[&str],
+    ) {
         let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.search_paths.is_some());
         assert_eq!(
             settings.search_paths.unwrap(),
-            vec!["/usr/local/lib/tree-sitter", "/opt/tree-sitter/parsers"]
+            expected_paths
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         );
-        assert!(settings.languages.contains_key("rust"));
-        assert_eq!(settings.languages["rust"].parser, None);
     }
 
     #[test]
@@ -570,29 +570,6 @@ mod tests {
 
         // python will use searchPaths
         assert_eq!(settings.languages["python"].parser, None);
-    }
-
-    #[test]
-    fn should_parse_searchpaths_configuration() {
-        let config_json = r#"{
-            "searchPaths": [
-                "/data/tree-sitter",
-                "/assets/ts"
-            ],
-            "languages": {
-                "lua": {
-                    "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
-                }
-            }
-        }"#;
-
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert_eq!(
-            settings.search_paths.unwrap(),
-            vec!["/data/tree-sitter", "/assets/ts"]
-        );
-        assert!(settings.languages.contains_key("lua"));
     }
 
     #[test]
@@ -635,61 +612,11 @@ mod tests {
         }"#;
 
         let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        // Check capture mappings are parsed correctly
-        assert!(settings.capture_mappings.contains_key(WILDCARD_KEY));
-        assert!(settings.capture_mappings.contains_key("rust"));
-
-        let wildcard_mappings = &settings.capture_mappings[WILDCARD_KEY].highlights;
-        assert_eq!(
-            wildcard_mappings.get("variable.builtin"),
-            Some(&"variable.defaultLibrary".to_string())
-        );
-        assert_eq!(
-            wildcard_mappings.get("function.builtin"),
-            Some(&"function.defaultLibrary".to_string())
-        );
-
-        let rust_mappings = &settings.capture_mappings["rust"].highlights;
-        assert_eq!(
-            rust_mappings.get("type.builtin"),
-            Some(&"type.defaultLibrary".to_string())
-        );
-
-        let rust_locals = &settings.capture_mappings["rust"].locals;
-        assert_eq!(
-            rust_locals.get("definition.var"),
-            Some(&"definition.variable".to_string())
-        );
-    }
-
-    #[test]
-    fn should_parse_queries_as_vec_query_item() {
-        // Unified queries field with multiple entries
-        let config_json = r#"{
-            "languages": {
-                "lua": {
-                    "parser": "/path/to/lua.so",
-                    "queries": [
-                        {"path": "/path/to/highlights.scm", "kind": "highlights"},
-                        {"path": "/path/to/custom.scm"}
-                    ]
-                }
-            }
-        }"#;
-
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.languages.contains_key("lua"));
-        let lua_config = &settings.languages["lua"];
-        assert_eq!(lua_config.parser, Some("/path/to/lua.so".to_string()));
-
-        let queries = lua_config.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[0].path, "/path/to/highlights.scm");
-        assert_eq!(queries[0].kind, Some(QueryKind::Highlights));
-        assert_eq!(queries[1].path, "/path/to/custom.scm");
-        assert_eq!(queries[1].kind, None);
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
+            insta::assert_json_snapshot!(settings.capture_mappings);
+        });
     }
 
     #[test]
@@ -852,32 +779,6 @@ mod tests {
         assert!(config.initialization_options.is_none());
     }
 
-    #[test]
-    fn should_parse_configuration_with_injections_query() {
-        // Test that injection queries can be specified in the unified queries field
-        let config_json = r#"{
-            "languages": {
-                "markdown": {
-                    "queries": [
-                        {"path": "/path/to/highlights.scm", "kind": "highlights"},
-                        {"path": "/path/to/injections.scm", "kind": "injections"}
-                    ]
-                }
-            }
-        }"#;
-
-        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.languages.contains_key("markdown"));
-        let md_config = &settings.languages["markdown"];
-
-        // Verify queries configuration is parsed
-        let queries = md_config.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 2);
-        assert_eq!(queries[1].path, "/path/to/injections.scm");
-        assert_eq!(queries[1].kind, Some(QueryKind::Injections));
-    }
-
     #[rstest]
     #[case::cargo(
         r#"{"cmd": ["rust-analyzer"], "languages": ["rust"], "workspaceType": "cargo"}"#,
@@ -955,139 +856,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bridge_filter_null_bridges_all_languages() {
-        // PBI-108 AC3: bridge omitted or null bridges all configured languages
-        // When bridge is None (default), all languages should be bridgeable
-        let settings = LanguageSettings::default();
-
-        // Default (None) should bridge all languages
-        assert!(
-            settings.is_language_bridgeable("python"),
-            "None bridge should allow python"
-        );
-        assert!(
-            settings.is_language_bridgeable("r"),
-            "None bridge should allow r"
-        );
-        assert!(
-            settings.is_language_bridgeable("rust"),
-            "None bridge should allow rust"
-        );
-        assert!(
-            settings.is_language_bridgeable("any_language"),
-            "None bridge should allow any language"
-        );
-    }
-
-    #[test]
-    fn test_bridge_filter_empty_disables_bridging() {
-        // PBI-120: Empty bridge map disables all bridging for that host filetype
+    /// Bridge filter: None (default) bridges all, empty map bridges nothing,
+    /// explicit entries control per-language bridging.
+    #[rstest]
+    // None bridge → all languages bridgeable
+    #[case::null_allows_all(None, "python", true)]
+    #[case::null_allows_any(None, "any_language", true)]
+    // Empty map → nothing bridgeable
+    #[case::empty_blocks_all(Some(HashMap::new()), "python", false)]
+    #[case::empty_blocks_rust(Some(HashMap::new()), "rust", false)]
+    // Explicit enabled entries
+    #[case::enabled_language(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+        ])),
+        "python",
+        true
+    )]
+    #[case::unlisted_language(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+        ])),
+        "rust",
+        false
+    )]
+    #[case::disabled_language(
+        Some(HashMap::from([
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "r",
+        false
+    )]
+    // Multi-entry map: enabled + disabled coexist
+    #[case::multi_entry_enabled(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "python",
+        true
+    )]
+    #[case::multi_entry_disabled(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "r",
+        false
+    )]
+    #[case::multi_entry_unlisted(
+        Some(HashMap::from([
+            ("python".to_string(), BridgeLanguageConfig { enabled: Some(true), ..Default::default() }),
+            ("r".to_string(), BridgeLanguageConfig { enabled: Some(false), ..Default::default() }),
+        ])),
+        "rust",
+        false
+    )]
+    fn test_bridge_filter(
+        #[case] bridge: Option<HashMap<String, BridgeLanguageConfig>>,
+        #[case] language: &str,
+        #[case] expected: bool,
+    ) {
         let settings = LanguageSettings {
-            bridge: Some(HashMap::new()), // Empty map disables all bridging
+            bridge,
             ..Default::default()
         };
-
-        // Empty map should disable all bridging
-        assert!(
-            !settings.is_language_bridgeable("python"),
-            "Empty bridge should not allow python"
-        );
-        assert!(
-            !settings.is_language_bridgeable("r"),
-            "Empty bridge should not allow r"
-        );
-        assert!(
-            !settings.is_language_bridgeable("rust"),
-            "Empty bridge should not allow rust"
-        );
-    }
-
-    #[test]
-    fn test_bridge_filter_allows_enabled_languages() {
-        // PBI-120: Only languages with enabled: true should be bridgeable
-        let mut bridge = HashMap::new();
-        bridge.insert(
-            "python".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-        bridge.insert(
-            "r".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        let settings = LanguageSettings {
-            bridge: Some(bridge),
-            ..Default::default()
-        };
-
-        // Enabled languages should be allowed
-        assert!(
-            settings.is_language_bridgeable("python"),
-            "python should be in bridge filter"
-        );
-        assert!(
-            settings.is_language_bridgeable("r"),
-            "r should be in bridge filter"
-        );
-
-        // Languages not in map should NOT be allowed
-        assert!(
-            !settings.is_language_bridgeable("rust"),
-            "rust should not be in bridge filter"
-        );
-        assert!(
-            !settings.is_language_bridgeable("javascript"),
-            "javascript should not be in bridge filter"
-        );
-    }
-
-    #[test]
-    fn test_bridge_filter_disabled_language() {
-        // PBI-120: Languages with enabled: false should not be bridgeable
-        let mut bridge = HashMap::new();
-        bridge.insert(
-            "python".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-        bridge.insert(
-            "r".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(false),
-                ..Default::default()
-            },
-        );
-
-        let settings = LanguageSettings {
-            bridge: Some(bridge),
-            ..Default::default()
-        };
-
-        // python with enabled: true should be allowed
-        assert!(
-            settings.is_language_bridgeable("python"),
-            "python should be bridgeable"
-        );
-        // r with enabled: false should NOT be allowed
-        assert!(
-            !settings.is_language_bridgeable("r"),
-            "r with enabled: false should not be bridgeable"
+        assert_eq!(
+            settings.is_language_bridgeable(language),
+            expected,
+            "is_language_bridgeable({language:?}) should be {expected}"
         );
     }
 
     #[test]
     fn should_parse_language_servers_at_root() {
-        // PBI-119: languageServers field should be at root level of InitializationOptions
-        // This replaces the nested bridge.servers structure with a flatter schema
         let config_json = r#"{
             "searchPaths": ["/usr/local/lib"],
             "languageServers": {
@@ -1104,26 +946,15 @@ mod tests {
         }"#;
 
         let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
-
-        assert!(settings.language_servers.is_some());
-        let servers = settings.language_servers.as_ref().unwrap();
-        assert_eq!(servers.len(), 2);
-
-        // Check rust-analyzer config
-        assert!(servers.contains_key("rust-analyzer"));
-        let ra = &servers["rust-analyzer"];
-        assert_eq!(ra.cmd, vec!["rust-analyzer".to_string()]);
-        assert_eq!(ra.languages, vec!["rust".to_string()]);
-        assert_eq!(ra.workspace_type, Some(WorkspaceType::Cargo));
-
-        // Check pyright config
-        assert!(servers.contains_key("pyright"));
-        let py = &servers["pyright"];
-        assert_eq!(
-            py.cmd,
-            vec!["pyright-langserver".to_string(), "--stdio".to_string()]
+        assert!(
+            settings.language_servers.is_some(),
+            "languageServers should be parsed as Some"
         );
-        assert_eq!(py.languages, vec!["python".to_string()]);
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
+            insta::assert_json_snapshot!(settings.language_servers);
+        });
     }
 
     #[test]

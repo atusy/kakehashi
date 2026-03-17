@@ -1,0 +1,27 @@
+---
+source: src/config/settings.rs
+expression: settings.language_servers
+---
+{
+  "pyright": {
+    "cmd": [
+      "pyright-langserver",
+      "--stdio"
+    ],
+    "languages": [
+      "python"
+    ],
+    "initializationOptions": null,
+    "workspaceType": null
+  },
+  "rust-analyzer": {
+    "cmd": [
+      "rust-analyzer"
+    ],
+    "languages": [
+      "rust"
+    ],
+    "initializationOptions": null,
+    "workspaceType": "cargo"
+  }
+}
