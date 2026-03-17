@@ -14,9 +14,8 @@ impl Kakehashi {
         let lsp_uri = params.text_document.uri;
         let position = params.position;
 
-        let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/prepareRename")
-            .await
+        let Some(ctx) =
+            self.resolve_bridge_contexts(&lsp_uri, position, "textDocument/prepareRename")
         else {
             return Ok(None);
         };

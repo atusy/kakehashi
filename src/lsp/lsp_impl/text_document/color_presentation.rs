@@ -15,10 +15,11 @@ impl Kakehashi {
         let range = params.range;
         let color = params.color;
 
-        let Some(ctx) = self
-            .resolve_bridge_contexts_for_range(&lsp_uri, range, "textDocument/colorPresentation")
-            .await
-        else {
+        let Some(ctx) = self.resolve_bridge_contexts_for_range(
+            &lsp_uri,
+            range,
+            "textDocument/colorPresentation",
+        ) else {
             return Ok(Vec::new());
         };
 

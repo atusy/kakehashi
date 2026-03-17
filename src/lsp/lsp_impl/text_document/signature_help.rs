@@ -15,9 +15,8 @@ impl Kakehashi {
         let position = params.text_document_position_params.position;
 
         // Use shared preamble to resolve injection context with ALL matching servers
-        let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/signatureHelp")
-            .await
+        let Some(ctx) =
+            self.resolve_bridge_contexts(&lsp_uri, position, "textDocument/signatureHelp")
         else {
             return Ok(None);
         };

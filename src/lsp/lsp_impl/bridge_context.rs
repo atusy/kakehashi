@@ -6,7 +6,7 @@
 //! that shared preamble into a reusable method: `resolve_bridge_contexts`.
 
 use tower_lsp_server::jsonrpc::Id;
-use tower_lsp_server::ls_types::{MessageType, Position, Range, Uri};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 use url::Url;
 
 use crate::config::settings::{AggregationStrategy, BridgeLanguageConfig};
@@ -146,7 +146,7 @@ impl Kakehashi {
     ///
     /// Returns `None` for any early-exit condition (invalid URI, no document,
     /// no language, no injection at position).
-    async fn resolve_bridge_preamble(
+    fn resolve_bridge_preamble(
         &self,
         lsp_uri: &Uri,
         position: Position,
@@ -158,29 +158,27 @@ impl Kakehashi {
             return None;
         };
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "{} called for {} at line {} col {}",
-                    method_name, uri, position.line, position.character
-                ),
-            )
-            .await;
+        log::debug!(
+            "{} called for {} at line {} col {}",
+            method_name,
+            uri,
+            position.line,
+            position.character
+        );
 
         // Get document snapshot (minimizes lock duration)
         let snapshot = match self.documents.get(&uri) {
             None => {
-                self.client
-                    .log_message(MessageType::INFO, "No document found")
-                    .await;
+                log::debug!("{}: No document found for {}", method_name, uri);
                 return None;
             }
             Some(doc) => match doc.snapshot() {
                 None => {
-                    self.client
-                        .log_message(MessageType::INFO, "Document not fully initialized")
-                        .await;
+                    log::debug!(
+                        "{}: Document not fully initialized for {}",
+                        method_name,
+                        uri
+                    );
                     return None;
                 }
                 Some(snapshot) => snapshot,
@@ -232,7 +230,7 @@ impl Kakehashi {
     /// to resolve per-method aggregation priorities from the bridge language config.
     ///
     /// Returns `None` if no configs are found.
-    async fn preamble_to_document_context(
+    fn preamble_to_document_context(
         &self,
         preamble: PreambleResult,
         method_name: &str,
@@ -243,15 +241,11 @@ impl Kakehashi {
         );
 
         if configs.is_empty() {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!(
-                        "No bridge server configured for language: {} (host: {})",
-                        preamble.resolved.injection_language, preamble.language_name
-                    ),
-                )
-                .await;
+            log::debug!(
+                "No bridge server configured for language: {} (host: {})",
+                preamble.resolved.injection_language,
+                preamble.language_name
+            );
             return None;
         }
 
@@ -343,18 +337,14 @@ impl Kakehashi {
     ///
     /// Delegates to the shared preamble, then looks up ALL bridge server configs
     /// for the injection language. Returns `None` if no configs found.
-    pub(crate) async fn resolve_bridge_contexts(
+    pub(crate) fn resolve_bridge_contexts(
         &self,
         lsp_uri: &Uri,
         position: Position,
         method_name: &str,
     ) -> Option<PositionRequestContext> {
-        let preamble = self
-            .resolve_bridge_preamble(lsp_uri, position, method_name)
-            .await?;
-        let document = self
-            .preamble_to_document_context(preamble, method_name)
-            .await?;
+        let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
+        let document = self.preamble_to_document_context(preamble, method_name)?;
 
         Some(PositionRequestContext { document, position })
     }
@@ -363,18 +353,14 @@ impl Kakehashi {
     ///
     /// Uses `range.start` to find the injection region, then returns a
     /// [`RangeRequestContext`] with the full range for the handler to use.
-    pub(crate) async fn resolve_bridge_contexts_for_range(
+    pub(crate) fn resolve_bridge_contexts_for_range(
         &self,
         lsp_uri: &Uri,
         range: Range,
         method_name: &str,
     ) -> Option<RangeRequestContext> {
-        let preamble = self
-            .resolve_bridge_preamble(lsp_uri, range.start, method_name)
-            .await?;
-        let document = self
-            .preamble_to_document_context(preamble, method_name)
-            .await?;
+        let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
+        let document = self.preamble_to_document_context(preamble, method_name)?;
 
         Some(RangeRequestContext { document, range })
     }

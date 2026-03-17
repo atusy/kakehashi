@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{ColorInformation, DocumentColorParams, MessageType};
+use tower_lsp_server::ls_types::{ColorInformation, DocumentColorParams};
 
 use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
@@ -27,27 +27,23 @@ impl Kakehashi {
             return Ok(vec![]);
         };
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!("documentColor called for {}", uri),
-            )
-            .await;
+        log::debug!("documentColor called for {}", uri);
 
         // Get document snapshot (minimizes lock duration)
-        let (snapshot, missing_message) = match self.documents.get(&uri) {
-            None => (None, Some("No document found")),
+        let snapshot = match self.documents.get(&uri) {
+            None => {
+                log::debug!("documentColor: No document found for {}", uri);
+                return Ok(Vec::new());
+            }
             Some(doc) => match doc.snapshot() {
-                None => (None, Some("Document not fully initialized")),
-                Some(snapshot) => (Some(snapshot), None),
+                None => {
+                    log::debug!("documentColor: Document not fully initialized for {}", uri);
+                    return Ok(Vec::new());
+                }
+                Some(snapshot) => snapshot,
             },
             // doc automatically dropped here, lock released
         };
-        if let Some(message) = missing_message {
-            self.client.log_message(MessageType::INFO, message).await;
-            return Ok(Vec::new());
-        }
-        let snapshot = snapshot.expect("snapshot set when missing_message is None");
 
         // Get the language for this document
         let Some(language_name) = self.get_language_for_document(&uri) else {

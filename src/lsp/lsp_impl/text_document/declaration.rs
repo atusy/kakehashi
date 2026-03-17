@@ -17,9 +17,8 @@ impl Kakehashi {
         let lsp_uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let Some(ctx) = self
-            .resolve_bridge_contexts(&lsp_uri, position, "textDocument/declaration")
-            .await
+        let Some(ctx) =
+            self.resolve_bridge_contexts(&lsp_uri, position, "textDocument/declaration")
         else {
             return Ok(None);
         };

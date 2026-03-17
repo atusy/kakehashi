@@ -14,9 +14,8 @@ impl Kakehashi {
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
-        let Some(ctx) = self
-            .resolve_bridge_contexts_for_range(&lsp_uri, range, "textDocument/inlayHint")
-            .await
+        let Some(ctx) =
+            self.resolve_bridge_contexts_for_range(&lsp_uri, range, "textDocument/inlayHint")
         else {
             return Ok(None);
         };
