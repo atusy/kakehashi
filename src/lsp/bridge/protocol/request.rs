@@ -124,8 +124,8 @@ pub(crate) fn build_didopen_notification(
 /// where the LSP spec defines different params types per method but the bridge
 /// only sends the `textDocument` field.
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct DocumentParams {
-    #[serde(rename = "textDocument")]
     text_document: TextDocumentIdentifier,
 }
 

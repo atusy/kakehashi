@@ -41,6 +41,7 @@ pub enum AggregationStrategy {
 /// order — the first server in the list that returns a non-empty result wins.
 /// Empty priorities degrades to first-win (arrival-order) behavior.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AggregationConfig {
     /// Server names in priority order (highest first). Empty = pure first-win behavior.
     #[serde(default)]
@@ -49,7 +50,7 @@ pub struct AggregationConfig {
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
     /// Maximum number of servers to fan out to. Omit for no limit. Set to `0` to disable fan-out. Negative values are treated as no limit.
-    #[serde(default, rename = "maxFanOut")]
+    #[serde(default)]
     pub max_fan_out: Option<i64>,
 }
 
@@ -115,6 +116,7 @@ impl BridgeLanguageConfig {
 /// This is used to configure external language servers (like rust-analyzer, pyright)
 /// that kakehashi can redirect requests to for injection regions.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"]
@@ -122,10 +124,8 @@ pub struct BridgeServerConfig {
     /// Languages this server handles (e.g., ["rust"], ["python"])
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
-    #[serde(rename = "initializationOptions")]
     pub initialization_options: Option<Value>,
     /// Workspace type for this server (defaults to None, meaning Generic)
-    #[serde(rename = "workspaceType")]
     pub workspace_type: Option<WorkspaceType>,
 }
 
@@ -201,22 +201,20 @@ pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RawWorkspaceSettings {
     /// Directories to search for Tree-sitter parser libraries and query files.
-    #[serde(rename = "searchPaths")]
     pub search_paths: Option<Vec<String>>,
     /// Per-language configuration (parser paths, queries, bridge filters, aliases).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
     /// Custom mappings from Tree-sitter capture names to semantic token types.
-    #[serde(rename = "captureMappings", default)]
+    #[serde(default)]
     pub capture_mappings: CaptureMappings,
     /// Whether to automatically install missing parsers and queries.
-    #[serde(rename = "autoInstall")]
     pub auto_install: Option<bool>,
     /// Language servers for bridging LSP requests to injection regions.
     /// Map of server name to server configuration.
-    #[serde(rename = "languageServers")]
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
 }
 
