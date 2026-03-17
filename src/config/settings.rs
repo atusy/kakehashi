@@ -49,7 +49,12 @@ pub struct AggregationConfig {
     /// Aggregation strategy override. Omit to use the handler default.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
-    /// Maximum number of servers to fan out to. Omit for no limit. Set to `0` to disable fan-out. Negative values are treated as no limit.
+    /// Maximum number of servers to fan out to.
+    ///
+    /// - `None` / absent: no limit (fan out to all matching servers)
+    /// - `0`: disable fan-out entirely
+    /// - Positive: cap the number of concurrent server requests
+    /// - Negative: treated as no limit (silently ignored via `usize::try_from`)
     #[serde(default)]
     pub max_fan_out: Option<i64>,
 }
