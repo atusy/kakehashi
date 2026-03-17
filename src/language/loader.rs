@@ -8,13 +8,13 @@ use tree_sitter::Language;
 
 /// A wrapper around dynamic library loading for Tree-sitter language parsers
 #[derive(Default)]
-pub struct ParserLoader {
+pub(crate) struct ParserLoader {
     /// Cache of loaded libraries to prevent reloading
     loaded_libraries: HashMap<String, Library>,
 }
 
 #[derive(Debug)]
-pub enum ParserLoadError {
+pub(crate) enum ParserLoadError {
     LibraryLoadError(libloading::Error),
     SymbolNotFound(String),
     CacheError(String),
@@ -40,7 +40,7 @@ impl From<libloading::Error> for ParserLoadError {
 
 impl ParserLoader {
     /// Create a new ParserLoader instance
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -52,7 +52,7 @@ impl ParserLoader {
     ///
     /// # Returns
     /// The loaded Language or an error
-    pub fn load_language(
+    pub(crate) fn load_language(
         &mut self,
         path: &str,
         lang_name: &str,

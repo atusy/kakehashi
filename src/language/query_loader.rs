@@ -83,7 +83,7 @@ pub(crate) struct ParseResult {
 }
 
 /// Loads Tree-sitter queries from files and configuration
-pub struct QueryLoader;
+pub(crate) struct QueryLoader;
 
 impl QueryLoader {
     /// Resolve query inheritance and return the combined query content.
@@ -101,8 +101,8 @@ impl QueryLoader {
     ///
     /// # Returns
     /// Combined query content with all inherited queries.
-    fn resolve_query_recursive(
-        runtime_bases: &[String],
+    fn resolve_query_recursive<P: AsRef<Path>>(
+        runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
         preloaded_content: Option<String>,
@@ -176,12 +176,12 @@ impl QueryLoader {
         }
     }
 
-    /// Load query content from path strings (without parsing).
-    fn load_content_from_paths(paths: &[String]) -> LspResult<String> {
+    /// Load query content from paths (without parsing).
+    fn load_content_from_paths<P: AsRef<Path>>(paths: &[P]) -> LspResult<String> {
         let mut combined_query = String::new();
 
         for path in paths {
-            let normalized_path = PathBuf::from(path).clean();
+            let normalized_path = path.as_ref().clean();
             match fs::read_to_string(&normalized_path) {
                 Ok(content) => {
                     combined_query.push_str(&content);
@@ -200,13 +200,14 @@ impl QueryLoader {
     }
 
     /// Find a query file in search paths
-    fn find_query_file(
-        runtime_bases: &[String],
+    fn find_query_file<P: AsRef<Path>>(
+        runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> Option<PathBuf> {
         for base in runtime_bases {
-            let candidate = Path::new(base)
+            let candidate = base
+                .as_ref()
                 .join("queries")
                 .join(lang_name)
                 .join(file_name)
@@ -219,8 +220,8 @@ impl QueryLoader {
     }
 
     /// Load a query file from search paths
-    fn load_query_file(
-        runtime_bases: &[String],
+    fn load_query_file<P: AsRef<Path>>(
+        runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> LspResult<String> {
@@ -232,10 +233,18 @@ impl QueryLoader {
                     e
                 ))
             }),
-            None => Err(LspError::query(format!(
-                "Query file {} not found for language {} in search paths",
-                file_name, lang_name
-            ))),
+            None => {
+                let paths_display: Vec<_> = runtime_bases
+                    .iter()
+                    .map(|p| p.as_ref().display().to_string())
+                    .collect();
+                Err(LspError::query(format!(
+                    "Query file {} not found for language {} in search paths: [{}]",
+                    file_name,
+                    lang_name,
+                    paths_display.join(", ")
+                )))
+            }
         }
     }
 
@@ -345,7 +354,7 @@ impl QueryLoader {
         }
     }
 
-    /// Load and parse a query from explicit path strings with fault tolerance.
+    /// Load and parse a query from explicit paths with fault tolerance.
     ///
     /// Loads query content from the specified paths and uses tolerant parsing
     /// to skip invalid patterns instead of failing the entire query.
@@ -354,9 +363,9 @@ impl QueryLoader {
     /// - `Ok(ParseResult)` if the query files were found and at least
     ///   partially parsed
     /// - `Err` if any query file could not be found or read
-    pub(crate) fn load_query_from_paths(
+    pub(crate) fn load_query_from_paths<P: AsRef<Path>>(
         language: &Language,
-        paths: &[String],
+        paths: &[P],
     ) -> LspResult<ParseResult> {
         let query_str = Self::load_content_from_paths(paths)?;
         Ok(Self::parse_query(language, &query_str, false))
@@ -378,9 +387,9 @@ impl QueryLoader {
     /// - `Ok(ParseResult)` if the query file was found and at least
     ///   partially parsed
     /// - `Err` if the query file could not be found or read
-    pub(crate) fn load_query_with_inheritance(
+    pub(crate) fn load_query_with_inheritance<P: AsRef<Path>>(
         language: &Language,
-        runtime_bases: &[String],
+        runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> LspResult<ParseResult> {
@@ -400,10 +409,10 @@ impl QueryLoader {
     }
 
     /// Resolve library path for a language
-    pub fn resolve_library_path(
+    pub(crate) fn resolve_library_path<P: AsRef<Path>>(
         library: Option<&String>,
         language: &str,
-        search_paths: &[String],
+        search_paths: &[P],
     ) -> Option<String> {
         // If explicit library path is provided, normalize and use it
         if let Some(lib) = library {
@@ -414,7 +423,8 @@ impl QueryLoader {
         // Otherwise, search in searchPaths: <base>/parser/
         for path in search_paths {
             for ext in PARSER_EXTENSIONS {
-                let parser_path = PathBuf::from(path)
+                let parser_path = path
+                    .as_ref()
                     .join("parser")
                     .join(format!("{language}.{ext}"))
                     .clean();
@@ -434,9 +444,11 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    const NO_SEARCH_PATHS: &[&Path] = &[];
+
     /// Test helper: resolve query without preloaded content
-    fn resolve_query(
-        runtime_bases: &[String],
+    fn resolve_query<P: AsRef<Path>>(
+        runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> LspResult<String> {
@@ -488,7 +500,7 @@ mod tests {
         assert_eq!(result.unwrap(), query_file);
 
         // Test not finding a non-existent file
-        let result = QueryLoader::find_query_file(&[], "rust", "highlights.scm");
+        let result = QueryLoader::find_query_file(NO_SEARCH_PATHS, "rust", "highlights.scm");
         assert!(result.is_none());
     }
 
@@ -496,13 +508,13 @@ mod tests {
     fn test_resolve_library_path() {
         // Test explicit library path
         let explicit = Some(&"explicit/path.so".to_string());
-        let result = QueryLoader::resolve_library_path(explicit, "rust", &[]);
+        let no_paths: &[String] = &[];
+        let result = QueryLoader::resolve_library_path(explicit, "rust", no_paths);
         assert_eq!(result, Some("explicit/path.so".to_string()));
 
         // Test search paths
         let dir = tempdir().unwrap();
         let base_path = dir.path().to_str().unwrap().to_string();
-
         // Create parser directory
         let parser_dir = dir.path().join("parser");
         fs::create_dir_all(&parser_dir).unwrap();
@@ -517,7 +529,130 @@ mod tests {
         assert!(result.unwrap().ends_with("parser/rust.so"));
 
         // Empty search paths and no explicit library → None
-        assert!(QueryLoader::resolve_library_path(None, "rust", &[]).is_none());
+        assert!(QueryLoader::resolve_library_path(None, "rust", no_paths).is_none());
+    }
+
+    // ============================================================
+    // Tests for AsRef<Path> generic with PathBuf inputs
+    // ============================================================
+
+    #[test]
+    fn test_resolve_library_path_with_pathbuf_search_paths() {
+        let dir = tempdir().unwrap();
+        let parser_dir = dir.path().join("parser");
+        fs::create_dir_all(&parser_dir).unwrap();
+        fs::write(parser_dir.join("rust.so"), "").unwrap();
+
+        let search_paths = vec![dir.path().to_path_buf()];
+        let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string_lossy().ends_with("parser/rust.so"));
+    }
+
+    #[test]
+    fn test_load_content_from_paths_with_pathbuf() {
+        let dir = tempdir().unwrap();
+        let file1 = dir.path().join("query1.scm");
+        let file2 = dir.path().join("query2.scm");
+        fs::write(&file1, "(identifier) @variable").unwrap();
+        fs::write(&file2, "(string) @string").unwrap();
+
+        let paths: Vec<PathBuf> = vec![file1, file2];
+        let result = QueryLoader::load_content_from_paths(&paths).unwrap();
+        assert!(result.contains("(identifier) @variable"));
+        assert!(result.contains("(string) @string"));
+    }
+
+    /// Create a directory with non-UTF-8 bytes in its name under the given temp dir.
+    #[cfg(unix)]
+    fn create_non_utf8_base(dir: &tempfile::TempDir) -> PathBuf {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8_name = OsStr::from_bytes(b"base_\xff\xfe");
+        dir.path().join(non_utf8_name)
+    }
+
+    // macOS APFS enforces UTF-8 filenames at the kernel level, so non-UTF-8
+    // directory names cannot be created. This test only works on Linux.
+    #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore)]
+    #[test]
+    fn test_find_query_file_with_non_utf8_search_path() {
+        let dir = tempdir().unwrap();
+        let non_utf8_base = create_non_utf8_base(&dir);
+        let query_dir = non_utf8_base.join("queries").join("rust");
+        fs::create_dir_all(&query_dir).unwrap();
+        fs::write(query_dir.join("highlights.scm"), "(identifier) @variable").unwrap();
+
+        let search_paths = vec![non_utf8_base];
+        let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
+        assert!(result.is_some(), "Should find query file under non-UTF-8 path");
+    }
+
+    // macOS APFS enforces UTF-8 filenames at the kernel level, so non-UTF-8
+    // directory names cannot be created. This test only works on Linux.
+    #[cfg(unix)]
+    #[cfg_attr(target_os = "macos", ignore)]
+    #[test]
+    fn test_resolve_library_path_with_non_utf8_search_path() {
+        let dir = tempdir().unwrap();
+        let non_utf8_base = create_non_utf8_base(&dir);
+        let parser_dir = non_utf8_base.join("parser");
+        fs::create_dir_all(&parser_dir).unwrap();
+        fs::write(parser_dir.join("rust.so"), "").unwrap();
+
+        let search_paths = vec![non_utf8_base];
+        let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
+        assert!(result.is_some(), "Should resolve parser under non-UTF-8 path");
+    }
+
+    #[test]
+    fn test_find_query_file_with_path_ref() {
+        let dir = tempdir().unwrap();
+        let query_dir = dir.path().join("queries").join("rust");
+        fs::create_dir_all(&query_dir).unwrap();
+        let query_file = query_dir.join("highlights.scm");
+        fs::write(&query_file, "(identifier) @variable").unwrap();
+
+        let search_paths: Vec<&Path> = vec![dir.path()];
+        let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
+        assert_eq!(result.unwrap(), query_file);
+    }
+
+    #[test]
+    fn test_load_query_with_inheritance_pathbuf_search_paths() {
+        // Uses Rust grammar with arbitrary language names to test that
+        // PathBuf search paths work with the inheritance mechanism.
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let dir = tempdir().unwrap();
+
+        // Create base_lang query
+        let base_dir = dir.path().join("queries").join("base_lang");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::write(base_dir.join("highlights.scm"), "(identifier) @variable\n").unwrap();
+
+        // Create child_lang query (inherits base_lang)
+        let child_dir = dir.path().join("queries").join("child_lang");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("highlights.scm"),
+            "; inherits: base_lang\n(string_literal) @string\n",
+        )
+        .unwrap();
+
+        // Pass PathBuf search paths (not String) to exercise the generic bound
+        let search_paths: Vec<PathBuf> = vec![dir.path().to_path_buf()];
+        let result = QueryLoader::load_query_with_inheritance(
+            &language,
+            &search_paths,
+            "child_lang",
+            "highlights.scm",
+        );
+        assert!(result.is_ok(), "Should resolve with PathBuf search paths");
+        let parsed = result.unwrap();
+        assert!(parsed.query.is_some(), "Should produce a valid query");
+        assert!(parsed.used_inheritance, "Should detect inheritance");
     }
 
     // ============================================================
@@ -560,14 +695,13 @@ mod tests {
     fn test_resolve_query_no_inheritance() {
         // ecma has no inheritance - should return content as-is
         let dir = tempdir().unwrap();
-        let base_path = dir.path().to_str().unwrap().to_string();
 
         // Create ecma query
         let ecma_dir = dir.path().join("queries").join("ecma");
         fs::create_dir_all(&ecma_dir).unwrap();
         fs::write(ecma_dir.join("highlights.scm"), "(identifier) @variable\n").unwrap();
 
-        let result = resolve_query(&[base_path], "ecma", "highlights.scm");
+        let result = resolve_query(&[dir.path().to_path_buf()], "ecma", "highlights.scm");
         assert!(result.is_ok());
         let content = result.unwrap();
         assert!(content.contains("(identifier) @variable"));
@@ -577,7 +711,6 @@ mod tests {
     fn test_resolve_query_single_parent() {
         // typescript inherits from ecma
         let dir = tempdir().unwrap();
-        let base_path = dir.path().to_str().unwrap().to_string();
 
         // Create ecma query (base)
         let ecma_dir = dir.path().join("queries").join("ecma");
@@ -593,7 +726,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_query(&[base_path], "typescript", "highlights.scm");
+        let result = resolve_query(&[dir.path().to_path_buf()], "typescript", "highlights.scm");
         assert!(result.is_ok());
         let content = result.unwrap();
 
@@ -611,7 +744,6 @@ mod tests {
     fn test_resolve_query_removes_directive() {
         // The "; inherits:" line should be removed from output
         let dir = tempdir().unwrap();
-        let base_path = dir.path().to_str().unwrap().to_string();
 
         // Create ecma query
         let ecma_dir = dir.path().join("queries").join("ecma");
@@ -627,7 +759,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = resolve_query(&[base_path], "typescript", "highlights.scm");
+        let result = resolve_query(&[dir.path().to_path_buf()], "typescript", "highlights.scm");
         let content = result.unwrap();
 
         // The inherits directive should not be in the output
@@ -637,10 +769,10 @@ mod tests {
     #[test]
     fn test_resolve_query_with_real_typescript() {
         // Integration test with actual installed queries
-        let search_path = "/Users/atusy/Library/Application Support/kakehashi".to_string();
+        let search_path = PathBuf::from("/Users/atusy/Library/Application Support/kakehashi");
 
         // Skip if queries aren't installed
-        let ts_path = std::path::Path::new(&search_path)
+        let ts_path = search_path
             .join("queries")
             .join("typescript")
             .join("highlights.scm");
@@ -681,7 +813,6 @@ mod tests {
     fn test_resolve_query_circular_detection() {
         // a inherits b, b inherits a - should detect and error
         let dir = tempdir().unwrap();
-        let base_path = dir.path().to_str().unwrap().to_string();
 
         let a_dir = dir.path().join("queries").join("lang_a");
         fs::create_dir_all(&a_dir).unwrap();
@@ -691,7 +822,7 @@ mod tests {
         fs::create_dir_all(&b_dir).unwrap();
         fs::write(b_dir.join("highlights.scm"), "; inherits: lang_a\n(b) @b\n").unwrap();
 
-        let result = resolve_query(&[base_path], "lang_a", "highlights.scm");
+        let result = resolve_query(&[dir.path().to_path_buf()], "lang_a", "highlights.scm");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("circular") || err.to_string().contains("Circular"));
@@ -700,14 +831,14 @@ mod tests {
     #[test]
     fn test_resolve_query_with_real_javascript_multiple_inheritance() {
         // Integration test: JavaScript inherits from BOTH ecma AND jsx
-        let search_path = "/Users/atusy/Library/Application Support/kakehashi".to_string();
+        let search_path = PathBuf::from("/Users/atusy/Library/Application Support/kakehashi");
 
         // Skip if queries aren't installed
-        let js_path = std::path::Path::new(&search_path)
+        let js_path = search_path
             .join("queries")
             .join("javascript")
             .join("highlights.scm");
-        let jsx_path = std::path::Path::new(&search_path)
+        let jsx_path = search_path
             .join("queries")
             .join("jsx")
             .join("highlights.scm");
