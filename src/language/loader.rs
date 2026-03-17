@@ -3,7 +3,7 @@ use path_clean::PathClean;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::Path;
 use tree_sitter::Language;
 
 /// A wrapper around dynamic library loading for Tree-sitter language parsers
@@ -54,11 +54,11 @@ impl ParserLoader {
     /// The loaded Language or an error
     pub(crate) fn load_language(
         &mut self,
-        path: &str,
+        path: &Path,
         lang_name: &str,
     ) -> Result<Language, ParserLoadError> {
         // Normalize the path before loading
-        let normalized_path = PathBuf::from(path).clean();
+        let normalized_path = path.clean();
 
         // Derive function name from language name using standard convention
         let func_name = format!("tree_sitter_{lang_name}");

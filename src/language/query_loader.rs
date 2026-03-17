@@ -408,16 +408,30 @@ impl QueryLoader {
         Ok(Self::parse_query(language, &query_str, used_inheritance))
     }
 
-    /// Resolve library path for a language
+    /// Resolve library path for a language.
+    ///
+    /// If an explicit `library` path is provided, it is normalized and returned.
+    /// Otherwise, searches `search_paths` for `<base>/parser/<language>.<ext>`.
+    ///
+    /// # Arguments
+    /// * `library` - Optional explicit path string to the parser shared library.
+    ///   Remains `&str` because it comes from `LanguageSettings.parser: Option<String>`.
+    /// * `language` - The language name used for search-path-based discovery
+    /// * `search_paths` - Directories to search for `parser/<language>.<ext>`.
+    ///   Generic over `AsRef<Path>` to accept both `PathBuf` (from `ConfigStore`)
+    ///   and `String` (from `WorkspaceSettings`).
+    ///
+    /// # Returns
+    /// The resolved `PathBuf` if found, or `None` if no matching parser exists.
     pub(crate) fn resolve_library_path<P: AsRef<Path>>(
-        library: Option<&String>,
+        library: Option<&str>,
         language: &str,
         search_paths: &[P],
-    ) -> Option<String> {
+    ) -> Option<PathBuf> {
         // If explicit library path is provided, normalize and use it
         if let Some(lib) = library {
             let normalized = PathBuf::from(lib).clean();
-            return Some(normalized.to_string_lossy().into_owned());
+            return Some(normalized);
         }
 
         // Otherwise, search in searchPaths: <base>/parser/
@@ -429,7 +443,7 @@ impl QueryLoader {
                     .join(format!("{language}.{ext}"))
                     .clean();
                 if parser_path.exists() {
-                    return Some(parser_path.to_string_lossy().into_owned());
+                    return Some(parser_path);
                 }
             }
         }
@@ -507,10 +521,10 @@ mod tests {
     #[test]
     fn test_resolve_library_path() {
         // Test explicit library path
-        let explicit = Some(&"explicit/path.so".to_string());
+        let explicit = Some("explicit/path.so");
         let no_paths: &[String] = &[];
         let result = QueryLoader::resolve_library_path(explicit, "rust", no_paths);
-        assert_eq!(result, Some("explicit/path.so".to_string()));
+        assert_eq!(result, Some(PathBuf::from("explicit/path.so")));
 
         // Test search paths
         let dir = tempdir().unwrap();
@@ -526,7 +540,7 @@ mod tests {
         let search_paths = vec![base_path];
         let result = QueryLoader::resolve_library_path(None, "rust", &search_paths);
         assert!(result.is_some());
-        assert!(result.unwrap().ends_with("parser/rust.so"));
+        assert!(result.unwrap().to_string_lossy().ends_with("parser/rust.so"));
 
         // Empty search paths and no explicit library → None
         assert!(QueryLoader::resolve_library_path(None, "rust", no_paths).is_none());

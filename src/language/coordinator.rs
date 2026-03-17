@@ -191,7 +191,7 @@ impl LanguageCoordinator {
                 Err(err) => {
                     return LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
-                        format!("Failed to load language {language_id} from {lib_path}: {err}"),
+                        format!("Failed to load language {language_id} from {}: {err}", lib_path.display()),
                     ));
                 }
             }
@@ -241,7 +241,7 @@ impl LanguageCoordinator {
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!("Dynamically loaded language {language_id} from {lib_path}"),
+            format!("Dynamically loaded language {language_id} from {}", lib_path.display()),
         ));
         if self.has_queries(language_id) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -700,7 +700,7 @@ impl LanguageCoordinator {
         search_paths: &[String],
     ) -> LanguageLoadResult {
         let library_path =
-            QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths);
+            QueryLoader::resolve_library_path(config.parser.as_deref(), lang_name, search_paths);
         let Some(lib_path) = library_path else {
             let paths_display: Vec<_> = search_paths.iter().map(|p| p.display().to_string()).collect();
             return LanguageLoadResult::failure_with(LanguageEvent::log(
