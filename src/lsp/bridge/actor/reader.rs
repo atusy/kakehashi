@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use log::{debug, warn};
 use tokio::sync::{mpsc, oneshot};
+
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
@@ -26,6 +27,7 @@ use super::super::connection::BridgeReader;
 use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::RouteResult;
+use crate::error::LockResultExt;
 use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 
 /// Notification to forward from downstream server to upstream editor.
@@ -288,7 +290,7 @@ impl ReaderTaskHandle {
         let mut guard = self
             .liveness_failed_rx
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .recover_poison("ReaderTaskHandle::check_liveness_failed");
 
         if let Some(mut rx) = guard.take() {
             match rx.try_recv() {

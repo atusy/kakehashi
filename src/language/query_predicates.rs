@@ -113,7 +113,7 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
 fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Regex> {
     let mut cache = LUA_REGEX_CACHE
         .lock()
-        .recover_poison("get_or_compile_lua_regex");
+        .recover_poison("query_predicates::get_or_compile_lua_regex");
 
     if let Some(cached) = cache.get(pattern_str) {
         return cached.clone();
