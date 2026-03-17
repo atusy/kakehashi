@@ -1,17 +1,19 @@
 use crate::config::{CaptureMappings, LanguageSettings, WorkspaceSettings};
 use crate::error::LockResultExt;
+use path_clean::PathClean;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 
 /// Thread-safe cache of workspace settings for the language subsystem.
-pub struct ConfigStore {
+pub(crate) struct ConfigStore {
     language_configs: RwLock<HashMap<String, LanguageSettings>>,
     capture_mappings: RwLock<CaptureMappings>,
-    search_paths: RwLock<Vec<String>>,
+    search_paths: RwLock<Vec<PathBuf>>,
 }
 
 impl ConfigStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             language_configs: RwLock::new(HashMap::new()),
             capture_mappings: RwLock::new(CaptureMappings::default()),
@@ -20,28 +22,28 @@ impl ConfigStore {
     }
 
     // ========== Language Configs ==========
-    pub fn set_language_configs(&self, configs: HashMap<String, LanguageSettings>) {
+    pub(crate) fn set_language_configs(&self, configs: HashMap<String, LanguageSettings>) {
         *self
             .language_configs
             .write()
             .recover_poison("ConfigStore::set_language_configs") = configs;
     }
 
-    pub fn update_from_settings(&self, settings: &WorkspaceSettings) {
+    pub(crate) fn update_from_settings(&self, settings: &WorkspaceSettings) {
         self.set_language_configs(settings.languages.clone());
         self.set_capture_mappings(settings.capture_mappings.clone());
         self.set_search_paths(settings.search_paths.clone());
     }
 
     // ========== Capture Mappings ==========
-    pub fn set_capture_mappings(&self, mappings: CaptureMappings) {
+    pub(crate) fn set_capture_mappings(&self, mappings: CaptureMappings) {
         *self
             .capture_mappings
             .write()
             .recover_poison("ConfigStore::set_capture_mappings") = mappings;
     }
 
-    pub fn get_capture_mappings(&self) -> CaptureMappings {
+    pub(crate) fn get_capture_mappings(&self) -> CaptureMappings {
         self.capture_mappings
             .read()
             .recover_poison("ConfigStore::get_capture_mappings")
@@ -49,14 +51,15 @@ impl ConfigStore {
     }
 
     // ========== Search Paths ==========
-    pub fn set_search_paths(&self, paths: Vec<String>) {
+    pub(crate) fn set_search_paths(&self, paths: Vec<String>) {
         *self
             .search_paths
             .write()
-            .recover_poison("ConfigStore::set_search_paths") = paths;
+            .recover_poison("ConfigStore::set_search_paths") =
+            paths.into_iter().map(|p| PathBuf::from(p).clean()).collect();
     }
 
-    pub fn get_search_paths(&self) -> Vec<String> {
+    pub(crate) fn get_search_paths(&self) -> Vec<PathBuf> {
         self.search_paths
             .read()
             .recover_poison("ConfigStore::get_search_paths")
@@ -172,11 +175,11 @@ mod tests {
         let store = ConfigStore::new();
 
         let paths = vec!["/path/one".to_string(), "/path/two".to_string()];
-        store.set_search_paths(paths.clone());
+        store.set_search_paths(paths);
 
         let retrieved = store.get_search_paths();
         assert_eq!(retrieved.len(), 2);
-        assert_eq!(retrieved[0], "/path/one");
+        assert_eq!(retrieved[0], PathBuf::from("/path/one"));
     }
 
     #[test]
@@ -198,6 +201,24 @@ mod tests {
         store.update_from_settings(&settings);
 
         assert!(store.get_language_config("python").is_some());
-        assert_eq!(store.get_search_paths(), vec!["/search/path".to_string()]);
+        assert_eq!(store.get_search_paths(), vec![PathBuf::from("/search/path")]);
+    }
+
+    #[test]
+    fn test_search_paths_string_to_pathbuf_round_trip() {
+        let store = ConfigStore::new();
+        let input = vec![
+            "/path/one".to_string(),
+            "/path/with/../dots".to_string(),
+        ];
+        store.set_search_paths(input);
+        let retrieved = store.get_search_paths();
+        assert_eq!(
+            retrieved,
+            vec![
+                PathBuf::from("/path/one"),
+                PathBuf::from("/path/dots"),
+            ]
+        );
     }
 }
