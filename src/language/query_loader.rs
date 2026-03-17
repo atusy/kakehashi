@@ -1,6 +1,7 @@
 use crate::error::{LspError, LspResult};
 use log::warn;
 use path_clean::PathClean;
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Query};
@@ -80,6 +81,23 @@ pub(crate) struct ParseResult {
     /// When true, line numbers in `skipped` refer to the combined query,
     /// not the original source file.
     pub used_inheritance: bool,
+}
+
+/// Format search paths for display in error messages.
+pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
+    if paths.is_empty() {
+        "(no search paths configured)".to_string()
+    } else {
+        let mut buf = String::from("[");
+        for (i, p) in paths.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            let _ = write!(buf, "{}", p.as_ref().display());
+        }
+        buf.push(']');
+        buf
+    }
 }
 
 /// Loads Tree-sitter queries from files and configuration
@@ -233,18 +251,12 @@ impl QueryLoader {
                     e
                 ))
             }),
-            None => {
-                let paths_display: Vec<_> = runtime_bases
-                    .iter()
-                    .map(|p| p.as_ref().display().to_string())
-                    .collect();
-                Err(LspError::query(format!(
-                    "Query file {} not found for language {} in search paths: [{}]",
-                    file_name,
-                    lang_name,
-                    paths_display.join(", ")
-                )))
-            }
+            None => Err(LspError::query(format!(
+                "Query file {} not found for language {} in search paths: {}",
+                file_name,
+                lang_name,
+                format_search_paths(runtime_bases)
+            ))),
         }
     }
 
@@ -648,6 +660,24 @@ mod tests {
         let search_paths: Vec<&Path> = vec![dir.path()];
         let result = QueryLoader::find_query_file(&search_paths, "rust", "highlights.scm");
         assert_eq!(result.unwrap(), query_file);
+    }
+
+    #[test]
+    fn test_format_search_paths_empty() {
+        let paths: Vec<PathBuf> = vec![];
+        assert_eq!(format_search_paths(&paths), "(no search paths configured)");
+    }
+
+    #[test]
+    fn test_format_search_paths_single() {
+        let paths = vec![PathBuf::from("/path/one")];
+        assert_eq!(format_search_paths(&paths), "[/path/one]");
+    }
+
+    #[test]
+    fn test_format_search_paths_multiple() {
+        let paths = vec![PathBuf::from("/path/one"), PathBuf::from("/path/two")];
+        assert_eq!(format_search_paths(&paths), "[/path/one, /path/two]");
     }
 
     #[test]

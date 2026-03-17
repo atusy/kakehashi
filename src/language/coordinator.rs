@@ -3,7 +3,7 @@ use super::events::{LanguageEvent, LanguageLoadResult, LanguageLoadSummary, Lang
 use super::filetypes::FiletypeResolver;
 use super::loader::ParserLoader;
 use super::parser_pool::{DocumentParserPool, ParserFactory};
-use super::query_loader::{ParseFailure, QueryLoader};
+use super::query_loader::{ParseFailure, QueryLoader, format_search_paths};
 use super::query_store::QueryStore;
 use super::registry::LanguageRegistry;
 use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
@@ -178,7 +178,10 @@ impl LanguageCoordinator {
         let Some(lib_path) = library_path else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Warning,
-                format!("Could not find parser for language '{language_id}'"),
+                format!(
+                    "Could not find parser for language '{language_id}' in search paths: {}",
+                    format_search_paths(&search_paths),
+                ),
             ));
         };
 
@@ -710,12 +713,11 @@ impl LanguageCoordinator {
         let library_path =
             QueryLoader::resolve_library_path(config.parser.as_deref(), lang_name, search_paths);
         let Some(lib_path) = library_path else {
-            let paths_display: Vec<_> = search_paths.iter().map(|p| p.display().to_string()).collect();
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Error,
                 format!(
-                    "No parser path found for language {lang_name} in search paths: [{}]",
-                    paths_display.join(", ")
+                    "No parser path found for language {lang_name} in search paths: {}",
+                    format_search_paths(search_paths),
                 ),
             ));
         };
