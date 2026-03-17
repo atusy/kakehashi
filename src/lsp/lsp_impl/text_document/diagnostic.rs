@@ -151,30 +151,21 @@ impl Kakehashi {
 
             // Resolve strategy per-region so different injection languages can use
             // different strategies (e.g., Python=Preferred, Lua=All in the same host).
-            let strategy = self.resolve_aggregation_strategy(
+            let agg = self.resolve_aggregation_config(
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/diagnostic",
                 AggregationStrategy::Concatenated,
             );
-            let priorities = self.resolve_aggregation_priorities(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/diagnostic",
-            );
-            let max_fan_out = self.resolve_max_fan_out(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/diagnostic",
-            );
+            let strategy = agg.strategy;
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
-                priorities,
-                strategy, // resolved per-region above; used in outer_join_set dispatch
-                max_fan_out,
+                priorities: agg.priorities,
+                strategy,
+                max_fan_out: agg.max_fan_out,
             };
             let pool = Arc::clone(&pool);
 

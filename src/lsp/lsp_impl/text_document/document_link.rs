@@ -90,24 +90,20 @@ impl Kakehashi {
                 continue;
             }
 
-            let priorities = self.resolve_aggregation_priorities(
+            let agg = self.resolve_aggregation_config(
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/documentLink",
-            );
-            let max_fan_out = self.resolve_max_fan_out(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/documentLink",
+                AggregationStrategy::Preferred,
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
                 resolved,
                 configs,
                 upstream_request_id: upstream_request_id.clone(),
-                priorities,
-                strategy: AggregationStrategy::Preferred,
-                max_fan_out,
+                priorities: agg.priorities,
+                strategy: agg.strategy,
+                max_fan_out: agg.max_fan_out,
             };
             let pool = Arc::clone(&pool);
 

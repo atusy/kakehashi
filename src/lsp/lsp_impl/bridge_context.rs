@@ -8,7 +8,9 @@
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 use url::Url;
 
-use crate::config::settings::{AggregationStrategy, BridgeLanguageConfig};
+use crate::config::settings::{
+    AggregationStrategy, BridgeLanguageConfig, ResolvedAggregationConfig,
+};
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard, current_upstream_id};
@@ -39,11 +41,9 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) priorities: Vec<String>,
     /// Aggregation strategy for this region.
     ///
-    /// For contexts built by [`preamble_to_document_context`] (position-based and
-    /// range-based handlers), this is always [`AggregationStrategy::Preferred`].
-    /// For diagnostic contexts (`textDocument/publishDiagnostics`), this is resolved
-    /// dynamically from the bridge language config's aggregation settings via
-    /// [`Kakehashi::resolve_aggregation_strategy`].
+    /// Resolved from the bridge language config's aggregation settings via
+    /// `Kakehashi::resolve_aggregation_config`, defaulting to
+    /// `AggregationStrategy::Preferred` for position-based and range-based handlers.
     pub(crate) strategy: AggregationStrategy,
     /// Maximum number of servers to fan out to.
     /// `None` = no limit, `Some(0)` = disable fan-out.
@@ -235,17 +235,11 @@ impl Kakehashi {
             return None;
         }
 
-        // Resolve aggregation priorities from the bridge language config.
-        let priorities = self.resolve_aggregation_priorities(
+        let agg = self.resolve_aggregation_config(
             &preamble.language_name,
             &preamble.resolved.injection_language,
             method_name,
-        );
-
-        let max_fan_out = self.resolve_max_fan_out(
-            &preamble.language_name,
-            &preamble.resolved.injection_language,
-            method_name,
+            AggregationStrategy::Preferred,
         );
 
         Some(DocumentRequestContext {
@@ -253,9 +247,9 @@ impl Kakehashi {
             resolved: preamble.resolved,
             configs,
             upstream_request_id: preamble.upstream_request_id,
-            priorities,
-            strategy: AggregationStrategy::Preferred,
-            max_fan_out,
+            priorities: agg.priorities,
+            strategy: agg.strategy,
+            max_fan_out: agg.max_fan_out,
         })
     }
 
@@ -280,43 +274,21 @@ impl Kakehashi {
             })
     }
 
-    /// Resolve aggregation strategy for a given host language, injection language,
-    /// and LSP method.
-    pub(crate) fn resolve_aggregation_strategy(
+    /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
+    /// given host language, injection language, and LSP method in a single call.
+    ///
+    /// Performs one config lookup instead of three, avoiding redundant
+    /// `resolve_bridge_language_config` calls when all settings are needed.
+    pub(crate) fn resolve_aggregation_config(
         &self,
         host_language: &str,
         injection_language: &str,
         method_name: &str,
-        default: AggregationStrategy,
-    ) -> AggregationStrategy {
+        default_strategy: AggregationStrategy,
+    ) -> ResolvedAggregationConfig {
         self.resolve_bridge_language_config(host_language, injection_language)
-            .map(|bridge_config| bridge_config.resolve_strategy(method_name, default))
-            .unwrap_or(default)
-    }
-
-    /// Resolve max fan-out for a given host language, injection language,
-    /// and LSP method.
-    pub(crate) fn resolve_max_fan_out(
-        &self,
-        host_language: &str,
-        injection_language: &str,
-        method_name: &str,
-    ) -> Option<usize> {
-        self.resolve_bridge_language_config(host_language, injection_language)
-            .and_then(|bridge_config| bridge_config.resolve_max_fan_out(method_name))
-    }
-
-    /// Resolve aggregation priorities for a given host language, injection language,
-    /// and LSP method.
-    pub(crate) fn resolve_aggregation_priorities(
-        &self,
-        host_language: &str,
-        injection_language: &str,
-        method_name: &str,
-    ) -> Vec<String> {
-        self.resolve_bridge_language_config(host_language, injection_language)
-            .map(|bridge_config| bridge_config.resolve_priorities(method_name))
-            .unwrap_or_default()
+            .map(|bridge_config| bridge_config.resolve_aggregation(method_name, default_strategy))
+            .unwrap_or_else(|| ResolvedAggregationConfig::with_defaults(default_strategy))
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
