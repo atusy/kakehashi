@@ -184,7 +184,7 @@ pub struct QueryItem {
 /// - Exact match `highlights.scm` -> `Some(Highlights)`
 /// - Exact match `locals.scm` -> `Some(Locals)`
 /// - Exact match `injections.scm` -> `Some(Injections)`
-/// - Otherwise -> `None` (unknown patterns are skipped by callers)
+/// - Otherwise -> `None`
 ///
 /// Examples:
 /// - `injections.scm` -> matches
