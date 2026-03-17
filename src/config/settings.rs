@@ -277,7 +277,7 @@ pub struct WorkspaceSettings {
     pub languages: HashMap<String, LanguageSettings>,
     pub capture_mappings: CaptureMappings,
     pub auto_install: bool,
-    pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
+    pub language_servers: HashMap<String, BridgeServerConfig>,
 }
 
 impl Default for WorkspaceSettings {
@@ -287,7 +287,7 @@ impl Default for WorkspaceSettings {
             languages: HashMap::new(),
             capture_mappings: CaptureMappings::default(),
             auto_install: true, // Default to true for zero-config experience
-            language_servers: None,
+            language_servers: HashMap::new(),
         }
     }
 }

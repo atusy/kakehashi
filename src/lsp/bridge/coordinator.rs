@@ -246,26 +246,24 @@ impl BridgeCoordinator {
             return None;
         }
 
-        // Check if language servers exist
-        if let Some(ref servers) = settings.language_servers {
-            // Look for a server that handles this language
-            // ADR-0011: Resolve each server with wildcard BEFORE checking languages,
-            // because languages list may be inherited from languageServers._
-            for server_name in servers.keys() {
-                // Skip wildcard entry - we use it for inheritance, not direct lookup
-                if server_name == "_" {
-                    continue;
-                }
+        // Look for a server that handles this language
+        // ADR-0011: Resolve each server with wildcard BEFORE checking languages,
+        // because languages list may be inherited from languageServers._
+        let servers = &settings.language_servers;
+        for server_name in servers.keys() {
+            // Skip wildcard entry - we use it for inheritance, not direct lookup
+            if server_name == "_" {
+                continue;
+            }
 
-                if let Some(resolved_config) =
-                    resolve_language_server_with_wildcard(servers, server_name)
-                        .filter(|c| c.languages.iter().any(|l| l == injection_language))
-                {
-                    return Some(ResolvedServerConfig {
-                        server_name: server_name.clone(),
-                        config: Arc::new(resolved_config),
-                    });
-                }
+            if let Some(resolved_config) =
+                resolve_language_server_with_wildcard(servers, server_name)
+                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
+            {
+                return Some(ResolvedServerConfig {
+                    server_name: server_name.clone(),
+                    config: Arc::new(resolved_config),
+                });
             }
         }
 
@@ -304,9 +302,7 @@ impl BridgeCoordinator {
             return Vec::new();
         }
 
-        let Some(ref servers) = settings.language_servers else {
-            return Vec::new();
-        };
+        let servers = &settings.language_servers;
 
         let mut results: Vec<ResolvedServerConfig> = servers
             .keys()
@@ -718,7 +714,7 @@ mod tests {
         let settings = WorkspaceSettings {
             languages,
             auto_install: false,
-            language_servers: Some(servers),
+            language_servers: servers,
             ..Default::default()
         };
 
@@ -752,7 +748,7 @@ mod tests {
         let settings = WorkspaceSettings {
             languages,
             auto_install: false,
-            language_servers: Some(servers),
+            language_servers: servers,
             ..Default::default()
         };
 
@@ -798,7 +794,7 @@ mod tests {
         let settings = WorkspaceSettings {
             languages,
             auto_install: false,
-            language_servers: Some(servers),
+            language_servers: servers,
             ..Default::default()
         };
 
@@ -849,7 +845,7 @@ mod tests {
         let settings = WorkspaceSettings {
             languages,
             auto_install: false,
-            language_servers: Some(servers),
+            language_servers: servers,
             ..Default::default()
         };
 
@@ -883,7 +879,7 @@ mod tests {
         let settings = WorkspaceSettings {
             languages,
             auto_install: false,
-            language_servers: Some(servers),
+            language_servers: servers,
             ..Default::default()
         };
 
@@ -993,7 +989,7 @@ mod tests {
         let settings = WorkspaceSettings {
             languages,
             auto_install: false,
-            language_servers: Some(servers),
+            language_servers: servers,
             ..Default::default()
         };
 
