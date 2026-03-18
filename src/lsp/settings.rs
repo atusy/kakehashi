@@ -109,9 +109,9 @@ pub fn load_settings(
                 Ok(ws) => Some(ws),
                 Err(errs) => {
                     events.push(SettingsEvent::error(format!(
-                        "Environment variable expansion failed: {errs}. \
+                        "Path expansion failed: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
-                     Please define the missing variables or remove them from your config.",
+                     Please correct the affected paths and environment variables or remove them from your config.",
                     )));
                     None
                 }
