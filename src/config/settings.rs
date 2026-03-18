@@ -271,8 +271,11 @@ impl LanguageSettings {
             None => true,                         // Default: bridge all configured languages
             Some(map) if map.is_empty() => false, // Empty map: bridge nothing
             Some(map) => {
-                let resolved =
-                    crate::config::resolve_bridge_language_with_wildcard(map, injection_language);
+                let resolved = crate::config::resolve_with_wildcard(
+                    map,
+                    injection_language,
+                    crate::config::merge_bridge_language_configs,
+                );
                 resolved.map(|c| c.enabled.unwrap_or(true)).unwrap_or(false)
             }
         }
@@ -363,7 +366,7 @@ mod tests {
     fn should_distinguish_between_unspecified_and_empty_queries() {
         // This test demonstrates the need for Option<Vec<QueryItem>>
         // to distinguish between "not specified" and "explicitly empty"
-        // which is critical for merging logic in resolve_language_settings_with_wildcard
+        // which is critical for merging logic in resolve_with_wildcard + merge_language_settings
 
         // Case 1: queries not specified (should be None)
         // User didn't specify queries - should inherit from wildcard/defaults

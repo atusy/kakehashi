@@ -18,8 +18,8 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::config::{
-    WorkspaceSettings, resolve_language_server_with_wildcard,
-    resolve_language_settings_with_wildcard, settings::BridgeServerConfig,
+    WorkspaceSettings, merge_bridge_server_configs, merge_language_settings, resolve_with_wildcard,
+    settings::BridgeServerConfig,
 };
 use crate::language::region_id_tracker::{EditInfo, RegionIdTracker};
 use crate::lsp::request_id::CancelForwarder;
@@ -234,7 +234,7 @@ impl BridgeCoordinator {
         // Use wildcard resolution for host language lookup (ADR-0011)
         // This allows languages._ to define default bridge filters
         if let Some(host_settings) =
-            resolve_language_settings_with_wildcard(&settings.languages, host_language)
+            resolve_with_wildcard(&settings.languages, host_language, merge_language_settings)
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -257,7 +257,7 @@ impl BridgeCoordinator {
             }
 
             if let Some(resolved_config) =
-                resolve_language_server_with_wildcard(servers, server_name)
+                resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
             {
                 return Some(ResolvedServerConfig {
@@ -290,7 +290,7 @@ impl BridgeCoordinator {
     ) -> Vec<ResolvedServerConfig> {
         // Check bridge filter (same logic as get_config_for_language)
         if let Some(host_settings) =
-            resolve_language_settings_with_wildcard(&settings.languages, host_language)
+            resolve_with_wildcard(&settings.languages, host_language, merge_language_settings)
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -308,7 +308,7 @@ impl BridgeCoordinator {
             .keys()
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
-                resolve_language_server_with_wildcard(servers, server_name)
+                resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),

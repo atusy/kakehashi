@@ -256,22 +256,27 @@ impl Kakehashi {
     /// Resolve the `BridgeLanguageConfig` for a given host/injection language pair.
     ///
     /// Resolution chain:
-    /// 1. `resolve_language_settings_with_wildcard(languages, host_lang)` → host settings
-    /// 2. `resolve_bridge_language_with_wildcard(bridge_map, injection_lang)` → bridge config
+    /// 1. `resolve_with_wildcard(languages, host_lang, merge_language_settings)` → host settings
+    /// 2. `resolve_with_wildcard(bridge_map, injection_lang, merge_bridge_language_configs)` → bridge config
     fn resolve_bridge_language_config(
         &self,
         host_language: &str,
         injection_language: &str,
     ) -> Option<BridgeLanguageConfig> {
         let settings = self.settings_manager.load_settings();
-        crate::config::resolve_language_settings_with_wildcard(&settings.languages, host_language)
-            .and_then(|lang_settings| lang_settings.bridge)
-            .and_then(|bridge_map| {
-                crate::config::resolve_bridge_language_with_wildcard(
-                    &bridge_map,
-                    injection_language,
-                )
-            })
+        crate::config::resolve_with_wildcard(
+            &settings.languages,
+            host_language,
+            crate::config::merge_language_settings,
+        )
+        .and_then(|lang_settings| lang_settings.bridge)
+        .and_then(|bridge_map| {
+            crate::config::resolve_with_wildcard(
+                &bridge_map,
+                injection_language,
+                crate::config::merge_bridge_language_configs,
+            )
+        })
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a

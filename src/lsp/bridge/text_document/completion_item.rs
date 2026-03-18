@@ -33,7 +33,9 @@ use super::completion::{
     transform_completion_item,
 };
 use crate::config::settings::WorkspaceSettings;
-use crate::config::{resolve_language_server_with_wildcard, settings::BridgeServerConfig};
+use crate::config::{
+    merge_bridge_server_configs, resolve_with_wildcard, settings::BridgeServerConfig,
+};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 
 impl LanguageServerPool {
@@ -55,8 +57,11 @@ impl LanguageServerPool {
         };
 
         // Look up the server config for the origin server
-        let config =
-            resolve_language_server_with_wildcard(&settings.language_servers, &envelope.origin);
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            &envelope.origin,
+            merge_bridge_server_configs,
+        );
 
         let Some(config) = config else {
             // Server no longer configured — re-envelope and return as-is
