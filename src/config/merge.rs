@@ -151,36 +151,27 @@ fn deep_merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> ser
     }
 }
 
-/// Merge two RawWorkspaceSettings, preferring values from `primary` over `fallback`
+/// Merge two RawWorkspaceSettings, preferring values from `overlay` over `base`
 pub(crate) fn merge_settings(
-    fallback: Option<RawWorkspaceSettings>,
-    primary: Option<RawWorkspaceSettings>,
+    base: Option<RawWorkspaceSettings>,
+    overlay: Option<RawWorkspaceSettings>,
 ) -> Option<RawWorkspaceSettings> {
-    match (fallback, primary) {
+    match (base, overlay) {
         (None, None) => None,
         (Some(settings), None) => Some(settings),
         (None, Some(settings)) => Some(settings),
-        (Some(fallback), Some(primary)) => {
+        (Some(base), Some(overlay)) => {
             let merged = RawWorkspaceSettings {
-                // Prefer primary search_paths, fall back to fallback
-                search_paths: primary.search_paths.or(fallback.search_paths),
-
-                // Merge languages: start with fallback, override with primary
-                languages: merge_languages(fallback.languages, primary.languages),
-
-                // Merge capture mappings: deep merge with primary taking precedence
+                search_paths: overlay.search_paths.or(base.search_paths),
+                languages: merge_languages(base.languages, overlay.languages),
                 capture_mappings: merge_capture_mappings(
-                    fallback.capture_mappings,
-                    primary.capture_mappings,
+                    base.capture_mappings,
+                    overlay.capture_mappings,
                 ),
-
-                // Prefer primary auto_install, fall back to fallback
-                auto_install: primary.auto_install.or(fallback.auto_install),
-
-                // Deep merge language_servers HashMap
+                auto_install: overlay.auto_install.or(base.auto_install),
                 language_servers: merge_language_servers(
-                    fallback.language_servers,
-                    primary.language_servers,
+                    base.language_servers,
+                    overlay.language_servers,
                 ),
             };
             Some(merged)
