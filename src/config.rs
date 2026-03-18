@@ -512,31 +512,6 @@ pub(crate) fn resolve_with_wildcard(map: &CaptureMappings, key: &str) -> Option<
 }
 
 
-/// Resolve a bridge language key from a map with wildcard fallback (test helper).
-///
-/// Implements ADR-0011 wildcard config inheritance for bridge HashMap:
-/// - If both wildcard ("_") and specific key exist: return specific (no merge needed for single-field struct)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// Note: BridgeLanguageConfig only has `enabled` field, so no merging is needed.
-#[cfg(test)]
-pub(crate) fn resolve_bridge_with_wildcard(
-    map: &HashMap<String, settings::BridgeLanguageConfig>,
-    key: &str,
-) -> Option<settings::BridgeLanguageConfig> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        // Specific overrides wildcard entirely (no merge for single-field struct)
-        (Some(_), Some(s)) => Some(s.clone()),
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1729,7 +1704,7 @@ mod tests {
         let bridge = lang_config.bridge.as_ref().unwrap();
 
         // JavaScript: python-specific override (enabled = false)
-        let js_resolved = resolve_bridge_with_wildcard(bridge, "javascript");
+        let js_resolved = resolve_bridge_language_with_wildcard(bridge, "javascript");
         assert!(js_resolved.is_some(), "Should resolve javascript bridge");
         assert!(
             js_resolved.unwrap().enabled == Some(false),
@@ -1738,7 +1713,7 @@ mod tests {
 
         // Rust: inherited from _.bridge._ through deep merge
         // ADR-0011: bridge maps are deep merged, so python gets wildcard's bridge._
-        let rust_resolved = resolve_bridge_with_wildcard(bridge, "rust");
+        let rust_resolved = resolve_bridge_language_with_wildcard(bridge, "rust");
         assert!(
             rust_resolved.is_some(),
             "Python's rust bridge should resolve (inherited from wildcard's bridge._)"
@@ -1789,7 +1764,7 @@ mod tests {
         let bridge = lang_config.bridge.as_ref().unwrap();
 
         // JavaScript: specific override
-        let js_resolved = resolve_bridge_with_wildcard(bridge, "javascript");
+        let js_resolved = resolve_bridge_language_with_wildcard(bridge, "javascript");
         assert!(js_resolved.is_some());
         assert!(
             js_resolved.unwrap().enabled == Some(false),
@@ -1797,7 +1772,7 @@ mod tests {
         );
 
         // Rust: inherits from python's bridge._
-        let rust_resolved = resolve_bridge_with_wildcard(bridge, "rust");
+        let rust_resolved = resolve_bridge_language_with_wildcard(bridge, "rust");
         assert!(rust_resolved.is_some());
         assert!(
             rust_resolved.unwrap().enabled == Some(true),
@@ -1852,7 +1827,7 @@ mod tests {
         );
         let bridge = lang_config.bridge.as_ref().unwrap();
 
-        let resolved_bridge = resolve_bridge_with_wildcard(bridge, "rust");
+        let resolved_bridge = resolve_bridge_language_with_wildcard(bridge, "rust");
         assert!(
             resolved_bridge.is_some(),
             "Should resolve to wildcard bridge"
@@ -1977,7 +1952,7 @@ mod tests {
         );
 
         // Resolve for "javascript" which doesn't exist - should return wildcard
-        let result = resolve_bridge_with_wildcard(&bridge, "javascript");
+        let result = resolve_bridge_language_with_wildcard(&bridge, "javascript");
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
