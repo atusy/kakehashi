@@ -511,40 +511,6 @@ pub(crate) fn resolve_with_wildcard(map: &CaptureMappings, key: &str) -> Option<
     }
 }
 
-/// Resolve a language key from a map with wildcard fallback and merging (test helper).
-///
-/// Implements ADR-0011 wildcard config inheritance for languages HashMap:
-/// - If both wildcard ("_") and specific key exist: merge them (specific overrides wildcard)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// The merge creates a new LanguageSettings where specific values override wildcard values.
-#[cfg(test)]
-pub(crate) fn resolve_language_with_wildcard(
-    map: &HashMap<String, LanguageSettings>,
-    key: &str,
-) -> Option<LanguageSettings> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        (Some(w), Some(s)) => {
-            // Merge: start with wildcard, override with specific
-            Some(LanguageSettings {
-                parser: s.parser.clone().or_else(|| w.parser.clone()),
-                queries: s.queries.clone().or_else(|| w.queries.clone()),
-                // Deep merge bridge HashMaps: wildcard + specific
-                bridge: merge_bridge_maps(&w.bridge, &s.bridge),
-                // Aliases are not merged from wildcard - they're specific to each language
-                aliases: s.aliases.clone(),
-            })
-        }
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
-}
 
 /// Resolve a bridge language key from a map with wildcard fallback (test helper).
 ///
@@ -1673,7 +1639,7 @@ mod tests {
         );
 
         // Resolve for "rust" which doesn't exist - should return wildcard
-        let result = resolve_language_with_wildcard(&languages, "rust");
+        let result = resolve_language_settings_with_wildcard(&languages, "rust");
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
@@ -1747,7 +1713,7 @@ mod tests {
         );
 
         // Resolve for "python" - should merge with wildcard
-        let resolved_lang = resolve_language_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(resolved_lang.is_some(), "Should resolve python language");
         let lang_config = resolved_lang.unwrap();
 
@@ -1817,7 +1783,7 @@ mod tests {
             },
         );
 
-        let resolved_lang = resolve_language_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(resolved_lang.is_some());
         let lang_config = resolved_lang.unwrap();
         let bridge = lang_config.bridge.as_ref().unwrap();
@@ -1872,7 +1838,7 @@ mod tests {
         );
 
         // Resolve for "python" which doesn't exist - should get wildcard language
-        let resolved_lang = resolve_language_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(
             resolved_lang.is_some(),
             "Should resolve to wildcard language"
@@ -1958,7 +1924,7 @@ mod tests {
         );
 
         // Resolve for "python" - bridge should be deep merged with wildcard
-        let resolved = resolve_language_with_wildcard(&languages, "python");
+        let resolved = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(resolved.is_some());
         let lang_config = resolved.unwrap();
 
@@ -2482,7 +2448,7 @@ mod tests {
         );
 
         // Test 1: "markdown" should have its own bridge filter (not wildcard's)
-        let markdown = resolve_language_with_wildcard(&languages, "markdown").unwrap();
+        let markdown = resolve_language_settings_with_wildcard(&languages, "markdown").unwrap();
         assert!(
             markdown.queries.is_some(),
             "markdown should inherit queries from wildcard"
@@ -2500,7 +2466,7 @@ mod tests {
         );
 
         // Test 2: "quarto" (not defined) should get wildcard settings entirely
-        let quarto = resolve_language_with_wildcard(&languages, "quarto").unwrap();
+        let quarto = resolve_language_settings_with_wildcard(&languages, "quarto").unwrap();
         assert!(
             quarto.queries.is_some(),
             "quarto should inherit queries from wildcard"
