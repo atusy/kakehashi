@@ -1138,7 +1138,7 @@ mod tests {
         // Simulate the lookup logic from get_bridge_config_for_language:
         // For each server (excluding "_"), resolve it and check if it handles "rust"
         let injection_language = "rust";
-        let mut found_server: Option<BridgeServerConfig> = None;
+        let mut found_server = None;
 
         for server_name in servers.keys() {
             if server_name == "_" {
