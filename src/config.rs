@@ -467,111 +467,6 @@ fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -
     base
 }
 
-/// Resolve a key from a map with wildcard fallback and merging (test helper).
-///
-/// Implements ADR-0011 wildcard config inheritance:
-/// - If both wildcard ("_") and specific key exist: merge them (specific overrides wildcard)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// The merge creates a new QueryTypeMappings where specific values override wildcard values.
-#[cfg(test)]
-pub(crate) fn resolve_with_wildcard(map: &CaptureMappings, key: &str) -> Option<QueryTypeMappings> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        (Some(w), Some(s)) => {
-            // Merge: start with wildcard, override with specific
-            let mut merged_highlights = w.highlights.clone();
-            for (k, v) in &s.highlights {
-                merged_highlights.insert(k.clone(), v.clone());
-            }
-
-            let mut merged_locals = w.locals.clone();
-            for (k, v) in &s.locals {
-                merged_locals.insert(k.clone(), v.clone());
-            }
-
-            let mut merged_folds = w.folds.clone();
-            for (k, v) in &s.folds {
-                merged_folds.insert(k.clone(), v.clone());
-            }
-
-            Some(QueryTypeMappings {
-                highlights: merged_highlights,
-                locals: merged_locals,
-                folds: merged_folds,
-            })
-        }
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
-}
-
-/// Resolve a language key from a map with wildcard fallback and merging (test helper).
-///
-/// Implements ADR-0011 wildcard config inheritance for languages HashMap:
-/// - If both wildcard ("_") and specific key exist: merge them (specific overrides wildcard)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// The merge creates a new LanguageSettings where specific values override wildcard values.
-#[cfg(test)]
-pub(crate) fn resolve_language_with_wildcard(
-    map: &HashMap<String, LanguageSettings>,
-    key: &str,
-) -> Option<LanguageSettings> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        (Some(w), Some(s)) => {
-            // Merge: start with wildcard, override with specific
-            Some(LanguageSettings {
-                parser: s.parser.clone().or_else(|| w.parser.clone()),
-                queries: s.queries.clone().or_else(|| w.queries.clone()),
-                // Deep merge bridge HashMaps: wildcard + specific
-                bridge: merge_bridge_maps(&w.bridge, &s.bridge),
-                // Aliases are not merged from wildcard - they're specific to each language
-                aliases: s.aliases.clone(),
-            })
-        }
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
-}
-
-/// Resolve a bridge language key from a map with wildcard fallback (test helper).
-///
-/// Implements ADR-0011 wildcard config inheritance for bridge HashMap:
-/// - If both wildcard ("_") and specific key exist: return specific (no merge needed for single-field struct)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// Note: BridgeLanguageConfig only has `enabled` field, so no merging is needed.
-#[cfg(test)]
-pub(crate) fn resolve_bridge_with_wildcard(
-    map: &HashMap<String, settings::BridgeLanguageConfig>,
-    key: &str,
-) -> Option<settings::BridgeLanguageConfig> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        // Specific overrides wildcard entirely (no merge for single-field struct)
-        (Some(_), Some(s)) => Some(s.clone()),
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,117 +1424,6 @@ mod tests {
         );
     }
 
-    // PBI-152: Wildcard Config Inheritance (ADR-0011)
-
-    #[test]
-    fn test_resolve_with_wildcard_returns_wildcard_when_specific_absent() {
-        // ADR-0011: Missing specific key -> use wildcard entirely
-        // When captureMappings only has "_" and we ask for "python",
-        // we should get the wildcard's mappings
-        let mut mappings = CaptureMappings::new();
-
-        let mut wildcard_highlights = HashMap::new();
-        wildcard_highlights.insert("variable".to_string(), "variable".to_string());
-        wildcard_highlights.insert(
-            "variable.builtin".to_string(),
-            "variable.defaultLibrary".to_string(),
-        );
-
-        mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: wildcard_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        // Resolve for "python" which doesn't exist - should return wildcard
-        let result = resolve_with_wildcard(&mappings, "python");
-
-        assert!(result.is_some(), "Should return Some when wildcard exists");
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.highlights.get("variable"),
-            Some(&"variable".to_string())
-        );
-        assert_eq!(
-            resolved.highlights.get("variable.builtin"),
-            Some(&"variable.defaultLibrary".to_string())
-        );
-    }
-
-    #[test]
-    fn test_resolve_with_wildcard_merges_wildcard_with_specific_key() {
-        // ADR-0011: When both wildcard and specific key exist, merge them
-        // Rust-specific adds type.builtin, inherits variable.* from wildcard
-        let mut mappings = CaptureMappings::new();
-
-        // Wildcard has variable mappings
-        let mut wildcard_highlights = HashMap::new();
-        wildcard_highlights.insert("variable".to_string(), "variable".to_string());
-        wildcard_highlights.insert(
-            "variable.builtin".to_string(),
-            "variable.defaultLibrary".to_string(),
-        );
-        wildcard_highlights.insert("function".to_string(), "function".to_string());
-
-        mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: wildcard_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        // Rust-specific adds type.builtin
-        let mut rust_highlights = HashMap::new();
-        rust_highlights.insert(
-            "type.builtin".to_string(),
-            "type.defaultLibrary".to_string(),
-        );
-
-        mappings.insert(
-            "rust".to_string(),
-            QueryTypeMappings {
-                highlights: rust_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        // Resolve for "rust" - should merge wildcard + rust-specific
-        let result = resolve_with_wildcard(&mappings, "rust");
-
-        assert!(result.is_some(), "Should return merged mappings");
-        let resolved = result.unwrap();
-
-        // Inherited from wildcard
-        assert_eq!(
-            resolved.highlights.get("variable"),
-            Some(&"variable".to_string()),
-            "Should inherit 'variable' from wildcard"
-        );
-        assert_eq!(
-            resolved.highlights.get("variable.builtin"),
-            Some(&"variable.defaultLibrary".to_string()),
-            "Should inherit 'variable.builtin' from wildcard"
-        );
-        assert_eq!(
-            resolved.highlights.get("function"),
-            Some(&"function".to_string()),
-            "Should inherit 'function' from wildcard"
-        );
-
-        // Added by rust-specific
-        assert_eq!(
-            resolved.highlights.get("type.builtin"),
-            Some(&"type.defaultLibrary".to_string()),
-            "Should include rust-specific 'type.builtin'"
-        );
-    }
-
     // PBI-153: Languages Wildcard Inheritance (ADR-0011)
 
     #[test]
@@ -1673,7 +1457,7 @@ mod tests {
         );
 
         // Resolve for "rust" which doesn't exist - should return wildcard
-        let result = resolve_language_with_wildcard(&languages, "rust");
+        let result = resolve_language_settings_with_wildcard(&languages, "rust");
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
@@ -1747,7 +1531,7 @@ mod tests {
         );
 
         // Resolve for "python" - should merge with wildcard
-        let resolved_lang = resolve_language_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(resolved_lang.is_some(), "Should resolve python language");
         let lang_config = resolved_lang.unwrap();
 
@@ -1763,7 +1547,7 @@ mod tests {
         let bridge = lang_config.bridge.as_ref().unwrap();
 
         // JavaScript: python-specific override (enabled = false)
-        let js_resolved = resolve_bridge_with_wildcard(bridge, "javascript");
+        let js_resolved = resolve_bridge_language_with_wildcard(bridge, "javascript");
         assert!(js_resolved.is_some(), "Should resolve javascript bridge");
         assert!(
             js_resolved.unwrap().enabled == Some(false),
@@ -1772,7 +1556,7 @@ mod tests {
 
         // Rust: inherited from _.bridge._ through deep merge
         // ADR-0011: bridge maps are deep merged, so python gets wildcard's bridge._
-        let rust_resolved = resolve_bridge_with_wildcard(bridge, "rust");
+        let rust_resolved = resolve_bridge_language_with_wildcard(bridge, "rust");
         assert!(
             rust_resolved.is_some(),
             "Python's rust bridge should resolve (inherited from wildcard's bridge._)"
@@ -1817,13 +1601,13 @@ mod tests {
             },
         );
 
-        let resolved_lang = resolve_language_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(resolved_lang.is_some());
         let lang_config = resolved_lang.unwrap();
         let bridge = lang_config.bridge.as_ref().unwrap();
 
         // JavaScript: specific override
-        let js_resolved = resolve_bridge_with_wildcard(bridge, "javascript");
+        let js_resolved = resolve_bridge_language_with_wildcard(bridge, "javascript");
         assert!(js_resolved.is_some());
         assert!(
             js_resolved.unwrap().enabled == Some(false),
@@ -1831,7 +1615,7 @@ mod tests {
         );
 
         // Rust: inherits from python's bridge._
-        let rust_resolved = resolve_bridge_with_wildcard(bridge, "rust");
+        let rust_resolved = resolve_bridge_language_with_wildcard(bridge, "rust");
         assert!(rust_resolved.is_some());
         assert!(
             rust_resolved.unwrap().enabled == Some(true),
@@ -1872,7 +1656,7 @@ mod tests {
         );
 
         // Resolve for "python" which doesn't exist - should get wildcard language
-        let resolved_lang = resolve_language_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(
             resolved_lang.is_some(),
             "Should resolve to wildcard language"
@@ -1886,7 +1670,7 @@ mod tests {
         );
         let bridge = lang_config.bridge.as_ref().unwrap();
 
-        let resolved_bridge = resolve_bridge_with_wildcard(bridge, "rust");
+        let resolved_bridge = resolve_bridge_language_with_wildcard(bridge, "rust");
         assert!(
             resolved_bridge.is_some(),
             "Should resolve to wildcard bridge"
@@ -1958,7 +1742,7 @@ mod tests {
         );
 
         // Resolve for "python" - bridge should be deep merged with wildcard
-        let resolved = resolve_language_with_wildcard(&languages, "python");
+        let resolved = resolve_language_settings_with_wildcard(&languages, "python");
         assert!(resolved.is_some());
         let lang_config = resolved.unwrap();
 
@@ -2011,7 +1795,7 @@ mod tests {
         );
 
         // Resolve for "javascript" which doesn't exist - should return wildcard
-        let result = resolve_bridge_with_wildcard(&bridge, "javascript");
+        let result = resolve_bridge_language_with_wildcard(&bridge, "javascript");
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
@@ -2019,60 +1803,6 @@ mod tests {
             resolved.enabled,
             Some(true),
             "Should inherit enabled from wildcard"
-        );
-    }
-
-    #[test]
-    fn test_resolve_with_wildcard_specific_overrides_same_capture_name() {
-        // ADR-0011: Specific key values override wildcard values for same capture name
-        // Example: rust has different "function" mapping than wildcard
-        let mut mappings = CaptureMappings::new();
-
-        // Wildcard has function -> function
-        let mut wildcard_highlights = HashMap::new();
-        wildcard_highlights.insert("function".to_string(), "function".to_string());
-        wildcard_highlights.insert("variable".to_string(), "variable".to_string());
-
-        mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: wildcard_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        // Rust overrides function mapping to suppress it (empty string)
-        let mut rust_highlights = HashMap::new();
-        rust_highlights.insert("function".to_string(), "".to_string());
-
-        mappings.insert(
-            "rust".to_string(),
-            QueryTypeMappings {
-                highlights: rust_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        // Resolve for "rust" - rust's "function" should override wildcard's "function"
-        let result = resolve_with_wildcard(&mappings, "rust");
-
-        assert!(result.is_some(), "Should return merged mappings");
-        let resolved = result.unwrap();
-
-        // Overridden by rust-specific (empty string suppresses the token)
-        assert_eq!(
-            resolved.highlights.get("function"),
-            Some(&"".to_string()),
-            "Rust-specific 'function' should override wildcard 'function'"
-        );
-
-        // Still inherited from wildcard
-        assert_eq!(
-            resolved.highlights.get("variable"),
-            Some(&"variable".to_string()),
-            "Should still inherit 'variable' from wildcard"
         );
     }
 
@@ -2482,7 +2212,7 @@ mod tests {
         );
 
         // Test 1: "markdown" should have its own bridge filter (not wildcard's)
-        let markdown = resolve_language_with_wildcard(&languages, "markdown").unwrap();
+        let markdown = resolve_language_settings_with_wildcard(&languages, "markdown").unwrap();
         assert!(
             markdown.queries.is_some(),
             "markdown should inherit queries from wildcard"
@@ -2500,7 +2230,7 @@ mod tests {
         );
 
         // Test 2: "quarto" (not defined) should get wildcard settings entirely
-        let quarto = resolve_language_with_wildcard(&languages, "quarto").unwrap();
+        let quarto = resolve_language_settings_with_wildcard(&languages, "quarto").unwrap();
         assert!(
             quarto.queries.is_some(),
             "quarto should inherit queries from wildcard"
