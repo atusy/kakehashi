@@ -41,7 +41,7 @@ effective_config[rust] = merge(config["_"], config["rust"])
 Wildcard inheritance happens **after** cross-layer merging (ADR-0010):
 
 ```
-1. Merge across layers:    final_config = [user, project, InitializationOptions].into_iter().reduce(merge_settings).flatten()
+1. Merge across layers:    final_config = [user, project, InitializationOptions].into_iter().reduce(merge_workspace_settings).flatten()
 2. Resolve wildcards:      effective[rust] = merge(final_config["_"], final_config["rust"])
 ```
 

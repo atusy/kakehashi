@@ -86,21 +86,21 @@ queries = [
 
 ### Merge Algorithm
 
-Layers are merged pairwise via `merge_settings` using `reduce` and `flatten`:
+Layers are merged pairwise via `merge_workspace_settings` using `reduce` and `flatten`:
 
 ```rust
-fn merge_settings(fallback: Option<RawWorkspaceSettings>, primary: Option<RawWorkspaceSettings>) -> Option<RawWorkspaceSettings>
+fn merge_workspace_settings(base: Option<RawWorkspaceSettings>, overlay: Option<RawWorkspaceSettings>) -> Option<RawWorkspaceSettings>
 ```
 
 Configs are applied in order (earlier = lower precedence, later = higher precedence):
 
 ```
 final_config = [defaults, user_config, project_config, InitializationOptions]
-    .into_iter().reduce(merge_settings).flatten()
+    .into_iter().reduce(merge_workspace_settings).flatten()
 ```
 
 **Scalar values and Option types** (`searchPaths`, `autoInstall`):
-- Later sources completely replace earlier values (via `primary.or(fallback)`)
+- Later sources completely replace earlier values (via `overlay.or(base)`)
 - Example: `autoInstall: false` in InitializationOptions overrides `autoInstall: true` from project config
 
 **Languages HashMap** (`languages`):
@@ -208,7 +208,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
     let project_config = load_optional_project_config(cli_config_path);
     // InitializationOptions applied later in LSP initialize handler
 
-    [defaults, user_config, project_config].into_iter().reduce(merge_settings).flatten()
+    [defaults, user_config, project_config].into_iter().reduce(merge_workspace_settings).flatten()
 }
 ```
 
@@ -254,7 +254,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 - [x] Implement type inference from exact filename (`highlights.scm`, `locals.scm`, `injections.scm`)
 
 ### Phase 2: Core Merging (Completed - Sprint 119, PBI-150)
-- [x] Implement `merge_settings()` function for layered config merging
+- [x] Implement `merge_workspace_settings()` function for layered config merging
 - [x] Deep merge for `languages` HashMap
 - [x] Deep merge for `languageServers` HashMap
 - [x] Deep merge for `captureMappings`
