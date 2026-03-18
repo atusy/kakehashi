@@ -242,10 +242,7 @@ mod tests {
     fn test_merge_workspace_settings_fallback_only() {
         let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
         let result = merge_workspace_settings(Some(fallback.clone()), None).unwrap();
         assert_eq!(
@@ -258,10 +255,7 @@ mod tests {
     fn test_merge_workspace_settings_primary_only() {
         let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
         let result = merge_workspace_settings(None, Some(primary.clone())).unwrap();
         assert_eq!(
@@ -284,9 +278,7 @@ mod tests {
         let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
             languages: fallback_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let mut primary_languages = HashMap::new();
@@ -301,9 +293,7 @@ mod tests {
         let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
             languages: primary_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(fallback), Some(primary)).unwrap();
@@ -344,11 +334,8 @@ mod tests {
         );
 
         let fallback = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: fallback_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let mut primary_mappings = HashMap::new();
@@ -369,11 +356,8 @@ mod tests {
         );
 
         let primary = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: primary_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(fallback), Some(primary)).unwrap();
@@ -403,17 +387,13 @@ mod tests {
         // Simulates: user config has autoInstall=true, project has autoInstall=false
         let user_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/user/path".to_string()]),
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
             auto_install: Some(true),
-            language_servers: None,
+            ..Default::default()
         };
         let project_config = RawWorkspaceSettings {
             search_paths: Some(vec!["/project/path".to_string()]),
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
             auto_install: Some(false),
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -463,11 +443,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: user_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         // Project overrides queries for python
@@ -486,11 +463,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: project_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -598,11 +572,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: user_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let mut project_languages = HashMap::new();
@@ -615,11 +586,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: project_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -662,11 +630,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
-            auto_install: None,
             language_servers: Some(user_servers),
+            ..Default::default()
         };
 
         // Project only adds initializationOptions
@@ -681,11 +646,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
-            auto_install: None,
             language_servers: Some(project_servers),
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -726,11 +688,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
-            auto_install: None,
             language_servers: Some(user_servers),
+            ..Default::default()
         };
 
         let mut project_servers = HashMap::new();
@@ -744,11 +703,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
-            auto_install: None,
             language_servers: Some(project_servers),
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -801,11 +757,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: user_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         // Project only overrides variable.builtin
@@ -826,11 +779,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: project_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -867,11 +817,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: user_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let mut project_mappings = HashMap::new();
@@ -888,11 +835,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: project_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -938,11 +882,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: user_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         // Project overrides one locals, adds one folds
@@ -965,11 +906,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
-            languages: HashMap::new(),
             capture_mappings: project_mappings,
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -1858,11 +1796,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: user_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         // Project only adds queries, doesn't set aliases
@@ -1880,11 +1815,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: project_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
@@ -1927,11 +1859,8 @@ mod tests {
         );
 
         let user_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: user_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         // Project overrides aliases
@@ -1945,11 +1874,8 @@ mod tests {
         );
 
         let project_config = RawWorkspaceSettings {
-            search_paths: None,
             languages: project_languages,
-            capture_mappings: HashMap::new(),
-            auto_install: None,
-            language_servers: None,
+            ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(user_config), Some(project_config));
