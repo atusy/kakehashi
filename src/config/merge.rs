@@ -845,140 +845,74 @@ mod tests {
 
     // PBI-154: languageServers Wildcard Inheritance (ADR-0011)
 
-    /// Helper to build servers map for wildcard resolution tests
-    fn build_servers_map(
-        wildcard: Option<settings::BridgeServerConfig>,
-        specific: Option<settings::BridgeServerConfig>,
-    ) -> HashMap<String, settings::BridgeServerConfig> {
-        let mut servers = HashMap::new();
-        if let Some(w) = wildcard {
-            servers.insert("_".to_string(), w);
-        }
-        if let Some(s) = specific {
-            servers.insert("rust-analyzer".to_string(), s);
-        }
-        servers
-    }
-
+    /// ADR-0011: resolve_with_wildcard covers all 4 match arms for language servers.
+    ///
+    /// - Neither wildcard nor specific → None
+    /// - Wildcard only → cloned wildcard
+    /// - Specific only → cloned specific
+    /// - Both → merged (specific overrides wildcard, empty Vec inherits)
     #[test]
-    fn test_resolve_language_server_returns_none_when_neither_exists() {
-        // ADR-0011: Neither wildcard nor specific key -> return None
-        let servers = build_servers_map(None, None);
-
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
-
-        assert!(
-            result.is_none(),
-            "Should return None when neither wildcard nor specific key exists"
-        );
-    }
-
-    #[test]
-    fn test_resolve_language_server_returns_wildcard_when_specific_absent() {
-        // ADR-0011: When languageServers only has "_" and we ask for "rust-analyzer",
-        // we should get the wildcard's settings
-        let wildcard = settings::BridgeServerConfig {
-            cmd: vec!["default-lsp".to_string()],
-            languages: vec!["any".to_string()],
-            initialization_options: None,
-        };
-        let servers = build_servers_map(Some(wildcard), None);
-
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
-
-        assert!(result.is_some(), "Should return Some when wildcard exists");
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.cmd,
-            vec!["default-lsp".to_string()],
-            "Should inherit cmd from wildcard"
-        );
-        assert_eq!(
-            resolved.languages,
-            vec!["any".to_string()],
-            "Should inherit languages from wildcard"
-        );
-    }
-
-    #[test]
-    fn test_resolve_language_server_returns_specific_when_wildcard_absent() {
-        // ADR-0011: No wildcard, only specific key -> return specific
-        let specific = settings::BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec!["rust".to_string()],
-            initialization_options: None,
-        };
-        let servers = build_servers_map(None, Some(specific));
-
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
-
-        assert!(
-            result.is_some(),
-            "Should return Some when specific key exists"
-        );
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.cmd,
-            vec!["rust-analyzer".to_string()],
-            "Should return specific config"
-        );
-        assert_eq!(
-            resolved.languages,
-            vec!["rust".to_string()],
-            "Should return specific languages"
-        );
-    }
-
-    #[test]
-    fn test_resolve_language_server_specific_overrides_wildcard() {
-        // ADR-0011: Server-specific values override wildcard values
-        // When both wildcard and specific server exist, specific values take precedence
+    fn test_resolve_language_server_wildcard_combinations() {
         use serde_json::json;
+        use settings::BridgeServerConfig;
 
-        let wildcard = settings::BridgeServerConfig {
-            cmd: vec!["default-lsp".to_string()],
-            languages: vec!["any".to_string()],
-            initialization_options: Some(json!({ "defaultOption": true })),
-        };
-        let specific = settings::BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![], // Empty means inherit from wildcard
-            initialization_options: Some(json!({ "linkedProjects": ["./Cargo.toml"] })),
-        };
-        let servers = build_servers_map(Some(wildcard), Some(specific));
+        // Neither → None
+        let empty: HashMap<String, BridgeServerConfig> = HashMap::new();
+        assert!(resolve_with_wildcard(&empty, "ra", merge_bridge_server_configs).is_none());
 
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
+        // Wildcard only → cloned
+        let servers = HashMap::from([(
+            "_".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["default-lsp".to_string()],
+                languages: vec!["any".to_string()],
+                initialization_options: None,
+            },
+        )]);
+        let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
+        assert_eq!(resolved.cmd, vec!["default-lsp".to_string()]);
+        assert_eq!(resolved.languages, vec!["any".to_string()]);
 
-        assert!(result.is_some(), "Should return merged config");
-        let resolved = result.unwrap();
+        // Specific only → cloned
+        let servers = HashMap::from([(
+            "ra".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["rust-analyzer".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+            },
+        )]);
+        let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
+        assert_eq!(resolved.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(resolved.languages, vec!["rust".to_string()]);
 
-        // cmd: overridden by specific
-        assert_eq!(
-            resolved.cmd,
-            vec!["rust-analyzer".to_string()],
-            "Should use rust-analyzer's cmd"
-        );
-
-        // languages: inherited from wildcard (specific was empty)
-        assert_eq!(
-            resolved.languages,
-            vec!["any".to_string()],
-            "Should inherit languages from wildcard since specific is empty"
-        );
-
-        // initialization_options: deep merged (ADR-0010)
-        let init_opts = resolved
-            .initialization_options
-            .expect("Should have merged initialization_options");
+        // Both → merged (specific cmd wins, empty languages inherits, initOptions deep-merged)
+        let servers = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["default-lsp".to_string()],
+                    languages: vec!["any".to_string()],
+                    initialization_options: Some(json!({"defaultOption": true})),
+                },
+            ),
+            (
+                "ra".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec![],
+                    initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                },
+            ),
+        ]);
+        let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
+        assert_eq!(resolved.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(resolved.languages, vec!["any".to_string()]);
+        let init_opts = resolved.initialization_options.unwrap();
+        assert_eq!(init_opts.get("defaultOption"), Some(&json!(true)));
         assert_eq!(
             init_opts.get("linkedProjects"),
-            Some(&json!(["./Cargo.toml"])),
-            "Should have rust-analyzer's linkedProjects"
-        );
-        assert_eq!(
-            init_opts.get("defaultOption"),
-            Some(&json!(true)),
-            "Should inherit defaultOption from wildcard (deep merge per ADR-0010)"
+            Some(&json!(["./Cargo.toml"]))
         );
     }
 
