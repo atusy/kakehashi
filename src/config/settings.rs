@@ -7,20 +7,6 @@ use super::WILDCARD_KEY;
 
 pub(crate) type CaptureMapping = HashMap<String, String>;
 
-/// Workspace type for bridge language server connections.
-///
-/// Determines the project structure created in the temp directory:
-/// - Cargo: Creates Cargo.toml and src/main.rs (for rust-analyzer)
-/// - Generic: Creates only a virtual.<ext> file (for language servers that don't need project structure)
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum WorkspaceType {
-    /// Cargo workspace with Cargo.toml and src/main.rs
-    Cargo,
-    /// Generic workspace with just a virtual file
-    Generic,
-}
-
 /// Aggregation strategy for combining results from multiple bridge servers.
 ///
 /// - `Preferred`: Use the first non-empty response (priority-ordered).
@@ -139,8 +125,6 @@ pub struct BridgeServerConfig {
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
     pub initialization_options: Option<Value>,
-    /// Workspace type for this server (defaults to None, meaning Generic)
-    pub workspace_type: Option<WorkspaceType>,
 }
 
 /// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
@@ -791,24 +775,6 @@ mod tests {
         assert!(config.initialization_options.is_none());
     }
 
-    #[rstest]
-    #[case::cargo(
-        r#"{"cmd": ["rust-analyzer"], "languages": ["rust"], "workspaceType": "cargo"}"#,
-        Some(WorkspaceType::Cargo)
-    )]
-    #[case::generic(
-        r#"{"cmd": ["pyright-langserver", "--stdio"], "languages": ["python"], "workspaceType": "generic"}"#,
-        Some(WorkspaceType::Generic),
-    )]
-    #[case::defaults_to_none(r#"{"cmd": ["rust-analyzer"], "languages": ["rust"]}"#, None)]
-    fn should_parse_bridge_server_config_workspace_type(
-        #[case] config_json: &str,
-        #[case] expected: Option<WorkspaceType>,
-    ) {
-        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
-        assert_eq!(config.workspace_type, expected);
-    }
-
     #[test]
     fn should_parse_language_config_with_bridge_map_enabled() {
         // PBI-120: LanguageSettings should parse bridge field as HashMap<String, BridgeLanguageConfig>
@@ -947,8 +913,7 @@ mod tests {
             "languageServers": {
                 "rust-analyzer": {
                     "cmd": ["rust-analyzer"],
-                    "languages": ["rust"],
-                    "workspaceType": "cargo"
+                    "languages": ["rust"]
                 },
                 "pyright": {
                     "cmd": ["pyright-langserver", "--stdio"],

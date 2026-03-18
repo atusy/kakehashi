@@ -1627,7 +1627,6 @@ mod tests {
             ],
             languages: vec!["lua".to_string()],
             initialization_options: None,
-            workspace_type: None,
         };
 
         let result = pool

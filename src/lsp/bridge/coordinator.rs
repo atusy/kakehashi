@@ -707,7 +707,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -741,7 +740,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -778,7 +776,6 @@ mod tests {
                 cmd: vec!["pyright-langserver".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
         servers.insert(
@@ -787,7 +784,6 @@ mod tests {
                 cmd: vec!["ruff".to_string(), "server".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -838,7 +834,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -872,7 +867,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -982,7 +976,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 

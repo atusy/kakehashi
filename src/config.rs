@@ -86,7 +86,6 @@ pub(crate) fn merge_bridge_server_configs(
                 .clone()
                 .or(base.initialization_options.clone()),
         },
-        workspace_type: overlay.workspace_type.or(base.workspace_type),
     }
 }
 
@@ -393,8 +392,6 @@ fn merge_language_servers(
                             (None, Some(overlay_opts)) => Some(overlay_opts.clone()),
                             (None, None) => None,
                         };
-                        base_config.workspace_type =
-                            overlay_config.workspace_type.or(base_config.workspace_type);
                     })
                     .or_insert(overlay_config);
             }
@@ -937,7 +934,7 @@ mod tests {
     fn test_merge_settings_language_servers_deep_merge() {
         // Project adds initializationOptions to rust-analyzer, inherits cmd and languages from user
         use serde_json::json;
-        use settings::{BridgeServerConfig, WorkspaceType};
+        use settings::BridgeServerConfig;
 
         let mut user_servers = HashMap::new();
         user_servers.insert(
@@ -946,7 +943,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: Some(WorkspaceType::Cargo),
             },
         );
 
@@ -966,7 +962,6 @@ mod tests {
                 cmd: vec![],       // Empty, should inherit from user
                 languages: vec![], // Empty, should inherit from user
                 initialization_options: Some(json!({ "linkedProjects": ["./Cargo.toml"] })),
-                workspace_type: None, // Should inherit from user
             },
         );
 
@@ -998,9 +993,6 @@ mod tests {
         assert!(ra.initialization_options.is_some());
         let init_opts = ra.initialization_options.as_ref().unwrap();
         assert!(init_opts.get("linkedProjects").is_some());
-
-        // workspaceType: inherited from user
-        assert_eq!(ra.workspace_type, Some(WorkspaceType::Cargo));
     }
 
     #[test]
@@ -1015,7 +1007,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -1034,7 +1025,6 @@ mod tests {
                 cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -1633,7 +1623,6 @@ mod tests {
             cmd: vec!["default-lsp".to_string()],
             languages: vec!["any".to_string()],
             initialization_options: None,
-            workspace_type: Some(settings::WorkspaceType::Generic),
         };
         let servers = build_servers_map(Some(wildcard), None);
 
@@ -1651,11 +1640,6 @@ mod tests {
             vec!["any".to_string()],
             "Should inherit languages from wildcard"
         );
-        assert_eq!(
-            resolved.workspace_type,
-            Some(settings::WorkspaceType::Generic),
-            "Should inherit workspace_type from wildcard"
-        );
     }
 
     #[test]
@@ -1665,7 +1649,6 @@ mod tests {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec!["rust".to_string()],
             initialization_options: None,
-            workspace_type: Some(settings::WorkspaceType::Cargo),
         };
         let servers = build_servers_map(None, Some(specific));
 
@@ -1686,11 +1669,6 @@ mod tests {
             vec!["rust".to_string()],
             "Should return specific languages"
         );
-        assert_eq!(
-            resolved.workspace_type,
-            Some(settings::WorkspaceType::Cargo),
-            "Should return specific workspace_type"
-        );
     }
 
     #[test]
@@ -1703,13 +1681,11 @@ mod tests {
             cmd: vec!["default-lsp".to_string()],
             languages: vec!["any".to_string()],
             initialization_options: Some(json!({ "defaultOption": true })),
-            workspace_type: Some(settings::WorkspaceType::Generic),
         };
         let specific = settings::BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec![], // Empty means inherit from wildcard
             initialization_options: Some(json!({ "linkedProjects": ["./Cargo.toml"] })),
-            workspace_type: Some(settings::WorkspaceType::Cargo),
         };
         let servers = build_servers_map(Some(wildcard), Some(specific));
 
@@ -1730,13 +1706,6 @@ mod tests {
             resolved.languages,
             vec!["any".to_string()],
             "Should inherit languages from wildcard since specific is empty"
-        );
-
-        // workspace_type: overridden by specific
-        assert_eq!(
-            resolved.workspace_type,
-            Some(settings::WorkspaceType::Cargo),
-            "Should use rust-analyzer's workspace_type"
         );
 
         // initialization_options: deep merged (ADR-0010)
@@ -1769,13 +1738,11 @@ mod tests {
             cmd: vec!["default-lsp".to_string()],
             languages: vec![],
             initialization_options: Some(json!({ "feature1": true })),
-            workspace_type: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec!["rust".to_string()],
             initialization_options: Some(json!({ "feature2": true })),
-            workspace_type: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1809,7 +1776,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: Some(json!({ "baseOpt": 1 })),
-                workspace_type: None,
             },
         );
 
@@ -1820,7 +1786,6 @@ mod tests {
                 cmd: vec![],
                 languages: vec![],
                 initialization_options: Some(json!({ "overlayOpt": 2 })),
-                workspace_type: None,
             },
         );
 
@@ -1857,13 +1822,11 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: Some(json!({ "opt": 1 })),
-            workspace_type: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec![],
             initialization_options: Some(json!({ "opt": 2 })),
-            workspace_type: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1889,13 +1852,11 @@ mod tests {
             cmd: vec![],
             languages: vec![],
             initialization_options: Some(json!({ "a": { "b": 1 } })),
-            workspace_type: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec![],
             initialization_options: Some(json!({ "a": { "c": 2 } })),
-            workspace_type: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -2056,14 +2017,13 @@ mod tests {
 
         let mut servers: HashMap<String, BridgeServerConfig> = HashMap::new();
 
-        // Wildcard server: default initialization options and workspace_type
+        // Wildcard server: default initialization options
         servers.insert(
             "_".to_string(),
             BridgeServerConfig {
                 cmd: vec![],
                 languages: vec![],
                 initialization_options: Some(json!({ "checkOnSave": true })),
-                workspace_type: Some(settings::WorkspaceType::Generic),
             },
         );
 
@@ -2074,7 +2034,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None, // Should inherit from wildcard
-                workspace_type: None,         // Should inherit from wildcard
             },
         );
 
@@ -2090,8 +2049,6 @@ mod tests {
         assert!(ra.initialization_options.is_some());
         let opts = ra.initialization_options.as_ref().unwrap();
         assert_eq!(opts.get("checkOnSave"), Some(&json!(true)));
-        // workspace_type inherited from wildcard
-        assert_eq!(ra.workspace_type, Some(settings::WorkspaceType::Generic));
     }
 
     /// Test that server lookup finds servers when languages list is inherited from wildcard.
@@ -2113,7 +2070,6 @@ mod tests {
                 cmd: vec!["default-lsp".to_string()],
                 languages: vec!["rust".to_string(), "python".to_string()],
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 
@@ -2124,7 +2080,6 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec![], // Empty - should inherit from wildcard
                 initialization_options: None,
-                workspace_type: None,
             },
         );
 

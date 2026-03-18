@@ -51,7 +51,6 @@ pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
         cmd: vec!["lua-language-server".to_string()],
         languages: vec!["lua".to_string()],
         initialization_options: None,
-        workspace_type: None,
     }
 }
 
@@ -71,7 +70,6 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
         ],
         languages: vec![language.to_string()],
         initialization_options: None,
-        workspace_type: None,
     }
 }
 
