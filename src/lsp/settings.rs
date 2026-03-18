@@ -1,6 +1,6 @@
 use crate::config::{
     RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
-    merge_all,
+    merge_settings,
 };
 use serde_json::Value;
 use std::fs;
@@ -102,7 +102,7 @@ pub fn load_settings(
     let mut layers = vec![defaults];
     layers.extend(config_layers);
     layers.push(override_settings);
-    let merged = merge_all(&layers);
+    let merged = layers.into_iter().reduce(merge_settings).flatten();
     let settings =
         merged.and_then(
             |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
@@ -264,7 +264,7 @@ mod tests {
     ///
     /// This test verifies that load_settings():
     /// 1. Loads user config from XDG_CONFIG_HOME
-    /// 2. Uses merge_all() with 4 layers: defaults < user < project < InitializationOptions
+    /// 2. Merges 4 layers via reduce(merge_settings): defaults < user < project < InitializationOptions
     #[test]
     #[serial(xdg_env)]
     fn test_load_settings_merges_user_config_with_project_and_override() {

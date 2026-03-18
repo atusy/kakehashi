@@ -86,19 +86,18 @@ queries = [
 
 ### Merge Algorithm
 
-The merge function should accept a slice of configs for flexibility:
+Layers are merged pairwise via `merge_settings` using `reduce` and `flatten`:
 
 ```rust
-fn merge_all(configs: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings>
+fn merge_settings(fallback: Option<RawWorkspaceSettings>, primary: Option<RawWorkspaceSettings>) -> Option<RawWorkspaceSettings>
 ```
 
 Configs are applied in order (earlier = lower precedence, later = higher precedence):
 
 ```
-final_config = merge_all(&[defaults, user_config, project_config, InitializationOptions])
+final_config = [defaults, user_config, project_config, InitializationOptions]
+    .into_iter().reduce(merge_settings).flatten()
 ```
-
-This design allows adding new layers (e.g., workspace-level config) without changing the function signature.
 
 **Scalar values and Option types** (`searchPaths`, `autoInstall`):
 - Later sources completely replace earlier values (via `primary.or(fallback)`)
@@ -211,7 +210,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
     let project_config = load_optional_project_config(cli_config_path);
     // InitializationOptions applied later in LSP initialize handler
 
-    merge_all(&[defaults, user_config, project_config])
+    [defaults, user_config, project_config].into_iter().reduce(merge_settings).flatten()
 }
 ```
 
@@ -257,7 +256,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 - [x] Implement type inference from exact filename (`highlights.scm`, `locals.scm`, `injections.scm`)
 
 ### Phase 2: Core Merging (Completed - Sprint 119, PBI-150)
-- [x] Implement `merge_all()` function for layered config merging
+- [x] Implement `merge_settings()` function for layered config merging
 - [x] Deep merge for `languages` HashMap
 - [x] Deep merge for `languageServers` HashMap
 - [x] Deep merge for `captureMappings`
