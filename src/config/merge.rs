@@ -219,25 +219,7 @@ fn merge_language_servers(
                 base_servers
                     .entry(key)
                     .and_modify(|base_config| {
-                        // For Vec fields: use overlay if non-empty, otherwise keep base
-                        if !overlay_config.cmd.is_empty() {
-                            base_config.cmd = overlay_config.cmd.clone();
-                        }
-                        if !overlay_config.languages.is_empty() {
-                            base_config.languages = overlay_config.languages.clone();
-                        }
-                        // For JSON Option fields: deep merge (ADR-0010)
-                        base_config.initialization_options = match (
-                            &base_config.initialization_options,
-                            &overlay_config.initialization_options,
-                        ) {
-                            (Some(base_opts), Some(overlay_opts)) => {
-                                Some(deep_merge_json(base_opts, overlay_opts))
-                            }
-                            (Some(base_opts), None) => Some(base_opts.clone()),
-                            (None, Some(overlay_opts)) => Some(overlay_opts.clone()),
-                            (None, None) => None,
-                        };
+                        *base_config = merge_bridge_server_configs(base_config, &overlay_config);
                     })
                     .or_insert(overlay_config);
             }
