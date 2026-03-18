@@ -1200,76 +1200,8 @@ mod tests {
         );
     }
 
-    // Regression test: aliases must be merged in merge_languages()
-    // Bug: When aliases field was added to LanguageSettings, merge_languages() was not
-    // updated to merge it. This caused aliases from user config to be lost when
-    // project config also defined the same language.
-
-    #[test]
-    fn test_merge_workspace_settings_languages_preserves_aliases() {
-        // User config defines markdown with aliases=["rmd"]
-        // Project config adds highlights for markdown but doesn't set aliases
-        // Result should preserve aliases from user config
-        let mut user_languages = HashMap::new();
-        user_languages.insert(
-            "markdown".to_string(),
-            LanguageSettings {
-                parser: Some("/usr/lib/markdown.so".to_string()),
-                aliases: Some(vec!["rmd".to_string(), "qmd".to_string()]),
-                ..Default::default()
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            languages: user_languages,
-            ..Default::default()
-        };
-
-        // Project only adds queries, doesn't set aliases
-        let mut project_languages = HashMap::new();
-        project_languages.insert(
-            "markdown".to_string(),
-            LanguageSettings {
-                queries: Some(vec![settings::QueryItem {
-                    path: "./queries/markdown-highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                }]),
-                // aliases: None - should inherit from user
-                ..Default::default()
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            languages: project_languages,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // Markdown should exist
-        assert!(result.languages.contains_key("markdown"));
-        let markdown = &result.languages["markdown"];
-
-        // Parser: inherited from user
-        assert_eq!(markdown.parser, Some("/usr/lib/markdown.so".to_string()));
-
-        // Queries: overridden by project
-        let queries = markdown.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(queries[0].path, "./queries/markdown-highlights.scm");
-
-        // Aliases: MUST be inherited from user (this was the bug)
-        assert!(
-            markdown.aliases.is_some(),
-            "aliases should be preserved from user config"
-        );
-        let aliases = markdown.aliases.as_ref().unwrap();
-        assert_eq!(aliases.len(), 2);
-        assert!(aliases.contains(&"rmd".to_string()));
-        assert!(aliases.contains(&"qmd".to_string()));
-    }
+    // Alias inheritance (overlay=None inherits from base) is covered by
+    // test_merge_workspace_settings_all_fields snapshot (python.aliases = ["py3"]).
 
     #[test]
     fn test_merge_workspace_settings_languages_project_aliases_override_user() {
