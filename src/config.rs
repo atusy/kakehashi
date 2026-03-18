@@ -89,6 +89,22 @@ fn merge_bridge_server_configs(
     }
 }
 
+/// Field-level merge of two LanguageSettings values.
+/// Option fields: overlay wins when present; base provides defaults.
+/// Bridge HashMaps: deep merged via merge_bridge_maps.
+/// Aliases: not inherited from wildcard (specific to each language).
+fn merge_language_settings(
+    base: &LanguageSettings,
+    overlay: &LanguageSettings,
+) -> LanguageSettings {
+    LanguageSettings {
+        parser: overlay.parser.clone().or_else(|| base.parser.clone()),
+        queries: overlay.queries.clone().or_else(|| base.queries.clone()),
+        bridge: merge_bridge_maps(&base.bridge, &overlay.bridge),
+        aliases: overlay.aliases.clone(),
+    }
+}
+
 /// Deep merge two optional bridge HashMaps.
 ///
 /// When both base and overlay exist:
@@ -191,19 +207,7 @@ pub(crate) fn resolve_language_settings_with_wildcard(
     let specific = map.get(key);
 
     match (wildcard, specific) {
-        (Some(w), Some(s)) => {
-            // Merge: start with wildcard, override with specific
-            Some(LanguageSettings {
-                parser: s.parser.clone().or_else(|| w.parser.clone()),
-                // For Option<Vec> fields: use specific if Some, else wildcard
-                // This allows specific to override wildcard with Some([]) (explicitly empty)
-                queries: s.queries.clone().or_else(|| w.queries.clone()),
-                // Deep merge bridge HashMaps: wildcard + specific
-                bridge: merge_bridge_maps(&w.bridge, &s.bridge),
-                // Aliases are not inherited from wildcard - they're specific to each language
-                aliases: s.aliases.clone(),
-            })
-        }
+        (Some(w), Some(s)) => Some(merge_language_settings(w, s)),
         (Some(w), None) => Some(w.clone()),
         (None, Some(s)) => Some(s.clone()),
         (None, None) => None,
