@@ -196,10 +196,22 @@ fn merge_languages(
     for (key, mut overlay_config) in overlay {
         base.entry(key)
             .and_modify(|base_config| {
-                base_config.parser = overlay_config.parser.take().or(base_config.parser.take());
-                base_config.queries = overlay_config.queries.take().or(base_config.queries.take());
-                base_config.bridge = overlay_config.bridge.take().or(base_config.bridge.take());
-                base_config.aliases = overlay_config.aliases.take().or(base_config.aliases.take());
+                base_config.parser = overlay_config
+                    .parser
+                    .take()
+                    .or_else(|| base_config.parser.take());
+                base_config.queries = overlay_config
+                    .queries
+                    .take()
+                    .or_else(|| base_config.queries.take());
+                base_config.bridge = overlay_config
+                    .bridge
+                    .take()
+                    .or_else(|| base_config.bridge.take());
+                base_config.aliases = overlay_config
+                    .aliases
+                    .take()
+                    .or_else(|| base_config.aliases.take());
             })
             .or_insert(overlay_config);
     }
@@ -249,20 +261,10 @@ fn merge_language_servers(
 fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -> CaptureMappings {
     // Deep merge: overlay values override base values for the same key
     for (lang, overlay_mappings) in overlay {
-        base.entry(lang)
-            .and_modify(|base_mappings| {
-                // Merge each mapping type: overlay entries override base entries
-                for (k, v) in overlay_mappings.highlights.clone() {
-                    base_mappings.highlights.insert(k, v);
-                }
-                for (k, v) in overlay_mappings.locals.clone() {
-                    base_mappings.locals.insert(k, v);
-                }
-                for (k, v) in overlay_mappings.folds.clone() {
-                    base_mappings.folds.insert(k, v);
-                }
-            })
-            .or_insert(overlay_mappings);
+        let base_mappings = base.entry(lang).or_default();
+        base_mappings.highlights.extend(overlay_mappings.highlights);
+        base_mappings.locals.extend(overlay_mappings.locals);
+        base_mappings.folds.extend(overlay_mappings.folds);
     }
     base
 }
@@ -270,8 +272,8 @@ fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::QueryTypeMappings;
     use crate::config::settings;
-    use crate::config::{CaptureMappings, QueryTypeMappings, RawWorkspaceSettings, WILDCARD_KEY};
     use std::collections::HashMap;
 
     #[test]
