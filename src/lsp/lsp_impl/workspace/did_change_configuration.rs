@@ -2,7 +2,7 @@
 
 use tower_lsp_server::ls_types::DidChangeConfigurationParams;
 
-use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_settings};
+use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 
 use super::super::Kakehashi;
 
@@ -25,11 +25,11 @@ impl Kakehashi {
         // so merging preserves languages and other fields set during initialize.
         let current = self.settings_manager.load_settings();
         let current_ts = RawWorkspaceSettings::from(current.as_ref());
-        // SAFETY: merge_settings(Some, Some) always returns Some, so unwrap_or_return is
+        // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) = merge_settings(Some(current_ts), Some(parsed)) else {
+        let Some(merged_ts) = merge_workspace_settings(Some(current_ts), Some(parsed)) else {
             log::warn!(
-                "merge_settings returned None despite two Some inputs; skipping configuration update"
+                "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
             );
             return;
         };

@@ -152,7 +152,7 @@ fn deep_merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> ser
 }
 
 /// Merge two RawWorkspaceSettings, preferring values from `overlay` over `base`
-pub(crate) fn merge_settings(
+pub(crate) fn merge_workspace_settings(
     base: Option<RawWorkspaceSettings>,
     overlay: Option<RawWorkspaceSettings>,
 ) -> Option<RawWorkspaceSettings> {
@@ -268,13 +268,13 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_merge_settings_with_none() {
-        let result = merge_settings(None, None);
+    fn test_merge_workspace_settings_with_none() {
+        let result = merge_workspace_settings(None, None);
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_merge_settings_fallback_only() {
+    fn test_merge_workspace_settings_fallback_only() {
         let fallback = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/fallback".to_string()]),
             languages: HashMap::new(),
@@ -282,7 +282,7 @@ mod tests {
             auto_install: None,
             language_servers: None,
         };
-        let result = merge_settings(Some(fallback.clone()), None).unwrap();
+        let result = merge_workspace_settings(Some(fallback.clone()), None).unwrap();
         assert_eq!(
             result.search_paths,
             Some(vec!["/path/to/fallback".to_string()])
@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_primary_only() {
+    fn test_merge_workspace_settings_primary_only() {
         let primary = RawWorkspaceSettings {
             search_paths: Some(vec!["/path/to/primary".to_string()]),
             languages: HashMap::new(),
@@ -298,7 +298,7 @@ mod tests {
             auto_install: None,
             language_servers: None,
         };
-        let result = merge_settings(None, Some(primary.clone())).unwrap();
+        let result = merge_workspace_settings(None, Some(primary.clone())).unwrap();
         assert_eq!(
             result.search_paths,
             Some(vec!["/path/to/primary".to_string()])
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_prefer_primary() {
+    fn test_merge_workspace_settings_prefer_primary() {
         let mut fallback_languages = HashMap::new();
         fallback_languages.insert(
             "rust".to_string(),
@@ -341,7 +341,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(fallback), Some(primary)).unwrap();
+        let result = merge_workspace_settings(Some(fallback), Some(primary)).unwrap();
 
         // Primary search paths should win
         assert_eq!(
@@ -411,7 +411,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(fallback), Some(primary)).unwrap();
+        let result = merge_workspace_settings(Some(fallback), Some(primary)).unwrap();
 
         // Primary should override fallback for same keys
         assert_eq!(
@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_scalar_later_wins() {
+    fn test_merge_workspace_settings_scalar_later_wins() {
         // Later config's scalar values should override earlier ones
         // Simulates: user config has autoInstall=true, project has autoInstall=false
         let user_config = RawWorkspaceSettings {
@@ -451,7 +451,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -463,7 +463,7 @@ mod tests {
     // PBI-150 Subtask 2: Deep merge for languages HashMap
 
     #[test]
-    fn test_merge_settings_languages_deep_merge() {
+    fn test_merge_workspace_settings_languages_deep_merge() {
         // Project sets queries field, inherits parser and bridge from user config
         // This is the key behavior change from shallow to deep merge
         use settings::BridgeLanguageConfig;
@@ -528,7 +528,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_languages_adds_new_keys() {
+    fn test_merge_workspace_settings_languages_adds_new_keys() {
         // User has python, project adds rust - both should exist
         let mut user_languages = HashMap::new();
         user_languages.insert(
@@ -587,7 +587,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -611,7 +611,7 @@ mod tests {
     // PBI-150 Subtask 3: Deep merge for languageServers HashMap
 
     #[test]
-    fn test_merge_settings_language_servers_deep_merge() {
+    fn test_merge_workspace_settings_language_servers_deep_merge() {
         // Project adds initializationOptions to rust-analyzer, inherits cmd and languages from user
         use serde_json::json;
         use settings::BridgeServerConfig;
@@ -653,7 +653,7 @@ mod tests {
             language_servers: Some(project_servers),
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_language_servers_adds_new_server() {
+    fn test_merge_workspace_settings_language_servers_adds_new_server() {
         // User has rust-analyzer, project adds pyright - both should exist
         use settings::BridgeServerConfig;
 
@@ -716,7 +716,7 @@ mod tests {
             language_servers: Some(project_servers),
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -740,10 +740,10 @@ mod tests {
         );
     }
 
-    // PBI-150 Subtask 4: Deep merge for captureMappings (already implemented, verify via merge_settings)
+    // PBI-150 Subtask 4: Deep merge for captureMappings (already implemented, verify via merge_workspace_settings)
 
     #[test]
-    fn test_merge_settings_capture_mappings_deep_merge() {
+    fn test_merge_workspace_settings_capture_mappings_deep_merge() {
         // Project overrides variable.builtin, inherits function.builtin from user config
         let mut user_mappings = HashMap::new();
         let mut user_highlights = HashMap::new();
@@ -798,7 +798,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -816,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_capture_mappings_adds_new_language() {
+    fn test_merge_workspace_settings_capture_mappings_adds_new_language() {
         // User has wildcard "_", project adds "rust" - both should exist
         let mut user_mappings = HashMap::new();
         let mut user_highlights = HashMap::new();
@@ -860,7 +860,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -882,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_capture_mappings_locals_and_folds() {
+    fn test_merge_workspace_settings_capture_mappings_locals_and_folds() {
         // Verify deep merge works for locals and folds, not just highlights
         let mut user_mappings = HashMap::new();
         let mut user_locals = HashMap::new();
@@ -937,7 +937,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1808,7 +1808,7 @@ mod tests {
     // project config also defined the same language.
 
     #[test]
-    fn test_merge_settings_languages_preserves_aliases() {
+    fn test_merge_workspace_settings_languages_preserves_aliases() {
         // User config defines markdown with aliases=["rmd"]
         // Project config adds highlights for markdown but doesn't set aliases
         // Result should preserve aliases from user config
@@ -1852,7 +1852,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1880,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_settings_languages_project_aliases_override_user() {
+    fn test_merge_workspace_settings_languages_project_aliases_override_user() {
         // When project explicitly sets aliases, it should override user config
         let mut user_languages = HashMap::new();
         user_languages.insert(
@@ -1917,7 +1917,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_settings(Some(user_config), Some(project_config));
+        let result = merge_workspace_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1961,7 +1961,7 @@ mod tests {
         );
 
         // Merge: defaults < user (user overrides defaults)
-        let merged = merge_settings(Some(defaults), Some(user_settings));
+        let merged = merge_workspace_settings(Some(defaults), Some(user_settings));
         assert!(merged.is_some());
         let merged = merged.unwrap();
 
