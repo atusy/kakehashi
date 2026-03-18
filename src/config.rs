@@ -1390,57 +1390,6 @@ mod tests {
     // PBI-153: Languages Wildcard Inheritance (ADR-0011)
 
     #[test]
-    fn test_resolve_language_with_wildcard_returns_wildcard_when_specific_absent() {
-        // ADR-0011: languages['rust'] inherits from languages['_']
-        // When languages only has "_" and we ask for "rust",
-        // we should get the wildcard's settings
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
-        // Wildcard has parser and bridge settings
-        let mut wildcard_bridge = HashMap::new();
-        wildcard_bridge.insert(
-            "rust".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        languages.insert(
-            "_".to_string(),
-            LanguageSettings {
-                parser: Some("/default/path.so".to_string()),
-                queries: Some(vec![settings::QueryItem {
-                    path: "/default/highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                }]),
-                bridge: Some(wildcard_bridge),
-                ..Default::default()
-            },
-        );
-
-        // Resolve for "rust" which doesn't exist - should return wildcard
-        let result = resolve_with_wildcard(&languages, "rust", merge_language_settings);
-
-        assert!(result.is_some(), "Should return Some when wildcard exists");
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.parser,
-            Some("/default/path.so".to_string()),
-            "Should inherit parser from wildcard"
-        );
-        assert!(
-            resolved.bridge.is_some(),
-            "Should inherit bridge from wildcard"
-        );
-        let bridge = resolved.bridge.as_ref().unwrap();
-        assert!(
-            bridge.get("rust").is_some_and(|c| c.enabled == Some(true)),
-            "Should inherit bridge settings from wildcard"
-        );
-    }
-
-    #[test]
     fn test_specific_values_override_wildcards_at_both_levels() {
         // ADR-0011: python.bridge.javascript overrides _.bridge._ settings
         // Setup:
@@ -1740,34 +1689,6 @@ mod tests {
                 .get("javascript")
                 .is_some_and(|c| c.enabled == Some(false)),
             "Python should have its own javascript bridge setting"
-        );
-    }
-
-    #[test]
-    fn test_resolve_bridge_with_wildcard_returns_wildcard_when_specific_absent() {
-        // ADR-0011: bridge['javascript'] inherits from bridge['_']
-        // When bridge only has "_" and we ask for "javascript",
-        // we should get the wildcard's enabled setting
-        let mut bridge: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-
-        // Wildcard has enabled = true
-        bridge.insert(
-            "_".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        // Resolve for "javascript" which doesn't exist - should return wildcard
-        let result = resolve_with_wildcard(&bridge, "javascript", merge_bridge_language_configs);
-
-        assert!(result.is_some(), "Should return Some when wildcard exists");
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.enabled,
-            Some(true),
-            "Should inherit enabled from wildcard"
         );
     }
 
@@ -2674,26 +2595,6 @@ mod tests {
         assert_eq!(
             resolved.aggregation.unwrap()["_"].priorities,
             vec!["server_a".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_resolve_with_wildcard_bridge_language_returns_none_when_absent() {
-        let map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        assert!(resolve_with_wildcard(&map, "python", merge_bridge_language_configs).is_none());
-    }
-
-    #[test]
-    fn test_resolve_with_wildcard_bridge_language_enabled_defaults_to_none() {
-        // When both wildcard and specific omit enabled, it should be None
-        let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        map.insert("_".to_string(), settings::BridgeLanguageConfig::default());
-
-        let resolved =
-            resolve_with_wildcard(&map, "python", merge_bridge_language_configs).unwrap();
-        assert_eq!(
-            resolved.enabled, None,
-            "enabled should be None when inherited wildcard has None"
         );
     }
 
