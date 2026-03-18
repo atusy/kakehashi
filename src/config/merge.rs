@@ -199,6 +199,9 @@ fn merge_language_servers(
     match (base, overlay) {
         (None, None) => None,
         (Some(servers), None) | (None, Some(servers)) => Some(servers),
+        (Some(_), Some(overlay_servers)) if overlay_servers.is_empty() => {
+            Some(HashMap::new()) // empty-means-clear
+        }
         (Some(mut base_servers), Some(overlay_servers)) => {
             // Deep merge: overlay values override base values for the same key
             for (key, overlay_config) in overlay_servers {
@@ -728,6 +731,30 @@ mod tests {
         assert_eq!(
             servers["pyright"].cmd,
             vec!["pyright-langserver".to_string(), "--stdio".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_language_servers_empty_overlay_clears_base() {
+        // Empty overlay map means "disable all servers" — should not inherit from base
+        // This mirrors merge_bridge_maps' "empty-means-clear" contract
+        use settings::BridgeServerConfig;
+
+        let mut base_servers = HashMap::new();
+        base_servers.insert(
+            "rust-analyzer".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["rust-analyzer".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let result = merge_language_servers(Some(base_servers), Some(HashMap::new()));
+        assert!(result.is_some());
+        assert!(
+            result.unwrap().is_empty(),
+            "empty overlay should clear base language servers"
         );
     }
 
