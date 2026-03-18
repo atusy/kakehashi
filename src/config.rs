@@ -789,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_scalar_later_wins() {
+    fn test_merge_settings_scalar_later_wins() {
         // Later config's scalar values should override earlier ones
         // Simulates: user config has autoInstall=true, project has autoInstall=false
         let user_config = RawWorkspaceSettings {
@@ -807,7 +807,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -884,7 +884,7 @@ mod tests {
     // PBI-150 Subtask 2: Deep merge for languages HashMap
 
     #[test]
-    fn test_merge_all_languages_deep_merge() {
+    fn test_merge_settings_languages_deep_merge() {
         // Project sets queries field, inherits parser and bridge from user config
         // This is the key behavior change from shallow to deep merge
         use settings::BridgeLanguageConfig;
@@ -949,7 +949,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -972,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_languages_adds_new_keys() {
+    fn test_merge_settings_languages_adds_new_keys() {
         // User has python, project adds rust - both should exist
         let mut user_languages = HashMap::new();
         user_languages.insert(
@@ -1008,7 +1008,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1032,7 +1032,7 @@ mod tests {
     // PBI-150 Subtask 3: Deep merge for languageServers HashMap
 
     #[test]
-    fn test_merge_all_language_servers_deep_merge() {
+    fn test_merge_settings_language_servers_deep_merge() {
         // Project adds initializationOptions to rust-analyzer, inherits cmd and languages from user
         use serde_json::json;
         use settings::{BridgeServerConfig, WorkspaceType};
@@ -1076,7 +1076,7 @@ mod tests {
             language_servers: Some(project_servers),
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_language_servers_adds_new_server() {
+    fn test_merge_settings_language_servers_adds_new_server() {
         // User has rust-analyzer, project adds pyright - both should exist
         use settings::BridgeServerConfig;
 
@@ -1144,7 +1144,7 @@ mod tests {
             language_servers: Some(project_servers),
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1171,7 +1171,7 @@ mod tests {
     // PBI-150 Subtask 4: Deep merge for captureMappings (already implemented, verify via merge_all)
 
     #[test]
-    fn test_merge_all_capture_mappings_deep_merge() {
+    fn test_merge_settings_capture_mappings_deep_merge() {
         // Project overrides variable.builtin, inherits function.builtin from user config
         let mut user_mappings = HashMap::new();
         let mut user_highlights = HashMap::new();
@@ -1226,7 +1226,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1244,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_capture_mappings_adds_new_language() {
+    fn test_merge_settings_capture_mappings_adds_new_language() {
         // User has wildcard "_", project adds "rust" - both should exist
         let mut user_mappings = HashMap::new();
         let mut user_highlights = HashMap::new();
@@ -1288,7 +1288,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -1310,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_capture_mappings_locals_and_folds() {
+    fn test_merge_settings_capture_mappings_locals_and_folds() {
         // Verify deep merge works for locals and folds, not just highlights
         let mut user_mappings = HashMap::new();
         let mut user_locals = HashMap::new();
@@ -1365,7 +1365,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -2347,7 +2347,7 @@ mod tests {
     // project config also defined the same language.
 
     #[test]
-    fn test_merge_all_languages_preserves_aliases() {
+    fn test_merge_settings_languages_preserves_aliases() {
         // User config defines markdown with aliases=["rmd"]
         // Project config adds highlights for markdown but doesn't set aliases
         // Result should preserve aliases from user config
@@ -2391,7 +2391,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -2419,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_all_languages_project_aliases_override_user() {
+    fn test_merge_settings_languages_project_aliases_override_user() {
         // When project explicitly sets aliases, it should override user config
         let mut user_languages = HashMap::new();
         user_languages.insert(
@@ -2456,7 +2456,7 @@ mod tests {
             language_servers: None,
         };
 
-        let result = merge_all(&[Some(user_config), Some(project_config)]);
+        let result = merge_settings(Some(user_config), Some(project_config));
         assert!(result.is_some());
         let result = result.unwrap();
 
@@ -2500,7 +2500,7 @@ mod tests {
         );
 
         // Merge: defaults < user (user overrides defaults)
-        let merged = merge_all(&[Some(defaults), Some(user_settings)]);
+        let merged = merge_settings(Some(defaults), Some(user_settings));
         assert!(merged.is_some());
         let merged = merged.unwrap();
 
