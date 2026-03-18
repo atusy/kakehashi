@@ -918,105 +918,40 @@ mod tests {
 
     // PBI-157: Deep merge for initialization_options (ADR-0010)
 
+    /// ADR-0010: initialization_options deep merge covers three behaviors:
+    /// - Disjoint keys: both preserved (feature1 from base, feature2 from overlay)
+    /// - Same key: overlay wins (shared_opt = "overlay")
+    /// - Nested objects: recursively merged (nested.base_only + nested.overlay_only)
     #[test]
-    fn test_merge_bridge_server_configs_deep_merges_initialization_options() {
-        // ADR-0010: initialization_options should be deep merged, not replaced
-        // Base provides {feature1: true}, overlay provides {feature2: true}
-        // Result should be {feature1: true, feature2: true}
+    fn test_merge_bridge_server_configs_initialization_options_deep_merge() {
         use serde_json::json;
         use settings::BridgeServerConfig;
 
         let base = BridgeServerConfig {
             cmd: vec!["default-lsp".to_string()],
             languages: vec![],
-            initialization_options: Some(json!({ "feature1": true })),
+            initialization_options: Some(json!({
+                "feature1": true,
+                "shared_opt": "base",
+                "nested": { "base_only": 1, "shared": "base" }
+            })),
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec!["rust".to_string()],
-            initialization_options: Some(json!({ "feature2": true })),
+            initialization_options: Some(json!({
+                "feature2": true,
+                "shared_opt": "overlay",
+                "nested": { "overlay_only": 2, "shared": "overlay" }
+            })),
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
-
-        // Should deep merge both features
-        let init_opts = resolved.initialization_options.unwrap();
-        assert_eq!(
-            init_opts.get("feature1"),
-            Some(&json!(true)),
-            "Should inherit feature1 from base (deep merge)"
-        );
-        assert_eq!(
-            init_opts.get("feature2"),
-            Some(&json!(true)),
-            "Should have feature2 from overlay"
-        );
-    }
-
-    #[test]
-    fn test_merge_bridge_server_configs_overlay_overrides_base_same_key() {
-        // ADR-0010: Overlay values override base for same keys
-        // Base has {opt: 1}, overlay has {opt: 2}
-        // Result should be {opt: 2}
-        use serde_json::json;
-        use settings::BridgeServerConfig;
-
-        let base = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
-            initialization_options: Some(json!({ "opt": 1 })),
-        };
-        let overlay = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![],
-            initialization_options: Some(json!({ "opt": 2 })),
-        };
-
-        let resolved = merge_bridge_server_configs(&base, &overlay);
-        let init_opts = resolved.initialization_options.unwrap();
-
-        // Overlay value should override base
-        assert_eq!(
-            init_opts.get("opt"),
-            Some(&json!(2)),
-            "Overlay value should override base for same key"
-        );
-    }
-
-    #[test]
-    fn test_merge_bridge_server_configs_nested_objects_deep_merge() {
-        // ADR-0010: Nested JSON objects should merge recursively
-        // Base has {a: {b: 1}}, overlay has {a: {c: 2}}
-        // Result should be {a: {b: 1, c: 2}}
-        use serde_json::json;
-        use settings::BridgeServerConfig;
-
-        let base = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
-            initialization_options: Some(json!({ "a": { "b": 1 } })),
-        };
-        let overlay = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![],
-            initialization_options: Some(json!({ "a": { "c": 2 } })),
-        };
-
-        let resolved = merge_bridge_server_configs(&base, &overlay);
-        let init_opts = resolved.initialization_options.unwrap();
-
-        // Should deep merge nested objects
-        let a_obj = init_opts.get("a").unwrap().as_object().unwrap();
-        assert_eq!(
-            a_obj.get("b"),
-            Some(&json!(1)),
-            "Should preserve b from base"
-        );
-        assert_eq!(
-            a_obj.get("c"),
-            Some(&json!(2)),
-            "Should have c from overlay"
-        );
+        let mut settings = insta::Settings::clone_current();
+        settings.set_sort_maps(true);
+        settings.bind(|| {
+            insta::assert_json_snapshot!(resolved.initialization_options);
+        });
     }
 
     // ========================================================================
