@@ -18,6 +18,7 @@
 //! - `settings`: Can be updated via `apply_settings()`
 
 use arc_swap::ArcSwap;
+use path_clean::PathClean;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tower_lsp_server::ls_types::{
@@ -205,14 +206,21 @@ impl SettingsManager {
     }
 
     /// Check if the given search paths include the default data directory.
-    pub(crate) fn search_paths_include_default_data_dir(&self, search_paths: &[String]) -> bool {
+    pub(crate) fn search_paths_include_default_data_dir<P: AsRef<std::path::Path>>(
+        &self,
+        search_paths: &[P],
+    ) -> bool {
         let Some(default_dir) = crate::install::default_data_dir() else {
             // Can't determine default dir - allow auto-install anyway
             return true;
         };
 
-        let default_str = default_dir.to_string_lossy();
-        search_paths.iter().any(|p| p == default_str.as_ref())
+        let default_dir = default_dir.clean();
+        // Clean each search path for comparison since callers may provide
+        // uncleaned paths via the generic AsRef<Path> parameter.
+        search_paths
+            .iter()
+            .any(|p| p.as_ref().clean() == default_dir)
     }
 
     /// Check if client supports LocationLink[] for a specific goto capability.
@@ -439,6 +447,47 @@ mod tests {
         };
         manager.set_capabilities(caps);
         assert_eq!(manager.supports_hierarchical_document_symbol(), expected);
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_with_matching_string() {
+        let manager = SettingsManager::new();
+        let Some(default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
+        let paths = vec![default_dir.to_string_lossy().into_owned()];
+        assert!(manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_with_non_matching_path() {
+        let manager = SettingsManager::new();
+        let Some(_default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
+        let paths = vec!["/nonexistent/path".to_string()];
+        assert!(!manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_empty() {
+        let manager = SettingsManager::new();
+        let Some(_default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
+        let paths: Vec<String> = vec![];
+        assert!(!manager.search_paths_include_default_data_dir(&paths));
+    }
+
+    #[test]
+    fn test_search_paths_include_default_data_dir_with_path_ref() {
+        let manager = SettingsManager::new();
+        let Some(default_dir) = crate::install::default_data_dir() else {
+            return; // skip on platforms without dirs::data_dir()
+        };
+        // Exercise &Path (distinct from the String variant above)
+        let paths: Vec<&std::path::Path> = vec![default_dir.as_path()];
+        assert!(manager.search_paths_include_default_data_dir(&paths));
     }
 
     #[test]

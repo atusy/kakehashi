@@ -3,7 +3,7 @@ use super::events::{LanguageEvent, LanguageLoadResult, LanguageLoadSummary, Lang
 use super::filetypes::FiletypeResolver;
 use super::loader::ParserLoader;
 use super::parser_pool::{DocumentParserPool, ParserFactory};
-use super::query_loader::{ParseFailure, QueryLoader};
+use super::query_loader::{ParseFailure, QueryLoader, format_search_paths};
 use super::query_store::QueryStore;
 use super::registry::LanguageRegistry;
 use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
@@ -11,6 +11,7 @@ use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use log::debug;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tree_sitter::Language;
 
@@ -80,8 +81,9 @@ impl LanguageCoordinator {
         self.build_alias_map(&settings.languages);
 
         let mut summary = LanguageLoadSummary::default();
+        let search_paths = self.config_store.get_search_paths();
         for (lang_name, config) in &settings.languages {
-            let result = self.load_single_language(lang_name, config, &settings.search_paths);
+            let result = self.load_single_language(lang_name, config, &search_paths);
             summary.record(lang_name, result);
         }
         summary
@@ -176,7 +178,10 @@ impl LanguageCoordinator {
         let Some(lib_path) = library_path else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Warning,
-                format!("Could not find parser for language '{language_id}'"),
+                format!(
+                    "Could not find parser for language '{language_id}' in search paths: {}",
+                    format_search_paths(&search_paths),
+                ),
             ));
         };
 
@@ -191,7 +196,10 @@ impl LanguageCoordinator {
                 Err(err) => {
                     return LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
-                        format!("Failed to load language {language_id} from {lib_path}: {err}"),
+                        format!(
+                            "Failed to load language {language_id} from {}: {err}",
+                            lib_path.display()
+                        ),
                     ));
                 }
             }
@@ -241,7 +249,10 @@ impl LanguageCoordinator {
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!("Dynamically loaded language {language_id} from {lib_path}"),
+            format!(
+                "Dynamically loaded language {language_id} from {}",
+                lib_path.display()
+            ),
         ));
         if self.has_queries(language_id) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -256,7 +267,7 @@ impl LanguageCoordinator {
     fn load_query(
         &self,
         language: &Language,
-        paths: &[String],
+        paths: &[PathBuf],
         ctx: QueryLoadContext<'_>,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
@@ -285,10 +296,10 @@ impl LanguageCoordinator {
     }
 
     /// Load a query from explicit paths (unified queries configuration).
-    fn load_query_from_paths(
+    fn load_query_from_paths<P: AsRef<Path>>(
         &self,
         language: &Language,
-        paths: &[String],
+        paths: &[P],
         ctx: QueryLoadContext<'_>,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
@@ -697,14 +708,17 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &[String],
+        search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
         let library_path =
-            QueryLoader::resolve_library_path(config.parser.as_ref(), lang_name, search_paths);
+            QueryLoader::resolve_library_path(config.parser.as_deref(), lang_name, search_paths);
         let Some(lib_path) = library_path else {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Error,
-                format!("No parser path found for language {lang_name}"),
+                format!(
+                    "No parser path found for language {lang_name} in search paths: {}",
+                    format_search_paths(search_paths),
+                ),
             ));
         };
 
@@ -719,7 +733,10 @@ impl LanguageCoordinator {
                 Err(err) => {
                     return LanguageLoadResult::failure_with(LanguageEvent::log(
                         LanguageLogLevel::Error,
-                        format!("Failed to load language {lang_name}: {err}"),
+                        format!(
+                            "Failed to load language {lang_name} from {}: {err}",
+                            lib_path.display()
+                        ),
                     ));
                 }
             }
@@ -741,7 +758,7 @@ impl LanguageCoordinator {
         &self,
         lang_name: &str,
         config: &LanguageSettings,
-        search_paths: &[String],
+        search_paths: &[PathBuf],
         language: &Language,
     ) -> Vec<LanguageEvent> {
         let mut events = Vec::new();
@@ -1676,7 +1693,8 @@ mod tests {
             queries: None,
             ..Default::default()
         };
-        let result = coordinator.load_single_language("lua", &config, &[]);
+        const NO_SEARCH_PATHS: &[PathBuf] = &[];
+        let result = coordinator.load_single_language("lua", &config, NO_SEARCH_PATHS);
         assert!(result.success, "Language should load with explicit parser");
         assert!(
             coordinator.has_parser_available("lua"),
