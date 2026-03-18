@@ -282,8 +282,8 @@ fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::QueryTypeMappings;
     use crate::config::settings;
-    use crate::config::{CaptureMappings, QueryTypeMappings, RawWorkspaceSettings, WILDCARD_KEY};
     use std::collections::HashMap;
 
     #[test]
