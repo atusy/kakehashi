@@ -25,26 +25,31 @@ impl Kakehashi {
         // so merging preserves languages and other fields set during initialize.
         let current = self.settings_manager.load_settings();
         let current_ts = RawWorkspaceSettings::from(current.as_ref());
-        let merged = merge_settings(Some(current_ts), Some(parsed));
+        // SAFETY: merge_settings(Some, Some) always returns Some, so unwrap_or_return is
+        // defensive only — the None branch is unreachable under the current implementation.
+        let Some(merged_ts) = merge_settings(Some(current_ts), Some(parsed)) else {
+            log::warn!(
+                "merge_settings returned None despite two Some inputs; skipping configuration update"
+            );
+            return;
+        };
 
-        if let Some(merged_ts) = merged {
-            match WorkspaceSettings::try_from_settings(
-                &merged_ts,
-                self.home_dir.as_deref(),
-                crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-            ) {
-                Ok(settings) => {
-                    self.apply_settings(settings).await;
-                    self.notifier().log_info("Configuration updated!").await;
-                }
-                Err(errs) => {
-                    let event = crate::lsp::SettingsEvent::error(format!(
-                        "Environment variable expansion failed: {errs}. \
-                         This configuration has been discarded; previous settings remain in effect. \
-                         Please define the missing variables or remove them from your config.",
-                    ));
-                    self.report_settings_events(&[event]).await;
-                }
+        match WorkspaceSettings::try_from_settings(
+            &merged_ts,
+            self.home_dir.as_deref(),
+            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
+        ) {
+            Ok(settings) => {
+                self.apply_settings(settings).await;
+                self.notifier().log_info("Configuration updated!").await;
+            }
+            Err(errs) => {
+                let event = crate::lsp::SettingsEvent::error(format!(
+                    "Environment variable expansion failed: {errs}. \
+                     This configuration has been discarded; previous settings remain in effect. \
+                     Please define the missing variables or remove them from your config.",
+                ));
+                self.report_settings_events(&[event]).await;
             }
         }
     }
