@@ -23,7 +23,7 @@ pub(crate) const WILDCARD_KEY: &str = "_";
 /// - If only wildcard exists: return wildcard (cloned)
 /// - If only specific key exists: return specific key (cloned)
 /// - If neither exists: return None
-fn resolve_with_wildcard<V: Clone>(
+pub(crate) fn resolve_with_wildcard<V: Clone>(
     map: &HashMap<String, V>,
     key: &str,
     merge: impl Fn(&V, &V) -> V,
@@ -38,23 +38,9 @@ fn resolve_with_wildcard<V: Clone>(
     }
 }
 
-/// Resolve a bridge language key from a map with wildcard fallback and field-level merging.
-///
-/// Implements ADR-0011 wildcard config inheritance for bridge HashMap:
-/// - If both wildcard ("_") and specific key exist: merge them (specific fields override wildcard)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-pub(crate) fn resolve_bridge_language_with_wildcard(
-    map: &HashMap<String, settings::BridgeLanguageConfig>,
-    key: &str,
-) -> Option<settings::BridgeLanguageConfig> {
-    resolve_with_wildcard(map, key, merge_bridge_language_configs)
-}
-
 /// Field-level merge of two BridgeLanguageConfig values.
 /// Overlay fields win when present; base provides defaults.
-fn merge_bridge_language_configs(
+pub(crate) fn merge_bridge_language_configs(
     base: &settings::BridgeLanguageConfig,
     overlay: &settings::BridgeLanguageConfig,
 ) -> settings::BridgeLanguageConfig {
@@ -75,7 +61,7 @@ fn merge_bridge_language_configs(
 /// Vec fields: use overlay if non-empty, else base.
 /// JSON Option fields: deep merge (ADR-0010).
 /// Option fields: overlay wins when present.
-fn merge_bridge_server_configs(
+pub(crate) fn merge_bridge_server_configs(
     base: &settings::BridgeServerConfig,
     overlay: &settings::BridgeServerConfig,
 ) -> settings::BridgeServerConfig {
@@ -107,7 +93,7 @@ fn merge_bridge_server_configs(
 /// Option fields: overlay wins when present; base provides defaults.
 /// Bridge HashMaps: deep merged via merge_bridge_maps.
 /// Aliases: not inherited from wildcard (specific to each language).
-fn merge_language_settings(
+pub(crate) fn merge_language_settings(
     base: &LanguageSettings,
     overlay: &LanguageSettings,
 ) -> LanguageSettings {
@@ -177,39 +163,6 @@ fn deep_merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> ser
         // For non-objects, overlay completely replaces base
         _ => overlay.clone(),
     }
-}
-
-/// Resolve a language server key from a map with wildcard fallback and merging.
-///
-/// Implements ADR-0011 wildcard config inheritance for languageServers HashMap:
-/// - If both wildcard ("_") and specific key exist: merge them (specific overrides wildcard)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// The merge creates a new BridgeServerConfig where specific values override wildcard values.
-pub(crate) fn resolve_language_server_with_wildcard(
-    map: &HashMap<String, settings::BridgeServerConfig>,
-    key: &str,
-) -> Option<settings::BridgeServerConfig> {
-    resolve_with_wildcard(map, key, merge_bridge_server_configs)
-}
-
-/// Resolve a LanguageSettings key from a map with wildcard fallback and merging.
-///
-/// Implements ADR-0011 wildcard config inheritance for WorkspaceSettings.languages HashMap:
-/// - If both wildcard ("_") and specific key exist: merge them (specific overrides wildcard)
-/// - If only wildcard exists: return wildcard
-/// - If only specific key exists: return specific key
-/// - If neither exists: return None
-///
-/// The merge creates a new LanguageSettings where specific values override wildcard values.
-/// This is used by bridge config lookup functions to resolve host language settings.
-pub(crate) fn resolve_language_settings_with_wildcard(
-    map: &HashMap<String, LanguageSettings>,
-    key: &str,
-) -> Option<LanguageSettings> {
-    resolve_with_wildcard(map, key, merge_language_settings)
 }
 
 /// Returns the default search paths for parsers and queries.
@@ -1467,7 +1420,7 @@ mod tests {
         );
 
         // Resolve for "rust" which doesn't exist - should return wildcard
-        let result = resolve_language_settings_with_wildcard(&languages, "rust");
+        let result = resolve_with_wildcard(&languages, "rust", merge_language_settings);
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
@@ -1541,7 +1494,7 @@ mod tests {
         );
 
         // Resolve for "python" - should merge with wildcard
-        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_with_wildcard(&languages, "python", merge_language_settings);
         assert!(resolved_lang.is_some(), "Should resolve python language");
         let lang_config = resolved_lang.unwrap();
 
@@ -1557,7 +1510,8 @@ mod tests {
         let bridge = lang_config.bridge.as_ref().unwrap();
 
         // JavaScript: python-specific override (enabled = false)
-        let js_resolved = resolve_bridge_language_with_wildcard(bridge, "javascript");
+        let js_resolved =
+            resolve_with_wildcard(bridge, "javascript", merge_bridge_language_configs);
         assert!(js_resolved.is_some(), "Should resolve javascript bridge");
         assert!(
             js_resolved.unwrap().enabled == Some(false),
@@ -1566,7 +1520,7 @@ mod tests {
 
         // Rust: inherited from _.bridge._ through deep merge
         // ADR-0011: bridge maps are deep merged, so python gets wildcard's bridge._
-        let rust_resolved = resolve_bridge_language_with_wildcard(bridge, "rust");
+        let rust_resolved = resolve_with_wildcard(bridge, "rust", merge_bridge_language_configs);
         assert!(
             rust_resolved.is_some(),
             "Python's rust bridge should resolve (inherited from wildcard's bridge._)"
@@ -1611,13 +1565,14 @@ mod tests {
             },
         );
 
-        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_with_wildcard(&languages, "python", merge_language_settings);
         assert!(resolved_lang.is_some());
         let lang_config = resolved_lang.unwrap();
         let bridge = lang_config.bridge.as_ref().unwrap();
 
         // JavaScript: specific override
-        let js_resolved = resolve_bridge_language_with_wildcard(bridge, "javascript");
+        let js_resolved =
+            resolve_with_wildcard(bridge, "javascript", merge_bridge_language_configs);
         assert!(js_resolved.is_some());
         assert!(
             js_resolved.unwrap().enabled == Some(false),
@@ -1625,7 +1580,7 @@ mod tests {
         );
 
         // Rust: inherits from python's bridge._
-        let rust_resolved = resolve_bridge_language_with_wildcard(bridge, "rust");
+        let rust_resolved = resolve_with_wildcard(bridge, "rust", merge_bridge_language_configs);
         assert!(rust_resolved.is_some());
         assert!(
             rust_resolved.unwrap().enabled == Some(true),
@@ -1666,7 +1621,7 @@ mod tests {
         );
 
         // Resolve for "python" which doesn't exist - should get wildcard language
-        let resolved_lang = resolve_language_settings_with_wildcard(&languages, "python");
+        let resolved_lang = resolve_with_wildcard(&languages, "python", merge_language_settings);
         assert!(
             resolved_lang.is_some(),
             "Should resolve to wildcard language"
@@ -1680,7 +1635,7 @@ mod tests {
         );
         let bridge = lang_config.bridge.as_ref().unwrap();
 
-        let resolved_bridge = resolve_bridge_language_with_wildcard(bridge, "rust");
+        let resolved_bridge = resolve_with_wildcard(bridge, "rust", merge_bridge_language_configs);
         assert!(
             resolved_bridge.is_some(),
             "Should resolve to wildcard bridge"
@@ -1752,7 +1707,7 @@ mod tests {
         );
 
         // Resolve for "python" - bridge should be deep merged with wildcard
-        let resolved = resolve_language_settings_with_wildcard(&languages, "python");
+        let resolved = resolve_with_wildcard(&languages, "python", merge_language_settings);
         assert!(resolved.is_some());
         let lang_config = resolved.unwrap();
 
@@ -1805,7 +1760,7 @@ mod tests {
         );
 
         // Resolve for "javascript" which doesn't exist - should return wildcard
-        let result = resolve_bridge_language_with_wildcard(&bridge, "javascript");
+        let result = resolve_with_wildcard(&bridge, "javascript", merge_bridge_language_configs);
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
@@ -1838,7 +1793,7 @@ mod tests {
         // ADR-0011: Neither wildcard nor specific key -> return None
         let servers = build_servers_map(None, None);
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
 
         assert!(
             result.is_none(),
@@ -1858,7 +1813,7 @@ mod tests {
         };
         let servers = build_servers_map(Some(wildcard), None);
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
 
         assert!(result.is_some(), "Should return Some when wildcard exists");
         let resolved = result.unwrap();
@@ -1890,7 +1845,7 @@ mod tests {
         };
         let servers = build_servers_map(None, Some(specific));
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
 
         assert!(
             result.is_some(),
@@ -1934,7 +1889,7 @@ mod tests {
         };
         let servers = build_servers_map(Some(wildcard), Some(specific));
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
 
         assert!(result.is_some(), "Should return merged config");
         let resolved = result.unwrap();
@@ -2010,7 +1965,7 @@ mod tests {
             },
         );
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
         assert!(result.is_some());
         let resolved = result.unwrap();
 
@@ -2109,7 +2064,7 @@ mod tests {
             },
         );
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
         let resolved = result.unwrap();
         let init_opts = resolved.initialization_options.unwrap();
 
@@ -2151,7 +2106,7 @@ mod tests {
             },
         );
 
-        let result = resolve_language_server_with_wildcard(&servers, "rust-analyzer");
+        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
         let resolved = result.unwrap();
         let init_opts = resolved.initialization_options.unwrap();
 
@@ -2222,7 +2177,8 @@ mod tests {
         );
 
         // Test 1: "markdown" should have its own bridge filter (not wildcard's)
-        let markdown = resolve_language_settings_with_wildcard(&languages, "markdown").unwrap();
+        let markdown =
+            resolve_with_wildcard(&languages, "markdown", merge_language_settings).unwrap();
         assert!(
             markdown.queries.is_some(),
             "markdown should inherit queries from wildcard"
@@ -2240,7 +2196,7 @@ mod tests {
         );
 
         // Test 2: "quarto" (not defined) should get wildcard settings entirely
-        let quarto = resolve_language_settings_with_wildcard(&languages, "quarto").unwrap();
+        let quarto = resolve_with_wildcard(&languages, "quarto", merge_language_settings).unwrap();
         assert!(
             quarto.queries.is_some(),
             "quarto should inherit queries from wildcard"
@@ -2273,7 +2229,7 @@ mod tests {
         );
 
         // Look up "quarto" which doesn't exist - should inherit from wildcard
-        let quarto = resolve_language_settings_with_wildcard(&languages, "quarto");
+        let quarto = resolve_with_wildcard(&languages, "quarto", merge_language_settings);
         assert!(
             quarto.is_some(),
             "Looking up undefined 'quarto' should return wildcard settings"
@@ -2332,7 +2288,8 @@ mod tests {
         );
 
         // Test: rust-analyzer should merge with wildcard
-        let ra = resolve_language_server_with_wildcard(&servers, "rust-analyzer").unwrap();
+        let ra =
+            resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs).unwrap();
 
         // cmd from specific
         assert_eq!(ra.cmd, vec!["rust-analyzer".to_string()]);
@@ -2391,7 +2348,7 @@ mod tests {
             }
 
             if let Some(resolved_config) =
-                resolve_language_server_with_wildcard(&servers, server_name)
+                resolve_with_wildcard(&servers, server_name, merge_bridge_server_configs)
                 && resolved_config
                     .languages
                     .iter()
@@ -2679,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_bridge_language_with_wildcard_merges_fields() {
+    fn test_resolve_with_wildcard_bridge_language_merges_fields() {
         // Wildcard provides aggregation defaults; specific provides enabled override
         let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
         map.insert(
@@ -2703,7 +2660,8 @@ mod tests {
             },
         );
 
-        let resolved = resolve_bridge_language_with_wildcard(&map, "python").unwrap();
+        let resolved =
+            resolve_with_wildcard(&map, "python", merge_bridge_language_configs).unwrap();
         assert_eq!(
             resolved.enabled,
             Some(false),
@@ -2720,18 +2678,19 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_bridge_language_with_wildcard_returns_none_when_absent() {
+    fn test_resolve_with_wildcard_bridge_language_returns_none_when_absent() {
         let map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        assert!(resolve_bridge_language_with_wildcard(&map, "python").is_none());
+        assert!(resolve_with_wildcard(&map, "python", merge_bridge_language_configs).is_none());
     }
 
     #[test]
-    fn test_resolve_bridge_language_with_wildcard_enabled_defaults_to_none() {
+    fn test_resolve_with_wildcard_bridge_language_enabled_defaults_to_none() {
         // When both wildcard and specific omit enabled, it should be None
         let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
         map.insert("_".to_string(), settings::BridgeLanguageConfig::default());
 
-        let resolved = resolve_bridge_language_with_wildcard(&map, "python").unwrap();
+        let resolved =
+            resolve_with_wildcard(&map, "python", merge_bridge_language_configs).unwrap();
         assert_eq!(
             resolved.enabled, None,
             "enabled should be None when inherited wildcard has None"
