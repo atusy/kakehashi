@@ -188,7 +188,7 @@ One language server process handles **all virtual documents** for that language,
 
 ### Phase 1: Isolated Mode Only (Complete)
 - [x] Virtual document creation and lifecycle
-- [x] Materialization for rust-analyzer (`workspaceType: "cargo"`)
+- [x] Materialization for rust-analyzer
 - [x] Server process sharing
 - [x] Per-host bridge filtering via `languages.*.bridge` map
 

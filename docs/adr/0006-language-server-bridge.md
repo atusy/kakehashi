@@ -157,7 +157,6 @@ The bridge requires knowing which server to use for each language. Language serv
     "rust-analyzer": {
       "cmd": ["rust-analyzer"],
       "languages": ["rust"],
-      "workspaceType": "cargo",
       "initializationOptions": {
         "linkedProjects": ["~/.config/kakehashi/rust-project.json"]
       }
@@ -180,7 +179,6 @@ The bridge requires knowing which server to use for each language. Language serv
 | `languageServers.*.cmd` | Yes | Command array: first element is program, rest are arguments |
 | `languageServers.*.languages` | Yes | Languages this server handles |
 | `languageServers.*.initializationOptions` | No | Passed to server's `initialize` request |
-| `languageServers.*.workspaceType` | No | `"cargo"` creates Cargo.toml scaffolding for rust-analyzer; `"generic"` (default) creates only the source file |
 
 #### Per-Host Language Bridge Configuration
 
@@ -327,7 +325,6 @@ kakehashi configuration points rust-analyzer to this file:
     "rust-analyzer": {
       "cmd": ["rust-analyzer"],
       "languages": ["rust"],
-      "workspaceType": "cargo",
       "initializationOptions": {
         "linkedProjects": ["~/.config/kakehashi/rust-project.json"]
       }
@@ -478,7 +475,6 @@ Translation is straightforward for positions within a single injection. See [ADR
 - [x] Go-to-definition working
 - [x] `languageServers` configuration at root level (PBI-119)
 - [x] Per-host `bridge` filter with map format (PBI-120)
-- [x] `workspaceType` for cargo vs generic workspaces
 
 ### Phase 2: Connection Pool
 

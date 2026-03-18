@@ -144,14 +144,13 @@ final_config = [defaults, user_config, project_config, InitializationOptions]
 
 **Bridge servers HashMap** (`languageServers`):
 - **Deep merge at server level**: Keys (server names) from later sources override same keys from earlier sources
-- **Deep merge within each server**: Individual fields (`cmd`, `languages`, `workspaceType`, `initializationOptions`) are merged
+- **Deep merge within each server**: Individual fields (`cmd`, `languages`, `initializationOptions`) are merged
 - Example:
   ```toml
   # user config
   [languageServers.rust-analyzer]
   cmd = ["rust-analyzer"]
   languages = ["rust"]
-  workspaceType = "cargo"
 
   # project config
   [languageServers.rust-analyzer]
@@ -161,7 +160,6 @@ final_config = [defaults, user_config, project_config, InitializationOptions]
   [languageServers.rust-analyzer]
   cmd = ["rust-analyzer"]                                        # inherited
   languages = ["rust"]                                           # inherited
-  workspaceType = "cargo"                                        # inherited
   initializationOptions = { linkedProjects = ["./Cargo.toml"] }  # added by project
   ```
 
