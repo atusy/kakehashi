@@ -166,20 +166,6 @@ fn deep_merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> ser
     }
 }
 
-/// Returns the default search paths for parsers and queries.
-/// Uses the platform-specific data directory (via `dirs` crate):
-/// - Linux: ~/.local/share/kakehashi
-/// - macOS: ~/Library/Application Support/kakehashi
-/// - Windows: %APPDATA%/kakehashi
-///
-/// Note: Returns the base directory only. The resolver functions append
-/// "parser/" or "queries/" subdirectories as needed.
-pub(crate) fn default_search_paths() -> Vec<String> {
-    crate::install::default_data_dir()
-        .map(|d| vec![d.to_string_lossy().to_string()])
-        .unwrap_or_default()
-}
-
 /// Merge two RawWorkspaceSettings, preferring values from `primary` over `fallback`
 pub(crate) fn merge_settings(
     fallback: Option<RawWorkspaceSettings>,
@@ -215,6 +201,20 @@ pub(crate) fn merge_settings(
             Some(merged)
         }
     }
+}
+
+/// Returns the default search paths for parsers and queries.
+/// Uses the platform-specific data directory (via `dirs` crate):
+/// - Linux: ~/.local/share/kakehashi
+/// - macOS: ~/Library/Application Support/kakehashi
+/// - Windows: %APPDATA%/kakehashi
+///
+/// Note: Returns the base directory only. The resolver functions append
+/// "parser/" or "queries/" subdirectories as needed.
+fn default_search_paths() -> Vec<String> {
+    crate::install::default_data_dir()
+        .map(|d| vec![d.to_string_lossy().to_string()])
+        .unwrap_or_default()
 }
 
 /// Convert `RawWorkspaceSettings` to `WorkspaceSettings` without expanding
