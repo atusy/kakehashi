@@ -441,9 +441,9 @@ mod tests {
 
         // ── merge & snapshot ──────────────────────────────────────────
         let result = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
-        let mut settings = insta::Settings::clone_current();
-        settings.set_sort_maps(true);
-        settings.bind(|| {
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
             insta::assert_json_snapshot!(result);
         });
     }
@@ -929,9 +929,9 @@ mod tests {
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
-        let mut settings = insta::Settings::clone_current();
-        settings.set_sort_maps(true);
-        settings.bind(|| {
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
             insta::assert_json_snapshot!(resolved.initialization_options);
         });
     }
