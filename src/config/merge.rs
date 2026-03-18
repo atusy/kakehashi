@@ -613,8 +613,9 @@ mod tests {
         let js_resolved =
             resolve_with_wildcard(bridge, "javascript", merge_bridge_language_configs);
         assert!(js_resolved.is_some(), "Should resolve javascript bridge");
-        assert!(
-            js_resolved.unwrap().enabled == Some(false),
+        assert_eq!(
+            js_resolved.unwrap().enabled,
+            Some(false),
             "Python's javascript bridge should be disabled (override)"
         );
 
@@ -625,8 +626,9 @@ mod tests {
             rust_resolved.is_some(),
             "Python's rust bridge should resolve (inherited from wildcard's bridge._)"
         );
-        assert!(
-            rust_resolved.unwrap().enabled == Some(true),
+        assert_eq!(
+            rust_resolved.unwrap().enabled,
+            Some(true),
             "Python's rust bridge should be enabled (from wildcard's bridge._)"
         );
     }
@@ -674,16 +676,18 @@ mod tests {
         let js_resolved =
             resolve_with_wildcard(bridge, "javascript", merge_bridge_language_configs);
         assert!(js_resolved.is_some());
-        assert!(
-            js_resolved.unwrap().enabled == Some(false),
+        assert_eq!(
+            js_resolved.unwrap().enabled,
+            Some(false),
             "JavaScript should be disabled"
         );
 
         // Rust: inherits from python's bridge._
         let rust_resolved = resolve_with_wildcard(bridge, "rust", merge_bridge_language_configs);
         assert!(rust_resolved.is_some());
-        assert!(
-            rust_resolved.unwrap().enabled == Some(true),
+        assert_eq!(
+            rust_resolved.unwrap().enabled,
+            Some(true),
             "Rust should inherit from python.bridge._"
         );
     }
@@ -740,8 +744,9 @@ mod tests {
             resolved_bridge.is_some(),
             "Should resolve to wildcard bridge"
         );
-        assert!(
-            resolved_bridge.unwrap().enabled == Some(true),
+        assert_eq!(
+            resolved_bridge.unwrap().enabled,
+            Some(true),
             "Nested wildcard resolution: languages._.bridge._ should apply to python.bridge.rust"
         );
     }
