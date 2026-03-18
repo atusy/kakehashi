@@ -17,7 +17,6 @@ vim.lsp.config["kakehashi"] = {
 			["rust-analyzer"] = {
 				cmd = { "rust-analyzer" },
 				languages = { "rust" },
-				workspaceType = "cargo",
 			},
 			["pyright"] = {
 				cmd = { "pyright-langserver", "--stdio" },

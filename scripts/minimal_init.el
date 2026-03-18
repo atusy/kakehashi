@@ -64,8 +64,7 @@
       :languageServers
       (:rust-analyzer
        (:cmd ["rust-analyzer"]
-        :languages ["rust"]
-        :workspaceType "cargo")
+        :languages ["rust"])
        :pyright
        (:cmd ["pyright-langserver" "--stdio"]
         :languages ["python"])

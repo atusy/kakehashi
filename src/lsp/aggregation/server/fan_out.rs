@@ -148,7 +148,6 @@ mod tests {
                 cmd: vec![name.to_string()],
                 languages: vec![],
                 initialization_options: None,
-                workspace_type: None,
             }),
         }
     }
