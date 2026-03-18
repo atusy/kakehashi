@@ -735,9 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_language_servers_empty_overlay_clears_base() {
-        // Empty overlay map means "disable all servers" — should not inherit from base
-        // This mirrors merge_bridge_maps' "empty-means-clear" contract
+    fn test_merge_workspace_settings_empty_language_servers_overlay_clears_base() {
         use settings::BridgeServerConfig;
 
         let mut base_servers = HashMap::new();
@@ -750,10 +748,18 @@ mod tests {
             },
         );
 
-        let result = merge_language_servers(Some(base_servers), Some(HashMap::new()));
-        assert!(result.is_some());
+        let base = RawWorkspaceSettings {
+            language_servers: Some(base_servers),
+            ..Default::default()
+        };
+        let overlay = RawWorkspaceSettings {
+            language_servers: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let result = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
         assert!(
-            result.unwrap().is_empty(),
+            result.language_servers.unwrap().is_empty(),
             "empty overlay should clear base language servers"
         );
     }
@@ -1442,10 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_language_servers_deep_merges_initialization_options() {
-        // ADR-0010: merge_language_servers should deep merge initialization_options
-        // Base layer has {baseOpt: 1}, overlay has {overlayOpt: 2}
-        // Result should have both options
+    fn test_merge_workspace_settings_deep_merges_language_server_init_options() {
         use serde_json::json;
         use settings::BridgeServerConfig;
 
@@ -1469,15 +1472,20 @@ mod tests {
             },
         );
 
-        let result = merge_language_servers(Some(base_servers), Some(overlay_servers));
-        assert!(result.is_some());
-        let merged = result.unwrap();
-        assert!(merged.contains_key("rust-analyzer"));
+        let base = RawWorkspaceSettings {
+            language_servers: Some(base_servers),
+            ..Default::default()
+        };
+        let overlay = RawWorkspaceSettings {
+            language_servers: Some(overlay_servers),
+            ..Default::default()
+        };
 
-        let ra = &merged["rust-analyzer"];
+        let result = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
+        let servers = result.language_servers.unwrap();
+        let ra = &servers["rust-analyzer"];
         let init_opts = ra.initialization_options.as_ref().unwrap();
 
-        // Should have both options (deep merge)
         assert_eq!(
             init_opts.get("baseOpt"),
             Some(&json!(1)),
@@ -2016,45 +2024,41 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_deep_merges_aggregation() {
-        // Wildcard bridge has python with aggregation defaults
-        // Specific bridge has python with enabled override but no aggregation
-        // After merge, python should have both enabled override AND inherited aggregation
-        let mut wildcard_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        wildcard_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "_".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_aggregation_inherited_from_base() {
+        // Base bridge has aggregation, overlay has enabled override but no aggregation.
+        // After merge, aggregation should be inherited from base.
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut specific_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        specific_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(false),
-                aggregation: None, // no aggregation override
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(false),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(wildcard_map), &Some(specific_map)).unwrap();
-        let python = merged.get("python").unwrap();
-        assert_eq!(
-            python.enabled,
-            Some(false),
-            "specific enabled should override"
-        );
-        assert!(
-            python.aggregation.is_some(),
-            "aggregation should be inherited from wildcard"
-        );
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
+        assert_eq!(python.enabled, Some(false), "specific enabled should override");
+        assert!(python.aggregation.is_some(), "aggregation should be inherited from base");
         assert_eq!(
             python.aggregation.as_ref().unwrap()["_"].priorities,
             vec!["pyright".to_string()]
@@ -2062,82 +2066,83 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_empty_overlay_clears_base() {
-        // Empty overlay map means "disable all bridging" — should not inherit from base
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
+    fn test_merge_language_settings_empty_bridge_overlay_clears_base() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let empty_overlay: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::new()),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(empty_overlay)).unwrap();
-        assert!(merged.is_empty(), "empty overlay should clear base");
+        let merged = merge_language_settings(&base, &overlay);
+        assert!(merged.bridge.unwrap().is_empty(), "empty overlay should clear base");
     }
 
     #[test]
-    fn test_merge_bridge_maps_overlay_aggregation_wins_on_shared_keys() {
-        // Both base and overlay define aggregation for the same method key.
-        // Overlay should win for shared keys; base-only keys are preserved.
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([
-                    (
-                        "_".to_string(),
-                        settings::AggregationConfig {
-                            priorities: vec!["base_default".to_string()],
-                            ..Default::default()
-                        },
-                    ),
-                    (
+    fn test_merge_language_settings_bridge_aggregation_overlay_wins_on_shared_keys() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        (
+                            "_".to_string(),
+                            settings::AggregationConfig {
+                                priorities: vec!["base_default".to_string()],
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "textDocument/hover".to_string(),
+                            settings::AggregationConfig {
+                                priorities: vec!["base_hover".to_string()],
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["base_hover".to_string()],
+                            priorities: vec!["overlay_hover".to_string()],
                             ..Default::default()
                         },
-                    ),
-                ])),
-            },
-        );
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["overlay_hover".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
-
-        // enabled: overlay has None, so base's Some(true) wins
         assert_eq!(python.enabled, Some(true));
 
         let agg = python.aggregation.as_ref().unwrap();
-
-        // Shared key "textDocument/hover": overlay wins
         assert_eq!(
             agg["textDocument/hover"].priorities,
             vec!["overlay_hover".to_string()],
             "overlay should win for shared aggregation keys"
         );
-
-        // Base-only key "_": preserved from base
         assert_eq!(
             agg["_"].priorities,
             vec!["base_default".to_string()],
@@ -2146,48 +2151,47 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_overlay_aggregation_preserves_strategy_when_atomic() {
-        // When overlay replaces an aggregation entry, the entire entry
-        // (including strategy) is replaced atomically — base's strategy
-        // does NOT leak into overlay's entry.
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "textDocument/diagnostic".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["ruff".to_string()],
-                        strategy: Some(settings::AggregationStrategy::Concatenated),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_aggregation_strategy_replaced_atomically() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/diagnostic".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["ruff".to_string()],
+                            strategy: Some(settings::AggregationStrategy::Concatenated),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/diagnostic".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        strategy: Some(settings::AggregationStrategy::Preferred),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/diagnostic".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            strategy: Some(settings::AggregationStrategy::Preferred),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
-        let agg = python.aggregation.as_ref().unwrap();
-        let diag = &agg["textDocument/diagnostic"];
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
+        let diag = &python.aggregation.as_ref().unwrap()["textDocument/diagnostic"];
 
-        // Overlay wins entirely for the shared key
         assert_eq!(
             diag.priorities,
             vec!["pyright".to_string()],
@@ -2201,43 +2205,45 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_preserves_max_fan_out_from_base_only_keys() {
-        // Overlay omits method key entirely → base maxFanOut preserved
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "_".to_string(),
-                    settings::AggregationConfig {
-                        max_fan_out: Some(3),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_max_fan_out_preserved_from_base_only_keys() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            max_fan_out: Some(3),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
         let agg = python.aggregation.as_ref().unwrap();
 
-        // Base-only key "_" is preserved (overlay didn't touch it)
         assert_eq!(
             agg["_"].max_fan_out,
             Some(3),
@@ -2246,44 +2252,45 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_overlay_same_key_without_max_fan_out_replaces_atomically() {
-        // Overlay includes same method key without maxFanOut →
-        // base maxFanOut is lost (atomic per-key replacement)
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["ruff".to_string()],
-                        max_fan_out: Some(2),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_max_fan_out_lost_on_same_key_replacement() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["ruff".to_string()],
+                            max_fan_out: Some(2),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
-        let agg = python.aggregation.as_ref().unwrap();
-        let hover = &agg["textDocument/hover"];
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
+        let hover = &python.aggregation.as_ref().unwrap()["textDocument/hover"];
 
         assert_eq!(
             hover.priorities,
