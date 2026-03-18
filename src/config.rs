@@ -16,6 +16,28 @@ pub(crate) use user::load_user_config;
 /// Used in capture_mappings, languages, and language_servers for fallback values.
 pub(crate) const WILDCARD_KEY: &str = "_";
 
+/// Resolve a key from a map with wildcard fallback and merging.
+///
+/// Implements ADR-0011 wildcard config inheritance for HashMap-based settings:
+/// - If both wildcard ("_") and specific key exist: merge them via `merge`
+/// - If only wildcard exists: return wildcard (cloned)
+/// - If only specific key exists: return specific key (cloned)
+/// - If neither exists: return None
+fn resolve_with_wildcard<V: Clone>(
+    map: &HashMap<String, V>,
+    key: &str,
+    merge: impl Fn(&V, &V) -> V,
+) -> Option<V> {
+    let wildcard = map.get(WILDCARD_KEY);
+    let specific = map.get(key);
+    match (wildcard, specific) {
+        (Some(w), Some(s)) => Some(merge(w, s)),
+        (Some(w), None) => Some(w.clone()),
+        (None, Some(s)) => Some(s.clone()),
+        (None, None) => None,
+    }
+}
+
 /// Resolve a bridge language key from a map with wildcard fallback and field-level merging.
 ///
 /// Implements ADR-0011 wildcard config inheritance for bridge HashMap:
@@ -27,15 +49,7 @@ pub(crate) fn resolve_bridge_language_with_wildcard(
     map: &HashMap<String, settings::BridgeLanguageConfig>,
     key: &str,
 ) -> Option<settings::BridgeLanguageConfig> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        (Some(w), Some(s)) => Some(merge_bridge_language_configs(w, s)),
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
+    resolve_with_wildcard(map, key, merge_bridge_language_configs)
 }
 
 /// Field-level merge of two BridgeLanguageConfig values.
@@ -178,15 +192,7 @@ pub(crate) fn resolve_language_server_with_wildcard(
     map: &HashMap<String, settings::BridgeServerConfig>,
     key: &str,
 ) -> Option<settings::BridgeServerConfig> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        (Some(w), Some(s)) => Some(merge_bridge_server_configs(w, s)),
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
+    resolve_with_wildcard(map, key, merge_bridge_server_configs)
 }
 
 /// Resolve a LanguageSettings key from a map with wildcard fallback and merging.
@@ -203,15 +209,7 @@ pub(crate) fn resolve_language_settings_with_wildcard(
     map: &HashMap<String, LanguageSettings>,
     key: &str,
 ) -> Option<LanguageSettings> {
-    let wildcard = map.get(WILDCARD_KEY);
-    let specific = map.get(key);
-
-    match (wildcard, specific) {
-        (Some(w), Some(s)) => Some(merge_language_settings(w, s)),
-        (Some(w), None) => Some(w.clone()),
-        (None, Some(s)) => Some(s.clone()),
-        (None, None) => None,
-    }
+    resolve_with_wildcard(map, key, merge_language_settings)
 }
 
 /// Returns the default search paths for parsers and queries.
