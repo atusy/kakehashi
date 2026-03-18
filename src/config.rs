@@ -80,10 +80,11 @@ pub(crate) fn merge_bridge_server_configs(
             &base.initialization_options,
             &overlay.initialization_options,
         ) {
-            (Some(w_opts), Some(s_opts)) => Some(deep_merge_json(w_opts, s_opts)),
-            (Some(w_opts), None) => Some(w_opts.clone()),
-            (None, Some(s_opts)) => Some(s_opts.clone()),
-            (None, None) => None,
+            (Some(b), Some(o)) => Some(deep_merge_json(b, o)),
+            _ => overlay
+                .initialization_options
+                .clone()
+                .or(base.initialization_options.clone()),
         },
         workspace_type: overlay.workspace_type.or(base.workspace_type),
     }
