@@ -1,0 +1,14 @@
+---
+source: src/config/merge.rs
+expression: resolved.initialization_options
+---
+{
+  "feature1": true,
+  "feature2": true,
+  "nested": {
+    "base_only": 1,
+    "overlay_only": 2,
+    "shared": "overlay"
+  },
+  "shared_opt": "overlay"
+}

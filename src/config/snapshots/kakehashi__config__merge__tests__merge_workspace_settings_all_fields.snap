@@ -1,0 +1,107 @@
+---
+source: src/config/merge.rs
+expression: result
+---
+{
+  "searchPaths": [
+    "/overlay/path"
+  ],
+  "languages": {
+    "lua": {
+      "parser": "/base/lua.so",
+      "queries": null,
+      "bridge": null,
+      "aliases": null
+    },
+    "python": {
+      "parser": "/base/python.so",
+      "queries": [
+        {
+          "path": "./overlay/python-highlights.scm",
+          "kind": "highlights"
+        }
+      ],
+      "bridge": {
+        "rust": {
+          "enabled": true,
+          "aggregation": null
+        }
+      },
+      "aliases": [
+        "py3"
+      ]
+    },
+    "rust": {
+      "parser": "/overlay/rust.so",
+      "queries": null,
+      "bridge": null,
+      "aliases": null
+    }
+  },
+  "captureMappings": {
+    "_": {
+      "highlights": {
+        "function.builtin": "base.function",
+        "type.builtin": "overlay.type",
+        "variable.builtin": "overlay.variable"
+      },
+      "locals": {
+        "definition.var": "overlay.definition"
+      },
+      "folds": {
+        "fold.comment": "base.comment",
+        "fold.function": "overlay.function"
+      }
+    },
+    "lua": {
+      "highlights": {
+        "keyword": "base.keyword"
+      },
+      "locals": {},
+      "folds": {}
+    },
+    "rust": {
+      "highlights": {
+        "type.builtin": "rust.type"
+      },
+      "locals": {},
+      "folds": {}
+    }
+  },
+  "autoInstall": false,
+  "languageServers": {
+    "lua-language-server": {
+      "cmd": [
+        "lua-language-server"
+      ],
+      "languages": [
+        "lua"
+      ],
+      "initializationOptions": null
+    },
+    "pyright": {
+      "cmd": [
+        "pyright-langserver",
+        "--stdio"
+      ],
+      "languages": [
+        "python"
+      ],
+      "initializationOptions": null
+    },
+    "rust-analyzer": {
+      "cmd": [
+        "rust-analyzer"
+      ],
+      "languages": [
+        "rust"
+      ],
+      "initializationOptions": {
+        "checkOnSave": true,
+        "linkedProjects": [
+          "./Cargo.toml"
+        ]
+      }
+    }
+  }
+}

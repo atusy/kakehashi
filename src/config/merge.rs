@@ -235,262 +235,253 @@ mod tests {
     use crate::config::settings;
     use std::collections::HashMap;
 
+    // ========================================================================
+    // merge_workspace_settings: Option combinator tests
+    // ========================================================================
+
     #[test]
-    fn test_merge_workspace_settings_with_none() {
-        let result = merge_workspace_settings(None, None);
-        assert!(result.is_none());
+    fn test_merge_workspace_settings_none_combinations() {
+        // None + None = None
+        assert!(merge_workspace_settings(None, None).is_none());
+
+        // Some + None = Some (base returned)
+        let base = RawWorkspaceSettings {
+            search_paths: Some(vec!["/base".to_string()]),
+            ..Default::default()
+        };
+        let result = merge_workspace_settings(Some(base), None).unwrap();
+        assert_eq!(result.search_paths, Some(vec!["/base".to_string()]));
+
+        // None + Some = Some (overlay returned)
+        let overlay = RawWorkspaceSettings {
+            search_paths: Some(vec!["/overlay".to_string()]),
+            ..Default::default()
+        };
+        let result = merge_workspace_settings(None, Some(overlay)).unwrap();
+        assert_eq!(result.search_paths, Some(vec!["/overlay".to_string()]));
     }
 
+    // ========================================================================
+    // merge_workspace_settings: overlay-wins and deep-merge across all fields
+    // ========================================================================
+
+    /// Exercises all five RawWorkspaceSettings fields in a single merge call.
+    ///
+    /// Tests three merge behaviors simultaneously:
+    /// - Scalar/Option fields: overlay wins (search_paths, auto_install)
+    /// - HashMap fields with shared keys: deep-merged (languages, language_servers,
+    ///   capture_mappings) — overlay values override per-key, base-only keys preserved
+    /// - HashMap fields with disjoint keys: union of both sides
     #[test]
-    fn test_merge_workspace_settings_fallback_only() {
-        let fallback = RawWorkspaceSettings {
-            search_paths: Some(vec!["/path/to/fallback".to_string()]),
-            ..Default::default()
-        };
-        let result = merge_workspace_settings(Some(fallback.clone()), None).unwrap();
-        assert_eq!(
-            result.search_paths,
-            Some(vec!["/path/to/fallback".to_string()])
-        );
-    }
+    fn test_merge_workspace_settings_all_fields() {
+        use serde_json::json;
+        use settings::{BridgeLanguageConfig, BridgeServerConfig};
 
-    #[test]
-    fn test_merge_workspace_settings_primary_only() {
-        let primary = RawWorkspaceSettings {
-            search_paths: Some(vec!["/path/to/primary".to_string()]),
-            ..Default::default()
-        };
-        let result = merge_workspace_settings(None, Some(primary.clone())).unwrap();
-        assert_eq!(
-            result.search_paths,
-            Some(vec!["/path/to/primary".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_merge_workspace_settings_prefer_primary() {
-        let mut fallback_languages = HashMap::new();
-        fallback_languages.insert(
-            "rust".to_string(),
-            LanguageSettings {
-                parser: Some("/fallback/rust.so".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let fallback = RawWorkspaceSettings {
-            search_paths: Some(vec!["/path/to/fallback".to_string()]),
-            languages: fallback_languages,
-            ..Default::default()
-        };
-
-        let mut primary_languages = HashMap::new();
-        primary_languages.insert(
-            "rust".to_string(),
-            LanguageSettings {
-                parser: Some("/primary/rust.so".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let primary = RawWorkspaceSettings {
-            search_paths: Some(vec!["/path/to/primary".to_string()]),
-            languages: primary_languages,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(fallback), Some(primary)).unwrap();
-
-        // Primary search paths should win
-        assert_eq!(
-            result.search_paths,
-            Some(vec!["/path/to/primary".to_string()])
-        );
-
-        // Primary language config should override fallback
-        assert_eq!(
-            result.languages["rust"].parser,
-            Some("/primary/rust.so".to_string())
-        );
-    }
-
-    #[test]
-    fn test_merge_capture_mappings() {
-        let mut fallback_mappings = HashMap::new();
-        let mut fallback_highlights = HashMap::new();
-        fallback_highlights.insert(
-            "variable.builtin".to_string(),
-            "fallback.variable".to_string(),
-        );
-        fallback_highlights.insert(
-            "function.builtin".to_string(),
-            "fallback.function".to_string(),
-        );
-
-        fallback_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: fallback_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        let fallback = RawWorkspaceSettings {
-            capture_mappings: fallback_mappings,
-            ..Default::default()
-        };
-
-        let mut primary_mappings = HashMap::new();
-        let mut primary_highlights = HashMap::new();
-        primary_highlights.insert(
-            "variable.builtin".to_string(),
-            "primary.variable".to_string(),
-        );
-        primary_highlights.insert("type.builtin".to_string(), "primary.type".to_string());
-
-        primary_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: primary_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        let primary = RawWorkspaceSettings {
-            capture_mappings: primary_mappings,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(fallback), Some(primary)).unwrap();
-
-        // Primary should override fallback for same keys
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].highlights["variable.builtin"],
-            "primary.variable"
-        );
-
-        // Primary adds new keys
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].highlights["type.builtin"],
-            "primary.type"
-        );
-
-        // Fallback keys not in primary should remain
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].highlights["function.builtin"],
-            "fallback.function"
-        );
-    }
-
-    #[test]
-    fn test_merge_workspace_settings_scalar_later_wins() {
-        // Later config's scalar values should override earlier ones
-        // Simulates: user config has autoInstall=true, project has autoInstall=false
-        let user_config = RawWorkspaceSettings {
-            search_paths: Some(vec!["/user/path".to_string()]),
+        // ── base ──────────────────────────────────────────────────────
+        let base = RawWorkspaceSettings {
+            search_paths: Some(vec!["/base/path".to_string()]),
             auto_install: Some(true),
-            ..Default::default()
+            languages: HashMap::from([
+                (
+                    "python".to_string(),
+                    LanguageSettings {
+                        parser: Some("/base/python.so".to_string()),
+                        queries: Some(vec![settings::QueryItem {
+                            path: "/base/python-highlights.scm".to_string(),
+                            kind: Some(settings::QueryKind::Highlights),
+                        }]),
+                        bridge: Some(HashMap::from([(
+                            "rust".to_string(),
+                            BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        aliases: Some(vec!["py3".to_string()]),
+                    },
+                ),
+                (
+                    "lua".to_string(),
+                    LanguageSettings {
+                        parser: Some("/base/lua.so".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            language_servers: Some(HashMap::from([
+                (
+                    "rust-analyzer".to_string(),
+                    BridgeServerConfig {
+                        cmd: vec!["rust-analyzer".to_string()],
+                        languages: vec!["rust".to_string()],
+                        initialization_options: Some(json!({"checkOnSave": true})),
+                    },
+                ),
+                (
+                    "lua-language-server".to_string(),
+                    BridgeServerConfig {
+                        cmd: vec!["lua-language-server".to_string()],
+                        languages: vec!["lua".to_string()],
+                        initialization_options: None,
+                    },
+                ),
+            ])),
+            capture_mappings: HashMap::from([
+                (
+                    "_".to_string(),
+                    QueryTypeMappings {
+                        highlights: HashMap::from([
+                            ("variable.builtin".to_string(), "base.variable".to_string()),
+                            ("function.builtin".to_string(), "base.function".to_string()),
+                        ]),
+                        locals: HashMap::from([(
+                            "definition.var".to_string(),
+                            "base.definition".to_string(),
+                        )]),
+                        folds: HashMap::from([(
+                            "fold.comment".to_string(),
+                            "base.comment".to_string(),
+                        )]),
+                    },
+                ),
+                (
+                    "lua".to_string(),
+                    QueryTypeMappings {
+                        highlights: HashMap::from([(
+                            "keyword".to_string(),
+                            "base.keyword".to_string(),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
         };
-        let project_config = RawWorkspaceSettings {
-            search_paths: Some(vec!["/project/path".to_string()]),
+
+        // ── overlay ───────────────────────────────────────────────────
+        let overlay = RawWorkspaceSettings {
+            search_paths: Some(vec!["/overlay/path".to_string()]),
             auto_install: Some(false),
-            ..Default::default()
+            languages: HashMap::from([
+                (
+                    // shared key: python — overlay overrides queries, inherits parser/bridge/aliases
+                    "python".to_string(),
+                    LanguageSettings {
+                        queries: Some(vec![settings::QueryItem {
+                            path: "./overlay/python-highlights.scm".to_string(),
+                            kind: Some(settings::QueryKind::Highlights),
+                        }]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    // new key: rust — added by overlay
+                    "rust".to_string(),
+                    LanguageSettings {
+                        parser: Some("/overlay/rust.so".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            language_servers: Some(HashMap::from([
+                (
+                    // shared key: rust-analyzer — overlay adds initOptions, inherits cmd/languages
+                    "rust-analyzer".to_string(),
+                    BridgeServerConfig {
+                        cmd: vec![],
+                        languages: vec![],
+                        initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                    },
+                ),
+                (
+                    // new key: pyright — added by overlay
+                    "pyright".to_string(),
+                    BridgeServerConfig {
+                        cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
+                        languages: vec!["python".to_string()],
+                        initialization_options: None,
+                    },
+                ),
+            ])),
+            capture_mappings: HashMap::from([
+                (
+                    // shared key: _ — overlay overrides variable.builtin, adds type.builtin;
+                    //   overrides locals definition.var; adds folds fold.function
+                    "_".to_string(),
+                    QueryTypeMappings {
+                        highlights: HashMap::from([
+                            (
+                                "variable.builtin".to_string(),
+                                "overlay.variable".to_string(),
+                            ),
+                            ("type.builtin".to_string(), "overlay.type".to_string()),
+                        ]),
+                        locals: HashMap::from([(
+                            "definition.var".to_string(),
+                            "overlay.definition".to_string(),
+                        )]),
+                        folds: HashMap::from([(
+                            "fold.function".to_string(),
+                            "overlay.function".to_string(),
+                        )]),
+                    },
+                ),
+                (
+                    // new key: rust — added by overlay
+                    "rust".to_string(),
+                    QueryTypeMappings {
+                        highlights: HashMap::from([(
+                            "type.builtin".to_string(),
+                            "rust.type".to_string(),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
+            ]),
         };
 
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // Project's values should win (later overrides earlier)
-        assert_eq!(result.search_paths, Some(vec!["/project/path".to_string()]));
-        assert_eq!(result.auto_install, Some(false));
+        // ── merge & snapshot ──────────────────────────────────────────
+        let result = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
+            insta::assert_json_snapshot!(result);
+        });
     }
 
-    // PBI-150 Subtask 2: Deep merge for languages HashMap
+    // ========================================================================
+    // merge_workspace_settings: empty-means-clear
+    // ========================================================================
 
     #[test]
-    fn test_merge_workspace_settings_languages_deep_merge() {
-        // Project sets queries field, inherits parser and bridge from user config
-        // This is the key behavior change from shallow to deep merge
-        use settings::BridgeLanguageConfig;
+    fn test_merge_workspace_settings_empty_language_servers_overlay_clears_base() {
+        use settings::BridgeServerConfig;
 
-        let mut user_languages = HashMap::new();
-        let mut user_bridge = HashMap::new();
-        user_bridge.insert(
-            "rust".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        user_languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                parser: Some("/usr/lib/python.so".to_string()),
-                queries: Some(vec![
-                    settings::QueryItem {
-                        path: "/usr/share/python/highlights.scm".to_string(),
-                        kind: Some(settings::QueryKind::Highlights),
-                    },
-                    settings::QueryItem {
-                        path: "/usr/share/python/locals.scm".to_string(),
-                        kind: Some(settings::QueryKind::Locals),
-                    },
-                ]),
-                bridge: Some(user_bridge),
-                ..Default::default()
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            languages: user_languages,
+        let base = RawWorkspaceSettings {
+            language_servers: Some(HashMap::from([(
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec!["rust".to_string()],
+                    initialization_options: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let overlay = RawWorkspaceSettings {
+            language_servers: Some(HashMap::new()),
             ..Default::default()
         };
 
-        // Project overrides queries for python
-        let mut project_languages = HashMap::new();
-        project_languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                // parser: None - Not specified - should inherit from user
-                queries: Some(vec![settings::QueryItem {
-                    path: "./queries/python-highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                }]),
-                // bridge: None - Not specified - should inherit from user
-                ..Default::default()
-            },
+        let result = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
+        assert!(
+            result.language_servers.unwrap().is_empty(),
+            "empty overlay should clear base language servers"
         );
-
-        let project_config = RawWorkspaceSettings {
-            languages: project_languages,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // Python should exist
-        assert!(result.languages.contains_key("python"));
-        let python = &result.languages["python"];
-
-        // Library: inherited from user (project was None)
-        assert_eq!(python.parser, Some("/usr/lib/python.so".to_string()));
-
-        // Queries: overridden by project (array replacement, not merge)
-        let queries = python.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(queries[0].path, "./queries/python-highlights.scm");
-
-        // Bridge: inherited from user (project was None)
-        assert!(python.bridge.is_some());
-        let bridge = python.bridge.as_ref().unwrap();
-        assert_eq!(bridge.get("rust").unwrap().enabled, Some(true));
     }
+
+    // ========================================================================
+    // merge_workspace_settings: bridge sub-map deep merge
+    // ========================================================================
 
     #[test]
     fn test_merge_workspace_settings_languages_bridge_deep_merge() {
@@ -500,464 +491,48 @@ mod tests {
         // Result should contain both rust and javascript.
         use settings::BridgeLanguageConfig;
 
-        let mut base_bridge = HashMap::new();
-        base_bridge.insert(
-            "rust".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        let mut overlay_bridge = HashMap::new();
-        overlay_bridge.insert(
-            "javascript".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        let mut base_languages = HashMap::new();
-        base_languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                bridge: Some(base_bridge),
-                ..Default::default()
-            },
-        );
-
-        let mut overlay_languages = HashMap::new();
-        overlay_languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                bridge: Some(overlay_bridge),
-                ..Default::default()
-            },
-        );
-
         let base_config = RawWorkspaceSettings {
-            languages: base_languages,
+            languages: HashMap::from([(
+                "python".to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "rust".to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
         let overlay_config = RawWorkspaceSettings {
-            languages: overlay_languages,
+            languages: HashMap::from([(
+                "python".to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "javascript".to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
 
         let result = merge_workspace_settings(Some(base_config), Some(overlay_config)).unwrap();
-        let python = &result.languages["python"];
-        let bridge = python.bridge.as_ref().expect("bridge should be Some");
+        let bridge = result.languages["python"]
+            .bridge
+            .as_ref()
+            .expect("bridge should be Some");
 
         // Both keys should be present (deep merge, not replacement)
-        assert!(
-            bridge.contains_key("rust"),
-            "base bridge entry 'rust' should be preserved after deep merge"
-        );
-        assert!(
-            bridge.contains_key("javascript"),
-            "overlay bridge entry 'javascript' should be present after deep merge"
-        );
-        assert_eq!(bridge.get("rust").unwrap().enabled, Some(true));
-        assert_eq!(bridge.get("javascript").unwrap().enabled, Some(true));
-    }
-
-    #[test]
-    fn test_merge_workspace_settings_languages_adds_new_keys() {
-        // User has python, project adds rust - both should exist
-        let mut user_languages = HashMap::new();
-        user_languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                parser: Some("/usr/lib/python.so".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            languages: user_languages,
-            ..Default::default()
-        };
-
-        let mut project_languages = HashMap::new();
-        project_languages.insert(
-            "rust".to_string(),
-            LanguageSettings {
-                parser: Some("/project/rust.so".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            languages: project_languages,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // Both languages should exist
-        assert!(result.languages.contains_key("python"));
-        assert!(result.languages.contains_key("rust"));
-
-        // Python from user
-        assert_eq!(
-            result.languages["python"].parser,
-            Some("/usr/lib/python.so".to_string())
-        );
-
-        // Rust from project
-        assert_eq!(
-            result.languages["rust"].parser,
-            Some("/project/rust.so".to_string())
-        );
-    }
-
-    // PBI-150 Subtask 3: Deep merge for languageServers HashMap
-
-    #[test]
-    fn test_merge_workspace_settings_language_servers_deep_merge() {
-        // Project adds initializationOptions to rust-analyzer, inherits cmd and languages from user
-        use serde_json::json;
-        use settings::BridgeServerConfig;
-
-        let mut user_servers = HashMap::new();
-        user_servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
-                initialization_options: None,
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            language_servers: Some(user_servers),
-            ..Default::default()
-        };
-
-        // Project only adds initializationOptions
-        let mut project_servers = HashMap::new();
-        project_servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec![],       // Empty, should inherit from user
-                languages: vec![], // Empty, should inherit from user
-                initialization_options: Some(json!({ "linkedProjects": ["./Cargo.toml"] })),
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            language_servers: Some(project_servers),
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        assert!(result.language_servers.is_some());
-        let servers = result.language_servers.as_ref().unwrap();
-        assert!(servers.contains_key("rust-analyzer"));
-
-        let ra = &servers["rust-analyzer"];
-
-        // cmd: inherited from user (project was empty)
-        assert_eq!(ra.cmd, vec!["rust-analyzer".to_string()]);
-
-        // languages: inherited from user (project was empty)
-        assert_eq!(ra.languages, vec!["rust".to_string()]);
-
-        // initializationOptions: added by project
-        assert!(ra.initialization_options.is_some());
-        let init_opts = ra.initialization_options.as_ref().unwrap();
-        assert!(init_opts.get("linkedProjects").is_some());
-    }
-
-    #[test]
-    fn test_merge_workspace_settings_language_servers_adds_new_server() {
-        // User has rust-analyzer, project adds pyright - both should exist
-        use settings::BridgeServerConfig;
-
-        let mut user_servers = HashMap::new();
-        user_servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
-                initialization_options: None,
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            language_servers: Some(user_servers),
-            ..Default::default()
-        };
-
-        let mut project_servers = HashMap::new();
-        project_servers.insert(
-            "pyright".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
-                languages: vec!["python".to_string()],
-                initialization_options: None,
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            language_servers: Some(project_servers),
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        assert!(result.language_servers.is_some());
-        let servers = result.language_servers.as_ref().unwrap();
-
-        // Both servers should exist
-        assert!(servers.contains_key("rust-analyzer"));
-        assert!(servers.contains_key("pyright"));
-
-        // rust-analyzer from user
-        assert_eq!(
-            servers["rust-analyzer"].cmd,
-            vec!["rust-analyzer".to_string()]
-        );
-
-        // pyright from project
-        assert_eq!(
-            servers["pyright"].cmd,
-            vec!["pyright-langserver".to_string(), "--stdio".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_merge_language_servers_empty_overlay_clears_base() {
-        // Empty overlay map means "disable all servers" — should not inherit from base
-        // This mirrors merge_bridge_maps' "empty-means-clear" contract
-        use settings::BridgeServerConfig;
-
-        let mut base_servers = HashMap::new();
-        base_servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
-                initialization_options: None,
-            },
-        );
-
-        let result = merge_language_servers(Some(base_servers), Some(HashMap::new()));
-        assert!(result.is_some());
-        assert!(
-            result.unwrap().is_empty(),
-            "empty overlay should clear base language servers"
-        );
-    }
-
-    // PBI-150 Subtask 4: Deep merge for captureMappings (already implemented, verify via merge_workspace_settings)
-
-    #[test]
-    fn test_merge_workspace_settings_capture_mappings_deep_merge() {
-        // Project overrides variable.builtin, inherits function.builtin from user config
-        let mut user_mappings = HashMap::new();
-        let mut user_highlights = HashMap::new();
-        user_highlights.insert(
-            "variable.builtin".to_string(),
-            "variable.defaultLibrary".to_string(),
-        );
-        user_highlights.insert(
-            "function.builtin".to_string(),
-            "function.defaultLibrary".to_string(),
-        );
-
-        user_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: user_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            capture_mappings: user_mappings,
-            ..Default::default()
-        };
-
-        // Project only overrides variable.builtin
-        let mut project_mappings = HashMap::new();
-        let mut project_highlights = HashMap::new();
-        project_highlights.insert(
-            "variable.builtin".to_string(),
-            "project.variable".to_string(),
-        );
-
-        project_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: project_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            capture_mappings: project_mappings,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // variable.builtin: overridden by project
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].highlights["variable.builtin"],
-            "project.variable"
-        );
-
-        // function.builtin: inherited from user
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].highlights["function.builtin"],
-            "function.defaultLibrary"
-        );
-    }
-
-    #[test]
-    fn test_merge_workspace_settings_capture_mappings_adds_new_language() {
-        // User has wildcard "_", project adds "rust" - both should exist
-        let mut user_mappings = HashMap::new();
-        let mut user_highlights = HashMap::new();
-        user_highlights.insert("variable.builtin".to_string(), "user.variable".to_string());
-
-        user_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: user_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            capture_mappings: user_mappings,
-            ..Default::default()
-        };
-
-        let mut project_mappings = HashMap::new();
-        let mut rust_highlights = HashMap::new();
-        rust_highlights.insert("type.builtin".to_string(), "rust.type".to_string());
-
-        project_mappings.insert(
-            "rust".to_string(),
-            QueryTypeMappings {
-                highlights: rust_highlights,
-                locals: HashMap::new(),
-                folds: HashMap::new(),
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            capture_mappings: project_mappings,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // Both language keys should exist
-        assert!(result.capture_mappings.contains_key(WILDCARD_KEY));
-        assert!(result.capture_mappings.contains_key("rust"));
-
-        // Wildcard from user
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].highlights["variable.builtin"],
-            "user.variable"
-        );
-
-        // Rust from project
-        assert_eq!(
-            result.capture_mappings["rust"].highlights["type.builtin"],
-            "rust.type"
-        );
-    }
-
-    #[test]
-    fn test_merge_workspace_settings_capture_mappings_locals_and_folds() {
-        // Verify deep merge works for locals and folds, not just highlights
-        let mut user_mappings = HashMap::new();
-        let mut user_locals = HashMap::new();
-        user_locals.insert(
-            "definition.var".to_string(),
-            "definition.variable".to_string(),
-        );
-        let mut user_folds = HashMap::new();
-        user_folds.insert("fold.comment".to_string(), "comment".to_string());
-
-        user_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: HashMap::new(),
-                locals: user_locals,
-                folds: user_folds,
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            capture_mappings: user_mappings,
-            ..Default::default()
-        };
-
-        // Project overrides one locals, adds one folds
-        let mut project_mappings = HashMap::new();
-        let mut project_locals = HashMap::new();
-        project_locals.insert(
-            "definition.var".to_string(),
-            "project.definition".to_string(),
-        );
-        let mut project_folds = HashMap::new();
-        project_folds.insert("fold.function".to_string(), "function".to_string());
-
-        project_mappings.insert(
-            "_".to_string(),
-            QueryTypeMappings {
-                highlights: HashMap::new(),
-                locals: project_locals,
-                folds: project_folds,
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            capture_mappings: project_mappings,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // locals.definition.var: overridden by project
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].locals["definition.var"],
-            "project.definition"
-        );
-
-        // folds.fold.comment: inherited from user
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].folds["fold.comment"],
-            "comment"
-        );
-
-        // folds.fold.function: added by project
-        assert_eq!(
-            result.capture_mappings[WILDCARD_KEY].folds["fold.function"],
-            "function"
-        );
+        assert!(bridge.contains_key("rust"));
+        assert!(bridge.contains_key("javascript"));
     }
 
     // PBI-153: Languages Wildcard Inheritance (ADR-0011)
@@ -970,50 +545,43 @@ mod tests {
         // - languages.python has bridge.javascript with enabled = false (override)
         // - We ask for bridge setting for "javascript" in "python" -> should get enabled = false
         // - We ask for bridge setting for "rust" in "python" -> should get enabled = true (from _)
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
-        // Wildcard language with wildcard bridge (default enabled = true)
-        let mut wildcard_bridge = HashMap::new();
-        wildcard_bridge.insert(
-            "_".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        languages.insert(
-            "_".to_string(),
-            LanguageSettings {
-                parser: Some("/default/path.so".to_string()),
-                queries: Some(vec![settings::QueryItem {
-                    path: "/default/highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                }]),
-                bridge: Some(wildcard_bridge),
-                ..Default::default()
-            },
-        );
-
-        // Python-specific: disable bridging to JavaScript, but inherit _ for parser
-        let mut python_bridge = HashMap::new();
-        python_bridge.insert(
-            "javascript".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(false),
-                ..Default::default()
-            },
-        );
-
-        languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                // parser: None - Should inherit from _
-                // queries: None - Should inherit from _
-                bridge: Some(python_bridge),
-                ..Default::default()
-            },
-        );
+        let languages = HashMap::from([
+            // Wildcard language with wildcard bridge (default enabled = true)
+            (
+                "_".to_string(),
+                LanguageSettings {
+                    parser: Some("/default/path.so".to_string()),
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/default/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    bridge: Some(HashMap::from([(
+                        "_".to_string(),
+                        settings::BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            // Python-specific: disable bridging to JavaScript, but inherit _ for parser
+            (
+                "python".to_string(),
+                LanguageSettings {
+                    // parser: None - Should inherit from _
+                    // queries: None - Should inherit from _
+                    bridge: Some(HashMap::from([(
+                        "javascript".to_string(),
+                        settings::BridgeLanguageConfig {
+                            enabled: Some(false),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        ]);
 
         // Resolve for "python" - should merge with wildcard
         let resolved_lang = resolve_with_wildcard(&languages, "python", merge_language_settings);
@@ -1035,8 +603,9 @@ mod tests {
         let js_resolved =
             resolve_with_wildcard(bridge, "javascript", merge_bridge_language_configs);
         assert!(js_resolved.is_some(), "Should resolve javascript bridge");
-        assert!(
-            js_resolved.unwrap().enabled == Some(false),
+        assert_eq!(
+            js_resolved.unwrap().enabled,
+            Some(false),
             "Python's javascript bridge should be disabled (override)"
         );
 
@@ -1047,8 +616,9 @@ mod tests {
             rust_resolved.is_some(),
             "Python's rust bridge should resolve (inherited from wildcard's bridge._)"
         );
-        assert!(
-            rust_resolved.unwrap().enabled == Some(true),
+        assert_eq!(
+            rust_resolved.unwrap().enabled,
+            Some(true),
             "Python's rust bridge should be enabled (from wildcard's bridge._)"
         );
     }
@@ -1059,33 +629,30 @@ mod tests {
         // - languages.python.bridge._ = enabled: true (python-specific default)
         // - languages.python.bridge.javascript = enabled: false (override)
         // - rust should inherit from python.bridge._ (enabled = true)
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
         // Python with its own wildcard bridge
-        let mut python_bridge = HashMap::new();
-        python_bridge.insert(
-            "_".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            }, // Python's own default
-        );
-        python_bridge.insert(
-            "javascript".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(false),
-                ..Default::default()
-            }, // Override for JS
-        );
-
-        languages.insert(
+        let languages = HashMap::from([(
             "python".to_string(),
             LanguageSettings {
                 parser: Some("/python/path.so".to_string()),
-                bridge: Some(python_bridge),
+                bridge: Some(HashMap::from([
+                    (
+                        "_".to_string(),
+                        settings::BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        }, // Python's own default
+                    ),
+                    (
+                        "javascript".to_string(),
+                        settings::BridgeLanguageConfig {
+                            enabled: Some(false),
+                            ..Default::default()
+                        }, // Override for JS
+                    ),
+                ])),
                 ..Default::default()
             },
-        );
+        )]);
 
         let resolved_lang = resolve_with_wildcard(&languages, "python", merge_language_settings);
         assert!(resolved_lang.is_some());
@@ -1096,16 +663,18 @@ mod tests {
         let js_resolved =
             resolve_with_wildcard(bridge, "javascript", merge_bridge_language_configs);
         assert!(js_resolved.is_some());
-        assert!(
-            js_resolved.unwrap().enabled == Some(false),
+        assert_eq!(
+            js_resolved.unwrap().enabled,
+            Some(false),
             "JavaScript should be disabled"
         );
 
         // Rust: inherits from python's bridge._
         let rust_resolved = resolve_with_wildcard(bridge, "rust", merge_bridge_language_configs);
         assert!(rust_resolved.is_some());
-        assert!(
-            rust_resolved.unwrap().enabled == Some(true),
+        assert_eq!(
+            rust_resolved.unwrap().enabled,
+            Some(true),
             "Rust should inherit from python.bridge._"
         );
     }
@@ -1121,26 +690,21 @@ mod tests {
         // languages._ has bridge._ with enabled = true
         // languages.python is NOT defined (should inherit from _)
         // We ask for bridge setting for "rust" in "python" -> should get enabled = true
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
         // Wildcard language with wildcard bridge
-        let mut wildcard_bridge = HashMap::new();
-        wildcard_bridge.insert(
-            "_".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        languages.insert(
+        let languages = HashMap::from([(
             "_".to_string(),
             LanguageSettings {
                 parser: Some("/default/path.so".to_string()),
-                bridge: Some(wildcard_bridge),
+                bridge: Some(HashMap::from([(
+                    "_".to_string(),
+                    settings::BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
                 ..Default::default()
             },
-        );
+        )]);
 
         // Resolve for "python" which doesn't exist - should get wildcard language
         let resolved_lang = resolve_with_wildcard(&languages, "python", merge_language_settings);
@@ -1162,8 +726,9 @@ mod tests {
             resolved_bridge.is_some(),
             "Should resolve to wildcard bridge"
         );
-        assert!(
-            resolved_bridge.unwrap().enabled == Some(true),
+        assert_eq!(
+            resolved_bridge.unwrap().enabled,
+            Some(true),
             "Nested wildcard resolution: languages._.bridge._ should apply to python.bridge.rust"
         );
     }
@@ -1181,52 +746,47 @@ mod tests {
         //
         // This tests that python inherits rust/go from wildcard while adding
         // its own javascript setting.
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
-        // Wildcard has default bridge settings for rust and go
-        let mut wildcard_bridge = HashMap::new();
-        wildcard_bridge.insert(
-            "rust".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-        wildcard_bridge.insert(
-            "go".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-
-        languages.insert(
-            "_".to_string(),
-            LanguageSettings {
-                parser: Some("/default/path.so".to_string()),
-                bridge: Some(wildcard_bridge),
-                ..Default::default()
-            },
-        );
-
-        // Python adds javascript bridge but should inherit rust/go from wildcard
-        let mut python_bridge = HashMap::new();
-        python_bridge.insert(
-            "javascript".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(false),
-                ..Default::default()
-            },
-        );
-
-        languages.insert(
-            "python".to_string(),
-            LanguageSettings {
-                // parser: None - Inherits from wildcard
-                bridge: Some(python_bridge),
-                ..Default::default()
-            },
-        );
+        let languages = HashMap::from([
+            // Wildcard has default bridge settings for rust and go
+            (
+                "_".to_string(),
+                LanguageSettings {
+                    parser: Some("/default/path.so".to_string()),
+                    bridge: Some(HashMap::from([
+                        (
+                            "rust".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "go".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+            ),
+            // Python adds javascript bridge but should inherit rust/go from wildcard
+            (
+                "python".to_string(),
+                LanguageSettings {
+                    // parser: None - Inherits from wildcard
+                    bridge: Some(HashMap::from([(
+                        "javascript".to_string(),
+                        settings::BridgeLanguageConfig {
+                            enabled: Some(false),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        ]);
 
         // Resolve for "python" - bridge should be deep merged with wildcard
         let resolved = resolve_with_wildcard(&languages, "python", merge_language_settings);
@@ -1267,293 +827,113 @@ mod tests {
 
     // PBI-154: languageServers Wildcard Inheritance (ADR-0011)
 
-    /// Helper to build servers map for wildcard resolution tests
-    fn build_servers_map(
-        wildcard: Option<settings::BridgeServerConfig>,
-        specific: Option<settings::BridgeServerConfig>,
-    ) -> HashMap<String, settings::BridgeServerConfig> {
-        let mut servers = HashMap::new();
-        if let Some(w) = wildcard {
-            servers.insert("_".to_string(), w);
-        }
-        if let Some(s) = specific {
-            servers.insert("rust-analyzer".to_string(), s);
-        }
-        servers
-    }
-
+    /// ADR-0011: resolve_with_wildcard covers all 4 match arms for language servers.
+    ///
+    /// - Neither wildcard nor specific → None
+    /// - Wildcard only → cloned wildcard
+    /// - Specific only → cloned specific
+    /// - Both → merged (specific overrides wildcard, empty Vec inherits)
     #[test]
-    fn test_resolve_language_server_returns_none_when_neither_exists() {
-        // ADR-0011: Neither wildcard nor specific key -> return None
-        let servers = build_servers_map(None, None);
-
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
-
-        assert!(
-            result.is_none(),
-            "Should return None when neither wildcard nor specific key exists"
-        );
-    }
-
-    #[test]
-    fn test_resolve_language_server_returns_wildcard_when_specific_absent() {
-        // ADR-0011: When languageServers only has "_" and we ask for "rust-analyzer",
-        // we should get the wildcard's settings
-        let wildcard = settings::BridgeServerConfig {
-            cmd: vec!["default-lsp".to_string()],
-            languages: vec!["any".to_string()],
-            initialization_options: None,
-        };
-        let servers = build_servers_map(Some(wildcard), None);
-
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
-
-        assert!(result.is_some(), "Should return Some when wildcard exists");
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.cmd,
-            vec!["default-lsp".to_string()],
-            "Should inherit cmd from wildcard"
-        );
-        assert_eq!(
-            resolved.languages,
-            vec!["any".to_string()],
-            "Should inherit languages from wildcard"
-        );
-    }
-
-    #[test]
-    fn test_resolve_language_server_returns_specific_when_wildcard_absent() {
-        // ADR-0011: No wildcard, only specific key -> return specific
-        let specific = settings::BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec!["rust".to_string()],
-            initialization_options: None,
-        };
-        let servers = build_servers_map(None, Some(specific));
-
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
-
-        assert!(
-            result.is_some(),
-            "Should return Some when specific key exists"
-        );
-        let resolved = result.unwrap();
-        assert_eq!(
-            resolved.cmd,
-            vec!["rust-analyzer".to_string()],
-            "Should return specific config"
-        );
-        assert_eq!(
-            resolved.languages,
-            vec!["rust".to_string()],
-            "Should return specific languages"
-        );
-    }
-
-    #[test]
-    fn test_resolve_language_server_specific_overrides_wildcard() {
-        // ADR-0011: Server-specific values override wildcard values
-        // When both wildcard and specific server exist, specific values take precedence
+    fn test_resolve_language_server_wildcard_combinations() {
         use serde_json::json;
+        use settings::BridgeServerConfig;
 
-        let wildcard = settings::BridgeServerConfig {
-            cmd: vec!["default-lsp".to_string()],
-            languages: vec!["any".to_string()],
-            initialization_options: Some(json!({ "defaultOption": true })),
-        };
-        let specific = settings::BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![], // Empty means inherit from wildcard
-            initialization_options: Some(json!({ "linkedProjects": ["./Cargo.toml"] })),
-        };
-        let servers = build_servers_map(Some(wildcard), Some(specific));
+        // Neither → None
+        let empty: HashMap<String, BridgeServerConfig> = HashMap::new();
+        assert!(resolve_with_wildcard(&empty, "ra", merge_bridge_server_configs).is_none());
 
-        let result = resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs);
+        // Wildcard only → cloned
+        let servers = HashMap::from([(
+            "_".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["default-lsp".to_string()],
+                languages: vec!["any".to_string()],
+                initialization_options: None,
+            },
+        )]);
+        let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
+        assert_eq!(resolved.cmd, vec!["default-lsp".to_string()]);
+        assert_eq!(resolved.languages, vec!["any".to_string()]);
 
-        assert!(result.is_some(), "Should return merged config");
-        let resolved = result.unwrap();
+        // Specific only → cloned
+        let servers = HashMap::from([(
+            "ra".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["rust-analyzer".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+            },
+        )]);
+        let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
+        assert_eq!(resolved.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(resolved.languages, vec!["rust".to_string()]);
 
-        // cmd: overridden by specific
-        assert_eq!(
-            resolved.cmd,
-            vec!["rust-analyzer".to_string()],
-            "Should use rust-analyzer's cmd"
-        );
-
-        // languages: inherited from wildcard (specific was empty)
-        assert_eq!(
-            resolved.languages,
-            vec!["any".to_string()],
-            "Should inherit languages from wildcard since specific is empty"
-        );
-
-        // initialization_options: deep merged (ADR-0010)
-        let init_opts = resolved
-            .initialization_options
-            .expect("Should have merged initialization_options");
+        // Both → merged (specific cmd wins, empty languages inherits, initOptions deep-merged)
+        let servers = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["default-lsp".to_string()],
+                    languages: vec!["any".to_string()],
+                    initialization_options: Some(json!({"defaultOption": true})),
+                },
+            ),
+            (
+                "ra".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec![],
+                    initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                },
+            ),
+        ]);
+        let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
+        assert_eq!(resolved.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(resolved.languages, vec!["any".to_string()]);
+        let init_opts = resolved.initialization_options.unwrap();
+        assert_eq!(init_opts.get("defaultOption"), Some(&json!(true)));
         assert_eq!(
             init_opts.get("linkedProjects"),
-            Some(&json!(["./Cargo.toml"])),
-            "Should have rust-analyzer's linkedProjects"
-        );
-        assert_eq!(
-            init_opts.get("defaultOption"),
-            Some(&json!(true)),
-            "Should inherit defaultOption from wildcard (deep merge per ADR-0010)"
+            Some(&json!(["./Cargo.toml"]))
         );
     }
 
     // PBI-157: Deep merge for initialization_options (ADR-0010)
 
+    /// ADR-0010: initialization_options deep merge covers three behaviors:
+    /// - Disjoint keys: both preserved (feature1 from base, feature2 from overlay)
+    /// - Same key: overlay wins (shared_opt = "overlay")
+    /// - Nested objects: recursively merged (nested.base_only + nested.overlay_only)
     #[test]
-    fn test_merge_bridge_server_configs_deep_merges_initialization_options() {
-        // ADR-0010: initialization_options should be deep merged, not replaced
-        // Base provides {feature1: true}, overlay provides {feature2: true}
-        // Result should be {feature1: true, feature2: true}
+    fn test_merge_bridge_server_configs_initialization_options_deep_merge() {
         use serde_json::json;
         use settings::BridgeServerConfig;
 
         let base = BridgeServerConfig {
             cmd: vec!["default-lsp".to_string()],
             languages: vec![],
-            initialization_options: Some(json!({ "feature1": true })),
+            initialization_options: Some(json!({
+                "feature1": true,
+                "shared_opt": "base",
+                "nested": { "base_only": 1, "shared": "base" }
+            })),
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
             languages: vec!["rust".to_string()],
-            initialization_options: Some(json!({ "feature2": true })),
+            initialization_options: Some(json!({
+                "feature2": true,
+                "shared_opt": "overlay",
+                "nested": { "overlay_only": 2, "shared": "overlay" }
+            })),
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
-
-        // Should deep merge both features
-        let init_opts = resolved.initialization_options.unwrap();
-        assert_eq!(
-            init_opts.get("feature1"),
-            Some(&json!(true)),
-            "Should inherit feature1 from base (deep merge)"
-        );
-        assert_eq!(
-            init_opts.get("feature2"),
-            Some(&json!(true)),
-            "Should have feature2 from overlay"
-        );
-    }
-
-    #[test]
-    fn test_merge_language_servers_deep_merges_initialization_options() {
-        // ADR-0010: merge_language_servers should deep merge initialization_options
-        // Base layer has {baseOpt: 1}, overlay has {overlayOpt: 2}
-        // Result should have both options
-        use serde_json::json;
-        use settings::BridgeServerConfig;
-
-        let mut base_servers = HashMap::new();
-        base_servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
-                initialization_options: Some(json!({ "baseOpt": 1 })),
-            },
-        );
-
-        let mut overlay_servers = HashMap::new();
-        overlay_servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec![],
-                languages: vec![],
-                initialization_options: Some(json!({ "overlayOpt": 2 })),
-            },
-        );
-
-        let result = merge_language_servers(Some(base_servers), Some(overlay_servers));
-        assert!(result.is_some());
-        let merged = result.unwrap();
-        assert!(merged.contains_key("rust-analyzer"));
-
-        let ra = &merged["rust-analyzer"];
-        let init_opts = ra.initialization_options.as_ref().unwrap();
-
-        // Should have both options (deep merge)
-        assert_eq!(
-            init_opts.get("baseOpt"),
-            Some(&json!(1)),
-            "Should preserve baseOpt from base layer"
-        );
-        assert_eq!(
-            init_opts.get("overlayOpt"),
-            Some(&json!(2)),
-            "Should have overlayOpt from overlay layer"
-        );
-    }
-
-    #[test]
-    fn test_merge_bridge_server_configs_overlay_overrides_base_same_key() {
-        // ADR-0010: Overlay values override base for same keys
-        // Base has {opt: 1}, overlay has {opt: 2}
-        // Result should be {opt: 2}
-        use serde_json::json;
-        use settings::BridgeServerConfig;
-
-        let base = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
-            initialization_options: Some(json!({ "opt": 1 })),
-        };
-        let overlay = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![],
-            initialization_options: Some(json!({ "opt": 2 })),
-        };
-
-        let resolved = merge_bridge_server_configs(&base, &overlay);
-        let init_opts = resolved.initialization_options.unwrap();
-
-        // Overlay value should override base
-        assert_eq!(
-            init_opts.get("opt"),
-            Some(&json!(2)),
-            "Overlay value should override base for same key"
-        );
-    }
-
-    #[test]
-    fn test_merge_bridge_server_configs_nested_objects_deep_merge() {
-        // ADR-0010: Nested JSON objects should merge recursively
-        // Base has {a: {b: 1}}, overlay has {a: {c: 2}}
-        // Result should be {a: {b: 1, c: 2}}
-        use serde_json::json;
-        use settings::BridgeServerConfig;
-
-        let base = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
-            initialization_options: Some(json!({ "a": { "b": 1 } })),
-        };
-        let overlay = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![],
-            initialization_options: Some(json!({ "a": { "c": 2 } })),
-        };
-
-        let resolved = merge_bridge_server_configs(&base, &overlay);
-        let init_opts = resolved.initialization_options.unwrap();
-
-        // Should deep merge nested objects
-        let a_obj = init_opts.get("a").unwrap().as_object().unwrap();
-        assert_eq!(
-            a_obj.get("b"),
-            Some(&json!(1)),
-            "Should preserve b from base"
-        );
-        assert_eq!(
-            a_obj.get("c"),
-            Some(&json!(2)),
-            "Should have c from overlay"
-        );
+        let mut snap_settings = insta::Settings::clone_current();
+        snap_settings.set_sort_maps(true);
+        snap_settings.bind(|| {
+            insta::assert_json_snapshot!(resolved.initialization_options);
+        });
     }
 
     // ========================================================================
@@ -1574,39 +954,35 @@ mod tests {
     fn test_language_config_inherits_from_wildcard() {
         use settings::BridgeLanguageConfig;
 
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
-        // Wildcard language: disable bridging by default (empty bridge filter)
-        let wildcard_bridge = HashMap::new(); // Empty = disable all bridging
-        languages.insert(
-            "_".to_string(),
-            LanguageSettings {
-                queries: Some(vec![settings::QueryItem {
-                    path: "/default/highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                }]),
-                bridge: Some(wildcard_bridge),
-                ..Default::default()
-            },
-        );
-
-        // Markdown: enable only rust bridging
-        let mut markdown_bridge = HashMap::new();
-        markdown_bridge.insert(
-            "rust".to_string(),
-            BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
-        );
-        languages.insert(
-            "markdown".to_string(),
-            LanguageSettings {
-                // highlights: None - Should inherit from wildcard
-                bridge: Some(markdown_bridge),
-                ..Default::default()
-            },
-        );
+        let languages = HashMap::from([
+            // Wildcard language: disable bridging by default (empty bridge filter)
+            (
+                "_".to_string(),
+                LanguageSettings {
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/default/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    bridge: Some(HashMap::new()), // Empty = disable all bridging
+                    ..Default::default()
+                },
+            ),
+            // Markdown: enable only rust bridging
+            (
+                "markdown".to_string(),
+                LanguageSettings {
+                    // highlights: None - Should inherit from wildcard
+                    bridge: Some(HashMap::from([(
+                        "rust".to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+        ]);
 
         // Test 1: "markdown" should have its own bridge filter (not wildcard's)
         let markdown =
@@ -1649,16 +1025,14 @@ mod tests {
     /// from languages._ settings.
     #[test]
     fn test_language_settings_wildcard_lookup_blocks_bridging_for_undefined_host() {
-        let mut languages: HashMap<String, LanguageSettings> = HashMap::new();
-
         // Wildcard: block all bridging with empty filter
-        languages.insert(
+        let languages = HashMap::from([(
             "_".to_string(),
             LanguageSettings {
                 bridge: Some(HashMap::new()),
                 ..Default::default()
             },
-        );
+        )]);
 
         // Look up "quarto" which doesn't exist - should inherit from wildcard
         let quarto = resolve_with_wildcard(&languages, "quarto", merge_language_settings);
@@ -1695,27 +1069,26 @@ mod tests {
         use serde_json::json;
         use settings::BridgeServerConfig;
 
-        let mut servers: HashMap<String, BridgeServerConfig> = HashMap::new();
-
-        // Wildcard server: default initialization options
-        servers.insert(
-            "_".to_string(),
-            BridgeServerConfig {
-                cmd: vec![],
-                languages: vec![],
-                initialization_options: Some(json!({ "checkOnSave": true })),
-            },
-        );
-
-        // rust-analyzer: only specifies cmd and languages
-        servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
-                initialization_options: None, // Should inherit from wildcard
-            },
-        );
+        let servers = HashMap::from([
+            // Wildcard server: default initialization options
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    cmd: vec![],
+                    languages: vec![],
+                    initialization_options: Some(json!({ "checkOnSave": true })),
+                },
+            ),
+            // rust-analyzer: only specifies cmd and languages
+            (
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec!["rust".to_string()],
+                    initialization_options: None, // Should inherit from wildcard
+                },
+            ),
+        ]);
 
         // Test: rust-analyzer should merge with wildcard
         let ra =
@@ -1741,32 +1114,31 @@ mod tests {
     fn test_language_server_lookup_uses_resolved_languages_from_wildcard() {
         use settings::BridgeServerConfig;
 
-        let mut servers: HashMap<String, BridgeServerConfig> = HashMap::new();
-
-        // Wildcard server: specifies languages = ["rust", "python"]
-        servers.insert(
-            "_".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["default-lsp".to_string()],
-                languages: vec!["rust".to_string(), "python".to_string()],
-                initialization_options: None,
-            },
-        );
-
-        // rust-analyzer: specifies only cmd, inherits languages from wildcard
-        servers.insert(
-            "rust-analyzer".to_string(),
-            BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec![], // Empty - should inherit from wildcard
-                initialization_options: None,
-            },
-        );
+        let servers = HashMap::from([
+            // Wildcard server: specifies languages = ["rust", "python"]
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["default-lsp".to_string()],
+                    languages: vec!["rust".to_string(), "python".to_string()],
+                    initialization_options: None,
+                },
+            ),
+            // rust-analyzer: specifies only cmd, inherits languages from wildcard
+            (
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec![], // Empty - should inherit from wildcard
+                    initialization_options: None,
+                },
+            ),
+        ]);
 
         // Simulate the lookup logic from get_bridge_config_for_language:
         // For each server (excluding "_"), resolve it and check if it handles "rust"
         let injection_language = "rust";
-        let mut found_server: Option<BridgeServerConfig> = None;
+        let mut found_server = None;
 
         for server_name in servers.keys() {
             if server_name == "_" {
@@ -1802,103 +1174,31 @@ mod tests {
         );
     }
 
-    // Regression test: aliases must be merged in merge_languages()
-    // Bug: When aliases field was added to LanguageSettings, merge_languages() was not
-    // updated to merge it. This caused aliases from user config to be lost when
-    // project config also defined the same language.
-
-    #[test]
-    fn test_merge_workspace_settings_languages_preserves_aliases() {
-        // User config defines markdown with aliases=["rmd"]
-        // Project config adds highlights for markdown but doesn't set aliases
-        // Result should preserve aliases from user config
-        let mut user_languages = HashMap::new();
-        user_languages.insert(
-            "markdown".to_string(),
-            LanguageSettings {
-                parser: Some("/usr/lib/markdown.so".to_string()),
-                aliases: Some(vec!["rmd".to_string(), "qmd".to_string()]),
-                ..Default::default()
-            },
-        );
-
-        let user_config = RawWorkspaceSettings {
-            languages: user_languages,
-            ..Default::default()
-        };
-
-        // Project only adds queries, doesn't set aliases
-        let mut project_languages = HashMap::new();
-        project_languages.insert(
-            "markdown".to_string(),
-            LanguageSettings {
-                queries: Some(vec![settings::QueryItem {
-                    path: "./queries/markdown-highlights.scm".to_string(),
-                    kind: Some(settings::QueryKind::Highlights),
-                }]),
-                // aliases: None - should inherit from user
-                ..Default::default()
-            },
-        );
-
-        let project_config = RawWorkspaceSettings {
-            languages: project_languages,
-            ..Default::default()
-        };
-
-        let result = merge_workspace_settings(Some(user_config), Some(project_config));
-        assert!(result.is_some());
-        let result = result.unwrap();
-
-        // Markdown should exist
-        assert!(result.languages.contains_key("markdown"));
-        let markdown = &result.languages["markdown"];
-
-        // Parser: inherited from user
-        assert_eq!(markdown.parser, Some("/usr/lib/markdown.so".to_string()));
-
-        // Queries: overridden by project
-        let queries = markdown.queries.as_ref().unwrap();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(queries[0].path, "./queries/markdown-highlights.scm");
-
-        // Aliases: MUST be inherited from user (this was the bug)
-        assert!(
-            markdown.aliases.is_some(),
-            "aliases should be preserved from user config"
-        );
-        let aliases = markdown.aliases.as_ref().unwrap();
-        assert_eq!(aliases.len(), 2);
-        assert!(aliases.contains(&"rmd".to_string()));
-        assert!(aliases.contains(&"qmd".to_string()));
-    }
+    // Alias inheritance (overlay=None inherits from base) is covered by
+    // test_merge_workspace_settings_all_fields snapshot (python.aliases = ["py3"]).
 
     #[test]
     fn test_merge_workspace_settings_languages_project_aliases_override_user() {
         // When project explicitly sets aliases, it should override user config
-        let mut user_languages = HashMap::new();
-        user_languages.insert(
-            "markdown".to_string(),
-            LanguageSettings {
-                aliases: Some(vec!["rmd".to_string()]),
-                ..Default::default()
-            },
-        );
-
         let user_config = RawWorkspaceSettings {
-            languages: user_languages,
+            languages: HashMap::from([(
+                "markdown".to_string(),
+                LanguageSettings {
+                    aliases: Some(vec!["rmd".to_string()]),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
 
         // Project overrides aliases
-        let mut project_languages = HashMap::new();
-        project_languages.insert(
+        let project_languages = HashMap::from([(
             "markdown".to_string(),
             LanguageSettings {
                 aliases: Some(vec!["qmd".to_string(), "mdx".to_string()]),
                 ..Default::default()
             },
-        );
+        )]);
 
         let project_config = RawWorkspaceSettings {
             languages: project_languages,
@@ -1976,27 +1276,28 @@ mod tests {
     #[test]
     fn test_resolve_with_wildcard_bridge_language_merges_fields() {
         // Wildcard provides aggregation defaults; specific provides enabled override
-        let mut map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        map.insert(
-            "_".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "_".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["server_a".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
-        map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(false),
-                aggregation: None,
-            },
-        );
+        let map = HashMap::from([
+            (
+                "_".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["server_a".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            ),
+            (
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(false),
+                    aggregation: None,
+                },
+            ),
+        ]);
 
         let resolved =
             resolve_with_wildcard(&map, "python", merge_bridge_language_configs).unwrap();
@@ -2016,36 +1317,39 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_deep_merges_aggregation() {
-        // Wildcard bridge has python with aggregation defaults
-        // Specific bridge has python with enabled override but no aggregation
-        // After merge, python should have both enabled override AND inherited aggregation
-        let mut wildcard_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        wildcard_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "_".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_aggregation_inherited_from_base() {
+        // Base bridge has aggregation, overlay has enabled override but no aggregation.
+        // After merge, aggregation should be inherited from base.
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut specific_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        specific_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(false),
-                aggregation: None, // no aggregation override
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(false),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(wildcard_map), &Some(specific_map)).unwrap();
-        let python = merged.get("python").unwrap();
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
         assert_eq!(
             python.enabled,
             Some(false),
@@ -2053,7 +1357,7 @@ mod tests {
         );
         assert!(
             python.aggregation.is_some(),
-            "aggregation should be inherited from wildcard"
+            "aggregation should be inherited from base"
         );
         assert_eq!(
             python.aggregation.as_ref().unwrap()["_"].priorities,
@@ -2062,82 +1366,86 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_empty_overlay_clears_base() {
-        // Empty overlay map means "disable all bridging" — should not inherit from base
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                ..Default::default()
-            },
+    fn test_merge_language_settings_empty_bridge_overlay_clears_base() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let merged = merge_language_settings(&base, &overlay);
+        assert!(
+            merged.bridge.unwrap().is_empty(),
+            "empty overlay should clear base"
         );
-
-        let empty_overlay: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-
-        let merged = merge_bridge_maps(&Some(base_map), &Some(empty_overlay)).unwrap();
-        assert!(merged.is_empty(), "empty overlay should clear base");
     }
 
     #[test]
-    fn test_merge_bridge_maps_overlay_aggregation_wins_on_shared_keys() {
-        // Both base and overlay define aggregation for the same method key.
-        // Overlay should win for shared keys; base-only keys are preserved.
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([
-                    (
-                        "_".to_string(),
-                        settings::AggregationConfig {
-                            priorities: vec!["base_default".to_string()],
-                            ..Default::default()
-                        },
-                    ),
-                    (
+    fn test_merge_language_settings_bridge_aggregation_overlay_wins_on_shared_keys() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        (
+                            "_".to_string(),
+                            settings::AggregationConfig {
+                                priorities: vec!["base_default".to_string()],
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "textDocument/hover".to_string(),
+                            settings::AggregationConfig {
+                                priorities: vec!["base_hover".to_string()],
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["base_hover".to_string()],
+                            priorities: vec!["overlay_hover".to_string()],
                             ..Default::default()
                         },
-                    ),
-                ])),
-            },
-        );
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["overlay_hover".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
-
-        // enabled: overlay has None, so base's Some(true) wins
         assert_eq!(python.enabled, Some(true));
 
         let agg = python.aggregation.as_ref().unwrap();
-
-        // Shared key "textDocument/hover": overlay wins
         assert_eq!(
             agg["textDocument/hover"].priorities,
             vec!["overlay_hover".to_string()],
             "overlay should win for shared aggregation keys"
         );
-
-        // Base-only key "_": preserved from base
         assert_eq!(
             agg["_"].priorities,
             vec!["base_default".to_string()],
@@ -2146,48 +1454,47 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_overlay_aggregation_preserves_strategy_when_atomic() {
-        // When overlay replaces an aggregation entry, the entire entry
-        // (including strategy) is replaced atomically — base's strategy
-        // does NOT leak into overlay's entry.
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "textDocument/diagnostic".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["ruff".to_string()],
-                        strategy: Some(settings::AggregationStrategy::Concatenated),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_aggregation_strategy_replaced_atomically() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/diagnostic".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["ruff".to_string()],
+                            strategy: Some(settings::AggregationStrategy::Concatenated),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/diagnostic".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        strategy: Some(settings::AggregationStrategy::Preferred),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/diagnostic".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            strategy: Some(settings::AggregationStrategy::Preferred),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
-        let agg = python.aggregation.as_ref().unwrap();
-        let diag = &agg["textDocument/diagnostic"];
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
+        let diag = &python.aggregation.as_ref().unwrap()["textDocument/diagnostic"];
 
-        // Overlay wins entirely for the shared key
         assert_eq!(
             diag.priorities,
             vec!["pyright".to_string()],
@@ -2201,43 +1508,45 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_preserves_max_fan_out_from_base_only_keys() {
-        // Overlay omits method key entirely → base maxFanOut preserved
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "_".to_string(),
-                    settings::AggregationConfig {
-                        max_fan_out: Some(3),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_max_fan_out_preserved_from_base_only_keys() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "_".to_string(),
+                        settings::AggregationConfig {
+                            max_fan_out: Some(3),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
         let agg = python.aggregation.as_ref().unwrap();
 
-        // Base-only key "_" is preserved (overlay didn't touch it)
         assert_eq!(
             agg["_"].max_fan_out,
             Some(3),
@@ -2246,44 +1555,45 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_bridge_maps_overlay_same_key_without_max_fan_out_replaces_atomically() {
-        // Overlay includes same method key without maxFanOut →
-        // base maxFanOut is lost (atomic per-key replacement)
-        let mut base_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        base_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: Some(true),
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["ruff".to_string()],
-                        max_fan_out: Some(2),
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+    fn test_merge_language_settings_bridge_max_fan_out_lost_on_same_key_replacement() {
+        let base = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["ruff".to_string()],
+                            max_fan_out: Some(2),
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let mut overlay_map: HashMap<String, settings::BridgeLanguageConfig> = HashMap::new();
-        overlay_map.insert(
-            "python".to_string(),
-            settings::BridgeLanguageConfig {
-                enabled: None,
-                aggregation: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    settings::AggregationConfig {
-                        priorities: vec!["pyright".to_string()],
-                        ..Default::default()
-                    },
-                )])),
-            },
-        );
+        let overlay = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                "python".to_string(),
+                settings::BridgeLanguageConfig {
+                    enabled: None,
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        settings::AggregationConfig {
+                            priorities: vec!["pyright".to_string()],
+                            ..Default::default()
+                        },
+                    )])),
+                },
+            )])),
+            ..Default::default()
+        };
 
-        let merged = merge_bridge_maps(&Some(base_map), &Some(overlay_map)).unwrap();
-        let python = merged.get("python").unwrap();
-        let agg = python.aggregation.as_ref().unwrap();
-        let hover = &agg["textDocument/hover"];
+        let merged = merge_language_settings(&base, &overlay);
+        let python = merged.bridge.unwrap().remove("python").unwrap();
+        let hover = &python.aggregation.as_ref().unwrap()["textDocument/hover"];
 
         assert_eq!(
             hover.priorities,
