@@ -78,7 +78,6 @@ pub(crate) fn merge_bridge_server_configs(
 /// Field-level merge of two LanguageSettings values.
 /// Option fields: overlay wins when present; base provides defaults.
 /// Bridge HashMaps: deep merged via merge_bridge_maps.
-/// Aliases: not inherited from wildcard (specific to each language).
 pub(crate) fn merge_language_settings(
     base: &LanguageSettings,
     overlay: &LanguageSettings,
@@ -87,7 +86,7 @@ pub(crate) fn merge_language_settings(
         parser: overlay.parser.clone().or_else(|| base.parser.clone()),
         queries: overlay.queries.clone().or_else(|| base.queries.clone()),
         bridge: merge_bridge_maps(&base.bridge, &overlay.bridge),
-        aliases: overlay.aliases.clone(),
+        aliases: overlay.aliases.clone().or_else(|| base.aliases.clone()),
     }
 }
 
@@ -183,23 +182,10 @@ fn merge_languages(
     mut base: HashMap<String, LanguageSettings>,
     overlay: HashMap<String, LanguageSettings>,
 ) -> HashMap<String, LanguageSettings> {
-    // Deep merge: overlay values override base values for the same key
-    for (key, mut overlay_config) in overlay {
+    for (key, overlay_config) in overlay {
         base.entry(key)
             .and_modify(|base_config| {
-                base_config.parser = overlay_config
-                    .parser
-                    .take()
-                    .or_else(|| base_config.parser.take());
-                base_config.queries = overlay_config
-                    .queries
-                    .take()
-                    .or_else(|| base_config.queries.take());
-                base_config.bridge = merge_bridge_maps(&base_config.bridge, &overlay_config.bridge);
-                base_config.aliases = overlay_config
-                    .aliases
-                    .take()
-                    .or_else(|| base_config.aliases.take());
+                *base_config = merge_language_settings(base_config, &overlay_config);
             })
             .or_insert(overlay_config);
     }
