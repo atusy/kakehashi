@@ -57,6 +57,38 @@ fn merge_bridge_language_configs(
     }
 }
 
+/// Field-level merge of two BridgeServerConfig values.
+/// Vec fields: use overlay if non-empty, else base.
+/// JSON Option fields: deep merge (ADR-0010).
+/// Option fields: overlay wins when present.
+fn merge_bridge_server_configs(
+    base: &settings::BridgeServerConfig,
+    overlay: &settings::BridgeServerConfig,
+) -> settings::BridgeServerConfig {
+    settings::BridgeServerConfig {
+        cmd: if overlay.cmd.is_empty() {
+            base.cmd.clone()
+        } else {
+            overlay.cmd.clone()
+        },
+        languages: if overlay.languages.is_empty() {
+            base.languages.clone()
+        } else {
+            overlay.languages.clone()
+        },
+        initialization_options: match (
+            &base.initialization_options,
+            &overlay.initialization_options,
+        ) {
+            (Some(w_opts), Some(s_opts)) => Some(deep_merge_json(w_opts, s_opts)),
+            (Some(w_opts), None) => Some(w_opts.clone()),
+            (None, Some(s_opts)) => Some(s_opts.clone()),
+            (None, None) => None,
+        },
+        workspace_type: overlay.workspace_type.or(base.workspace_type),
+    }
+}
+
 /// Deep merge two optional bridge HashMaps.
 ///
 /// When both base and overlay exist:
@@ -134,31 +166,7 @@ pub(crate) fn resolve_language_server_with_wildcard(
     let specific = map.get(key);
 
     match (wildcard, specific) {
-        (Some(w), Some(s)) => {
-            // Merge: start with wildcard, override with specific
-            Some(settings::BridgeServerConfig {
-                // For Vec fields: use specific if non-empty, else wildcard
-                cmd: if s.cmd.is_empty() {
-                    w.cmd.clone()
-                } else {
-                    s.cmd.clone()
-                },
-                languages: if s.languages.is_empty() {
-                    w.languages.clone()
-                } else {
-                    s.languages.clone()
-                },
-                // For JSON Option fields: deep merge (ADR-0010)
-                initialization_options: match (&w.initialization_options, &s.initialization_options)
-                {
-                    (Some(w_opts), Some(s_opts)) => Some(deep_merge_json(w_opts, s_opts)),
-                    (Some(w_opts), None) => Some(w_opts.clone()),
-                    (None, Some(s_opts)) => Some(s_opts.clone()),
-                    (None, None) => None,
-                },
-                workspace_type: s.workspace_type.or(w.workspace_type),
-            })
-        }
+        (Some(w), Some(s)) => Some(merge_bridge_server_configs(w, s)),
         (Some(w), None) => Some(w.clone()),
         (None, Some(s)) => Some(s.clone()),
         (None, None) => None,
