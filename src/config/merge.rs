@@ -195,10 +195,7 @@ fn merge_languages(
                     .queries
                     .take()
                     .or_else(|| base_config.queries.take());
-                base_config.bridge = overlay_config
-                    .bridge
-                    .take()
-                    .or_else(|| base_config.bridge.take());
+                base_config.bridge = merge_bridge_maps(&base_config.bridge, &overlay_config.bridge);
                 base_config.aliases = overlay_config
                     .aliases
                     .take()
@@ -548,6 +545,76 @@ mod tests {
         assert!(python.bridge.is_some());
         let bridge = python.bridge.as_ref().unwrap();
         assert_eq!(bridge.get("rust").unwrap().enabled, Some(true));
+    }
+
+    #[test]
+    fn test_merge_workspace_settings_languages_bridge_deep_merge() {
+        // When both base and overlay define bridge maps for the same language,
+        // bridge entries should be deep-merged per-key (not shallow-replaced).
+        // Base has rust bridge; overlay adds javascript bridge.
+        // Result should contain both rust and javascript.
+        use settings::BridgeLanguageConfig;
+
+        let mut base_bridge = HashMap::new();
+        base_bridge.insert(
+            "rust".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut overlay_bridge = HashMap::new();
+        overlay_bridge.insert(
+            "javascript".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut base_languages = HashMap::new();
+        base_languages.insert(
+            "python".to_string(),
+            LanguageSettings {
+                bridge: Some(base_bridge),
+                ..Default::default()
+            },
+        );
+
+        let mut overlay_languages = HashMap::new();
+        overlay_languages.insert(
+            "python".to_string(),
+            LanguageSettings {
+                bridge: Some(overlay_bridge),
+                ..Default::default()
+            },
+        );
+
+        let base_config = RawWorkspaceSettings {
+            languages: base_languages,
+            ..Default::default()
+        };
+        let overlay_config = RawWorkspaceSettings {
+            languages: overlay_languages,
+            ..Default::default()
+        };
+
+        let result = merge_workspace_settings(Some(base_config), Some(overlay_config)).unwrap();
+        let python = &result.languages["python"];
+        let bridge = python.bridge.as_ref().expect("bridge should be Some");
+
+        // Both keys should be present (deep merge, not replacement)
+        assert!(
+            bridge.contains_key("rust"),
+            "base bridge entry 'rust' should be preserved after deep merge"
+        );
+        assert!(
+            bridge.contains_key("javascript"),
+            "overlay bridge entry 'javascript' should be present after deep merge"
+        );
+        assert_eq!(bridge.get("rust").unwrap().enabled, Some(true));
+        assert_eq!(bridge.get("javascript").unwrap().enabled, Some(true));
     }
 
     #[test]
