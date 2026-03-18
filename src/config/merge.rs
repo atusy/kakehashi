@@ -261,20 +261,10 @@ fn merge_language_servers(
 fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -> CaptureMappings {
     // Deep merge: overlay values override base values for the same key
     for (lang, overlay_mappings) in overlay {
-        base.entry(lang)
-            .and_modify(|base_mappings| {
-                // Merge each mapping type: overlay entries override base entries
-                for (k, v) in overlay_mappings.highlights.clone() {
-                    base_mappings.highlights.insert(k, v);
-                }
-                for (k, v) in overlay_mappings.locals.clone() {
-                    base_mappings.locals.insert(k, v);
-                }
-                for (k, v) in overlay_mappings.folds.clone() {
-                    base_mappings.folds.insert(k, v);
-                }
-            })
-            .or_insert(overlay_mappings);
+        let base_mappings = base.entry(lang).or_default();
+        base_mappings.highlights.extend(overlay_mappings.highlights);
+        base_mappings.locals.extend(overlay_mappings.locals);
+        base_mappings.folds.extend(overlay_mappings.folds);
     }
     base
 }
