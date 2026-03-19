@@ -662,16 +662,12 @@ impl Kakehashi {
 
         // Extract tree and text from document with minimal lock duration
         // IMPORTANT: Clone both to release document lock immediately
-        let (tree, text) = {
-            let Some(doc) = self.documents.get(uri) else {
-                return Vec::new();
-            };
-            let Some(tree) = doc.tree().cloned() else {
-                return Vec::new();
-            };
-            let text = doc.text().to_string();
-            (tree, text)
-            // Document lock released here when `doc` guard drops
+        let (tree, text) = match self.documents.get(uri) {
+            Some(doc) => match doc.tree().cloned() {
+                Some(tree) => (tree, doc.text().to_string()),
+                None => return Vec::new(),
+            },
+            None => return Vec::new(),
         };
 
         // Collect all injection regions (no locks held)
