@@ -149,7 +149,9 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
-        self.report_settings_events(&settings_outcome.events).await;
+        self.notifier()
+            .log_settings_events(&settings_outcome.events)
+            .await;
 
         // Always apply settings (use defaults if none were loaded)
         // This ensures auto_install=true, default capture_mappings, and other defaults are active

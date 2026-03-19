@@ -49,7 +49,7 @@ impl Kakehashi {
                      This configuration has been discarded; previous settings remain in effect. \
                      Please correct the affected paths and environment variables or remove them from your config.",
                 ));
-                self.report_settings_events(&[event]).await;
+                self.notifier().log_settings_events(&[event]).await;
             }
         }
     }
