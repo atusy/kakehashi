@@ -209,31 +209,32 @@ impl Kakehashi {
         }
     }
 
-    /// Notify user that parser is missing and needs manual installation.
-    ///
-    /// Called when a parser fails to load and auto-install is disabled
-    /// (either explicitly or because searchPaths doesn't include the default data dir).
-    async fn notify_parser_missing(&self, language: &str) {
+    /// Build a human-readable reason why auto-install is disabled.
+    fn auto_install_disabled_reason(&self) -> String {
         let settings = self.settings_manager.load_settings();
-
-        // Check why auto-install is disabled
-        let reason = if !settings.auto_install {
-            "autoInstall is disabled".to_string()
-        } else if !self
+        if !settings.auto_install {
+            return "autoInstall is disabled".to_string();
+        }
+        if !self
             .settings_manager
             .search_paths_include_default_data_dir(&settings.search_paths)
         {
             let default_dir = crate::install::default_data_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
-            format!(
+            return format!(
                 "searchPaths does not include the default data directory ({})",
                 default_dir
-            )
-        } else {
-            "unknown reason".to_string()
-        };
+            );
+        }
+        "unknown reason".to_string()
+    }
 
+    /// Notify user that parser is missing and needs manual installation.
+    ///
+    /// Called when a parser fails to load and auto-install is disabled
+    /// (either explicitly or because searchPaths doesn't include the default data dir).
+    async fn notify_parser_missing(&self, language: &str, reason: &str) {
         self.notifier()
             .log_warning(format!(
                 "Parser for '{}' not found. Auto-install is disabled because {}. \
@@ -746,11 +747,14 @@ impl Kakehashi {
     async fn check_injected_languages_auto_install(&self, uri: &Url, languages: &HashSet<String>) {
         let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
-        // Get document text for auto-install (needed by maybe_auto_install_language)
-        let text = if auto_install_enabled {
-            self.documents.get(uri).map(|doc| doc.text().to_string())
+        // Pre-compute reason (once) or text (once) depending on auto-install state
+        let (text, reason) = if auto_install_enabled {
+            (
+                self.documents.get(uri).map(|doc| doc.text().to_string()),
+                String::new(),
+            )
         } else {
-            None
+            (None, self.auto_install_disabled_reason())
         };
 
         // Check each injected language and trigger auto-install if not loaded
@@ -771,7 +775,7 @@ impl Kakehashi {
             }
 
             if !auto_install_enabled {
-                self.notify_parser_missing(&resolved_lang).await;
+                self.notify_parser_missing(&resolved_lang, &reason).await;
                 continue;
             }
 

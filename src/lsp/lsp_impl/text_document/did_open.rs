@@ -62,7 +62,8 @@ impl Kakehashi {
                         .await;
                 } else {
                     // Notify user that parser is missing and needs manual installation
-                    self.notify_parser_missing(lang).await;
+                    let reason = self.auto_install_disabled_reason();
+                    self.notify_parser_missing(lang, &reason).await;
                 }
             }
         }
