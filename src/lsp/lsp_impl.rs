@@ -1,4 +1,5 @@
 pub(crate) mod bridge_context;
+mod coordinator;
 mod diagnostics;
 mod injections;
 mod install;
