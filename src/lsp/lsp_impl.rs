@@ -52,10 +52,6 @@ use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Convert ls_types::Uri to url::Url
-///
-/// This is needed because ls-types uses its own Uri type (based on fluent-uri),
-/// while kakehashi internally uses url::Url for document storage and processing.
 pub(super) fn uri_to_url(uri: &Uri) -> std::result::Result<Url, url::ParseError> {
     Url::parse(uri.as_str())
 }
