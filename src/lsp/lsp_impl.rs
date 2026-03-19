@@ -34,7 +34,6 @@ use url::Url;
 
 use crate::config::WorkspaceSettings;
 use crate::document::DocumentStore;
-use crate::language::LanguageEvent;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
@@ -385,7 +384,7 @@ impl Kakehashi {
                     .insert(uri.clone(), text, Some(language_name), None);
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, false);
-                self.handle_language_events(&events).await;
+                self.notifier().log_language_events(&events).await;
                 return;
             }
 
@@ -457,7 +456,7 @@ impl Kakehashi {
 
                 self.documents
                     .mark_parse_finished(&uri, parse_generation, true);
-                self.handle_language_events(&events).await;
+                self.notifier().log_language_events(&events).await;
                 return;
             }
         }
@@ -466,7 +465,7 @@ impl Kakehashi {
         self.documents.insert(uri.clone(), text, None, None);
         self.documents
             .mark_parse_finished(&uri, parse_generation, false);
-        self.handle_language_events(&events).await;
+        self.notifier().log_language_events(&events).await;
     }
 
     /// Get the language for a document using the full detection chain.
@@ -519,14 +518,6 @@ impl Kakehashi {
         self.settings_manager.apply_settings(settings.clone());
         let summary = self.language.load_settings(settings);
         self.notifier().log_language_events(&summary.events).await;
-    }
-
-    async fn report_settings_events(&self, events: &[crate::lsp::SettingsEvent]) {
-        self.notifier().log_settings_events(events).await;
-    }
-
-    async fn handle_language_events(&self, events: &[LanguageEvent]) {
-        self.notifier().log_language_events(events).await;
     }
 
     /// Try to auto-install a language if not already being installed.
@@ -613,7 +604,9 @@ impl Kakehashi {
         // The load result contains SemanticTokensRefresh event that will trigger
         // a non-blocking refresh request to the client via handle_language_events.
         let load_result = self.language.ensure_language_loaded(language);
-        self.handle_language_events(&load_result.events).await;
+        self.notifier()
+            .log_language_events(&load_result.events)
+            .await;
 
         // For document languages, re-parse the document that triggered the install.
         // For injection languages, DON'T re-parse - the host document is already parsed

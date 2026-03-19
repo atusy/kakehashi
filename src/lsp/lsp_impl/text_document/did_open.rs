@@ -45,7 +45,8 @@ impl Kakehashi {
                         deferred_events.push(event.clone());
                     }
                     _ => {
-                        self.handle_language_events(std::slice::from_ref(event))
+                        self.notifier()
+                            .log_language_events(std::slice::from_ref(event))
                             .await;
                     }
                 }
@@ -81,7 +82,7 @@ impl Kakehashi {
 
         // Now handle deferred SemanticTokensRefresh events after document is parsed
         if !deferred_events.is_empty() {
-            self.handle_language_events(&deferred_events).await;
+            self.notifier().log_language_events(&deferred_events).await;
         }
 
         // Process injected languages: auto-install missing parsers and spawn bridge servers.
