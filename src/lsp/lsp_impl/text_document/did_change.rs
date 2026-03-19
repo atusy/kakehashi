@@ -86,7 +86,8 @@ impl Kakehashi {
         // ADR-0020 Phase 3: Schedule debounced diagnostic push on didChange.
         // After 500ms of no changes, diagnostics will be collected and published.
         // This provides near-real-time feedback while avoiding excessive requests during typing.
-        self.schedule_debounced_diagnostic(uri, lsp_uri);
+        self.diagnostic_scheduler()
+            .schedule_debounced_diagnostic(uri, lsp_uri);
 
         // NOTE: We intentionally do NOT call semantic_tokens_refresh() here.
         // LSP clients already request new tokens after didChange (via semanticTokens/full/delta).
