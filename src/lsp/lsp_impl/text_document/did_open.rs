@@ -72,13 +72,14 @@ impl Kakehashi {
         // If auto-install was triggered, reload_language_after_install will call parse_document
         // after the parser file is completely written, preventing race condition
         if !skip_parse {
-            self.parse_document(
-                uri.clone(),
-                params.text_document.text,
-                Some(&language_id),
-                vec![], // No edits for initial document open
-            )
-            .await;
+            self.parse_coordinator()
+                .parse_document(
+                    uri.clone(),
+                    params.text_document.text,
+                    Some(&language_id),
+                    vec![], // No edits for initial document open
+                )
+                .await;
         }
 
         // Now handle deferred SemanticTokensRefresh events after document is parsed

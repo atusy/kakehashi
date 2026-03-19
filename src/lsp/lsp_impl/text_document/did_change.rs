@@ -57,7 +57,8 @@ impl Kakehashi {
         self.cache.invalidate_for_edits(&uri, &edits);
 
         // Parse the updated document with edit information
-        self.parse_document(uri.clone(), text, language_id.as_deref(), edits)
+        self.parse_coordinator()
+            .parse_document(uri.clone(), text, language_id.as_deref(), edits)
             .await;
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.

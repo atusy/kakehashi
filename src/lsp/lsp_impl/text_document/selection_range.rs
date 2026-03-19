@@ -22,7 +22,7 @@ impl Kakehashi {
         };
 
         // Get language for document
-        let Some(language_name) = self.get_language_for_document(&uri) else {
+        let Some(language_name) = self.parse_coordinator().get_language_for_document(&uri) else {
             return Ok(None);
         };
 
@@ -45,6 +45,7 @@ impl Kakehashi {
             let text_clone = text.clone();
 
             let sync_parse_result = self
+                .parse_coordinator()
                 .parse_with_pool(&language_name, &uri, text.len(), move |mut parser| {
                     let parse_result = parser.parse(&text_clone, None);
                     (parser, parse_result)

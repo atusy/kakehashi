@@ -130,7 +130,7 @@ impl Kakehashi {
     ///
     /// Must be called AFTER parse_document so we have access to the AST.
     pub(super) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
-        let Some(host_language) = self.get_language_for_document(uri) else {
+        let Some(host_language) = self.parse_coordinator().get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
             return;
         };

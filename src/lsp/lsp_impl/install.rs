@@ -156,9 +156,10 @@ impl Kakehashi {
         // all highlighting. The SemanticTokensRefresh event above will notify the client.
         if !is_injection {
             // Get the host language for this document (not the installed language)
-            let host_language = self.get_language_for_document(&uri);
+            let host_language = self.parse_coordinator().get_language_for_document(&uri);
             let lang_for_parse = host_language.as_deref();
-            self.parse_document(uri.clone(), text, lang_for_parse, vec![])
+            self.parse_coordinator()
+                .parse_document(uri.clone(), text, lang_for_parse, vec![])
                 .await;
         }
     }

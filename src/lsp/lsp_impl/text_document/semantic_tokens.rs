@@ -121,6 +121,7 @@ impl Kakehashi {
         // Parse with panic protection via catch_unwind, delegating pool
         // management to the shared parse_with_pool helper
         let parse_result: Option<Tree> = self
+            .parse_coordinator()
             .parse_with_pool(language_name, uri, text.len(), move |mut parser: Parser| {
                 let result = catch_unwind(AssertUnwindSafe(|| parser.parse(&text_clone, None)))
                     .ok()
@@ -196,7 +197,7 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(language_name) = self.get_language_for_document(&uri) else {
+        let Some(language_name) = self.parse_coordinator().get_language_for_document(&uri) else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -415,7 +416,7 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(language_name) = self.get_language_for_document(&uri) else {
+        let Some(language_name) = self.parse_coordinator().get_language_for_document(&uri) else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -649,7 +650,7 @@ impl Kakehashi {
 
         let domain_range = range;
 
-        let Some(language_name) = self.get_language_for_document(&uri) else {
+        let Some(language_name) = self.parse_coordinator().get_language_for_document(&uri) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
