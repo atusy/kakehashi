@@ -44,13 +44,13 @@ use crate::lsp::settings_manager::SettingsManager;
 use tokio::sync::Mutex;
 
 use super::auto_install::{AutoInstallManager, InstallEvent, InstallingLanguages};
+use super::cache::CacheCoordinator;
+use super::debounced_diagnostics::DebouncedDiagnosticsManager;
+use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
 /// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-use super::cache::CacheCoordinator;
-use super::debounced_diagnostics::DebouncedDiagnosticsManager;
-use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
 /// Convert ls_types::Uri to url::Url
 ///
