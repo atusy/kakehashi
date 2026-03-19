@@ -156,20 +156,27 @@ impl Kakehashi {
         // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()
         // because the derived Default creates empty capture_mappings while default_settings() includes
         // the full default capture_mappings (markup.strong → "", etc.)
-        let settings = settings_outcome.settings.unwrap_or_else(|| {
-            WorkspaceSettings::try_from_settings(
+        let settings = match settings_outcome.settings {
+            Some(s) => s,
+            None => match WorkspaceSettings::try_from_settings(
                 &crate::config::defaults::default_settings(),
                 self.home_dir.as_deref(),
                 crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-            )
-            .unwrap_or_else(|e| {
-                log::error!(
-                    "Failed to expand default settings: {}. Falling back to empty defaults.",
-                    e
-                );
-                WorkspaceSettings::default()
-            })
-        });
+            ) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    log::error!(
+                        "Failed to expand default settings: {e}. Falling back to empty defaults."
+                    );
+                    self.notifier()
+                        .log_warning(format!(
+                            "Failed to expand default settings: {e}. Semantic highlighting may be degraded."
+                        ))
+                        .await;
+                    WorkspaceSettings::default()
+                }
+            },
+        };
         self.apply_settings(settings).await;
 
         self.notifier().log_info("server initialized!").await;
