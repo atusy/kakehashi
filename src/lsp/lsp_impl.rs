@@ -783,26 +783,23 @@ impl Kakehashi {
             };
 
             let load_result = self.language.ensure_language_loaded(&resolved_lang);
-            if !load_result.success {
-                if auto_install_enabled {
-                    if let Some(ref text) = text {
-                        // Language not loaded - trigger auto-install with resolved name
-                        // maybe_auto_install_language uses InstallingLanguages to prevent duplicates
-                        // is_injection=true: Don't re-parse the document with injection language
-                        // Return value ignored - for injections we never skip parsing (host document already parsed)
-                        let _ = self
-                            .maybe_auto_install_language(
-                                &resolved_lang,
-                                uri.clone(),
-                                text.clone(),
-                                true,
-                            )
-                            .await;
-                    }
-                } else {
-                    // Notify user that parser is missing and needs manual installation
-                    self.notify_parser_missing(&resolved_lang).await;
-                }
+            if load_result.success {
+                continue;
+            }
+
+            if !auto_install_enabled {
+                self.notify_parser_missing(&resolved_lang).await;
+                continue;
+            }
+
+            if let Some(ref text) = text {
+                // Language not loaded - trigger auto-install with resolved name
+                // maybe_auto_install_language uses InstallingLanguages to prevent duplicates
+                // is_injection=true: Don't re-parse the document with injection language
+                // Return value ignored - for injections we never skip parsing (host document already parsed)
+                let _ = self
+                    .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
+                    .await;
             }
         }
     }
