@@ -177,7 +177,10 @@ impl Kakehashi {
                 String::new(),
             )
         } else {
-            (None, self.auto_install_disabled_reason())
+            (
+                None,
+                self.install_coordinator().auto_install_disabled_reason(),
+            )
         };
 
         for lang in languages {
@@ -195,12 +198,15 @@ impl Kakehashi {
             }
 
             if !auto_install_enabled {
-                self.notify_parser_missing(&resolved_lang, &reason).await;
+                self.install_coordinator()
+                    .notify_parser_missing(&resolved_lang, &reason)
+                    .await;
                 continue;
             }
 
             if let Some(ref text) = text {
                 let _ = self
+                    .install_coordinator()
                     .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
                     .await;
             }

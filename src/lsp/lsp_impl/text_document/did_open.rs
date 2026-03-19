@@ -58,12 +58,15 @@ impl Kakehashi {
                     // is_injection=false: This is the document's main language
                     // If install is triggered, skip parse_document here - reload_language_after_install will handle it
                     skip_parse = self
+                        .install_coordinator()
                         .maybe_auto_install_language(lang, uri.clone(), text.clone(), false)
                         .await;
                 } else {
                     // Notify user that parser is missing and needs manual installation
-                    let reason = self.auto_install_disabled_reason();
-                    self.notify_parser_missing(lang, &reason).await;
+                    let reason = self.install_coordinator().auto_install_disabled_reason();
+                    self.install_coordinator()
+                        .notify_parser_missing(lang, &reason)
+                        .await;
                 }
             }
         }
