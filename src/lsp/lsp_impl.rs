@@ -625,25 +625,20 @@ impl Kakehashi {
     /// Resolve all injection regions for a document.
     ///
     /// This method:
-    /// 1. Gets the host language and its injection query
+    /// 1. Gets the injection query for `host_language`
     /// 2. Extracts the parse tree (minimal lock duration on document store)
     /// 3. Collects all injection regions via `collect_all_injections`
     /// 4. Calculates stable region IDs via `RegionIdTracker` (ADR-0019)
     ///
-    /// Returns an empty Vec if no injections are found (no language, no query,
-    /// no tree, or no injection regions).
+    /// Returns an empty Vec if no injections are found (no query, no tree,
+    /// or no injection regions).
     ///
     /// # Lock Safety
     /// The document store lock is held only to clone the tree and text, then
     /// released before the tree traversal. No DashMap deadlock risk.
-    fn resolve_injection_data(&self, uri: &Url) -> Vec<BridgeInjection> {
-        // Get the host language for this document
-        let Some(host_language) = self.get_language_for_document(uri) else {
-            return Vec::new();
-        };
-
+    fn resolve_injection_data(&self, uri: &Url, host_language: &str) -> Vec<BridgeInjection> {
         // Get the injection query for this language
-        let Some(injection_query) = self.language.get_injection_query(&host_language) else {
+        let Some(injection_query) = self.language.get_injection_query(host_language) else {
             return Vec::new();
         };
 
@@ -708,7 +703,11 @@ impl Kakehashi {
     ///
     /// Must be called AFTER parse_document so we have access to the AST.
     async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
-        let injections = self.resolve_injection_data(uri);
+        let Some(host_language) = self.get_language_for_document(uri) else {
+            self.bridge.cancel_eager_open(uri);
+            return;
+        };
+        let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
             // Cancel any previously spawned eager-open tasks for this URI.
             // Without this, stale tasks could send didOpen for removed injection regions.
@@ -732,7 +731,7 @@ impl Kakehashi {
             .await;
 
         // Eagerly spawn bridge servers and open virtual documents
-        self.eager_spawn_bridge_servers(uri, injections);
+        self.eager_spawn_bridge_servers(uri, &host_language, injections);
     }
 
     /// Check injected languages and handle missing parsers.
@@ -796,18 +795,18 @@ impl Kakehashi {
     /// This warms up language servers (spawn + handshake + didOpen) in the background
     /// for injection regions found in the document. Downstream servers receive
     /// document content immediately, enabling faster diagnostic responses.
-    fn eager_spawn_bridge_servers(&self, uri: &Url, injections: Vec<BridgeInjection>) {
-        // Get the host language for this document
-        let Some(host_language) = self.get_language_for_document(uri) else {
-            return;
-        };
-
+    fn eager_spawn_bridge_servers(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        injections: Vec<BridgeInjection>,
+    ) {
         // Get current settings for server config lookup
         let settings = self.settings_manager.load_settings();
 
         // Spawn servers and open virtual documents for each detected injection
         self.bridge
-            .eager_spawn_and_open_documents(&settings, &host_language, uri, injections);
+            .eager_spawn_and_open_documents(&settings, host_language, uri, injections);
     }
 
     /// Schedule a debounced diagnostic for a document (ADR-0020 Phase 3).
