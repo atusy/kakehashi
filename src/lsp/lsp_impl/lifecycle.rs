@@ -162,7 +162,13 @@ impl Kakehashi {
                 self.home_dir.as_deref(),
                 crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
             )
-            .expect("default settings should expand without errors")
+            .unwrap_or_else(|e| {
+                log::error!(
+                    "Failed to expand default settings: {}. Falling back to empty defaults.",
+                    e
+                );
+                WorkspaceSettings::default()
+            })
         });
         self.apply_settings(settings).await;
 
