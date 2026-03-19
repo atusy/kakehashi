@@ -156,9 +156,6 @@ pub(crate) fn merge_workspace_settings(
     overlay: Option<RawWorkspaceSettings>,
 ) -> Option<RawWorkspaceSettings> {
     match (base, overlay) {
-        (None, None) => None,
-        (Some(settings), None) => Some(settings),
-        (None, Some(settings)) => Some(settings),
         (Some(base), Some(overlay)) => {
             let merged = RawWorkspaceSettings {
                 search_paths: overlay.search_paths.or(base.search_paths),
@@ -175,6 +172,7 @@ pub(crate) fn merge_workspace_settings(
             };
             Some(merged)
         }
+        (base, overlay) => base.or(overlay),
     }
 }
 
