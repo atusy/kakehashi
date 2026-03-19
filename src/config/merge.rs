@@ -85,7 +85,7 @@ pub(crate) fn merge_language_settings(
     LanguageSettings {
         parser: overlay.parser.clone().or_else(|| base.parser.clone()),
         queries: overlay.queries.clone().or_else(|| base.queries.clone()),
-        bridge: merge_bridge_maps(&base.bridge, &overlay.bridge),
+        bridge: merge_bridge_maps(base.bridge.as_ref(), overlay.bridge.as_ref()),
         aliases: overlay.aliases.clone().or_else(|| base.aliases.clone()),
     }
 }
@@ -98,8 +98,8 @@ pub(crate) fn merge_language_settings(
 /// - Otherwise, per-key entries are merged at the field level using
 ///   [`merge_bridge_language_configs`].
 fn merge_bridge_maps(
-    base: &Option<HashMap<String, BridgeLanguageConfig>>,
-    overlay: &Option<HashMap<String, BridgeLanguageConfig>>,
+    base: Option<&HashMap<String, BridgeLanguageConfig>>,
+    overlay: Option<&HashMap<String, BridgeLanguageConfig>>,
 ) -> Option<HashMap<String, BridgeLanguageConfig>> {
     match (base, overlay) {
         (None, None) => None,
