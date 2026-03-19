@@ -171,7 +171,7 @@ impl Kakehashi {
                     );
                     self.notifier()
                         .log_warning(format!(
-                            "Failed to expand default settings: {e}. Semantic highlighting may be degraded."
+                            "Failed to expand default settings: {e}. Some features (e.g., semantic highlighting, parser detection) may be degraded."
                         ))
                         .await;
                     WorkspaceSettings::default()
