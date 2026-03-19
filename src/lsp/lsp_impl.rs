@@ -44,18 +44,14 @@ use crate::lsp::settings_manager::SettingsManager;
 use tokio::sync::Mutex;
 
 use super::auto_install::{AutoInstallManager, InstallEvent, InstallingLanguages};
-
-/// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
-/// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
-const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use super::cache::CacheCoordinator;
 use super::debounced_diagnostics::DebouncedDiagnosticsManager;
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
-/// Convert ls_types::Uri to url::Url
-///
-/// This is needed because ls-types uses its own Uri type (based on fluent-uri),
-/// while kakehashi internally uses url::Url for document storage and processing.
+/// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
+/// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
+const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(super) fn uri_to_url(uri: &Uri) -> std::result::Result<Url, url::ParseError> {
     Url::parse(uri.as_str())
 }
@@ -401,7 +397,7 @@ impl Kakehashi {
             // Get old tree for incremental parsing before entering the closure
             // For edits: get edited tree (after tree.edit() applied)
             // For full parse: get current tree as-is
-            let (old_tree, edited_old_tree_for_store) = if !edits.is_empty() {
+            let (base_tree, pre_edit_tree) = if !edits.is_empty() {
                 let edited = self.documents.get_edited_tree(&uri, &edits);
                 // Clone for storage - we need to keep the edited tree for changed_ranges()
                 let for_store = edited.clone();
@@ -420,21 +416,18 @@ impl Kakehashi {
                     // Record that we're about to parse (for crash detection)
                     let _ = auto_install.begin_parsing(&language_name_clone);
 
-                    let parse_result = parser.parse(&text_clone, old_tree.as_ref());
+                    let parse_result = parser.parse(&text_clone, base_tree.as_ref());
 
                     // Parsing succeeded without crash - clear the state for this language
                     let _ = auto_install.end_parsing(&language_name_clone);
 
                     // Return both parse result and edited tree for proper changed_ranges support
-                    (
-                        parser,
-                        parse_result.map(|tree| (tree, edited_old_tree_for_store)),
-                    )
+                    (parser, parse_result.map(|tree| (tree, pre_edit_tree)))
                 })
                 .await;
 
             // Store the parsed document
-            if let Some((tree, edited_old_tree)) = parsed_tree {
+            if let Some((tree, pre_edit_tree)) = parsed_tree {
                 // Populate InjectionMap with injection regions for targeted cache invalidation
                 self.cache.populate_injections(
                     &uri,
@@ -445,7 +438,7 @@ impl Kakehashi {
                     self.bridge.region_id_tracker(),
                 );
 
-                if let Some(edited_tree) = edited_old_tree {
+                if let Some(edited_tree) = pre_edit_tree {
                     // Use the new method that preserves the edited tree for changed_ranges()
                     self.documents.update_document_with_edited_tree(
                         uri.clone(),
@@ -662,16 +655,12 @@ impl Kakehashi {
 
         // Extract tree and text from document with minimal lock duration
         // IMPORTANT: Clone both to release document lock immediately
-        let (tree, text) = {
-            let Some(doc) = self.documents.get(uri) else {
-                return Vec::new();
-            };
-            let Some(tree) = doc.tree().cloned() else {
-                return Vec::new();
-            };
-            let text = doc.text().to_string();
-            (tree, text)
-            // Document lock released here when `doc` guard drops
+        let (tree, text) = match self.documents.get(uri) {
+            Some(doc) => match doc.tree().cloned() {
+                Some(tree) => (tree, doc.text().to_string()),
+                None => return Vec::new(),
+            },
+            None => return Vec::new(),
         };
 
         // Collect all injection regions (no locks held)
@@ -783,26 +772,23 @@ impl Kakehashi {
             };
 
             let load_result = self.language.ensure_language_loaded(&resolved_lang);
-            if !load_result.success {
-                if auto_install_enabled {
-                    if let Some(ref text) = text {
-                        // Language not loaded - trigger auto-install with resolved name
-                        // maybe_auto_install_language uses InstallingLanguages to prevent duplicates
-                        // is_injection=true: Don't re-parse the document with injection language
-                        // Return value ignored - for injections we never skip parsing (host document already parsed)
-                        let _ = self
-                            .maybe_auto_install_language(
-                                &resolved_lang,
-                                uri.clone(),
-                                text.clone(),
-                                true,
-                            )
-                            .await;
-                    }
-                } else {
-                    // Notify user that parser is missing and needs manual installation
-                    self.notify_parser_missing(&resolved_lang).await;
-                }
+            if load_result.success {
+                continue;
+            }
+
+            if !auto_install_enabled {
+                self.notify_parser_missing(&resolved_lang).await;
+                continue;
+            }
+
+            if let Some(ref text) = text {
+                // Language not loaded - trigger auto-install with resolved name
+                // maybe_auto_install_language uses InstallingLanguages to prevent duplicates
+                // is_injection=true: Don't re-parse the document with injection language
+                // Return value ignored - for injections we never skip parsing (host document already parsed)
+                let _ = self
+                    .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
+                    .await;
             }
         }
     }
