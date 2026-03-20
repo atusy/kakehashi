@@ -2,18 +2,43 @@ use std::collections::HashSet;
 
 use url::Url;
 
+use crate::document::DocumentStore;
 use crate::language::injection::{InjectionResolver, collect_all_injections};
+use crate::language::{DocumentParserPool, LanguageCoordinator};
+use crate::lsp::auto_install::AutoInstallManager;
+use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::bridge::coordinator::BridgeInjection;
+use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::settings_manager::SettingsManager;
+use tower_lsp_server::Client;
+
+use super::{InstallCoordinator, InstallCoordinatorDeps, ParseCoordinator, ParseCoordinatorDeps};
 
 pub(crate) struct InjectionCoordinator<'a> {
-    server: &'a Kakehashi,
+    client: &'a Client,
+    language: &'a std::sync::Arc<LanguageCoordinator>,
+    parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
+    documents: &'a DocumentStore,
+    cache: &'a CacheCoordinator,
+    settings_manager: &'a SettingsManager,
+    auto_install: &'a AutoInstallManager,
+    bridge: &'a BridgeCoordinator,
 }
 
 impl<'a> InjectionCoordinator<'a> {
     pub(crate) fn new(server: &'a Kakehashi) -> Self {
-        Self { server }
+        Self {
+            client: &server.client,
+            language: &server.language,
+            parser_pool: &server.parser_pool,
+            documents: &server.documents,
+            cache: &server.cache,
+            settings_manager: &server.settings_manager,
+            auto_install: &server.auto_install,
+            bridge: &server.bridge,
+        }
     }
 
     /// Send didClose for invalidated virtual documents.
@@ -36,12 +61,10 @@ impl<'a> InjectionCoordinator<'a> {
             return;
         }
 
-        self.server
-            .cache
+        self.cache
             .remove_injection_tokens_for_ulids(host_uri, invalidated_ulids);
 
-        self.server
-            .bridge
+        self.bridge
             .close_invalidated_docs(host_uri, invalidated_ulids)
             .await;
     }
@@ -55,12 +78,9 @@ impl<'a> InjectionCoordinator<'a> {
         host_language: &str,
         injection_language: &str,
     ) -> Vec<ResolvedServerConfig> {
-        let settings = self.server.settings_manager.load_settings();
-        self.server.bridge.get_all_configs_for_language(
-            &settings,
-            host_language,
-            injection_language,
-        )
+        let settings = self.settings_manager.load_settings();
+        self.bridge
+            .get_all_configs_for_language(&settings, host_language, injection_language)
     }
 
     /// Resolve all injection regions for a document.
@@ -82,11 +102,11 @@ impl<'a> InjectionCoordinator<'a> {
         uri: &Url,
         host_language: &str,
     ) -> Vec<BridgeInjection> {
-        let Some(injection_query) = self.server.language.get_injection_query(host_language) else {
+        let Some(injection_query) = self.language.get_injection_query(host_language) else {
             return Vec::new();
         };
 
-        let Some(doc) = self.server.documents.get(uri) else {
+        let Some(doc) = self.documents.get(uri) else {
             return Vec::new();
         };
         let Some(tree) = doc.tree().cloned() else {
@@ -109,7 +129,7 @@ impl<'a> InjectionCoordinator<'a> {
             .iter()
             .map(|region| {
                 let region_id = InjectionResolver::calculate_region_id(
-                    self.server.bridge.region_id_tracker(),
+                    self.bridge.region_id_tracker(),
                     uri,
                     region,
                 );
@@ -141,23 +161,18 @@ impl<'a> InjectionCoordinator<'a> {
     ///
     /// Must be called AFTER parse_document so we have access to the AST.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
-        let Some(host_language) = self
-            .server
-            .parse_coordinator()
-            .get_language_for_document(uri)
-        else {
-            self.server.bridge.cancel_eager_open(uri);
+        let Some(host_language) = self.parse_coordinator().get_language_for_document(uri) else {
+            self.bridge.cancel_eager_open(uri);
             return;
         };
         let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
-            self.server.bridge.cancel_eager_open(uri);
+            self.bridge.cancel_eager_open(uri);
             return;
         }
 
         if forward_did_change {
-            self.server
-                .bridge
+            self.bridge
                 .forward_didchange_to_opened_docs(uri, &injections)
                 .await;
         }
@@ -185,27 +200,22 @@ impl<'a> InjectionCoordinator<'a> {
         uri: &Url,
         languages: &HashSet<String>,
     ) {
-        let auto_install_enabled = self.server.settings_manager.is_auto_install_enabled();
+        let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
         let (text, reason) = if auto_install_enabled {
             (
-                self.server
-                    .documents
-                    .get(uri)
-                    .map(|doc| doc.text().to_string()),
+                self.documents.get(uri).map(|doc| doc.text().to_string()),
                 String::new(),
             )
         } else {
             (
                 None,
-                self.server
-                    .install_coordinator()
-                    .auto_install_disabled_reason(),
+                self.install_coordinator().auto_install_disabled_reason(),
             )
         };
 
         for lang in languages {
-            let resolved_lang = if self.server.language.has_parser_available(lang) {
+            let resolved_lang = if self.language.has_parser_available(lang) {
                 lang.clone()
             } else if let Some(normalized) = crate::language::heuristic::detect_from_token(lang) {
                 normalized
@@ -213,14 +223,13 @@ impl<'a> InjectionCoordinator<'a> {
                 lang.clone()
             };
 
-            let load_result = self.server.language.ensure_language_loaded(&resolved_lang);
+            let load_result = self.language.ensure_language_loaded(&resolved_lang);
             if load_result.success {
                 continue;
             }
 
             if !auto_install_enabled {
-                self.server
-                    .install_coordinator()
+                self.install_coordinator()
                     .notify_parser_missing(&resolved_lang, &reason)
                     .await;
                 continue;
@@ -228,7 +237,6 @@ impl<'a> InjectionCoordinator<'a> {
 
             if let Some(ref text) = text {
                 let _ = self
-                    .server
                     .install_coordinator()
                     .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
                     .await;
@@ -247,12 +255,34 @@ impl<'a> InjectionCoordinator<'a> {
         host_language: &str,
         injections: Vec<BridgeInjection>,
     ) {
-        let settings = self.server.settings_manager.load_settings();
-        self.server.bridge.eager_spawn_and_open_documents(
-            &settings,
-            host_language,
-            uri,
-            injections,
-        );
+        let settings = self.settings_manager.load_settings();
+        self.bridge
+            .eager_spawn_and_open_documents(&settings, host_language, uri, injections);
+    }
+
+    fn parse_coordinator(&self) -> ParseCoordinator<'_> {
+        ParseCoordinator::from_parts(ParseCoordinatorDeps {
+            client: self.client,
+            language: self.language,
+            parser_pool: self.parser_pool,
+            documents: self.documents,
+            cache: self.cache,
+            settings_manager: self.settings_manager,
+            auto_install: self.auto_install,
+            bridge: self.bridge,
+        })
+    }
+
+    fn install_coordinator(&self) -> InstallCoordinator<'_> {
+        InstallCoordinator::from_parts(InstallCoordinatorDeps {
+            client: self.client,
+            language: self.language,
+            parser_pool: self.parser_pool,
+            documents: self.documents,
+            cache: self.cache,
+            settings_manager: self.settings_manager,
+            auto_install: self.auto_install,
+            bridge: self.bridge,
+        })
     }
 }
