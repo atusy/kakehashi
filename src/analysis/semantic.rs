@@ -531,7 +531,7 @@ mod tests {
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         // Load markdown and lua languages
         let md_result = coordinator.ensure_language_loaded("markdown");
@@ -609,7 +609,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         if !md_result.success {
@@ -668,7 +668,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let lua_result = coordinator.ensure_language_loaded("lua");
@@ -784,7 +784,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let lua_result = coordinator.ensure_language_loaded("lua");
@@ -892,7 +892,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let py_result = coordinator.ensure_language_loaded("python");
@@ -1008,7 +1008,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let lua_result = coordinator.ensure_language_loaded("lua");
@@ -1116,7 +1116,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let py_result = coordinator.ensure_language_loaded("python");
@@ -1246,7 +1246,7 @@ foo
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let lua_result = coordinator.ensure_language_loaded("lua");

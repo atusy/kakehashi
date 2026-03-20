@@ -294,7 +294,7 @@ mod tests {
 
         // Load into coordinator
         let coordinator = LanguageCoordinator::new();
-        let _summary = coordinator.load_settings(ws_settings);
+        let _summary = coordinator.load_settings(&ws_settings);
 
         // Verify coordinator has the mapping
         let mappings = coordinator.get_capture_mappings();

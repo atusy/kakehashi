@@ -790,7 +790,7 @@ mod tests {
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         // Load rust language
         let load_result = coordinator.ensure_language_loaded("rust");
@@ -849,7 +849,7 @@ mod tests {
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let load_result = coordinator.ensure_language_loaded("rust");
         if !load_result.success {
@@ -911,7 +911,7 @@ mod tests {
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         // Load markdown (host language)
         let load_result = coordinator.ensure_language_loaded("markdown");
@@ -955,7 +955,7 @@ mod tests {
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         // Load both markdown and lua
         let md_result = coordinator.ensure_language_loaded("markdown");
@@ -1028,7 +1028,7 @@ local x = 42
             search_paths: vec![test_search_path()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         let md_result = coordinator.ensure_language_loaded("markdown");
         let lua_result = coordinator.ensure_language_loaded("lua");

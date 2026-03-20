@@ -60,8 +60,8 @@ pub(super) async fn apply_shared_settings(
     settings_manager: &SettingsManager,
     settings: WorkspaceSettings,
 ) {
-    settings_manager.apply_settings(settings.clone());
-    let summary = language.load_settings(settings);
+    let summary = language.load_settings(&settings);
+    settings_manager.apply_settings(settings);
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
