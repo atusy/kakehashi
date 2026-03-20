@@ -72,7 +72,7 @@ mod tests {
         store.set_capture_mappings(mappings.clone());
 
         let retrieved = store.capture_mappings();
-        assert_eq!(retrieved.len(), mappings.len());
+        assert_eq!(retrieved, mappings);
     }
 
     #[test]
