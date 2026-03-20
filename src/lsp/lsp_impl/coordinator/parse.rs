@@ -15,15 +15,15 @@ use crate::lsp::settings_manager::SettingsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub(crate) struct ParseCoordinatorDeps {
-    pub(crate) client: Client,
-    pub(crate) language: std::sync::Arc<LanguageCoordinator>,
-    pub(crate) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
-    pub(crate) documents: std::sync::Arc<DocumentStore>,
-    pub(crate) cache: std::sync::Arc<CacheCoordinator>,
-    pub(crate) settings_manager: std::sync::Arc<SettingsManager>,
-    pub(crate) auto_install: AutoInstallManager,
-    pub(crate) bridge: std::sync::Arc<BridgeCoordinator>,
+pub(super) struct ParseCoordinatorDeps {
+    pub(super) client: Client,
+    pub(super) language: std::sync::Arc<LanguageCoordinator>,
+    pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) documents: std::sync::Arc<DocumentStore>,
+    pub(super) cache: std::sync::Arc<CacheCoordinator>,
+    pub(super) settings_manager: std::sync::Arc<SettingsManager>,
+    pub(super) auto_install: AutoInstallManager,
+    pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
 pub(crate) struct ParseCoordinator {
@@ -51,7 +51,7 @@ impl ParseCoordinator {
         })
     }
 
-    pub(crate) fn from_parts(deps: ParseCoordinatorDeps) -> Self {
+    pub(super) fn from_parts(deps: ParseCoordinatorDeps) -> Self {
         Self {
             client: deps.client,
             language: deps.language,
