@@ -34,6 +34,7 @@ use crate::config::WorkspaceSettings;
 use crate::document::DocumentStore;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
+use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::settings_manager::SettingsManager;
 use tokio::sync::Mutex;
@@ -70,6 +71,16 @@ pub(super) fn detect_document_language(
     } else {
         language.detect_language(path, "", None, None)
     }
+}
+
+pub(super) fn bridge_configs_for_injection_language(
+    bridge: &BridgeCoordinator,
+    settings_manager: &SettingsManager,
+    host_language: &str,
+    injection_language: &str,
+) -> Vec<ResolvedServerConfig> {
+    let settings = settings_manager.load_settings();
+    bridge.get_all_configs_for_language(&settings, host_language, injection_language)
 }
 
 pub(super) async fn apply_shared_settings(
@@ -231,6 +242,19 @@ impl Kakehashi {
 
     pub(super) fn document_language(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
+    }
+
+    pub(super) fn bridge_configs_for_injection_language(
+        &self,
+        host_language: &str,
+        injection_language: &str,
+    ) -> Vec<ResolvedServerConfig> {
+        bridge_configs_for_injection_language(
+            &self.bridge,
+            &self.settings_manager,
+            host_language,
+            injection_language,
+        )
     }
 
     pub(super) fn install_coordinator(&self) -> coordinator::InstallCoordinator {
