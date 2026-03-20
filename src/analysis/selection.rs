@@ -176,8 +176,9 @@ mod tests {
         use tree_sitter::{Parser, Query};
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("yaml", tree_sitter_yaml::LANGUAGE.into());
-        coordinator.register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+        let registry = coordinator.language_registry_for_parallel();
+        registry.register("yaml".to_string(), tree_sitter_yaml::LANGUAGE.into());
+        registry.register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         let yaml_injection_query_str = r#"
 ((double_quote_scalar) @injection.content
@@ -186,7 +187,10 @@ mod tests {
         let yaml_lang: tree_sitter::Language = tree_sitter_yaml::LANGUAGE.into();
         let yaml_injection_query =
             Query::new(&yaml_lang, yaml_injection_query_str).expect("valid yaml injection query");
-        coordinator.register_injection_query_for_test("yaml", yaml_injection_query);
+        coordinator.query_store().insert_injection_query(
+            "yaml".to_string(),
+            std::sync::Arc::new(yaml_injection_query),
+        );
 
         let mut parser_pool = coordinator.create_document_parser_pool();
 
@@ -210,7 +214,9 @@ mod tests {
         "#;
         let injection_query =
             Query::new(&rust_language, injection_query_str).expect("valid injection query");
-        coordinator.register_injection_query_for_test("rust", injection_query);
+        coordinator
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(injection_query));
 
         let cursor_pos = Position::new(1, 33);
         let mapper = crate::text::PositionMapper::new(text);
@@ -263,7 +269,9 @@ mod tests {
         use tree_sitter::{Parser, Query};
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("yaml", tree_sitter_yaml::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("yaml".to_string(), tree_sitter_yaml::LANGUAGE.into());
 
         let mut parser_pool = coordinator.create_document_parser_pool();
 
@@ -287,7 +295,9 @@ array: ["xxxx"]"#;
         "#;
         let injection_query =
             Query::new(&rust_language, injection_query_str).expect("valid injection query");
-        coordinator.register_injection_query_for_test("rust", injection_query);
+        coordinator
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(injection_query));
 
         let cursor_pos = Position::new(1, 32); // 'a' in "awesome"
         let point = Point::new(cursor_pos.line as usize, cursor_pos.character as usize);
@@ -484,7 +494,9 @@ array: ["xxxx"]"#;
         use tree_sitter::{Parser, Query};
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("yaml", tree_sitter_yaml::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("yaml".to_string(), tree_sitter_yaml::LANGUAGE.into());
 
         let yaml_injection_query_str = r#"
 ((double_quote_scalar) @injection.content
@@ -493,7 +505,10 @@ array: ["xxxx"]"#;
         let yaml_lang: tree_sitter::Language = tree_sitter_yaml::LANGUAGE.into();
         let yaml_injection_query =
             Query::new(&yaml_lang, yaml_injection_query_str).expect("valid yaml injection query");
-        coordinator.register_injection_query_for_test("yaml", yaml_injection_query);
+        coordinator.query_store().insert_injection_query(
+            "yaml".to_string(),
+            std::sync::Arc::new(yaml_injection_query),
+        );
 
         let mut parser_pool = coordinator.create_document_parser_pool();
 
@@ -515,7 +530,9 @@ array: ["xxxx"]"#;
   (#set! injection.language "yaml"))
         "#;
         let injection_query = Query::new(&rust_language, injection_query_str).expect("valid query");
-        coordinator.register_injection_query_for_test("rust", injection_query);
+        coordinator
+            .query_store()
+            .insert_injection_query("rust".to_string(), std::sync::Arc::new(injection_query));
 
         let mapper = crate::text::PositionMapper::new(text);
 
@@ -651,7 +668,9 @@ array: ["xxxx"]"#;
         use tree_sitter::{Parser, Query};
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("yaml", tree_sitter_yaml::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("yaml".to_string(), tree_sitter_yaml::LANGUAGE.into());
 
         let mut parser_pool = coordinator.create_document_parser_pool();
 
@@ -673,7 +692,9 @@ array: ["xxxx"]"#;
         "#;
         let injection_query =
             Query::new(&md_language, injection_query_str).expect("valid injection query");
-        coordinator.register_injection_query_for_test("markdown", injection_query);
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
 
         // --- Blockquote case ---
         // Line 0: "> ```yaml"

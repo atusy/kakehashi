@@ -668,12 +668,20 @@ impl LanguageCoordinator {
         DocumentParserPool::new(parser_factory)
     }
 
+    /// Access the query store.
+    ///
+    /// Visibility: pub(crate) - used internally by coordinator methods and
+    /// by test code that needs to register queries directly.
+    pub(crate) fn query_store(&self) -> &QueryStore {
+        &self.query_store
+    }
+
     /// Check if queries exist for a language.
     ///
     /// Visibility: Public - called by LSP layer (lsp_impl) to determine if
     /// semantic tokens should be refreshed after language load.
     pub fn has_queries(&self, lang_name: &str) -> bool {
-        self.query_store.has_highlight_query(lang_name)
+        self.query_store().has_highlight_query(lang_name)
     }
 
     /// Get highlight query for a language.
@@ -681,7 +689,7 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
     pub fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
-        self.query_store.highlight_query(lang_name)
+        self.query_store().highlight_query(lang_name)
     }
 
     /// Get injection query for a language.
@@ -689,7 +697,7 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer (multiple handlers) and analysis
     /// layer (refactor, semantic, selection) for nested language support.
     pub fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
-        self.query_store.injection_query(lang_name)
+        self.query_store().injection_query(lang_name)
     }
 
     /// Get capture mappings.
@@ -884,46 +892,6 @@ impl LanguageCoordinator {
         events
     }
 
-    /// Register a language directly for testing purposes.
-    ///
-    /// This bypasses the normal loading process and directly registers
-    /// a tree-sitter Language in the registry. Useful for unit tests
-    /// that need to test with specific language parsers.
-    #[cfg(test)]
-    pub(crate) fn register_language_for_test(
-        &self,
-        language_id: &str,
-        language: tree_sitter::Language,
-    ) {
-        self.language_registry
-            .register(language_id.to_string(), language);
-    }
-
-    /// Register an injection query directly for testing purposes.
-    ///
-    /// This bypasses the normal loading process and directly registers
-    /// an injection query in the query store. Useful for unit tests
-    /// that need to test nested injection scenarios.
-    #[cfg(test)]
-    pub(crate) fn register_injection_query_for_test(
-        &self,
-        language_id: &str,
-        query: tree_sitter::Query,
-    ) {
-        self.query_store
-            .insert_injection_query(language_id.to_string(), Arc::new(query));
-    }
-
-    /// Get a clone of the language registry for testing purposes.
-    ///
-    /// This allows test code to access the registry directly for creating
-    /// parser factories without going through the coordinator's normal
-    /// document parser pool creation.
-    #[cfg(test)]
-    pub(crate) fn language_registry_for_testing(&self) -> LanguageRegistry {
-        self.language_registry.clone()
-    }
-
     /// Get a clone of the language registry for parallel processing.
     ///
     /// This allows the parallel injection processor to create thread-local
@@ -959,7 +927,9 @@ mod tests {
     fn test_injection_direct_identifier_first() {
         let coordinator = LanguageCoordinator::new();
         // Register "python" parser
-        coordinator.register_language_for_test("python", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Direct identifier "python" should work
         let result = coordinator.resolve_injection_language("python", "print('hello')");
@@ -973,7 +943,9 @@ mod tests {
     fn test_injection_uses_syntect_token() {
         let coordinator = LanguageCoordinator::new();
         // Register "python" parser (not "py")
-        coordinator.register_language_for_test("python", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Token "py" should resolve to "python" via syntect's detect_from_token
         let result = coordinator.resolve_injection_language("py", "print('hello')");
@@ -1003,7 +975,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         // Register "markdown" parser (not "rmd")
-        coordinator.register_language_for_test("markdown", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Build config-based alias map: "rmd" → "markdown"
         let mut languages = HashMap::new();
@@ -1028,8 +1002,9 @@ mod tests {
     fn test_injection_prefers_direct_over_alias() {
         let coordinator = LanguageCoordinator::new();
         // Register both "js" and "javascript" as separate parsers
-        coordinator.register_language_for_test("js", tree_sitter_rust::LANGUAGE.into());
-        coordinator.register_language_for_test("javascript", tree_sitter_rust::LANGUAGE.into());
+        let registry = coordinator.language_registry_for_parallel();
+        registry.register("js".to_string(), tree_sitter_rust::LANGUAGE.into());
+        registry.register("javascript".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // "js" should resolve to "js" (direct), not "javascript" (alias)
         let result = coordinator.resolve_injection_language("js", "");
@@ -1048,7 +1023,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         // Register "python" parser
-        coordinator.register_language_for_test("python", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("python".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Injection with unknown identifier but Python shebang in content
         let content = "#!/usr/bin/env python\nprint('hello')";
@@ -1069,7 +1046,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         // Register "bash" parser
-        coordinator.register_language_for_test("bash", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("bash".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Content with bash shebang - syntect detects "bash" for #!/bin/bash
         let content = "#!/bin/bash\necho hello";
@@ -1117,9 +1096,7 @@ mod tests {
         // No languages loaded initially - should return false
         assert!(!coordinator.has_parser_available("rust"));
 
-        // This test verifies the API is exposed on LanguageCoordinator.
-        // The full behavior (true when loaded) is tested in unit tests
-        // via register_language_for_test which is only available there.
+        // Full behavior (true when loaded) is tested in other unit tests.
     }
 
     #[test]
@@ -1221,7 +1198,9 @@ mod tests {
         use tempfile::TempDir;
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Create a temporary query file with valid highlights content
         let temp_dir = TempDir::new().unwrap();
@@ -1269,7 +1248,9 @@ mod tests {
         use tempfile::TempDir;
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Create a temporary query file with the exact filename "highlights.scm"
         let temp_dir = TempDir::new().unwrap();
@@ -1317,7 +1298,9 @@ mod tests {
         use tempfile::TempDir;
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Create a temporary query file with a non-standard filename
         let temp_dir = TempDir::new().unwrap();
@@ -1362,7 +1345,9 @@ mod tests {
         use tempfile::TempDir;
 
         let coordinator = LanguageCoordinator::new();
-        coordinator.register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Create temporary query files for different types
         let temp_dir = TempDir::new().unwrap();
@@ -1438,7 +1423,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         // Register "markdown" parser (using rust as a stand-in)
-        coordinator.register_language_for_test("markdown", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Build alias map: "rmd" → "markdown"
         let mut languages = HashMap::new();
@@ -1474,8 +1461,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         // Register both "rmd" and "markdown" as separate parsers
-        coordinator.register_language_for_test("rmd", tree_sitter_rust::LANGUAGE.into());
-        coordinator.register_language_for_test("markdown", tree_sitter_rust::LANGUAGE.into());
+        let registry = coordinator.language_registry_for_parallel();
+        registry.register("rmd".to_string(), tree_sitter_rust::LANGUAGE.into());
+        registry.register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Build alias map: "rmd" → "markdown"
         let mut languages = HashMap::new();
@@ -1578,7 +1566,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         // Register "javascript" parser (using rust as a stand-in)
-        coordinator.register_language_for_test("javascript", tree_sitter_rust::LANGUAGE.into());
+        coordinator
+            .language_registry_for_parallel()
+            .register("javascript".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         // Build alias map: "jsx" → "javascript"
         let mut languages = HashMap::new();

@@ -496,7 +496,9 @@ mod tests {
         "#;
         let injection_query =
             Query::new(&md_language, injection_query_str).expect("create injection query");
-        coordinator.register_injection_query_for_test("markdown", injection_query);
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
 
         // Parse markdown with a Lua code block
         let initial_text = r#"# Test
@@ -632,7 +634,9 @@ print("hello")
         "#;
         let injection_query =
             Query::new(&md_language, injection_query_str).expect("create injection query");
-        coordinator.register_injection_query_for_test("markdown", injection_query);
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
 
         // Parse markdown with a Lua code block
         let initial_text = r#"# Test
