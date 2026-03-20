@@ -22,9 +22,6 @@ const MAX_PREVIEW_LEN: usize = 60;
 struct QueryLoadContext<'a> {
     language_id: &'a str,
     query_type: &'a str,
-    /// Describes where the query was loaded from (e.g., "Dynamically loaded").
-    /// Only used by `load_query_with_inheritance`, not by `load_query_from_paths`.
-    context: Option<&'a str>,
 }
 
 /// Coordinates language runtime components (registry, queries, configs).
@@ -276,8 +273,8 @@ impl LanguageCoordinator {
                 QueryLoadContext {
                     language_id: lang_name,
                     query_type,
-                    context: Some(context),
                 },
+                context,
                 events,
                 |store, query| match query_type {
                     "highlights" => store.insert_highlight_query(lang, query),
@@ -295,6 +292,7 @@ impl LanguageCoordinator {
         language: &Language,
         paths: &[PathBuf],
         ctx: QueryLoadContext<'_>,
+        context: &str,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
@@ -316,7 +314,6 @@ impl LanguageCoordinator {
         };
 
         let query_label = format!("{}/{}", ctx.language_id, filename);
-        let context = ctx.context.unwrap_or(ctx.query_type);
         let success_prefix = format!("{} {} for {}", context, ctx.query_type, ctx.language_id);
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
@@ -830,7 +827,6 @@ impl LanguageCoordinator {
                     QueryLoadContext {
                         language_id: lang_name,
                         query_type,
-                        context: None,
                     },
                     &mut events,
                     |store, q| match query_type {
