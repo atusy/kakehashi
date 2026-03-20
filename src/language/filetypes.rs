@@ -26,7 +26,10 @@ impl FiletypeResolver {
 
     /// Extract file extension from a path
     fn extract_extension(path: &str) -> &str {
-        path.split('.').next_back().unwrap_or("")
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
     }
 }
 
@@ -135,5 +138,26 @@ mod tests {
         );
 
         assert_eq!(resolver.language_for_path("/path/to/file"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_edge_cases() {
+        // No extension
+        assert_eq!(FiletypeResolver::extract_extension("/path/to/file"), "");
+        // Dotfile without extension
+        assert_eq!(
+            FiletypeResolver::extract_extension("/path/to/.gitignore"),
+            ""
+        );
+        // Dots in directory name
+        assert_eq!(
+            FiletypeResolver::extract_extension("/path.d/to/file.rs"),
+            "rs"
+        );
+        // Multiple dots in filename
+        assert_eq!(
+            FiletypeResolver::extract_extension("/path/to/file.test.rs"),
+            "rs"
+        );
     }
 }
