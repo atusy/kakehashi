@@ -1,7 +1,11 @@
+use crate::config::settings::AggregationStrategy;
+use crate::language::InjectionResolver;
+use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::lsp_impl::text_document::publish_diagnostic::collect_push_diagnostics;
 
 pub(crate) struct DiagnosticScheduler<'a> {
     server: &'a Kakehashi,
@@ -21,7 +25,7 @@ impl<'a> DiagnosticScheduler<'a> {
     /// The diagnostic snapshot is captured immediately (at schedule time) to
     /// ensure consistency with the document state that triggered the change.
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url, lsp_uri: Uri) {
-        let snapshot_data = self.server.prepare_diagnostic_snapshot(&uri);
+        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
         self.server.debounced_diagnostics.schedule(
             uri,
@@ -32,4 +36,118 @@ impl<'a> DiagnosticScheduler<'a> {
             std::sync::Arc::clone(&self.server.synthetic_diagnostics),
         );
     }
+
+    /// Spawn a background task to collect and publish diagnostics.
+    ///
+    /// ADR-0020 Phase 2: Synthetic push on didSave/didOpen.
+    ///
+    /// The task:
+    /// 1. Registers itself with `SyntheticDiagnosticsManager` (superseding any previous task)
+    /// 2. Collects diagnostics via fan-out to downstream servers
+    /// 3. Publishes diagnostics via `textDocument/publishDiagnostics`
+    pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url, lsp_uri: Uri) {
+        let client = self.server.client.clone();
+        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        let bridge_pool = self.server.bridge.pool_arc();
+        let uri_clone = uri.clone();
+
+        let task = tokio::spawn(async move {
+            let diagnostics =
+                collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
+
+            let Some(diagnostics) = diagnostics else {
+                return;
+            };
+
+            log::debug!(
+                target: LOG_TARGET,
+                "Collected {} diagnostics for {}",
+                diagnostics.len(),
+                uri_clone
+            );
+
+            client.publish_diagnostics(lsp_uri, diagnostics, None).await;
+        });
+
+        self.server
+            .synthetic_diagnostics
+            .register_task(uri, task.abort_handle());
+    }
+
+    /// Prepare per-region diagnostic contexts for a background task.
+    ///
+    /// This extracts all necessary data synchronously before spawning,
+    /// avoiding lifetime issues with `self` references in async tasks.
+    /// Each region gets its own `DocumentRequestContext` with aggregation
+    /// priorities resolved for `"textDocument/publishDiagnostics"`.
+    ///
+    /// # Returns
+    ///
+    /// - `None`: Document doesn't exist, has no snapshot, or lacks language/injection configuration
+    /// - `Some(Vec::new())`: Document exists but has no injection regions (caller should clear diagnostics)
+    /// - `Some(vec![...])`: Injection regions found, ready for diagnostic requests
+    ///
+    /// Used by both immediate synthetic diagnostics (didSave/didOpen) and
+    /// debounced diagnostics (didChange).
+    pub(crate) fn prepare_diagnostic_snapshot(
+        &self,
+        uri: &Url,
+    ) -> Option<Vec<DocumentRequestContext>> {
+        let snapshot = {
+            let doc = self.server.documents.get(uri)?;
+            doc.snapshot()?
+        };
+
+        let language_name = self
+            .server
+            .parse_coordinator()
+            .get_language_for_document(uri)?;
+        let injection_query = self.server.language.get_injection_query(&language_name)?;
+
+        let all_regions = InjectionResolver::resolve_all(
+            &self.server.language,
+            self.server.bridge.region_id_tracker(),
+            uri,
+            snapshot.tree(),
+            snapshot.text(),
+            injection_query.as_ref(),
+        );
+
+        if all_regions.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let mut contexts = Vec::new();
+        for resolved in all_regions {
+            let configs = self
+                .server
+                .injection_coordinator()
+                .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
+            if configs.is_empty() {
+                continue;
+            }
+
+            let agg = self.server.resolve_aggregation_config(
+                &language_name,
+                &resolved.injection_language,
+                "textDocument/publishDiagnostics",
+                AggregationStrategy::Concatenated,
+            );
+
+            contexts.push(DocumentRequestContext {
+                uri: uri.clone(),
+                resolved,
+                configs,
+                upstream_request_id: None,
+                priorities: agg.priorities,
+                strategy: agg.strategy,
+                max_fan_out: agg.max_fan_out,
+            });
+        }
+
+        Some(contexts)
+    }
 }
+
+/// Logging target for synthetic push diagnostics.
+const LOG_TARGET: &str = "kakehashi::synthetic_diag";

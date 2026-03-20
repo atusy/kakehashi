@@ -1,15 +1,21 @@
-//! Injection resolution and bridge warmup helpers.
-
 use std::collections::HashSet;
 
 use url::Url;
 
 use crate::language::injection::{InjectionResolver, collect_all_injections};
+use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::bridge::coordinator::BridgeInjection;
+use crate::lsp::lsp_impl::Kakehashi;
 
-use super::Kakehashi;
+pub(crate) struct InjectionCoordinator<'a> {
+    server: &'a Kakehashi,
+}
 
-impl Kakehashi {
+impl<'a> InjectionCoordinator<'a> {
+    pub(crate) fn new(server: &'a Kakehashi) -> Self {
+        Self { server }
+    }
+
     /// Send didClose for invalidated virtual documents.
     ///
     /// When region IDs are invalidated (e.g., due to edits touching their START),
@@ -21,7 +27,7 @@ impl Kakehashi {
     ///
     /// Documents that were never opened (not in host_to_virtual) are automatically
     /// skipped - they don't need didClose since didOpen was never sent.
-    pub(super) async fn close_invalidated_virtual_docs(
+    pub(crate) async fn close_invalidated_virtual_docs(
         &self,
         host_uri: &Url,
         invalidated_ulids: &[ulid::Ulid],
@@ -30,10 +36,12 @@ impl Kakehashi {
             return;
         }
 
-        self.cache
+        self.server
+            .cache
             .remove_injection_tokens_for_ulids(host_uri, invalidated_ulids);
 
-        self.bridge
+        self.server
+            .bridge
             .close_invalidated_docs(host_uri, invalidated_ulids)
             .await;
     }
@@ -42,14 +50,17 @@ impl Kakehashi {
     ///
     /// Returns **all** servers configured for the injection language,
     /// supporting multiple servers per language (e.g., pyright + ruff both handling Python).
-    pub(super) fn get_all_bridge_configs_for_language(
+    pub(crate) fn get_all_bridge_configs_for_language(
         &self,
         host_language: &str,
         injection_language: &str,
-    ) -> Vec<crate::lsp::bridge::ResolvedServerConfig> {
-        let settings = self.settings_manager.load_settings();
-        self.bridge
-            .get_all_configs_for_language(&settings, host_language, injection_language)
+    ) -> Vec<ResolvedServerConfig> {
+        let settings = self.server.settings_manager.load_settings();
+        self.server.bridge.get_all_configs_for_language(
+            &settings,
+            host_language,
+            injection_language,
+        )
     }
 
     /// Resolve all injection regions for a document.
@@ -66,16 +77,16 @@ impl Kakehashi {
     /// # Lock Safety
     /// The document store lock is held only to clone the tree and text, then
     /// released before the tree traversal. No DashMap deadlock risk.
-    pub(super) fn resolve_injection_data(
+    pub(crate) fn resolve_injection_data(
         &self,
         uri: &Url,
         host_language: &str,
     ) -> Vec<BridgeInjection> {
-        let Some(injection_query) = self.language.get_injection_query(host_language) else {
+        let Some(injection_query) = self.server.language.get_injection_query(host_language) else {
             return Vec::new();
         };
 
-        let Some(doc) = self.documents.get(uri) else {
+        let Some(doc) = self.server.documents.get(uri) else {
             return Vec::new();
         };
         let Some(tree) = doc.tree().cloned() else {
@@ -98,7 +109,7 @@ impl Kakehashi {
             .iter()
             .map(|region| {
                 let region_id = InjectionResolver::calculate_region_id(
-                    self.bridge.region_id_tracker(),
+                    self.server.bridge.region_id_tracker(),
                     uri,
                     region,
                 );
@@ -129,19 +140,24 @@ impl Kakehashi {
     /// 3. Eager server spawn + didOpen for virtual documents
     ///
     /// Must be called AFTER parse_document so we have access to the AST.
-    pub(super) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
-        let Some(host_language) = self.parse_coordinator().get_language_for_document(uri) else {
-            self.bridge.cancel_eager_open(uri);
+    pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
+        let Some(host_language) = self
+            .server
+            .parse_coordinator()
+            .get_language_for_document(uri)
+        else {
+            self.server.bridge.cancel_eager_open(uri);
             return;
         };
         let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
-            self.bridge.cancel_eager_open(uri);
+            self.server.bridge.cancel_eager_open(uri);
             return;
         }
 
         if forward_did_change {
-            self.bridge
+            self.server
+                .bridge
                 .forward_didchange_to_opened_docs(uri, &injections)
                 .await;
         }
@@ -164,27 +180,32 @@ impl Kakehashi {
     ///
     /// The InstallingLanguages tracker in maybe_auto_install_language prevents
     /// duplicate install attempts.
-    pub(super) async fn check_injected_languages_auto_install(
+    pub(crate) async fn check_injected_languages_auto_install(
         &self,
         uri: &Url,
         languages: &HashSet<String>,
     ) {
-        let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
+        let auto_install_enabled = self.server.settings_manager.is_auto_install_enabled();
 
         let (text, reason) = if auto_install_enabled {
             (
-                self.documents.get(uri).map(|doc| doc.text().to_string()),
+                self.server
+                    .documents
+                    .get(uri)
+                    .map(|doc| doc.text().to_string()),
                 String::new(),
             )
         } else {
             (
                 None,
-                self.install_coordinator().auto_install_disabled_reason(),
+                self.server
+                    .install_coordinator()
+                    .auto_install_disabled_reason(),
             )
         };
 
         for lang in languages {
-            let resolved_lang = if self.language.has_parser_available(lang) {
+            let resolved_lang = if self.server.language.has_parser_available(lang) {
                 lang.clone()
             } else if let Some(normalized) = crate::language::heuristic::detect_from_token(lang) {
                 normalized
@@ -192,13 +213,14 @@ impl Kakehashi {
                 lang.clone()
             };
 
-            let load_result = self.language.ensure_language_loaded(&resolved_lang);
+            let load_result = self.server.language.ensure_language_loaded(&resolved_lang);
             if load_result.success {
                 continue;
             }
 
             if !auto_install_enabled {
-                self.install_coordinator()
+                self.server
+                    .install_coordinator()
                     .notify_parser_missing(&resolved_lang, &reason)
                     .await;
                 continue;
@@ -206,6 +228,7 @@ impl Kakehashi {
 
             if let Some(ref text) = text {
                 let _ = self
+                    .server
                     .install_coordinator()
                     .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
                     .await;
@@ -218,14 +241,18 @@ impl Kakehashi {
     /// This warms up language servers (spawn + handshake + didOpen) in the background
     /// for injection regions found in the document. Downstream servers receive
     /// document content immediately, enabling faster diagnostic responses.
-    pub(super) fn eager_spawn_bridge_servers(
+    pub(crate) fn eager_spawn_bridge_servers(
         &self,
         uri: &Url,
         host_language: &str,
         injections: Vec<BridgeInjection>,
     ) {
-        let settings = self.settings_manager.load_settings();
-        self.bridge
-            .eager_spawn_and_open_documents(&settings, host_language, uri, injections);
+        let settings = self.server.settings_manager.load_settings();
+        self.server.bridge.eager_spawn_and_open_documents(
+            &settings,
+            host_language,
+            uri,
+            injections,
+        );
     }
 }

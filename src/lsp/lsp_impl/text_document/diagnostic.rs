@@ -48,9 +48,9 @@ const DIAGNOSTIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Collect diagnostics for a single injection region using strategy-aware dispatch.
 ///
 /// Dispatches to either `dispatch_concatenated` or `dispatch_preferred` based on
-/// `ctx.strategy`. Used by push diagnostic helpers:
-/// `spawn_synthetic_diagnostic_task` in `publish_diagnostic.rs` and
-/// `execute_debounced_diagnostic` in `debounced_diagnostics.rs`.
+/// `ctx.strategy`. Used by push diagnostic collection paths driven by
+/// `DiagnosticScheduler` and `execute_debounced_diagnostic` in
+/// `debounced_diagnostics.rs`.
 ///
 /// Pull diagnostics (`diagnostic_impl`) use `dispatch_concatenated_diagnostics`
 /// and `dispatch_preferred_diagnostics` directly to support per-region
@@ -144,6 +144,7 @@ impl Kakehashi {
 
         for resolved in all_regions {
             let configs = self
+                .injection_coordinator()
                 .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
             if configs.is_empty() {
                 continue;

@@ -221,10 +221,12 @@ impl Kakehashi {
         preamble: PreambleResult,
         method_name: &str,
     ) -> Option<DocumentRequestContext> {
-        let configs = self.get_all_bridge_configs_for_language(
-            &preamble.language_name,
-            &preamble.resolved.injection_language,
-        );
+        let configs = self
+            .injection_coordinator()
+            .get_all_bridge_configs_for_language(
+                &preamble.language_name,
+                &preamble.resolved.injection_language,
+            );
 
         if configs.is_empty() {
             log::debug!(
