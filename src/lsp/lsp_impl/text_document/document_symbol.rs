@@ -48,7 +48,7 @@ impl Kakehashi {
         };
 
         // Get the language for this document
-        let Some(language_name) = self.parse_coordinator().get_language_for_document(&uri) else {
+        let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::document_symbol", "No language detected");
             return Ok(None);
         };

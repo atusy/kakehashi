@@ -22,7 +22,7 @@ impl Kakehashi {
         };
 
         // Get language for document
-        let Some(language_name) = self.parse_coordinator().get_language_for_document(&uri) else {
+        let Some(language_name) = self.document_language(&uri) else {
             return Ok(None);
         };
 

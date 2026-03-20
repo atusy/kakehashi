@@ -54,6 +54,24 @@ pub(super) fn build_notifier<'a>(
     ClientNotifier::new(client.clone(), settings_manager.client_capabilities_lock())
 }
 
+/// Detect the canonical language for a document using the full ADR-0005 chain.
+///
+/// This uses the stored document text and optional language_id so alias resolution
+/// still works even if the document is accessed before didOpen fully completes.
+pub(super) fn detect_document_language(
+    language: &std::sync::Arc<LanguageCoordinator>,
+    documents: &DocumentStore,
+    uri: &Url,
+) -> Option<String> {
+    let path = uri.path();
+
+    if let Some(doc) = documents.get(uri) {
+        language.detect_language(path, doc.text(), None, doc.language_id())
+    } else {
+        language.detect_language(path, "", None, None)
+    }
+}
+
 pub(super) async fn apply_shared_settings(
     client: &Client,
     language: &std::sync::Arc<LanguageCoordinator>,
@@ -209,6 +227,10 @@ impl Kakehashi {
 
     pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator {
         coordinator::ParseCoordinator::new(self)
+    }
+
+    pub(super) fn document_language(&self, uri: &Url) -> Option<String> {
+        detect_document_language(&self.language, &self.documents, uri)
     }
 
     pub(super) fn install_coordinator(&self) -> coordinator::InstallCoordinator {
