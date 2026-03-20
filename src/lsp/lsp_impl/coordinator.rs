@@ -5,5 +5,5 @@ mod parse;
 
 pub(crate) use diagnostic::DiagnosticScheduler;
 pub(crate) use injection::InjectionCoordinator;
-pub(crate) use install::{InstallCoordinator, InstallCoordinatorDeps};
-pub(crate) use parse::{ParseCoordinator, ParseCoordinatorDeps};
+pub(crate) use install::InstallCoordinator;
+pub(crate) use parse::ParseCoordinator;

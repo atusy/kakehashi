@@ -14,17 +14,18 @@ use crate::lsp::lsp_impl::{
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 
-use super::{ParseCoordinator, ParseCoordinatorDeps};
+use super::ParseCoordinator;
+use super::parse::ParseCoordinatorDeps;
 
-pub(crate) struct InstallCoordinatorDeps {
-    pub(crate) client: Client,
-    pub(crate) language: std::sync::Arc<LanguageCoordinator>,
-    pub(crate) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
-    pub(crate) documents: std::sync::Arc<DocumentStore>,
-    pub(crate) cache: std::sync::Arc<CacheCoordinator>,
-    pub(crate) settings_manager: std::sync::Arc<SettingsManager>,
-    pub(crate) auto_install: AutoInstallManager,
-    pub(crate) bridge: std::sync::Arc<BridgeCoordinator>,
+pub(super) struct InstallCoordinatorDeps {
+    pub(super) client: Client,
+    pub(super) language: std::sync::Arc<LanguageCoordinator>,
+    pub(super) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(super) documents: std::sync::Arc<DocumentStore>,
+    pub(super) cache: std::sync::Arc<CacheCoordinator>,
+    pub(super) settings_manager: std::sync::Arc<SettingsManager>,
+    pub(super) auto_install: AutoInstallManager,
+    pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
 pub(crate) struct InstallCoordinator {
@@ -52,7 +53,7 @@ impl InstallCoordinator {
         })
     }
 
-    pub(crate) fn from_parts(deps: InstallCoordinatorDeps) -> Self {
+    pub(super) fn from_parts(deps: InstallCoordinatorDeps) -> Self {
         Self {
             client: deps.client,
             language: deps.language,

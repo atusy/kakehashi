@@ -16,7 +16,8 @@ use tower_lsp_server::Client;
 
 use crate::lsp::lsp_impl::detect_document_language;
 
-use super::{InstallCoordinator, InstallCoordinatorDeps};
+use super::InstallCoordinator;
+use super::install::InstallCoordinatorDeps;
 
 pub(crate) struct InjectionCoordinator {
     client: Client,
