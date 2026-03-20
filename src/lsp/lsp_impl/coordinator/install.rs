@@ -14,6 +14,17 @@ use tower_lsp_server::Client;
 
 use super::{ParseCoordinator, ParseCoordinatorDeps};
 
+pub(crate) struct InstallCoordinatorDeps<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) language: &'a std::sync::Arc<LanguageCoordinator>,
+    pub(crate) parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
+    pub(crate) documents: &'a DocumentStore,
+    pub(crate) cache: &'a CacheCoordinator,
+    pub(crate) settings_manager: &'a SettingsManager,
+    pub(crate) auto_install: &'a AutoInstallManager,
+    pub(crate) bridge: &'a BridgeCoordinator,
+}
+
 pub(crate) struct InstallCoordinator<'a> {
     client: &'a Client,
     language: &'a std::sync::Arc<LanguageCoordinator>,
@@ -27,7 +38,7 @@ pub(crate) struct InstallCoordinator<'a> {
 
 impl<'a> InstallCoordinator<'a> {
     pub(crate) fn new(server: &'a Kakehashi) -> Self {
-        Self {
+        Self::from_parts(InstallCoordinatorDeps {
             client: &server.client,
             language: &server.language,
             parser_pool: &server.parser_pool,
@@ -36,6 +47,19 @@ impl<'a> InstallCoordinator<'a> {
             settings_manager: &server.settings_manager,
             auto_install: &server.auto_install,
             bridge: &server.bridge,
+        })
+    }
+
+    pub(crate) fn from_parts(deps: InstallCoordinatorDeps<'a>) -> Self {
+        Self {
+            client: deps.client,
+            language: deps.language,
+            parser_pool: deps.parser_pool,
+            documents: deps.documents,
+            cache: deps.cache,
+            settings_manager: deps.settings_manager,
+            auto_install: deps.auto_install,
+            bridge: deps.bridge,
         }
     }
 
