@@ -96,20 +96,20 @@ pub struct Kakehashi {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
     parser_pool: Mutex<DocumentParserPool>,
-    documents: DocumentStore,
+    documents: std::sync::Arc<DocumentStore>,
     /// Unified cache coordinator for semantic tokens, injections, and request tracking
     cache: CacheCoordinator,
     /// Consolidated settings, capabilities, and workspace root management
-    settings_manager: SettingsManager,
+    settings_manager: std::sync::Arc<SettingsManager>,
     /// Isolated coordinator for parser auto-installation
     auto_install: AutoInstallManager,
     /// Bridge coordinator for downstream LS pool and region ID tracking
-    bridge: BridgeCoordinator,
+    bridge: std::sync::Arc<BridgeCoordinator>,
     /// Manager for synthetic (background) diagnostic push tasks (ADR-0020 Phase 2).
     /// Wrapped in Arc for sharing with debounced diagnostics (Phase 3).
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
     /// Manager for debounced didChange diagnostic triggers (ADR-0020 Phase 3)
-    debounced_diagnostics: DebouncedDiagnosticsManager,
+    debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     /// Token for cancelling the upstream forwarding task on shutdown.
     ///
     /// Without this, the forwarding task only exits when all channel senders are
@@ -176,13 +176,13 @@ impl Kakehashi {
             client,
             language,
             parser_pool: Mutex::new(parser_pool),
-            documents: DocumentStore::new(),
+            documents: std::sync::Arc::new(DocumentStore::new()),
             cache: CacheCoordinator::new(),
-            settings_manager: SettingsManager::new(),
+            settings_manager: std::sync::Arc::new(SettingsManager::new()),
             auto_install,
-            bridge,
+            bridge: std::sync::Arc::new(bridge),
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
-            debounced_diagnostics: DebouncedDiagnosticsManager::new(),
+            debounced_diagnostics: std::sync::Arc::new(DebouncedDiagnosticsManager::new()),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
         }
@@ -219,7 +219,7 @@ impl Kakehashi {
         coordinator::InjectionCoordinator::new(self)
     }
 
-    pub(super) fn diagnostic_scheduler(&self) -> coordinator::DiagnosticScheduler<'_> {
+    pub(super) fn diagnostic_scheduler(&self) -> coordinator::DiagnosticScheduler {
         coordinator::DiagnosticScheduler::new(self)
     }
 }
