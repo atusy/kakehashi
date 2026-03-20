@@ -232,26 +232,6 @@ impl ParseCoordinator {
         self.notifier().log_language_events(&events).await;
     }
 
-    /// Get the language for a document using the full detection chain.
-    ///
-    /// Uses LanguageCoordinator::detect_language() which implements
-    /// the fallback chain (ADR-0005): languageId → heuristics
-    /// (token, path-derived token, first-line content) with alias
-    /// resolution at each step.
-    ///
-    /// This ensures aliases are resolved (e.g., "rmd" → "markdown") even when
-    /// the document is accessed before didOpen fully completes (race condition).
-    pub(crate) fn get_language_for_document(&self, uri: &Url) -> Option<String> {
-        let path = uri.path();
-
-        if let Some(doc) = self.documents.get(uri) {
-            self.language
-                .detect_language(path, doc.text(), None, doc.language_id())
-        } else {
-            self.language.detect_language(path, "", None, None)
-        }
-    }
-
     fn notifier(&self) -> ClientNotifier<'_> {
         build_notifier(&self.client, &self.settings_manager)
     }

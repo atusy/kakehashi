@@ -8,7 +8,9 @@ use crate::lsp::auto_install::InstallEvent;
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
-use crate::lsp::lsp_impl::{Kakehashi, apply_shared_settings, build_notifier};
+use crate::lsp::lsp_impl::{
+    Kakehashi, apply_shared_settings, build_notifier, detect_document_language,
+};
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 
@@ -179,9 +181,9 @@ impl InstallCoordinator {
             .await;
 
         if !is_injection {
-            let parse_coordinator = self.parse_coordinator();
-            let host_language = parse_coordinator.get_language_for_document(&uri);
+            let host_language = self.get_language_for_document(&uri);
             let lang_for_parse = host_language.as_deref();
+            let parse_coordinator = self.parse_coordinator();
             parse_coordinator
                 .parse_document(uri.clone(), text, lang_for_parse, vec![])
                 .await;
@@ -200,6 +202,10 @@ impl InstallCoordinator {
 
     fn notifier(&self) -> ClientNotifier<'_> {
         build_notifier(&self.client, &self.settings_manager)
+    }
+
+    fn get_language_for_document(&self, uri: &Url) -> Option<String> {
+        detect_document_language(&self.language, &self.documents, uri)
     }
 
     fn parse_coordinator(&self) -> ParseCoordinator {

@@ -14,7 +14,9 @@ use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 
-use super::{InstallCoordinator, InstallCoordinatorDeps, ParseCoordinator, ParseCoordinatorDeps};
+use crate::lsp::lsp_impl::detect_document_language;
+
+use super::{InstallCoordinator, InstallCoordinatorDeps};
 
 pub(crate) struct InjectionCoordinator {
     client: Client,
@@ -161,7 +163,7 @@ impl InjectionCoordinator {
     ///
     /// Must be called AFTER parse_document so we have access to the AST.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
-        let Some(host_language) = self.parse_coordinator().get_language_for_document(uri) else {
+        let Some(host_language) = self.get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
             return;
         };
@@ -255,17 +257,8 @@ impl InjectionCoordinator {
             .eager_spawn_and_open_documents(&settings, host_language, uri, injections);
     }
 
-    fn parse_coordinator(&self) -> ParseCoordinator {
-        ParseCoordinator::from_parts(ParseCoordinatorDeps {
-            client: self.client.clone(),
-            language: std::sync::Arc::clone(&self.language),
-            parser_pool: std::sync::Arc::clone(&self.parser_pool),
-            documents: std::sync::Arc::clone(&self.documents),
-            cache: std::sync::Arc::clone(&self.cache),
-            settings_manager: std::sync::Arc::clone(&self.settings_manager),
-            auto_install: self.auto_install.clone(),
-            bridge: std::sync::Arc::clone(&self.bridge),
-        })
+    fn get_language_for_document(&self, uri: &Url) -> Option<String> {
+        detect_document_language(&self.language, &self.documents, uri)
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {
