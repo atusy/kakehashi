@@ -272,7 +272,6 @@ impl LanguageCoordinator {
         events: &mut Vec<LanguageEvent>,
     ) {
         for query_type in ["highlights", "locals", "injections"] {
-            let lang = lang_name.to_string();
             self.load_query(
                 language,
                 search_paths,
@@ -283,9 +282,9 @@ impl LanguageCoordinator {
                 context,
                 events,
                 |store, query| match query_type {
-                    "highlights" => store.insert_highlight_query(lang, query),
-                    "locals" => store.insert_locals_query(lang, query),
-                    "injections" => store.insert_injection_query(lang, query),
+                    "highlights" => store.insert_highlight_query(lang_name.to_string(), query),
+                    "locals" => store.insert_locals_query(lang_name.to_string(), query),
+                    "injections" => store.insert_injection_query(lang_name.to_string(), query),
                     _ => unreachable!(),
                 },
             );
@@ -795,7 +794,6 @@ impl LanguageCoordinator {
             ("injections", &injections),
         ] {
             if !paths.is_empty() {
-                let lang = lang_name.to_string();
                 self.load_query_from_paths(
                     language,
                     paths,
@@ -805,9 +803,9 @@ impl LanguageCoordinator {
                     },
                     &mut events,
                     |store, q| match query_type {
-                        "highlights" => store.insert_highlight_query(lang, q),
-                        "locals" => store.insert_locals_query(lang, q),
-                        "injections" => store.insert_injection_query(lang, q),
+                        "highlights" => store.insert_highlight_query(lang_name.to_string(), q),
+                        "locals" => store.insert_locals_query(lang_name.to_string(), q),
+                        "injections" => store.insert_injection_query(lang_name.to_string(), q),
                         _ => unreachable!(),
                     },
                 );
