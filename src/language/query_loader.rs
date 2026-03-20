@@ -170,6 +170,8 @@ impl QueryLoader {
         let child_content = Self::strip_inherits_directive(&content);
         combined.push_str(&child_content);
 
+        visited.remove(lang_name);
+
         Ok(combined)
     }
 
@@ -799,6 +801,52 @@ mod tests {
         let ecma_pos = content.find("(identifier)").unwrap();
         let ts_pos = content.find("\"require\"").unwrap();
         assert!(ecma_pos < ts_pos, "Parent query should come before child");
+    }
+
+    #[test]
+    fn test_resolve_query_shared_ancestor_is_not_circular() {
+        let dir = tempdir().unwrap();
+
+        let shared_dir = dir.path().join("queries").join("shared");
+        fs::create_dir_all(&shared_dir).unwrap();
+        fs::write(shared_dir.join("highlights.scm"), "(identifier) @shared\n").unwrap();
+
+        let parent_a_dir = dir.path().join("queries").join("parent_a");
+        fs::create_dir_all(&parent_a_dir).unwrap();
+        fs::write(
+            parent_a_dir.join("highlights.scm"),
+            "; inherits: shared\n(string_literal) @parent_a\n",
+        )
+        .unwrap();
+
+        let parent_b_dir = dir.path().join("queries").join("parent_b");
+        fs::create_dir_all(&parent_b_dir).unwrap();
+        fs::write(
+            parent_b_dir.join("highlights.scm"),
+            "; inherits: shared\n(raw_string_literal) @parent_b\n",
+        )
+        .unwrap();
+
+        let child_dir = dir.path().join("queries").join("child");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("highlights.scm"),
+            "; inherits: parent_a,parent_b\n(boolean_literal) @child\n",
+        )
+        .unwrap();
+
+        let result = resolve_query(&[dir.path().to_path_buf()], "child", "highlights.scm");
+
+        assert!(
+            result.is_ok(),
+            "Shared ancestors should not be treated as circular: {:?}",
+            result.err()
+        );
+        let content = result.unwrap();
+        assert!(content.contains("(identifier) @shared"));
+        assert!(content.contains("(string_literal) @parent_a"));
+        assert!(content.contains("(raw_string_literal) @parent_b"));
+        assert!(content.contains("(boolean_literal) @child"));
     }
 
     #[test]
