@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 /// Thread-safe cache of workspace settings for the language subsystem.
+///
+/// Search paths are cleaned/normalized (e.g. `..` resolved) on write.
 pub(crate) struct ConfigStore {
     capture_mappings: RwLock<CaptureMappings>,
     search_paths: RwLock<Vec<PathBuf>>,
@@ -63,58 +65,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_config_store_capture_mappings() {
-        let store = ConfigStore::new();
-
-        let mappings = CaptureMappings::default();
-        store.set_capture_mappings(mappings.clone());
-
-        let retrieved = store.capture_mappings();
-        assert_eq!(retrieved, mappings);
-    }
-
-    #[test]
-    fn test_config_store_search_paths() {
-        let store = ConfigStore::new();
-
-        let paths = vec!["/path/one".to_string(), "/path/two".to_string()];
-        store.set_search_paths(paths);
-
-        let retrieved = store.search_paths();
-        assert_eq!(retrieved.len(), 2);
-        assert_eq!(retrieved[0], PathBuf::from("/path/one"));
-    }
-
-    #[test]
     fn test_config_store_update_from_settings() {
         let store = ConfigStore::new();
 
         let settings = WorkspaceSettings {
-            languages: {
-                let mut langs = HashMap::new();
-                langs.insert("python".to_string(), LanguageSettings::default());
-                langs
-            },
+            languages: HashMap::from([("python".to_string(), LanguageSettings::default())]),
             search_paths: vec!["/search/path".to_string()],
-            capture_mappings: CaptureMappings::default(),
-            auto_install: true,
-            language_servers: HashMap::new(),
+            ..Default::default()
         };
 
         store.update_from_settings(&settings);
 
         assert_eq!(store.search_paths(), vec![PathBuf::from("/search/path")]);
+        assert_eq!(store.capture_mappings(), settings.capture_mappings);
     }
 
     #[test]
-    fn test_search_paths_string_to_pathbuf_round_trip() {
+    fn test_search_paths_normalized_on_update() {
         let store = ConfigStore::new();
-        let input = vec!["/path/one".to_string(), "/path/with/../dots".to_string()];
-        store.set_search_paths(input);
-        let retrieved = store.search_paths();
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/path/one".to_string(), "/path/with/../dots".to_string()],
+            ..Default::default()
+        };
+        store.update_from_settings(&settings);
         assert_eq!(
-            retrieved,
-            vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots"),]
+            store.search_paths(),
+            vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots")]
         );
     }
 
