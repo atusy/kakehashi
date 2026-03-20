@@ -174,39 +174,15 @@ impl LanguageCoordinator {
             ));
         }
 
-        let library_path = QueryLoader::resolve_library_path(None, language_id, &search_paths);
-        let Some(lib_path) = library_path else {
-            return LanguageLoadResult::failure_with(LanguageEvent::log(
-                LanguageLogLevel::Warning,
-                format!(
-                    "Could not find parser for language '{language_id}' in search paths: {}",
-                    format_search_paths(&search_paths),
-                ),
-            ));
+        let language = match self.load_and_register_parser(
+            language_id,
+            None,
+            &search_paths,
+            LanguageLogLevel::Warning,
+        ) {
+            Ok(lang) => lang,
+            Err(result) => return result,
         };
-
-        let language = {
-            let result = self
-                .parser_loader
-                .write()
-                .recover_poison("LanguageCoordinator::try_load_language_by_id")
-                .load_language(&lib_path, language_id);
-            match result {
-                Ok(lang) => lang,
-                Err(err) => {
-                    return LanguageLoadResult::failure_with(LanguageEvent::log(
-                        LanguageLogLevel::Error,
-                        format!(
-                            "Failed to load language {language_id} from {}: {err}",
-                            lib_path.display()
-                        ),
-                    ));
-                }
-            }
-        };
-
-        self.language_registry
-            .register(language_id.to_string(), language.clone());
 
         let mut events = Vec::new();
 
@@ -249,10 +225,7 @@ impl LanguageCoordinator {
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!(
-                "Dynamically loaded language {language_id} from {}",
-                lib_path.display()
-            ),
+            format!("Dynamically loaded language {language_id} from search paths",),
         ));
         if self.has_queries(language_id) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -261,6 +234,55 @@ impl LanguageCoordinator {
         }
 
         LanguageLoadResult::success_with(events)
+    }
+
+    /// Resolve, load, and register a parser for the given language.
+    ///
+    /// Returns `Ok(Language)` on success, or `Err(LanguageLoadResult)` with
+    /// an appropriate failure event on error.
+    fn load_and_register_parser(
+        &self,
+        lang_name: &str,
+        parser_config: Option<&str>,
+        search_paths: &[PathBuf],
+        missing_parser_level: LanguageLogLevel,
+    ) -> Result<Language, LanguageLoadResult> {
+        let library_path =
+            QueryLoader::resolve_library_path(parser_config, lang_name, search_paths);
+        let Some(lib_path) = library_path else {
+            return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
+                missing_parser_level,
+                format!(
+                    "No parser path found for language '{lang_name}' in search paths: {}",
+                    format_search_paths(search_paths),
+                ),
+            )));
+        };
+
+        let language = {
+            let result = self
+                .parser_loader
+                .write()
+                .recover_poison("LanguageCoordinator::load_and_register_parser")
+                .load_language(&lib_path, lang_name);
+            match result {
+                Ok(lang) => lang,
+                Err(err) => {
+                    return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
+                        LanguageLogLevel::Error,
+                        format!(
+                            "Failed to load language {lang_name} from {}: {err}",
+                            lib_path.display()
+                        ),
+                    )));
+                }
+            }
+        };
+
+        self.language_registry
+            .register(lang_name.to_string(), language.clone());
+
+        Ok(language)
     }
 
     /// Load a query file with inheritance resolution.
@@ -714,40 +736,15 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
-        let library_path =
-            QueryLoader::resolve_library_path(config.parser.as_deref(), lang_name, search_paths);
-        let Some(lib_path) = library_path else {
-            return LanguageLoadResult::failure_with(LanguageEvent::log(
-                LanguageLogLevel::Error,
-                format!(
-                    "No parser path found for language {lang_name} in search paths: {}",
-                    format_search_paths(search_paths),
-                ),
-            ));
+        let language = match self.load_and_register_parser(
+            lang_name,
+            config.parser.as_deref(),
+            search_paths,
+            LanguageLogLevel::Error,
+        ) {
+            Ok(lang) => lang,
+            Err(result) => return result,
         };
-
-        let language = {
-            let result = self
-                .parser_loader
-                .write()
-                .recover_poison("LanguageCoordinator::load_single_language")
-                .load_language(&lib_path, lang_name);
-            match result {
-                Ok(lang) => lang,
-                Err(err) => {
-                    return LanguageLoadResult::failure_with(LanguageEvent::log(
-                        LanguageLogLevel::Error,
-                        format!(
-                            "Failed to load language {lang_name} from {}: {err}",
-                            lib_path.display()
-                        ),
-                    ));
-                }
-            }
-        };
-
-        self.language_registry
-            .register(lang_name.to_string(), language.clone());
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
 
