@@ -1,33 +1,30 @@
 //! Synthetic push diagnostics for ADR-0020 Phase 2.
 //!
-//! This module handles proactive diagnostic publishing triggered by
-//! `didSave` and `didOpen` events. Unlike pull diagnostics (`diagnostic.rs`),
-//! these are pushed to the client via `textDocument/publishDiagnostics`.
+//! This module contains the shared collection path for proactive
+//! `textDocument/publishDiagnostics` pushes. The scheduling entrypoints live in
+//! `DiagnosticScheduler`; this file keeps the fan-out and aggregation logic used
+//! by both immediate synthetic pushes and debounced didChange pushes.
 //!
 //! # Architecture
 //!
 //! ```text
-//! didSave/didOpen
+//! DiagnosticScheduler
 //!       │
 //!       ▼
-//! spawn_synthetic_diagnostic_task()
+//! prepare_diagnostic_snapshot()
 //!       │
-//!       ├─► prepare_diagnostic_snapshot() [sync: per-region contexts]
+//! collect_push_diagnostics()
 //!       │
-//!       └─► tokio::spawn [async: background task]
-//!               │
-//!               ▼
-//!           JoinSet { collect_region_diagnostics() per region }
-//!               │
-//!               ▼
-//!           client.publish_diagnostics()
+//!       ▼
+//! JoinSet { collect_region_diagnostics() per region }
 //! ```
 //!
 //! # Superseding Pattern
 //!
-//! When multiple saves occur rapidly, earlier tasks are aborted via
-//! `SyntheticDiagnosticsManager` to prevent stale diagnostics from
-//! being published. Only the latest task completes.
+//! `DiagnosticScheduler` coordinates superseding via
+//! `SyntheticDiagnosticsManager` and `DebouncedDiagnosticsManager`. This module
+//! only handles the per-region collection and aggregation once a snapshot has
+//! already been prepared.
 
 use std::sync::Arc;
 
