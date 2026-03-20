@@ -24,7 +24,7 @@ impl ConfigStore {
     }
 
     // ========== Capture Mappings ==========
-    pub(crate) fn set_capture_mappings(&self, mappings: CaptureMappings) {
+    fn set_capture_mappings(&self, mappings: CaptureMappings) {
         *self
             .capture_mappings
             .write()
@@ -39,7 +39,7 @@ impl ConfigStore {
     }
 
     // ========== Search Paths ==========
-    pub(crate) fn set_search_paths(&self, paths: Vec<String>) {
+    fn set_search_paths(&self, paths: Vec<String>) {
         *self
             .search_paths
             .write()
