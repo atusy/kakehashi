@@ -171,6 +171,7 @@ impl LanguageCoordinator {
             ));
         }
 
+        // Warning: parser may not exist yet (dynamic discovery)
         let language = match self.load_and_register_parser(
             language_id,
             None,
@@ -211,6 +212,11 @@ impl LanguageCoordinator {
     ///
     /// Returns `Ok(Language)` on success, or `Err(LanguageLoadResult)` with
     /// an appropriate failure event on error.
+    ///
+    /// `missing_parser_level` controls how a missing parser is reported:
+    /// - `Warning` for dynamic loading — the parser may not exist yet (normal)
+    /// - `Error` for config-driven loading — the parser was explicitly configured
+    ///   but cannot be found (configuration problem)
     fn load_and_register_parser(
         &self,
         lang_name: &str,
@@ -705,6 +711,7 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
+        // Error: parser was explicitly configured but can't be found
         let language = match self.load_and_register_parser(
             lang_name,
             config.parser.as_deref(),
