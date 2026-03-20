@@ -15,6 +15,17 @@ use crate::lsp::settings_manager::SettingsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+pub(crate) struct ParseCoordinatorDeps<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) language: &'a std::sync::Arc<LanguageCoordinator>,
+    pub(crate) parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
+    pub(crate) documents: &'a DocumentStore,
+    pub(crate) cache: &'a CacheCoordinator,
+    pub(crate) settings_manager: &'a SettingsManager,
+    pub(crate) auto_install: &'a AutoInstallManager,
+    pub(crate) bridge: &'a BridgeCoordinator,
+}
+
 pub(crate) struct ParseCoordinator<'a> {
     client: &'a Client,
     language: &'a std::sync::Arc<LanguageCoordinator>,
@@ -28,7 +39,7 @@ pub(crate) struct ParseCoordinator<'a> {
 
 impl<'a> ParseCoordinator<'a> {
     pub(crate) fn new(server: &'a Kakehashi) -> Self {
-        Self {
+        Self::from_parts(ParseCoordinatorDeps {
             client: &server.client,
             language: &server.language,
             parser_pool: &server.parser_pool,
@@ -37,6 +48,19 @@ impl<'a> ParseCoordinator<'a> {
             settings_manager: &server.settings_manager,
             auto_install: &server.auto_install,
             bridge: &server.bridge,
+        })
+    }
+
+    pub(crate) fn from_parts(deps: ParseCoordinatorDeps<'a>) -> Self {
+        Self {
+            client: deps.client,
+            language: deps.language,
+            parser_pool: deps.parser_pool,
+            documents: deps.documents,
+            cache: deps.cache,
+            settings_manager: deps.settings_manager,
+            auto_install: deps.auto_install,
+            bridge: deps.bridge,
         }
     }
 
