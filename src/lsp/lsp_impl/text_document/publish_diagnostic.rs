@@ -11,7 +11,7 @@
 //! DiagnosticScheduler
 //!       │
 //!       ▼
-//! prepare_diagnostic_snapshot()
+//! prepare_diagnostic_snapshot(uri)
 //!       │
 //! collect_push_diagnostics()
 //!       │

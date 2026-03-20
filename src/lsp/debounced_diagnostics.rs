@@ -236,7 +236,8 @@ impl DebouncedDiagnosticsManager {
 /// Execute diagnostic collection and publishing after debounce timer expires.
 ///
 /// This is the core logic that runs when a debounce timer fires.
-/// It mirrors `spawn_synthetic_diagnostic_task` but with pre-captured data.
+/// It mirrors `DiagnosticScheduler::spawn_synthetic_diagnostic_task()` but with
+/// pre-captured data.
 async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     let DebouncedDiagnosticData {
         uri,
@@ -247,7 +248,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         synthetic_diagnostics,
     } = data;
 
-    // Spawn the actual diagnostic task (similar to spawn_synthetic_diagnostic_task)
+    // Spawn the actual diagnostic task (similar to DiagnosticScheduler::spawn_synthetic_diagnostic_task)
     // This task is registered with SyntheticDiagnosticsManager for superseding
     let uri_clone = uri.clone();
     let task = tokio::spawn(async move {
