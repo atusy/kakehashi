@@ -8,7 +8,7 @@ use tower_lsp_server::Client;
 use tree_sitter::InputEdit;
 use url::Url;
 
-use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::lsp_impl::{Kakehashi, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 
 /// Timeout for spawn_blocking parse operations to prevent hangs on pathological inputs.
@@ -253,9 +253,6 @@ impl<'a> ParseCoordinator<'a> {
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
-        ClientNotifier::new(
-            self.client.clone(),
-            self.settings_manager.client_capabilities_lock(),
-        )
+        build_notifier(self.client, self.settings_manager)
     }
 }
