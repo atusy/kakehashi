@@ -74,8 +74,8 @@ pub(super) fn detect_document_language(
 }
 
 pub(super) fn bridge_configs_for_injection_language(
-    bridge: &std::sync::Arc<BridgeCoordinator>,
-    settings_manager: &std::sync::Arc<SettingsManager>,
+    bridge: &BridgeCoordinator,
+    settings_manager: &SettingsManager,
     host_language: &str,
     injection_language: &str,
 ) -> Vec<ResolvedServerConfig> {
