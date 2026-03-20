@@ -54,7 +54,7 @@ pub(super) fn build_notifier<'a>(
     ClientNotifier::new(client.clone(), settings_manager.client_capabilities_lock())
 }
 
-pub(super) async fn apply_settings(
+pub(super) async fn apply_shared_settings(
     client: &Client,
     language: &std::sync::Arc<LanguageCoordinator>,
     settings_manager: &SettingsManager,
@@ -198,7 +198,7 @@ impl Kakehashi {
     }
 
     async fn apply_settings(&self, settings: WorkspaceSettings) {
-        apply_settings(
+        apply_shared_settings(
             &self.client,
             &self.language,
             &self.settings_manager,
