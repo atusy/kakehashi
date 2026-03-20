@@ -16,7 +16,7 @@ use crate::lsp::settings_manager::SettingsManager;
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) struct ParseCoordinator<'a> {
-    client: Client,
+    client: &'a Client,
     language: &'a std::sync::Arc<LanguageCoordinator>,
     parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
@@ -29,7 +29,7 @@ pub(crate) struct ParseCoordinator<'a> {
 impl<'a> ParseCoordinator<'a> {
     pub(crate) fn new(server: &'a Kakehashi) -> Self {
         Self {
-            client: server.client.clone(),
+            client: &server.client,
             language: &server.language,
             parser_pool: &server.parser_pool,
             documents: &server.documents,
