@@ -17,23 +17,23 @@ use super::{ParseCoordinator, ParseCoordinatorDeps};
 pub(crate) struct InstallCoordinatorDeps<'a> {
     pub(crate) client: &'a Client,
     pub(crate) language: &'a std::sync::Arc<LanguageCoordinator>,
-    pub(crate) parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
-    pub(crate) documents: &'a DocumentStore,
-    pub(crate) cache: &'a CacheCoordinator,
-    pub(crate) settings_manager: &'a SettingsManager,
+    pub(crate) parser_pool: &'a std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(crate) documents: &'a std::sync::Arc<DocumentStore>,
+    pub(crate) cache: &'a std::sync::Arc<CacheCoordinator>,
+    pub(crate) settings_manager: &'a std::sync::Arc<SettingsManager>,
     pub(crate) auto_install: &'a AutoInstallManager,
-    pub(crate) bridge: &'a BridgeCoordinator,
+    pub(crate) bridge: &'a std::sync::Arc<BridgeCoordinator>,
 }
 
 pub(crate) struct InstallCoordinator<'a> {
     client: &'a Client,
     language: &'a std::sync::Arc<LanguageCoordinator>,
-    parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
-    documents: &'a DocumentStore,
-    cache: &'a CacheCoordinator,
-    settings_manager: &'a SettingsManager,
+    parser_pool: &'a std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    documents: &'a std::sync::Arc<DocumentStore>,
+    cache: &'a std::sync::Arc<CacheCoordinator>,
+    settings_manager: &'a std::sync::Arc<SettingsManager>,
     auto_install: &'a AutoInstallManager,
-    bridge: &'a BridgeCoordinator,
+    bridge: &'a std::sync::Arc<BridgeCoordinator>,
 }
 
 impl<'a> InstallCoordinator<'a> {
@@ -196,16 +196,16 @@ impl<'a> InstallCoordinator<'a> {
         build_notifier(self.client, self.settings_manager)
     }
 
-    fn parse_coordinator(&self) -> ParseCoordinator<'_> {
+    fn parse_coordinator(&self) -> ParseCoordinator {
         ParseCoordinator::from_parts(ParseCoordinatorDeps {
-            client: self.client,
-            language: self.language,
-            parser_pool: self.parser_pool,
-            documents: self.documents,
-            cache: self.cache,
-            settings_manager: self.settings_manager,
-            auto_install: self.auto_install,
-            bridge: self.bridge,
+            client: self.client.clone(),
+            language: std::sync::Arc::clone(self.language),
+            parser_pool: std::sync::Arc::clone(self.parser_pool),
+            documents: std::sync::Arc::clone(self.documents),
+            cache: std::sync::Arc::clone(self.cache),
+            settings_manager: std::sync::Arc::clone(self.settings_manager),
+            auto_install: self.auto_install.clone(),
+            bridge: std::sync::Arc::clone(self.bridge),
         })
     }
 }

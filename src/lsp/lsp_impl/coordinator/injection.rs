@@ -19,12 +19,12 @@ use super::{InstallCoordinator, InstallCoordinatorDeps, ParseCoordinator, ParseC
 pub(crate) struct InjectionCoordinator<'a> {
     client: &'a Client,
     language: &'a std::sync::Arc<LanguageCoordinator>,
-    parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
-    documents: &'a DocumentStore,
-    cache: &'a CacheCoordinator,
-    settings_manager: &'a SettingsManager,
+    parser_pool: &'a std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    documents: &'a std::sync::Arc<DocumentStore>,
+    cache: &'a std::sync::Arc<CacheCoordinator>,
+    settings_manager: &'a std::sync::Arc<SettingsManager>,
     auto_install: &'a AutoInstallManager,
-    bridge: &'a BridgeCoordinator,
+    bridge: &'a std::sync::Arc<BridgeCoordinator>,
 }
 
 impl<'a> InjectionCoordinator<'a> {
@@ -260,16 +260,16 @@ impl<'a> InjectionCoordinator<'a> {
             .eager_spawn_and_open_documents(&settings, host_language, uri, injections);
     }
 
-    fn parse_coordinator(&self) -> ParseCoordinator<'_> {
+    fn parse_coordinator(&self) -> ParseCoordinator {
         ParseCoordinator::from_parts(ParseCoordinatorDeps {
-            client: self.client,
-            language: self.language,
-            parser_pool: self.parser_pool,
-            documents: self.documents,
-            cache: self.cache,
-            settings_manager: self.settings_manager,
-            auto_install: self.auto_install,
-            bridge: self.bridge,
+            client: self.client.clone(),
+            language: std::sync::Arc::clone(self.language),
+            parser_pool: std::sync::Arc::clone(self.parser_pool),
+            documents: std::sync::Arc::clone(self.documents),
+            cache: std::sync::Arc::clone(self.cache),
+            settings_manager: std::sync::Arc::clone(self.settings_manager),
+            auto_install: self.auto_install.clone(),
+            bridge: std::sync::Arc::clone(self.bridge),
         })
     }
 
