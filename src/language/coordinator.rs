@@ -697,11 +697,7 @@ impl LanguageCoordinator {
     /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor) for custom capture-to-token-type mapping.
     pub fn get_capture_mappings(&self) -> CaptureMappings {
-        let config_mappings = self.config_store.get_capture_mappings();
-        config_mappings
-            .iter()
-            .map(|(lang, mappings)| (lang.clone(), mappings.clone()))
-            .collect::<CaptureMappings>()
+        self.config_store.get_capture_mappings()
     }
 
     fn load_single_language(
