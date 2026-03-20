@@ -85,6 +85,7 @@ impl Kakehashi {
         for resolved in all_regions {
             // Get ALL bridge server configs for this injection language
             let configs = self
+                .injection_coordinator()
                 .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
             if configs.is_empty() {
                 continue;

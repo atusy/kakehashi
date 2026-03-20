@@ -72,7 +72,8 @@ impl Kakehashi {
 
         // ADR-0019: Close invalidated virtual documents.
         // Send didClose notifications to downstream LSs for orphaned docs.
-        self.close_invalidated_virtual_docs(&uri, &invalidated_ulids)
+        self.injection_coordinator()
+            .close_invalidated_virtual_docs(&uri, &invalidated_ulids)
             .await;
 
         // Forward didChange to opened virtual documents + process injected languages.
@@ -81,7 +82,9 @@ impl Kakehashi {
         // 2. Auto-install missing parsers
         // 3. Eager server spawn + didOpen for virtual documents
         // Must be called AFTER parse_document so we have access to the updated AST.
-        self.process_injections(&uri, true).await;
+        self.injection_coordinator()
+            .process_injections(&uri, true)
+            .await;
 
         // ADR-0020 Phase 3: Schedule debounced diagnostic push on didChange.
         // After 500ms of no changes, diagnostics will be collected and published.

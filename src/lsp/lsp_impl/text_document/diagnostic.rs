@@ -144,6 +144,7 @@ impl Kakehashi {
 
         for resolved in all_regions {
             let configs = self
+                .injection_coordinator()
                 .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
             if configs.is_empty() {
                 continue;

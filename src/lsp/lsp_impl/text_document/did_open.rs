@@ -92,7 +92,9 @@ impl Kakehashi {
 
         // Process injected languages: auto-install missing parsers and spawn bridge servers.
         // This must be called AFTER parse_document so we have access to the AST.
-        self.process_injections(&uri, false).await;
+        self.injection_coordinator()
+            .process_injections(&uri, false)
+            .await;
 
         // ADR-0020 Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
