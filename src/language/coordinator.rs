@@ -189,38 +189,12 @@ impl LanguageCoordinator {
         // Use fault-tolerant loading for all query types
         // This handles languages like TypeScript that inherit from ecma,
         // and gracefully skips invalid patterns while preserving valid ones
-        self.load_query(
+        self.load_all_queries(
             &language,
             &search_paths,
-            QueryLoadContext {
-                language_id,
-                query_type: "highlights",
-                context: Some("Dynamically loaded"),
-            },
+            language_id,
+            "Dynamically loaded",
             &mut events,
-            |store, query| store.insert_highlight_query(language_id.to_string(), query),
-        );
-        self.load_query(
-            &language,
-            &search_paths,
-            QueryLoadContext {
-                language_id,
-                query_type: "locals",
-                context: Some("Dynamically loaded"),
-            },
-            &mut events,
-            |store, query| store.insert_locals_query(language_id.to_string(), query),
-        );
-        self.load_query(
-            &language,
-            &search_paths,
-            QueryLoadContext {
-                language_id,
-                query_type: "injections",
-                context: Some("Dynamically loaded"),
-            },
-            &mut events,
-            |store, query| store.insert_injection_query(language_id.to_string(), query),
         );
 
         events.push(LanguageEvent::log(
@@ -283,6 +257,36 @@ impl LanguageCoordinator {
             .register(lang_name.to_string(), language.clone());
 
         Ok(language)
+    }
+
+    /// Load all three query types (highlights, locals, injections) for a language.
+    fn load_all_queries(
+        &self,
+        language: &Language,
+        search_paths: &[PathBuf],
+        lang_name: &str,
+        context: &str,
+        events: &mut Vec<LanguageEvent>,
+    ) {
+        for query_type in ["highlights", "locals", "injections"] {
+            let lang = lang_name.to_string();
+            self.load_query(
+                language,
+                search_paths,
+                QueryLoadContext {
+                    language_id: lang_name,
+                    query_type,
+                    context: Some(context),
+                },
+                events,
+                |store, query| match query_type {
+                    "highlights" => store.insert_highlight_query(lang, query),
+                    "locals" => store.insert_locals_query(lang, query),
+                    "injections" => store.insert_injection_query(lang, query),
+                    _ => unreachable!(),
+                },
+            );
+        }
     }
 
     /// Load a query file with inheritance resolution.
@@ -772,40 +776,12 @@ impl LanguageCoordinator {
 
         // Fall back to search paths when queries field is not specified
         if !search_paths.is_empty() {
-            self.load_query(
+            self.load_all_queries(
                 language,
                 search_paths,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "highlights",
-                    context: Some("Loaded from search paths"),
-                },
+                lang_name,
+                "Loaded from search paths",
                 &mut events,
-                |store, q| store.insert_highlight_query(lang_name.to_string(), q),
-            );
-
-            self.load_query(
-                language,
-                search_paths,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "locals",
-                    context: Some("Loaded from search paths"),
-                },
-                &mut events,
-                |store, q| store.insert_locals_query(lang_name.to_string(), q),
-            );
-
-            self.load_query(
-                language,
-                search_paths,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "injections",
-                    context: Some("Loaded from search paths"),
-                },
-                &mut events,
-                |store, q| store.insert_injection_query(lang_name.to_string(), q),
             );
         }
 
@@ -841,49 +817,30 @@ impl LanguageCoordinator {
             }
         }
 
-        // Load highlights
-        if !highlights.is_empty() {
-            self.load_query_from_paths(
-                language,
-                &highlights,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "highlights",
-                    context: None,
-                },
-                &mut events,
-                |store, q| store.insert_highlight_query(lang_name.to_string(), q),
-            );
-        }
-
-        // Load locals
-        if !locals.is_empty() {
-            self.load_query_from_paths(
-                language,
-                &locals,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "locals",
-                    context: None,
-                },
-                &mut events,
-                |store, q| store.insert_locals_query(lang_name.to_string(), q),
-            );
-        }
-
-        // Load injections
-        if !injections.is_empty() {
-            self.load_query_from_paths(
-                language,
-                &injections,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "injections",
-                    context: None,
-                },
-                &mut events,
-                |store, q| store.insert_injection_query(lang_name.to_string(), q),
-            );
+        for (query_type, paths) in [
+            ("highlights", &highlights),
+            ("locals", &locals),
+            ("injections", &injections),
+        ] {
+            if !paths.is_empty() {
+                let lang = lang_name.to_string();
+                self.load_query_from_paths(
+                    language,
+                    paths,
+                    QueryLoadContext {
+                        language_id: lang_name,
+                        query_type,
+                        context: None,
+                    },
+                    &mut events,
+                    |store, q| match query_type {
+                        "highlights" => store.insert_highlight_query(lang, q),
+                        "locals" => store.insert_locals_query(lang, q),
+                        "injections" => store.insert_injection_query(lang, q),
+                        _ => unreachable!(),
+                    },
+                );
+            }
         }
 
         events
