@@ -63,29 +63,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_config_store_capture_mappings() {
-        let store = ConfigStore::new();
-
-        let mappings = CaptureMappings::default();
-        store.set_capture_mappings(mappings.clone());
-
-        let retrieved = store.capture_mappings();
-        assert_eq!(retrieved, mappings);
-    }
-
-    #[test]
-    fn test_config_store_search_paths() {
-        let store = ConfigStore::new();
-
-        let paths = vec!["/path/one".to_string(), "/path/two".to_string()];
-        store.set_search_paths(paths);
-
-        let retrieved = store.search_paths();
-        assert_eq!(retrieved.len(), 2);
-        assert_eq!(retrieved[0], PathBuf::from("/path/one"));
-    }
-
-    #[test]
     fn test_config_store_update_from_settings() {
         let store = ConfigStore::new();
 
@@ -107,14 +84,19 @@ mod tests {
     }
 
     #[test]
-    fn test_search_paths_string_to_pathbuf_round_trip() {
+    fn test_search_paths_normalized_on_update() {
         let store = ConfigStore::new();
-        let input = vec!["/path/one".to_string(), "/path/with/../dots".to_string()];
-        store.set_search_paths(input);
-        let retrieved = store.search_paths();
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            search_paths: vec!["/path/one".to_string(), "/path/with/../dots".to_string()],
+            capture_mappings: CaptureMappings::default(),
+            auto_install: false,
+            language_servers: HashMap::new(),
+        };
+        store.update_from_settings(&settings);
         assert_eq!(
-            retrieved,
-            vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots"),]
+            store.search_paths(),
+            vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots")]
         );
     }
 
