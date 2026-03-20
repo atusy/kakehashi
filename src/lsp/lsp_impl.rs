@@ -215,7 +215,7 @@ impl Kakehashi {
         coordinator::InstallCoordinator::new(self)
     }
 
-    pub(super) fn injection_coordinator(&self) -> coordinator::InjectionCoordinator<'_> {
+    pub(super) fn injection_coordinator(&self) -> coordinator::InjectionCoordinator {
         coordinator::InjectionCoordinator::new(self)
     }
 

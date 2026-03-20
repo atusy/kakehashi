@@ -16,28 +16,28 @@ use tower_lsp_server::Client;
 
 use super::{InstallCoordinator, InstallCoordinatorDeps, ParseCoordinator, ParseCoordinatorDeps};
 
-pub(crate) struct InjectionCoordinator<'a> {
-    client: &'a Client,
-    language: &'a std::sync::Arc<LanguageCoordinator>,
-    parser_pool: &'a std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
-    documents: &'a std::sync::Arc<DocumentStore>,
-    cache: &'a std::sync::Arc<CacheCoordinator>,
-    settings_manager: &'a std::sync::Arc<SettingsManager>,
-    auto_install: &'a AutoInstallManager,
-    bridge: &'a std::sync::Arc<BridgeCoordinator>,
+pub(crate) struct InjectionCoordinator {
+    client: Client,
+    language: std::sync::Arc<LanguageCoordinator>,
+    parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    documents: std::sync::Arc<DocumentStore>,
+    cache: std::sync::Arc<CacheCoordinator>,
+    settings_manager: std::sync::Arc<SettingsManager>,
+    auto_install: AutoInstallManager,
+    bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
-impl<'a> InjectionCoordinator<'a> {
-    pub(crate) fn new(server: &'a Kakehashi) -> Self {
+impl InjectionCoordinator {
+    pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
-            client: &server.client,
-            language: &server.language,
-            parser_pool: &server.parser_pool,
-            documents: &server.documents,
-            cache: &server.cache,
-            settings_manager: &server.settings_manager,
-            auto_install: &server.auto_install,
-            bridge: &server.bridge,
+            client: server.client.clone(),
+            language: std::sync::Arc::clone(&server.language),
+            parser_pool: std::sync::Arc::clone(&server.parser_pool),
+            documents: std::sync::Arc::clone(&server.documents),
+            cache: std::sync::Arc::clone(&server.cache),
+            settings_manager: std::sync::Arc::clone(&server.settings_manager),
+            auto_install: server.auto_install.clone(),
+            bridge: std::sync::Arc::clone(&server.bridge),
         }
     }
 
@@ -258,26 +258,26 @@ impl<'a> InjectionCoordinator<'a> {
     fn parse_coordinator(&self) -> ParseCoordinator {
         ParseCoordinator::from_parts(ParseCoordinatorDeps {
             client: self.client.clone(),
-            language: std::sync::Arc::clone(self.language),
-            parser_pool: std::sync::Arc::clone(self.parser_pool),
-            documents: std::sync::Arc::clone(self.documents),
-            cache: std::sync::Arc::clone(self.cache),
-            settings_manager: std::sync::Arc::clone(self.settings_manager),
+            language: std::sync::Arc::clone(&self.language),
+            parser_pool: std::sync::Arc::clone(&self.parser_pool),
+            documents: std::sync::Arc::clone(&self.documents),
+            cache: std::sync::Arc::clone(&self.cache),
+            settings_manager: std::sync::Arc::clone(&self.settings_manager),
             auto_install: self.auto_install.clone(),
-            bridge: std::sync::Arc::clone(self.bridge),
+            bridge: std::sync::Arc::clone(&self.bridge),
         })
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {
         InstallCoordinator::from_parts(InstallCoordinatorDeps {
             client: self.client.clone(),
-            language: std::sync::Arc::clone(self.language),
-            parser_pool: std::sync::Arc::clone(self.parser_pool),
-            documents: std::sync::Arc::clone(self.documents),
-            cache: std::sync::Arc::clone(self.cache),
-            settings_manager: std::sync::Arc::clone(self.settings_manager),
+            language: std::sync::Arc::clone(&self.language),
+            parser_pool: std::sync::Arc::clone(&self.parser_pool),
+            documents: std::sync::Arc::clone(&self.documents),
+            cache: std::sync::Arc::clone(&self.cache),
+            settings_manager: std::sync::Arc::clone(&self.settings_manager),
             auto_install: self.auto_install.clone(),
-            bridge: std::sync::Arc::clone(self.bridge),
+            bridge: std::sync::Arc::clone(&self.bridge),
         })
     }
 }
