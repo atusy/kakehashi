@@ -3,30 +3,33 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 /// Resolves file types to language identifiers
-pub struct FiletypeResolver {
+pub(crate) struct FiletypeResolver {
     filetype_map: RwLock<HashMap<String, String>>,
 }
 
 impl FiletypeResolver {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             filetype_map: RwLock::new(HashMap::new()),
         }
     }
 
     /// Get language for a document path (URI path or file path)
-    pub fn get_language_for_path(&self, path: &str) -> Option<String> {
+    pub(crate) fn language_for_path(&self, path: &str) -> Option<String> {
         let extension = Self::extract_extension(path);
         self.filetype_map
             .read()
-            .recover_poison("FiletypeResolver::get_language_for_path")
+            .recover_poison("FiletypeResolver::language_for_path")
             .get(extension)
             .cloned()
     }
 
     /// Extract file extension from a path
     fn extract_extension(path: &str) -> &str {
-        path.split('.').next_back().unwrap_or("")
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
     }
 }
 
@@ -49,10 +52,10 @@ mod tests {
                 .insert(extension, language);
         }
 
-        fn get_language_for_extension(&self, extension: &str) -> Option<String> {
+        fn language_for_extension(&self, extension: &str) -> Option<String> {
             self.filetype_map
                 .read()
-                .recover_poison("FiletypeResolver::get_language_for_extension")
+                .recover_poison("FiletypeResolver::language_for_extension")
                 .get(extension)
                 .cloned()
         }
@@ -66,14 +69,14 @@ mod tests {
         resolver.add_mapping("py".to_string(), "python".to_string());
 
         assert_eq!(
-            resolver.get_language_for_extension("rs"),
+            resolver.language_for_extension("rs"),
             Some("rust".to_string())
         );
         assert_eq!(
-            resolver.get_language_for_extension("py"),
+            resolver.language_for_extension("py"),
             Some("python".to_string())
         );
-        assert_eq!(resolver.get_language_for_extension("txt"), None);
+        assert_eq!(resolver.language_for_extension("txt"), None);
     }
 
     #[test]
@@ -92,9 +95,9 @@ mod tests {
         // Verify the lock is poisoned
         assert!(resolver.filetype_map.read().is_err());
 
-        // get_language_for_extension should recover from the poisoned lock
+        // language_for_extension should recover from the poisoned lock
         assert_eq!(
-            resolver.get_language_for_extension("rs"),
+            resolver.language_for_extension("rs"),
             Some("rust".to_string())
         );
     }
@@ -119,7 +122,7 @@ mod tests {
 
         // Verify the mapping was stored despite the poisoned lock
         assert_eq!(
-            resolver.get_language_for_extension("rs"),
+            resolver.language_for_extension("rs"),
             Some("rust".to_string())
         );
     }
@@ -130,10 +133,31 @@ mod tests {
         resolver.add_mapping("rs".to_string(), "rust".to_string());
 
         assert_eq!(
-            resolver.get_language_for_path("/path/to/file.rs"),
+            resolver.language_for_path("/path/to/file.rs"),
             Some("rust".to_string())
         );
 
-        assert_eq!(resolver.get_language_for_path("/path/to/file"), None);
+        assert_eq!(resolver.language_for_path("/path/to/file"), None);
+    }
+
+    #[test]
+    fn test_extract_extension_edge_cases() {
+        // No extension
+        assert_eq!(FiletypeResolver::extract_extension("/path/to/file"), "");
+        // Dotfile without extension
+        assert_eq!(
+            FiletypeResolver::extract_extension("/path/to/.gitignore"),
+            ""
+        );
+        // Dots in directory name
+        assert_eq!(
+            FiletypeResolver::extract_extension("/path.d/to/file.rs"),
+            "rs"
+        );
+        // Multiple dots in filename
+        assert_eq!(
+            FiletypeResolver::extract_extension("/path/to/file.test.rs"),
+            "rs"
+        );
     }
 }

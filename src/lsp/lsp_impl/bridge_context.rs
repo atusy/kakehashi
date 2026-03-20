@@ -212,7 +212,7 @@ impl Kakehashi {
         };
 
         // Get injection query to detect injection regions
-        let injection_query = self.language.get_injection_query(&language_name)?;
+        let injection_query = self.language.injection_query(&language_name)?;
 
         // Resolve injection region at position
         let mapper = PositionMapper::new(snapshot.text());

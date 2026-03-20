@@ -4,14 +4,14 @@ use std::sync::{Arc, RwLock};
 use tree_sitter::Query;
 
 /// Stores and manages Tree-sitter queries for different languages
-pub struct QueryStore {
+pub(crate) struct QueryStore {
     highlight_queries: RwLock<HashMap<String, Arc<Query>>>,
     locals_queries: RwLock<HashMap<String, Arc<Query>>>,
     injection_queries: RwLock<HashMap<String, Arc<Query>>>,
 }
 
 impl QueryStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             highlight_queries: RwLock::new(HashMap::new()),
             locals_queries: RwLock::new(HashMap::new()),
@@ -19,8 +19,7 @@ impl QueryStore {
         }
     }
 
-    // ========== Highlight Queries ==========
-    pub fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
+    pub(crate) fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
         self.highlight_queries
             .write()
             .recover_poison(format_args!(
@@ -30,18 +29,15 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+    pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.highlight_queries
             .read()
-            .recover_poison(format_args!(
-                "QueryStore::get_highlight_query({})",
-                lang_name
-            ))
+            .recover_poison(format_args!("QueryStore::highlight_query({})", lang_name))
             .get(lang_name)
             .cloned()
     }
 
-    pub fn has_highlight_query(&self, lang_name: &str) -> bool {
+    pub(crate) fn has_highlight_query(&self, lang_name: &str) -> bool {
         self.highlight_queries
             .read()
             .recover_poison(format_args!(
@@ -51,8 +47,7 @@ impl QueryStore {
             .contains_key(lang_name)
     }
 
-    // ========== Locals Queries ==========
-    pub fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
+    pub(crate) fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
         self.locals_queries
             .write()
             .recover_poison(format_args!(
@@ -62,8 +57,7 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    // ========== Injection Queries ==========
-    pub fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
+    pub(crate) fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
         self.injection_queries
             .write()
             .recover_poison(format_args!(
@@ -73,13 +67,10 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    pub fn get_injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+    pub(crate) fn injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.injection_queries
             .read()
-            .recover_poison(format_args!(
-                "QueryStore::get_injection_query({})",
-                lang_name
-            ))
+            .recover_poison(format_args!("QueryStore::injection_query({})", lang_name))
             .get(lang_name)
             .cloned()
     }
@@ -107,7 +98,7 @@ mod tests {
         assert!(!store.has_highlight_query("rust"));
         store.insert_highlight_query("rust".to_string(), query.clone());
         assert!(store.has_highlight_query("rust"));
-        assert_eq!(store.get_highlight_query("rust").unwrap(), query);
+        assert_eq!(store.highlight_query("rust").unwrap(), query);
 
         // Test locals queries - verify insert doesn't panic
         store.insert_locals_query("rust".to_string(), query.clone());
@@ -131,8 +122,8 @@ mod tests {
         // Verify the lock is poisoned
         assert!(store.highlight_queries.read().is_err());
 
-        // get_highlight_query should recover from the poisoned lock
-        let retrieved = store.get_highlight_query("rust");
+        // highlight_query should recover from the poisoned lock
+        let retrieved = store.highlight_query("rust");
         assert_eq!(retrieved.unwrap(), query);
     }
 

@@ -126,7 +126,7 @@ impl<'a> DiagnosticScheduler<'a> {
             (snapshot, language_name)
         };
 
-        let injection_query = self.language.get_injection_query(&language_name)?;
+        let injection_query = self.language.injection_query(&language_name)?;
 
         let all_regions = InjectionResolver::resolve_all(
             self.language,

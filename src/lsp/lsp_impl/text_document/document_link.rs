@@ -52,7 +52,7 @@ impl Kakehashi {
         };
 
         // Get injection query to detect injection regions
-        let Some(injection_query) = self.language.get_injection_query(&language_name) else {
+        let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Ok(None);
         };
 

@@ -125,11 +125,8 @@ impl<'a> InjectionContext<'a> {
     }
 
     /// Get the injection query for a language, if available.
-    pub fn get_injection_query(
-        &self,
-        language: &str,
-    ) -> Option<std::sync::Arc<tree_sitter::Query>> {
-        self.coordinator.get_injection_query(language)
+    pub fn injection_query(&self, language: &str) -> Option<std::sync::Arc<tree_sitter::Query>> {
+        self.coordinator.injection_query(language)
     }
 
     /// Acquire a parser for the given language.

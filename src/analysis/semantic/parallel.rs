@@ -301,7 +301,7 @@ fn collect_injection_contexts_sync<'a>(
     use crate::language::injection::{collect_all_injections, parse_offset_directive_for_pattern};
 
     let current_lang = filetype.unwrap_or("unknown");
-    let Some(injection_query) = coordinator.get_injection_query(current_lang) else {
+    let Some(injection_query) = coordinator.injection_query(current_lang) else {
         return (Vec::new(), Vec::new());
     };
 
@@ -333,7 +333,7 @@ fn collect_injection_contexts_sync<'a>(
         };
 
         // Get highlight query for resolved language
-        let Some(highlight_query) = coordinator.get_highlight_query(&resolved_lang) else {
+        let Some(highlight_query) = coordinator.highlight_query(&resolved_lang) else {
             continue;
         };
 
@@ -800,7 +800,7 @@ mod tests {
             return;
         }
 
-        let Some(highlight_query) = coordinator.get_highlight_query("rust") else {
+        let Some(highlight_query) = coordinator.highlight_query("rust") else {
             eprintln!("Skipping: rust highlight query not available");
             return;
         };
@@ -857,7 +857,7 @@ mod tests {
             return;
         }
 
-        let Some(highlight_query) = coordinator.get_highlight_query("rust") else {
+        let Some(highlight_query) = coordinator.highlight_query("rust") else {
             eprintln!("Skipping: rust highlight query not available");
             return;
         };
