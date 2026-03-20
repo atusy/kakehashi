@@ -8,6 +8,7 @@
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 use url::Url;
 
+use crate::config::WorkspaceSettings;
 use crate::config::settings::{
     AggregationStrategy, BridgeLanguageConfig, ResolvedAggregationConfig,
 };
@@ -76,6 +77,38 @@ struct PreambleResult {
     resolved: ResolvedInjection,
     language_name: String,
     upstream_request_id: Option<UpstreamId>,
+}
+
+fn resolve_bridge_language_config_from_settings(
+    settings: &WorkspaceSettings,
+    host_language: &str,
+    injection_language: &str,
+) -> Option<BridgeLanguageConfig> {
+    crate::config::resolve_with_wildcard(
+        &settings.languages,
+        host_language,
+        crate::config::merge_language_settings,
+    )
+    .and_then(|lang_settings| lang_settings.bridge)
+    .and_then(|bridge_map| {
+        crate::config::resolve_with_wildcard(
+            &bridge_map,
+            injection_language,
+            crate::config::merge_bridge_language_configs,
+        )
+    })
+}
+
+pub(crate) fn resolve_aggregation_config_from_settings(
+    settings: &WorkspaceSettings,
+    host_language: &str,
+    injection_language: &str,
+    method_name: &str,
+    default_strategy: AggregationStrategy,
+) -> ResolvedAggregationConfig {
+    resolve_bridge_language_config_from_settings(settings, host_language, injection_language)
+        .map(|bridge_config| bridge_config.resolve_aggregation(method_name, default_strategy))
+        .unwrap_or_else(|| ResolvedAggregationConfig::with_defaults(default_strategy))
 }
 
 impl Kakehashi {
@@ -255,32 +288,6 @@ impl Kakehashi {
         })
     }
 
-    /// Resolve the `BridgeLanguageConfig` for a given host/injection language pair.
-    ///
-    /// Resolution chain:
-    /// 1. `resolve_with_wildcard(languages, host_lang, merge_language_settings)` → host settings
-    /// 2. `resolve_with_wildcard(bridge_map, injection_lang, merge_bridge_language_configs)` → bridge config
-    fn resolve_bridge_language_config(
-        &self,
-        host_language: &str,
-        injection_language: &str,
-    ) -> Option<BridgeLanguageConfig> {
-        let settings = self.settings_manager.load_settings();
-        crate::config::resolve_with_wildcard(
-            &settings.languages,
-            host_language,
-            crate::config::merge_language_settings,
-        )
-        .and_then(|lang_settings| lang_settings.bridge)
-        .and_then(|bridge_map| {
-            crate::config::resolve_with_wildcard(
-                &bridge_map,
-                injection_language,
-                crate::config::merge_bridge_language_configs,
-            )
-        })
-    }
-
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
     /// given host language, injection language, and LSP method in a single call.
     ///
@@ -293,9 +300,14 @@ impl Kakehashi {
         method_name: &str,
         default_strategy: AggregationStrategy,
     ) -> ResolvedAggregationConfig {
-        self.resolve_bridge_language_config(host_language, injection_language)
-            .map(|bridge_config| bridge_config.resolve_aggregation(method_name, default_strategy))
-            .unwrap_or_else(|| ResolvedAggregationConfig::with_defaults(default_strategy))
+        let settings = self.settings_manager.load_settings();
+        resolve_aggregation_config_from_settings(
+            &settings,
+            host_language,
+            injection_language,
+            method_name,
+            default_strategy,
+        )
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
