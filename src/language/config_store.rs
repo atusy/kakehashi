@@ -81,6 +81,7 @@ mod tests {
         store.update_from_settings(&settings);
 
         assert_eq!(store.search_paths(), vec![PathBuf::from("/search/path")]);
+        assert_eq!(store.capture_mappings(), settings.capture_mappings);
     }
 
     #[test]
