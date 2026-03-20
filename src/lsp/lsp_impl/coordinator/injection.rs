@@ -200,6 +200,7 @@ impl<'a> InjectionCoordinator<'a> {
         uri: &Url,
         languages: &HashSet<String>,
     ) {
+        let install = self.install_coordinator();
         let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
         let (text, reason) = if auto_install_enabled {
@@ -208,10 +209,7 @@ impl<'a> InjectionCoordinator<'a> {
                 String::new(),
             )
         } else {
-            (
-                None,
-                self.install_coordinator().auto_install_disabled_reason(),
-            )
+            (None, install.auto_install_disabled_reason())
         };
 
         for lang in languages {
@@ -229,15 +227,12 @@ impl<'a> InjectionCoordinator<'a> {
             }
 
             if !auto_install_enabled {
-                self.install_coordinator()
-                    .notify_parser_missing(&resolved_lang, &reason)
-                    .await;
+                install.notify_parser_missing(&resolved_lang, &reason).await;
                 continue;
             }
 
             if let Some(ref text) = text {
-                let _ = self
-                    .install_coordinator()
+                let _ = install
                     .maybe_auto_install_language(&resolved_lang, uri.clone(), text.clone(), true)
                     .await;
             }
