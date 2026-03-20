@@ -185,7 +185,7 @@ impl CacheCoordinator {
         tracker: &RegionIdTracker,
     ) {
         // Get the injection query for this language
-        let injection_query = match language.get_injection_query(language_name) {
+        let injection_query = match language.injection_query(language_name) {
             Some(q) => q,
             None => {
                 // No injection query = no injections to track

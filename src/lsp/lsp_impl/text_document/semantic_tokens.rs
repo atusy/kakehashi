@@ -227,7 +227,7 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(query) = self.language.get_highlight_query(&language_name) else {
+        let Some(query) = self.language.highlight_query(&language_name) else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
@@ -277,7 +277,7 @@ impl Kakehashi {
             }
 
             // Get capture mappings for token type resolution
-            let capture_mappings = self.language.get_capture_mappings();
+            let capture_mappings = self.language.capture_mappings();
 
             // Use Rayon-based parallel injection processing.
             // This uses thread-local parser caching instead of the shared parser pool,
@@ -450,7 +450,7 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(query) = self.language.get_highlight_query(&language_name) else {
+        let Some(query) = self.language.highlight_query(&language_name) else {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -504,7 +504,7 @@ impl Kakehashi {
             }
 
             // Get capture mappings for token type resolution
-            let capture_mappings = self.language.get_capture_mappings();
+            let capture_mappings = self.language.capture_mappings();
 
             // Use Rayon-based parallel injection processing (SAME as semanticTokens/full)
             let supports_multiline = self.settings_manager.supports_multiline_tokens();
@@ -657,7 +657,7 @@ impl Kakehashi {
             })));
         };
 
-        let Some(query) = self.language.get_highlight_query(&language_name) else {
+        let Some(query) = self.language.highlight_query(&language_name) else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -680,7 +680,7 @@ impl Kakehashi {
         };
 
         // Get capture mappings for token type resolution
-        let capture_mappings = self.language.get_capture_mappings();
+        let capture_mappings = self.language.capture_mappings();
 
         // Use Rayon-based parallel injection processing
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
@@ -743,7 +743,7 @@ mod tests {
             .insert(uri.clone(), initial_text, Some("lua".to_string()), None);
 
         let load_result = server.language.ensure_language_loaded("lua");
-        if !load_result.success || server.language.get_highlight_query("lua").is_none() {
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
             eprintln!("Skipping: lua language parser or highlight query not available");
             return;
         }
@@ -803,7 +803,7 @@ mod tests {
         );
 
         let load_result = server.language.ensure_language_loaded("rust");
-        if !load_result.success || server.language.get_highlight_query("rust").is_none() {
+        if !load_result.success || server.language.highlight_query("rust").is_none() {
             eprintln!("Skipping: rust highlight query not available");
             return;
         }
@@ -866,7 +866,7 @@ mod tests {
         );
 
         let load_result = server.language.ensure_language_loaded("lua");
-        if !load_result.success || server.language.get_highlight_query("lua").is_none() {
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
             eprintln!("Skipping: lua language parser or highlight query not available");
             return;
         }
@@ -977,7 +977,7 @@ mod tests {
         );
 
         let load_result = server.language.ensure_language_loaded("lua");
-        if !load_result.success || server.language.get_highlight_query("lua").is_none() {
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
             eprintln!("Skipping: lua language parser or highlight query not available");
             return;
         }

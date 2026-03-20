@@ -20,7 +20,7 @@ impl Kakehashi {
         // Try to determine the language
         let language_name = self
             .language
-            .get_language_for_path(uri.path())
+            .language_for_path(uri.path())
             .or_else(|| Some(language_id.clone()));
 
         // Insert document immediately (without tree) so concurrent requests can find it.

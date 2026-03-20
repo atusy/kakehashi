@@ -81,7 +81,7 @@ impl LanguageCoordinator {
         self.build_alias_map(&settings.languages);
 
         let mut summary = LanguageLoadSummary::default();
-        let search_paths = self.config_store.get_search_paths();
+        let search_paths = self.config_store.search_paths();
         for (lang_name, config) in &settings.languages {
             let result = self.load_single_language(lang_name, config, &search_paths);
             summary.record(lang_name, result);
@@ -166,7 +166,7 @@ impl LanguageCoordinator {
             return LanguageLoadResult::success_with(Vec::new());
         }
 
-        let search_paths = self.config_store.get_search_paths();
+        let search_paths = self.config_store.search_paths();
         if search_paths.is_empty() {
             return LanguageLoadResult::failure_with(LanguageEvent::log(
                 LanguageLogLevel::Warning,
@@ -390,8 +390,8 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (auto_install, lsp_impl)
     /// for document language detection.
-    pub fn get_language_for_path(&self, path: &str) -> Option<String> {
-        self.filetype_resolver.get_language_for_path(path)
+    pub fn language_for_path(&self, path: &str) -> Option<String> {
+        self.filetype_resolver.language_for_path(path)
     }
 
     /// Check if a parser is available for a given language name.
@@ -680,24 +680,24 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
-    pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
-        self.query_store.get_highlight_query(lang_name)
+    pub fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+        self.query_store.highlight_query(lang_name)
     }
 
     /// Get injection query for a language.
     ///
     /// Visibility: Public - called by LSP layer (multiple handlers) and analysis
     /// layer (refactor, semantic, selection) for nested language support.
-    pub fn get_injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
-        self.query_store.get_injection_query(lang_name)
+    pub fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+        self.query_store.injection_query(lang_name)
     }
 
     /// Get capture mappings.
     ///
     /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor) for custom capture-to-token-type mapping.
-    pub fn get_capture_mappings(&self) -> CaptureMappings {
-        self.config_store.get_capture_mappings()
+    pub fn capture_mappings(&self) -> CaptureMappings {
+        self.config_store.capture_mappings()
     }
 
     fn load_single_language(
@@ -1256,7 +1256,7 @@ mod tests {
 
         // Verify the query was actually loaded
         assert!(
-            coordinator.get_highlight_query("rust").is_some(),
+            coordinator.highlight_query("rust").is_some(),
             "Highlight query should be loaded"
         );
     }
@@ -1304,7 +1304,7 @@ mod tests {
 
         // Verify the query was actually loaded via inference
         assert!(
-            coordinator.get_highlight_query("rust").is_some(),
+            coordinator.highlight_query("rust").is_some(),
             "Highlight query should be loaded via filename inference"
         );
     }
@@ -1349,7 +1349,7 @@ mod tests {
 
         // Verify no queries were loaded
         assert!(
-            coordinator.get_highlight_query("rust").is_none(),
+            coordinator.highlight_query("rust").is_none(),
             "No highlight query should be loaded for unknown pattern"
         );
     }
@@ -1424,7 +1424,7 @@ mod tests {
 
         // Verify highlight query was loaded (locals and injections confirmed by events)
         assert!(
-            coordinator.get_highlight_query("rust").is_some(),
+            coordinator.highlight_query("rust").is_some(),
             "Highlight query should be loaded"
         );
     }
@@ -1724,7 +1724,7 @@ mod tests {
         let _summary = coordinator.load_settings(&settings);
 
         assert!(
-            !coordinator.config_store.get_search_paths().is_empty(),
+            !coordinator.config_store.search_paths().is_empty(),
             "Search paths should be set after load_settings"
         );
 

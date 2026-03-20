@@ -31,10 +31,10 @@ impl ConfigStore {
             .recover_poison("ConfigStore::set_capture_mappings") = mappings;
     }
 
-    pub(crate) fn get_capture_mappings(&self) -> CaptureMappings {
+    pub(crate) fn capture_mappings(&self) -> CaptureMappings {
         self.capture_mappings
             .read()
-            .recover_poison("ConfigStore::get_capture_mappings")
+            .recover_poison("ConfigStore::capture_mappings")
             .clone()
     }
 
@@ -49,10 +49,10 @@ impl ConfigStore {
             .collect();
     }
 
-    pub(crate) fn get_search_paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn search_paths(&self) -> Vec<PathBuf> {
         self.search_paths
             .read()
-            .recover_poison("ConfigStore::get_search_paths")
+            .recover_poison("ConfigStore::search_paths")
             .clone()
     }
 }
@@ -71,7 +71,7 @@ mod tests {
         let mappings = CaptureMappings::default();
         store.set_capture_mappings(mappings.clone());
 
-        let retrieved = store.get_capture_mappings();
+        let retrieved = store.capture_mappings();
         assert_eq!(retrieved.len(), mappings.len());
     }
 
@@ -82,7 +82,7 @@ mod tests {
         let paths = vec!["/path/one".to_string(), "/path/two".to_string()];
         store.set_search_paths(paths);
 
-        let retrieved = store.get_search_paths();
+        let retrieved = store.search_paths();
         assert_eq!(retrieved.len(), 2);
         assert_eq!(retrieved[0], PathBuf::from("/path/one"));
     }
@@ -105,10 +105,7 @@ mod tests {
 
         store.update_from_settings(&settings);
 
-        assert_eq!(
-            store.get_search_paths(),
-            vec![PathBuf::from("/search/path")]
-        );
+        assert_eq!(store.search_paths(), vec![PathBuf::from("/search/path")]);
     }
 
     #[test]
@@ -116,7 +113,7 @@ mod tests {
         let store = ConfigStore::new();
         let input = vec!["/path/one".to_string(), "/path/with/../dots".to_string()];
         store.set_search_paths(input);
-        let retrieved = store.get_search_paths();
+        let retrieved = store.search_paths();
         assert_eq!(
             retrieved,
             vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots"),]
@@ -139,8 +136,8 @@ mod tests {
         // Verify the lock is poisoned
         assert!(store.search_paths.read().is_err());
 
-        // get_search_paths should recover from the poisoned lock
-        assert_eq!(store.get_search_paths(), vec![PathBuf::from("/path/one")]);
+        // search_paths should recover from the poisoned lock
+        assert_eq!(store.search_paths(), vec![PathBuf::from("/path/one")]);
     }
 
     #[test]
@@ -162,6 +159,6 @@ mod tests {
         store.set_search_paths(vec!["/path/one".to_string()]);
 
         // Verify the data was stored despite the poisoned lock
-        assert_eq!(store.get_search_paths(), vec![PathBuf::from("/path/one")]);
+        assert_eq!(store.search_paths(), vec![PathBuf::from("/path/one")]);
     }
 }

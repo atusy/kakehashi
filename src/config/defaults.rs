@@ -297,7 +297,7 @@ mod tests {
         let _summary = coordinator.load_settings(&ws_settings);
 
         // Verify coordinator has the mapping
-        let mappings = coordinator.get_capture_mappings();
+        let mappings = coordinator.capture_mappings();
         assert!(
             mappings.contains_key(WILDCARD_KEY),
             "Coordinator should have wildcard key after loading settings"

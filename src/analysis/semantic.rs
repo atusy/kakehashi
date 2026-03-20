@@ -541,7 +541,7 @@ mod tests {
             return;
         }
 
-        let Some(query) = coordinator.get_highlight_query("markdown") else {
+        let Some(query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -617,7 +617,7 @@ local x = 42
             return;
         }
 
-        let Some(query) = coordinator.get_highlight_query("markdown") else {
+        let Some(query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -677,7 +677,7 @@ local x = 42
             return;
         }
 
-        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+        let Some(md_query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -793,7 +793,7 @@ local x = 42
             return;
         }
 
-        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+        let Some(md_query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -901,7 +901,7 @@ local x = 42
             return;
         }
 
-        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+        let Some(md_query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -1017,7 +1017,7 @@ local x = 42
             return;
         }
 
-        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+        let Some(md_query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -1125,7 +1125,7 @@ local x = 42
             return;
         }
 
-        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+        let Some(md_query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };
@@ -1255,7 +1255,7 @@ foo
             return;
         }
 
-        let Some(md_query) = coordinator.get_highlight_query("markdown") else {
+        let Some(md_query) = coordinator.highlight_query("markdown") else {
             eprintln!("Skipping: markdown highlight query not available");
             return;
         };

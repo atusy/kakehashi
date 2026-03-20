@@ -102,7 +102,7 @@ impl<'a> InjectionCoordinator<'a> {
         uri: &Url,
         host_language: &str,
     ) -> Vec<BridgeInjection> {
-        let Some(injection_query) = self.language.get_injection_query(host_language) else {
+        let Some(injection_query) = self.language.injection_query(host_language) else {
             return Vec::new();
         };
 

@@ -30,13 +30,10 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    pub(crate) fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+    pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.highlight_queries
             .read()
-            .recover_poison(format_args!(
-                "QueryStore::get_highlight_query({})",
-                lang_name
-            ))
+            .recover_poison(format_args!("QueryStore::highlight_query({})", lang_name))
             .get(lang_name)
             .cloned()
     }
@@ -73,13 +70,10 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    pub(crate) fn get_injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+    pub(crate) fn injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.injection_queries
             .read()
-            .recover_poison(format_args!(
-                "QueryStore::get_injection_query({})",
-                lang_name
-            ))
+            .recover_poison(format_args!("QueryStore::injection_query({})", lang_name))
             .get(lang_name)
             .cloned()
     }
@@ -107,7 +101,7 @@ mod tests {
         assert!(!store.has_highlight_query("rust"));
         store.insert_highlight_query("rust".to_string(), query.clone());
         assert!(store.has_highlight_query("rust"));
-        assert_eq!(store.get_highlight_query("rust").unwrap(), query);
+        assert_eq!(store.highlight_query("rust").unwrap(), query);
 
         // Test locals queries - verify insert doesn't panic
         store.insert_locals_query("rust".to_string(), query.clone());
@@ -131,8 +125,8 @@ mod tests {
         // Verify the lock is poisoned
         assert!(store.highlight_queries.read().is_err());
 
-        // get_highlight_query should recover from the poisoned lock
-        let retrieved = store.get_highlight_query("rust");
+        // highlight_query should recover from the poisoned lock
+        let retrieved = store.highlight_query("rust");
         assert_eq!(retrieved.unwrap(), query);
     }
 

@@ -192,7 +192,7 @@ pub fn build(
     inj_ctx: &mut InjectionContext,
     cursor_byte: usize,
 ) -> SelectionRange {
-    let injection_query = inj_ctx.get_injection_query(doc_ctx.base_language);
+    let injection_query = inj_ctx.injection_query(doc_ctx.base_language);
     let injection_query_ref = injection_query.as_ref().map(|q| q.as_ref());
 
     let injection_info = injection::detect_injection(
@@ -275,7 +275,7 @@ pub fn build(
         return build_fallback();
     };
 
-    let nested_injection_query = inj_ctx.get_injection_query(injected_lang);
+    let nested_injection_query = inj_ctx.injection_query(injected_lang);
 
     let injected_selection = if let Some(nested_inj_query) = nested_injection_query.as_ref() {
         let nested_injection_info = injection::detect_injection(
@@ -416,7 +416,7 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
 
-    let deeply_nested_injection_query = inj_ctx.get_injection_query(&nested_lang);
+    let deeply_nested_injection_query = inj_ctx.injection_query(&nested_lang);
 
     let nested_selection = if let Some(deep_inj_query) = deeply_nested_injection_query.as_ref()
         && inj_ctx.can_descend()
