@@ -74,8 +74,8 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer during initialization and
     /// settings updates to configure language support.
-    pub fn load_settings(&self, settings: WorkspaceSettings) -> LanguageLoadSummary {
-        self.config_store.update_from_settings(&settings);
+    pub fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
+        self.config_store.update_from_settings(settings);
 
         // Build alias map from language configs
         self.build_alias_map(&settings.languages);
@@ -1098,7 +1098,7 @@ mod tests {
 
         // Load settings (simulating apply_settings behavior)
         let settings = WorkspaceSettings::default();
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         // After load_settings, parser is STILL not available
         assert!(
@@ -1721,7 +1721,7 @@ mod tests {
             search_paths: vec![search_path.clone()],
             ..Default::default()
         };
-        let _summary = coordinator.load_settings(settings);
+        let _summary = coordinator.load_settings(&settings);
 
         assert!(
             !coordinator.config_store.get_search_paths().is_empty(),
