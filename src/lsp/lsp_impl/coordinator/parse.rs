@@ -17,43 +17,43 @@ const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(crate) struct ParseCoordinatorDeps<'a> {
     pub(crate) client: &'a Client,
-    pub(crate) language: &'a std::sync::Arc<LanguageCoordinator>,
-    pub(crate) parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
-    pub(crate) documents: &'a DocumentStore,
-    pub(crate) cache: &'a CacheCoordinator,
-    pub(crate) settings_manager: &'a SettingsManager,
-    pub(crate) auto_install: &'a AutoInstallManager,
-    pub(crate) bridge: &'a BridgeCoordinator,
+    pub(crate) language: std::sync::Arc<LanguageCoordinator>,
+    pub(crate) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    pub(crate) documents: std::sync::Arc<DocumentStore>,
+    pub(crate) cache: std::sync::Arc<CacheCoordinator>,
+    pub(crate) settings_manager: std::sync::Arc<SettingsManager>,
+    pub(crate) auto_install: AutoInstallManager,
+    pub(crate) bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
-pub(crate) struct ParseCoordinator<'a> {
-    client: &'a Client,
-    language: &'a std::sync::Arc<LanguageCoordinator>,
-    parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
-    documents: &'a DocumentStore,
-    cache: &'a CacheCoordinator,
-    settings_manager: &'a SettingsManager,
-    auto_install: &'a AutoInstallManager,
-    bridge: &'a BridgeCoordinator,
+pub(crate) struct ParseCoordinator {
+    client: Client,
+    language: std::sync::Arc<LanguageCoordinator>,
+    parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
+    documents: std::sync::Arc<DocumentStore>,
+    cache: std::sync::Arc<CacheCoordinator>,
+    settings_manager: std::sync::Arc<SettingsManager>,
+    auto_install: AutoInstallManager,
+    bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
-impl<'a> ParseCoordinator<'a> {
-    pub(crate) fn new(server: &'a Kakehashi) -> Self {
+impl ParseCoordinator {
+    pub(crate) fn new(server: &Kakehashi) -> Self {
         Self::from_parts(ParseCoordinatorDeps {
             client: &server.client,
-            language: &server.language,
-            parser_pool: &server.parser_pool,
-            documents: &server.documents,
-            cache: &server.cache,
-            settings_manager: &server.settings_manager,
-            auto_install: &server.auto_install,
-            bridge: &server.bridge,
+            language: std::sync::Arc::clone(&server.language),
+            parser_pool: std::sync::Arc::clone(&server.parser_pool),
+            documents: std::sync::Arc::clone(&server.documents),
+            cache: std::sync::Arc::clone(&server.cache),
+            settings_manager: std::sync::Arc::clone(&server.settings_manager),
+            auto_install: server.auto_install.clone(),
+            bridge: std::sync::Arc::clone(&server.bridge),
         })
     }
 
-    pub(crate) fn from_parts(deps: ParseCoordinatorDeps<'a>) -> Self {
+    pub(crate) fn from_parts(deps: ParseCoordinatorDeps<'_>) -> Self {
         Self {
-            client: deps.client,
+            client: deps.client.clone(),
             language: deps.language,
             parser_pool: deps.parser_pool,
             documents: deps.documents,
@@ -199,7 +199,7 @@ impl<'a> ParseCoordinator<'a> {
                     &text,
                     &tree,
                     &language_name,
-                    self.language,
+                    &self.language,
                     self.bridge.region_id_tracker(),
                 );
 
@@ -253,6 +253,6 @@ impl<'a> ParseCoordinator<'a> {
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
-        build_notifier(self.client, self.settings_manager)
+        build_notifier(&self.client, &self.settings_manager)
     }
 }

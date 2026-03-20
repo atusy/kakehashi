@@ -95,10 +95,10 @@ pub(crate) fn url_to_uri(url: &Url) -> std::result::Result<Uri, crate::error::Ls
 pub struct Kakehashi {
     client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
-    parser_pool: Mutex<DocumentParserPool>,
+    parser_pool: std::sync::Arc<Mutex<DocumentParserPool>>,
     documents: std::sync::Arc<DocumentStore>,
     /// Unified cache coordinator for semantic tokens, injections, and request tracking
-    cache: CacheCoordinator,
+    cache: std::sync::Arc<CacheCoordinator>,
     /// Consolidated settings, capabilities, and workspace root management
     settings_manager: std::sync::Arc<SettingsManager>,
     /// Isolated coordinator for parser auto-installation
@@ -175,9 +175,9 @@ impl Kakehashi {
         Self {
             client,
             language,
-            parser_pool: Mutex::new(parser_pool),
+            parser_pool: std::sync::Arc::new(Mutex::new(parser_pool)),
             documents: std::sync::Arc::new(DocumentStore::new()),
-            cache: CacheCoordinator::new(),
+            cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
             auto_install,
             bridge: std::sync::Arc::new(bridge),
@@ -207,7 +207,7 @@ impl Kakehashi {
         .await;
     }
 
-    pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator<'_> {
+    pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator {
         coordinator::ParseCoordinator::new(self)
     }
 
