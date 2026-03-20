@@ -3,19 +3,19 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 /// Resolves file types to language identifiers
-pub struct FiletypeResolver {
+pub(crate) struct FiletypeResolver {
     filetype_map: RwLock<HashMap<String, String>>,
 }
 
 impl FiletypeResolver {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             filetype_map: RwLock::new(HashMap::new()),
         }
     }
 
     /// Get language for a document path (URI path or file path)
-    pub fn get_language_for_path(&self, path: &str) -> Option<String> {
+    pub(crate) fn get_language_for_path(&self, path: &str) -> Option<String> {
         let extension = Self::extract_extension(path);
         self.filetype_map
             .read()

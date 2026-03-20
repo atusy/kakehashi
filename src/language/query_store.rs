@@ -4,14 +4,14 @@ use std::sync::{Arc, RwLock};
 use tree_sitter::Query;
 
 /// Stores and manages Tree-sitter queries for different languages
-pub struct QueryStore {
+pub(crate) struct QueryStore {
     highlight_queries: RwLock<HashMap<String, Arc<Query>>>,
     locals_queries: RwLock<HashMap<String, Arc<Query>>>,
     injection_queries: RwLock<HashMap<String, Arc<Query>>>,
 }
 
 impl QueryStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             highlight_queries: RwLock::new(HashMap::new()),
             locals_queries: RwLock::new(HashMap::new()),
@@ -20,7 +20,7 @@ impl QueryStore {
     }
 
     // ========== Highlight Queries ==========
-    pub fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
+    pub(crate) fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
         self.highlight_queries
             .write()
             .recover_poison(format_args!(
@@ -30,7 +30,7 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    pub fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+    pub(crate) fn get_highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.highlight_queries
             .read()
             .recover_poison(format_args!(
@@ -41,7 +41,7 @@ impl QueryStore {
             .cloned()
     }
 
-    pub fn has_highlight_query(&self, lang_name: &str) -> bool {
+    pub(crate) fn has_highlight_query(&self, lang_name: &str) -> bool {
         self.highlight_queries
             .read()
             .recover_poison(format_args!(
@@ -52,7 +52,7 @@ impl QueryStore {
     }
 
     // ========== Locals Queries ==========
-    pub fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
+    pub(crate) fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
         self.locals_queries
             .write()
             .recover_poison(format_args!(
@@ -63,7 +63,7 @@ impl QueryStore {
     }
 
     // ========== Injection Queries ==========
-    pub fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
+    pub(crate) fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
         self.injection_queries
             .write()
             .recover_poison(format_args!(
@@ -73,7 +73,7 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    pub fn get_injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+    pub(crate) fn get_injection_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.injection_queries
             .read()
             .recover_poison(format_args!(
