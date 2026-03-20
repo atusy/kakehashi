@@ -114,12 +114,18 @@ impl<'a> DiagnosticScheduler<'a> {
         &self,
         uri: &Url,
     ) -> Option<Vec<DocumentRequestContext>> {
-        let snapshot = {
+        let (snapshot, language_name) = {
             let doc = self.documents.get(uri)?;
-            doc.snapshot()?
+            let snapshot = doc.snapshot()?;
+            let language_name = self.language.detect_language(
+                uri.path(),
+                snapshot.text(),
+                None,
+                doc.language_id(),
+            )?;
+            (snapshot, language_name)
         };
 
-        let language_name = self.get_language_for_document(uri)?;
         let injection_query = self.language.get_injection_query(&language_name)?;
 
         let all_regions = InjectionResolver::resolve_all(
@@ -167,17 +173,6 @@ impl<'a> DiagnosticScheduler<'a> {
         }
 
         Some(contexts)
-    }
-
-    fn get_language_for_document(&self, uri: &Url) -> Option<String> {
-        let path = uri.path();
-
-        if let Some(doc) = self.documents.get(uri) {
-            self.language
-                .detect_language(path, doc.text(), None, doc.language_id())
-        } else {
-            self.language.detect_language(path, "", None, None)
-        }
     }
 }
 
