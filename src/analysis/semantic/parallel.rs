@@ -806,7 +806,7 @@ mod tests {
         };
 
         // Create factory with the coordinator's registry
-        let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_testing());
+        let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
 
         let code = "fn main() {}";
         let host_text = code;
@@ -862,7 +862,7 @@ mod tests {
             return;
         };
 
-        let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_testing());
+        let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
 
         let code = "fn main() {}";
         let host_text = code;

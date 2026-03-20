@@ -143,12 +143,9 @@ mod tests {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
 
-        server
-            .language
-            .register_language_for_test("markdown", tree_sitter_md::LANGUAGE.into());
-        server
-            .language
-            .register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+        let registry = server.language.language_registry_for_parallel();
+        registry.register("markdown".to_string(), tree_sitter_md::LANGUAGE.into());
+        registry.register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
 
         let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
         let injection_query = Query::new(
@@ -163,7 +160,8 @@ mod tests {
         .expect("valid markdown injection query");
         server
             .language
-            .register_injection_query_for_test("markdown", injection_query);
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(injection_query));
 
         let mut language_servers = HashMap::new();
         language_servers.insert(
