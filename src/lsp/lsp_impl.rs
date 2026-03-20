@@ -47,6 +47,26 @@ pub(super) fn uri_to_url(uri: &Uri) -> std::result::Result<Url, url::ParseError>
     Url::parse(uri.as_str())
 }
 
+pub(super) fn build_notifier<'a>(
+    client: &'a Client,
+    settings_manager: &'a SettingsManager,
+) -> ClientNotifier<'a> {
+    ClientNotifier::new(client.clone(), settings_manager.client_capabilities_lock())
+}
+
+pub(super) async fn apply_settings(
+    client: &Client,
+    language: &std::sync::Arc<LanguageCoordinator>,
+    settings_manager: &SettingsManager,
+    settings: WorkspaceSettings,
+) {
+    settings_manager.apply_settings(settings.clone());
+    let summary = language.load_settings(settings);
+    build_notifier(client, settings_manager)
+        .log_language_events(&summary.events)
+        .await;
+}
+
 /// Convert url::Url to ls_types::Uri
 ///
 /// This is the reverse conversion, needed when calling bridge protocol functions
@@ -174,17 +194,17 @@ impl Kakehashi {
     /// providing a clean API for logging, progress notifications, and semantic
     /// token refresh requests.
     pub(super) fn notifier(&self) -> ClientNotifier<'_> {
-        ClientNotifier::new(
-            self.client.clone(),
-            self.settings_manager.client_capabilities_lock(),
-        )
+        build_notifier(&self.client, &self.settings_manager)
     }
 
     async fn apply_settings(&self, settings: WorkspaceSettings) {
-        // Store settings via SettingsManager for auto_install check
-        self.settings_manager.apply_settings(settings.clone());
-        let summary = self.language.load_settings(settings);
-        self.notifier().log_language_events(&summary.events).await;
+        apply_settings(
+            &self.client,
+            &self.language,
+            &self.settings_manager,
+            settings,
+        )
+        .await;
     }
 
     pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator<'_> {

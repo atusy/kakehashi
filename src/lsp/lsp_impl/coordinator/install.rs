@@ -8,7 +8,7 @@ use crate::lsp::auto_install::InstallEvent;
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
-use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::lsp_impl::{Kakehashi, apply_settings, build_notifier};
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 
@@ -165,16 +165,11 @@ impl<'a> InstallCoordinator<'a> {
     }
 
     async fn apply_settings(&self, settings: WorkspaceSettings) {
-        self.settings_manager.apply_settings(settings.clone());
-        let summary = self.language.load_settings(settings);
-        self.notifier().log_language_events(&summary.events).await;
+        apply_settings(self.client, self.language, self.settings_manager, settings).await;
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
-        ClientNotifier::new(
-            self.client.clone(),
-            self.settings_manager.client_capabilities_lock(),
-        )
+        build_notifier(self.client, self.settings_manager)
     }
 
     fn parse_coordinator(&self) -> ParseCoordinator<'_> {
