@@ -145,7 +145,7 @@ mod tests {
             .register_language_for_test("markdown", tree_sitter_md::LANGUAGE.into());
         server
             .language
-            .register_language_for_test("lua", tree_sitter_rust::LANGUAGE.into());
+            .register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
 
         let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
         let injection_query = Query::new(
@@ -164,14 +164,14 @@ mod tests {
 
         let mut language_servers = HashMap::new();
         language_servers.insert(
-            "lua-bridge".to_string(),
+            "rust-bridge".to_string(),
             BridgeServerConfig {
                 cmd: vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "cat > /dev/null".to_string(),
                 ],
-                languages: vec!["lua".to_string()],
+                languages: vec!["rust".to_string()],
                 initialization_options: None,
             },
         );
@@ -183,14 +183,14 @@ mod tests {
 
         server
             .bridge
-            .insert_ready_test_connection("lua-bridge")
+            .insert_ready_test_connection("rust-bridge")
             .await;
 
         let uri = Url::parse("file:///test/did_open_injection.md").expect("valid test URI");
         let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
         let text = r#"# Example
 
-```lua
+```rust
 print("hello")
 ```
 "#;
@@ -222,7 +222,7 @@ print("hello")
             .expect("parse should populate injection cache");
         assert_eq!(injections.len(), 1, "expected one fenced code injection");
 
-        let virtual_uri = VirtualDocumentUri::new(&lsp_uri, "lua", &injections[0].region_id);
+        let virtual_uri = VirtualDocumentUri::new(&lsp_uri, "rust", &injections[0].region_id);
 
         wait_until(|| server.bridge.pool().is_document_opened(&virtual_uri)).await;
 
