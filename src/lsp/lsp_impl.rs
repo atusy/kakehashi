@@ -1,11 +1,7 @@
 pub(crate) mod bridge_context;
 mod coordinator;
-mod diagnostics;
-mod injections;
-mod install;
 mod kakehashi;
 mod lifecycle;
-mod parsing;
 pub(crate) mod text_document;
 mod workspace;
 
@@ -189,6 +185,22 @@ impl Kakehashi {
         self.settings_manager.apply_settings(settings.clone());
         let summary = self.language.load_settings(settings);
         self.notifier().log_language_events(&summary.events).await;
+    }
+
+    pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator<'_> {
+        coordinator::ParseCoordinator::new(self)
+    }
+
+    pub(super) fn install_coordinator(&self) -> coordinator::InstallCoordinator<'_> {
+        coordinator::InstallCoordinator::new(self)
+    }
+
+    pub(super) fn injection_coordinator(&self) -> coordinator::InjectionCoordinator<'_> {
+        coordinator::InjectionCoordinator::new(self)
+    }
+
+    pub(super) fn diagnostic_scheduler(&self) -> coordinator::DiagnosticScheduler<'_> {
+        coordinator::DiagnosticScheduler::new(self)
     }
 }
 
