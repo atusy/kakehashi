@@ -7,7 +7,6 @@ use crate::language::injection::{InjectionResolver, collect_all_injections};
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::auto_install::AutoInstallManager;
 use crate::lsp::bridge::BridgeCoordinator;
-use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::bridge::coordinator::BridgeInjection;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::lsp_impl::Kakehashi;
@@ -70,20 +69,6 @@ impl InjectionCoordinator {
         self.bridge
             .close_invalidated_docs(host_uri, invalidated_ulids)
             .await;
-    }
-
-    /// Get all bridge server configs for a given injection language from settings.
-    ///
-    /// Returns **all** servers configured for the injection language,
-    /// supporting multiple servers per language (e.g., pyright + ruff both handling Python).
-    pub(crate) fn get_all_bridge_configs_for_language(
-        &self,
-        host_language: &str,
-        injection_language: &str,
-    ) -> Vec<ResolvedServerConfig> {
-        let settings = self.settings_manager.load_settings();
-        self.bridge
-            .get_all_configs_for_language(&settings, host_language, injection_language)
     }
 
     /// Resolve all injection regions for a document.

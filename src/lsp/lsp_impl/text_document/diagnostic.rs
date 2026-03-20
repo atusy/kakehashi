@@ -143,9 +143,10 @@ impl Kakehashi {
         let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
 
         for resolved in all_regions {
-            let configs = self
-                .injection_coordinator()
-                .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
+            let configs = self.bridge_configs_for_injection_language(
+                &language_name,
+                &resolved.injection_language,
+            );
             if configs.is_empty() {
                 continue;
             }
