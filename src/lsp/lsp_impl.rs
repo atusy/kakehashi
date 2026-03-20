@@ -54,6 +54,10 @@ pub(super) fn build_notifier<'a>(
     ClientNotifier::new(client.clone(), settings_manager.client_capabilities_lock())
 }
 
+/// Detect the canonical language for a document using the full ADR-0005 chain.
+///
+/// This uses the stored document text and optional language_id so alias resolution
+/// still works even if the document is accessed before didOpen fully completes.
 pub(super) fn detect_document_language(
     language: &std::sync::Arc<LanguageCoordinator>,
     documents: &DocumentStore,
