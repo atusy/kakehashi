@@ -15,25 +15,25 @@ use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
 use tower_lsp_server::Client;
 
-pub(crate) struct DiagnosticScheduler<'a> {
+pub(crate) struct DiagnosticScheduler {
     client: Client,
-    language: &'a std::sync::Arc<LanguageCoordinator>,
-    documents: &'a DocumentStore,
-    bridge: &'a BridgeCoordinator,
-    settings_manager: &'a SettingsManager,
-    debounced_diagnostics: &'a DebouncedDiagnosticsManager,
+    language: std::sync::Arc<LanguageCoordinator>,
+    documents: std::sync::Arc<DocumentStore>,
+    bridge: std::sync::Arc<BridgeCoordinator>,
+    settings_manager: std::sync::Arc<SettingsManager>,
+    debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
 }
 
-impl<'a> DiagnosticScheduler<'a> {
-    pub(crate) fn new(server: &'a Kakehashi) -> Self {
+impl DiagnosticScheduler {
+    pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
             client: server.client.clone(),
-            language: &server.language,
-            documents: &server.documents,
-            bridge: &server.bridge,
-            settings_manager: &server.settings_manager,
-            debounced_diagnostics: &server.debounced_diagnostics,
+            language: std::sync::Arc::clone(&server.language),
+            documents: std::sync::Arc::clone(&server.documents),
+            bridge: std::sync::Arc::clone(&server.bridge),
+            settings_manager: std::sync::Arc::clone(&server.settings_manager),
+            debounced_diagnostics: std::sync::Arc::clone(&server.debounced_diagnostics),
             synthetic_diagnostics: std::sync::Arc::clone(&server.synthetic_diagnostics),
         }
     }
@@ -129,7 +129,7 @@ impl<'a> DiagnosticScheduler<'a> {
         let injection_query = self.language.injection_query(&language_name)?;
 
         let all_regions = InjectionResolver::resolve_all(
-            self.language,
+            &self.language,
             self.bridge.region_id_tracker(),
             uri,
             snapshot.tree(),
