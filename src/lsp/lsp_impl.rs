@@ -211,7 +211,7 @@ impl Kakehashi {
         coordinator::ParseCoordinator::new(self)
     }
 
-    pub(super) fn install_coordinator(&self) -> coordinator::InstallCoordinator<'_> {
+    pub(super) fn install_coordinator(&self) -> coordinator::InstallCoordinator {
         coordinator::InstallCoordinator::new(self)
     }
 

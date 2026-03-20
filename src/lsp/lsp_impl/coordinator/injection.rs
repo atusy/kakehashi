@@ -273,16 +273,16 @@ impl<'a> InjectionCoordinator<'a> {
         })
     }
 
-    fn install_coordinator(&self) -> InstallCoordinator<'_> {
+    fn install_coordinator(&self) -> InstallCoordinator {
         InstallCoordinator::from_parts(InstallCoordinatorDeps {
-            client: self.client,
-            language: self.language,
-            parser_pool: self.parser_pool,
-            documents: self.documents,
-            cache: self.cache,
-            settings_manager: self.settings_manager,
-            auto_install: self.auto_install,
-            bridge: self.bridge,
+            client: self.client.clone(),
+            language: std::sync::Arc::clone(self.language),
+            parser_pool: std::sync::Arc::clone(self.parser_pool),
+            documents: std::sync::Arc::clone(self.documents),
+            cache: std::sync::Arc::clone(self.cache),
+            settings_manager: std::sync::Arc::clone(self.settings_manager),
+            auto_install: self.auto_install.clone(),
+            bridge: std::sync::Arc::clone(self.bridge),
         })
     }
 }
