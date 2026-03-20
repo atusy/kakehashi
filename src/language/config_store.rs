@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 
 /// Thread-safe cache of workspace settings for the language subsystem.
+///
+/// Search paths are cleaned/normalized (e.g. `..` resolved) on write.
 pub(crate) struct ConfigStore {
     capture_mappings: RwLock<CaptureMappings>,
     search_paths: RwLock<Vec<PathBuf>>,
