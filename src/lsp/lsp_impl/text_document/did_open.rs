@@ -58,12 +58,15 @@ impl Kakehashi {
                     // is_injection=false: This is the document's main language
                     // If install is triggered, skip parse_document here - reload_language_after_install will handle it
                     skip_parse = self
+                        .install_coordinator()
                         .maybe_auto_install_language(lang, uri.clone(), text.clone(), false)
                         .await;
                 } else {
                     // Notify user that parser is missing and needs manual installation
-                    let reason = self.auto_install_disabled_reason();
-                    self.notify_parser_missing(lang, &reason).await;
+                    let reason = self.install_coordinator().auto_install_disabled_reason();
+                    self.install_coordinator()
+                        .notify_parser_missing(lang, &reason)
+                        .await;
                 }
             }
         }
@@ -72,13 +75,14 @@ impl Kakehashi {
         // If auto-install was triggered, reload_language_after_install will call parse_document
         // after the parser file is completely written, preventing race condition
         if !skip_parse {
-            self.parse_document(
-                uri.clone(),
-                params.text_document.text,
-                Some(&language_id),
-                vec![], // No edits for initial document open
-            )
-            .await;
+            self.parse_coordinator()
+                .parse_document(
+                    uri.clone(),
+                    params.text_document.text,
+                    Some(&language_id),
+                    vec![], // No edits for initial document open
+                )
+                .await;
         }
 
         // Now handle deferred SemanticTokensRefresh events after document is parsed
@@ -101,5 +105,130 @@ impl Kakehashi {
         // like vim-lsp that don't respond to workspace/semanticTokens/refresh requests.
 
         self.notifier().log_info("file opened!").await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::config::WorkspaceSettings;
+    use crate::config::settings::BridgeServerConfig;
+    use crate::lsp::bridge::VirtualDocumentUri;
+    use tokio::time::{Duration, timeout};
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{DidOpenTextDocumentParams, TextDocumentItem};
+    use tree_sitter::Query;
+    use url::Url;
+
+    async fn wait_until(condition: impl Fn() -> bool) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if condition() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("condition should become true");
+    }
+
+    #[tokio::test]
+    async fn did_open_parses_before_eager_opening_injected_virtual_documents() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        server
+            .language
+            .register_language_for_test("markdown", tree_sitter_md::LANGUAGE.into());
+        server
+            .language
+            .register_language_for_test("rust", tree_sitter_rust::LANGUAGE.into());
+
+        let markdown_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let injection_query = Query::new(
+            &markdown_language,
+            r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+            "#,
+        )
+        .expect("valid markdown injection query");
+        server
+            .language
+            .register_injection_query_for_test("markdown", injection_query);
+
+        let mut language_servers = HashMap::new();
+        language_servers.insert(
+            "rust-bridge".to_string(),
+            BridgeServerConfig {
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            ..Default::default()
+        });
+
+        server
+            .bridge
+            .insert_ready_test_connection("rust-bridge")
+            .await;
+
+        let uri = Url::parse("file:///test/did_open_injection.md").expect("valid test URI");
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).expect("URI should convert");
+        let text = r#"# Example
+
+```rust
+print("hello")
+```
+"#;
+
+        server
+            .did_open_impl(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: lsp_uri.clone(),
+                    language_id: "markdown".to_string(),
+                    version: 1,
+                    text: text.to_string(),
+                },
+            })
+            .await;
+
+        let document = server
+            .documents
+            .get(&uri)
+            .expect("document should be stored");
+        assert!(
+            document.tree().is_some(),
+            "did_open should parse the document"
+        );
+        drop(document);
+
+        let injections = server
+            .cache
+            .get_injections(&uri)
+            .expect("parse should populate injection cache");
+        assert_eq!(injections.len(), 1, "expected one fenced code injection");
+
+        let virtual_uri = VirtualDocumentUri::new(&lsp_uri, "rust", &injections[0].region_id);
+
+        wait_until(|| server.bridge.pool().is_document_opened(&virtual_uri)).await;
+
+        assert!(
+            server.bridge.pool().is_document_opened(&virtual_uri),
+            "did_open should eagerly open the parsed injection as a virtual document"
+        );
     }
 }

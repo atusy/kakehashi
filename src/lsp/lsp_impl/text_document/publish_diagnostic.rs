@@ -125,7 +125,7 @@ impl Kakehashi {
         };
 
         // Get language for document
-        let language_name = self.get_language_for_document(uri)?;
+        let language_name = self.parse_coordinator().get_language_for_document(uri)?;
 
         // Get injection query
         let injection_query = self.language.get_injection_query(&language_name)?;

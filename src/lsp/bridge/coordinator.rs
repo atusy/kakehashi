@@ -203,6 +203,19 @@ impl BridgeCoordinator {
         &self.cancel_forwarder
     }
 
+    /// Insert a ready test connection into the pool.
+    ///
+    /// Used by higher-level LSP tests that need eager-open behavior without
+    /// depending on a real downstream language server.
+    #[cfg(test)]
+    pub(crate) async fn insert_ready_test_connection(&self, server_name: &str) {
+        use crate::lsp::bridge::pool::ConnectionState;
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_state;
+
+        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        self.pool.insert_connection(server_name, handle).await;
+    }
+
     // ========================================
     // Config lookup (moved from Kakehashi)
     // ========================================
