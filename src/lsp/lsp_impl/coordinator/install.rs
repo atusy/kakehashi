@@ -155,9 +155,10 @@ impl<'a> InstallCoordinator<'a> {
             .await;
 
         if !is_injection {
-            let host_language = self.parse_coordinator().get_language_for_document(&uri);
+            let parse_coordinator = self.parse_coordinator();
+            let host_language = parse_coordinator.get_language_for_document(&uri);
             let lang_for_parse = host_language.as_deref();
-            self.parse_coordinator()
+            parse_coordinator
                 .parse_document(uri.clone(), text, lang_for_parse, vec![])
                 .await;
         }
