@@ -19,7 +19,6 @@ impl QueryStore {
         }
     }
 
-    // ========== Highlight Queries ==========
     pub(crate) fn insert_highlight_query(&self, lang_name: String, query: Arc<Query>) {
         self.highlight_queries
             .write()
@@ -48,7 +47,6 @@ impl QueryStore {
             .contains_key(lang_name)
     }
 
-    // ========== Locals Queries ==========
     pub(crate) fn insert_locals_query(&self, lang_name: String, query: Arc<Query>) {
         self.locals_queries
             .write()
@@ -59,7 +57,6 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
-    // ========== Injection Queries ==========
     pub(crate) fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
         self.injection_queries
             .write()

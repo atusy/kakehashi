@@ -23,7 +23,6 @@ impl ConfigStore {
         self.set_search_paths(settings.search_paths.clone());
     }
 
-    // ========== Capture Mappings ==========
     fn set_capture_mappings(&self, mappings: CaptureMappings) {
         *self
             .capture_mappings
@@ -38,7 +37,6 @@ impl ConfigStore {
             .clone()
     }
 
-    // ========== Search Paths ==========
     fn set_search_paths(&self, paths: Vec<String>) {
         *self
             .search_paths
