@@ -57,7 +57,7 @@ impl LanguageCoordinator {
 
     /// Ensure a language parser is loaded, attempting dynamic load if needed.
     ///
-    /// Visibility: Public - called by LSP layer (semantic_tokens, selection_range)
+    /// Visibility: pub(crate) - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
     pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
         if self.language_registry.contains(language_id) {
@@ -69,7 +69,7 @@ impl LanguageCoordinator {
 
     /// Initialize from workspace-level settings and return coordination events.
     ///
-    /// Visibility: Public - called by LSP layer during initialization and
+    /// Visibility: pub(crate) - called by LSP layer during initialization and
     /// settings updates to configure language support.
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
@@ -417,7 +417,7 @@ impl LanguageCoordinator {
 
     /// Get language for a document path.
     ///
-    /// Visibility: Public - called by LSP layer (auto_install, lsp_impl)
+    /// Visibility: pub(crate) - called by LSP layer (auto_install, lsp_impl)
     /// for document language detection.
     pub(crate) fn language_for_path(&self, path: &str) -> Option<String> {
         self.filetype_resolver.language_for_path(path)
@@ -428,7 +428,7 @@ impl LanguageCoordinator {
     /// Used by the detection fallback chain (ADR-0005) to determine whether
     /// to accept a detection result or continue to the next method.
     ///
-    /// Visibility: Public - called by LSP layer (lsp_impl) to check parser
+    /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to check parser
     /// availability before attempting language operations.
     pub(crate) fn has_parser_available(&self, language_name: &str) -> bool {
         self.language_registry.contains(language_name)
@@ -450,7 +450,7 @@ impl LanguageCoordinator {
     /// - Host document: `detect_language(path, content, None, language_id)`
     /// - Injection: `detect_language(token, content, Some(token), Some(token))`
     ///
-    /// Visibility: Public - called by LSP layer and injection resolution.
+    /// Visibility: pub(crate) - called by LSP layer and injection resolution.
     pub(crate) fn detect_language(
         &self,
         path: &str,
@@ -578,9 +578,9 @@ impl LanguageCoordinator {
     /// 3. First-line detection (shebang, mode line)
     ///
     /// Config-based alias resolution (rmd -> markdown) is applied as a sub-step
-    /// after each detection method via `try_with_alias_fallback`.
+    /// after each detection method via `try_load_with_alias`.
     ///
-    /// Visibility: Public - called by analysis layer (semantic.rs) for
+    /// Visibility: pub(crate) - called by analysis layer (semantic.rs) for
     /// nested language injection support.
     pub(crate) fn resolve_injection_language(
         &self,
@@ -600,7 +600,7 @@ impl LanguageCoordinator {
         {
             log::debug!(
                 target: "kakehashi::language_detection",
-                "Resolved injection '{}' -> '{}' via direct identifier",
+                "Resolved injection '{}' -> '{}' via identifier (direct or alias)",
                 identifier, found.0
             );
             return Some(found);
@@ -612,7 +612,7 @@ impl LanguageCoordinator {
         {
             log::debug!(
                 target: "kakehashi::language_detection",
-                "Resolved injection '{}' -> '{}' via syntect token",
+                "Resolved injection '{}' -> '{}' via syntect token (direct or alias)",
                 identifier, found.0
             );
             return Some(found);
@@ -624,7 +624,7 @@ impl LanguageCoordinator {
         {
             log::debug!(
                 target: "kakehashi::language_detection",
-                "Resolved injection '{}' -> '{}' via first-line detection",
+                "Resolved injection '{}' -> '{}' via first-line detection (direct or alias)",
                 identifier, found.0
             );
             return Some(found);
@@ -658,7 +658,7 @@ impl LanguageCoordinator {
 
     /// Create a document parser pool.
     ///
-    /// Visibility: Public - called by LSP layer (lsp_impl) and analysis modules
+    /// Visibility: pub(crate) - called by LSP layer (lsp_impl) and analysis modules
     /// to obtain parser instances for document processing.
     pub(crate) fn create_document_parser_pool(&self) -> DocumentParserPool {
         let parser_factory = ParserFactory::new(self.language_registry.clone());
@@ -675,7 +675,7 @@ impl LanguageCoordinator {
 
     /// Check if queries exist for a language.
     ///
-    /// Visibility: Public - called by LSP layer (lsp_impl) to determine if
+    /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to determine if
     /// semantic tokens should be refreshed after language load.
     pub(crate) fn has_queries(&self, lang_name: &str) -> bool {
         self.query_store().has_highlight_query(lang_name)
@@ -683,7 +683,7 @@ impl LanguageCoordinator {
 
     /// Get highlight query for a language.
     ///
-    /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
+    /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
     pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store().highlight_query(lang_name)
@@ -691,7 +691,7 @@ impl LanguageCoordinator {
 
     /// Get injection query for a language.
     ///
-    /// Visibility: Public - called by LSP layer (multiple handlers) and analysis
+    /// Visibility: pub(crate) - called by LSP layer (multiple handlers) and analysis
     /// layer (refactor, semantic, selection) for nested language support.
     pub(crate) fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store().injection_query(lang_name)
@@ -699,7 +699,7 @@ impl LanguageCoordinator {
 
     /// Get capture mappings.
     ///
-    /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
+    /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor) for custom capture-to-token-type mapping.
     pub(crate) fn capture_mappings(&self) -> CaptureMappings {
         self.config_store.capture_mappings()
@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_heuristic_skipped_when_language_id_has_parser() {
+    fn test_falls_back_to_heuristic_when_language_id_missing_parser() {
         let coordinator = LanguageCoordinator::new();
 
         // languageId "rust" has no parser, falls through to heuristic.
