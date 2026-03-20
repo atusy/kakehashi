@@ -15,8 +15,8 @@ use crate::lsp::settings_manager::SettingsManager;
 /// Shared across all parse-with-pool call sites (didChange, semantic tokens, selection range).
 const PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub(crate) struct ParseCoordinatorDeps<'a> {
-    pub(crate) client: &'a Client,
+pub(crate) struct ParseCoordinatorDeps {
+    pub(crate) client: Client,
     pub(crate) language: std::sync::Arc<LanguageCoordinator>,
     pub(crate) parser_pool: std::sync::Arc<tokio::sync::Mutex<DocumentParserPool>>,
     pub(crate) documents: std::sync::Arc<DocumentStore>,
@@ -40,7 +40,7 @@ pub(crate) struct ParseCoordinator {
 impl ParseCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self::from_parts(ParseCoordinatorDeps {
-            client: &server.client,
+            client: server.client.clone(),
             language: std::sync::Arc::clone(&server.language),
             parser_pool: std::sync::Arc::clone(&server.parser_pool),
             documents: std::sync::Arc::clone(&server.documents),
@@ -51,9 +51,9 @@ impl ParseCoordinator {
         })
     }
 
-    pub(crate) fn from_parts(deps: ParseCoordinatorDeps<'_>) -> Self {
+    pub(crate) fn from_parts(deps: ParseCoordinatorDeps) -> Self {
         Self {
-            client: deps.client.clone(),
+            client: deps.client,
             language: deps.language,
             parser_pool: deps.parser_pool,
             documents: deps.documents,

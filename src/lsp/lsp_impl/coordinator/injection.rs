@@ -262,7 +262,7 @@ impl<'a> InjectionCoordinator<'a> {
 
     fn parse_coordinator(&self) -> ParseCoordinator {
         ParseCoordinator::from_parts(ParseCoordinatorDeps {
-            client: self.client,
+            client: self.client.clone(),
             language: std::sync::Arc::clone(self.language),
             parser_pool: std::sync::Arc::clone(self.parser_pool),
             documents: std::sync::Arc::clone(self.documents),
