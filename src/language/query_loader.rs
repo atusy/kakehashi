@@ -8,6 +8,7 @@ use tree_sitter::{Language, Query};
 
 /// Parser library file extensions for different platforms
 const PARSER_EXTENSIONS: &[&str] = &["so", "dylib", "dll"];
+const INHERITS_DIRECTIVE_PREFIX: &str = "; inherits:";
 
 /// Information about a pattern that was skipped during tolerant parsing.
 ///
@@ -104,6 +105,16 @@ pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
 pub(crate) struct QueryLoader;
 
 impl QueryLoader {
+    fn query_file_path(base: &Path, lang_name: &str, file_name: &str) -> PathBuf {
+        base.join("queries").join(lang_name).join(file_name).clean()
+    }
+
+    fn parser_library_path(base: &Path, language: &str, ext: &str) -> PathBuf {
+        base.join("parser")
+            .join(format!("{language}.{ext}"))
+            .clean()
+    }
+
     /// Resolve query inheritance and return the combined query content.
     ///
     /// Recursively resolves parent queries and concatenates them in the correct order
@@ -165,7 +176,7 @@ impl QueryLoader {
     /// Remove the `; inherits:` line from query content.
     fn strip_inherits_directive(content: &str) -> String {
         let first_line = content.lines().next().unwrap_or("");
-        if first_line.starts_with("; inherits:") {
+        if first_line.starts_with(INHERITS_DIRECTIVE_PREFIX) {
             // Skip the first line
             content.lines().skip(1).collect::<Vec<_>>().join("\n")
         } else {
@@ -183,8 +194,7 @@ impl QueryLoader {
     fn parse_inherits_directive(content: &str) -> Vec<String> {
         let first_line = content.lines().next().unwrap_or("");
 
-        // Pattern: "; inherits: lang1,lang2,..."
-        if let Some(rest) = first_line.strip_prefix("; inherits:") {
+        if let Some(rest) = first_line.strip_prefix(INHERITS_DIRECTIVE_PREFIX) {
             rest.split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -224,12 +234,7 @@ impl QueryLoader {
         file_name: &str,
     ) -> Option<PathBuf> {
         for base in runtime_bases {
-            let candidate = base
-                .as_ref()
-                .join("queries")
-                .join(lang_name)
-                .join(file_name)
-                .clean();
+            let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -449,11 +454,7 @@ impl QueryLoader {
         // Otherwise, search in searchPaths: <base>/parser/
         for path in search_paths {
             for ext in PARSER_EXTENSIONS {
-                let parser_path = path
-                    .as_ref()
-                    .join("parser")
-                    .join(format!("{language}.{ext}"))
-                    .clean();
+                let parser_path = Self::parser_library_path(path.as_ref(), language, ext);
                 if parser_path.exists() {
                     return Some(parser_path);
                 }
