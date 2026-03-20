@@ -145,7 +145,7 @@ impl<'a> ParseCoordinator<'a> {
             }
 
             let load_result = self.language.ensure_language_loaded(&language_name);
-            events.extend(load_result.events.clone());
+            events.extend(load_result.events);
 
             let (base_tree, pre_edit_tree) = if !edits.is_empty() {
                 let edited = self.documents.get_edited_tree(&uri, &edits);
