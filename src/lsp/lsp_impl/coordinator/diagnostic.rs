@@ -172,19 +172,12 @@ impl<'a> DiagnosticScheduler<'a> {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         let path = uri.path();
 
-        let (language_id, content) = self
-            .documents
-            .get(uri)
-            .map(|doc| {
-                (
-                    doc.language_id().map(|s| s.to_string()),
-                    doc.text().to_string(),
-                )
-            })
-            .unwrap_or((None, String::new()));
-
-        self.language
-            .detect_language(path, &content, None, language_id.as_deref())
+        if let Some(doc) = self.documents.get(uri) {
+            self.language
+                .detect_language(path, doc.text(), None, doc.language_id())
+        } else {
+            self.language.detect_language(path, "", None, None)
+        }
     }
 }
 
