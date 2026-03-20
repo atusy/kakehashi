@@ -589,89 +589,39 @@ impl LanguageCoordinator {
         );
 
         // 1. Try direct identifier first (skip "plaintext")
-        if identifier != "plaintext" {
-            // Try direct match
-            let direct_result = self.ensure_language_loaded(identifier);
-            if direct_result.success {
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Resolved injection '{}' via direct identifier",
-                    identifier
-                );
-                return Some((identifier.to_string(), direct_result));
-            }
-
-            // Try config-based alias for direct identifier
-            if let Some(canonical) = self.resolve_alias(identifier) {
-                let alias_result = self.ensure_language_loaded(&canonical);
-                if alias_result.success {
-                    log::debug!(
-                        target: "kakehashi::language_detection",
-                        "Resolved injection '{}' -> '{}' via config alias",
-                        identifier,
-                        canonical
-                    );
-                    return Some((canonical, alias_result));
-                }
-            }
+        if identifier != "plaintext"
+            && let Some(found) = self.try_load_with_alias(identifier)
+        {
+            log::debug!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via direct identifier",
+                identifier, found.0
+            );
+            return Some(found);
         }
 
         // 2. Try syntect token normalization (handles py -> python, js -> javascript, etc.)
-        if let Some(normalized) = super::heuristic::detect_from_token(identifier) {
-            let token_result = self.ensure_language_loaded(&normalized);
-            if token_result.success {
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Resolved injection '{}' -> '{}' via syntect token",
-                    identifier,
-                    normalized
-                );
-                return Some((normalized, token_result));
-            }
-
-            // Try config alias for the normalized name too
-            if let Some(canonical) = self.resolve_alias(&normalized) {
-                let alias_result = self.ensure_language_loaded(&canonical);
-                if alias_result.success {
-                    log::debug!(
-                        target: "kakehashi::language_detection",
-                        "Resolved injection '{}' -> '{}' -> '{}' via syntect + config alias",
-                        identifier,
-                        normalized,
-                        canonical
-                    );
-                    return Some((canonical, alias_result));
-                }
-            }
+        if let Some(normalized) = super::heuristic::detect_from_token(identifier)
+            && let Some(found) = self.try_load_with_alias(&normalized)
+        {
+            log::debug!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via syntect token",
+                identifier, found.0
+            );
+            return Some(found);
         }
 
         // 3. Try first-line detection (shebang, mode line)
-        if let Some(first_line_lang) = super::heuristic::detect_from_first_line(content) {
-            let first_line_result = self.ensure_language_loaded(&first_line_lang);
-            if first_line_result.success {
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Resolved injection '{}' -> '{}' via first-line detection",
-                    identifier,
-                    first_line_lang
-                );
-                return Some((first_line_lang, first_line_result));
-            }
-
-            // Try config alias for the first-line detected language
-            if let Some(canonical) = self.resolve_alias(&first_line_lang) {
-                let alias_result = self.ensure_language_loaded(&canonical);
-                if alias_result.success {
-                    log::debug!(
-                        target: "kakehashi::language_detection",
-                        "Resolved injection '{}' -> '{}' -> '{}' via first-line + config alias",
-                        identifier,
-                        first_line_lang,
-                        canonical
-                    );
-                    return Some((canonical, alias_result));
-                }
-            }
+        if let Some(first_line_lang) = super::heuristic::detect_from_first_line(content)
+            && let Some(found) = self.try_load_with_alias(&first_line_lang)
+        {
+            log::debug!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via first-line detection",
+                identifier, found.0
+            );
+            return Some(found);
         }
 
         log::debug!(
@@ -679,6 +629,24 @@ impl LanguageCoordinator {
             "Failed to resolve injection language for identifier='{}'",
             identifier
         );
+        None
+    }
+
+    /// Try to load a language directly, then via config alias.
+    ///
+    /// Returns `(resolved_name, load_result)` on success, or `None` if
+    /// neither direct load nor alias resolution succeeded.
+    fn try_load_with_alias(&self, candidate: &str) -> Option<(String, LanguageLoadResult)> {
+        let result = self.ensure_language_loaded(candidate);
+        if result.success {
+            return Some((candidate.to_string(), result));
+        }
+        if let Some(canonical) = self.resolve_alias(candidate) {
+            let result = self.ensure_language_loaded(&canonical);
+            if result.success {
+                return Some((canonical, result));
+            }
+        }
         None
     }
 
