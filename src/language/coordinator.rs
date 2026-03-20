@@ -25,7 +25,7 @@ struct QueryLoadContext<'a> {
 }
 
 /// Coordinates language runtime components (registry, queries, configs).
-pub struct LanguageCoordinator {
+pub(crate) struct LanguageCoordinator {
     query_store: QueryStore,
     config_store: ConfigStore,
     filetype_resolver: FiletypeResolver,
@@ -44,7 +44,7 @@ impl Default for LanguageCoordinator {
 }
 
 impl LanguageCoordinator {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             query_store: QueryStore::new(),
             config_store: ConfigStore::new(),
@@ -59,7 +59,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
-    pub fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
+    pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
         if self.language_registry.contains(language_id) {
             LanguageLoadResult::success_with(Vec::new())
         } else {
@@ -71,7 +71,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer during initialization and
     /// settings updates to configure language support.
-    pub fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
+    pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
 
         // Build alias map from language configs
@@ -413,7 +413,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (auto_install, lsp_impl)
     /// for document language detection.
-    pub fn language_for_path(&self, path: &str) -> Option<String> {
+    pub(crate) fn language_for_path(&self, path: &str) -> Option<String> {
         self.filetype_resolver.language_for_path(path)
     }
 
@@ -424,7 +424,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (lsp_impl) to check parser
     /// availability before attempting language operations.
-    pub fn has_parser_available(&self, language_name: &str) -> bool {
+    pub(crate) fn has_parser_available(&self, language_name: &str) -> bool {
         self.language_registry.contains(language_name)
     }
 
@@ -445,7 +445,7 @@ impl LanguageCoordinator {
     /// - Injection: `detect_language(token, content, Some(token), Some(token))`
     ///
     /// Visibility: Public - called by LSP layer and injection resolution.
-    pub fn detect_language(
+    pub(crate) fn detect_language(
         &self,
         path: &str,
         content: &str,
@@ -576,7 +576,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by analysis layer (semantic.rs) for
     /// nested language injection support.
-    pub fn resolve_injection_language(
+    pub(crate) fn resolve_injection_language(
         &self,
         identifier: &str,
         content: &str,
@@ -654,7 +654,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (lsp_impl) and analysis modules
     /// to obtain parser instances for document processing.
-    pub fn create_document_parser_pool(&self) -> DocumentParserPool {
+    pub(crate) fn create_document_parser_pool(&self) -> DocumentParserPool {
         let parser_factory = ParserFactory::new(self.language_registry.clone());
         DocumentParserPool::new(parser_factory)
     }
@@ -671,7 +671,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (lsp_impl) to determine if
     /// semantic tokens should be refreshed after language load.
-    pub fn has_queries(&self, lang_name: &str) -> bool {
+    pub(crate) fn has_queries(&self, lang_name: &str) -> bool {
         self.query_store().has_highlight_query(lang_name)
     }
 
@@ -679,7 +679,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
-    pub fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+    pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store().highlight_query(lang_name)
     }
 
@@ -687,7 +687,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (multiple handlers) and analysis
     /// layer (refactor, semantic, selection) for nested language support.
-    pub fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+    pub(crate) fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store().injection_query(lang_name)
     }
 
@@ -695,7 +695,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor) for custom capture-to-token-type mapping.
-    pub fn capture_mappings(&self) -> CaptureMappings {
+    pub(crate) fn capture_mappings(&self) -> CaptureMappings {
         self.config_store.capture_mappings()
     }
 
