@@ -57,12 +57,6 @@ impl ConfigStore {
     }
 }
 
-impl Default for ConfigStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
