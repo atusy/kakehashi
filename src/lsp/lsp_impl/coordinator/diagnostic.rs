@@ -1,19 +1,41 @@
 use crate::config::settings::AggregationStrategy;
+use crate::document::DocumentStore;
 use crate::language::InjectionResolver;
+use crate::language::LanguageCoordinator;
+use crate::lsp::bridge::BridgeCoordinator;
+use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings;
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::collect_push_diagnostics;
+use crate::lsp::settings_manager::SettingsManager;
+use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
+use tower_lsp_server::Client;
 
 pub(crate) struct DiagnosticScheduler<'a> {
-    server: &'a Kakehashi,
+    client: Client,
+    language: &'a std::sync::Arc<LanguageCoordinator>,
+    documents: &'a DocumentStore,
+    bridge: &'a BridgeCoordinator,
+    settings_manager: &'a SettingsManager,
+    debounced_diagnostics: &'a DebouncedDiagnosticsManager,
+    synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
 }
 
 impl<'a> DiagnosticScheduler<'a> {
     pub(crate) fn new(server: &'a Kakehashi) -> Self {
-        Self { server }
+        Self {
+            client: server.client.clone(),
+            language: &server.language,
+            documents: &server.documents,
+            bridge: &server.bridge,
+            settings_manager: &server.settings_manager,
+            debounced_diagnostics: &server.debounced_diagnostics,
+            synthetic_diagnostics: std::sync::Arc::clone(&server.synthetic_diagnostics),
+        }
     }
 
     /// Schedule a debounced diagnostic for a document (ADR-0020 Phase 3).
@@ -27,13 +49,13 @@ impl<'a> DiagnosticScheduler<'a> {
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url, lsp_uri: Uri) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
-        self.server.debounced_diagnostics.schedule(
+        self.debounced_diagnostics.schedule(
             uri,
             lsp_uri,
-            self.server.client.clone(),
+            self.client.clone(),
             snapshot_data,
-            self.server.bridge.pool_arc(),
-            std::sync::Arc::clone(&self.server.synthetic_diagnostics),
+            self.bridge.pool_arc(),
+            std::sync::Arc::clone(&self.synthetic_diagnostics),
         );
     }
 
@@ -46,9 +68,9 @@ impl<'a> DiagnosticScheduler<'a> {
     /// 2. Collects diagnostics via fan-out to downstream servers
     /// 3. Publishes diagnostics via `textDocument/publishDiagnostics`
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url, lsp_uri: Uri) {
-        let client = self.server.client.clone();
+        let client = self.client.clone();
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
-        let bridge_pool = self.server.bridge.pool_arc();
+        let bridge_pool = self.bridge.pool_arc();
         let uri_clone = uri.clone();
 
         let task = tokio::spawn(async move {
@@ -69,8 +91,7 @@ impl<'a> DiagnosticScheduler<'a> {
             client.publish_diagnostics(lsp_uri, diagnostics, None).await;
         });
 
-        self.server
-            .synthetic_diagnostics
+        self.synthetic_diagnostics
             .register_task(uri, task.abort_handle());
     }
 
@@ -93,20 +114,23 @@ impl<'a> DiagnosticScheduler<'a> {
         &self,
         uri: &Url,
     ) -> Option<Vec<DocumentRequestContext>> {
-        let snapshot = {
-            let doc = self.server.documents.get(uri)?;
-            doc.snapshot()?
+        let (snapshot, language_name) = {
+            let doc = self.documents.get(uri)?;
+            let snapshot = doc.snapshot()?;
+            let language_name = self.language.detect_language(
+                uri.path(),
+                snapshot.text(),
+                None,
+                doc.language_id(),
+            )?;
+            (snapshot, language_name)
         };
 
-        let language_name = self
-            .server
-            .parse_coordinator()
-            .get_language_for_document(uri)?;
-        let injection_query = self.server.language.get_injection_query(&language_name)?;
+        let injection_query = self.language.get_injection_query(&language_name)?;
 
         let all_regions = InjectionResolver::resolve_all(
-            &self.server.language,
-            self.server.bridge.region_id_tracker(),
+            self.language,
+            self.bridge.region_id_tracker(),
             uri,
             snapshot.tree(),
             snapshot.text(),
@@ -118,16 +142,19 @@ impl<'a> DiagnosticScheduler<'a> {
         }
 
         let mut contexts = Vec::new();
+        let settings = self.settings_manager.load_settings();
         for resolved in all_regions {
-            let configs = self
-                .server
-                .injection_coordinator()
-                .get_all_bridge_configs_for_language(&language_name, &resolved.injection_language);
+            let configs = self.bridge.get_all_configs_for_language(
+                &settings,
+                &language_name,
+                &resolved.injection_language,
+            );
             if configs.is_empty() {
                 continue;
             }
 
-            let agg = self.server.resolve_aggregation_config(
+            let agg = resolve_aggregation_config_from_settings(
+                &settings,
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/publishDiagnostics",
