@@ -69,15 +69,9 @@ mod tests {
         let store = ConfigStore::new();
 
         let settings = WorkspaceSettings {
-            languages: {
-                let mut langs = HashMap::new();
-                langs.insert("python".to_string(), LanguageSettings::default());
-                langs
-            },
+            languages: HashMap::from([("python".to_string(), LanguageSettings::default())]),
             search_paths: vec!["/search/path".to_string()],
-            capture_mappings: CaptureMappings::default(),
-            auto_install: true,
-            language_servers: HashMap::new(),
+            ..Default::default()
         };
 
         store.update_from_settings(&settings);
@@ -90,11 +84,8 @@ mod tests {
     fn test_search_paths_normalized_on_update() {
         let store = ConfigStore::new();
         let settings = WorkspaceSettings {
-            languages: HashMap::new(),
             search_paths: vec!["/path/one".to_string(), "/path/with/../dots".to_string()],
-            capture_mappings: CaptureMappings::default(),
-            auto_install: false,
-            language_servers: HashMap::new(),
+            ..Default::default()
         };
         store.update_from_settings(&settings);
         assert_eq!(
