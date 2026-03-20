@@ -195,7 +195,6 @@ impl QueryLoader {
     /// A vector of parent language names (empty if no inheritance).
     fn parse_inherits_directive(content: &str) -> Vec<String> {
         let first_line = content.lines().next().unwrap_or("");
-
         if let Some(rest) = first_line.strip_prefix(INHERITS_DIRECTIVE_PREFIX) {
             rest.split(',')
                 .map(|s| s.trim().to_string())
