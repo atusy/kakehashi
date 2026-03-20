@@ -62,6 +62,7 @@ mod tests {
     use super::*;
     use crate::config::LanguageSettings;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn test_config_store_capture_mappings() {
@@ -120,5 +121,47 @@ mod tests {
             retrieved,
             vec![PathBuf::from("/path/one"), PathBuf::from("/path/dots"),]
         );
+    }
+
+    #[test]
+    fn test_poison_recovery_on_read() {
+        let store = Arc::new(ConfigStore::new());
+        store.set_search_paths(vec!["/path/one".to_string()]);
+
+        // Poison the RwLock by panicking while holding a write guard
+        let store_clone = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            let _guard = store_clone.search_paths.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(store.search_paths.read().is_err());
+
+        // get_search_paths should recover from the poisoned lock
+        assert_eq!(store.get_search_paths(), vec![PathBuf::from("/path/one")]);
+    }
+
+    #[test]
+    fn test_poison_recovery_on_write() {
+        let store = Arc::new(ConfigStore::new());
+
+        // Poison the RwLock by panicking while holding a write guard
+        let store_clone = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            let _guard = store_clone.search_paths.write().unwrap();
+            panic!("intentional panic to poison the lock");
+        });
+        let _ = handle.join();
+
+        // Verify the lock is poisoned
+        assert!(store.search_paths.write().is_err());
+
+        // set_search_paths should recover from the poisoned lock
+        store.set_search_paths(vec!["/path/one".to_string()]);
+
+        // Verify the data was stored despite the poisoned lock
+        assert_eq!(store.get_search_paths(), vec![PathBuf::from("/path/one")]);
     }
 }
