@@ -1,15 +1,42 @@
+use crate::document::DocumentStore;
+use crate::language::{DocumentParserPool, LanguageCoordinator};
+use crate::lsp::auto_install::AutoInstallManager;
 use url::Url;
 
+use crate::config::WorkspaceSettings;
 use crate::lsp::auto_install::InstallEvent;
+use crate::lsp::bridge::BridgeCoordinator;
+use crate::lsp::cache::CacheCoordinator;
+use crate::lsp::client::ClientNotifier;
 use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::settings_manager::SettingsManager;
+use tower_lsp_server::Client;
+
+use super::{ParseCoordinator, ParseCoordinatorDeps};
 
 pub(crate) struct InstallCoordinator<'a> {
-    server: &'a Kakehashi,
+    client: &'a Client,
+    language: &'a std::sync::Arc<LanguageCoordinator>,
+    parser_pool: &'a tokio::sync::Mutex<DocumentParserPool>,
+    documents: &'a DocumentStore,
+    cache: &'a CacheCoordinator,
+    settings_manager: &'a SettingsManager,
+    auto_install: &'a AutoInstallManager,
+    bridge: &'a BridgeCoordinator,
 }
 
 impl<'a> InstallCoordinator<'a> {
     pub(crate) fn new(server: &'a Kakehashi) -> Self {
-        Self { server }
+        Self {
+            client: &server.client,
+            language: &server.language,
+            parser_pool: &server.parser_pool,
+            documents: &server.documents,
+            cache: &server.cache,
+            settings_manager: &server.settings_manager,
+            auto_install: &server.auto_install,
+            bridge: &server.bridge,
+        }
     }
 
     /// Dispatch install events to ClientNotifier.
@@ -17,7 +44,7 @@ impl<'a> InstallCoordinator<'a> {
     /// This method bridges AutoInstallManager (isolated) with ClientNotifier.
     /// AutoInstallManager returns events, Kakehashi dispatches them.
     pub(crate) async fn dispatch_install_events(&self, language: &str, events: &[InstallEvent]) {
-        let notifier = self.server.notifier();
+        let notifier = self.notifier();
         for event in events {
             match event {
                 InstallEvent::Log { level, message } => {
@@ -35,12 +62,11 @@ impl<'a> InstallCoordinator<'a> {
 
     /// Build a human-readable reason why auto-install is disabled.
     pub(crate) fn auto_install_disabled_reason(&self) -> String {
-        let settings = self.server.settings_manager.load_settings();
+        let settings = self.settings_manager.load_settings();
         if !settings.auto_install {
             return "autoInstall is disabled".to_string();
         }
         if !self
-            .server
             .settings_manager
             .search_paths_include_default_data_dir(&settings.search_paths)
         {
@@ -60,8 +86,7 @@ impl<'a> InstallCoordinator<'a> {
     /// Called when a parser fails to load and auto-install is disabled
     /// (either explicitly or because searchPaths doesn't include the default data dir).
     pub(crate) async fn notify_parser_missing(&self, language: &str, reason: &str) {
-        self.server
-            .notifier()
+        self.notifier()
             .log_warning(format!(
                 "Parser for '{}' not found. Auto-install is disabled because {}. \
                  Please install the parser manually using: kakehashi language install {}",
@@ -92,7 +117,7 @@ impl<'a> InstallCoordinator<'a> {
         text: String,
         is_injection: bool,
     ) -> bool {
-        let result = self.server.auto_install.try_install(language).await;
+        let result = self.auto_install.try_install(language).await;
 
         self.dispatch_install_events(language, &result.events).await;
 
@@ -114,7 +139,7 @@ impl<'a> InstallCoordinator<'a> {
         text: String,
         is_injection: bool,
     ) {
-        let current_settings = self.server.settings_manager.load_settings();
+        let current_settings = self.settings_manager.load_settings();
         let mut updated_settings = (*current_settings).clone();
 
         let data_dir_str = data_dir.to_string_lossy().to_string();
@@ -122,24 +147,46 @@ impl<'a> InstallCoordinator<'a> {
             updated_settings.search_paths.push(data_dir_str);
         }
 
-        self.server.apply_settings(updated_settings).await;
+        self.apply_settings(updated_settings).await;
 
-        let load_result = self.server.language.ensure_language_loaded(language);
-        self.server
-            .notifier()
+        let load_result = self.language.ensure_language_loaded(language);
+        self.notifier()
             .log_language_events(&load_result.events)
             .await;
 
         if !is_injection {
-            let host_language = self
-                .server
-                .parse_coordinator()
-                .get_language_for_document(&uri);
+            let parse_coordinator = self.parse_coordinator();
+            let host_language = parse_coordinator.get_language_for_document(&uri);
             let lang_for_parse = host_language.as_deref();
-            self.server
-                .parse_coordinator()
+            parse_coordinator
                 .parse_document(uri.clone(), text, lang_for_parse, vec![])
                 .await;
         }
+    }
+
+    async fn apply_settings(&self, settings: WorkspaceSettings) {
+        self.settings_manager.apply_settings(settings.clone());
+        let summary = self.language.load_settings(settings);
+        self.notifier().log_language_events(&summary.events).await;
+    }
+
+    fn notifier(&self) -> ClientNotifier<'_> {
+        ClientNotifier::new(
+            self.client.clone(),
+            self.settings_manager.client_capabilities_lock(),
+        )
+    }
+
+    fn parse_coordinator(&self) -> ParseCoordinator<'_> {
+        ParseCoordinator::from_parts(ParseCoordinatorDeps {
+            client: self.client,
+            language: self.language,
+            parser_pool: self.parser_pool,
+            documents: self.documents,
+            cache: self.cache,
+            settings_manager: self.settings_manager,
+            auto_install: self.auto_install,
+            bridge: self.bridge,
+        })
     }
 }
