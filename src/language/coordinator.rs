@@ -22,13 +22,10 @@ const MAX_PREVIEW_LEN: usize = 60;
 struct QueryLoadContext<'a> {
     language_id: &'a str,
     query_type: &'a str,
-    /// Describes where the query was loaded from (e.g., "Dynamically loaded").
-    /// Only used by `load_query_with_inheritance`, not by `load_query_from_paths`.
-    context: Option<&'a str>,
 }
 
 /// Coordinates language runtime components (registry, queries, configs).
-pub struct LanguageCoordinator {
+pub(crate) struct LanguageCoordinator {
     query_store: QueryStore,
     config_store: ConfigStore,
     filetype_resolver: FiletypeResolver,
@@ -47,7 +44,7 @@ impl Default for LanguageCoordinator {
 }
 
 impl LanguageCoordinator {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             query_store: QueryStore::new(),
             config_store: ConfigStore::new(),
@@ -60,9 +57,9 @@ impl LanguageCoordinator {
 
     /// Ensure a language parser is loaded, attempting dynamic load if needed.
     ///
-    /// Visibility: Public - called by LSP layer (semantic_tokens, selection_range)
+    /// Visibility: pub(crate) - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
-    pub fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
+    pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
         if self.language_registry.contains(language_id) {
             LanguageLoadResult::success_with(Vec::new())
         } else {
@@ -72,9 +69,9 @@ impl LanguageCoordinator {
 
     /// Initialize from workspace-level settings and return coordination events.
     ///
-    /// Visibility: Public - called by LSP layer during initialization and
+    /// Visibility: pub(crate) - called by LSP layer during initialization and
     /// settings updates to configure language support.
-    pub fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
+    pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
 
         // Build alias map from language configs
@@ -174,85 +171,33 @@ impl LanguageCoordinator {
             ));
         }
 
-        let library_path = QueryLoader::resolve_library_path(None, language_id, &search_paths);
-        let Some(lib_path) = library_path else {
-            return LanguageLoadResult::failure_with(LanguageEvent::log(
-                LanguageLogLevel::Warning,
-                format!(
-                    "Could not find parser for language '{language_id}' in search paths: {}",
-                    format_search_paths(&search_paths),
-                ),
-            ));
+        // Warning: parser may not exist yet (dynamic discovery)
+        let language = match self.load_and_register_parser(
+            language_id,
+            None,
+            &search_paths,
+            LanguageLogLevel::Warning,
+        ) {
+            Ok(lang) => lang,
+            Err(result) => return result,
         };
-
-        let language = {
-            let result = self
-                .parser_loader
-                .write()
-                .recover_poison("LanguageCoordinator::try_load_language_by_id")
-                .load_language(&lib_path, language_id);
-            match result {
-                Ok(lang) => lang,
-                Err(err) => {
-                    return LanguageLoadResult::failure_with(LanguageEvent::log(
-                        LanguageLogLevel::Error,
-                        format!(
-                            "Failed to load language {language_id} from {}: {err}",
-                            lib_path.display()
-                        ),
-                    ));
-                }
-            }
-        };
-
-        self.language_registry
-            .register(language_id.to_string(), language.clone());
 
         let mut events = Vec::new();
 
         // Use fault-tolerant loading for all query types
         // This handles languages like TypeScript that inherit from ecma,
         // and gracefully skips invalid patterns while preserving valid ones
-        self.load_query(
+        self.load_all_queries(
             &language,
             &search_paths,
-            QueryLoadContext {
-                language_id,
-                query_type: "highlights",
-                context: Some("Dynamically loaded"),
-            },
+            language_id,
+            "Dynamically loaded",
             &mut events,
-            |store, query| store.insert_highlight_query(language_id.to_string(), query),
-        );
-        self.load_query(
-            &language,
-            &search_paths,
-            QueryLoadContext {
-                language_id,
-                query_type: "locals",
-                context: Some("Dynamically loaded"),
-            },
-            &mut events,
-            |store, query| store.insert_locals_query(language_id.to_string(), query),
-        );
-        self.load_query(
-            &language,
-            &search_paths,
-            QueryLoadContext {
-                language_id,
-                query_type: "injections",
-                context: Some("Dynamically loaded"),
-            },
-            &mut events,
-            |store, query| store.insert_injection_query(language_id.to_string(), query),
         );
 
         events.push(LanguageEvent::log(
             LanguageLogLevel::Info,
-            format!(
-                "Dynamically loaded language {language_id} from {}",
-                lib_path.display()
-            ),
+            format!("Dynamically loaded language {language_id} from search paths",),
         ));
         if self.has_queries(language_id) {
             events.push(LanguageEvent::semantic_tokens_refresh(
@@ -263,12 +208,96 @@ impl LanguageCoordinator {
         LanguageLoadResult::success_with(events)
     }
 
+    /// Resolve, load, and register a parser for the given language.
+    ///
+    /// Returns `Ok(Language)` on success, or `Err(LanguageLoadResult)` with
+    /// an appropriate failure event on error.
+    ///
+    /// `missing_parser_level` controls how a missing parser is reported:
+    /// - `Warning` for dynamic loading — the parser may not exist yet (normal)
+    /// - `Error` for config-driven loading — the parser was explicitly configured
+    ///   but cannot be found (configuration problem)
+    fn load_and_register_parser(
+        &self,
+        lang_name: &str,
+        parser_config: Option<&str>,
+        search_paths: &[PathBuf],
+        missing_parser_level: LanguageLogLevel,
+    ) -> Result<Language, LanguageLoadResult> {
+        let library_path =
+            QueryLoader::resolve_library_path(parser_config, lang_name, search_paths);
+        let Some(lib_path) = library_path else {
+            return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
+                missing_parser_level,
+                format!(
+                    "No parser path found for language '{lang_name}' in search paths: {}",
+                    format_search_paths(search_paths),
+                ),
+            )));
+        };
+
+        let language = {
+            let result = self
+                .parser_loader
+                .write()
+                .recover_poison("LanguageCoordinator::load_and_register_parser")
+                .load_language(&lib_path, lang_name);
+            match result {
+                Ok(lang) => lang,
+                Err(err) => {
+                    return Err(LanguageLoadResult::failure_with(LanguageEvent::log(
+                        LanguageLogLevel::Error,
+                        format!(
+                            "Failed to load language {lang_name} from {}: {err}",
+                            lib_path.display()
+                        ),
+                    )));
+                }
+            }
+        };
+
+        self.language_registry
+            .register(lang_name.to_string(), language.clone());
+
+        Ok(language)
+    }
+
+    /// Load all three query types (highlights, locals, injections) for a language.
+    fn load_all_queries(
+        &self,
+        language: &Language,
+        search_paths: &[PathBuf],
+        lang_name: &str,
+        context: &str,
+        events: &mut Vec<LanguageEvent>,
+    ) {
+        for query_type in ["highlights", "locals", "injections"] {
+            self.load_query(
+                language,
+                search_paths,
+                QueryLoadContext {
+                    language_id: lang_name,
+                    query_type,
+                },
+                context,
+                events,
+                |store, query| match query_type {
+                    "highlights" => store.insert_highlight_query(lang_name.to_string(), query),
+                    "locals" => store.insert_locals_query(lang_name.to_string(), query),
+                    "injections" => store.insert_injection_query(lang_name.to_string(), query),
+                    _ => unreachable!(),
+                },
+            );
+        }
+    }
+
     /// Load a query file with inheritance resolution.
     fn load_query(
         &self,
         language: &Language,
         paths: &[PathBuf],
         ctx: QueryLoadContext<'_>,
+        context: &str,
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
@@ -290,7 +319,6 @@ impl LanguageCoordinator {
         };
 
         let query_label = format!("{}/{}", ctx.language_id, filename);
-        let context = ctx.context.unwrap_or(ctx.query_type);
         let success_prefix = format!("{} {} for {}", context, ctx.query_type, ctx.language_id);
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
@@ -388,9 +416,9 @@ impl LanguageCoordinator {
 
     /// Get language for a document path.
     ///
-    /// Visibility: Public - called by LSP layer (auto_install, lsp_impl)
+    /// Visibility: pub(crate) - called by LSP layer (auto_install, lsp_impl)
     /// for document language detection.
-    pub fn language_for_path(&self, path: &str) -> Option<String> {
+    pub(crate) fn language_for_path(&self, path: &str) -> Option<String> {
         self.filetype_resolver.language_for_path(path)
     }
 
@@ -399,9 +427,9 @@ impl LanguageCoordinator {
     /// Used by the detection fallback chain (ADR-0005) to determine whether
     /// to accept a detection result or continue to the next method.
     ///
-    /// Visibility: Public - called by LSP layer (lsp_impl) to check parser
+    /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to check parser
     /// availability before attempting language operations.
-    pub fn has_parser_available(&self, language_name: &str) -> bool {
+    pub(crate) fn has_parser_available(&self, language_name: &str) -> bool {
         self.language_registry.contains(language_name)
     }
 
@@ -421,8 +449,8 @@ impl LanguageCoordinator {
     /// - Host document: `detect_language(path, content, None, language_id)`
     /// - Injection: `detect_language(token, content, Some(token), Some(token))`
     ///
-    /// Visibility: Public - called by LSP layer and injection resolution.
-    pub fn detect_language(
+    /// Visibility: pub(crate) - called by LSP layer and injection resolution.
+    pub(crate) fn detect_language(
         &self,
         path: &str,
         content: &str,
@@ -549,11 +577,11 @@ impl LanguageCoordinator {
     /// 3. First-line detection (shebang, mode line)
     ///
     /// Config-based alias resolution (rmd -> markdown) is applied as a sub-step
-    /// after each detection method via `try_with_alias_fallback`.
+    /// after each detection method via `try_load_with_alias`.
     ///
-    /// Visibility: Public - called by analysis layer (semantic.rs) for
+    /// Visibility: pub(crate) - called by analysis layer (semantic.rs) for
     /// nested language injection support.
-    pub fn resolve_injection_language(
+    pub(crate) fn resolve_injection_language(
         &self,
         identifier: &str,
         content: &str,
@@ -566,89 +594,39 @@ impl LanguageCoordinator {
         );
 
         // 1. Try direct identifier first (skip "plaintext")
-        if identifier != "plaintext" {
-            // Try direct match
-            let direct_result = self.ensure_language_loaded(identifier);
-            if direct_result.success {
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Resolved injection '{}' via direct identifier",
-                    identifier
-                );
-                return Some((identifier.to_string(), direct_result));
-            }
-
-            // Try config-based alias for direct identifier
-            if let Some(canonical) = self.resolve_alias(identifier) {
-                let alias_result = self.ensure_language_loaded(&canonical);
-                if alias_result.success {
-                    log::debug!(
-                        target: "kakehashi::language_detection",
-                        "Resolved injection '{}' -> '{}' via config alias",
-                        identifier,
-                        canonical
-                    );
-                    return Some((canonical, alias_result));
-                }
-            }
+        if identifier != "plaintext"
+            && let Some(found) = self.try_load_with_alias(identifier)
+        {
+            log::debug!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via identifier (direct or alias)",
+                identifier, found.0
+            );
+            return Some(found);
         }
 
         // 2. Try syntect token normalization (handles py -> python, js -> javascript, etc.)
-        if let Some(normalized) = super::heuristic::detect_from_token(identifier) {
-            let token_result = self.ensure_language_loaded(&normalized);
-            if token_result.success {
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Resolved injection '{}' -> '{}' via syntect token",
-                    identifier,
-                    normalized
-                );
-                return Some((normalized, token_result));
-            }
-
-            // Try config alias for the normalized name too
-            if let Some(canonical) = self.resolve_alias(&normalized) {
-                let alias_result = self.ensure_language_loaded(&canonical);
-                if alias_result.success {
-                    log::debug!(
-                        target: "kakehashi::language_detection",
-                        "Resolved injection '{}' -> '{}' -> '{}' via syntect + config alias",
-                        identifier,
-                        normalized,
-                        canonical
-                    );
-                    return Some((canonical, alias_result));
-                }
-            }
+        if let Some(normalized) = super::heuristic::detect_from_token(identifier)
+            && let Some(found) = self.try_load_with_alias(&normalized)
+        {
+            log::debug!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via syntect token (direct or alias)",
+                identifier, found.0
+            );
+            return Some(found);
         }
 
         // 3. Try first-line detection (shebang, mode line)
-        if let Some(first_line_lang) = super::heuristic::detect_from_first_line(content) {
-            let first_line_result = self.ensure_language_loaded(&first_line_lang);
-            if first_line_result.success {
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Resolved injection '{}' -> '{}' via first-line detection",
-                    identifier,
-                    first_line_lang
-                );
-                return Some((first_line_lang, first_line_result));
-            }
-
-            // Try config alias for the first-line detected language
-            if let Some(canonical) = self.resolve_alias(&first_line_lang) {
-                let alias_result = self.ensure_language_loaded(&canonical);
-                if alias_result.success {
-                    log::debug!(
-                        target: "kakehashi::language_detection",
-                        "Resolved injection '{}' -> '{}' -> '{}' via first-line + config alias",
-                        identifier,
-                        first_line_lang,
-                        canonical
-                    );
-                    return Some((canonical, alias_result));
-                }
-            }
+        if let Some(first_line_lang) = super::heuristic::detect_from_first_line(content)
+            && let Some(found) = self.try_load_with_alias(&first_line_lang)
+        {
+            log::debug!(
+                target: "kakehashi::language_detection",
+                "Resolved injection '{}' -> '{}' via first-line detection (direct or alias)",
+                identifier, found.0
+            );
+            return Some(found);
         }
 
         log::debug!(
@@ -659,11 +637,29 @@ impl LanguageCoordinator {
         None
     }
 
+    /// Try to load a language directly, then via config alias.
+    ///
+    /// Returns `(resolved_name, load_result)` on success, or `None` if
+    /// neither direct load nor alias resolution succeeded.
+    fn try_load_with_alias(&self, candidate: &str) -> Option<(String, LanguageLoadResult)> {
+        let result = self.ensure_language_loaded(candidate);
+        if result.success {
+            return Some((candidate.to_string(), result));
+        }
+        if let Some(canonical) = self.resolve_alias(candidate) {
+            let result = self.ensure_language_loaded(&canonical);
+            if result.success {
+                return Some((canonical, result));
+            }
+        }
+        None
+    }
+
     /// Create a document parser pool.
     ///
-    /// Visibility: Public - called by LSP layer (lsp_impl) and analysis modules
+    /// Visibility: pub(crate) - called by LSP layer (lsp_impl) and analysis modules
     /// to obtain parser instances for document processing.
-    pub fn create_document_parser_pool(&self) -> DocumentParserPool {
+    pub(crate) fn create_document_parser_pool(&self) -> DocumentParserPool {
         let parser_factory = ParserFactory::new(self.language_registry.clone());
         DocumentParserPool::new(parser_factory)
     }
@@ -678,33 +674,33 @@ impl LanguageCoordinator {
 
     /// Check if queries exist for a language.
     ///
-    /// Visibility: Public - called by LSP layer (lsp_impl) to determine if
+    /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to determine if
     /// semantic tokens should be refreshed after language load.
-    pub fn has_queries(&self, lang_name: &str) -> bool {
+    pub(crate) fn has_queries(&self, lang_name: &str) -> bool {
         self.query_store().has_highlight_query(lang_name)
     }
 
     /// Get highlight query for a language.
     ///
-    /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
+    /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor, semantic) for syntax highlighting and token analysis.
-    pub fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+    pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store().highlight_query(lang_name)
     }
 
     /// Get injection query for a language.
     ///
-    /// Visibility: Public - called by LSP layer (multiple handlers) and analysis
+    /// Visibility: pub(crate) - called by LSP layer (multiple handlers) and analysis
     /// layer (refactor, semantic, selection) for nested language support.
-    pub fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
+    pub(crate) fn injection_query(&self, lang_name: &str) -> Option<Arc<tree_sitter::Query>> {
         self.query_store().injection_query(lang_name)
     }
 
     /// Get capture mappings.
     ///
-    /// Visibility: Public - called by LSP layer (semantic_tokens) and analysis
+    /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor) for custom capture-to-token-type mapping.
-    pub fn capture_mappings(&self) -> CaptureMappings {
+    pub(crate) fn capture_mappings(&self) -> CaptureMappings {
         self.config_store.capture_mappings()
     }
 
@@ -714,40 +710,16 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
         search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
-        let library_path =
-            QueryLoader::resolve_library_path(config.parser.as_deref(), lang_name, search_paths);
-        let Some(lib_path) = library_path else {
-            return LanguageLoadResult::failure_with(LanguageEvent::log(
-                LanguageLogLevel::Error,
-                format!(
-                    "No parser path found for language {lang_name} in search paths: {}",
-                    format_search_paths(search_paths),
-                ),
-            ));
+        // Error: parser was explicitly configured but can't be found
+        let language = match self.load_and_register_parser(
+            lang_name,
+            config.parser.as_deref(),
+            search_paths,
+            LanguageLogLevel::Error,
+        ) {
+            Ok(lang) => lang,
+            Err(result) => return result,
         };
-
-        let language = {
-            let result = self
-                .parser_loader
-                .write()
-                .recover_poison("LanguageCoordinator::load_single_language")
-                .load_language(&lib_path, lang_name);
-            match result {
-                Ok(lang) => lang,
-                Err(err) => {
-                    return LanguageLoadResult::failure_with(LanguageEvent::log(
-                        LanguageLogLevel::Error,
-                        format!(
-                            "Failed to load language {lang_name} from {}: {err}",
-                            lib_path.display()
-                        ),
-                    ));
-                }
-            }
-        };
-
-        self.language_registry
-            .register(lang_name.to_string(), language.clone());
 
         let mut events = self.load_queries_for_language(lang_name, config, search_paths, &language);
 
@@ -775,40 +747,12 @@ impl LanguageCoordinator {
 
         // Fall back to search paths when queries field is not specified
         if !search_paths.is_empty() {
-            self.load_query(
+            self.load_all_queries(
                 language,
                 search_paths,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "highlights",
-                    context: Some("Loaded from search paths"),
-                },
+                lang_name,
+                "Loaded from search paths",
                 &mut events,
-                |store, q| store.insert_highlight_query(lang_name.to_string(), q),
-            );
-
-            self.load_query(
-                language,
-                search_paths,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "locals",
-                    context: Some("Loaded from search paths"),
-                },
-                &mut events,
-                |store, q| store.insert_locals_query(lang_name.to_string(), q),
-            );
-
-            self.load_query(
-                language,
-                search_paths,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "injections",
-                    context: Some("Loaded from search paths"),
-                },
-                &mut events,
-                |store, q| store.insert_injection_query(lang_name.to_string(), q),
             );
         }
 
@@ -844,49 +788,28 @@ impl LanguageCoordinator {
             }
         }
 
-        // Load highlights
-        if !highlights.is_empty() {
-            self.load_query_from_paths(
-                language,
-                &highlights,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "highlights",
-                    context: None,
-                },
-                &mut events,
-                |store, q| store.insert_highlight_query(lang_name.to_string(), q),
-            );
-        }
-
-        // Load locals
-        if !locals.is_empty() {
-            self.load_query_from_paths(
-                language,
-                &locals,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "locals",
-                    context: None,
-                },
-                &mut events,
-                |store, q| store.insert_locals_query(lang_name.to_string(), q),
-            );
-        }
-
-        // Load injections
-        if !injections.is_empty() {
-            self.load_query_from_paths(
-                language,
-                &injections,
-                QueryLoadContext {
-                    language_id: lang_name,
-                    query_type: "injections",
-                    context: None,
-                },
-                &mut events,
-                |store, q| store.insert_injection_query(lang_name.to_string(), q),
-            );
+        for (query_type, paths) in [
+            ("highlights", &highlights),
+            ("locals", &locals),
+            ("injections", &injections),
+        ] {
+            if !paths.is_empty() {
+                self.load_query_from_paths(
+                    language,
+                    paths,
+                    QueryLoadContext {
+                        language_id: lang_name,
+                        query_type,
+                    },
+                    &mut events,
+                    |store, q| match query_type {
+                        "highlights" => store.insert_highlight_query(lang_name.to_string(), q),
+                        "locals" => store.insert_locals_query(lang_name.to_string(), q),
+                        "injections" => store.insert_injection_query(lang_name.to_string(), q),
+                        _ => unreachable!(),
+                    },
+                );
+            }
         }
 
         events
@@ -1103,70 +1026,72 @@ mod tests {
     fn test_heuristic_used_when_language_id_plaintext() {
         let coordinator = LanguageCoordinator::new();
 
-        // When languageId is "plaintext", fallback to heuristic detection
-        // Note: No parser loaded, so will return None (graceful degradation)
-        // But the heuristic detection path is still exercised
+        // When languageId is "plaintext", skip it and fall through to heuristic.
+        // Python shebang detected but no parser loaded.
         let content = "#!/usr/bin/env python\nprint('hello')";
-        let result = coordinator.detect_language("/script", content, None, Some("plaintext"));
+        let (result, method, last_candidate) =
+            coordinator.detect_language_with_method("/script", content, None, Some("plaintext"));
 
-        // No python parser loaded, so result is None
-        // The important thing is that "plaintext" didn't short-circuit
         assert_eq!(result, None);
+        assert_eq!(method, "none");
+        assert_eq!(last_candidate, Some("python".to_string()));
     }
 
     #[test]
-    fn test_heuristic_skipped_when_language_id_has_parser() {
+    fn test_falls_back_to_heuristic_when_language_id_missing_parser() {
         let coordinator = LanguageCoordinator::new();
 
-        // When languageId has an available parser, don't run heuristic detection
-        // This tests lazy evaluation - heuristic parsing is skipped entirely
-
-        // Scenario: languageId is "rust" but no rust parser loaded
-        // So it falls through to heuristic, but no python parser either
+        // languageId "rust" has no parser, falls through to heuristic.
+        // Python shebang overrides "rust" as last_candidate.
         let content = "#!/usr/bin/env python\nprint('hello')";
-        let result = coordinator.detect_language("/script", content, None, Some("rust"));
+        let (result, method, last_candidate) =
+            coordinator.detect_language_with_method("/script", content, None, Some("rust"));
 
-        // Neither rust nor python parser loaded
         assert_eq!(result, None);
-
-        // Full behavior with loaded parser is tested in unit tests
+        assert_eq!(method, "none");
+        assert_eq!(last_candidate, Some("python".to_string()));
     }
 
     #[test]
     fn test_extension_fallback_after_heuristic() {
         let coordinator = LanguageCoordinator::new();
 
-        // When heuristic detection fails (no parser), extension fallback runs
-        // File has .rs extension but content has python shebang
+        // No languageId. Path extension "rs" → syntect detects "rust" (no parser).
+        // Then first-line shebang detects "python" (no parser) → last candidate.
         let content = "#!/usr/bin/env python\nprint('hello')";
-        let result = coordinator.detect_language("/path/to/file.rs", content, None, None);
+        let (result, method, last_candidate) =
+            coordinator.detect_language_with_method("/path/to/file.rs", content, None, None);
 
-        // No parsers loaded, so result is None
-        // But the chain tried: languageId (None) -> heuristic (python, no parser) -> extension (rs, no parser)
         assert_eq!(result, None);
+        assert_eq!(method, "none");
+        assert_eq!(last_candidate, Some("python".to_string()));
     }
 
     #[test]
     fn test_full_detection_chain() {
         let coordinator = LanguageCoordinator::new();
 
-        // Full chain test: languageId -> heuristic -> extension
-        // All methods tried, none have parsers available
-
-        // languageId = "plaintext" (skipped), heuristic = python (no parser), extension = rs (no parser)
+        // Full chain: "plaintext" skipped, "rs" extension → "rust" (no parser),
+        // first-line shebang → "python" (no parser).
         let content = "#!/usr/bin/env python\nprint('hello')";
-        let result =
-            coordinator.detect_language("/path/to/file.rs", content, None, Some("plaintext"));
+        let (result, method, last_candidate) = coordinator.detect_language_with_method(
+            "/path/to/file.rs",
+            content,
+            None,
+            Some("plaintext"),
+        );
 
         assert_eq!(result, None);
+        assert_eq!(method, "none");
+        assert_eq!(last_candidate, Some("python".to_string()));
     }
 
     #[test]
     fn test_detection_chain_returns_none_when_all_fail() {
         let coordinator = LanguageCoordinator::new();
 
-        // No languageId, no heuristic match, no extension -> None
-        let result = coordinator.detect_language(
+        // No languageId, syntect doesn't recognize "random_file", no shebang.
+        let (result, method, last_candidate) = coordinator.detect_language_with_method(
             "/random_file",
             "random content without shebang",
             None,
@@ -1174,18 +1099,22 @@ mod tests {
         );
 
         assert_eq!(result, None);
+        assert_eq!(method, "none");
+        // "random_file" basename is tried as token but syntect doesn't recognize it
+        assert_eq!(last_candidate, Some("random_file".to_string()));
     }
 
     #[test]
     fn test_heuristic_detects_makefile_by_filename() {
         let coordinator = LanguageCoordinator::new();
 
-        // Makefile has no extension but should be detected by filename pattern
-        // No parser loaded, so returns None (but heuristic path is exercised)
-        let result = coordinator.detect_language("/path/to/Makefile", "all: build", None, None);
+        // Basename "Makefile" → syntect maps to "make" (no parser loaded).
+        let (result, method, last_candidate) =
+            coordinator.detect_language_with_method("/path/to/Makefile", "all: build", None, None);
 
-        // No make parser loaded
         assert_eq!(result, None);
+        assert_eq!(method, "none");
+        assert_eq!(last_candidate, Some("make".to_string()));
     }
 
     // Tests for load_unified_queries
