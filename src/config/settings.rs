@@ -204,7 +204,7 @@ pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
 pub struct RawWorkspaceSettings {
     /// Directories to search for Tree-sitter parser libraries and query files.
     pub search_paths: Option<Vec<String>>,
-    /// Per-language configuration (parser paths, queries, bridge filters, aliases).
+    /// Per-language configuration (parser paths, queries, bridge filters, base inheritance).
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
     /// Custom mappings from Tree-sitter capture names to semantic token types.
