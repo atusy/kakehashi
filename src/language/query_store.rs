@@ -57,6 +57,14 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
+    pub(crate) fn locals_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+        self.locals_queries
+            .read()
+            .recover_poison(format_args!("QueryStore::locals_query({})", lang_name))
+            .get(lang_name)
+            .cloned()
+    }
+
     pub(crate) fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {
         self.injection_queries
             .write()

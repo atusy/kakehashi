@@ -77,13 +77,106 @@ impl LanguageCoordinator {
         // Build base map from language configs
         self.build_base_map(&settings.languages);
 
+        // Partition languages into (no-base, has-base) groups.
+        // HashMap iteration order is arbitrary, so explicit partitioning
+        // ensures base languages are loaded before derived ones.
+        let (base_languages, derived_languages): (Vec<_>, Vec<_>) = settings
+            .languages
+            .iter()
+            .partition(|(_, config)| config.base.is_none());
+
         let mut summary = LanguageLoadSummary::default();
         let search_paths = self.config_store.search_paths();
-        for (lang_name, config) in &settings.languages {
+
+        // Pass 1: Load all languages WITHOUT base (normal path)
+        for (lang_name, config) in &base_languages {
             let result = self.load_single_language(lang_name, config, &search_paths);
             summary.record(lang_name, result);
         }
+
+        // Pass 2: For each language WITH base, register base's parser and queries
+        // under the derived name
+        for (derived_name, config) in &derived_languages {
+            let result = self.load_derived_language(derived_name, config);
+            summary.record(derived_name, result);
+        }
+
         summary
+    }
+
+    /// Load a derived language by copying parser and queries from its base.
+    ///
+    /// The base's parser is loaded first (if not already available), then
+    /// registered under the derived name. Queries are similarly copied.
+    fn load_derived_language(
+        &self,
+        derived_name: &str,
+        config: &LanguageSettings,
+    ) -> LanguageLoadResult {
+        let base_name = match &config.base {
+            Some(name) => name.as_str(),
+            None => {
+                return LanguageLoadResult::failure_with(LanguageEvent::log(
+                    LanguageLogLevel::Error,
+                    format!("load_derived_language called for '{derived_name}' without base"),
+                ));
+            }
+        };
+
+        // Ensure base language is loaded (may need dynamic load from search paths)
+        if !self.language_registry.contains(base_name) {
+            let base_result = self.try_load_language_by_id(base_name);
+            if !base_result.success {
+                return LanguageLoadResult::failure_with(LanguageEvent::log(
+                    LanguageLogLevel::Error,
+                    format!(
+                        "Cannot load derived language '{derived_name}': \
+                         base language '{base_name}' not found"
+                    ),
+                ));
+            }
+        }
+
+        // Get the base's Language object and register under derived name
+        let language = match self.language_registry.get(base_name) {
+            Some(lang) => lang,
+            None => {
+                return LanguageLoadResult::failure_with(LanguageEvent::log(
+                    LanguageLogLevel::Error,
+                    format!("Base language '{base_name}' was loaded but not found in registry"),
+                ));
+            }
+        };
+
+        self.language_registry
+            .register(derived_name.to_string(), language);
+
+        // Copy queries from base to derived
+        let mut events = Vec::new();
+        if let Some(query) = self.query_store.highlight_query(base_name) {
+            self.query_store
+                .insert_highlight_query(derived_name.to_string(), query);
+        }
+        if let Some(query) = self.query_store.locals_query(base_name) {
+            self.query_store
+                .insert_locals_query(derived_name.to_string(), query);
+        }
+        if let Some(query) = self.query_store.injection_query(base_name) {
+            self.query_store
+                .insert_injection_query(derived_name.to_string(), query);
+        }
+
+        events.push(LanguageEvent::log(
+            LanguageLogLevel::Info,
+            format!("Derived language '{derived_name}' loaded from base '{base_name}'"),
+        ));
+        if self.has_queries(derived_name) {
+            events.push(LanguageEvent::semantic_tokens_refresh(
+                derived_name.to_string(),
+            ));
+        }
+
+        LanguageLoadResult::success_with(events)
     }
 
     /// Build the derived → base language map from configuration.
@@ -1525,6 +1618,94 @@ mod tests {
             result,
             Some("javascript".to_string()),
             "jsx extension should resolve to javascript via base"
+        );
+    }
+
+    // Tests for two-pass loading of base languages
+
+    #[test]
+    fn test_load_settings_registers_derived_language_from_base() {
+        // When rmd has base = "markdown" and markdown parser is loadable,
+        // load_settings should register "rmd" with markdown's parser
+        let coordinator = LanguageCoordinator::new();
+
+        // Manually register "markdown" parser (simulating it being loaded)
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query =
+            std::sync::Arc::new(tree_sitter::Query::new(&lang, "(identifier) @variable").unwrap());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), lang);
+        coordinator
+            .query_store()
+            .insert_highlight_query("markdown".to_string(), query.clone());
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        // rmd should now have a parser available
+        assert!(
+            coordinator.has_parser_available("rmd"),
+            "rmd should have parser from base markdown"
+        );
+
+        // rmd should also have the highlight query
+        assert!(
+            coordinator.has_queries("rmd"),
+            "rmd should have queries from base markdown"
+        );
+
+        // rmd should be recorded as loaded
+        assert!(
+            summary.loaded.contains(&"rmd".to_string()),
+            "rmd should be recorded as loaded"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_derived_with_missing_base_fails() {
+        // When rmd has base = "nonexistent" and no parser for it exists,
+        // it should fail gracefully
+        let coordinator = LanguageCoordinator::new();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("nonexistent".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            !coordinator.has_parser_available("rmd"),
+            "rmd should not have parser when base is missing"
+        );
+        assert!(
+            !summary.loaded.contains(&"rmd".to_string()),
+            "rmd should not be recorded as loaded"
         );
     }
 
