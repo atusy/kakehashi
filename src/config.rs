@@ -116,6 +116,9 @@ impl WorkspaceSettings {
             }
         }
 
+        // Resolve base configs: derived languages inherit base's parser/queries/bridge
+        merge::resolve_base_configs(&mut ws.languages);
+
         if errors.is_empty() {
             Ok(ws)
         } else {
@@ -432,9 +435,7 @@ mod try_from_settings_tests {
             "lua".to_string(),
             LanguageSettings {
                 parser: Some("$TEST_VAR/lua.so".to_string()),
-                queries: None,
-                bridge: None,
-                aliases: None,
+                ..Default::default()
             },
         );
         let settings = RawWorkspaceSettings {
@@ -458,13 +459,11 @@ mod try_from_settings_tests {
         languages.insert(
             "lua".to_string(),
             LanguageSettings {
-                parser: None,
                 queries: Some(vec![QueryItem {
                     path: "${TEST_VAR}/highlights.scm".to_string(),
                     kind: Some(QueryKind::Highlights),
                 }]),
-                bridge: None,
-                aliases: None,
+                ..Default::default()
             },
         );
         let settings = RawWorkspaceSettings {
@@ -507,9 +506,7 @@ mod try_from_settings_tests {
             "lua".to_string(),
             LanguageSettings {
                 parser: Some("$ALSO_MISSING/lua.so".to_string()),
-                queries: None,
-                bridge: None,
-                aliases: None,
+                ..Default::default()
             },
         );
         let settings = RawWorkspaceSettings {
@@ -545,5 +542,39 @@ mod try_from_settings_tests {
                 input: "~/parsers".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn base_config_redirect_replaces_derived_settings() {
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                parser: Some("/opt/markdown.so".to_string()),
+                ..Default::default()
+            },
+        );
+        languages.insert(
+            "rmd".to_string(),
+            LanguageSettings {
+                base: Some("markdown".to_string()),
+                parser: Some("/should/be/replaced.so".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = RawWorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+        let env = make_env(&[]);
+        let ws = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap();
+
+        // rmd should get markdown's parser, not its own
+        assert_eq!(
+            ws.languages["rmd"].parser.as_deref(),
+            Some("/opt/markdown.so")
+        );
+        // base field should be preserved
+        assert_eq!(ws.languages["rmd"].base, Some("markdown".to_string()));
     }
 }

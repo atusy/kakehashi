@@ -228,15 +228,18 @@ pub fn json_schema() -> schemars::Schema {
 /// Per-language Tree-sitter configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct LanguageSettings {
+    /// Base language to inherit parser, queries, and bridge config from.
+    /// When set, the derived language uses the base's config entirely.
+    /// E.g., `base = "markdown"` on `rmd` means rmd uses markdown's config.
+    pub base: Option<String>,
     /// Path to the parser library (.so/.dylib/.dll)
     pub parser: Option<String>,
     /// Omit to inherit from wildcard/defaults. Use an empty array `[]` to explicitly clear queries.
     pub queries: Option<Vec<QueryItem>>,
     /// Omit to bridge all configured languages (default). Use an empty object `{}` to disable bridging. Use `{ "python": { "enabled": true } }` to bridge specific languages.
     pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
+    /// Deprecated: use `base` on the derived language instead.
     /// Alternative languageId values that should use this parser.
-    /// E.g., `aliases = ["rmd", "qmd"]` for markdown allows editors sending
-    /// "rmd" or "qmd" as languageId to use the markdown parser.
     pub aliases: Option<Vec<String>>,
 }
 
@@ -1572,5 +1575,28 @@ kind = "injections""#;
             config.aliases.as_ref().unwrap().is_empty(),
             "should be empty vec"
         );
+    }
+
+    #[test]
+    fn should_parse_language_config_with_base() {
+        let config_toml = r#"
+            base = "markdown"
+        "#;
+
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
+
+        assert_eq!(config.base, Some("markdown".to_string()));
+        assert!(config.parser.is_none());
+    }
+
+    #[test]
+    fn should_parse_language_config_without_base() {
+        let config_toml = r#"
+            parser = "/path/to/rust.so"
+        "#;
+
+        let config: LanguageSettings = toml::from_str(config_toml).unwrap();
+
+        assert!(config.base.is_none());
     }
 }

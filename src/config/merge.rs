@@ -83,10 +83,47 @@ pub(crate) fn merge_language_settings(
     overlay: &LanguageSettings,
 ) -> LanguageSettings {
     LanguageSettings {
+        base: overlay.base.clone().or_else(|| base.base.clone()),
         parser: overlay.parser.clone().or_else(|| base.parser.clone()),
         queries: overlay.queries.clone().or_else(|| base.queries.clone()),
         bridge: merge_bridge_maps(base.bridge.as_ref(), overlay.bridge.as_ref()),
         aliases: overlay.aliases.clone().or_else(|| base.aliases.clone()),
+    }
+}
+
+/// Resolve base configs: for each language with `base = Some(name)`,
+/// replace derived language's parser/queries/bridge with the base's raw config.
+///
+/// Single-level only: if the base itself has a `base`, a warning is logged
+/// but chain walking is not performed.
+pub(crate) fn resolve_base_configs(languages: &mut HashMap<String, LanguageSettings>) {
+    // Collect derived → base pairs first to avoid borrowing conflicts
+    let derived_pairs: Vec<(String, String)> = languages
+        .iter()
+        .filter_map(|(name, settings)| settings.base.as_ref().map(|b| (name.clone(), b.clone())))
+        .collect();
+
+    for (derived_name, base_name) in derived_pairs {
+        // Look up base's config (or default if not explicitly configured)
+        let base_config = languages.get(&base_name).cloned().unwrap_or_default();
+
+        // Warn if the base itself has a base (multi-level chain not yet supported)
+        if base_config.base.is_some() {
+            log::warn!(
+                target: "kakehashi::config",
+                "Language '{}' has base='{}', which itself has a base. \
+                 Multi-level base chains are not yet supported; \
+                 '{}' will inherit '{}' config as-is.",
+                derived_name, base_name, derived_name, base_name
+            );
+        }
+
+        // Replace derived's config fields with base's, preserving the `base` field
+        if let Some(derived) = languages.get_mut(&derived_name) {
+            derived.parser = base_config.parser;
+            derived.queries = base_config.queries;
+            derived.bridge = base_config.bridge;
+        }
     }
 }
 
@@ -296,6 +333,7 @@ mod tests {
                             },
                         )])),
                         aliases: Some(vec!["py3".to_string()]),
+                        ..Default::default()
                     },
                 ),
                 (
@@ -1602,5 +1640,87 @@ mod tests {
             hover.max_fan_out, None,
             "base maxFanOut should be lost when overlay replaces the same method key atomically"
         );
+    }
+
+    // Tests for resolve_base_configs
+
+    #[test]
+    fn test_resolve_base_configs_replaces_derived_settings() {
+        let mut languages = HashMap::from([
+            (
+                "markdown".to_string(),
+                LanguageSettings {
+                    parser: Some("/opt/markdown.so".to_string()),
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/opt/markdown/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    bridge: Some(HashMap::from([(
+                        "python".to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rmd".to_string(),
+                LanguageSettings {
+                    base: Some("markdown".to_string()),
+                    parser: Some("/opt/rmd.so".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        resolve_base_configs(&mut languages);
+
+        let rmd = &languages["rmd"];
+        // base field preserved
+        assert_eq!(rmd.base, Some("markdown".to_string()));
+        // parser/queries/bridge replaced with markdown's
+        assert_eq!(rmd.parser, Some("/opt/markdown.so".to_string()));
+        assert!(rmd.queries.is_some());
+        assert!(rmd.bridge.is_some());
+        // markdown unchanged
+        let md = &languages["markdown"];
+        assert_eq!(md.parser, Some("/opt/markdown.so".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_base_configs_with_missing_base_uses_defaults() {
+        let mut languages = HashMap::from([(
+            "rmd".to_string(),
+            LanguageSettings {
+                base: Some("markdown".to_string()),
+                parser: Some("/opt/rmd.so".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        resolve_base_configs(&mut languages);
+
+        let rmd = &languages["rmd"];
+        // base's config is default (None for all fields)
+        assert_eq!(rmd.parser, None);
+        assert_eq!(rmd.queries, None);
+        assert_eq!(rmd.bridge, None);
+    }
+
+    #[test]
+    fn test_resolve_base_configs_no_base_languages_unchanged() {
+        let mut languages = HashMap::from([(
+            "rust".to_string(),
+            LanguageSettings {
+                parser: Some("/opt/rust.so".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let original = languages.clone();
+        resolve_base_configs(&mut languages);
+        assert_eq!(languages, original);
     }
 }
