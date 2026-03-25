@@ -224,9 +224,9 @@ impl LanguageCoordinator {
                 .insert(derived_name.to_string());
 
             let mut events = Vec::new();
-            if let Some(base_config) = base_config
-                && config.queries != base_config.queries
-            {
+            let should_load_derived_queries = config.queries.is_some()
+                && base_config.is_none_or(|base_config| config.queries != base_config.queries);
+            if should_load_derived_queries {
                 events.extend(self.load_queries_for_language(
                     derived_name,
                     config,
@@ -2101,6 +2101,72 @@ mod tests {
             rmd_query.capture_names(),
             &["function".to_string()],
             "derived language should use its effective queries instead of copying base queries"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_derived_language_uses_effective_queries_with_dynamic_base() {
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let parser_path = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join(format!("markdown.{}", std::env::consts::DLL_EXTENSION));
+        if !parser_path.exists() {
+            eprintln!(
+                "skipping test_load_settings_derived_language_uses_effective_queries_with_dynamic_base: parser '{}' does not exist",
+                parser_path.display()
+            );
+            return;
+        }
+
+        let search_dir = tempdir().unwrap();
+        let markdown_query_dir = search_dir.path().join("queries").join("markdown");
+        fs::create_dir_all(&markdown_query_dir).unwrap();
+        fs::write(
+            markdown_query_dir.join("highlights.scm"),
+            "(paragraph) @markup.heading",
+        )
+        .unwrap();
+
+        let custom_query = search_dir.path().join("rmd-highlights.scm");
+        fs::write(&custom_query, "(paragraph) @function").unwrap();
+
+        let settings = WorkspaceSettings {
+            search_paths: vec![
+                search_dir.path().to_string_lossy().into_owned(),
+                grammar_dir.clone(),
+            ],
+            languages: HashMap::from([(
+                "rmd".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("markdown".to_string()),
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: custom_query.display().to_string(),
+                        kind: Some(crate::config::settings::QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            summary.loaded.contains(&"rmd".to_string()),
+            "rmd should be recorded as loaded, summary={summary:?}"
+        );
+
+        let rmd_query = coordinator
+            .highlight_query("rmd")
+            .expect("rmd should have a highlight query");
+        assert_eq!(
+            rmd_query.capture_names(),
+            &["function".to_string()],
+            "derived language should use its explicit queries even when base loads from search paths"
         );
     }
 
