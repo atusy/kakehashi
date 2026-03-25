@@ -131,7 +131,7 @@ impl LanguageCoordinator {
             Some(name) if name != derived_name => name.as_str(),
             Some(_) => {
                 // Self-reference: load as a normal language using its own config
-                return self.load_single_language(derived_name, config, &search_paths);
+                return self.load_single_language(derived_name, config, search_paths);
             }
             None => {
                 return LanguageLoadResult::failure_with(LanguageEvent::log(
