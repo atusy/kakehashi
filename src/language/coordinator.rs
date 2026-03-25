@@ -35,6 +35,7 @@ pub(crate) struct LanguageCoordinator {
     /// Built from `languages.<name>.base` in configuration.
     /// Example: "rmd" → "markdown" (when rmd has `base = "markdown"`)
     base_map: RwLock<HashMap<String, String>>,
+    deprecated_alias_warnings: RwLock<Vec<String>>,
 }
 
 impl Default for LanguageCoordinator {
@@ -52,6 +53,7 @@ impl LanguageCoordinator {
             language_registry: LanguageRegistry::new(),
             parser_loader: RwLock::new(ParserLoader::new()),
             base_map: RwLock::new(HashMap::new()),
+            deprecated_alias_warnings: RwLock::new(Vec::new()),
         }
     }
 
@@ -86,6 +88,7 @@ impl LanguageCoordinator {
             .partition(|(_, config)| config.base.is_none());
 
         let mut summary = LanguageLoadSummary::default();
+        summary.events.extend(self.deprecated_alias_events());
         let search_paths = self.config_store.search_paths();
 
         // Pass 1: Load all languages WITHOUT base (normal path)
@@ -190,8 +193,13 @@ impl LanguageCoordinator {
             .base_map
             .write()
             .recover_poison("LanguageCoordinator::build_base_map");
+        let mut deprecated_alias_warnings = self
+            .deprecated_alias_warnings
+            .write()
+            .recover_poison("LanguageCoordinator::build_base_map(deprecated_alias_warnings)");
 
         base_map.clear();
+        deprecated_alias_warnings.clear();
 
         for (lang_name, config) in languages {
             if let Some(base) = &config.base {
@@ -205,14 +213,14 @@ impl LanguageCoordinator {
             }
 
             if config.aliases.is_some() {
-                log::warn!(
-                    target: "kakehashi::config",
+                let message = format!(
                     "Language '{}' uses deprecated 'aliases' field. \
                      Use 'base' on derived languages instead. \
                      Example: [languages.rmd] base = \"{}\"",
-                    lang_name,
-                    lang_name
+                    lang_name, lang_name
                 );
+                log::warn!(target: "kakehashi::config", "{message}");
+                deprecated_alias_warnings.push(message);
             }
         }
     }
@@ -228,6 +236,19 @@ impl LanguageCoordinator {
             .recover_poison("LanguageCoordinator::resolve_base");
 
         base_map.get(language_id).cloned()
+    }
+
+    fn deprecated_alias_events(&self) -> Vec<LanguageEvent> {
+        let warnings = self
+            .deprecated_alias_warnings
+            .read()
+            .recover_poison("LanguageCoordinator::deprecated_alias_events");
+
+        warnings
+            .iter()
+            .cloned()
+            .map(|message| LanguageEvent::show_message(LanguageLogLevel::Warning, message))
+            .collect()
     }
 
     /// ADR-0005: Try candidate directly, then with config-based base fallback.
@@ -1482,6 +1503,37 @@ mod tests {
             result,
             Some("markdown".to_string()),
             "qmd should also resolve to markdown via base"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_surfaces_deprecated_aliases_to_client() {
+        let coordinator = LanguageCoordinator::new();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings {
+                aliases: Some(vec!["rmd".to_string(), "qmd".to_string()]),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            summary.events.iter().any(|event| matches!(
+                event,
+                LanguageEvent::ShowMessage { level, message }
+                    if *level == LanguageLogLevel::Warning
+                        && message.contains("deprecated 'aliases' field")
+                        && message.contains("Use 'base' on derived languages instead")
+            )),
+            "load_settings should emit a client-visible migration warning for deprecated aliases"
         );
     }
 

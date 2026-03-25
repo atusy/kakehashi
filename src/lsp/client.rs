@@ -142,6 +142,16 @@ impl<'a> ClientNotifier<'a> {
                     };
                     self.client.log_message(message_type, message.clone()).await;
                 }
+                LanguageEvent::ShowMessage { level, message } => {
+                    let message_type = match level {
+                        LanguageLogLevel::Error => MessageType::ERROR,
+                        LanguageLogLevel::Warning => MessageType::WARNING,
+                        LanguageLogLevel::Info => MessageType::INFO,
+                    };
+                    self.client
+                        .show_message(message_type, message.clone())
+                        .await;
+                }
                 LanguageEvent::SemanticTokensRefresh { language_id } => {
                     // Only send refresh if client supports it (LSP @since 3.16.0 compliance).
                     // Check MUST be before tokio::spawn - can't `continue` from async block.
