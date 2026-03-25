@@ -36,7 +36,7 @@ pub(crate) struct LanguageCoordinator {
     /// Example: "rmd" → "markdown" (when rmd has `base = "markdown"`)
     base_map: RwLock<HashMap<String, String>>,
     derived_languages: RwLock<HashSet<String>>,
-    deprecated_alias_warnings: RwLock<Vec<String>>,
+    config_warnings: RwLock<Vec<String>>,
 }
 
 impl Default for LanguageCoordinator {
@@ -55,7 +55,7 @@ impl LanguageCoordinator {
             parser_loader: RwLock::new(ParserLoader::new()),
             base_map: RwLock::new(HashMap::new()),
             derived_languages: RwLock::new(HashSet::new()),
-            deprecated_alias_warnings: RwLock::new(Vec::new()),
+            config_warnings: RwLock::new(Vec::new()),
         }
     }
 
@@ -91,7 +91,7 @@ impl LanguageCoordinator {
             .partition(|(_, config)| config.base.is_none());
 
         let mut summary = LanguageLoadSummary::default();
-        summary.events.extend(self.deprecated_alias_events());
+        summary.events.extend(self.config_warning_events());
         let search_paths = self.config_store.search_paths();
 
         // Pass 1: Load all languages WITHOUT base (normal path)
@@ -217,13 +217,13 @@ impl LanguageCoordinator {
             .base_map
             .write()
             .recover_poison("LanguageCoordinator::build_base_map");
-        let mut deprecated_alias_warnings = self
-            .deprecated_alias_warnings
+        let mut config_warnings = self
+            .config_warnings
             .write()
-            .recover_poison("LanguageCoordinator::build_base_map(deprecated_alias_warnings)");
+            .recover_poison("LanguageCoordinator::build_base_map(config_warnings)");
 
         base_map.clear();
-        deprecated_alias_warnings.clear();
+        config_warnings.clear();
 
         for (lang_name, config) in languages {
             if let Some(base) = &config.base {
@@ -234,7 +234,7 @@ impl LanguageCoordinator {
                         lang_name, base
                     );
                     log::warn!(target: "kakehashi::config", "{message}");
-                    deprecated_alias_warnings.push(message);
+                    config_warnings.push(message);
                 } else {
                     base_map.insert(lang_name.clone(), base.clone());
                     log::debug!(
@@ -259,7 +259,7 @@ impl LanguageCoordinator {
                     lang_name, example_alias, lang_name
                 );
                 log::warn!(target: "kakehashi::config", "{message}");
-                deprecated_alias_warnings.push(message);
+                config_warnings.push(message);
             }
         }
     }
@@ -277,11 +277,11 @@ impl LanguageCoordinator {
         base_map.get(language_id).cloned()
     }
 
-    fn deprecated_alias_events(&self) -> Vec<LanguageEvent> {
+    fn config_warning_events(&self) -> Vec<LanguageEvent> {
         let warnings = self
-            .deprecated_alias_warnings
+            .config_warnings
             .read()
-            .recover_poison("LanguageCoordinator::deprecated_alias_events");
+            .recover_poison("LanguageCoordinator::config_warning_events");
 
         warnings
             .iter()

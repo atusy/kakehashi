@@ -129,6 +129,7 @@ impl<'a> ClientNotifier<'a> {
     ///
     /// This processes events emitted by `LanguageCoordinator` operations:
     /// - `Log` events are sent as log messages to the client
+    /// - `ShowMessage` events are surfaced to the user via window/showMessage
     /// - `SemanticTokensRefresh` events trigger workspace/semanticTokens/refresh
     ///   (only if client declared support via capabilities)
     pub(crate) async fn log_language_events(&self, events: &[LanguageEvent]) {

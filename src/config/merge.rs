@@ -105,16 +105,8 @@ pub(crate) fn resolve_base_configs(
             let resolved = match settings.base.as_deref() {
                 // No base → keep as-is
                 None => settings.clone(),
-                // Self-reference → keep as-is with warning
-                Some(base_name) if base_name == name => {
-                    log::warn!(
-                        target: "kakehashi::config",
-                        "Language '{}' has base='{}' (self-reference). \
-                         The base field will be ignored; the language's own config is preserved.",
-                        name, base_name
-                    );
-                    settings.clone()
-                }
+                // Self-reference → keep as-is (coordinator surfaces the warning)
+                Some(base_name) if base_name == name => settings.clone(),
                 // Normal base → inherit parser/queries/bridge from base
                 Some(base_name) => {
                     let base_config = languages.get(base_name).cloned().unwrap_or_default();
