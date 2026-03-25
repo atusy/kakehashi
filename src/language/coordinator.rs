@@ -370,7 +370,11 @@ impl LanguageCoordinator {
                     );
                     log::warn!(target: "kakehashi::config", "{message}");
                     config_warnings.push(message);
-                } else if config.parser.is_some() {
+                } else if config.parser.is_some()
+                    && languages
+                        .get(base)
+                        .is_none_or(|base_config| config.parser != base_config.parser)
+                {
                     log::debug!(
                         target: "kakehashi::language_detection",
                         "Skipping base fallback for '{}' because it defines its own parser",
@@ -1140,6 +1144,8 @@ fn truncate_preview(pattern: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::expand::make_env;
+    use crate::config::settings::RawWorkspaceSettings;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1832,6 +1838,50 @@ mod tests {
             result.is_none(),
             "injection language with its own parser should not fall back to its base language"
         );
+    }
+
+    #[test]
+    fn test_inherited_parser_preserves_base_fallback_after_try_from_settings() {
+        let coordinator = LanguageCoordinator::new();
+
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings {
+                parser: Some("/opt/parsers/markdown.so".to_string()),
+                ..Default::default()
+            },
+        );
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let settings = RawWorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+        let settings =
+            crate::config::WorkspaceSettings::try_from_settings(&settings, None, make_env(&[]))
+                .expect("settings should resolve inherited parser");
+
+        coordinator.build_base_map(&settings.languages);
+
+        let result = coordinator.resolve_injection_language("rmd", "");
+        assert!(
+            result.is_some(),
+            "derived language that only inherits parser should still fall back to base"
+        );
+
+        let (resolved, _) = result.unwrap();
+        assert_eq!(resolved, "markdown");
     }
 
     #[test]
