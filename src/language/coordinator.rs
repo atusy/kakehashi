@@ -324,6 +324,12 @@ impl LanguageCoordinator {
                     );
                     log::warn!(target: "kakehashi::config", "{message}");
                     config_warnings.push(message);
+                } else if config.parser.is_some() {
+                    log::debug!(
+                        target: "kakehashi::language_detection",
+                        "Skipping base fallback for '{}' because it defines its own parser",
+                        lang_name
+                    );
                 } else {
                     base_map.insert(lang_name.clone(), base.clone());
                     log::debug!(
@@ -1727,6 +1733,58 @@ mod tests {
             result,
             Some("rmd".to_string()),
             "Direct languageId should be preferred over base"
+        );
+    }
+
+    #[test]
+    fn test_base_resolution_skips_base_fallback_for_custom_parser_languages() {
+        let coordinator = LanguageCoordinator::new();
+
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                parser: Some("/missing/rmd-parser.dylib".to_string()),
+                ..Default::default()
+            },
+        );
+        coordinator.build_base_map(&languages);
+
+        let result = coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd"));
+        assert_eq!(
+            result, None,
+            "language with its own parser should not fall back to its base language"
+        );
+    }
+
+    #[test]
+    fn test_injection_resolution_skips_base_fallback_for_custom_parser_languages() {
+        let coordinator = LanguageCoordinator::new();
+
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                parser: Some("/missing/rmd-parser.dylib".to_string()),
+                ..Default::default()
+            },
+        );
+        coordinator.build_base_map(&languages);
+
+        let result = coordinator.resolve_injection_language("rmd", "");
+        assert!(
+            result.is_none(),
+            "injection language with its own parser should not fall back to its base language"
         );
     }
 
