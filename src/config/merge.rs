@@ -1898,4 +1898,35 @@ mod tests {
         assert_eq!(a.parser, Some("/opt/a.so".to_string()));
         assert!(a.queries.is_some()); // inherited from b
     }
+
+    #[test]
+    fn test_resolve_base_configs_wildcard_self_reference_terminates() {
+        let languages = HashMap::from([
+            (
+                "_".to_string(),
+                LanguageSettings {
+                    base: Some("_".to_string()),
+                    parser: Some("/opt/default.so".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rust".to_string(),
+                LanguageSettings {
+                    base: Some("_".to_string()),
+                    parser: Some("/opt/rust.so".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let languages = resolve_base_configs(&languages);
+
+        // _ self-reference: chain is just ["_"], no infinite loop
+        let wildcard = &languages["_"];
+        assert_eq!(wildcard.parser, Some("/opt/default.so".to_string()));
+        // rust -> _: chain is ["rust", "_"], rust's parser wins
+        let rust = &languages["rust"];
+        assert_eq!(rust.parser, Some("/opt/rust.so".to_string()));
+    }
 }
