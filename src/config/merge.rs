@@ -104,6 +104,17 @@ pub(crate) fn resolve_base_configs(languages: &mut HashMap<String, LanguageSetti
         .collect();
 
     for (derived_name, base_name) in derived_pairs {
+        // Skip self-references: preserve the language's own config
+        if derived_name == base_name {
+            log::warn!(
+                target: "kakehashi::config",
+                "Language '{}' has base='{}' (self-reference). \
+                 The base field will be ignored; the language's own config is preserved.",
+                derived_name, base_name
+            );
+            continue;
+        }
+
         // Look up base's config (or default if not explicitly configured)
         let base_config = languages.get(&base_name).cloned().unwrap_or_default();
 
@@ -1707,6 +1718,26 @@ mod tests {
         assert_eq!(rmd.parser, None);
         assert_eq!(rmd.queries, None);
         assert_eq!(rmd.bridge, None);
+    }
+
+    #[test]
+    fn test_resolve_base_configs_skips_self_reference() {
+        let mut languages = HashMap::from([(
+            "rmd".to_string(),
+            LanguageSettings {
+                base: Some("rmd".to_string()),
+                parser: Some("/opt/rmd.so".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        resolve_base_configs(&mut languages);
+
+        let rmd = &languages["rmd"];
+        // Self-reference should be skipped: original config preserved
+        assert_eq!(rmd.parser, Some("/opt/rmd.so".to_string()));
+        // base field preserved (coordinator handles user-facing warning)
+        assert_eq!(rmd.base, Some("rmd".to_string()));
     }
 
     #[test]

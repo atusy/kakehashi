@@ -120,7 +120,12 @@ impl LanguageCoordinator {
         config: &LanguageSettings,
     ) -> LanguageLoadResult {
         let base_name = match &config.base {
-            Some(name) => name.as_str(),
+            Some(name) if name != derived_name => name.as_str(),
+            Some(_) => {
+                // Self-reference: load as a normal language using its own config
+                let search_paths = self.config_store.search_paths();
+                return self.load_single_language(derived_name, config, &search_paths);
+            }
             None => {
                 return LanguageLoadResult::failure_with(LanguageEvent::log(
                     LanguageLogLevel::Error,
@@ -222,13 +227,23 @@ impl LanguageCoordinator {
 
         for (lang_name, config) in languages {
             if let Some(base) = &config.base {
-                base_map.insert(lang_name.clone(), base.clone());
-                log::debug!(
-                    target: "kakehashi::language_detection",
-                    "Registered base '{}' → '{}'",
-                    lang_name,
-                    base
-                );
+                if lang_name == base {
+                    let message = format!(
+                        "Language '{}' has base='{}' (self-reference). \
+                         The base field will be ignored.",
+                        lang_name, base
+                    );
+                    log::warn!(target: "kakehashi::config", "{message}");
+                    deprecated_alias_warnings.push(message);
+                } else {
+                    base_map.insert(lang_name.clone(), base.clone());
+                    log::debug!(
+                        target: "kakehashi::language_detection",
+                        "Registered base '{}' → '{}'",
+                        lang_name,
+                        base
+                    );
+                }
             }
 
             if config.aliases.is_some() {
@@ -1553,6 +1568,39 @@ mod tests {
                         && message.contains("Use 'base' on derived languages instead")
             )),
             "load_settings should emit a client-visible migration warning for deprecated aliases"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_self_ref_base_surfaces_warning_and_loads_normally() {
+        let coordinator = LanguageCoordinator::new();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("rmd".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        // Should surface a user-visible warning about self-reference
+        assert!(
+            summary.events.iter().any(|event| matches!(
+                event,
+                LanguageEvent::ShowMessage { level, message }
+                    if *level == LanguageLogLevel::Warning
+                        && message.contains("self-reference")
+                        && message.contains("rmd")
+            )),
+            "load_settings should emit a client-visible warning for self-referencing base. Events: {:?}",
+            summary.events
         );
     }
 
