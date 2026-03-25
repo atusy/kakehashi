@@ -103,7 +103,12 @@ impl LanguageCoordinator {
         // Pass 2: For each language WITH base, register base's parser and queries
         // under the derived name
         for (derived_name, config) in &derived_languages {
-            let result = self.load_derived_language(derived_name, config);
+            let base_config = config
+                .base
+                .as_ref()
+                .and_then(|base_name| settings.languages.get(base_name));
+            let result =
+                self.load_derived_language(derived_name, config, base_config, &search_paths);
             summary.record(derived_name, result);
         }
 
@@ -118,12 +123,13 @@ impl LanguageCoordinator {
         &self,
         derived_name: &str,
         config: &LanguageSettings,
+        base_config: Option<&LanguageSettings>,
+        search_paths: &[PathBuf],
     ) -> LanguageLoadResult {
         let base_name = match &config.base {
             Some(name) if name != derived_name => name.as_str(),
             Some(_) => {
                 // Self-reference: load as a normal language using its own config
-                let search_paths = self.config_store.search_paths();
                 return self.load_single_language(derived_name, config, &search_paths);
             }
             None => {
@@ -133,6 +139,10 @@ impl LanguageCoordinator {
                 ));
             }
         };
+
+        if base_config.is_none() && config.parser.is_some() {
+            return self.load_single_language(derived_name, config, search_paths);
+        }
 
         // Ensure base language is loaded (may need dynamic load from search paths)
         if !self.language_registry.contains(base_name) {
@@ -159,26 +169,42 @@ impl LanguageCoordinator {
             }
         };
 
+        if let Some(base_config) = base_config
+            && config.parser != base_config.parser
+        {
+            return self.load_single_language(derived_name, config, search_paths);
+        }
+
         self.language_registry
-            .register(derived_name.to_string(), language);
+            .register(derived_name.to_string(), language.clone());
         self.derived_languages
             .write()
             .recover_poison("LanguageCoordinator::load_derived_language(derived_languages)")
             .insert(derived_name.to_string());
 
-        // Copy queries from base to derived
         let mut events = Vec::new();
-        if let Some(query) = self.query_store.highlight_query(base_name) {
-            self.query_store
-                .insert_highlight_query(derived_name.to_string(), query);
-        }
-        if let Some(query) = self.query_store.locals_query(base_name) {
-            self.query_store
-                .insert_locals_query(derived_name.to_string(), query);
-        }
-        if let Some(query) = self.query_store.injection_query(base_name) {
-            self.query_store
-                .insert_injection_query(derived_name.to_string(), query);
+        if let Some(base_config) = base_config
+            && config.queries != base_config.queries
+        {
+            events.extend(self.load_queries_for_language(
+                derived_name,
+                config,
+                search_paths,
+                &language,
+            ));
+        } else {
+            if let Some(query) = self.query_store.highlight_query(base_name) {
+                self.query_store
+                    .insert_highlight_query(derived_name.to_string(), query);
+            }
+            if let Some(query) = self.query_store.locals_query(base_name) {
+                self.query_store
+                    .insert_locals_query(derived_name.to_string(), query);
+            }
+            if let Some(query) = self.query_store.injection_query(base_name) {
+                self.query_store
+                    .insert_injection_query(derived_name.to_string(), query);
+            }
         }
 
         events.push(LanguageEvent::log(
@@ -999,6 +1025,8 @@ fn truncate_preview(pattern: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_injection_direct_identifier_first() {
@@ -1799,6 +1827,62 @@ mod tests {
         assert!(
             summary.loaded.contains(&"rmd".to_string()),
             "rmd should be recorded as loaded"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_derived_language_uses_effective_queries() {
+        let coordinator = LanguageCoordinator::new();
+
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let base_query =
+            std::sync::Arc::new(tree_sitter::Query::new(&language, "(identifier) @variable").unwrap());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language);
+        coordinator
+            .query_store()
+            .insert_highlight_query("markdown".to_string(), base_query);
+
+        let dir = tempdir().unwrap();
+        let custom_query = dir.path().join("rmd-highlights.scm");
+        fs::write(&custom_query, "(identifier) @function").unwrap();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                queries: Some(vec![crate::config::settings::QueryItem {
+                    path: custom_query.display().to_string(),
+                    kind: Some(crate::config::settings::QueryKind::Highlights),
+                }]),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            summary.loaded.contains(&"rmd".to_string()),
+            "rmd should be recorded as loaded"
+        );
+
+        let rmd_query = coordinator
+            .highlight_query("rmd")
+            .expect("rmd should have a highlight query");
+        assert_eq!(
+            rmd_query.capture_names(),
+            &["function".to_string()],
+            "derived language should use its effective queries instead of copying base queries"
         );
     }
 
