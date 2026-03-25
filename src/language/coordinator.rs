@@ -246,12 +246,17 @@ impl LanguageCoordinator {
                 }
             }
 
-            if config.aliases.is_some() {
+            if let Some(aliases) = &config.aliases {
+                let example_alias = aliases
+                    .iter()
+                    .next()
+                    .map(|a| a.as_str())
+                    .unwrap_or("<derived>");
                 let message = format!(
                     "Language '{}' uses deprecated 'aliases' field. \
                      Use 'base' on derived languages instead. \
-                     Example: [languages.rmd] base = \"{}\"",
-                    lang_name, lang_name
+                     Example: [languages.{}] base = \"{}\"",
+                    lang_name, example_alias, lang_name
                 );
                 log::warn!(target: "kakehashi::config", "{message}");
                 deprecated_alias_warnings.push(message);
