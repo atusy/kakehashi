@@ -10,7 +10,7 @@ use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
 use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use log::debug;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tree_sitter::Language;
@@ -31,10 +31,12 @@ pub(crate) struct LanguageCoordinator {
     filetype_resolver: FiletypeResolver,
     language_registry: LanguageRegistry,
     parser_loader: RwLock<ParserLoader>,
-    /// Maps alias languageId → canonical language name.
-    /// Built from `languages.<name>.aliases` in configuration.
-    /// Example: "rmd" → "markdown", "qmd" → "markdown"
-    alias_map: RwLock<HashMap<String, String>>,
+    /// Maps derived languageId → base language name.
+    /// Built from `languages.<name>.base` in configuration.
+    /// Example: "rmd" → "markdown" (when rmd has `base = "markdown"`)
+    base_map: RwLock<HashMap<String, String>>,
+    derived_languages: RwLock<HashSet<String>>,
+    config_warnings: RwLock<Vec<String>>,
 }
 
 impl Default for LanguageCoordinator {
@@ -51,7 +53,9 @@ impl LanguageCoordinator {
             filetype_resolver: FiletypeResolver::new(),
             language_registry: LanguageRegistry::new(),
             parser_loader: RwLock::new(ParserLoader::new()),
-            alias_map: RwLock::new(HashMap::new()),
+            base_map: RwLock::new(HashMap::new()),
+            derived_languages: RwLock::new(HashSet::new()),
+            config_warnings: RwLock::new(Vec::new()),
         }
     }
 
@@ -73,83 +77,233 @@ impl LanguageCoordinator {
     /// settings updates to configure language support.
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
+        self.clear_derived_languages();
 
-        // Build alias map from language configs
-        self.build_alias_map(&settings.languages);
+        // Build base map from language configs
+        self.build_base_map(&settings.languages);
+
+        // Partition languages into (no-base, has-base) groups.
+        // HashMap iteration order is arbitrary, so explicit partitioning
+        // ensures base languages are loaded before derived ones.
+        let (base_languages, derived_languages): (Vec<_>, Vec<_>) = settings
+            .languages
+            .iter()
+            .partition(|(_, config)| config.base.is_none());
 
         let mut summary = LanguageLoadSummary::default();
+        summary.events.extend(self.config_warning_events());
         let search_paths = self.config_store.search_paths();
-        for (lang_name, config) in &settings.languages {
+
+        // Pass 1: Load all languages WITHOUT base (normal path)
+        for (lang_name, config) in &base_languages {
             let result = self.load_single_language(lang_name, config, &search_paths);
             summary.record(lang_name, result);
         }
+
+        // Pass 2: For each language WITH base, register base's parser and queries
+        // under the derived name
+        for (derived_name, config) in &derived_languages {
+            let result = self.load_derived_language(derived_name, config);
+            summary.record(derived_name, result);
+        }
+
         summary
     }
 
-    /// Build the alias → canonical language map from configuration.
+    /// Load a derived language by copying parser and queries from its base.
     ///
-    /// For each language with `aliases = ["a", "b"]`, maps "a" → language_name
-    /// and "b" → language_name. This enables editors sending languageId "rmd"
-    /// to use the "markdown" parser configuration.
-    fn build_alias_map(&self, languages: &HashMap<String, LanguageSettings>) {
-        let mut alias_map = self
-            .alias_map
-            .write()
-            .recover_poison("LanguageCoordinator::build_alias_map");
+    /// The base's parser is loaded first (if not already available), then
+    /// registered under the derived name. Queries are similarly copied.
+    fn load_derived_language(
+        &self,
+        derived_name: &str,
+        config: &LanguageSettings,
+    ) -> LanguageLoadResult {
+        let base_name = match &config.base {
+            Some(name) if name != derived_name => name.as_str(),
+            Some(_) => {
+                // Self-reference: load as a normal language using its own config
+                let search_paths = self.config_store.search_paths();
+                return self.load_single_language(derived_name, config, &search_paths);
+            }
+            None => {
+                return LanguageLoadResult::failure_with(LanguageEvent::log(
+                    LanguageLogLevel::Error,
+                    format!("load_derived_language called for '{derived_name}' without base"),
+                ));
+            }
+        };
 
-        alias_map.clear();
+        // Ensure base language is loaded (may need dynamic load from search paths)
+        if !self.language_registry.contains(base_name) {
+            let base_result = self.try_load_language_by_id(base_name);
+            if !base_result.success {
+                return LanguageLoadResult::failure_with(LanguageEvent::log(
+                    LanguageLogLevel::Error,
+                    format!(
+                        "Cannot load derived language '{derived_name}': \
+                         base language '{base_name}' not found"
+                    ),
+                ));
+            }
+        }
+
+        // Get the base's Language object and register under derived name
+        let language = match self.language_registry.get(base_name) {
+            Some(lang) => lang,
+            None => {
+                return LanguageLoadResult::failure_with(LanguageEvent::log(
+                    LanguageLogLevel::Error,
+                    format!("Base language '{base_name}' was loaded but not found in registry"),
+                ));
+            }
+        };
+
+        self.language_registry
+            .register(derived_name.to_string(), language);
+        self.derived_languages
+            .write()
+            .recover_poison("LanguageCoordinator::load_derived_language(derived_languages)")
+            .insert(derived_name.to_string());
+
+        // Copy queries from base to derived
+        let mut events = Vec::new();
+        if let Some(query) = self.query_store.highlight_query(base_name) {
+            self.query_store
+                .insert_highlight_query(derived_name.to_string(), query);
+        }
+        if let Some(query) = self.query_store.locals_query(base_name) {
+            self.query_store
+                .insert_locals_query(derived_name.to_string(), query);
+        }
+        if let Some(query) = self.query_store.injection_query(base_name) {
+            self.query_store
+                .insert_injection_query(derived_name.to_string(), query);
+        }
+
+        events.push(LanguageEvent::log(
+            LanguageLogLevel::Info,
+            format!("Derived language '{derived_name}' loaded from base '{base_name}'"),
+        ));
+        if self.has_queries(derived_name) {
+            events.push(LanguageEvent::semantic_tokens_refresh(
+                derived_name.to_string(),
+            ));
+        }
+
+        LanguageLoadResult::success_with(events)
+    }
+
+    fn clear_derived_languages(&self) {
+        let mut derived_languages = self
+            .derived_languages
+            .write()
+            .recover_poison("LanguageCoordinator::clear_derived_languages");
+
+        for language_id in derived_languages.drain() {
+            self.language_registry.unregister(&language_id);
+            self.query_store.remove_queries(&language_id);
+        }
+    }
+
+    /// Build the derived → base language map from configuration.
+    ///
+    /// For each language with `base = "markdown"`, maps derived_name → "markdown".
+    /// This enables editors sending languageId "rmd" to use the "markdown" parser.
+    ///
+    /// Also warns if the deprecated `aliases` field is still in use.
+    fn build_base_map(&self, languages: &HashMap<String, LanguageSettings>) {
+        let mut base_map = self
+            .base_map
+            .write()
+            .recover_poison("LanguageCoordinator::build_base_map");
+        let mut config_warnings = self
+            .config_warnings
+            .write()
+            .recover_poison("LanguageCoordinator::build_base_map(config_warnings)");
+
+        base_map.clear();
+        config_warnings.clear();
 
         for (lang_name, config) in languages {
-            if let Some(aliases) = &config.aliases {
-                for alias in aliases {
-                    if let Some(previous) = alias_map.insert(alias.clone(), lang_name.clone()) {
-                        log::warn!(
-                            target: "kakehashi::language_detection",
-                            "Alias '{}' collision: was '{}', now '{}' (last-wins)",
-                            alias,
-                            previous,
-                            lang_name
-                        );
-                    } else {
-                        log::debug!(
-                            target: "kakehashi::language_detection",
-                            "Registered alias '{}' → '{}'",
-                            alias,
-                            lang_name
-                        );
-                    }
+            if let Some(base) = &config.base {
+                if lang_name == base {
+                    let message = format!(
+                        "Language '{}' has base='{}' (self-reference). \
+                         The base field will be ignored.",
+                        lang_name, base
+                    );
+                    log::warn!(target: "kakehashi::config", "{message}");
+                    config_warnings.push(message);
+                } else {
+                    base_map.insert(lang_name.clone(), base.clone());
+                    log::debug!(
+                        target: "kakehashi::language_detection",
+                        "Registered base '{}' → '{}'",
+                        lang_name,
+                        base
+                    );
                 }
+            }
+
+            if let Some(aliases) = &config.aliases {
+                let example_alias = aliases
+                    .iter()
+                    .next()
+                    .map(|a| a.as_str())
+                    .unwrap_or("<derived>");
+                let message = format!(
+                    "Language '{}' uses deprecated 'aliases' field. \
+                     Use 'base' on derived languages instead. \
+                     Example: [languages.{}] base = \"{}\"",
+                    lang_name, example_alias, lang_name
+                );
+                log::warn!(target: "kakehashi::config", "{message}");
+                config_warnings.push(message);
             }
         }
     }
 
-    /// Resolve a languageId to its canonical language name using the alias map.
+    /// Resolve a derived languageId to its base language name.
     ///
-    /// Returns the canonical name if the input is an alias, otherwise returns None.
-    /// Example: "rmd" → Some("markdown") if markdown has aliases = ["rmd"]
-    fn resolve_alias(&self, language_id: &str) -> Option<String> {
-        let alias_map = self
-            .alias_map
+    /// Returns the base name if the input has a base declaration, otherwise None.
+    /// Example: "rmd" → Some("markdown") if rmd has `base = "markdown"`
+    fn resolve_base(&self, language_id: &str) -> Option<String> {
+        let base_map = self
+            .base_map
             .read()
-            .recover_poison("LanguageCoordinator::resolve_alias");
+            .recover_poison("LanguageCoordinator::resolve_base");
 
-        alias_map.get(language_id).cloned()
+        base_map.get(language_id).cloned()
     }
 
-    /// ADR-0005: Try candidate directly, then with config-based alias.
+    fn config_warning_events(&self) -> Vec<LanguageEvent> {
+        let warnings = self
+            .config_warnings
+            .read()
+            .recover_poison("LanguageCoordinator::config_warning_events");
+
+        warnings
+            .iter()
+            .cloned()
+            .map(|message| LanguageEvent::show_message(LanguageLogLevel::Warning, message))
+            .collect()
+    }
+
+    /// ADR-0005: Try candidate directly, then with config-based base fallback.
     ///
-    /// Returns the language name if a parser is available (either directly or via alias).
+    /// Returns the language name if a parser is available (either directly or via base).
     /// This is applied as a sub-step after each detection method.
-    fn try_with_alias_fallback(&self, candidate: &str) -> Option<String> {
+    fn try_with_base_fallback(&self, candidate: &str) -> Option<String> {
         // Direct match
         if self.has_parser_available(candidate) {
             return Some(candidate.to_string());
         }
-        // Config-based alias
-        if let Some(canonical) = self.resolve_alias(candidate)
-            && self.has_parser_available(&canonical)
+        // Config-based base resolution
+        if let Some(base) = self.resolve_base(candidate)
+            && self.has_parser_available(&base)
         {
-            return Some(canonical);
+            return Some(base);
         }
         None
     }
@@ -438,7 +592,7 @@ impl LanguageCoordinator {
     /// Returns the first language for which a parser is available.
     ///
     /// Priority order (ADR-0005), two stages:
-    /// Each stage follows: detect → alias resolution → availability check
+    /// Each stage follows: detect → base resolution → availability check
     /// 1. LSP languageId (if not "plaintext")
     /// 2. Heuristic detection:
     ///    - Explicit token (for injections, e.g., "py", "js")
@@ -506,11 +660,11 @@ impl LanguageCoordinator {
         // Track last detected candidate without parser for logging
         let mut last_candidate: Option<String> = None;
 
-        // 1. Try languageId (with alias fallback)
+        // 1. Try languageId (with base fallback)
         if let Some(lang_id) = language_id
             && lang_id != "plaintext"
         {
-            if let Some(result) = self.try_with_alias_fallback(lang_id) {
+            if let Some(result) = self.try_with_base_fallback(lang_id) {
                 return (Some(result), "languageId", None);
             }
             last_candidate = Some(lang_id.to_string());
@@ -528,7 +682,7 @@ impl LanguageCoordinator {
         if let Some(tok) = effective_token {
             // First try syntect-based detection (normalizes "py" → "python", etc.)
             if let Some(candidate) = super::heuristic::detect_from_token(tok) {
-                if let Some(result) = self.try_with_alias_fallback(&candidate) {
+                if let Some(result) = self.try_with_base_fallback(&candidate) {
                     let method = if token.is_some() {
                         "token"
                     } else {
@@ -538,10 +692,10 @@ impl LanguageCoordinator {
                 }
                 // Syntect recognized but no parser available - record for logging
                 last_candidate = Some(candidate);
-            } else if let Some(result) = self.try_with_alias_fallback(tok) {
-                // Syntect doesn't recognize the token, try it directly as alias
+            } else if let Some(result) = self.try_with_base_fallback(tok) {
+                // Syntect doesn't recognize the token, try it directly as base
                 // This handles extensions like "jsx", "tsx" that syntect doesn't know
-                // but may be configured as aliases (e.g., "jsx" → "javascript")
+                // but may be configured with base (e.g., jsx has base = "javascript")
                 let method = if token.is_some() {
                     "token"
                 } else {
@@ -549,13 +703,13 @@ impl LanguageCoordinator {
                 };
                 return (Some(result), method, None);
             } else {
-                // Neither syntect nor alias resolved - record raw token for logging
+                // Neither syntect nor base resolved - record raw token for logging
                 last_candidate = Some(tok.to_string());
             }
         }
 
         if let Some(candidate) = super::heuristic::detect_from_first_line(content) {
-            if let Some(result) = self.try_with_alias_fallback(&candidate) {
+            if let Some(result) = self.try_with_base_fallback(&candidate) {
                 return (Some(result), "first-line", None);
             }
             last_candidate = Some(candidate);
@@ -576,8 +730,8 @@ impl LanguageCoordinator {
     /// 2. Syntect token normalization (py -> python, js -> javascript)
     /// 3. First-line detection (shebang, mode line)
     ///
-    /// Config-based alias resolution (rmd -> markdown) is applied as a sub-step
-    /// after each detection method via `try_load_with_alias`.
+    /// Config-based base resolution (rmd -> markdown) is applied as a sub-step
+    /// after each detection method via `try_load_with_base`.
     ///
     /// Visibility: pub(crate) - called by analysis layer (semantic.rs) for
     /// nested language injection support.
@@ -595,11 +749,11 @@ impl LanguageCoordinator {
 
         // 1. Try direct identifier first (skip "plaintext")
         if identifier != "plaintext"
-            && let Some(found) = self.try_load_with_alias(identifier)
+            && let Some(found) = self.try_load_with_base(identifier)
         {
             log::debug!(
                 target: "kakehashi::language_detection",
-                "Resolved injection '{}' -> '{}' via identifier (direct or alias)",
+                "Resolved injection '{}' -> '{}' via identifier (direct or base)",
                 identifier, found.0
             );
             return Some(found);
@@ -607,11 +761,11 @@ impl LanguageCoordinator {
 
         // 2. Try syntect token normalization (handles py -> python, js -> javascript, etc.)
         if let Some(normalized) = super::heuristic::detect_from_token(identifier)
-            && let Some(found) = self.try_load_with_alias(&normalized)
+            && let Some(found) = self.try_load_with_base(&normalized)
         {
             log::debug!(
                 target: "kakehashi::language_detection",
-                "Resolved injection '{}' -> '{}' via syntect token (direct or alias)",
+                "Resolved injection '{}' -> '{}' via syntect token (direct or base)",
                 identifier, found.0
             );
             return Some(found);
@@ -619,11 +773,11 @@ impl LanguageCoordinator {
 
         // 3. Try first-line detection (shebang, mode line)
         if let Some(first_line_lang) = super::heuristic::detect_from_first_line(content)
-            && let Some(found) = self.try_load_with_alias(&first_line_lang)
+            && let Some(found) = self.try_load_with_base(&first_line_lang)
         {
             log::debug!(
                 target: "kakehashi::language_detection",
-                "Resolved injection '{}' -> '{}' via first-line detection (direct or alias)",
+                "Resolved injection '{}' -> '{}' via first-line detection (direct or base)",
                 identifier, found.0
             );
             return Some(found);
@@ -637,19 +791,19 @@ impl LanguageCoordinator {
         None
     }
 
-    /// Try to load a language directly, then via config alias.
+    /// Try to load a language directly, then via config base resolution.
     ///
     /// Returns `(resolved_name, load_result)` on success, or `None` if
-    /// neither direct load nor alias resolution succeeded.
-    fn try_load_with_alias(&self, candidate: &str) -> Option<(String, LanguageLoadResult)> {
+    /// neither direct load nor base resolution succeeded.
+    fn try_load_with_base(&self, candidate: &str) -> Option<(String, LanguageLoadResult)> {
         let result = self.ensure_language_loaded(candidate);
         if result.success {
             return Some((candidate.to_string(), result));
         }
-        if let Some(canonical) = self.resolve_alias(candidate) {
-            let result = self.ensure_language_loaded(&canonical);
+        if let Some(base) = self.resolve_base(candidate) {
+            let result = self.ensure_language_loaded(&base);
             if result.success {
-                return Some((canonical, result));
+                return Some((base, result));
             }
         }
         None
@@ -879,11 +1033,11 @@ mod tests {
     }
 
     #[test]
-    fn test_injection_unknown_alias_returns_none() {
+    fn test_injection_unknown_base_returns_none() {
         let coordinator = LanguageCoordinator::new();
         // No parsers registered
 
-        // Unknown alias with no parser should return None
+        // Unknown language with no parser should return None
         let result = coordinator.resolve_injection_language("unknown_lang", "");
         assert!(result.is_none());
 
@@ -893,8 +1047,8 @@ mod tests {
     }
 
     #[test]
-    fn test_injection_uses_config_alias() {
-        // When config has "rmd" → "markdown" alias, injection resolution should use it
+    fn test_injection_uses_config_base() {
+        // When config has rmd.base = "markdown", injection resolution should use it
         let coordinator = LanguageCoordinator::new();
 
         // Register "markdown" parser (not "rmd")
@@ -902,40 +1056,40 @@ mod tests {
             .language_registry_for_parallel()
             .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
 
-        // Build config-based alias map: "rmd" → "markdown"
+        // Build base map: "rmd" → "markdown"
         let mut languages = HashMap::new();
         languages.insert(
-            "markdown".to_string(),
+            "rmd".to_string(),
             crate::config::settings::LanguageSettings {
-                aliases: Some(vec!["rmd".to_string()]),
+                base: Some("markdown".to_string()),
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages);
+        coordinator.build_base_map(&languages);
 
-        // Injection "rmd" should resolve to "markdown" via config alias
+        // Injection "rmd" should resolve to "markdown" via base
         let result = coordinator.resolve_injection_language("rmd", "");
-        assert!(result.is_some(), "rmd should resolve via config alias");
+        assert!(result.is_some(), "rmd should resolve via config base");
         let (resolved, load_result) = result.unwrap();
         assert_eq!(resolved, "markdown");
         assert!(load_result.success);
     }
 
     #[test]
-    fn test_injection_prefers_direct_over_alias() {
+    fn test_injection_prefers_direct_over_base() {
         let coordinator = LanguageCoordinator::new();
         // Register both "js" and "javascript" as separate parsers
         let registry = coordinator.language_registry_for_parallel();
         registry.register("js".to_string(), tree_sitter_rust::LANGUAGE.into());
         registry.register("javascript".to_string(), tree_sitter_rust::LANGUAGE.into());
 
-        // "js" should resolve to "js" (direct), not "javascript" (alias)
+        // "js" should resolve to "js" (direct), not "javascript" (base)
         let result = coordinator.resolve_injection_language("js", "");
         assert!(result.is_some());
         let (resolved, _) = result.unwrap();
         assert_eq!(
             resolved, "js",
-            "Direct identifier should be preferred over alias"
+            "Direct identifier should be preferred over base"
         );
     }
 
@@ -964,8 +1118,8 @@ mod tests {
     }
 
     #[test]
-    fn test_injection_first_line_with_alias() {
-        // First-line detection should also try config alias resolution
+    fn test_injection_first_line_with_base() {
+        // First-line detection should also try config base resolution
         let coordinator = LanguageCoordinator::new();
 
         // Register "bash" parser
@@ -1343,11 +1497,11 @@ mod tests {
         );
     }
 
-    // Tests for alias resolution
+    // Tests for base resolution
 
     #[test]
-    fn test_alias_resolution_detects_canonical_language() {
-        // When languageId "rmd" is aliased to "markdown" and markdown parser exists,
+    fn test_base_resolution_detects_canonical_language() {
+        // When languageId "rmd" has base = "markdown" and markdown parser exists,
         // detect_language should return "markdown"
         let coordinator = LanguageCoordinator::new();
 
@@ -1356,7 +1510,45 @@ mod tests {
             .language_registry_for_parallel()
             .register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
 
-        // Build alias map: "rmd" → "markdown"
+        // Build base map: "rmd" → "markdown", "qmd" → "markdown"
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        languages.insert(
+            "qmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        coordinator.build_base_map(&languages);
+
+        // Detection with languageId "rmd" should resolve to "markdown"
+        let result = coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd"));
+        assert_eq!(
+            result,
+            Some("markdown".to_string()),
+            "rmd should resolve to markdown via base"
+        );
+
+        // Also test qmd
+        let result = coordinator.detect_language("/path/to/file.qmd", "", None, Some("qmd"));
+        assert_eq!(
+            result,
+            Some("markdown".to_string()),
+            "qmd should also resolve to markdown via base"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_surfaces_deprecated_aliases_to_client() {
+        let coordinator = LanguageCoordinator::new();
+
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
@@ -1365,28 +1557,61 @@ mod tests {
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages);
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
 
-        // Detection with languageId "rmd" should resolve to "markdown"
-        let result = coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd"));
-        assert_eq!(
-            result,
-            Some("markdown".to_string()),
-            "rmd should resolve to markdown via alias"
-        );
+        let summary = coordinator.load_settings(&settings);
 
-        // Also test qmd
-        let result = coordinator.detect_language("/path/to/file.qmd", "", None, Some("qmd"));
-        assert_eq!(
-            result,
-            Some("markdown".to_string()),
-            "qmd should also resolve to markdown via alias"
+        assert!(
+            summary.events.iter().any(|event| matches!(
+                event,
+                LanguageEvent::ShowMessage { level, message }
+                    if *level == LanguageLogLevel::Warning
+                        && message.contains("deprecated 'aliases' field")
+                        && message.contains("Use 'base' on derived languages instead")
+            )),
+            "load_settings should emit a client-visible migration warning for deprecated aliases"
         );
     }
 
     #[test]
-    fn test_alias_resolution_prefers_direct_language() {
-        // When languageId directly has a parser, use it (don't check alias)
+    fn test_load_settings_self_ref_base_surfaces_warning_and_loads_normally() {
+        let coordinator = LanguageCoordinator::new();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("rmd".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        // Should surface a user-visible warning about self-reference
+        assert!(
+            summary.events.iter().any(|event| matches!(
+                event,
+                LanguageEvent::ShowMessage { level, message }
+                    if *level == LanguageLogLevel::Warning
+                        && message.contains("self-reference")
+                        && message.contains("rmd")
+            )),
+            "load_settings should emit a client-visible warning for self-referencing base. Events: {:?}",
+            summary.events
+        );
+    }
+
+    #[test]
+    fn test_base_resolution_prefers_direct_language() {
+        // When languageId directly has a parser, use it (don't check base)
         let coordinator = LanguageCoordinator::new();
 
         // Register both "rmd" and "markdown" as separate parsers
@@ -1394,103 +1619,103 @@ mod tests {
         registry.register("rmd".to_string(), tree_sitter_rust::LANGUAGE.into());
         registry.register("markdown".to_string(), tree_sitter_rust::LANGUAGE.into());
 
-        // Build alias map: "rmd" → "markdown"
+        // Build base map: "rmd" → "markdown"
         let mut languages = HashMap::new();
         languages.insert(
-            "markdown".to_string(),
+            "rmd".to_string(),
             crate::config::settings::LanguageSettings {
-                aliases: Some(vec!["rmd".to_string()]),
+                base: Some("markdown".to_string()),
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages);
+        coordinator.build_base_map(&languages);
 
-        // Detection with languageId "rmd" should use "rmd" directly (not alias)
+        // Detection with languageId "rmd" should use "rmd" directly (not base)
         let result = coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd"));
         assert_eq!(
             result,
             Some("rmd".to_string()),
-            "Direct languageId should be preferred over alias"
+            "Direct languageId should be preferred over base"
         );
     }
 
     #[test]
-    fn test_alias_resolution_skipped_when_no_parser_for_canonical() {
-        // When alias points to a language without a parser, continue fallback
+    fn test_base_resolution_skipped_when_no_parser_for_base() {
+        // When base points to a language without a parser, continue fallback
         let coordinator = LanguageCoordinator::new();
 
-        // Don't register any parser - only the alias mapping
+        // Don't register any parser - only the base mapping
 
-        // Build alias map: "rmd" → "markdown"
+        // Build base map: "rmd" → "markdown"
         let mut languages = HashMap::new();
         languages.insert(
-            "markdown".to_string(),
+            "rmd".to_string(),
             crate::config::settings::LanguageSettings {
-                aliases: Some(vec!["rmd".to_string()]),
+                base: Some("markdown".to_string()),
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages);
+        coordinator.build_base_map(&languages);
 
-        // Detection should return None (alias found but no parser for "markdown")
+        // Detection should return None (base found but no parser for "markdown")
         let result = coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd"));
         assert_eq!(
             result, None,
-            "Should return None when alias target has no parser"
+            "Should return None when base target has no parser"
         );
     }
 
     #[test]
-    fn test_alias_map_cleared_on_reload() {
-        // Verify that alias map is cleared and rebuilt when settings change
+    fn test_base_map_cleared_on_reload() {
+        // Verify that base map is cleared and rebuilt when settings change
         let coordinator = LanguageCoordinator::new();
 
         // First config: "rmd" → "markdown"
         let mut languages1 = HashMap::new();
         languages1.insert(
-            "markdown".to_string(),
+            "rmd".to_string(),
             crate::config::settings::LanguageSettings {
-                aliases: Some(vec!["rmd".to_string()]),
+                base: Some("markdown".to_string()),
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages1);
+        coordinator.build_base_map(&languages1);
 
         // Verify first mapping
         assert_eq!(
-            coordinator.resolve_alias("rmd"),
+            coordinator.resolve_base("rmd"),
             Some("markdown".to_string())
         );
 
-        // Second config: no aliases for markdown, "jsx" → "javascript"
+        // Second config: no base for rmd, "jsx" → "javascript"
         let mut languages2 = HashMap::new();
         languages2.insert(
-            "javascript".to_string(),
+            "jsx".to_string(),
             crate::config::settings::LanguageSettings {
-                aliases: Some(vec!["jsx".to_string()]),
+                base: Some("javascript".to_string()),
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages2);
+        coordinator.build_base_map(&languages2);
 
-        // Old alias should be gone
+        // Old base should be gone
         assert_eq!(
-            coordinator.resolve_alias("rmd"),
+            coordinator.resolve_base("rmd"),
             None,
-            "Old alias should be cleared after rebuild"
+            "Old base should be cleared after rebuild"
         );
-        // New alias should work
+        // New base should work
         assert_eq!(
-            coordinator.resolve_alias("jsx"),
+            coordinator.resolve_base("jsx"),
             Some("javascript".to_string())
         );
     }
 
-    // ADR-0005: Alias resolution as sub-step for extension detection
+    // ADR-0005: Base resolution as sub-step for extension detection
 
     #[test]
-    fn test_extension_detection_with_alias_fallback() {
-        // When extension is "jsx" and alias maps "jsx" → "javascript",
+    fn test_extension_detection_with_base_fallback() {
+        // When extension is "jsx" and base maps "jsx" → "javascript",
         // detect_language should return "javascript"
         let coordinator = LanguageCoordinator::new();
 
@@ -1499,16 +1724,16 @@ mod tests {
             .language_registry_for_parallel()
             .register("javascript".to_string(), tree_sitter_rust::LANGUAGE.into());
 
-        // Build alias map: "jsx" → "javascript"
+        // Build base map: "jsx" → "javascript"
         let mut languages = HashMap::new();
         languages.insert(
-            "javascript".to_string(),
+            "jsx".to_string(),
             crate::config::settings::LanguageSettings {
-                aliases: Some(vec!["jsx".to_string(), "mjs".to_string()]),
+                base: Some("javascript".to_string()),
                 ..Default::default()
             },
         );
-        coordinator.build_alias_map(&languages);
+        coordinator.build_base_map(&languages);
 
         // No languageId, no shebang, extension = jsx
         let result = coordinator.detect_language("/path/to/component.jsx", "", None, None);
@@ -1516,7 +1741,153 @@ mod tests {
         assert_eq!(
             result,
             Some("javascript".to_string()),
-            "jsx extension should resolve to javascript via alias"
+            "jsx extension should resolve to javascript via base"
+        );
+    }
+
+    // Tests for two-pass loading of base languages
+
+    #[test]
+    fn test_load_settings_registers_derived_language_from_base() {
+        // When rmd has base = "markdown" and markdown parser is loadable,
+        // load_settings should register "rmd" with markdown's parser
+        let coordinator = LanguageCoordinator::new();
+
+        // Manually register "markdown" parser (simulating it being loaded)
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query =
+            std::sync::Arc::new(tree_sitter::Query::new(&lang, "(identifier) @variable").unwrap());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), lang);
+        coordinator
+            .query_store()
+            .insert_highlight_query("markdown".to_string(), query.clone());
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        // rmd should now have a parser available
+        assert!(
+            coordinator.has_parser_available("rmd"),
+            "rmd should have parser from base markdown"
+        );
+
+        // rmd should also have the highlight query
+        assert!(
+            coordinator.has_queries("rmd"),
+            "rmd should have queries from base markdown"
+        );
+
+        // rmd should be recorded as loaded
+        assert!(
+            summary.loaded.contains(&"rmd".to_string()),
+            "rmd should be recorded as loaded"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_clears_removed_derived_language_registrations() {
+        let coordinator = LanguageCoordinator::new();
+
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query =
+            std::sync::Arc::new(tree_sitter::Query::new(&lang, "(identifier) @variable").unwrap());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), lang);
+        coordinator
+            .query_store()
+            .insert_highlight_query("markdown".to_string(), query);
+
+        let mut initial_languages = HashMap::new();
+        initial_languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        initial_languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: initial_languages,
+            ..Default::default()
+        });
+        assert!(coordinator.has_parser_available("rmd"), "precondition");
+        assert!(coordinator.has_queries("rmd"), "precondition");
+
+        let mut reloaded_languages = HashMap::new();
+        reloaded_languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: reloaded_languages,
+            ..Default::default()
+        });
+
+        assert!(
+            !coordinator.has_parser_available("rmd"),
+            "removed derived language should be unregistered on reload"
+        );
+        assert!(
+            !coordinator.has_queries("rmd"),
+            "removed derived language queries should be cleared on reload"
+        );
+        assert_eq!(
+            coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd")),
+            None,
+            "removed derived language should no longer resolve"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_derived_with_missing_base_fails() {
+        // When rmd has base = "nonexistent" and no parser for it exists,
+        // it should fail gracefully
+        let coordinator = LanguageCoordinator::new();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("nonexistent".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            !coordinator.has_parser_available("rmd"),
+            "rmd should not have parser when base is missing"
+        );
+        assert!(
+            !summary.loaded.contains(&"rmd".to_string()),
+            "rmd should not be recorded as loaded"
         );
     }
 

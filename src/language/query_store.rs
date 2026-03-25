@@ -29,6 +29,21 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
+    pub(crate) fn remove_queries(&self, lang_name: &str) {
+        self.highlight_queries
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .remove(lang_name);
+        self.locals_queries
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .remove(lang_name);
+        self.injection_queries
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .remove(lang_name);
+    }
+
     pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.highlight_queries
             .read()
@@ -55,6 +70,14 @@ impl QueryStore {
                 lang_name
             ))
             .insert(lang_name, query);
+    }
+
+    pub(crate) fn locals_query(&self, lang_name: &str) -> Option<Arc<Query>> {
+        self.locals_queries
+            .read()
+            .recover_poison(format_args!("QueryStore::locals_query({})", lang_name))
+            .get(lang_name)
+            .cloned()
     }
 
     pub(crate) fn insert_injection_query(&self, lang_name: String, query: Arc<Query>) {

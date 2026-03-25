@@ -1,0 +1,269 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RawWorkspaceSettings",
+  "type": "object",
+  "properties": {
+    "searchPaths": {
+      "description": "Directories to search for Tree-sitter parser libraries and query files.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "languages": {
+      "description": "Per-language configuration (parser paths, queries, bridge filters, base inheritance).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/LanguageSettings"
+      },
+      "default": {}
+    },
+    "captureMappings": {
+      "description": "Custom mappings from Tree-sitter capture names to semantic token types.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/QueryTypeMappings"
+      },
+      "default": {}
+    },
+    "autoInstall": {
+      "description": "Whether to automatically install missing parsers and queries.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "languageServers": {
+      "description": "Language servers for bridging LSP requests to injection regions.\nMap of server name to server configuration.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "$ref": "#/$defs/BridgeServerConfig"
+      }
+    }
+  },
+  "$defs": {
+    "LanguageSettings": {
+      "description": "Per-language Tree-sitter configuration.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "description": "Base language to inherit parser, queries, and bridge config from.\nWhen set, the derived language uses the base's config entirely.\nE.g., `base = \"markdown\"` on `rmd` means rmd uses markdown's config.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parser": {
+          "description": "Path to the parser library (.so/.dylib/.dll)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queries": {
+          "description": "Omit to inherit from wildcard/defaults. Use an empty array `[]` to explicitly clear queries.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/QueryItem"
+          }
+        },
+        "bridge": {
+          "description": "Omit to bridge all configured languages (default). Use an empty object `{}` to disable bridging. Use `{ \"python\": { \"enabled\": true } }` to bridge specific languages.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/BridgeLanguageConfig"
+          }
+        },
+        "aliases": {
+          "description": "Deprecated: use `base` on the derived language instead.\nAlternative languageId values that should use this parser.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "QueryItem": {
+      "description": "A single query file configuration entry.\n\nUsed in the unified `queries` array to specify query files with optional type.\nExample: `{ path = \"./highlights.scm\", kind = \"highlights\" }`",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Path to the query file (required)",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Query type: highlights, locals, or injections (optional - inferred from filename if omitted)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QueryKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "QueryKind": {
+      "description": "Query type for tree-sitter query files.\n\nUsed in the unified `queries` field to specify what kind of query a file contains.\nWhen not specified, the kind is inferred from the filename pattern.",
+      "oneOf": [
+        {
+          "description": "Syntax highlighting queries",
+          "type": "string",
+          "const": "highlights"
+        },
+        {
+          "description": "Local definitions/references queries (for scope analysis)",
+          "type": "string",
+          "const": "locals"
+        },
+        {
+          "description": "Language injection queries (for embedded languages)",
+          "type": "string",
+          "const": "injections"
+        }
+      ]
+    },
+    "BridgeLanguageConfig": {
+      "description": "Configuration for a single bridged language within a host filetype.\n\nUsed in the bridge filter map to control whether a specific injection language\nshould be bridged and how results are aggregated.\nExample: `{ python = { enabled = true, aggregation = { \"_\" = { priorities = [\"pyright\"] } } } }`.\n\nOmitted fields inherit from the wildcard `_` entry (see ADR-0011).",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Whether bridging is enabled for this language.\nOmit to inherit from wildcard (defaults to true).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "aggregation": {
+          "description": "Per-method aggregation config. Key = LSP method name or \"_\" for default.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/AggregationConfig"
+          }
+        }
+      }
+    },
+    "AggregationConfig": {
+      "description": "Per-method aggregation configuration.\n\nControls how results from multiple bridge servers are aggregated for a\nspecific LSP method. The `priorities` list determines server preference\norder — the first server in the list that returns a non-empty result wins.\nEmpty priorities degrades to first-win (arrival-order) behavior.",
+      "type": "object",
+      "properties": {
+        "priorities": {
+          "description": "Server names in priority order (highest first). Empty = pure first-win behavior.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "strategy": {
+          "description": "Aggregation strategy override. Omit to use the handler default.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AggregationStrategy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "maxFanOut": {
+          "description": "Maximum number of servers to fan out to.\n\n- `None` / absent: no limit (fan out to all matching servers)\n- `0`: disable fan-out entirely\n- Positive: cap the number of concurrent server requests\n- Negative: treated as no limit (silently ignored via `usize::try_from`)",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        }
+      }
+    },
+    "AggregationStrategy": {
+      "description": "Aggregation strategy for combining results from multiple bridge servers.\n\n- `Preferred`: Use the first non-empty response (priority-ordered).\n  This is the default for most LSP methods.\n- `Concatenated`: Collect and merge responses from all servers.\n  This is the default for `textDocument/diagnostic`.",
+      "type": "string",
+      "enum": [
+        "preferred",
+        "concatenated"
+      ]
+    },
+    "QueryTypeMappings": {
+      "description": "Custom mappings from Tree-sitter capture names to semantic token types, per query kind.",
+      "type": "object",
+      "properties": {
+        "highlights": {
+          "description": "Capture mappings for highlights queries.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "locals": {
+          "description": "Capture mappings for locals queries.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "folds": {
+          "description": "Capture mappings for folds queries.\nReserved for future folding range support — populated and merged but not yet consumed by analysis.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      }
+    },
+    "BridgeServerConfig": {
+      "description": "Configuration for a bridge language server.\n\nThis is used to configure external language servers (like rust-analyzer, pyright)\nthat kakehashi can redirect requests to for injection regions.",
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "description": "Command array: first element is the program, rest are arguments\ne.g., [\"rust-analyzer\"] or [\"pyright-langserver\", \"--stdio\"]",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "languages": {
+          "description": "Languages this server handles (e.g., [\"rust\"], [\"python\"])",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "initializationOptions": {
+          "description": "Optional initialization options to pass to the server during initialize"
+        }
+      },
+      "required": [
+        "cmd",
+        "languages"
+      ]
+    }
+  }
+}

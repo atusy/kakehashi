@@ -8,12 +8,14 @@ expression: result
   ],
   "languages": {
     "lua": {
+      "base": null,
       "parser": "/base/lua.so",
       "queries": null,
       "bridge": null,
       "aliases": null
     },
     "python": {
+      "base": null,
       "parser": "/base/python.so",
       "queries": [
         {
@@ -32,6 +34,7 @@ expression: result
       ]
     },
     "rust": {
+      "base": null,
       "parser": "/overlay/rust.so",
       "queries": null,
       "bridge": null,

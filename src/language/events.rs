@@ -5,6 +5,10 @@ pub enum LanguageEvent {
         level: LanguageLogLevel,
         message: String,
     },
+    ShowMessage {
+        level: LanguageLogLevel,
+        message: String,
+    },
     SemanticTokensRefresh {
         language_id: String,
     },
@@ -13,6 +17,13 @@ pub enum LanguageEvent {
 impl LanguageEvent {
     pub fn log(level: LanguageLogLevel, message: impl Into<String>) -> Self {
         Self::Log {
+            level,
+            message: message.into(),
+        }
+    }
+
+    pub fn show_message(level: LanguageLogLevel, message: impl Into<String>) -> Self {
+        Self::ShowMessage {
             level,
             message: message.into(),
         }
