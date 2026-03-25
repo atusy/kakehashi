@@ -89,7 +89,8 @@ impl LanguageCoordinator {
             .languages
             .iter()
             .partition(|(_, config)| config.base.is_none());
-        let derived_languages = Self::sort_derived_languages(&settings.languages, derived_languages);
+        let derived_languages =
+            Self::sort_derived_languages(&settings.languages, derived_languages);
 
         let mut summary = LanguageLoadSummary::default();
         summary.events.extend(self.config_warning_events());
@@ -131,7 +132,7 @@ impl LanguageCoordinator {
             Some(name) if name != derived_name => name.as_str(),
             Some(_) => {
                 // Self-reference: load as a normal language using its own config
-                return self.load_single_language(derived_name, config, search_paths);
+                return self.load_standalone_derived_language(derived_name, config, search_paths);
             }
             None => {
                 return LanguageLoadResult::failure_with(LanguageEvent::log(
@@ -142,7 +143,7 @@ impl LanguageCoordinator {
         };
 
         if base_config.is_none() && config.parser.is_some() {
-            return self.load_single_language(derived_name, config, search_paths);
+            return self.load_standalone_derived_language(derived_name, config, search_paths);
         }
 
         // Ensure base language is loaded (may need dynamic load from search paths)
@@ -173,7 +174,7 @@ impl LanguageCoordinator {
         if let Some(base_config) = base_config
             && config.parser != base_config.parser
         {
-            return self.load_single_language(derived_name, config, search_paths);
+            return self.load_standalone_derived_language(derived_name, config, search_paths);
         }
 
         self.language_registry
@@ -221,6 +222,24 @@ impl LanguageCoordinator {
         LanguageLoadResult::success_with(events)
     }
 
+    fn load_standalone_derived_language(
+        &self,
+        derived_name: &str,
+        config: &LanguageSettings,
+        search_paths: &[PathBuf],
+    ) -> LanguageLoadResult {
+        let result = self.load_single_language(derived_name, config, search_paths);
+        if result.success {
+            self.derived_languages
+                .write()
+                .recover_poison(
+                    "LanguageCoordinator::load_standalone_derived_language(derived_languages)",
+                )
+                .insert(derived_name.to_string());
+        }
+        result
+    }
+
     fn clear_derived_languages(&self) {
         let mut derived_languages = self
             .derived_languages
@@ -266,9 +285,9 @@ impl LanguageCoordinator {
             .and_then(|config| config.base.as_deref())
             .filter(|base_name| *base_name != language_id)
             .and_then(|base_name| {
-                languages.get(base_name).map(|_| {
-                    1 + Self::derived_load_depth_with_seen(base_name, languages, seen)
-                })
+                languages
+                    .get(base_name)
+                    .map(|_| 1 + Self::derived_load_depth_with_seen(base_name, languages, seen))
             })
             .unwrap_or(0);
 
@@ -1879,8 +1898,9 @@ mod tests {
         let coordinator = LanguageCoordinator::new();
 
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        let base_query =
-            std::sync::Arc::new(tree_sitter::Query::new(&language, "(identifier) @variable").unwrap());
+        let base_query = std::sync::Arc::new(
+            tree_sitter::Query::new(&language, "(identifier) @variable").unwrap(),
+        );
         coordinator
             .language_registry_for_parallel()
             .register("markdown".to_string(), language);
@@ -1985,6 +2005,69 @@ mod tests {
             coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd")),
             None,
             "removed derived language should no longer resolve"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_clears_removed_standalone_loaded_derived_language() {
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let parser_path = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join(format!("markdown.{}", std::env::consts::DLL_EXTENSION));
+        if !parser_path.exists() {
+            eprintln!(
+                "skipping test_load_settings_clears_removed_standalone_loaded_derived_language: parser '{}' does not exist",
+                parser_path.display()
+            );
+            return;
+        }
+
+        let query_dir = tempdir().unwrap();
+        let highlight_path = query_dir.path().join("markdown-highlights.scm");
+        fs::write(&highlight_path, "(paragraph) @function").unwrap();
+
+        let mut initial_languages = HashMap::new();
+        initial_languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("missing-markdown".to_string()),
+                parser: Some(parser_path.to_string_lossy().into_owned()),
+                queries: Some(vec![crate::config::settings::QueryItem {
+                    path: highlight_path.to_string_lossy().into_owned(),
+                    kind: Some(crate::config::settings::QueryKind::Highlights),
+                }]),
+                ..Default::default()
+            },
+        );
+        let summary = coordinator.load_settings(&WorkspaceSettings {
+            languages: initial_languages,
+            ..Default::default()
+        });
+        assert!(
+            coordinator.has_parser_available("markdown"),
+            "precondition: expected custom parser to load, summary={summary:?}"
+        );
+        assert!(
+            coordinator.has_queries("markdown"),
+            "precondition: expected custom queries to load, summary={summary:?}"
+        );
+
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: HashMap::new(),
+            ..Default::default()
+        });
+
+        assert!(
+            !coordinator.has_parser_available("markdown"),
+            "removed standalone-loaded derived language should be unregistered on reload"
+        );
+        assert!(
+            !coordinator.has_queries("markdown"),
+            "removed standalone-loaded derived language should have queries cleared on reload"
         );
     }
 
