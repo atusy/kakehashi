@@ -1,6 +1,6 @@
 use super::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Resolve a key from a map with wildcard fallback and merging.
 ///
@@ -91,47 +91,73 @@ pub(crate) fn merge_language_settings(
     }
 }
 
-/// Resolve base configs: for each language with `base = Some(name)`,
-/// replace derived language's parser/queries/bridge with the base's raw config.
+/// Resolve base configs: for each language, walk the `base` chain and merge
+/// configs using most-specific-wins semantics (ADR-0024 Phase 2).
 ///
-/// Single-level only: if the base itself has a `base`, a warning is logged
-/// but chain walking is not performed.
+/// The chain is built from most-specific (leaf) to least-specific (root),
+/// then merged root-to-leaf so that more specific entries override less
+/// specific ones at the field level.
+///
+/// Chain termination:
+/// - Self-reference (`base == own name`): normal termination
+/// - `None` base: chain stops (outer `_` wildcard is handled separately)
+/// - Circular reference: terminated at cycle point with a warning
 pub(crate) fn resolve_base_configs(
     languages: &HashMap<String, LanguageSettings>,
 ) -> HashMap<String, LanguageSettings> {
     languages
-        .iter()
-        .map(|(name, settings)| {
-            let resolved = match settings.base.as_deref() {
-                // No base → keep as-is
-                None => settings.clone(),
-                // Self-reference → keep as-is (coordinator surfaces the warning)
-                Some(base_name) if base_name == name => settings.clone(),
-                // Normal base → inherit parser/queries/bridge from base
-                Some(base_name) => {
-                    let base_config = languages.get(base_name).cloned().unwrap_or_default();
-
-                    if base_config.base.is_some() {
-                        log::warn!(
-                            target: "kakehashi::config",
-                            "Language '{}' has base='{}', which itself has a base. \
-                             Multi-level base chains are not yet supported; \
-                             '{}' will inherit '{}' config as-is.",
-                            name, base_name, name, base_name
-                        );
-                    }
-
-                    LanguageSettings {
-                        parser: base_config.parser,
-                        queries: base_config.queries,
-                        bridge: base_config.bridge,
-                        ..settings.clone()
-                    }
-                }
-            };
+        .keys()
+        .map(|name| {
+            let chain = build_base_chain(name, languages);
+            let resolved = chain
+                .iter()
+                .rev()
+                .map(|n| languages.get(n).cloned().unwrap_or_default())
+                .reduce(|acc, settings| merge_language_settings(&acc, &settings))
+                .unwrap_or_default();
             (name.clone(), resolved)
         })
         .collect()
+}
+
+/// Build the base chain for a language, from most-specific to least-specific.
+///
+/// Example: for `rmd` with `base = "markdown"`, and `markdown` with no base,
+/// the chain is `["rmd", "markdown"]`.
+fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -> Vec<String> {
+    let mut chain = vec![name.to_string()];
+    let mut visited = HashSet::new();
+    visited.insert(name.to_string());
+
+    let mut current = name.to_string();
+    loop {
+        let base_name = match languages.get(&current).and_then(|s| s.base.as_deref()) {
+            None => break,
+            Some(b) => b.to_string(),
+        };
+
+        // Self-reference terminates the chain
+        if base_name == current {
+            break;
+        }
+
+        // Cycle detection
+        if !visited.insert(base_name.clone()) {
+            log::warn!(
+                target: "kakehashi::config",
+                "Circular base chain detected for language '{}': \
+                 '{}' points to '{}' which was already visited. \
+                 Wildcard defaults will not be applied.",
+                name, current, base_name
+            );
+            break;
+        }
+
+        chain.push(base_name.clone());
+        current = base_name;
+    }
+
+    chain
 }
 
 /// Deep merge two optional bridge HashMaps.
@@ -1652,7 +1678,7 @@ mod tests {
     // Tests for resolve_base_configs
 
     #[test]
-    fn test_resolve_base_configs_replaces_derived_settings() {
+    fn test_resolve_base_configs_most_specific_wins() {
         let languages = HashMap::from([
             (
                 "markdown".to_string(),
@@ -1687,8 +1713,9 @@ mod tests {
         let rmd = &languages["rmd"];
         // base field preserved
         assert_eq!(rmd.base, Some("markdown".to_string()));
-        // parser/queries/bridge replaced with markdown's
-        assert_eq!(rmd.parser, Some("/opt/markdown.so".to_string()));
+        // rmd's own parser wins (most-specific-wins)
+        assert_eq!(rmd.parser, Some("/opt/rmd.so".to_string()));
+        // queries/bridge inherited from markdown (rmd didn't set them)
         assert!(rmd.queries.is_some());
         assert!(rmd.bridge.is_some());
         // markdown unchanged
@@ -1697,7 +1724,38 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_base_configs_with_missing_base_uses_defaults() {
+    fn test_resolve_base_configs_inherits_from_base_when_none() {
+        let languages = HashMap::from([
+            (
+                "markdown".to_string(),
+                LanguageSettings {
+                    parser: Some("/opt/markdown.so".to_string()),
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/opt/markdown/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rmd".to_string(),
+                LanguageSettings {
+                    base: Some("markdown".to_string()),
+                    // no parser, no queries — should inherit from markdown
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let languages = resolve_base_configs(&languages);
+
+        let rmd = &languages["rmd"];
+        assert_eq!(rmd.parser, Some("/opt/markdown.so".to_string()));
+        assert!(rmd.queries.is_some());
+    }
+
+    #[test]
+    fn test_resolve_base_configs_with_missing_base_preserves_own() {
         let languages = HashMap::from([(
             "rmd".to_string(),
             LanguageSettings {
@@ -1710,8 +1768,8 @@ mod tests {
         let languages = resolve_base_configs(&languages);
 
         let rmd = &languages["rmd"];
-        // base's config is default (None for all fields)
-        assert_eq!(rmd.parser, None);
+        // markdown not in map → defaults (all None), rmd's own parser wins
+        assert_eq!(rmd.parser, Some("/opt/rmd.so".to_string()));
         assert_eq!(rmd.queries, None);
         assert_eq!(rmd.bridge, None);
     }
@@ -1748,5 +1806,96 @@ mod tests {
 
         let resolved = resolve_base_configs(&languages);
         assert_eq!(resolved, languages);
+    }
+
+    #[test]
+    fn test_resolve_base_configs_multi_level_chain() {
+        let languages = HashMap::from([
+            (
+                "markdown".to_string(),
+                LanguageSettings {
+                    parser: Some("/opt/markdown.so".to_string()),
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/opt/markdown/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    bridge: Some(HashMap::from([(
+                        "python".to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "markdown_custom".to_string(),
+                LanguageSettings {
+                    base: Some("markdown".to_string()),
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/opt/custom/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rmd".to_string(),
+                LanguageSettings {
+                    base: Some("markdown_custom".to_string()),
+                    // rmd → markdown_custom → markdown
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let languages = resolve_base_configs(&languages);
+
+        let rmd = &languages["rmd"];
+        // parser from markdown (root of chain)
+        assert_eq!(rmd.parser, Some("/opt/markdown.so".to_string()));
+        // queries from markdown_custom (more specific than markdown)
+        assert_eq!(
+            rmd.queries.as_ref().unwrap()[0].path,
+            "/opt/custom/highlights.scm"
+        );
+        // bridge from markdown
+        assert!(rmd.bridge.is_some());
+    }
+
+    #[test]
+    fn test_resolve_base_configs_circular_reference() {
+        let languages = HashMap::from([
+            (
+                "a".to_string(),
+                LanguageSettings {
+                    base: Some("b".to_string()),
+                    parser: Some("/opt/a.so".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                LanguageSettings {
+                    base: Some("a".to_string()),
+                    queries: Some(vec![settings::QueryItem {
+                        path: "/opt/b/highlights.scm".to_string(),
+                        kind: Some(settings::QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let languages = resolve_base_configs(&languages);
+
+        // Both languages should still resolve (cycle is broken, not a panic)
+        assert!(languages.contains_key("a"));
+        assert!(languages.contains_key("b"));
+        // a's chain: [a, b] (stops at cycle), merged: b then a
+        let a = &languages["a"];
+        assert_eq!(a.parser, Some("/opt/a.so".to_string()));
+        assert!(a.queries.is_some()); // inherited from b
     }
 }
