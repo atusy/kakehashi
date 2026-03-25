@@ -89,6 +89,7 @@ impl LanguageCoordinator {
             .languages
             .iter()
             .partition(|(_, config)| config.base.is_none());
+        let derived_languages = Self::sort_derived_languages(&settings.languages, derived_languages);
 
         let mut summary = LanguageLoadSummary::default();
         summary.events.extend(self.config_warning_events());
@@ -230,6 +231,49 @@ impl LanguageCoordinator {
             self.language_registry.unregister(&language_id);
             self.query_store.remove_queries(&language_id);
         }
+    }
+
+    fn sort_derived_languages<'a>(
+        languages: &'a HashMap<String, LanguageSettings>,
+        mut derived_languages: Vec<(&'a String, &'a LanguageSettings)>,
+    ) -> Vec<(&'a String, &'a LanguageSettings)> {
+        derived_languages.sort_by(|(left_name, _), (right_name, _)| {
+            Self::derived_load_depth(left_name, languages)
+                .cmp(&Self::derived_load_depth(right_name, languages))
+                .then_with(|| left_name.cmp(right_name))
+        });
+        derived_languages
+    }
+
+    fn derived_load_depth(
+        language_id: &str,
+        languages: &HashMap<String, LanguageSettings>,
+    ) -> usize {
+        Self::derived_load_depth_with_seen(language_id, languages, &mut HashSet::new())
+    }
+
+    fn derived_load_depth_with_seen(
+        language_id: &str,
+        languages: &HashMap<String, LanguageSettings>,
+        seen: &mut HashSet<String>,
+    ) -> usize {
+        if !seen.insert(language_id.to_string()) {
+            return 0;
+        }
+
+        let depth = languages
+            .get(language_id)
+            .and_then(|config| config.base.as_deref())
+            .filter(|base_name| *base_name != language_id)
+            .and_then(|base_name| {
+                languages.get(base_name).map(|_| {
+                    1 + Self::derived_load_depth_with_seen(base_name, languages, seen)
+                })
+            })
+            .unwrap_or(0);
+
+        seen.remove(language_id);
+        depth
     }
 
     /// Build the derived → base language map from configuration.
@@ -1942,6 +1986,49 @@ mod tests {
             None,
             "removed derived language should no longer resolve"
         );
+    }
+
+    #[test]
+    fn test_sort_derived_languages_orders_multi_level_base_chains() {
+        let languages = HashMap::from([
+            (
+                "markdown".to_string(),
+                crate::config::settings::LanguageSettings::default(),
+            ),
+            (
+                "markdown_custom".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("markdown".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "rmd".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("markdown_custom".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let derived_languages = vec![
+            (
+                languages.get_key_value("rmd").unwrap().0,
+                languages.get_key_value("rmd").unwrap().1,
+            ),
+            (
+                languages.get_key_value("markdown_custom").unwrap().0,
+                languages.get_key_value("markdown_custom").unwrap().1,
+            ),
+        ];
+
+        let sorted = LanguageCoordinator::sort_derived_languages(&languages, derived_languages);
+        let sorted_names: Vec<_> = sorted
+            .into_iter()
+            .map(|(language_id, _)| language_id.as_str())
+            .collect();
+
+        assert_eq!(sorted_names, vec!["markdown_custom", "rmd"]);
     }
 
     #[test]
