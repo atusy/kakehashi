@@ -363,13 +363,11 @@ impl LanguageCoordinator {
         for (lang_name, config) in languages {
             if let Some(base) = &config.base {
                 if lang_name == base {
-                    let message = format!(
-                        "Language '{}' has base='{}' (self-reference). \
-                         The base field will be ignored.",
+                    log::debug!(
+                        target: "kakehashi::config",
+                        "Language '{}' has base='{}' (self-reference, chain terminator)",
                         lang_name, base
                     );
-                    log::warn!(target: "kakehashi::config", "{message}");
-                    config_warnings.push(message);
                 } else if config.parser.is_some()
                     && languages
                         .get(base)
@@ -1726,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_settings_self_ref_base_surfaces_warning_and_loads_normally() {
+    fn test_load_settings_self_ref_base_no_warning() {
         let coordinator = LanguageCoordinator::new();
 
         let mut languages = HashMap::new();
@@ -1744,16 +1742,14 @@ mod tests {
 
         let summary = coordinator.load_settings(&settings);
 
-        // Should surface a user-visible warning about self-reference
+        // Self-referential base is a normal chain terminator, not a warning
         assert!(
-            summary.events.iter().any(|event| matches!(
+            !summary.events.iter().any(|event| matches!(
                 event,
-                LanguageEvent::ShowMessage { level, message }
+                LanguageEvent::ShowMessage { level, .. }
                     if *level == LanguageLogLevel::Warning
-                        && message.contains("self-reference")
-                        && message.contains("rmd")
             )),
-            "load_settings should emit a client-visible warning for self-referencing base. Events: {:?}",
+            "load_settings should not emit warnings for self-referencing base. Events: {:?}",
             summary.events
         );
     }
