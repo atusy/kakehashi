@@ -96,46 +96,50 @@ pub(crate) fn merge_language_settings(
 ///
 /// Single-level only: if the base itself has a `base`, a warning is logged
 /// but chain walking is not performed.
-pub(crate) fn resolve_base_configs(languages: &mut HashMap<String, LanguageSettings>) {
-    // Collect derived → base pairs first to avoid borrowing conflicts
-    let derived_pairs: Vec<(String, String)> = languages
+pub(crate) fn resolve_base_configs(
+    languages: &HashMap<String, LanguageSettings>,
+) -> HashMap<String, LanguageSettings> {
+    languages
         .iter()
-        .filter_map(|(name, settings)| settings.base.as_ref().map(|b| (name.clone(), b.clone())))
-        .collect();
+        .map(|(name, settings)| {
+            let resolved = match settings.base.as_deref() {
+                // No base → keep as-is
+                None => settings.clone(),
+                // Self-reference → keep as-is with warning
+                Some(base_name) if base_name == name => {
+                    log::warn!(
+                        target: "kakehashi::config",
+                        "Language '{}' has base='{}' (self-reference). \
+                         The base field will be ignored; the language's own config is preserved.",
+                        name, base_name
+                    );
+                    settings.clone()
+                }
+                // Normal base → inherit parser/queries/bridge from base
+                Some(base_name) => {
+                    let base_config = languages.get(base_name).cloned().unwrap_or_default();
 
-    for (derived_name, base_name) in derived_pairs {
-        // Skip self-references: preserve the language's own config
-        if derived_name == base_name {
-            log::warn!(
-                target: "kakehashi::config",
-                "Language '{}' has base='{}' (self-reference). \
-                 The base field will be ignored; the language's own config is preserved.",
-                derived_name, base_name
-            );
-            continue;
-        }
+                    if base_config.base.is_some() {
+                        log::warn!(
+                            target: "kakehashi::config",
+                            "Language '{}' has base='{}', which itself has a base. \
+                             Multi-level base chains are not yet supported; \
+                             '{}' will inherit '{}' config as-is.",
+                            name, base_name, name, base_name
+                        );
+                    }
 
-        // Look up base's config (or default if not explicitly configured)
-        let base_config = languages.get(&base_name).cloned().unwrap_or_default();
-
-        // Warn if the base itself has a base (multi-level chain not yet supported)
-        if base_config.base.is_some() {
-            log::warn!(
-                target: "kakehashi::config",
-                "Language '{}' has base='{}', which itself has a base. \
-                 Multi-level base chains are not yet supported; \
-                 '{}' will inherit '{}' config as-is.",
-                derived_name, base_name, derived_name, base_name
-            );
-        }
-
-        // Replace derived's config fields with base's, preserving the `base` field
-        if let Some(derived) = languages.get_mut(&derived_name) {
-            derived.parser = base_config.parser;
-            derived.queries = base_config.queries;
-            derived.bridge = base_config.bridge;
-        }
-    }
+                    LanguageSettings {
+                        parser: base_config.parser,
+                        queries: base_config.queries,
+                        bridge: base_config.bridge,
+                        ..settings.clone()
+                    }
+                }
+            };
+            (name.clone(), resolved)
+        })
+        .collect()
 }
 
 /// Deep merge two optional bridge HashMaps.
@@ -1657,7 +1661,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_configs_replaces_derived_settings() {
-        let mut languages = HashMap::from([
+        let languages = HashMap::from([
             (
                 "markdown".to_string(),
                 LanguageSettings {
@@ -1686,7 +1690,7 @@ mod tests {
             ),
         ]);
 
-        resolve_base_configs(&mut languages);
+        let languages = resolve_base_configs(&languages);
 
         let rmd = &languages["rmd"];
         // base field preserved
@@ -1702,7 +1706,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_configs_with_missing_base_uses_defaults() {
-        let mut languages = HashMap::from([(
+        let languages = HashMap::from([(
             "rmd".to_string(),
             LanguageSettings {
                 base: Some("markdown".to_string()),
@@ -1711,7 +1715,7 @@ mod tests {
             },
         )]);
 
-        resolve_base_configs(&mut languages);
+        let languages = resolve_base_configs(&languages);
 
         let rmd = &languages["rmd"];
         // base's config is default (None for all fields)
@@ -1722,7 +1726,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_configs_skips_self_reference() {
-        let mut languages = HashMap::from([(
+        let languages = HashMap::from([(
             "rmd".to_string(),
             LanguageSettings {
                 base: Some("rmd".to_string()),
@@ -1731,7 +1735,7 @@ mod tests {
             },
         )]);
 
-        resolve_base_configs(&mut languages);
+        let languages = resolve_base_configs(&languages);
 
         let rmd = &languages["rmd"];
         // Self-reference should be skipped: original config preserved
@@ -1742,7 +1746,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_configs_no_base_languages_unchanged() {
-        let mut languages = HashMap::from([(
+        let languages = HashMap::from([(
             "rust".to_string(),
             LanguageSettings {
                 parser: Some("/opt/rust.so".to_string()),
@@ -1750,8 +1754,7 @@ mod tests {
             },
         )]);
 
-        let original = languages.clone();
-        resolve_base_configs(&mut languages);
-        assert_eq!(languages, original);
+        let resolved = resolve_base_configs(&languages);
+        assert_eq!(resolved, languages);
     }
 }

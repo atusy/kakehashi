@@ -89,7 +89,7 @@ impl WorkspaceSettings {
         let mut errors = Vec::new();
 
         // Resolve base configs first so expansion only sees effective parser/query paths.
-        merge::resolve_base_configs(&mut ws.languages);
+        ws.languages = merge::resolve_base_configs(&ws.languages);
 
         for p in &mut ws.search_paths {
             match expand::expand_path(p, home, &env_fn) {
