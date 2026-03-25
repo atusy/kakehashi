@@ -105,12 +105,13 @@ impl LanguageCoordinator {
         // Pass 2: For each language WITH base, register base's parser and queries
         // under the derived name
         for (derived_name, config) in &derived_languages {
-            let base_config = config
-                .base
-                .as_ref()
-                .and_then(|base_name| settings.languages.get(base_name));
-            let result =
-                self.load_derived_language(derived_name, config, base_config, &search_paths);
+            let result = self.load_derived_language(
+                derived_name,
+                config,
+                &settings.languages,
+                &search_paths,
+                &mut HashSet::new(),
+            );
             summary.record(derived_name, result);
         }
 
@@ -125,101 +126,146 @@ impl LanguageCoordinator {
         &self,
         derived_name: &str,
         config: &LanguageSettings,
-        base_config: Option<&LanguageSettings>,
+        languages: &HashMap<String, LanguageSettings>,
         search_paths: &[PathBuf],
+        visiting: &mut HashSet<String>,
     ) -> LanguageLoadResult {
-        let base_name = match &config.base {
-            Some(name) if name != derived_name => name.as_str(),
-            Some(_) => {
-                // Self-reference: load as a normal language using its own config
+        let inserted = visiting.insert(derived_name.to_string());
+        let outcome = (|| {
+            let base_name = match &config.base {
+                Some(name) if name != derived_name => name.as_str(),
+                Some(_) => {
+                    // Self-reference: load as a normal language using its own config
+                    return self.load_standalone_derived_language(
+                        derived_name,
+                        config,
+                        search_paths,
+                    );
+                }
+                None => {
+                    return LanguageLoadResult::failure_with(LanguageEvent::log(
+                        LanguageLogLevel::Error,
+                        format!("load_derived_language called for '{derived_name}' without base"),
+                    ));
+                }
+            };
+
+            let base_config = languages.get(base_name);
+
+            if base_config.is_none() && config.parser.is_some() {
                 return self.load_standalone_derived_language(derived_name, config, search_paths);
             }
-            None => {
-                return LanguageLoadResult::failure_with(LanguageEvent::log(
-                    LanguageLogLevel::Error,
-                    format!("load_derived_language called for '{derived_name}' without base"),
-                ));
-            }
-        };
 
-        if base_config.is_none() && config.parser.is_some() {
-            return self.load_standalone_derived_language(derived_name, config, search_paths);
-        }
-
-        // Ensure base language is loaded (may need dynamic load from search paths)
-        if !self.language_registry.contains(base_name) {
-            let base_result = self.try_load_language_by_id(base_name);
-            if !base_result.success {
-                return LanguageLoadResult::failure_with(LanguageEvent::log(
-                    LanguageLogLevel::Error,
-                    format!(
-                        "Cannot load derived language '{derived_name}': \
+            // Ensure base language is loaded (may need dynamic load from search paths)
+            if !self.language_registry.contains(base_name) {
+                let base_result = match base_config {
+                    Some(base_config) if !visiting.contains(base_name) => {
+                        if base_config.base.is_some() {
+                            self.load_derived_language(
+                                base_name,
+                                base_config,
+                                languages,
+                                search_paths,
+                                visiting,
+                            )
+                        } else {
+                            self.load_single_language(base_name, base_config, search_paths)
+                        }
+                    }
+                    Some(_) => LanguageLoadResult::failure_with(LanguageEvent::log(
+                        LanguageLogLevel::Error,
+                        format!(
+                            "Cannot load derived language '{derived_name}': \
+                         base language '{base_name}' is part of a circular chain"
+                        ),
+                    )),
+                    None => self.try_load_language_by_id(base_name),
+                };
+                if !base_result.success {
+                    if config.parser.is_some() {
+                        return self.load_standalone_derived_language(
+                            derived_name,
+                            config,
+                            search_paths,
+                        );
+                    }
+                    return LanguageLoadResult::failure_with(LanguageEvent::log(
+                        LanguageLogLevel::Error,
+                        format!(
+                            "Cannot load derived language '{derived_name}': \
                          base language '{base_name}' not found"
-                    ),
+                        ),
+                    ));
+                }
+            }
+
+            // Get the base's Language object and register under derived name
+            let language = match self.language_registry.get(base_name) {
+                Some(lang) => lang,
+                None => {
+                    return LanguageLoadResult::failure_with(LanguageEvent::log(
+                        LanguageLogLevel::Error,
+                        format!("Base language '{base_name}' was loaded but not found in registry"),
+                    ));
+                }
+            };
+
+            if let Some(base_config) = base_config
+                && config.parser != base_config.parser
+            {
+                return self.load_standalone_derived_language(derived_name, config, search_paths);
+            }
+
+            self.language_registry
+                .register(derived_name.to_string(), language.clone());
+            self.derived_languages
+                .write()
+                .recover_poison("LanguageCoordinator::load_derived_language(derived_languages)")
+                .insert(derived_name.to_string());
+
+            let mut events = Vec::new();
+            if let Some(base_config) = base_config
+                && config.queries != base_config.queries
+            {
+                events.extend(self.load_queries_for_language(
+                    derived_name,
+                    config,
+                    search_paths,
+                    &language,
+                ));
+            } else {
+                if let Some(query) = self.query_store.highlight_query(base_name) {
+                    self.query_store
+                        .insert_highlight_query(derived_name.to_string(), query);
+                }
+                if let Some(query) = self.query_store.locals_query(base_name) {
+                    self.query_store
+                        .insert_locals_query(derived_name.to_string(), query);
+                }
+                if let Some(query) = self.query_store.injection_query(base_name) {
+                    self.query_store
+                        .insert_injection_query(derived_name.to_string(), query);
+                }
+            }
+
+            events.push(LanguageEvent::log(
+                LanguageLogLevel::Info,
+                format!("Derived language '{derived_name}' loaded from base '{base_name}'"),
+            ));
+            if self.has_queries(derived_name) {
+                events.push(LanguageEvent::semantic_tokens_refresh(
+                    derived_name.to_string(),
                 ));
             }
+
+            LanguageLoadResult::success_with(events)
+        })();
+
+        if inserted {
+            visiting.remove(derived_name);
         }
 
-        // Get the base's Language object and register under derived name
-        let language = match self.language_registry.get(base_name) {
-            Some(lang) => lang,
-            None => {
-                return LanguageLoadResult::failure_with(LanguageEvent::log(
-                    LanguageLogLevel::Error,
-                    format!("Base language '{base_name}' was loaded but not found in registry"),
-                ));
-            }
-        };
-
-        if let Some(base_config) = base_config
-            && config.parser != base_config.parser
-        {
-            return self.load_standalone_derived_language(derived_name, config, search_paths);
-        }
-
-        self.language_registry
-            .register(derived_name.to_string(), language.clone());
-        self.derived_languages
-            .write()
-            .recover_poison("LanguageCoordinator::load_derived_language(derived_languages)")
-            .insert(derived_name.to_string());
-
-        let mut events = Vec::new();
-        if let Some(base_config) = base_config
-            && config.queries != base_config.queries
-        {
-            events.extend(self.load_queries_for_language(
-                derived_name,
-                config,
-                search_paths,
-                &language,
-            ));
-        } else {
-            if let Some(query) = self.query_store.highlight_query(base_name) {
-                self.query_store
-                    .insert_highlight_query(derived_name.to_string(), query);
-            }
-            if let Some(query) = self.query_store.locals_query(base_name) {
-                self.query_store
-                    .insert_locals_query(derived_name.to_string(), query);
-            }
-            if let Some(query) = self.query_store.injection_query(base_name) {
-                self.query_store
-                    .insert_injection_query(derived_name.to_string(), query);
-            }
-        }
-
-        events.push(LanguageEvent::log(
-            LanguageLogLevel::Info,
-            format!("Derived language '{derived_name}' loaded from base '{base_name}'"),
-        ));
-        if self.has_queries(derived_name) {
-            events.push(LanguageEvent::semantic_tokens_refresh(
-                derived_name.to_string(),
-            ));
-        }
-
-        LanguageLoadResult::success_with(events)
+        outcome
     }
 
     fn load_standalone_derived_language(
@@ -2005,6 +2051,78 @@ mod tests {
             rmd_query.capture_names(),
             &["function".to_string()],
             "derived language should use its effective queries instead of copying base queries"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_loads_circular_base_chain_from_resolved_config() {
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let parser_path = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
+        if !parser_path.exists() {
+            eprintln!(
+                "skipping test_load_settings_loads_circular_base_chain_from_resolved_config: parser '{}' does not exist",
+                parser_path.display()
+            );
+            return;
+        }
+
+        let query_dir = tempdir().unwrap();
+        let highlight_path = query_dir.path().join("rust-highlights.scm");
+        fs::write(&highlight_path, "(identifier) @variable").unwrap();
+
+        let unresolved_languages = HashMap::from([
+            (
+                "rust".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("derived-rust".to_string()),
+                    parser: Some(parser_path.to_string_lossy().into_owned()),
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: highlight_path.to_string_lossy().into_owned(),
+                        kind: Some(crate::config::settings::QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "derived-rust".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("rust".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = WorkspaceSettings {
+            languages: crate::config::merge::resolve_base_configs(&unresolved_languages),
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            coordinator.has_parser_available("rust"),
+            "rust should load from its resolved parser config, summary={summary:?}"
+        );
+        assert!(
+            coordinator.has_parser_available("derived-rust"),
+            "derived-rust should load from the resolved circular chain, summary={summary:?}"
+        );
+        assert!(
+            coordinator.has_queries("derived-rust"),
+            "derived-rust should inherit effective queries from the resolved circular chain, summary={summary:?}"
+        );
+        assert!(
+            summary.loaded.contains(&"rust".to_string()),
+            "rust should be recorded as loaded, summary={summary:?}"
+        );
+        assert!(
+            summary.loaded.contains(&"derived-rust".to_string()),
+            "derived-rust should be recorded as loaded, summary={summary:?}"
         );
     }
 
