@@ -10,7 +10,7 @@ use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
 use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use log::debug;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tree_sitter::Language;
@@ -35,6 +35,7 @@ pub(crate) struct LanguageCoordinator {
     /// Built from `languages.<name>.base` in configuration.
     /// Example: "rmd" → "markdown" (when rmd has `base = "markdown"`)
     base_map: RwLock<HashMap<String, String>>,
+    derived_languages: RwLock<HashSet<String>>,
     deprecated_alias_warnings: RwLock<Vec<String>>,
 }
 
@@ -53,6 +54,7 @@ impl LanguageCoordinator {
             language_registry: LanguageRegistry::new(),
             parser_loader: RwLock::new(ParserLoader::new()),
             base_map: RwLock::new(HashMap::new()),
+            derived_languages: RwLock::new(HashSet::new()),
             deprecated_alias_warnings: RwLock::new(Vec::new()),
         }
     }
@@ -75,6 +77,7 @@ impl LanguageCoordinator {
     /// settings updates to configure language support.
     pub(crate) fn load_settings(&self, settings: &WorkspaceSettings) -> LanguageLoadSummary {
         self.config_store.update_from_settings(settings);
+        self.clear_derived_languages();
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);
@@ -153,6 +156,10 @@ impl LanguageCoordinator {
 
         self.language_registry
             .register(derived_name.to_string(), language);
+        self.derived_languages
+            .write()
+            .recover_poison("LanguageCoordinator::load_derived_language(derived_languages)")
+            .insert(derived_name.to_string());
 
         // Copy queries from base to derived
         let mut events = Vec::new();
@@ -180,6 +187,18 @@ impl LanguageCoordinator {
         }
 
         LanguageLoadResult::success_with(events)
+    }
+
+    fn clear_derived_languages(&self) {
+        let mut derived_languages = self
+            .derived_languages
+            .write()
+            .recover_poison("LanguageCoordinator::clear_derived_languages");
+
+        for language_id in derived_languages.drain() {
+            self.language_registry.unregister(&language_id);
+            self.query_store.remove_queries(&language_id);
+        }
     }
 
     /// Build the derived → base language map from configuration.
@@ -1727,6 +1746,64 @@ mod tests {
         assert!(
             summary.loaded.contains(&"rmd".to_string()),
             "rmd should be recorded as loaded"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_clears_removed_derived_language_registrations() {
+        let coordinator = LanguageCoordinator::new();
+
+        let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query =
+            std::sync::Arc::new(tree_sitter::Query::new(&lang, "(identifier) @variable").unwrap());
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), lang);
+        coordinator
+            .query_store()
+            .insert_highlight_query("markdown".to_string(), query);
+
+        let mut initial_languages = HashMap::new();
+        initial_languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        initial_languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: initial_languages,
+            ..Default::default()
+        });
+        assert!(coordinator.has_parser_available("rmd"), "precondition");
+        assert!(coordinator.has_queries("rmd"), "precondition");
+
+        let mut reloaded_languages = HashMap::new();
+        reloaded_languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        coordinator.load_settings(&WorkspaceSettings {
+            languages: reloaded_languages,
+            ..Default::default()
+        });
+
+        assert!(
+            !coordinator.has_parser_available("rmd"),
+            "removed derived language should be unregistered on reload"
+        );
+        assert!(
+            !coordinator.has_queries("rmd"),
+            "removed derived language queries should be cleared on reload"
+        );
+        assert_eq!(
+            coordinator.detect_language("/path/to/file.Rmd", "", None, Some("rmd")),
+            None,
+            "removed derived language should no longer resolve"
         );
     }
 

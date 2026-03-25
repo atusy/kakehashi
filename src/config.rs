@@ -88,6 +88,9 @@ impl WorkspaceSettings {
         let mut ws = base_convert(settings);
         let mut errors = Vec::new();
 
+        // Resolve base configs first so expansion only sees effective parser/query paths.
+        merge::resolve_base_configs(&mut ws.languages);
+
         for p in &mut ws.search_paths {
             match expand::expand_path(p, home, &env_fn) {
                 Ok(expanded) => *p = expanded,
@@ -115,9 +118,6 @@ impl WorkspaceSettings {
                 }
             }
         }
-
-        // Resolve base configs: derived languages inherit base's parser/queries/bridge
-        merge::resolve_base_configs(&mut ws.languages);
 
         if errors.is_empty() {
             Ok(ws)
@@ -477,6 +477,42 @@ mod try_from_settings_tests {
         let ws = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap();
         let queries = ws.languages.get("lua").unwrap().queries.as_ref().unwrap();
         assert_eq!(queries[0].path, "/queries/highlights.scm");
+    }
+
+    #[test]
+    fn resolves_base_before_expanding_derived_paths() {
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                parser: Some("/opt/parsers/markdown.so".to_string()),
+                ..Default::default()
+            },
+        );
+        languages.insert(
+            "rmd".to_string(),
+            LanguageSettings {
+                base: Some("markdown".to_string()),
+                parser: Some("$MISSING/rmd.so".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = RawWorkspaceSettings {
+            search_paths: None,
+            languages,
+            capture_mappings: HashMap::new(),
+            auto_install: None,
+            language_servers: None,
+        };
+
+        let env = make_env(&[]);
+        let ws = WorkspaceSettings::try_from_settings(&settings, None, env)
+            .expect("derived parser path should be ignored after base resolution");
+
+        assert_eq!(
+            ws.languages.get("rmd").unwrap().parser.as_deref(),
+            Some("/opt/parsers/markdown.so")
+        );
     }
 
     #[test]

@@ -26,6 +26,11 @@ impl LanguageRegistry {
         self.languages.insert(language_id, language);
     }
 
+    /// Remove a language registration by ID.
+    pub fn unregister(&self, language_id: &str) {
+        self.languages.remove(language_id);
+    }
+
     /// Get a language by ID
     pub fn get(&self, language_id: &str) -> Option<Language> {
         self.languages

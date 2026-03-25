@@ -29,6 +29,21 @@ impl QueryStore {
             .insert(lang_name, query);
     }
 
+    pub(crate) fn remove_queries(&self, lang_name: &str) {
+        self.highlight_queries
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .remove(lang_name);
+        self.locals_queries
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .remove(lang_name);
+        self.injection_queries
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .remove(lang_name);
+    }
+
     pub(crate) fn highlight_query(&self, lang_name: &str) -> Option<Arc<Query>> {
         self.highlight_queries
             .read()
