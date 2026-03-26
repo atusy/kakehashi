@@ -228,9 +228,9 @@ pub fn json_schema() -> schemars::Schema {
 /// Per-language Tree-sitter configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct LanguageSettings {
-    /// Base language to inherit parser, queries, and bridge config from.
-    /// When set, the derived language uses the base's config entirely.
-    /// E.g., `base = "markdown"` on `rmd` means rmd uses markdown's config.
+    /// Base language to inherit unfilled fields from (most-specific-wins).
+    /// E.g., `base = "markdown"` on `rmd` means rmd inherits markdown's
+    /// parser/queries/bridge for fields rmd does not set itself.
     pub base: Option<String>,
     /// Path to the parser library (.so/.dylib/.dll)
     pub parser: Option<String>,

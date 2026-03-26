@@ -72,27 +72,27 @@ Every language config gains an optional `base` field (default: not set, implicit
 | `base` value | Meaning | Typical use |
 |---|---|---|
 | `None` (omitted) | Inherit from `_` | Most languages |
-| `""` (empty string) | **No inheritance** — chain stops here | `_` itself; self-contained languages |
 | `"_"` | Explicitly inherit from `_` | Equivalent to `None`; for clarity |
 | `"markdown"` etc. | Inherit from named language | Derived languages (`rmd`, `qmd`) |
+| Same as own name | **Self-reference** — chain terminates here | `_` itself; self-contained languages |
 
-- **`_` defaults to `base = ""`** — it is the root of all chains and does not inherit from anything. This means `_` is not special-cased; it simply has `base = ""` as its default, and the uniform termination rule is to stop when `base == ""`. Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
+- **`_` defaults to `base = "_"`** (self-reference) — it is the root of all chains and does not inherit from anything. Self-reference is the uniform termination condition: the chain stops when a language's `base` equals its own name. Users may override `_`'s `base` (e.g., `base = "some_language"`), but this can create unexpected inheritance chains.
 
 ### Chain Termination and Error Handling
 
-The **only** termination condition is `base = ""`. When `base` is `None`, the chain does not terminate — it continues by resolving `None` to `"_"`, which itself has `base = ""` by default, terminating the chain there. There is no special case for `_`; it terminates simply because its default `base` is `""`.
+The **primary** termination condition is **self-reference** (`base == own name`). When `base` is `None`, the chain does not terminate — it continues by resolving `None` to `"_"`, which itself has `base = "_"` (self-reference) by default, terminating the chain there. There is no special case for `_`; it terminates simply because its `base` equals its own name.
 
 | Condition | Behavior |
 |---|---|
+| **Self-reference** (`a.base = "a"`) | Normal termination. The chain stops here. This is not an error — it is the standard way to declare a chain root. |
 | **Undefined base language** | Not an error. The chain continues through it toward `_`, and parser/query resolution still searches `searchPaths` using that language's name. This is the normal case for languages discovered via `searchPaths` without explicit config. |
 | **Circular reference** (`a.base = "b"`, `b.base = "a"`) | Detected and terminated at the cycle point. `_` is **not** appended — the language loses wildcard defaults. The misconfiguration is reported to the user. |
-| **Self-reference** (`a.base = "a"`) | Special case of circular reference. Same behavior. |
 
 ### How Phase 2 Subsumes ADR-0011's Outer Wildcard
 
-Base chain resolution (Phase 2) **replaces** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 unconditionally merged `_` with every language. With base chains, `_` is already the root of every default chain (since chains terminate at `base = ""`), producing the same result. Additionally, base chains introduce a new capability: a language can **opt out** of `_` inheritance by setting `base = ""`, which was not possible under ADR-0011's unconditional merge.
+Base chain resolution (Phase 2) **replaces** ADR-0011's outer `languages._` wildcard resolution. Previously, ADR-0011 unconditionally merged `_` with every language. With base chains, `_` is already the root of every default chain (since chains terminate at self-reference), producing the same result. Additionally, base chains introduce a new capability: a language can **opt out** of `_` inheritance by setting `base` to its own name (self-reference), which was not possible under ADR-0011's unconditional merge.
 
-Note: `base = ""` on an intermediate language (e.g., `markdown.base = ""`) intentionally prevents `_` inheritance for all languages derived from it — derived languages respect that decision.
+Note: self-reference on an intermediate language (e.g., `markdown.base = "markdown"`) intentionally prevents `_` inheritance for all languages derived from it — derived languages respect that decision.
 
 ### Nested Wildcard Resolution (Phase 3)
 
@@ -124,7 +124,7 @@ Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged —
 
 ### Removed: `aliases` Field
 
-The `aliases` field is removed from language configuration without a deprecation period — existing `aliases` fields in config are silently ignored. This is a breaking change. The project is in beta (per CLAUDE.md), so this is acceptable.
+The `aliases` field is removed from language configuration with/without a deprecation period. Breaking changes can be introduced without deprecation periods until the product releases v1.0.
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
@@ -150,7 +150,7 @@ base = "L"
 - **Composable**: Multi-level chains enable layered customization (`rmd -> markdown_custom -> markdown -> _`)
 - **Consistent with ADR-0011**: Extends the wildcard pattern naturally — `_` is just the default base
 - **Simpler coordinator**: No reverse alias map to maintain; language names are direct keys
-- **Opt-out capability**: Languages can set `base = ""` to avoid inheriting from `_`, which was not possible under ADR-0011's unconditional merge
+- **Opt-out capability**: Languages can use self-reference (`base = "<own name>"`) to avoid inheriting from `_`, which was not possible under ADR-0011's unconditional merge
 
 ### Negative
 
@@ -162,7 +162,7 @@ base = "L"
 
 ### Neutral
 
-- **`_` is not special-cased**: It terminates the chain via `base = ""` (its default), not via name-based branching. However, `_` remains reserved as a key name (unchanged from ADR-0011)
+- **`_` is not special-cased**: It terminates the chain via self-reference (`base = "_"`), the same mechanism any language can use. However, `_` remains reserved as a key name (unchanged from ADR-0011)
 - **Auto-install chain walking**: When walking the chain, auto-install attempts use the language name at each level (e.g., try to auto-install `rmd`, then `markdown`), which may add latency for deeply nested chains
 
 ## Alternatives Considered
@@ -184,14 +184,14 @@ base = "L"
 - Con: No concrete use case requires it — bridge config already handles the "embedded language" dimension separately
 - Decision: **Rejected**; single inheritance with bridge config covers all current use cases without the complexity
 
-### 3. Name-based chain termination (stop at `_`)
+### 3. Value-based chain termination (`base = ""`)
 
-- Pro: Simpler mental model — `_` is the well-known root, chain stops when it reaches `_`
-- Pro: No need for `base = ""` as a special sentinel value
-- Con: Special-cases `_` by name, making it magical rather than uniform
-- Con: Cannot express "self-contained language with no inheritance" without a separate mechanism
-- Con: Prevents custom root templates — with value-based termination, users can create alternative roots (e.g., `base = ""` on a `_literate` template) that serve as chain terminators alongside `_`
-- Decision: **Rejected**; value-based termination (`base = ""`) is uniform and enables both opt-out and custom root templates
+- Pro: Simple sentinel value — empty string clearly means "stop"
+- Pro: Does not require knowing the language's own name
+- Con: Introduces a magic value (`""`) that is not a valid language name
+- Con: Less discoverable — users must know the empty string convention
+- Con: Conflicts with `None` semantics — both `""` and `None` could mean "no base"
+- Decision: **Rejected** in favor of self-reference termination; self-reference (`base = "<own name>"`) is uniform, self-documenting, and enables both opt-out and custom root templates without magic values
 
 ### 4. Hard error on circular references
 
@@ -230,8 +230,8 @@ base = "markdown_custom"
 
 ```toml
 [languages.my_custom_lang]
-base = ""
+base = "my_custom_lang"
 parser = "/path/to/my_parser.so"
 queries = [{ path = "/path/to/highlights.scm" }]
-# Does NOT inherit from "_" — fully self-contained
+# Self-reference terminates the chain — does NOT inherit from "_"
 ```

@@ -481,6 +481,9 @@ mod try_from_settings_tests {
 
     #[test]
     fn resolves_base_before_expanding_derived_paths() {
+        // With most-specific-wins, derived parser is kept and expanded.
+        // If derived has no parser, it inherits base's parser path,
+        // which must be expandable.
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
@@ -493,7 +496,7 @@ mod try_from_settings_tests {
             "rmd".to_string(),
             LanguageSettings {
                 base: Some("markdown".to_string()),
-                parser: Some("$MISSING/rmd.so".to_string()),
+                // No parser → inherits markdown's parser
                 ..Default::default()
             },
         );
@@ -507,7 +510,7 @@ mod try_from_settings_tests {
 
         let env = make_env(&[]);
         let ws = WorkspaceSettings::try_from_settings(&settings, None, env)
-            .expect("derived parser path should be ignored after base resolution");
+            .expect("inherited parser path should be expanded successfully");
 
         assert_eq!(
             ws.languages.get("rmd").unwrap().parser.as_deref(),
@@ -581,12 +584,16 @@ mod try_from_settings_tests {
     }
 
     #[test]
-    fn base_config_redirect_replaces_derived_settings() {
+    fn base_config_most_specific_wins() {
         let mut languages = HashMap::new();
         languages.insert(
             "markdown".to_string(),
             LanguageSettings {
                 parser: Some("/opt/markdown.so".to_string()),
+                queries: Some(vec![crate::config::settings::QueryItem {
+                    path: "/opt/markdown/highlights.scm".to_string(),
+                    kind: Some(crate::config::settings::QueryKind::Highlights),
+                }]),
                 ..Default::default()
             },
         );
@@ -594,7 +601,7 @@ mod try_from_settings_tests {
             "rmd".to_string(),
             LanguageSettings {
                 base: Some("markdown".to_string()),
-                parser: Some("/should/be/replaced.so".to_string()),
+                parser: Some("/opt/rmd.so".to_string()),
                 ..Default::default()
             },
         );
@@ -605,11 +612,10 @@ mod try_from_settings_tests {
         let env = make_env(&[]);
         let ws = WorkspaceSettings::try_from_settings(&settings, None, env).unwrap();
 
-        // rmd should get markdown's parser, not its own
-        assert_eq!(
-            ws.languages["rmd"].parser.as_deref(),
-            Some("/opt/markdown.so")
-        );
+        // rmd's own parser wins (most-specific-wins)
+        assert_eq!(ws.languages["rmd"].parser.as_deref(), Some("/opt/rmd.so"));
+        // queries inherited from markdown (rmd didn't set them)
+        assert!(ws.languages["rmd"].queries.is_some());
         // base field should be preserved
         assert_eq!(ws.languages["rmd"].base, Some("markdown".to_string()));
     }
