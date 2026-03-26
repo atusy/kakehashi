@@ -23,13 +23,12 @@ fn updated_settings_after_install(
     data_dir: &std::path::Path,
 ) -> (crate::config::RawWorkspaceSettings, WorkspaceSettings) {
     let mut updated_settings = settings.clone();
+    let mut updated_raw_settings = raw_settings.clone();
     let data_dir_str = data_dir.to_string_lossy().to_string();
     if !updated_settings.search_paths.contains(&data_dir_str) {
         updated_settings.search_paths.push(data_dir_str);
+        updated_raw_settings.search_paths = Some(updated_settings.search_paths.clone());
     }
-
-    let mut updated_raw_settings = raw_settings.clone();
-    updated_raw_settings.search_paths = Some(updated_settings.search_paths.clone());
 
     (updated_raw_settings, updated_settings)
 }
@@ -300,6 +299,30 @@ mod tests {
         assert_eq!(
             updated_settings.search_paths,
             vec!["/existing".to_string(), "/installed".to_string()]
+        );
+    }
+
+    #[test]
+    fn reload_after_install_preserves_raw_search_path_template_when_not_modified() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/installed".to_string()],
+            ..Default::default()
+        };
+
+        let (updated_raw, updated_settings) =
+            updated_settings_after_install(&raw_settings, &settings, Path::new("/installed"));
+
+        assert_eq!(
+            updated_raw.search_paths,
+            Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()])
+        );
+        assert_eq!(
+            updated_settings.search_paths,
+            vec!["/installed".to_string()]
         );
     }
 }
