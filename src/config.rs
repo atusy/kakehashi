@@ -75,16 +75,7 @@ fn strip_inherited_languages(
     languages
         .iter()
         .map(|(name, language)| {
-            let inherited = language
-                .base
-                .as_deref()
-                .filter(|base| *base != name.as_str())
-                .and_then(|base| languages.get(base))
-                .or_else(|| {
-                    (name.as_str() != WILDCARD_KEY && language.base.is_none())
-                        .then(|| languages.get(WILDCARD_KEY))
-                        .flatten()
-                });
+            let inherited = inherited_language_settings(languages, name, language);
 
             let stripped = match inherited {
                 Some(base) => strip_inherited_language_settings(base, language),
@@ -94,6 +85,23 @@ fn strip_inherited_languages(
             (name.clone(), stripped)
         })
         .collect()
+}
+
+fn inherited_language_settings<'a>(
+    languages: &'a std::collections::HashMap<String, LanguageSettings>,
+    name: &str,
+    language: &LanguageSettings,
+) -> Option<&'a LanguageSettings> {
+    language
+        .base
+        .as_deref()
+        .filter(|base| *base != name)
+        .and_then(|base| languages.get(base))
+        .or_else(|| {
+            (name != WILDCARD_KEY)
+                .then(|| languages.get(WILDCARD_KEY))
+                .flatten()
+        })
 }
 
 fn strip_inherited_language_settings(
@@ -786,6 +794,83 @@ mod try_from_settings_tests {
         assert_eq!(
             current_raw.languages["r"].bridge, None,
             "implicit wildcard bridge settings should stay inherited in raw settings"
+        );
+
+        let update = RawWorkspaceSettings {
+            languages: HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "python".to_string(),
+                        settings::BridgeLanguageConfig {
+                            aggregation: Some(HashMap::from([(
+                                WILDCARD_KEY.to_string(),
+                                settings::AggregationConfig {
+                                    priorities: Some(vec!["ruff".to_string()]),
+                                    ..Default::default()
+                                },
+                            )])),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let merged = merge::merge_workspace_settings(Some(current_raw), Some(update)).unwrap();
+        let reloaded = WorkspaceSettings::try_from_settings(&merged, None, |_| None).unwrap();
+
+        let priorities = reloaded.languages["r"].bridge.as_ref().unwrap()["python"]
+            .aggregation
+            .as_ref()
+            .unwrap()[WILDCARD_KEY]
+            .priorities
+            .clone();
+        assert_eq!(priorities, Some(vec!["ruff".to_string()]));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_wildcard_inheritance_when_base_is_missing() {
+        let initial = RawWorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::from([(
+                                    WILDCARD_KEY.to_string(),
+                                    settings::AggregationConfig {
+                                        priorities: Some(vec!["pyright".to_string()]),
+                                        ..Default::default()
+                                    },
+                                )])),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        base: Some("missing".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current = WorkspaceSettings::try_from_settings(&initial, None, |_| None).unwrap();
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge, None,
+            "wildcard bridge settings should stay inherited even when the named base is absent"
         );
 
         let update = RawWorkspaceSettings {
