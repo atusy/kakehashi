@@ -49,63 +49,10 @@ fn get_effective_search_paths(client: &mut LspClient) -> Vec<String> {
         .collect()
 }
 
-/// When only --data-dir is set (no env var), searchPaths should resolve to the flag value.
+/// effectiveConfiguration returns raw (pre-expansion) settings, so searchPaths
+/// contains the `${KAKEHASHI_DATA_DIR}` template regardless of env/flag state.
 #[test]
-fn test_search_paths_with_data_dir_flag_only() {
-    let mut client = LspClient::builder()
-        .arg("--data-dir")
-        .arg("/tmp/e2e-flag-only")
-        .env_remove("KAKEHASHI_DATA_DIR")
-        .build();
-
-    let paths = get_effective_search_paths(&mut client);
-
-    assert_eq!(
-        paths,
-        vec!["/tmp/e2e-flag-only"],
-        "searchPaths should resolve to --data-dir value"
-    );
-}
-
-/// When only KAKEHASHI_DATA_DIR env var is set (no --data-dir), searchPaths should resolve to env value.
-#[test]
-fn test_search_paths_with_env_var_only() {
-    let mut client = LspClient::builder()
-        .env("KAKEHASHI_DATA_DIR", "/tmp/e2e-env-only")
-        .build();
-
-    let paths = get_effective_search_paths(&mut client);
-
-    assert_eq!(
-        paths,
-        vec!["/tmp/e2e-env-only"],
-        "searchPaths should resolve to KAKEHASHI_DATA_DIR env var value"
-    );
-}
-
-/// When both --data-dir flag and KAKEHASHI_DATA_DIR env var are set,
-/// the flag should win (it sets env var in-process, overriding the inherited one).
-#[test]
-fn test_search_paths_flag_overrides_env_var() {
-    let mut client = LspClient::builder()
-        .env("KAKEHASHI_DATA_DIR", "/tmp/e2e-env-value")
-        .arg("--data-dir")
-        .arg("/tmp/e2e-flag-value")
-        .build();
-
-    let paths = get_effective_search_paths(&mut client);
-
-    assert_eq!(
-        paths,
-        vec!["/tmp/e2e-flag-value"],
-        "--data-dir flag should override KAKEHASHI_DATA_DIR env var"
-    );
-}
-
-/// When neither --data-dir nor KAKEHASHI_DATA_DIR is set,
-/// searchPaths should fall back to the platform default containing "kakehashi".
-#[test]
-fn test_search_paths_falls_back_to_platform_default() {
+fn test_search_paths_returns_raw_template() {
     let mut client = LspClient::builder()
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
@@ -113,19 +60,8 @@ fn test_search_paths_falls_back_to_platform_default() {
     let paths = get_effective_search_paths(&mut client);
 
     assert_eq!(
-        paths.len(),
-        1,
-        "should have exactly one default search path"
-    );
-    assert!(
-        paths[0].ends_with("kakehashi"),
-        "default search path should end with 'kakehashi', got: {}",
-        paths[0]
-    );
-    // Verify it's NOT some test path
-    assert!(
-        !paths[0].starts_with("/tmp/e2e"),
-        "should not be a test path, got: {}",
-        paths[0]
+        paths,
+        vec!["${KAKEHASHI_DATA_DIR}"],
+        "raw searchPaths should preserve the template variable"
     );
 }
