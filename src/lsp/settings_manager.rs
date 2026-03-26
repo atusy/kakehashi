@@ -25,7 +25,7 @@ use tower_lsp_server::ls_types::{
     ClientCapabilities, GotoCapability, TextDocumentClientCapabilities,
 };
 
-use crate::config::WorkspaceSettings;
+use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
 #[cfg(test)]
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 
@@ -46,6 +46,7 @@ use crate::lsp::client::check_semantic_tokens_refresh_support;
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
     settings: ArcSwap<WorkspaceSettings>,
+    raw_settings: ArcSwap<RawWorkspaceSettings>,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
@@ -56,6 +57,7 @@ impl std::fmt::Debug for SettingsManager {
         f.debug_struct("SettingsManager")
             .field("root_path", &"ArcSwap<Option<PathBuf>>")
             .field("settings", &"ArcSwap<WorkspaceSettings>")
+            .field("raw_settings", &"ArcSwap<RawWorkspaceSettings>")
             .field("client_capabilities", &"OnceLock<ClientCapabilities>")
             .finish()
     }
@@ -78,6 +80,9 @@ impl SettingsManager {
         Self {
             root_path: ArcSwap::new(Arc::new(None)),
             settings: ArcSwap::new(Arc::new(WorkspaceSettings::default())),
+            raw_settings: ArcSwap::new(Arc::new(RawWorkspaceSettings::from(
+                &WorkspaceSettings::default(),
+            ))),
             client_capabilities: OnceLock::new(),
         }
     }
@@ -137,6 +142,11 @@ impl SettingsManager {
         self.settings.load_full()
     }
 
+    /// Load the current raw workspace settings.
+    pub(crate) fn load_raw_settings(&self) -> Arc<RawWorkspaceSettings> {
+        self.raw_settings.load_full()
+    }
+
     /// Apply new workspace settings.
     ///
     /// This stores the settings for later retrieval via `load_settings()`.
@@ -144,6 +154,17 @@ impl SettingsManager {
     /// # Arguments
     /// * `settings` - The new workspace settings to apply
     pub(crate) fn apply_settings(&self, settings: WorkspaceSettings) {
+        let raw_settings = RawWorkspaceSettings::from(&settings);
+        self.apply_settings_with_raw(raw_settings, settings);
+    }
+
+    /// Apply new workspace settings with their original raw representation.
+    pub(crate) fn apply_settings_with_raw(
+        &self,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
+        self.raw_settings.store(Arc::new(raw_settings));
         self.settings.store(Arc::new(settings));
     }
 
@@ -267,7 +288,9 @@ impl SettingsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{RawWorkspaceSettings, WILDCARD_KEY};
     use rstest::rstest;
+    use std::collections::HashMap;
     use tower_lsp_server::ls_types::{
         DocumentSymbolClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
         TextDocumentClientCapabilities, WorkspaceClientCapabilities,
@@ -351,6 +374,51 @@ mod tests {
         let loaded = manager.load_settings();
 
         assert!(!loaded.auto_install);
+    }
+
+    #[test]
+    fn test_apply_settings_with_raw_preserves_explicit_matching_override() {
+        let manager = SettingsManager::new();
+        let raw = RawWorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    crate::config::LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            crate::config::settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    crate::config::LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            crate::config::settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings::try_from_settings(&raw, None, |_| None).unwrap();
+
+        manager.apply_settings_with_raw(raw.clone(), settings);
+
+        let stored = manager.load_raw_settings();
+        assert_eq!(
+            stored.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
+            Some(true)
+        );
     }
 
     /// Tests for supports_semantic_tokens_refresh capability checking.

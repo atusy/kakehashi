@@ -23,11 +23,11 @@ impl Kakehashi {
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
         // so merging preserves languages and other fields set during initialize.
-        let current = self.settings_manager.load_settings();
-        let current_ts = RawWorkspaceSettings::from(current.as_ref());
+        let current_ts = self.settings_manager.load_raw_settings();
         // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) = merge_workspace_settings(Some(current_ts), Some(parsed)) else {
+        let Some(merged_ts) = merge_workspace_settings(Some((*current_ts).clone()), Some(parsed))
+        else {
             log::warn!(
                 "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
             );
@@ -40,7 +40,7 @@ impl Kakehashi {
             crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
         ) {
             Ok(settings) => {
-                self.apply_settings(settings).await;
+                self.apply_raw_settings(merged_ts, settings).await;
                 self.notifier().log_info("Configuration updated!").await;
             }
             Err(errs) => {

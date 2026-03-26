@@ -2,7 +2,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use tower_lsp_server::jsonrpc::Result;
 
-use crate::config::RawWorkspaceSettings;
 use crate::lsp::lsp_impl::Kakehashi;
 
 #[derive(Deserialize)]
@@ -17,9 +16,8 @@ impl Kakehashi {
         &self,
         _params: EffectiveConfigurationParams,
     ) -> Result<Value> {
-        let settings = self.settings_manager.load_settings();
-        let raw_settings = RawWorkspaceSettings::from(settings.as_ref());
-        let settings_value = serde_json::to_value(raw_settings).map_err(|e| {
+        let raw_settings = self.settings_manager.load_raw_settings();
+        let settings_value = serde_json::to_value(raw_settings.as_ref()).map_err(|e| {
             log::error!(
                 target: "kakehashi::effective_configuration",
                 "Failed to serialize effective configuration: {}",
@@ -33,7 +31,8 @@ impl Kakehashi {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::WorkspaceSettings;
+    use crate::config::{LanguageSettings, RawWorkspaceSettings, WILDCARD_KEY, WorkspaceSettings};
+    use std::collections::HashMap;
     use tower_lsp_server::LspService;
 
     use super::*;
@@ -91,6 +90,63 @@ mod tests {
             settings["autoInstall"],
             serde_json::json!(true),
             "Pre-initialize default autoInstall should be true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effective_configuration_preserves_explicit_matching_override() {
+        let (service, _socket) = LspService::new(|client| {
+            let kakehashi = Kakehashi::new(client);
+            let raw_settings = RawWorkspaceSettings {
+                languages: HashMap::from([
+                    (
+                        WILDCARD_KEY.to_string(),
+                        LanguageSettings {
+                            bridge: Some(HashMap::from([(
+                                "python".to_string(),
+                                crate::config::settings::BridgeLanguageConfig {
+                                    enabled: Some(true),
+                                    ..Default::default()
+                                },
+                            )])),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "r".to_string(),
+                        LanguageSettings {
+                            bridge: Some(HashMap::from([(
+                                "python".to_string(),
+                                crate::config::settings::BridgeLanguageConfig {
+                                    enabled: Some(true),
+                                    ..Default::default()
+                                },
+                            )])),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let settings = WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None)
+                .expect("raw settings should resolve");
+            kakehashi
+                .settings_manager
+                .apply_settings_with_raw(raw_settings, settings);
+            kakehashi
+        });
+
+        let kakehashi = service.inner();
+        let result = kakehashi
+            .effective_configuration(EffectiveConfigurationParams {})
+            .await
+            .unwrap();
+
+        let settings = &result["settings"];
+        assert_eq!(
+            settings["languages"]["r"]["bridge"]["python"]["enabled"],
+            serde_json::json!(true),
+            "explicit override should remain visible in effective raw settings"
         );
     }
 }

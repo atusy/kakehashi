@@ -196,6 +196,7 @@ impl InstallCoordinator {
             &self.client,
             &self.language,
             &self.settings_manager,
+            None,
             settings,
         )
         .await;
