@@ -37,7 +37,14 @@ pub(crate) fn merge_bridge_language_configs(
         aggregation: match (&base.aggregation, &overlay.aggregation) {
             (Some(base_agg), Some(overlay_agg)) => {
                 let mut merged = base_agg.clone();
-                merged.extend(overlay_agg.clone());
+                for (method, overlay_config) in overlay_agg {
+                    merged
+                        .entry(method.clone())
+                        .and_modify(|base_config| {
+                            *base_config = merge_aggregation_configs(base_config, overlay_config);
+                        })
+                        .or_insert_with(|| overlay_config.clone());
+                }
                 Some(merged)
             }
             (base_agg, overlay_agg) => overlay_agg.clone().or_else(|| base_agg.clone()),
@@ -180,18 +187,17 @@ fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -
 /// Merge two `AggregationConfig`s field-by-field.
 ///
 /// - `strategy` / `max_fan_out`: overlay wins if set, else inherits from base
-/// - `priorities`: overlay wins if non-empty, else inherits from base (empty-means-inherit)
+/// - `priorities`: overlay wins if present, else inherits from base
 pub(crate) fn merge_aggregation_configs(
     base: &AggregationConfig,
     overlay: &AggregationConfig,
 ) -> AggregationConfig {
     AggregationConfig {
         strategy: overlay.strategy.or(base.strategy),
-        priorities: if overlay.priorities.is_empty() {
-            base.priorities.clone()
-        } else {
-            overlay.priorities.clone()
-        },
+        priorities: overlay
+            .priorities
+            .clone()
+            .or_else(|| base.priorities.clone()),
         max_fan_out: overlay.max_fan_out.or(base.max_fan_out),
     }
 }
@@ -1389,7 +1395,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["server_a".to_string()],
+                            priorities: Some(vec!["server_a".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1417,7 +1423,7 @@ mod tests {
         );
         assert_eq!(
             resolved.aggregation.unwrap()["_"].priorities,
-            vec!["server_a".to_string()]
+            Some(vec!["server_a".to_string()])
         );
     }
 
@@ -1433,7 +1439,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1466,7 +1472,7 @@ mod tests {
         );
         assert_eq!(
             python.aggregation.as_ref().unwrap()["_"].priorities,
-            vec!["pyright".to_string()]
+            Some(vec!["pyright".to_string()])
         );
     }
 
@@ -1506,14 +1512,14 @@ mod tests {
                         (
                             "_".to_string(),
                             settings::AggregationConfig {
-                                priorities: vec!["base_default".to_string()],
+                                priorities: Some(vec!["base_default".to_string()]),
                                 ..Default::default()
                             },
                         ),
                         (
                             "textDocument/hover".to_string(),
                             settings::AggregationConfig {
-                                priorities: vec!["base_hover".to_string()],
+                                priorities: Some(vec!["base_hover".to_string()]),
                                 ..Default::default()
                             },
                         ),
@@ -1531,7 +1537,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["overlay_hover".to_string()],
+                            priorities: Some(vec!["overlay_hover".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1548,18 +1554,18 @@ mod tests {
         let agg = python.aggregation.as_ref().unwrap();
         assert_eq!(
             agg["textDocument/hover"].priorities,
-            vec!["overlay_hover".to_string()],
+            Some(vec!["overlay_hover".to_string()]),
             "overlay should win for shared aggregation keys"
         );
         assert_eq!(
             agg["_"].priorities,
-            vec!["base_default".to_string()],
+            Some(vec!["base_default".to_string()]),
             "base-only aggregation keys should be preserved"
         );
     }
 
     #[test]
-    fn test_merge_language_settings_bridge_aggregation_strategy_replaced_atomically() {
+    fn test_merge_language_settings_bridge_aggregation_strategy_inherited_on_same_key() {
         let base = LanguageSettings {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
@@ -1568,7 +1574,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/diagnostic".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["ruff".to_string()],
+                            priorities: Some(vec!["ruff".to_string()]),
                             strategy: Some(settings::AggregationStrategy::Concatenated),
                             ..Default::default()
                         },
@@ -1586,8 +1592,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/diagnostic".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
-                            strategy: Some(settings::AggregationStrategy::Preferred),
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1602,13 +1607,13 @@ mod tests {
 
         assert_eq!(
             diag.priorities,
-            vec!["pyright".to_string()],
+            Some(vec!["pyright".to_string()]),
             "overlay priorities should win"
         );
         assert_eq!(
             diag.strategy,
-            Some(settings::AggregationStrategy::Preferred),
-            "overlay strategy should win atomically"
+            Some(settings::AggregationStrategy::Concatenated),
+            "base strategy should be inherited when overlay omits it"
         );
     }
 
@@ -1639,7 +1644,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1660,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_language_settings_bridge_max_fan_out_lost_on_same_key_replacement() {
+    fn test_merge_language_settings_bridge_max_fan_out_inherited_on_same_key() {
         let base = LanguageSettings {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
@@ -1669,7 +1674,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["ruff".to_string()],
+                            priorities: Some(vec!["ruff".to_string()]),
                             max_fan_out: Some(2),
                             ..Default::default()
                         },
@@ -1687,7 +1692,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1702,12 +1707,13 @@ mod tests {
 
         assert_eq!(
             hover.priorities,
-            vec!["pyright".to_string()],
+            Some(vec!["pyright".to_string()]),
             "overlay priorities should win"
         );
         assert_eq!(
-            hover.max_fan_out, None,
-            "base maxFanOut should be lost when overlay replaces the same method key atomically"
+            hover.max_fan_out,
+            Some(2),
+            "base maxFanOut should be inherited when overlay omits it"
         );
     }
 
@@ -2111,26 +2117,40 @@ mod tests {
     #[test]
     fn merge_aggregation_configs_non_empty_priorities_win() {
         let base = settings::AggregationConfig {
-            priorities: vec!["server_base".to_string()],
+            priorities: Some(vec!["server_base".to_string()]),
             ..Default::default()
         };
         let overlay = settings::AggregationConfig {
-            priorities: vec!["server_overlay".to_string()],
+            priorities: Some(vec!["server_overlay".to_string()]),
             ..Default::default()
         };
         let merged = merge_aggregation_configs(&base, &overlay);
-        assert_eq!(merged.priorities, vec!["server_overlay"]);
+        assert_eq!(merged.priorities, Some(vec!["server_overlay".to_string()]));
     }
 
     #[test]
     fn merge_aggregation_configs_empty_priorities_inherit_from_base() {
         let base = settings::AggregationConfig {
-            priorities: vec!["server_base".to_string()],
+            priorities: Some(vec!["server_base".to_string()]),
             ..Default::default()
         };
         let overlay = settings::AggregationConfig::default(); // priorities: []
         let merged = merge_aggregation_configs(&base, &overlay);
-        assert_eq!(merged.priorities, vec!["server_base"]);
+        assert_eq!(merged.priorities, Some(vec!["server_base".to_string()]));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_explicit_empty_priorities_clear_base() {
+        let base = settings::AggregationConfig {
+            priorities: Some(vec!["server_base".to_string()]),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            priorities: Some(vec![]),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.priorities, Some(vec![]));
     }
 
     #[test]

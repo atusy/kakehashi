@@ -23,13 +23,15 @@ pub enum AggregationStrategy {
 /// Controls how results from multiple bridge servers are aggregated for a
 /// specific LSP method. The `priorities` list determines server preference
 /// order — the first server in the list that returns a non-empty result wins.
-/// Empty priorities degrades to first-win (arrival-order) behavior.
+/// `Some(vec![])` degrades to first-win (arrival-order) behavior, while `None`
+/// means "inherit from wildcard/base".
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregationConfig {
-    /// Server names in priority order (highest first). Empty = pure first-win behavior.
+    /// Server names in priority order (highest first).
+    /// `Some(vec![])` = pure first-win behavior, `None` = inherit.
     #[serde(default)]
-    pub priorities: Vec<String>,
+    pub priorities: Option<Vec<String>>,
     /// Aggregation strategy override. Omit to use the handler default.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
@@ -103,7 +105,7 @@ impl BridgeLanguageConfig {
         match self.resolve_aggregation_entry(method) {
             Some(entry) => ResolvedAggregationConfig {
                 strategy: entry.strategy.unwrap_or(AggregationStrategy::Preferred),
-                priorities: entry.priorities,
+                priorities: entry.priorities.unwrap_or_default(),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
             None => ResolvedAggregationConfig::with_defaults(),
@@ -1170,7 +1172,7 @@ kind = "injections""#;
         let config: AggregationConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
             config.priorities,
-            vec!["server_a".to_string(), "server_b".to_string()]
+            Some(vec!["server_a".to_string(), "server_b".to_string()])
         );
     }
 
@@ -1178,14 +1180,21 @@ kind = "injections""#;
     fn should_parse_aggregation_config_empty_priorities() {
         let json = r#"{}"#;
         let config: AggregationConfig = serde_json::from_str(json).unwrap();
-        assert!(config.priorities.is_empty());
+        assert_eq!(config.priorities, None);
+    }
+
+    #[test]
+    fn should_parse_aggregation_config_explicit_empty_priorities() {
+        let json = r#"{"priorities": []}"#;
+        let config: AggregationConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.priorities, Some(vec![]));
     }
 
     #[test]
     fn should_parse_aggregation_config_from_toml() {
         let toml_str = r#"priorities = ["server_a"]"#;
         let config: AggregationConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.priorities, vec!["server_a".to_string()]);
+        assert_eq!(config.priorities, Some(vec!["server_a".to_string()]));
     }
 
     #[test]
@@ -1196,14 +1205,14 @@ kind = "injections""#;
                 (
                     "textDocument/completion".to_string(),
                     AggregationConfig {
-                        priorities: vec!["server_a".to_string()],
+                        priorities: Some(vec!["server_a".to_string()]),
                         ..Default::default()
                     },
                 ),
                 (
                     WILDCARD_KEY.to_string(),
                     AggregationConfig {
-                        priorities: vec!["server_b".to_string()],
+                        priorities: Some(vec!["server_b".to_string()]),
                         ..Default::default()
                     },
                 ),
@@ -1220,7 +1229,7 @@ kind = "injections""#;
             aggregation: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
                 AggregationConfig {
-                    priorities: vec!["server_b".to_string()],
+                    priorities: Some(vec!["server_b".to_string()]),
                     ..Default::default()
                 },
             )])),
@@ -1284,7 +1293,7 @@ kind = "injections""#;
             aggregation: Some(HashMap::from([(
                 "textDocument/diagnostic".to_string(),
                 AggregationConfig {
-                    priorities: vec!["server_a".to_string()],
+                    priorities: Some(vec!["server_a".to_string()]),
                     strategy: None,
                     ..Default::default()
                 },
@@ -1353,7 +1362,7 @@ kind = "injections""#;
                 (
                     "textDocument/completion".to_string(),
                     AggregationConfig {
-                        priorities: vec!["server_a".to_string()],
+                        priorities: Some(vec!["server_a".to_string()]),
                         ..Default::default() // max_fan_out: None
                     },
                 ),
@@ -1414,7 +1423,7 @@ kind = "injections""#;
                 "textDocument/completion".to_string(),
                 AggregationConfig {
                     strategy: Some(AggregationStrategy::Concatenated),
-                    priorities: vec!["server_a".to_string(), "server_b".to_string()],
+                    priorities: Some(vec!["server_a".to_string(), "server_b".to_string()]),
                     max_fan_out: Some(3),
                 },
             )])),
@@ -1448,9 +1457,9 @@ kind = "injections""#;
         assert_eq!(agg.len(), 2);
         assert_eq!(
             agg["textDocument/completion"].priorities,
-            vec!["server_a".to_string()]
+            Some(vec!["server_a".to_string()])
         );
-        assert_eq!(agg["_"].priorities, vec!["server_b".to_string()]);
+        assert_eq!(agg["_"].priorities, Some(vec!["server_b".to_string()]));
     }
 
     #[test]
