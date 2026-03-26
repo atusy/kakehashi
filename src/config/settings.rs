@@ -104,7 +104,7 @@ impl BridgeLanguageConfig {
         match self.resolve_aggregation_entry(method) {
             Some(entry) => ResolvedAggregationConfig {
                 strategy: entry.strategy.unwrap_or(default_strategy),
-                priorities: entry.priorities.clone(),
+                priorities: entry.priorities,
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
             None => ResolvedAggregationConfig::with_defaults(default_strategy),
