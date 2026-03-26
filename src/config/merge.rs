@@ -35,6 +35,7 @@ pub(crate) fn merge_bridge_language_configs(
     BridgeLanguageConfig {
         enabled: overlay.enabled.or(base.enabled),
         aggregation: match (&base.aggregation, &overlay.aggregation) {
+            (Some(_), Some(overlay_agg)) if overlay_agg.is_empty() => Some(HashMap::new()),
             (Some(base_agg), Some(overlay_agg)) => {
                 let mut merged = base_agg.clone();
                 for (method, overlay_config) in overlay_agg {
@@ -2134,7 +2135,7 @@ mod tests {
             priorities: Some(vec!["server_base".to_string()]),
             ..Default::default()
         };
-        let overlay = settings::AggregationConfig::default(); // priorities: []
+        let overlay = settings::AggregationConfig::default(); // priorities: None (inherit)
         let merged = merge_aggregation_configs(&base, &overlay);
         assert_eq!(merged.priorities, Some(vec!["server_base".to_string()]));
     }
@@ -2151,6 +2152,28 @@ mod tests {
         };
         let merged = merge_aggregation_configs(&base, &overlay);
         assert_eq!(merged.priorities, Some(vec![]));
+    }
+
+    #[test]
+    fn merge_bridge_language_configs_empty_aggregation_clears_base() {
+        let base = settings::BridgeLanguageConfig {
+            aggregation: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                settings::AggregationConfig {
+                    strategy: Some(settings::AggregationStrategy::Preferred),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let overlay = settings::BridgeLanguageConfig {
+            aggregation: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let merged = merge_bridge_language_configs(&base, &overlay);
+
+        assert_eq!(merged.aggregation, Some(HashMap::new()));
     }
 
     #[test]

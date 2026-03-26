@@ -26,8 +26,16 @@ fn updated_settings_after_install(
     let mut updated_raw_settings = raw_settings.clone();
     let data_dir_str = data_dir.to_string_lossy().to_string();
     if !updated_settings.search_paths.contains(&data_dir_str) {
-        updated_settings.search_paths.push(data_dir_str);
-        updated_raw_settings.search_paths = Some(updated_settings.search_paths.clone());
+        updated_settings.search_paths.push(data_dir_str.clone());
+
+        let mut raw_search_paths = updated_raw_settings
+            .search_paths
+            .clone()
+            .unwrap_or_default();
+        if !raw_search_paths.contains(&data_dir_str) {
+            raw_search_paths.push(data_dir_str);
+        }
+        updated_raw_settings.search_paths = Some(raw_search_paths);
     }
 
     (updated_raw_settings, updated_settings)
@@ -323,6 +331,41 @@ mod tests {
         assert_eq!(
             updated_settings.search_paths,
             vec!["/installed".to_string()]
+        );
+    }
+
+    #[test]
+    fn reload_after_install_appends_data_dir_to_raw_search_paths_without_expanding_templates() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec![
+                "${KAKEHASHI_DATA_DIR}".to_string(),
+                "/custom".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings {
+            search_paths: vec!["/expanded".to_string(), "/custom".to_string()],
+            ..Default::default()
+        };
+
+        let (updated_raw, updated_settings) =
+            updated_settings_after_install(&raw_settings, &settings, Path::new("/installed"));
+
+        assert_eq!(
+            updated_raw.search_paths,
+            Some(vec![
+                "${KAKEHASHI_DATA_DIR}".to_string(),
+                "/custom".to_string(),
+                "/installed".to_string(),
+            ])
+        );
+        assert_eq!(
+            updated_settings.search_paths,
+            vec![
+                "/expanded".to_string(),
+                "/custom".to_string(),
+                "/installed".to_string(),
+            ]
         );
     }
 }

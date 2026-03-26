@@ -77,12 +77,14 @@ impl SettingsManager {
     /// - Default workspace settings
     /// - Unset client capabilities (until initialize() calls set_capabilities)
     pub(crate) fn new() -> Self {
+        let raw_settings = crate::config::defaults::default_settings();
+        let settings =
+            WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None).unwrap_or_default();
+
         Self {
             root_path: ArcSwap::new(Arc::new(None)),
-            settings: ArcSwap::new(Arc::new(WorkspaceSettings::default())),
-            raw_settings: ArcSwap::new(Arc::new(RawWorkspaceSettings::from(
-                &WorkspaceSettings::default(),
-            ))),
+            settings: ArcSwap::new(Arc::new(settings)),
+            raw_settings: ArcSwap::new(Arc::new(raw_settings)),
             client_capabilities: OnceLock::new(),
         }
     }
@@ -418,6 +420,26 @@ mod tests {
         assert_eq!(
             stored.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_new_uses_default_raw_settings() {
+        let manager = SettingsManager::new();
+        let stored = manager.load_raw_settings();
+        let defaults = crate::config::defaults::default_settings();
+
+        assert_eq!(
+            stored.search_paths, defaults.search_paths,
+            "new manager should expose default raw search paths before initialize"
+        );
+        assert_eq!(
+            stored.languages, defaults.languages,
+            "new manager should expose default raw language defaults before initialize"
+        );
+        assert_eq!(
+            stored.auto_install, defaults.auto_install,
+            "new manager should expose default raw auto-install before initialize"
         );
     }
 

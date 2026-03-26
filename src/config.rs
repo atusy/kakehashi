@@ -172,6 +172,11 @@ fn strip_inherited_aggregation_map(
     current: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
 ) -> Option<std::collections::HashMap<String, settings::AggregationConfig>> {
     let current = current?;
+
+    if current.is_empty() {
+        return Some(current.clone());
+    }
+
     let mut stripped = std::collections::HashMap::new();
 
     for (method, current_config) in current {
@@ -906,5 +911,87 @@ mod try_from_settings_tests {
             .priorities
             .clone();
         assert_eq!(priorities, Some(vec!["ruff".to_string()]));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_explicit_empty_aggregation_map() {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::from([(
+                                    WILDCARD_KEY.to_string(),
+                                    settings::AggregationConfig {
+                                        strategy: Some(settings::AggregationStrategy::Preferred),
+                                        ..Default::default()
+                                    },
+                                )])),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::new()),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge.as_ref().unwrap()["python"].aggregation,
+            Some(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_keeps_self_referential_language_as_blank_slate_root() {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "_blank".to_string(),
+                    LanguageSettings {
+                        base: Some("_blank".to_string()),
+                        bridge: Some(HashMap::new()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(current_raw.languages["_blank"].bridge, Some(HashMap::new()));
     }
 }
