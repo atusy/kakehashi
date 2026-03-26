@@ -84,19 +84,19 @@ fn resolve_bridge_language_config_from_settings(
     host_language: &str,
     injection_language: &str,
 ) -> Option<BridgeLanguageConfig> {
-    crate::config::resolve_with_wildcard(
-        &settings.languages,
-        host_language,
-        crate::config::merge_language_settings,
-    )
-    .and_then(|lang_settings| lang_settings.bridge)
-    .and_then(|bridge_map| {
-        crate::config::resolve_with_wildcard(
-            &bridge_map,
-            injection_language,
-            crate::config::merge_bridge_language_configs,
-        )
-    })
+    // Phase 2 (resolve_base_configs) already merged "_"'s config into every
+    // configured language — direct lookup is sufficient.
+    settings
+        .languages
+        .get(host_language)
+        .and_then(|lang_settings| lang_settings.bridge.as_ref())
+        .and_then(|bridge_map| {
+            crate::config::resolve_with_wildcard(
+                bridge_map,
+                injection_language,
+                crate::config::merge_bridge_language_configs,
+            )
+        })
 }
 
 pub(crate) fn resolve_aggregation_config_from_settings(

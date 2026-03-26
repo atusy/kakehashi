@@ -10,7 +10,7 @@ pub(crate) mod user;
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
     merge_aggregation_configs, merge_bridge_language_configs, merge_bridge_server_configs,
-    merge_language_settings, merge_workspace_settings, resolve_with_wildcard,
+    merge_workspace_settings, resolve_with_wildcard,
 };
 pub(crate) use settings::{CaptureMappings, QueryTypeMappings};
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};

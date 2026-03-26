@@ -18,7 +18,7 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::config::{
-    WorkspaceSettings, merge_bridge_server_configs, merge_language_settings, resolve_with_wildcard,
+    WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
     settings::BridgeServerConfig,
 };
 use crate::language::region_id_tracker::{EditInfo, RegionIdTracker};
@@ -244,10 +244,10 @@ impl BridgeCoordinator {
         host_language: &str,
         injection_language: &str,
     ) -> Option<ResolvedServerConfig> {
-        // Use wildcard resolution for host language lookup (ADR-0011)
-        // This allows languages._ to define default bridge filters
-        if let Some(host_settings) =
-            resolve_with_wildcard(&settings.languages, host_language, merge_language_settings)
+        // Phase 2 (resolve_base_configs) already merged "_"'s config into every
+        // configured language. Unconfigured languages (absent from settings.languages)
+        // are not blocked — no filter entry means bridge is allowed.
+        if let Some(host_settings) = settings.languages.get(host_language)
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -302,8 +302,7 @@ impl BridgeCoordinator {
         injection_language: &str,
     ) -> Vec<ResolvedServerConfig> {
         // Check bridge filter (same logic as get_config_for_language)
-        if let Some(host_settings) =
-            resolve_with_wildcard(&settings.languages, host_language, merge_language_settings)
+        if let Some(host_settings) = settings.languages.get(host_language)
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -968,17 +967,20 @@ mod tests {
     }
 
     #[test]
-    fn test_get_config_uses_wildcard_for_undefined_host() {
+    fn test_get_config_blocks_configured_host_with_empty_bridge() {
+        // After Phase 2 (resolve_base_configs), each configured language has "_"'s
+        // bridge config merged in. If "quarto" is explicitly configured with an
+        // empty bridge map (which it would inherit from "_"), it should be blocked.
         let coordinator = BridgeCoordinator::new();
 
-        // Create settings with wildcard that blocks all bridging
+        // "quarto" is explicitly in the map with empty bridge (as Phase 2 would produce)
         let mut languages = HashMap::new();
         languages.insert(
-            "_".to_string(),
+            "quarto".to_string(),
             LanguageSettings {
-                bridge: Some(HashMap::new()),
+                bridge: Some(HashMap::new()), // empty = block all (inherited from "_")
                 ..Default::default()
-            }, // empty = block all
+            },
         );
 
         // Create language server config for rust
@@ -999,11 +1001,11 @@ mod tests {
             ..Default::default()
         };
 
-        // "quarto" is not defined, so it inherits from wildcard which blocks all
+        // "quarto" is configured with an empty bridge — should be blocked
         let result = coordinator.get_config_for_language(&settings, "quarto", "rust");
         assert!(
             result.is_none(),
-            "quarto should inherit wildcard's empty filter"
+            "quarto with empty bridge map should block all bridging"
         );
     }
 
@@ -1176,5 +1178,50 @@ mod tests {
         // Should not panic
         coordinator.abort_all_eager_open();
         assert!(coordinator.eager_open_tasks.is_empty());
+    }
+
+    #[test]
+    fn test_get_config_undefined_host_is_not_blocked_by_wildcard() {
+        // After Phase 2 (resolve_base_configs), all configured languages have "_"'s
+        // bridge config merged in. Languages not in settings.languages at all are
+        // unconfigured — they should NOT be blocked by "_"'s bridge filter.
+        // (get_config_for_language uses .get() directly, not outer resolve_with_wildcard)
+        let coordinator = BridgeCoordinator::new();
+
+        // "_" blocks all bridging (empty bridge map = deny all)
+        let mut languages = HashMap::new();
+        languages.insert(
+            "_".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::new()),
+                ..Default::default()
+            },
+        );
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "rust-analyzer".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["rust-analyzer".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        // "quarto" is not in settings.languages — it's unconfigured.
+        // Phase 2 never ran for it, so there's no entry to look up.
+        // Without the outer wildcard, .get("quarto") returns None → bridge allowed.
+        let result = coordinator.get_config_for_language(&settings, "quarto", "rust");
+        assert!(
+            result.is_some(),
+            "unconfigured host should not be blocked — bridge filter only applies to configured languages"
+        );
     }
 }
