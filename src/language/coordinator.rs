@@ -2320,7 +2320,8 @@ mod tests {
         // HashMap iteration order.
         let coordinator = LanguageCoordinator::new();
 
-        // Pre-register "markdown" parser so derived languages can find it
+        // Pre-register a parser under "markdown" so derived languages can find it
+        // (any grammar works here — we only test load mechanics, not parsing)
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         coordinator
             .language_registry_for_parallel()
