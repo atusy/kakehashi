@@ -4,7 +4,10 @@
 //! to generate configuration templates.
 
 use super::WILDCARD_KEY;
-use super::settings::{CaptureMapping, CaptureMappings, QueryTypeMappings, RawWorkspaceSettings};
+use super::settings::{
+    AggregationConfig, AggregationStrategy, BridgeLanguageConfig, CaptureMapping, CaptureMappings,
+    LanguageSettings, QueryTypeMappings, RawWorkspaceSettings,
+};
 use std::collections::HashMap;
 
 /// Returns the default RawWorkspaceSettings for configuration generation.
@@ -13,11 +16,55 @@ use std::collections::HashMap;
 pub fn default_settings() -> RawWorkspaceSettings {
     RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
-        languages: HashMap::new(),
+        languages: default_languages(),
         capture_mappings: default_capture_mappings(),
         auto_install: Some(true),
         language_servers: None,
     }
+}
+
+/// Returns the default languages map containing the wildcard `_` entry.
+///
+/// The wildcard language is the root of all base chains (ADR-0024).
+/// It provides default bridge settings: all bridging enabled, with
+/// `Preferred` strategy for most methods and `Concatenated` for diagnostics.
+fn default_languages() -> HashMap<String, LanguageSettings> {
+    HashMap::from([(
+        WILDCARD_KEY.to_string(),
+        LanguageSettings {
+            base: Some(WILDCARD_KEY.to_string()),
+            bridge: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: Some(HashMap::from([
+                        (
+                            WILDCARD_KEY.to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Preferred),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "textDocument/diagnostic".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "textDocument/publishDiagnostics".to_string(),
+                            AggregationConfig {
+                                strategy: Some(AggregationStrategy::Concatenated),
+                                ..Default::default()
+                            },
+                        ),
+                    ])),
+                },
+            )])),
+            ..Default::default()
+        },
+    )])
 }
 
 /// Returns the default capture mappings for semantic token translation.
@@ -157,6 +204,50 @@ fn default_highlight_mappings() -> CaptureMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::AggregationStrategy;
+
+    #[test]
+    fn default_settings_has_wildcard_language_with_bridge_defaults() {
+        let settings = default_settings();
+
+        // "_" key should exist
+        let wildcard = settings
+            .languages
+            .get(WILDCARD_KEY)
+            .expect("should have wildcard '_' language");
+
+        // Self-referential base (chain terminator)
+        assert_eq!(wildcard.base.as_deref(), Some(WILDCARD_KEY));
+
+        // Bridge wildcard with enabled: true
+        let bridge = wildcard.bridge.as_ref().expect("should have bridge");
+        let bridge_wildcard = bridge
+            .get(WILDCARD_KEY)
+            .expect("should have bridge wildcard '_'");
+        assert_eq!(bridge_wildcard.enabled, Some(true));
+
+        // Aggregation strategies
+        let agg = bridge_wildcard
+            .aggregation
+            .as_ref()
+            .expect("should have aggregation");
+
+        let wildcard_agg = agg.get(WILDCARD_KEY).expect("should have '_' aggregation");
+        assert_eq!(wildcard_agg.strategy, Some(AggregationStrategy::Preferred));
+
+        let diag_agg = agg
+            .get("textDocument/diagnostic")
+            .expect("should have diagnostic aggregation");
+        assert_eq!(diag_agg.strategy, Some(AggregationStrategy::Concatenated));
+
+        let pub_diag_agg = agg
+            .get("textDocument/publishDiagnostics")
+            .expect("should have publishDiagnostics aggregation");
+        assert_eq!(
+            pub_diag_agg.strategy,
+            Some(AggregationStrategy::Concatenated)
+        );
+    }
 
     #[test]
     fn default_capture_mappings_contains_variable_mapping() {
