@@ -85,10 +85,12 @@ fn resolve_bridge_language_config_from_settings(
     injection_language: &str,
 ) -> Option<BridgeLanguageConfig> {
     // Phase 2 (resolve_base_configs) already merged "_"'s config into every
-    // configured language — direct lookup is sufficient.
+    // configured language. Auto-discovered languages (not in config) fall back
+    // to "_" so they still inherit bridge/aggregation settings.
     settings
         .languages
         .get(host_language)
+        .or_else(|| settings.languages.get(crate::config::WILDCARD_KEY))
         .and_then(|lang_settings| lang_settings.bridge.as_ref())
         .and_then(|bridge_map| {
             crate::config::resolve_with_wildcard(
