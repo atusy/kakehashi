@@ -85,11 +85,11 @@ impl LanguageCoordinator {
         // Partition languages into (no-base, has-base) groups.
         // HashMap iteration order is arbitrary, so explicit partitioning
         // ensures base languages are loaded before derived ones.
-        let (loadable_languages, skipped_languages): (Vec<_>, Vec<_>) = settings
+        let (eager_load_candidates, skipped_languages): (Vec<_>, Vec<_>) = settings
             .languages
             .iter()
-            .partition(|(lang_name, config)| !is_inheritance_only_root(lang_name, config));
-        let (base_languages, derived_languages): (Vec<_>, Vec<_>) = loadable_languages
+            .partition(|(lang_name, config)| should_eager_load_language(lang_name, config));
+        let (base_languages, derived_languages): (Vec<_>, Vec<_>) = eager_load_candidates
             .into_iter()
             .partition(|(_, config)| config.base.is_none());
         let mut summary = LanguageLoadSummary::default();
@@ -160,7 +160,7 @@ impl LanguageCoordinator {
 
             let base_config = languages.get(base_name);
             let base_is_inheritance_only = base_config
-                .is_some_and(|base_config| is_inheritance_only_root(base_name, base_config));
+                .is_some_and(|base_config| !should_eager_load_language(base_name, base_config));
 
             if base_is_inheritance_only {
                 return self.load_standalone_derived_language(derived_name, config, search_paths);
@@ -1110,8 +1110,10 @@ fn truncate_preview(pattern: &str, max_len: usize) -> String {
     }
 }
 
-fn is_inheritance_only_root(language_id: &str, config: &LanguageSettings) -> bool {
-    config.base.as_deref() == Some(language_id) && config.parser.is_none()
+/// Self-referential entries without an explicit parser are configuration roots.
+/// They participate in base-chain resolution but should not be eager-loaded.
+fn should_eager_load_language(language_id: &str, config: &LanguageSettings) -> bool {
+    !(config.base.as_deref() == Some(language_id) && config.parser.is_none())
 }
 
 #[cfg(test)]
