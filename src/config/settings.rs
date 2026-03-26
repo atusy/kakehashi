@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::WILDCARD_KEY;
-
 pub(crate) type CaptureMapping = HashMap<String, String>;
 
 /// Aggregation strategy for combining results from multiple bridge servers.
@@ -85,10 +83,13 @@ impl ResolvedAggregationConfig {
 }
 
 impl BridgeLanguageConfig {
-    /// Look up the aggregation entry for a method, falling back to wildcard `"_"`.
-    fn resolve_aggregation_entry(&self, method: &str) -> Option<&AggregationConfig> {
+    /// Look up the aggregation entry for a method with field-level wildcard merge.
+    ///
+    /// Uses [`crate::config::resolve_with_wildcard`] so that a method-specific entry
+    /// inherits any unset fields from the `_` wildcard entry (ADR-0024).
+    fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
         let map = self.aggregation.as_ref()?;
-        map.get(method).or_else(|| map.get(WILDCARD_KEY))
+        crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
     }
 
     /// Resolve all aggregation settings for a specific LSP method in a single call.
@@ -294,6 +295,7 @@ impl Default for WorkspaceSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WILDCARD_KEY;
     use rstest::rstest;
 
     #[test]
@@ -1346,11 +1348,9 @@ kind = "injections""#;
     }
 
     #[test]
-    fn should_resolve_aggregation_max_fan_out_method_entry_without_field_does_not_fallback_to_wildcard()
-     {
+    fn should_resolve_aggregation_entry_inherits_missing_fields_from_wildcard() {
         // When a method-specific AggregationConfig exists but has max_fan_out: None,
-        // the wildcard's max_fan_out does NOT apply. This is atomic-per-entry behavior:
-        // the method key selects the entire AggregationConfig, not individual fields.
+        // the wildcard's max_fan_out IS applied via field-level merge (ADR-0024).
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([
@@ -1373,8 +1373,9 @@ kind = "injections""#;
         let agg =
             config.resolve_aggregation("textDocument/completion", AggregationStrategy::Preferred);
         assert_eq!(
-            agg.max_fan_out, None,
-            "method-specific entry without maxFanOut should NOT fall back to wildcard"
+            agg.max_fan_out,
+            Some(5),
+            "method-specific entry without maxFanOut should inherit from wildcard via field-level merge"
         );
     }
 

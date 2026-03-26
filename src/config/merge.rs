@@ -1,4 +1,6 @@
-use super::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+use super::settings::{
+    AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
+};
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
 
@@ -173,6 +175,25 @@ fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -
     }
 
     chain
+}
+
+/// Merge two `AggregationConfig`s field-by-field.
+///
+/// - `strategy` / `max_fan_out`: overlay wins if set, else inherits from base
+/// - `priorities`: overlay wins if non-empty, else inherits from base (empty-means-inherit)
+pub(crate) fn merge_aggregation_configs(
+    base: &AggregationConfig,
+    overlay: &AggregationConfig,
+) -> AggregationConfig {
+    AggregationConfig {
+        strategy: overlay.strategy.or(base.strategy),
+        priorities: if overlay.priorities.is_empty() {
+            base.priorities.clone()
+        } else {
+            overlay.priorities.clone()
+        },
+        max_fan_out: overlay.max_fan_out.or(base.max_fan_out),
+    }
 }
 
 /// Deep merge two optional bridge HashMaps.
@@ -2054,5 +2075,86 @@ mod tests {
             custom.bridge.is_none(),
             "custom_lang should not inherit '_'s bridge — chain stopped at _blank"
         );
+    }
+
+    #[test]
+    fn merge_aggregation_configs_overlay_strategy_wins() {
+        let base = settings::AggregationConfig {
+            strategy: Some(settings::AggregationStrategy::Preferred),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            strategy: Some(settings::AggregationStrategy::Concatenated),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(
+            merged.strategy,
+            Some(settings::AggregationStrategy::Concatenated)
+        );
+    }
+
+    #[test]
+    fn merge_aggregation_configs_inherits_strategy_from_base() {
+        let base = settings::AggregationConfig {
+            strategy: Some(settings::AggregationStrategy::Preferred),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig::default(); // strategy: None
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(
+            merged.strategy,
+            Some(settings::AggregationStrategy::Preferred)
+        );
+    }
+
+    #[test]
+    fn merge_aggregation_configs_non_empty_priorities_win() {
+        let base = settings::AggregationConfig {
+            priorities: vec!["server_base".to_string()],
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            priorities: vec!["server_overlay".to_string()],
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.priorities, vec!["server_overlay"]);
+    }
+
+    #[test]
+    fn merge_aggregation_configs_empty_priorities_inherit_from_base() {
+        let base = settings::AggregationConfig {
+            priorities: vec!["server_base".to_string()],
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig::default(); // priorities: []
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.priorities, vec!["server_base"]);
+    }
+
+    #[test]
+    fn merge_aggregation_configs_max_fan_out_overlay_wins() {
+        let base = settings::AggregationConfig {
+            max_fan_out: Some(3),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            max_fan_out: Some(7),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.max_fan_out, Some(7));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_max_fan_out_inherits_from_base() {
+        let base = settings::AggregationConfig {
+            max_fan_out: Some(5),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig::default(); // max_fan_out: None
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.max_fan_out, Some(5));
     }
 }
