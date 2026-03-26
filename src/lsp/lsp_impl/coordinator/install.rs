@@ -17,6 +17,23 @@ use tower_lsp_server::Client;
 use super::ParseCoordinator;
 use super::parse::ParseCoordinatorDeps;
 
+fn updated_settings_after_install(
+    raw_settings: &crate::config::RawWorkspaceSettings,
+    settings: &WorkspaceSettings,
+    data_dir: &std::path::Path,
+) -> (crate::config::RawWorkspaceSettings, WorkspaceSettings) {
+    let mut updated_settings = settings.clone();
+    let data_dir_str = data_dir.to_string_lossy().to_string();
+    if !updated_settings.search_paths.contains(&data_dir_str) {
+        updated_settings.search_paths.push(data_dir_str);
+    }
+
+    let mut updated_raw_settings = raw_settings.clone();
+    updated_raw_settings.search_paths = Some(updated_settings.search_paths.clone());
+
+    (updated_raw_settings, updated_settings)
+}
+
 pub(super) struct InstallCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
@@ -166,15 +183,13 @@ impl InstallCoordinator {
         text: String,
         is_injection: bool,
     ) {
+        let current_raw_settings = self.settings_manager.load_raw_settings();
         let current_settings = self.settings_manager.load_settings();
-        let mut updated_settings = (*current_settings).clone();
+        let (updated_raw_settings, updated_settings) =
+            updated_settings_after_install(&current_raw_settings, &current_settings, data_dir);
 
-        let data_dir_str = data_dir.to_string_lossy().to_string();
-        if !updated_settings.search_paths.contains(&data_dir_str) {
-            updated_settings.search_paths.push(data_dir_str);
-        }
-
-        self.apply_settings(updated_settings).await;
+        self.apply_raw_settings(updated_raw_settings, updated_settings)
+            .await;
 
         let load_result = self.language.ensure_language_loaded(language);
         self.notifier()
@@ -191,12 +206,16 @@ impl InstallCoordinator {
         }
     }
 
-    async fn apply_settings(&self, settings: WorkspaceSettings) {
+    async fn apply_raw_settings(
+        &self,
+        raw_settings: crate::config::RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
         apply_shared_settings(
             &self.client,
             &self.language,
             &self.settings_manager,
-            None,
+            Some(raw_settings),
             settings,
         )
         .await;
@@ -221,5 +240,66 @@ impl InstallCoordinator {
             auto_install: self.auto_install.clone(),
             bridge: std::sync::Arc::clone(&self.bridge),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LanguageSettings, RawWorkspaceSettings, WILDCARD_KEY, WorkspaceSettings};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    #[test]
+    fn reload_after_install_preserves_explicit_matching_override_in_raw_settings() {
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec!["/existing".to_string()]),
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            crate::config::settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            crate::config::settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None).unwrap();
+
+        let (updated_raw, updated_settings) =
+            updated_settings_after_install(&raw_settings, &settings, Path::new("/installed"));
+
+        assert_eq!(
+            updated_raw.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
+            Some(true)
+        );
+        assert_eq!(
+            updated_raw.search_paths,
+            Some(vec!["/existing".to_string(), "/installed".to_string()])
+        );
+        assert_eq!(
+            updated_settings.search_paths,
+            vec!["/existing".to_string(), "/installed".to_string()]
+        );
     }
 }
