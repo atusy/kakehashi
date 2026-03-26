@@ -100,21 +100,28 @@ pub(crate) fn merge_language_settings(
 ///
 /// Chain termination:
 /// - Self-reference (`base == own name`): normal termination
-/// - `None` base: chain stops (outer `_` wildcard is handled separately)
+/// - `None` base on `_`: terminates (root of all chains)
+/// - `None` base on other languages: implicitly chains to `_`
 /// - Circular reference: terminated at cycle point with a warning
+///
+/// The `base` field in the resolved config is restored to the original value
+/// so that `LanguageCoordinator`'s loading logic is not affected by inherited
+/// `base` values from the chain.
 pub(crate) fn resolve_base_configs(
     languages: &HashMap<String, LanguageSettings>,
 ) -> HashMap<String, LanguageSettings> {
     languages
         .keys()
         .map(|name| {
+            let original_base = languages.get(name).and_then(|s| s.base.clone());
             let chain = build_base_chain(name, languages);
-            let resolved = chain
+            let mut resolved = chain
                 .iter()
                 .rev()
                 .map(|n| languages.get(n).cloned().unwrap_or_default())
                 .reduce(|acc, settings| merge_language_settings(&acc, &settings))
                 .unwrap_or_default();
+            resolved.base = original_base;
             (name.clone(), resolved)
         })
         .collect()
@@ -123,7 +130,10 @@ pub(crate) fn resolve_base_configs(
 /// Build the base chain for a language, from most-specific to least-specific.
 ///
 /// Example: for `rmd` with `base = "markdown"`, and `markdown` with no base,
-/// the chain is `["rmd", "markdown"]`.
+/// the chain is `["rmd", "markdown", "_"]`.
+///
+/// Languages with no explicit `base` implicitly chain to `_` (ADR-0024).
+/// `_` itself terminates when its `base` is `None` or self-referential.
 fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -> Vec<String> {
     let mut chain = vec![name.to_string()];
     let mut visited = HashSet::new();
@@ -132,7 +142,12 @@ fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -
     let mut current = name.to_string();
     loop {
         let base_name = match languages.get(&current).and_then(|s| s.base.as_deref()) {
-            None => break,
+            None => {
+                if current == WILDCARD_KEY {
+                    break; // "_" with no explicit base terminates the chain
+                }
+                WILDCARD_KEY.to_string() // implicit chain to "_"
+            }
             Some(b) => b.to_string(),
         };
 
@@ -1928,5 +1943,116 @@ mod tests {
         // rust -> _: chain is ["rust", "_"], rust's parser wins
         let rust = &languages["rust"];
         assert_eq!(rust.parser, Some("/opt/rust.so".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_base_configs_none_base_chains_to_wildcard() {
+        // A language with base: None should implicitly chain to "_" and inherit
+        // its settings when "_" exists in the map. The language's own base field
+        // must remain None after resolution (not inherit "_"'s self-ref).
+        let languages = HashMap::from([
+            (
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    base: Some(WILDCARD_KEY.to_string()), // self-reference
+                    parser: Some("/opt/default.so".to_string()),
+                    bridge: Some(HashMap::from([(
+                        WILDCARD_KEY.to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "python".to_string(),
+                LanguageSettings {
+                    // base: None — should implicitly chain to "_"
+                    parser: Some("/opt/python.so".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let resolved = resolve_base_configs(&languages);
+        let python = &resolved["python"];
+
+        // parser: python's own wins (most-specific)
+        assert_eq!(python.parser, Some("/opt/python.so".to_string()));
+        // bridge: inherited from "_"
+        assert!(
+            python.bridge.is_some(),
+            "python should inherit bridge from '_'"
+        );
+        // base: original value preserved, not inherited from "_"
+        assert_eq!(python.base, None, "python's base field should remain None");
+    }
+
+    #[test]
+    fn test_resolve_base_configs_wildcard_none_base_terminates() {
+        // "_" with base: None should not cause infinite loop — it terminates.
+        let languages = HashMap::from([(
+            WILDCARD_KEY.to_string(),
+            LanguageSettings {
+                // base: None — should be treated as self-reference for "_"
+                parser: Some("/opt/default.so".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        // Must not hang or panic
+        let resolved = resolve_base_configs(&languages);
+        assert_eq!(
+            resolved[WILDCARD_KEY].parser,
+            Some("/opt/default.so".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_base_configs_self_reference_prevents_wildcard_inheritance() {
+        // A language with base = its own name (self-reference) terminates the
+        // chain before reaching "_", acting as a blank-slate root.
+        // Languages derived from it inherit its config, not "_"'s.
+        let languages = HashMap::from([
+            (
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    base: Some(WILDCARD_KEY.to_string()),
+                    bridge: Some(HashMap::from([(
+                        WILDCARD_KEY.to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "_blank".to_string(),
+                LanguageSettings {
+                    base: Some("_blank".to_string()), // self-ref: chain stops here
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom_lang".to_string(),
+                LanguageSettings {
+                    base: Some("_blank".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let resolved = resolve_base_configs(&languages);
+        let custom = &resolved["custom_lang"];
+
+        // _blank has no bridge, so custom_lang should not inherit "_"'s bridge
+        assert!(
+            custom.bridge.is_none(),
+            "custom_lang should not inherit '_'s bridge — chain stopped at _blank"
+        );
     }
 }
