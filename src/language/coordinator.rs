@@ -85,13 +85,24 @@ impl LanguageCoordinator {
         // Partition languages into (no-base, has-base) groups.
         // HashMap iteration order is arbitrary, so explicit partitioning
         // ensures base languages are loaded before derived ones.
-        let (base_languages, derived_languages): (Vec<_>, Vec<_>) = settings
+        let (loadable_languages, skipped_languages): (Vec<_>, Vec<_>) = settings
             .languages
             .iter()
+            .partition(|(lang_name, config)| !is_inheritance_only_root(lang_name, config));
+        let (base_languages, derived_languages): (Vec<_>, Vec<_>) = loadable_languages
+            .into_iter()
             .partition(|(_, config)| config.base.is_none());
         let mut summary = LanguageLoadSummary::default();
         summary.events.extend(self.config_warning_events());
         let search_paths = self.config_store.search_paths();
+
+        for (lang_name, _) in skipped_languages {
+            debug!(
+                target: "kakehashi::config",
+                "Skipping eager load for inheritance-only language root '{}'",
+                lang_name
+            );
+        }
 
         // Pass 1: Load all languages WITHOUT base (normal path)
         for (lang_name, config) in &base_languages {
@@ -148,6 +159,12 @@ impl LanguageCoordinator {
             };
 
             let base_config = languages.get(base_name);
+            let base_is_inheritance_only = base_config
+                .is_some_and(|base_config| is_inheritance_only_root(base_name, base_config));
+
+            if base_is_inheritance_only {
+                return self.load_standalone_derived_language(derived_name, config, search_paths);
+            }
 
             if base_config.is_none() && config.parser.is_some() {
                 return self.load_standalone_derived_language(derived_name, config, search_paths);
@@ -1093,6 +1110,10 @@ fn truncate_preview(pattern: &str, max_len: usize) -> String {
     }
 }
 
+fn is_inheritance_only_root(language_id: &str, config: &LanguageSettings) -> bool {
+    config.base.as_deref() == Some(language_id) && config.parser.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1705,6 +1726,127 @@ mod tests {
             )),
             "load_settings should not emit warnings for self-referencing base. Events: {:?}",
             summary.events
+        );
+    }
+
+    #[test]
+    fn test_load_settings_skips_wildcard_inheritance_root() {
+        let coordinator = LanguageCoordinator::new();
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "_".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("_".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            !summary.loaded.contains(&"_".to_string()),
+            "wildcard inheritance root should not be recorded as loaded"
+        );
+        assert!(
+            !summary.events.iter().any(|event| matches!(
+                event,
+                LanguageEvent::Log { level, message }
+                    if *level == LanguageLogLevel::Error && message.contains("'_'")
+            )),
+            "wildcard inheritance root should not emit parser load errors: {:?}",
+            summary.events
+        );
+    }
+
+    #[test]
+    fn test_load_settings_skips_named_inheritance_root() {
+        let coordinator = LanguageCoordinator::new();
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "custom_default".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("custom_default".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            !summary.loaded.contains(&"custom_default".to_string()),
+            "named inheritance root should not be recorded as loaded"
+        );
+        assert!(
+            !summary.events.iter().any(|event| matches!(
+                event,
+                LanguageEvent::Log { level, message }
+                    if *level == LanguageLogLevel::Error && message.contains("custom_default")
+            )),
+            "named inheritance root should not emit parser load errors: {:?}",
+            summary.events
+        );
+    }
+
+    #[test]
+    fn test_load_settings_loads_language_through_named_inheritance_root() {
+        let coordinator = LanguageCoordinator::new();
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let grammar_dir = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| cwd.join("deps/tree-sitter").to_string_lossy().to_string());
+        let parser_path = std::path::PathBuf::from(&grammar_dir)
+            .join("parser")
+            .join(format!("markdown.{}", std::env::consts::DLL_EXTENSION));
+        if !parser_path.exists() {
+            eprintln!(
+                "skipping test_load_settings_loads_language_through_named_inheritance_root: parser '{}' does not exist",
+                parser_path.display()
+            );
+            return;
+        }
+
+        let raw_settings = RawWorkspaceSettings {
+            search_paths: Some(vec![grammar_dir]),
+            languages: HashMap::from([
+                (
+                    "markdown".to_string(),
+                    crate::config::settings::LanguageSettings {
+                        base: Some("custom_default".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "custom_default".to_string(),
+                    crate::config::settings::LanguageSettings {
+                        base: Some("custom_default".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let settings = WorkspaceSettings::try_from_settings(&raw_settings, None, make_env(&[]))
+            .expect("settings should resolve");
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            coordinator.has_parser_available("markdown"),
+            "markdown should load via its own language id through the inheritance-only root, summary={summary:?}"
+        );
+        assert!(
+            summary.loaded.contains(&"markdown".to_string()),
+            "markdown should be recorded as loaded, summary={summary:?}"
+        );
+        assert!(
+            !summary.loaded.contains(&"custom_default".to_string()),
+            "named inheritance root should not be recorded as loaded, summary={summary:?}"
         );
     }
 
