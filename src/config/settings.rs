@@ -84,6 +84,15 @@ impl ResolvedAggregationConfig {
     }
 }
 
+fn default_aggregation_strategy_for_method(method: &str) -> AggregationStrategy {
+    match method {
+        "textDocument/diagnostic" | "textDocument/publishDiagnostics" => {
+            AggregationStrategy::Concatenated
+        }
+        _ => AggregationStrategy::Preferred,
+    }
+}
+
 impl BridgeLanguageConfig {
     /// Look up the aggregation entry for a method with field-level wildcard merge.
     ///
@@ -104,7 +113,9 @@ impl BridgeLanguageConfig {
     pub(crate) fn resolve_aggregation(&self, method: &str) -> ResolvedAggregationConfig {
         match self.resolve_aggregation_entry(method) {
             Some(entry) => ResolvedAggregationConfig {
-                strategy: entry.strategy.unwrap_or(AggregationStrategy::Preferred),
+                strategy: entry
+                    .strategy
+                    .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
                 priorities: entry.priorities.unwrap_or_default(),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
@@ -1286,8 +1297,8 @@ kind = "injections""#;
     }
 
     #[test]
-    fn should_resolve_aggregation_strategy_returns_default_when_strategy_is_none() {
-        // Entry exists but strategy = None → falls back to hardcoded Preferred
+    fn should_resolve_aggregation_strategy_uses_handler_default_when_strategy_is_none() {
+        // Entry exists but strategy = None → falls back to the handler default.
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
@@ -1300,7 +1311,7 @@ kind = "injections""#;
             )])),
         };
         let agg = config.resolve_aggregation("textDocument/diagnostic");
-        assert_eq!(agg.strategy, AggregationStrategy::Preferred);
+        assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
     }
 
     #[test]
