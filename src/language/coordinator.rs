@@ -2360,46 +2360,52 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_derived_languages_orders_multi_level_base_chains() {
-        let languages = HashMap::from([
-            (
-                "markdown".to_string(),
-                crate::config::settings::LanguageSettings::default(),
-            ),
-            (
-                "markdown_custom".to_string(),
-                crate::config::settings::LanguageSettings {
-                    base: Some("markdown".to_string()),
-                    ..Default::default()
-                },
-            ),
-            (
-                "rmd".to_string(),
-                crate::config::settings::LanguageSettings {
-                    base: Some("markdown_custom".to_string()),
-                    ..Default::default()
-                },
-            ),
-        ]);
+    fn test_load_settings_multi_level_derived_chain() {
+        // Verifies that a 3-level chain (rmd → markdown_custom → markdown)
+        // loads correctly via on-demand recursive resolution, regardless of
+        // HashMap iteration order.
+        let coordinator = LanguageCoordinator::new();
 
-        let derived_languages = vec![
-            (
-                languages.get_key_value("rmd").unwrap().0,
-                languages.get_key_value("rmd").unwrap().1,
-            ),
-            (
-                languages.get_key_value("markdown_custom").unwrap().0,
-                languages.get_key_value("markdown_custom").unwrap().1,
-            ),
-        ];
+        // Pre-register "markdown" parser so derived languages can find it
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        coordinator
+            .language_registry_for_parallel()
+            .register("markdown".to_string(), language);
 
-        let sorted = LanguageCoordinator::sort_derived_languages(&languages, derived_languages);
-        let sorted_names: Vec<_> = sorted
-            .into_iter()
-            .map(|(language_id, _)| language_id.as_str())
-            .collect();
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            crate::config::settings::LanguageSettings::default(),
+        );
+        languages.insert(
+            "markdown_custom".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown".to_string()),
+                ..Default::default()
+            },
+        );
+        languages.insert(
+            "rmd".to_string(),
+            crate::config::settings::LanguageSettings {
+                base: Some("markdown_custom".to_string()),
+                ..Default::default()
+            },
+        );
+        let settings = WorkspaceSettings {
+            languages,
+            ..Default::default()
+        };
 
-        assert_eq!(sorted_names, vec!["markdown_custom", "rmd"]);
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            summary.loaded.contains(&"markdown_custom".to_string()),
+            "intermediate derived 'markdown_custom' should load"
+        );
+        assert!(
+            summary.loaded.contains(&"rmd".to_string()),
+            "leaf derived 'rmd' should load"
+        );
     }
 
     #[test]
