@@ -72,10 +72,10 @@ pub(crate) struct ResolvedAggregationConfig {
 }
 
 impl ResolvedAggregationConfig {
-    /// Create a config with the given default strategy and all other fields at their defaults.
-    pub(crate) fn with_defaults(default_strategy: AggregationStrategy) -> Self {
+    /// Create a config with all fields at their defaults (`Preferred` strategy).
+    pub(crate) fn with_defaults() -> Self {
         Self {
-            strategy: default_strategy,
+            strategy: AggregationStrategy::Preferred,
             priorities: Vec::new(),
             max_fan_out: None,
         }
@@ -96,18 +96,17 @@ impl BridgeLanguageConfig {
     ///
     /// Performs one config lookup and extracts strategy, priorities, and max_fan_out
     /// together, avoiding redundant resolution when all three are needed.
-    pub(crate) fn resolve_aggregation(
-        &self,
-        method: &str,
-        default_strategy: AggregationStrategy,
-    ) -> ResolvedAggregationConfig {
+    ///
+    /// The ultimate fallback strategy is `Preferred`; configure `languages._` defaults
+    /// to change the per-method strategy.
+    pub(crate) fn resolve_aggregation(&self, method: &str) -> ResolvedAggregationConfig {
         match self.resolve_aggregation_entry(method) {
             Some(entry) => ResolvedAggregationConfig {
-                strategy: entry.strategy.unwrap_or(default_strategy),
+                strategy: entry.strategy.unwrap_or(AggregationStrategy::Preferred),
                 priorities: entry.priorities,
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
-            None => ResolvedAggregationConfig::with_defaults(default_strategy),
+            None => ResolvedAggregationConfig::with_defaults(),
         }
     }
 }
@@ -1210,8 +1209,7 @@ kind = "injections""#;
                 ),
             ])),
         };
-        let agg =
-            config.resolve_aggregation("textDocument/completion", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/completion");
         assert_eq!(agg.priorities, &["server_a".to_string()]);
     }
 
@@ -1227,14 +1225,14 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.priorities, &["server_b".to_string()]);
     }
 
     #[test]
     fn should_resolve_aggregation_priorities_returns_empty_when_no_aggregation() {
         let config = BridgeLanguageConfig::default();
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert!(agg.priorities.is_empty());
     }
 
@@ -1250,8 +1248,7 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config
-            .resolve_aggregation("textDocument/diagnostic", AggregationStrategy::Concatenated);
+        let agg = config.resolve_aggregation("textDocument/diagnostic");
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
     }
 
@@ -1267,20 +1264,21 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
     }
 
     #[test]
     fn should_resolve_aggregation_strategy_returns_default_when_no_aggregation() {
+        // No aggregation config at all → hardcoded Preferred fallback
         let config = BridgeLanguageConfig::default();
-        let agg = config
-            .resolve_aggregation("textDocument/diagnostic", AggregationStrategy::Concatenated);
-        assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
+        let agg = config.resolve_aggregation("textDocument/diagnostic");
+        assert_eq!(agg.strategy, AggregationStrategy::Preferred);
     }
 
     #[test]
     fn should_resolve_aggregation_strategy_returns_default_when_strategy_is_none() {
+        // Entry exists but strategy = None → falls back to hardcoded Preferred
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
@@ -1292,9 +1290,8 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config
-            .resolve_aggregation("textDocument/diagnostic", AggregationStrategy::Concatenated);
-        assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
+        let agg = config.resolve_aggregation("textDocument/diagnostic");
+        assert_eq!(agg.strategy, AggregationStrategy::Preferred);
     }
 
     #[test]
@@ -1319,8 +1316,7 @@ kind = "injections""#;
             ])),
         };
         // Method-specific should win over wildcard
-        let agg =
-            config.resolve_aggregation("textDocument/completion", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/completion");
         assert_eq!(agg.max_fan_out, Some(2));
     }
 
@@ -1336,14 +1332,14 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.max_fan_out, Some(3));
     }
 
     #[test]
     fn should_resolve_aggregation_max_fan_out_none_when_no_aggregation() {
         let config = BridgeLanguageConfig::default();
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.max_fan_out, None);
     }
 
@@ -1370,8 +1366,7 @@ kind = "injections""#;
                 ),
             ])),
         };
-        let agg =
-            config.resolve_aggregation("textDocument/completion", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/completion");
         assert_eq!(
             agg.max_fan_out,
             Some(5),
@@ -1391,7 +1386,7 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.max_fan_out, None);
     }
 
@@ -1407,7 +1402,7 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg = config.resolve_aggregation("textDocument/hover", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.max_fan_out, Some(0));
     }
 
@@ -1424,21 +1419,15 @@ kind = "injections""#;
                 },
             )])),
         };
-        let agg =
-            config.resolve_aggregation("textDocument/completion", AggregationStrategy::Preferred);
+        let agg = config.resolve_aggregation("textDocument/completion");
         assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
         assert_eq!(agg.priorities, vec!["server_a", "server_b"]);
         assert_eq!(agg.max_fan_out, Some(3));
     }
 
     #[test]
-    fn should_resolve_aggregation_with_defaults_uses_given_strategy() {
-        let agg = ResolvedAggregationConfig::with_defaults(AggregationStrategy::Concatenated);
-        assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
-        assert!(agg.priorities.is_empty());
-        assert_eq!(agg.max_fan_out, None);
-
-        let agg = ResolvedAggregationConfig::with_defaults(AggregationStrategy::Preferred);
+    fn should_resolve_aggregation_with_defaults_returns_preferred() {
+        let agg = ResolvedAggregationConfig::with_defaults();
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
         assert!(agg.priorities.is_empty());
         assert_eq!(agg.max_fan_out, None);
@@ -1599,5 +1588,19 @@ kind = "injections""#;
         let config: LanguageSettings = toml::from_str(config_toml).unwrap();
 
         assert!(config.base.is_none());
+    }
+
+    #[test]
+    fn should_resolve_aggregation_defaults_to_preferred_without_explicit_strategy() {
+        // When no aggregation config exists at all, the default strategy should be
+        // Preferred — hardcoded as the sensible fallback per ADR-0024.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: None,
+        };
+        let agg = config.resolve_aggregation("textDocument/hover");
+        assert_eq!(agg.strategy, AggregationStrategy::Preferred);
+        assert!(agg.priorities.is_empty());
+        assert_eq!(agg.max_fan_out, None);
     }
 }

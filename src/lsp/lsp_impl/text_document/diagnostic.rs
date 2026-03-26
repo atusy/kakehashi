@@ -157,7 +157,6 @@ impl Kakehashi {
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/diagnostic",
-                AggregationStrategy::Concatenated,
             );
             let strategy = agg.strategy;
             let region_ctx = DocumentRequestContext {

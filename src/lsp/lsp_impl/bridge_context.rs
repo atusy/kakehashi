@@ -104,11 +104,10 @@ pub(crate) fn resolve_aggregation_config_from_settings(
     host_language: &str,
     injection_language: &str,
     method_name: &str,
-    default_strategy: AggregationStrategy,
 ) -> ResolvedAggregationConfig {
     resolve_bridge_language_config_from_settings(settings, host_language, injection_language)
-        .map(|bridge_config| bridge_config.resolve_aggregation(method_name, default_strategy))
-        .unwrap_or_else(|| ResolvedAggregationConfig::with_defaults(default_strategy))
+        .map(|bridge_config| bridge_config.resolve_aggregation(method_name))
+        .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
 }
 
 impl Kakehashi {
@@ -272,7 +271,6 @@ impl Kakehashi {
             &preamble.language_name,
             &preamble.resolved.injection_language,
             method_name,
-            AggregationStrategy::Preferred,
         );
 
         Some(DocumentRequestContext {
@@ -296,7 +294,6 @@ impl Kakehashi {
         host_language: &str,
         injection_language: &str,
         method_name: &str,
-        default_strategy: AggregationStrategy,
     ) -> ResolvedAggregationConfig {
         let settings = self.settings_manager.load_settings();
         resolve_aggregation_config_from_settings(
@@ -304,7 +301,6 @@ impl Kakehashi {
             host_language,
             injection_language,
             method_name,
-            default_strategy,
         )
     }
 

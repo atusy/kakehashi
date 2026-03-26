@@ -1,4 +1,3 @@
-use crate::config::settings::AggregationStrategy;
 use crate::document::DocumentStore;
 use crate::language::InjectionResolver;
 use crate::language::LanguageCoordinator;
@@ -158,7 +157,6 @@ impl DiagnosticScheduler {
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/publishDiagnostics",
-                AggregationStrategy::Concatenated,
             );
 
             contexts.push(DocumentRequestContext {
