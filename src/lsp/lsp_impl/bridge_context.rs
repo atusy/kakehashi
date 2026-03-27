@@ -84,8 +84,11 @@ fn resolve_bridge_language_config_from_settings(
     host_language: &str,
     injection_language: &str,
 ) -> Option<BridgeLanguageConfig> {
-    // Phase 2 (resolve_base_configs) already merged "_"'s config into every
-    // configured language. Auto-discovered languages (not in config) fall back
+    // Phase 2 (resolve_base_configs) generally resolves inherited settings, so
+    // most configured languages already have "_" merged into them. However,
+    // self-referential roots and detected cycles terminate before wildcard
+    // defaults are applied, so those cases may still rely on the explicit "_"
+    // fallback below. Auto-discovered languages (not in config) also fall back
     // to "_" so they still inherit bridge/aggregation settings.
     settings
         .languages

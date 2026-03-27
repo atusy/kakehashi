@@ -28,14 +28,12 @@ fn updated_settings_after_install(
     if !updated_settings.search_paths.contains(&data_dir_str) {
         updated_settings.search_paths.push(data_dir_str.clone());
 
-        let mut raw_search_paths = updated_raw_settings
+        let raw_search_paths = updated_raw_settings
             .search_paths
-            .clone()
-            .unwrap_or_default();
+            .get_or_insert_with(Default::default);
         if !raw_search_paths.contains(&data_dir_str) {
             raw_search_paths.push(data_dir_str);
         }
-        updated_raw_settings.search_paths = Some(raw_search_paths);
     }
 
     (updated_raw_settings, updated_settings)

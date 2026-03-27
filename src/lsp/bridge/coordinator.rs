@@ -244,9 +244,10 @@ impl BridgeCoordinator {
         host_language: &str,
         injection_language: &str,
     ) -> Option<ResolvedServerConfig> {
-        // Phase 2 (resolve_base_configs) already merged "_"'s config into every
-        // configured language. Auto-discovered languages (not in config) fall back
-        // to "_" so they still inherit bridge filters.
+        // Host-language bridge filters are checked first, with an optional
+        // fallback to the wildcard ("_") entry when the host has no explicit
+        // configuration. This allows using languages._ to define shared
+        // defaults, but does not guarantee that every language inherits them.
         if let Some(host_settings) = settings
             .languages
             .get(host_language)
