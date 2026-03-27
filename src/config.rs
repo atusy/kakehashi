@@ -92,10 +92,13 @@ fn inherited_language_settings<'a>(
     name: &str,
     language: &LanguageSettings,
 ) -> Option<&'a LanguageSettings> {
+    if language.base.as_deref() == Some(name) {
+        return None;
+    }
+
     language
         .base
         .as_deref()
-        .filter(|base| *base != name)
         .and_then(|base| languages.get(base))
         .or_else(|| {
             (name != WILDCARD_KEY)
@@ -993,5 +996,92 @@ mod try_from_settings_tests {
         let current_raw = RawWorkspaceSettings::from(&current);
 
         assert_eq!(current_raw.languages["_blank"].bridge, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_explicit_bridge_override_for_self_referential_root() {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        base: Some("r".to_string()),
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(false),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_explicit_bridge_value_matching_wildcard_for_self_referential_root()
+     {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        base: Some("r".to_string()),
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
+            Some(true)
+        );
     }
 }

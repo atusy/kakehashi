@@ -111,7 +111,8 @@ impl BridgeLanguageConfig {
     /// together, avoiding redundant resolution when all three are needed.
     ///
     /// Fallback rules for `strategy`:
-    /// - No matching aggregation entry: `Preferred`
+    /// - No matching aggregation entry: method default from
+    ///   [`default_aggregation_strategy_for_method`]
     /// - Matching entry with `strategy = None`: method default from
     ///   [`default_aggregation_strategy_for_method`] (`Concatenated` for diagnostics,
     ///   otherwise `Preferred`)
@@ -125,7 +126,11 @@ impl BridgeLanguageConfig {
                 priorities: entry.priorities.unwrap_or_default(),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
-            None => ResolvedAggregationConfig::with_defaults(),
+            None => ResolvedAggregationConfig {
+                strategy: default_aggregation_strategy_for_method(method),
+                priorities: Vec::new(),
+                max_fan_out: None,
+            },
         }
     }
 }
@@ -1296,10 +1301,10 @@ kind = "injections""#;
 
     #[test]
     fn should_resolve_aggregation_strategy_returns_default_when_no_aggregation() {
-        // No aggregation config at all → hardcoded Preferred fallback
+        // No aggregation config at all → method-specific handler default.
         let config = BridgeLanguageConfig::default();
         let agg = config.resolve_aggregation("textDocument/diagnostic");
-        assert_eq!(agg.strategy, AggregationStrategy::Preferred);
+        assert_eq!(agg.strategy, AggregationStrategy::Concatenated);
     }
 
     #[test]
