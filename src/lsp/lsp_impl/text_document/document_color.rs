@@ -6,7 +6,6 @@ use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{ColorInformation, DocumentColorParams};
 
-use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -96,7 +95,6 @@ impl Kakehashi {
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/documentColor",
-                AggregationStrategy::Preferred,
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),

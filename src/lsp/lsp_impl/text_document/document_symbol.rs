@@ -8,7 +8,6 @@ use tower_lsp_server::ls_types::{
     DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Location, SymbolInformation, Uri,
 };
 
-use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
@@ -98,7 +97,6 @@ impl Kakehashi {
                 &language_name,
                 &resolved.injection_language,
                 "textDocument/documentSymbol",
-                AggregationStrategy::Preferred,
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),

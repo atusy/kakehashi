@@ -59,6 +59,7 @@ impl SettingsSource {
 #[derive(Default, Debug)]
 pub struct SettingsLoadOutcome {
     pub settings: Option<WorkspaceSettings>,
+    pub raw_settings: Option<RawWorkspaceSettings>,
     pub events: Vec<SettingsEvent>,
 }
 
@@ -106,6 +107,7 @@ pub fn load_settings(
         .into_iter()
         .reduce(merge_workspace_settings)
         .flatten();
+    let raw_settings = merged.clone();
     let settings =
         merged.and_then(
             |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
@@ -121,7 +123,11 @@ pub fn load_settings(
             },
         );
 
-    SettingsLoadOutcome { settings, events }
+    SettingsLoadOutcome {
+        settings,
+        raw_settings,
+        events,
+    }
 }
 
 /// Load user config and add appropriate events to the events vector.

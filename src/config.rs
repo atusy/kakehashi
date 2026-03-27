@@ -9,7 +9,7 @@ pub(crate) mod user;
 
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
-    merge_bridge_language_configs, merge_bridge_server_configs, merge_language_settings,
+    merge_aggregation_configs, merge_bridge_language_configs, merge_bridge_server_configs,
     merge_workspace_settings, resolve_with_wildcard,
 };
 pub(crate) use settings::{CaptureMappings, QueryTypeMappings};
@@ -66,6 +66,154 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
         capture_mappings,
         auto_install: settings.auto_install.unwrap_or(true),
         language_servers: settings.language_servers.clone().unwrap_or_default(),
+    }
+}
+
+fn strip_inherited_languages(
+    languages: &std::collections::HashMap<String, LanguageSettings>,
+) -> std::collections::HashMap<String, LanguageSettings> {
+    languages
+        .iter()
+        .map(|(name, language)| {
+            let inherited = inherited_language_settings(languages, name, language);
+
+            let stripped = match inherited {
+                Some(base) => strip_inherited_language_settings(base, language),
+                None => language.clone(),
+            };
+
+            (name.clone(), stripped)
+        })
+        .collect()
+}
+
+fn inherited_language_settings<'a>(
+    languages: &'a std::collections::HashMap<String, LanguageSettings>,
+    name: &str,
+    language: &LanguageSettings,
+) -> Option<&'a LanguageSettings> {
+    if language.base.as_deref() == Some(name) {
+        return None;
+    }
+
+    language
+        .base
+        .as_deref()
+        .and_then(|base| languages.get(base))
+        .or_else(|| {
+            (name != WILDCARD_KEY)
+                .then(|| languages.get(WILDCARD_KEY))
+                .flatten()
+        })
+}
+
+fn strip_inherited_language_settings(
+    inherited: &LanguageSettings,
+    current: &LanguageSettings,
+) -> LanguageSettings {
+    LanguageSettings {
+        base: current.base.clone(),
+        parser: (current.parser != inherited.parser)
+            .then(|| current.parser.clone())
+            .flatten(),
+        queries: (current.queries != inherited.queries)
+            .then(|| current.queries.clone())
+            .flatten(),
+        bridge: strip_inherited_bridge_map(inherited.bridge.as_ref(), current.bridge.as_ref()),
+        aliases: (current.aliases != inherited.aliases)
+            .then(|| current.aliases.clone())
+            .flatten(),
+    }
+}
+
+fn strip_inherited_bridge_map(
+    inherited: Option<&std::collections::HashMap<String, settings::BridgeLanguageConfig>>,
+    current: Option<&std::collections::HashMap<String, settings::BridgeLanguageConfig>>,
+) -> Option<std::collections::HashMap<String, settings::BridgeLanguageConfig>> {
+    let current = current?;
+
+    if current.is_empty() {
+        return Some(current.clone());
+    }
+
+    let mut stripped = std::collections::HashMap::new();
+    for (name, current_config) in current {
+        let inherited_config = inherited.and_then(|base| {
+            merge::resolve_with_wildcard(base, name, merge::merge_bridge_language_configs)
+        });
+
+        let stripped_config = match inherited_config {
+            Some(base) => strip_inherited_bridge_language_config(&base, current_config),
+            None => current_config.clone(),
+        };
+
+        if stripped_config != settings::BridgeLanguageConfig::default() {
+            stripped.insert(name.clone(), stripped_config);
+        }
+    }
+
+    (!stripped.is_empty()).then_some(stripped)
+}
+
+fn strip_inherited_bridge_language_config(
+    inherited: &settings::BridgeLanguageConfig,
+    current: &settings::BridgeLanguageConfig,
+) -> settings::BridgeLanguageConfig {
+    settings::BridgeLanguageConfig {
+        enabled: (current.enabled != inherited.enabled)
+            .then_some(current.enabled)
+            .flatten(),
+        aggregation: strip_inherited_aggregation_map(
+            inherited.aggregation.as_ref(),
+            current.aggregation.as_ref(),
+        ),
+    }
+}
+
+fn strip_inherited_aggregation_map(
+    inherited: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
+    current: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
+) -> Option<std::collections::HashMap<String, settings::AggregationConfig>> {
+    let current = current?;
+
+    if current.is_empty() {
+        return Some(current.clone());
+    }
+
+    let mut stripped = std::collections::HashMap::new();
+
+    for (method, current_config) in current {
+        let inherited_config = inherited.and_then(|base| {
+            merge::resolve_with_wildcard(base, method, merge::merge_aggregation_configs)
+        });
+
+        let stripped_config = match inherited_config {
+            Some(base) => strip_inherited_aggregation_config(&base, current_config),
+            None => current_config.clone(),
+        };
+
+        if stripped_config != settings::AggregationConfig::default() {
+            stripped.insert(method.clone(), stripped_config);
+        }
+    }
+
+    (!stripped.is_empty()).then_some(stripped)
+}
+
+fn strip_inherited_aggregation_config(
+    inherited: &settings::AggregationConfig,
+    current: &settings::AggregationConfig,
+) -> settings::AggregationConfig {
+    settings::AggregationConfig {
+        priorities: (current.priorities != inherited.priorities)
+            .then(|| current.priorities.clone())
+            .flatten(),
+        strategy: (current.strategy != inherited.strategy)
+            .then_some(current.strategy)
+            .flatten(),
+        max_fan_out: (current.max_fan_out != inherited.max_fan_out)
+            .then_some(current.max_fan_out)
+            .flatten(),
     }
 }
 
@@ -129,7 +277,7 @@ impl WorkspaceSettings {
 
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: &WorkspaceSettings) -> Self {
-        let languages = settings.languages.clone();
+        let languages = strip_inherited_languages(&settings.languages);
         let capture_mappings = settings
             .capture_mappings
             .iter()
@@ -618,5 +766,322 @@ mod try_from_settings_tests {
         assert!(ws.languages["rmd"].queries.is_some());
         // base field should be preserved
         assert_eq!(ws.languages["rmd"].base, Some("markdown".to_string()));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_implicit_wildcard_inheritance_on_reload() {
+        let initial = RawWorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::from([(
+                                    WILDCARD_KEY.to_string(),
+                                    settings::AggregationConfig {
+                                        priorities: Some(vec!["pyright".to_string()]),
+                                        ..Default::default()
+                                    },
+                                )])),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                ("r".to_string(), LanguageSettings::default()),
+            ]),
+            ..Default::default()
+        };
+
+        let current = WorkspaceSettings::try_from_settings(&initial, None, |_| None).unwrap();
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge, None,
+            "implicit wildcard bridge settings should stay inherited in raw settings"
+        );
+
+        let update = RawWorkspaceSettings {
+            languages: HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "python".to_string(),
+                        settings::BridgeLanguageConfig {
+                            aggregation: Some(HashMap::from([(
+                                WILDCARD_KEY.to_string(),
+                                settings::AggregationConfig {
+                                    priorities: Some(vec!["ruff".to_string()]),
+                                    ..Default::default()
+                                },
+                            )])),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let merged = merge::merge_workspace_settings(Some(current_raw), Some(update)).unwrap();
+        let reloaded = WorkspaceSettings::try_from_settings(&merged, None, |_| None).unwrap();
+
+        let priorities = reloaded.languages["r"].bridge.as_ref().unwrap()["python"]
+            .aggregation
+            .as_ref()
+            .unwrap()[WILDCARD_KEY]
+            .priorities
+            .clone();
+        assert_eq!(priorities, Some(vec!["ruff".to_string()]));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_wildcard_inheritance_when_base_is_missing() {
+        let initial = RawWorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::from([(
+                                    WILDCARD_KEY.to_string(),
+                                    settings::AggregationConfig {
+                                        priorities: Some(vec!["pyright".to_string()]),
+                                        ..Default::default()
+                                    },
+                                )])),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        base: Some("missing".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current = WorkspaceSettings::try_from_settings(&initial, None, |_| None).unwrap();
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge, None,
+            "wildcard bridge settings should stay inherited even when the named base is absent"
+        );
+
+        let update = RawWorkspaceSettings {
+            languages: HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([(
+                        "python".to_string(),
+                        settings::BridgeLanguageConfig {
+                            aggregation: Some(HashMap::from([(
+                                WILDCARD_KEY.to_string(),
+                                settings::AggregationConfig {
+                                    priorities: Some(vec!["ruff".to_string()]),
+                                    ..Default::default()
+                                },
+                            )])),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let merged = merge::merge_workspace_settings(Some(current_raw), Some(update)).unwrap();
+        let reloaded = WorkspaceSettings::try_from_settings(&merged, None, |_| None).unwrap();
+
+        let priorities = reloaded.languages["r"].bridge.as_ref().unwrap()["python"]
+            .aggregation
+            .as_ref()
+            .unwrap()[WILDCARD_KEY]
+            .priorities
+            .clone();
+        assert_eq!(priorities, Some(vec!["ruff".to_string()]));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_explicit_empty_aggregation_map() {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::from([(
+                                    WILDCARD_KEY.to_string(),
+                                    settings::AggregationConfig {
+                                        strategy: Some(settings::AggregationStrategy::Preferred),
+                                        ..Default::default()
+                                    },
+                                )])),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                aggregation: Some(HashMap::new()),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge.as_ref().unwrap()["python"].aggregation,
+            Some(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_keeps_self_referential_language_as_blank_slate_root() {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "_blank".to_string(),
+                    LanguageSettings {
+                        base: Some("_blank".to_string()),
+                        bridge: Some(HashMap::new()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(current_raw.languages["_blank"].bridge, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_explicit_bridge_override_for_self_referential_root() {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        base: Some("r".to_string()),
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(false),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn raw_workspace_settings_from_preserves_explicit_bridge_value_matching_wildcard_for_self_referential_root()
+     {
+        let current = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "r".to_string(),
+                    LanguageSettings {
+                        base: Some("r".to_string()),
+                        bridge: Some(HashMap::from([(
+                            "python".to_string(),
+                            settings::BridgeLanguageConfig {
+                                enabled: Some(true),
+                                ..Default::default()
+                            },
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let current_raw = RawWorkspaceSettings::from(&current);
+
+        assert_eq!(
+            current_raw.languages["r"].bridge.as_ref().unwrap()["python"].enabled,
+            Some(true)
+        );
     }
 }

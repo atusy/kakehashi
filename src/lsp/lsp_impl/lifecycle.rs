@@ -158,11 +158,17 @@ impl Kakehashi {
         // for zero-config experience. Use default_settings() instead of RawWorkspaceSettings::default()
         // because the derived Default creates empty capture_mappings while default_settings() includes
         // the full default capture_mappings (markup.strong → "", etc.)
-        let settings = if let Some(s) = settings_outcome.settings {
-            s
+        let (raw_settings, settings) = if let Some(s) = settings_outcome.settings {
+            (
+                settings_outcome
+                    .raw_settings
+                    .unwrap_or_else(|| crate::config::RawWorkspaceSettings::from(&s)),
+                s,
+            )
         } else {
-            match WorkspaceSettings::try_from_settings(
-                &crate::config::defaults::default_settings(),
+            let raw_settings = crate::config::defaults::default_settings();
+            let settings = match WorkspaceSettings::try_from_settings(
+                &raw_settings,
                 self.home_dir.as_deref(),
                 crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
             ) {
@@ -178,9 +184,10 @@ impl Kakehashi {
                         .await;
                     WorkspaceSettings::default()
                 }
-            }
+            };
+            (raw_settings, settings)
         };
-        self.apply_settings(settings).await;
+        self.apply_raw_settings(raw_settings, settings).await;
 
         self.notifier().log_info("server initialized!").await;
         Ok(InitializeResult {

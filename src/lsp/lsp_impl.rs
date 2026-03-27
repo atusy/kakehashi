@@ -30,7 +30,7 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{Client, LanguageServer};
 use url::Url;
 
-use crate::config::WorkspaceSettings;
+use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
 use crate::document::DocumentStore;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
 use crate::lsp::bridge::BridgeCoordinator;
@@ -87,10 +87,14 @@ pub(super) async fn apply_shared_settings(
     client: &Client,
     language: &std::sync::Arc<LanguageCoordinator>,
     settings_manager: &SettingsManager,
+    raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) {
     let summary = language.load_settings(&settings);
-    settings_manager.apply_settings(settings);
+    match raw_settings {
+        Some(raw_settings) => settings_manager.apply_settings_with_raw(raw_settings, settings),
+        None => settings_manager.apply_settings(settings),
+    }
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
@@ -226,11 +230,16 @@ impl Kakehashi {
         build_notifier(&self.client, &self.settings_manager)
     }
 
-    async fn apply_settings(&self, settings: WorkspaceSettings) {
+    async fn apply_raw_settings(
+        &self,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
         apply_shared_settings(
             &self.client,
             &self.language,
             &self.settings_manager,
+            Some(raw_settings),
             settings,
         )
         .await;

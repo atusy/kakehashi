@@ -18,7 +18,7 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::config::{
-    WorkspaceSettings, merge_bridge_server_configs, merge_language_settings, resolve_with_wildcard,
+    WILDCARD_KEY, WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
     settings::BridgeServerConfig,
 };
 use crate::language::region_id_tracker::{EditInfo, RegionIdTracker};
@@ -244,10 +244,14 @@ impl BridgeCoordinator {
         host_language: &str,
         injection_language: &str,
     ) -> Option<ResolvedServerConfig> {
-        // Use wildcard resolution for host language lookup (ADR-0011)
-        // This allows languages._ to define default bridge filters
-        if let Some(host_settings) =
-            resolve_with_wildcard(&settings.languages, host_language, merge_language_settings)
+        // Host-language bridge filters are checked first, with an optional
+        // fallback to the wildcard ("_") entry when the host has no explicit
+        // configuration. This allows using languages._ to define shared
+        // defaults, but does not guarantee that every language inherits them.
+        if let Some(host_settings) = settings
+            .languages
+            .get(host_language)
+            .or_else(|| settings.languages.get(WILDCARD_KEY))
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -302,8 +306,10 @@ impl BridgeCoordinator {
         injection_language: &str,
     ) -> Vec<ResolvedServerConfig> {
         // Check bridge filter (same logic as get_config_for_language)
-        if let Some(host_settings) =
-            resolve_with_wildcard(&settings.languages, host_language, merge_language_settings)
+        if let Some(host_settings) = settings
+            .languages
+            .get(host_language)
+            .or_else(|| settings.languages.get(WILDCARD_KEY))
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -968,17 +974,20 @@ mod tests {
     }
 
     #[test]
-    fn test_get_config_uses_wildcard_for_undefined_host() {
+    fn test_get_config_blocks_configured_host_with_empty_bridge() {
+        // After Phase 2 (resolve_base_configs), each configured language has "_"'s
+        // bridge config merged in. If "quarto" is explicitly configured with an
+        // empty bridge map (which it would inherit from "_"), it should be blocked.
         let coordinator = BridgeCoordinator::new();
 
-        // Create settings with wildcard that blocks all bridging
+        // "quarto" is explicitly in the map with empty bridge (as Phase 2 would produce)
         let mut languages = HashMap::new();
         languages.insert(
-            "_".to_string(),
+            "quarto".to_string(),
             LanguageSettings {
-                bridge: Some(HashMap::new()),
+                bridge: Some(HashMap::new()), // empty = block all (inherited from "_")
                 ..Default::default()
-            }, // empty = block all
+            },
         );
 
         // Create language server config for rust
@@ -999,11 +1008,11 @@ mod tests {
             ..Default::default()
         };
 
-        // "quarto" is not defined, so it inherits from wildcard which blocks all
+        // "quarto" is configured with an empty bridge — should be blocked
         let result = coordinator.get_config_for_language(&settings, "quarto", "rust");
         assert!(
             result.is_none(),
-            "quarto should inherit wildcard's empty filter"
+            "quarto with empty bridge map should block all bridging"
         );
     }
 
@@ -1176,5 +1185,53 @@ mod tests {
         // Should not panic
         coordinator.abort_all_eager_open();
         assert!(coordinator.eager_open_tasks.is_empty());
+    }
+
+    #[test]
+    fn test_get_config_unconfigured_host_inherits_wildcard_bridge_filter() {
+        // Auto-discovered languages (not in config) should still inherit "_"'s bridge
+        // filter. This tests the scenario where [languages.markdown] is absent but
+        // [languages._] has bridge = { lua = { enabled = false } }.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut languages = HashMap::new();
+        languages.insert(
+            "_".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "lua".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(false),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "lua-language-server".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                languages: vec!["lua".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        // "markdown" is not in settings.languages (auto-discovered at runtime).
+        // It should still inherit "_"'s bridge filter that blocks lua.
+        let result = coordinator.get_config_for_language(&settings, "markdown", "lua");
+        assert!(
+            result.is_none(),
+            "unconfigured host should inherit '_'s bridge filter — lua should be blocked"
+        );
     }
 }

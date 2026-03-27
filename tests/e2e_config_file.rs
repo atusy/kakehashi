@@ -502,3 +502,127 @@ fn test_did_change_configuration_overrides_config_file_and_init_options() {
     );
     assert_eq!(settings["autoInstall"], json!(false));
 }
+
+/// didChangeConfiguration preserves implicit wildcard inheritance for existing languages.
+#[test]
+fn test_did_change_configuration_updates_wildcard_bridge_defaults_for_existing_languages() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(
+        &config,
+        r#"
+[languages._.bridge.python.aggregation._]
+priorities = ["pyright"]
+
+[languages.r]
+"#,
+    )
+    .unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(
+        settings["languages"]["r"]["bridge"],
+        json!(null),
+        "precondition: inherited wildcard bridge settings should remain implicit in raw effective settings"
+    );
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "_": {
+                        "bridge": {
+                            "python": {
+                                "aggregation": {
+                                    "_": {
+                                        "priorities": ["ruff"]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| {
+            s["languages"]["_"]["bridge"]["python"]["aggregation"]["_"]["priorities"]
+                == json!(["ruff"])
+        },
+        "didChangeConfiguration should update wildcard bridge priorities",
+    );
+    assert_eq!(
+        settings["languages"]["r"]["bridge"],
+        json!(null),
+        "existing languages with implicit wildcard inheritance should not materialize copied wildcard bridge settings after reload"
+    );
+}
+
+/// didChangeConfiguration preserves explicit overrides even when they match inherited values.
+#[test]
+fn test_did_change_configuration_preserves_explicit_matching_override() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("base.toml");
+    std::fs::write(
+        &config,
+        r#"
+[languages._.bridge.python]
+enabled = true
+
+[languages.r.bridge.python]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings(&mut client);
+    assert_eq!(
+        settings["languages"]["r"]["bridge"]["python"]["enabled"],
+        json!(true),
+        "precondition: explicit override should remain visible in raw effective settings",
+    );
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "_": {
+                        "bridge": {
+                            "python": {
+                                "enabled": false
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    let settings = poll_effective_settings(
+        &mut client,
+        |s| s["languages"]["_"]["bridge"]["python"]["enabled"] == json!(false),
+        "didChangeConfiguration should update wildcard bridge enabled",
+    );
+    assert_eq!(
+        settings["languages"]["r"]["bridge"]["python"]["enabled"],
+        json!(true),
+        "explicit override should remain after wildcard updates",
+    );
+}

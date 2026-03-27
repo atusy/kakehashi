@@ -1,4 +1,6 @@
-use super::settings::{BridgeLanguageConfig, BridgeServerConfig, LanguageSettings};
+use super::settings::{
+    AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
+};
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
 
@@ -33,9 +35,17 @@ pub(crate) fn merge_bridge_language_configs(
     BridgeLanguageConfig {
         enabled: overlay.enabled.or(base.enabled),
         aggregation: match (&base.aggregation, &overlay.aggregation) {
+            (Some(_), Some(overlay_agg)) if overlay_agg.is_empty() => Some(HashMap::new()),
             (Some(base_agg), Some(overlay_agg)) => {
                 let mut merged = base_agg.clone();
-                merged.extend(overlay_agg.clone());
+                for (method, overlay_config) in overlay_agg {
+                    merged
+                        .entry(method.clone())
+                        .and_modify(|base_config| {
+                            *base_config = merge_aggregation_configs(base_config, overlay_config);
+                        })
+                        .or_insert_with(|| overlay_config.clone());
+                }
                 Some(merged)
             }
             (base_agg, overlay_agg) => overlay_agg.clone().or_else(|| base_agg.clone()),
@@ -100,21 +110,28 @@ pub(crate) fn merge_language_settings(
 ///
 /// Chain termination:
 /// - Self-reference (`base == own name`): normal termination
-/// - `None` base: chain stops (outer `_` wildcard is handled separately)
+/// - `None` base on `_`: terminates (root of all chains)
+/// - `None` base on other languages: implicitly chains to `_`
 /// - Circular reference: terminated at cycle point with a warning
+///
+/// The `base` field in the resolved config is restored to the original value
+/// so that `LanguageCoordinator`'s loading logic is not affected by inherited
+/// `base` values from the chain.
 pub(crate) fn resolve_base_configs(
     languages: &HashMap<String, LanguageSettings>,
 ) -> HashMap<String, LanguageSettings> {
     languages
         .keys()
         .map(|name| {
+            let original_base = languages.get(name).and_then(|s| s.base.clone());
             let chain = build_base_chain(name, languages);
-            let resolved = chain
+            let mut resolved = chain
                 .iter()
                 .rev()
                 .map(|n| languages.get(n).cloned().unwrap_or_default())
                 .reduce(|acc, settings| merge_language_settings(&acc, &settings))
                 .unwrap_or_default();
+            resolved.base = original_base;
             (name.clone(), resolved)
         })
         .collect()
@@ -123,7 +140,10 @@ pub(crate) fn resolve_base_configs(
 /// Build the base chain for a language, from most-specific to least-specific.
 ///
 /// Example: for `rmd` with `base = "markdown"`, and `markdown` with no base,
-/// the chain is `["rmd", "markdown"]`.
+/// the chain is `["rmd", "markdown", "_"]`.
+///
+/// Languages with no explicit `base` implicitly chain to `_` (ADR-0024).
+/// `_` itself terminates when its `base` is `None` or self-referential.
 fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -> Vec<String> {
     let mut chain = vec![name.to_string()];
     let mut visited = HashSet::new();
@@ -132,7 +152,12 @@ fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -
     let mut current = name.to_string();
     loop {
         let base_name = match languages.get(&current).and_then(|s| s.base.as_deref()) {
-            None => break,
+            None => {
+                if current == WILDCARD_KEY {
+                    break; // "_" with no explicit base terminates the chain
+                }
+                WILDCARD_KEY.to_string() // implicit chain to "_"
+            }
             Some(b) => b.to_string(),
         };
 
@@ -158,6 +183,24 @@ fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -
     }
 
     chain
+}
+
+/// Merge two `AggregationConfig`s field-by-field.
+///
+/// - `strategy` / `max_fan_out`: overlay wins if set, else inherits from base
+/// - `priorities`: overlay wins if present, else inherits from base
+pub(crate) fn merge_aggregation_configs(
+    base: &AggregationConfig,
+    overlay: &AggregationConfig,
+) -> AggregationConfig {
+    AggregationConfig {
+        strategy: overlay.strategy.or(base.strategy),
+        priorities: overlay
+            .priorities
+            .clone()
+            .or_else(|| base.priorities.clone()),
+        max_fan_out: overlay.max_fan_out.or(base.max_fan_out),
+    }
 }
 
 /// Deep merge two optional bridge HashMaps.
@@ -1353,7 +1396,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["server_a".to_string()],
+                            priorities: Some(vec!["server_a".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1381,7 +1424,7 @@ mod tests {
         );
         assert_eq!(
             resolved.aggregation.unwrap()["_"].priorities,
-            vec!["server_a".to_string()]
+            Some(vec!["server_a".to_string()])
         );
     }
 
@@ -1397,7 +1440,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1430,7 +1473,7 @@ mod tests {
         );
         assert_eq!(
             python.aggregation.as_ref().unwrap()["_"].priorities,
-            vec!["pyright".to_string()]
+            Some(vec!["pyright".to_string()])
         );
     }
 
@@ -1470,14 +1513,14 @@ mod tests {
                         (
                             "_".to_string(),
                             settings::AggregationConfig {
-                                priorities: vec!["base_default".to_string()],
+                                priorities: Some(vec!["base_default".to_string()]),
                                 ..Default::default()
                             },
                         ),
                         (
                             "textDocument/hover".to_string(),
                             settings::AggregationConfig {
-                                priorities: vec!["base_hover".to_string()],
+                                priorities: Some(vec!["base_hover".to_string()]),
                                 ..Default::default()
                             },
                         ),
@@ -1495,7 +1538,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["overlay_hover".to_string()],
+                            priorities: Some(vec!["overlay_hover".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1512,18 +1555,18 @@ mod tests {
         let agg = python.aggregation.as_ref().unwrap();
         assert_eq!(
             agg["textDocument/hover"].priorities,
-            vec!["overlay_hover".to_string()],
+            Some(vec!["overlay_hover".to_string()]),
             "overlay should win for shared aggregation keys"
         );
         assert_eq!(
             agg["_"].priorities,
-            vec!["base_default".to_string()],
+            Some(vec!["base_default".to_string()]),
             "base-only aggregation keys should be preserved"
         );
     }
 
     #[test]
-    fn test_merge_language_settings_bridge_aggregation_strategy_replaced_atomically() {
+    fn test_merge_language_settings_bridge_aggregation_strategy_inherited_on_same_key() {
         let base = LanguageSettings {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
@@ -1532,7 +1575,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/diagnostic".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["ruff".to_string()],
+                            priorities: Some(vec!["ruff".to_string()]),
                             strategy: Some(settings::AggregationStrategy::Concatenated),
                             ..Default::default()
                         },
@@ -1550,8 +1593,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/diagnostic".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
-                            strategy: Some(settings::AggregationStrategy::Preferred),
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1566,13 +1608,13 @@ mod tests {
 
         assert_eq!(
             diag.priorities,
-            vec!["pyright".to_string()],
+            Some(vec!["pyright".to_string()]),
             "overlay priorities should win"
         );
         assert_eq!(
             diag.strategy,
-            Some(settings::AggregationStrategy::Preferred),
-            "overlay strategy should win atomically"
+            Some(settings::AggregationStrategy::Concatenated),
+            "base strategy should be inherited when overlay omits it"
         );
     }
 
@@ -1603,7 +1645,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1624,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_language_settings_bridge_max_fan_out_lost_on_same_key_replacement() {
+    fn test_merge_language_settings_bridge_max_fan_out_inherited_on_same_key() {
         let base = LanguageSettings {
             bridge: Some(HashMap::from([(
                 "python".to_string(),
@@ -1633,7 +1675,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["ruff".to_string()],
+                            priorities: Some(vec!["ruff".to_string()]),
                             max_fan_out: Some(2),
                             ..Default::default()
                         },
@@ -1651,7 +1693,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         settings::AggregationConfig {
-                            priorities: vec!["pyright".to_string()],
+                            priorities: Some(vec!["pyright".to_string()]),
                             ..Default::default()
                         },
                     )])),
@@ -1666,12 +1708,13 @@ mod tests {
 
         assert_eq!(
             hover.priorities,
-            vec!["pyright".to_string()],
+            Some(vec!["pyright".to_string()]),
             "overlay priorities should win"
         );
         assert_eq!(
-            hover.max_fan_out, None,
-            "base maxFanOut should be lost when overlay replaces the same method key atomically"
+            hover.max_fan_out,
+            Some(2),
+            "base maxFanOut should be inherited when overlay omits it"
         );
     }
 
@@ -1928,5 +1971,233 @@ mod tests {
         // rust -> _: chain is ["rust", "_"], rust's parser wins
         let rust = &languages["rust"];
         assert_eq!(rust.parser, Some("/opt/rust.so".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_base_configs_none_base_chains_to_wildcard() {
+        // A language with base: None should implicitly chain to "_" and inherit
+        // its settings when "_" exists in the map. The language's own base field
+        // must remain None after resolution (not inherit "_"'s self-ref).
+        let languages = HashMap::from([
+            (
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    base: Some(WILDCARD_KEY.to_string()), // self-reference
+                    parser: Some("/opt/default.so".to_string()),
+                    bridge: Some(HashMap::from([(
+                        WILDCARD_KEY.to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "python".to_string(),
+                LanguageSettings {
+                    // base: None — should implicitly chain to "_"
+                    parser: Some("/opt/python.so".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let resolved = resolve_base_configs(&languages);
+        let python = &resolved["python"];
+
+        // parser: python's own wins (most-specific)
+        assert_eq!(python.parser, Some("/opt/python.so".to_string()));
+        // bridge: inherited from "_"
+        assert!(
+            python.bridge.is_some(),
+            "python should inherit bridge from '_'"
+        );
+        // base: original value preserved, not inherited from "_"
+        assert_eq!(python.base, None, "python's base field should remain None");
+    }
+
+    #[test]
+    fn test_resolve_base_configs_wildcard_none_base_terminates() {
+        // "_" with base: None should not cause infinite loop — it terminates.
+        let languages = HashMap::from([(
+            WILDCARD_KEY.to_string(),
+            LanguageSettings {
+                // base: None — should be treated as self-reference for "_"
+                parser: Some("/opt/default.so".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        // Must not hang or panic
+        let resolved = resolve_base_configs(&languages);
+        assert_eq!(
+            resolved[WILDCARD_KEY].parser,
+            Some("/opt/default.so".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_base_configs_self_reference_prevents_wildcard_inheritance() {
+        // A language with base = its own name (self-reference) terminates the
+        // chain before reaching "_", acting as a blank-slate root.
+        // Languages derived from it inherit its config, not "_"'s.
+        let languages = HashMap::from([
+            (
+                WILDCARD_KEY.to_string(),
+                LanguageSettings {
+                    base: Some(WILDCARD_KEY.to_string()),
+                    bridge: Some(HashMap::from([(
+                        WILDCARD_KEY.to_string(),
+                        BridgeLanguageConfig {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            (
+                "_blank".to_string(),
+                LanguageSettings {
+                    base: Some("_blank".to_string()), // self-ref: chain stops here
+                    ..Default::default()
+                },
+            ),
+            (
+                "custom_lang".to_string(),
+                LanguageSettings {
+                    base: Some("_blank".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let resolved = resolve_base_configs(&languages);
+        let custom = &resolved["custom_lang"];
+
+        // _blank has no bridge, so custom_lang should not inherit "_"'s bridge
+        assert!(
+            custom.bridge.is_none(),
+            "custom_lang should not inherit '_'s bridge — chain stopped at _blank"
+        );
+    }
+
+    #[test]
+    fn merge_aggregation_configs_overlay_strategy_wins() {
+        let base = settings::AggregationConfig {
+            strategy: Some(settings::AggregationStrategy::Preferred),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            strategy: Some(settings::AggregationStrategy::Concatenated),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(
+            merged.strategy,
+            Some(settings::AggregationStrategy::Concatenated)
+        );
+    }
+
+    #[test]
+    fn merge_aggregation_configs_inherits_strategy_from_base() {
+        let base = settings::AggregationConfig {
+            strategy: Some(settings::AggregationStrategy::Preferred),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig::default(); // strategy: None
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(
+            merged.strategy,
+            Some(settings::AggregationStrategy::Preferred)
+        );
+    }
+
+    #[test]
+    fn merge_aggregation_configs_non_empty_priorities_win() {
+        let base = settings::AggregationConfig {
+            priorities: Some(vec!["server_base".to_string()]),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            priorities: Some(vec!["server_overlay".to_string()]),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.priorities, Some(vec!["server_overlay".to_string()]));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_none_priorities_inherit_from_base() {
+        let base = settings::AggregationConfig {
+            priorities: Some(vec!["server_base".to_string()]),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig::default(); // priorities: None (inherit)
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.priorities, Some(vec!["server_base".to_string()]));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_explicit_empty_priorities_clear_base() {
+        let base = settings::AggregationConfig {
+            priorities: Some(vec!["server_base".to_string()]),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            priorities: Some(vec![]),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.priorities, Some(vec![]));
+    }
+
+    #[test]
+    fn merge_bridge_language_configs_empty_aggregation_clears_base() {
+        let base = settings::BridgeLanguageConfig {
+            aggregation: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                settings::AggregationConfig {
+                    strategy: Some(settings::AggregationStrategy::Preferred),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+        let overlay = settings::BridgeLanguageConfig {
+            aggregation: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let merged = merge_bridge_language_configs(&base, &overlay);
+
+        assert_eq!(merged.aggregation, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_max_fan_out_overlay_wins() {
+        let base = settings::AggregationConfig {
+            max_fan_out: Some(3),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig {
+            max_fan_out: Some(7),
+            ..Default::default()
+        };
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.max_fan_out, Some(7));
+    }
+
+    #[test]
+    fn merge_aggregation_configs_max_fan_out_inherits_from_base() {
+        let base = settings::AggregationConfig {
+            max_fan_out: Some(5),
+            ..Default::default()
+        };
+        let overlay = settings::AggregationConfig::default(); // max_fan_out: None
+        let merged = merge_aggregation_configs(&base, &overlay);
+        assert_eq!(merged.max_fan_out, Some(5));
     }
 }
