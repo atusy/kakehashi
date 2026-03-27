@@ -168,7 +168,7 @@ impl Kakehashi {
         } else {
             let raw_settings = crate::config::defaults::default_settings();
             let settings = match WorkspaceSettings::try_from_settings(
-                &crate::config::defaults::default_settings(),
+                &raw_settings,
                 self.home_dir.as_deref(),
                 crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
             ) {
