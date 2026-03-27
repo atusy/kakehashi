@@ -25,6 +25,7 @@ use tower_lsp_server::ls_types::{
     ClientCapabilities, GotoCapability, TextDocumentClientCapabilities,
 };
 
+use crate::config::expand::with_kakehashi_defaults;
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
 #[cfg(test)]
 use crate::lsp::client::check_semantic_tokens_refresh_support;
@@ -78,8 +79,13 @@ impl SettingsManager {
     /// - Unset client capabilities (until initialize() calls set_capabilities)
     pub(crate) fn new() -> Self {
         let raw_settings = crate::config::defaults::default_settings();
-        let settings =
-            WorkspaceSettings::try_from_settings(&raw_settings, None, |_| None).unwrap_or_default();
+        let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+        let settings = WorkspaceSettings::try_from_settings(
+            &raw_settings,
+            home.as_deref(),
+            with_kakehashi_defaults(|var| std::env::var(var).ok()),
+        )
+        .unwrap_or_default();
 
         Self {
             root_path: ArcSwap::new(Arc::new(None)),
@@ -428,6 +434,7 @@ mod tests {
         let manager = SettingsManager::new();
         let stored = manager.load_raw_settings();
         let defaults = crate::config::defaults::default_settings();
+        let effective = manager.load_settings();
 
         assert_eq!(
             stored.search_paths, defaults.search_paths,
@@ -440,6 +447,16 @@ mod tests {
         assert_eq!(
             stored.auto_install, defaults.auto_install,
             "new manager should expose default raw auto-install before initialize"
+        );
+        assert!(
+            !effective.search_paths.is_empty(),
+            "new manager should expose default effective search paths before initialize"
+        );
+        assert!(
+            effective
+                .languages
+                .contains_key(crate::config::WILDCARD_KEY),
+            "new manager should expose default wildcard language settings before initialize"
         );
     }
 
