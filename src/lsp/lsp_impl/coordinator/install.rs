@@ -188,10 +188,12 @@ impl InstallCoordinator {
         text: String,
         is_injection: bool,
     ) {
-        let current_raw_settings = self.settings_manager.load_raw_settings();
-        let current_settings = self.settings_manager.load_settings();
-        let (updated_raw_settings, updated_settings) =
-            updated_settings_after_install(&current_raw_settings, &current_settings, data_dir);
+        let settings_snapshot = self.settings_manager.load_settings_pair();
+        let (updated_raw_settings, updated_settings) = updated_settings_after_install(
+            &settings_snapshot.raw_settings,
+            &settings_snapshot.settings,
+            data_dir,
+        );
 
         self.apply_raw_settings(updated_raw_settings, updated_settings)
             .await;
