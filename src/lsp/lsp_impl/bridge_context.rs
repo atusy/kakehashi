@@ -114,6 +114,9 @@ pub(crate) fn resolve_aggregation_config_from_settings(
 ) -> ResolvedAggregationConfig {
     resolve_bridge_language_config_from_settings(settings, host_language, injection_language)
         .map(|bridge_config| bridge_config.resolve_aggregation(method_name))
+        // Intentionally use a stable hard-coded fallback when no bridge config
+        // resolves at all. The wildcard "_" strategy may evolve in the future,
+        // but this path should remain predictable even if wildcard defaults do.
         .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
 }
 
