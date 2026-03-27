@@ -87,9 +87,11 @@ fn resolve_bridge_language_config_from_settings(
     // Phase 2 (resolve_base_configs) generally resolves inherited settings, so
     // most configured languages already have "_" merged into them. However,
     // self-referential roots and detected cycles terminate before wildcard
-    // defaults are applied, so those cases may still rely on the explicit "_"
-    // fallback below. Auto-discovered languages (not in config) also fall back
-    // to "_" so they still inherit bridge/aggregation settings.
+    // defaults are applied. This helper only falls back to "_" when the host
+    // language entry itself is missing, so blank-slate roots keep blocking
+    // wildcard bridge inheritance here. Auto-discovered languages (not in
+    // config) fall back to "_" so they still inherit bridge/aggregation
+    // settings.
     settings
         .languages
         .get(host_language)

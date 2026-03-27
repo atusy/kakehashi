@@ -32,7 +32,9 @@ pub struct AggregationConfig {
     /// `Some(vec![])` = pure first-win behavior, `None` = inherit.
     #[serde(default)]
     pub priorities: Option<Vec<String>>,
-    /// Aggregation strategy override. Omit to use the handler default.
+    /// Aggregation strategy override.
+    /// Omit to inherit from wildcard/base configs; if none is resolved, the
+    /// handler default strategy is used.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
     /// Maximum number of servers to fan out to.
