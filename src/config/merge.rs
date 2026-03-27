@@ -2130,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_aggregation_configs_empty_priorities_inherit_from_base() {
+    fn merge_aggregation_configs_none_priorities_inherit_from_base() {
         let base = settings::AggregationConfig {
             priorities: Some(vec!["server_base".to_string()]),
             ..Default::default()
