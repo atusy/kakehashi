@@ -110,8 +110,12 @@ impl BridgeLanguageConfig {
     /// Performs one config lookup and extracts strategy, priorities, and max_fan_out
     /// together, avoiding redundant resolution when all three are needed.
     ///
-    /// The ultimate fallback strategy is `Preferred`; configure `languages._` defaults
-    /// to change the per-method strategy.
+    /// Fallback rules for `strategy`:
+    /// - No matching aggregation entry: `Preferred`
+    /// - Matching entry with `strategy = None`: method default from
+    ///   [`default_aggregation_strategy_for_method`] (`Concatenated` for diagnostics,
+    ///   otherwise `Preferred`)
+    /// - Matching entry with explicit `strategy`: use that value
     pub(crate) fn resolve_aggregation(&self, method: &str) -> ResolvedAggregationConfig {
         match self.resolve_aggregation_entry(method) {
             Some(entry) => ResolvedAggregationConfig {

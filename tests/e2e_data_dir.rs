@@ -49,8 +49,9 @@ fn get_effective_search_paths(client: &mut LspClient) -> Vec<String> {
         .collect()
 }
 
-/// effectiveConfiguration returns raw (pre-expansion) settings, so searchPaths
-/// contains the `${KAKEHASHI_DATA_DIR}` template regardless of env/flag state.
+/// effectiveConfiguration returns raw (pre-expansion) settings, so with no
+/// `KAKEHASHI_DATA_DIR` env var and no `--data-dir` flag the raw searchPaths
+/// still contains the `${KAKEHASHI_DATA_DIR}` template.
 #[test]
 fn test_search_paths_returns_raw_template() {
     let mut client = LspClient::builder()
