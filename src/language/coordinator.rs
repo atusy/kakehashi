@@ -222,11 +222,32 @@ impl LanguageCoordinator {
             return self.load_standalone_derived_language(derived_name, config, search_paths);
         }
 
+        self.register_derived_from_base(
+            derived_name,
+            base_name,
+            config,
+            base_config,
+            search_paths,
+            &language,
+        )
+    }
+
+    /// Register a derived language by reusing the base's parser and copying
+    /// (or loading) queries. Marks the language as derived in the tracking set.
+    fn register_derived_from_base(
+        &self,
+        derived_name: &str,
+        base_name: &str,
+        config: &LanguageSettings,
+        base_config: Option<&LanguageSettings>,
+        search_paths: &[PathBuf],
+        language: &tree_sitter::Language,
+    ) -> LanguageLoadResult {
         self.language_registry
             .register(derived_name.to_string(), language.clone());
         self.derived_languages
             .write()
-            .recover_poison("LanguageCoordinator::load_derived_language(derived_languages)")
+            .recover_poison("LanguageCoordinator::register_derived_from_base(derived_languages)")
             .insert(derived_name.to_string());
 
         let mut events = Vec::new();
@@ -237,7 +258,7 @@ impl LanguageCoordinator {
                 derived_name,
                 config,
                 search_paths,
-                &language,
+                language,
             ));
         } else {
             for kind in QueryKind::ALL {
