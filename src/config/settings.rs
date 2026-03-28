@@ -99,7 +99,7 @@ impl BridgeLanguageConfig {
     /// Look up the aggregation entry for a method with field-level wildcard merge.
     ///
     /// Uses [`crate::config::resolve_with_wildcard`] so that a method-specific entry
-    /// inherits any unset fields from the `_` wildcard entry (ADR-0024).
+    /// inherits any unset fields from the `_` wildcard entry (ADR-0011).
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
         let map = self.aggregation.as_ref()?;
         crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
@@ -1404,7 +1404,7 @@ kind = "injections""#;
     #[test]
     fn should_resolve_aggregation_entry_inherits_missing_fields_from_wildcard() {
         // When a method-specific AggregationConfig exists but has max_fan_out: None,
-        // the wildcard's max_fan_out IS applied via field-level merge (ADR-0024).
+        // the wildcard's max_fan_out IS applied via field-level merge (ADR-0011).
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([
@@ -1651,7 +1651,7 @@ kind = "injections""#;
     #[test]
     fn should_resolve_aggregation_defaults_to_preferred_without_explicit_strategy() {
         // When no aggregation config exists at all, the default strategy should be
-        // Preferred — hardcoded as the sensible fallback per ADR-0024.
+        // Preferred — the hardcoded default when no explicit strategy is configured.
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: None,

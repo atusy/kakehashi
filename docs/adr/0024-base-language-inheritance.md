@@ -124,7 +124,7 @@ Syntect-based token normalization (e.g., `py` -> `python`) remains unchanged —
 
 ### Removed: `aliases` Field
 
-The `aliases` field is removed from language configuration with/without a deprecation period. Breaking changes can be introduced without deprecation periods until the product releases v1.0.
+The `aliases` field is removed from language configuration with a deprecation warning. When `aliases` is still present, the server emits a client-visible warning with migration guidance.
 
 **Migration**: Each `aliases = ["x", "y"]` on language `L` becomes:
 
@@ -154,7 +154,7 @@ base = "L"
 
 ### Negative
 
-- **Silent breaking change**: Existing `aliases` fields are silently ignored — languages that relied on aliases will stop working without warning. Users must migrate to `base` declarations.
+- **Breaking change**: Existing `aliases` fields trigger a deprecation warning with migration guidance, but the aliases themselves are no longer functional. Users must migrate to `base` declarations.
 - **Longer resolution chains**: Multi-level chains add resolution complexity and make it harder to debug "where did this config value come from?"
 - **Parser symbol name coupling**: Loading a base language's parser requires knowing the base language name for the `tree_sitter_<lang>` symbol lookup in the shared library
 - **Verbose for pure aliases**: `[languages.rmd]\nbase = "markdown"` is more verbose than `aliases = ["rmd"]` when no customization is needed
