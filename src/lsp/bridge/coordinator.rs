@@ -18,7 +18,7 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::config::{
-    WILDCARD_KEY, WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
+    WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
     settings::BridgeServerConfig,
 };
 use crate::language::region_id_tracker::{EditInfo, RegionIdTracker};
@@ -248,10 +248,7 @@ impl BridgeCoordinator {
         // fallback to the wildcard ("_") entry when the host has no explicit
         // configuration. This allows using languages._ to define shared
         // defaults, but does not guarantee that every language inherits them.
-        if let Some(host_settings) = settings
-            .languages
-            .get(host_language)
-            .or_else(|| settings.languages.get(WILDCARD_KEY))
+        if let Some(host_settings) = settings.resolve_host_language_settings(host_language)
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(
@@ -306,10 +303,7 @@ impl BridgeCoordinator {
         injection_language: &str,
     ) -> Vec<ResolvedServerConfig> {
         // Check bridge filter (same logic as get_config_for_language)
-        if let Some(host_settings) = settings
-            .languages
-            .get(host_language)
-            .or_else(|| settings.languages.get(WILDCARD_KEY))
+        if let Some(host_settings) = settings.resolve_host_language_settings(host_language)
             && !host_settings.is_language_bridgeable(injection_language)
         {
             log::debug!(

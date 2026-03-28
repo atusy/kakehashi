@@ -275,6 +275,17 @@ impl WorkspaceSettings {
             Err(expand::ExpandErrors(errors))
         }
     }
+
+    /// Look up language settings for a host language, falling back to the
+    /// wildcard (`"_"`) entry when the host has no explicit configuration.
+    pub(crate) fn resolve_host_language_settings(
+        &self,
+        host_language: &str,
+    ) -> Option<&LanguageSettings> {
+        self.languages
+            .get(host_language)
+            .or_else(|| self.languages.get(WILDCARD_KEY))
+    }
 }
 
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {

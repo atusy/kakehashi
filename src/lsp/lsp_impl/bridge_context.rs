@@ -93,9 +93,7 @@ fn resolve_bridge_language_config_from_settings(
     // config) fall back to "_" so they still inherit bridge/aggregation
     // settings.
     settings
-        .languages
-        .get(host_language)
-        .or_else(|| settings.languages.get(crate::config::WILDCARD_KEY))
+        .resolve_host_language_settings(host_language)
         .and_then(|lang_settings| lang_settings.bridge.as_ref())
         .and_then(|bridge_map| {
             crate::config::resolve_with_wildcard(
