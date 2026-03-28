@@ -250,7 +250,9 @@ impl WorkspaceSettings {
         let mut lang_names: Vec<_> = ws.languages.keys().cloned().collect();
         lang_names.sort();
         for name in lang_names {
-            let lang = ws.languages.get_mut(&name).unwrap();
+            let Some(lang) = ws.languages.get_mut(&name) else {
+                continue;
+            };
             if let Some(parser) = lang.parser.as_mut() {
                 match expand::expand_path(parser, home, &env_fn) {
                     Ok(expanded) => *parser = expanded,
