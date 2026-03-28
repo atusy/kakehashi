@@ -4,7 +4,7 @@ use tree_sitter::Language;
 
 /// Registry for managing loaded Tree-sitter languages
 #[derive(Clone)]
-pub struct LanguageRegistry {
+pub(crate) struct LanguageRegistry {
     languages: Arc<DashMap<String, Language>>,
 }
 
@@ -15,31 +15,31 @@ impl Default for LanguageRegistry {
 }
 
 impl LanguageRegistry {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             languages: Arc::new(DashMap::new()),
         }
     }
 
     /// Register a language with the given ID
-    pub fn register(&self, language_id: String, language: Language) {
+    pub(crate) fn register(&self, language_id: String, language: Language) {
         self.languages.insert(language_id, language);
     }
 
     /// Remove a language registration by ID.
-    pub fn unregister(&self, language_id: &str) {
+    pub(crate) fn unregister(&self, language_id: &str) {
         self.languages.remove(language_id);
     }
 
     /// Get a language by ID
-    pub fn get(&self, language_id: &str) -> Option<Language> {
+    pub(crate) fn get(&self, language_id: &str) -> Option<Language> {
         self.languages
             .get(language_id)
             .map(|entry| entry.value().clone())
     }
 
     /// Check if a language is registered
-    pub fn contains(&self, language_id: &str) -> bool {
+    pub(crate) fn contains(&self, language_id: &str) -> bool {
         self.languages.contains_key(language_id)
     }
 }
