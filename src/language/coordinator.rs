@@ -21,7 +21,7 @@ const MAX_PREVIEW_LEN: usize = 60;
 /// Context for loading a query, including metadata for log messages.
 struct QueryLoadContext<'a> {
     language_id: &'a str,
-    query_type: &'a str,
+    query_kind: QueryKind,
 }
 
 /// Coordinates language runtime components (registry, queries, configs).
@@ -253,17 +253,11 @@ impl LanguageCoordinator {
                     &language,
                 ));
             } else {
-                if let Some(query) = self.query_store.highlight_query(base_name) {
-                    self.query_store
-                        .insert_highlight_query(derived_name.to_string(), query);
-                }
-                if let Some(query) = self.query_store.locals_query(base_name) {
-                    self.query_store
-                        .insert_locals_query(derived_name.to_string(), query);
-                }
-                if let Some(query) = self.query_store.injection_query(base_name) {
-                    self.query_store
-                        .insert_injection_query(derived_name.to_string(), query);
+                for kind in QueryKind::ALL {
+                    if let Some(query) = self.query_store.get_query(kind, base_name) {
+                        self.query_store
+                            .insert_query(kind, derived_name.to_string(), query);
+                    }
                 }
             }
 
@@ -544,22 +538,17 @@ impl LanguageCoordinator {
         context: &str,
         events: &mut Vec<LanguageEvent>,
     ) {
-        for query_type in ["highlights", "locals", "injections"] {
+        for query_kind in QueryKind::ALL {
             self.load_query(
                 language,
                 search_paths,
                 QueryLoadContext {
                     language_id: lang_name,
-                    query_type,
+                    query_kind,
                 },
                 context,
                 events,
-                |store, query| match query_type {
-                    "highlights" => store.insert_highlight_query(lang_name.to_string(), query),
-                    "locals" => store.insert_locals_query(lang_name.to_string(), query),
-                    "injections" => store.insert_injection_query(lang_name.to_string(), query),
-                    _ => unreachable!(),
-                },
+                |store, query| store.insert_query(query_kind, lang_name.to_string(), query),
             );
         }
     }
@@ -574,12 +563,12 @@ impl LanguageCoordinator {
         events: &mut Vec<LanguageEvent>,
         insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
     ) {
-        let filename = format!("{}.scm", ctx.query_type);
+        let filename = ctx.query_kind.filename();
         let result = match QueryLoader::load_query_with_inheritance(
             language,
             paths,
             ctx.language_id,
-            &filename,
+            filename,
         ) {
             Ok(r) => r,
             Err(_) => {
@@ -592,7 +581,12 @@ impl LanguageCoordinator {
         };
 
         let query_label = format!("{}/{}", ctx.language_id, filename);
-        let success_prefix = format!("{} {} for {}", context, ctx.query_type, ctx.language_id);
+        let success_prefix = format!(
+            "{} {} for {}",
+            context,
+            ctx.query_kind.name(),
+            ctx.language_id
+        );
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
 
@@ -612,15 +606,20 @@ impl LanguageCoordinator {
                     LanguageLogLevel::Error,
                     format!(
                         "Failed to load {} query for {}: {err}",
-                        ctx.query_type, ctx.language_id
+                        ctx.query_kind.name(),
+                        ctx.language_id
                     ),
                 ));
                 return;
             }
         };
 
-        let query_label = format!("{} {} query", ctx.language_id, ctx.query_type);
-        let success_prefix = format!("{} query loaded for {}", ctx.query_type, ctx.language_id);
+        let query_label = format!("{} {} query", ctx.language_id, ctx.query_kind.name());
+        let success_prefix = format!(
+            "{} query loaded for {}",
+            ctx.query_kind.name(),
+            ctx.language_id
+        );
         self.process_query_result(result, &query_label, &success_prefix, events, insert_fn);
     }
 
@@ -1061,10 +1060,10 @@ impl LanguageCoordinator {
             }
         }
 
-        for (query_type, paths) in [
-            ("highlights", &highlights),
-            ("locals", &locals),
-            ("injections", &injections),
+        for (query_kind, paths) in [
+            (QueryKind::Highlights, &highlights),
+            (QueryKind::Locals, &locals),
+            (QueryKind::Injections, &injections),
         ] {
             if !paths.is_empty() {
                 self.load_query_from_paths(
@@ -1072,15 +1071,10 @@ impl LanguageCoordinator {
                     paths,
                     QueryLoadContext {
                         language_id: lang_name,
-                        query_type,
+                        query_kind,
                     },
                     &mut events,
-                    |store, q| match query_type {
-                        "highlights" => store.insert_highlight_query(lang_name.to_string(), q),
-                        "locals" => store.insert_locals_query(lang_name.to_string(), q),
-                        "injections" => store.insert_injection_query(lang_name.to_string(), q),
-                        _ => unreachable!(),
-                    },
+                    |store, q| store.insert_query(query_kind, lang_name.to_string(), q),
                 );
             }
         }

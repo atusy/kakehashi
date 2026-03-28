@@ -183,6 +183,33 @@ pub enum QueryKind {
     Injections,
 }
 
+impl QueryKind {
+    /// All query kinds in standard processing order.
+    pub const ALL: [QueryKind; 3] = [
+        QueryKind::Highlights,
+        QueryKind::Locals,
+        QueryKind::Injections,
+    ];
+
+    /// The lowercase name used in filenames and log messages (e.g. `"highlights"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            QueryKind::Highlights => "highlights",
+            QueryKind::Locals => "locals",
+            QueryKind::Injections => "injections",
+        }
+    }
+
+    /// The query filename (e.g. `"highlights.scm"`).
+    pub fn filename(self) -> &'static str {
+        match self {
+            QueryKind::Highlights => "highlights.scm",
+            QueryKind::Locals => "locals.scm",
+            QueryKind::Injections => "injections.scm",
+        }
+    }
+}
+
 /// A single query file configuration entry.
 ///
 /// Used in the unified `queries` array to specify query files with optional type.
