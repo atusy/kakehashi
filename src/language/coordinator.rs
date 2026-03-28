@@ -197,57 +197,23 @@ impl LanguageCoordinator {
         }
 
         // Ensure base language is loaded (may need dynamic load from search paths)
-        if !self.language_registry.contains(base_name) {
-            let base_result = match base_config {
-                Some(base_config) if !visiting.contains(base_name) => {
-                    if base_config.base.is_some() {
-                        self.load_derived_language(
-                            base_name,
-                            base_config,
-                            languages,
-                            search_paths,
-                            visiting,
-                        )
-                    } else {
-                        self.load_single_language(base_name, base_config, search_paths)
-                    }
-                }
-                Some(_) => LanguageLoadResult::failure_with(LanguageEvent::log(
-                    LanguageLogLevel::Error,
-                    format!(
-                        "Cannot load derived language '{derived_name}': \
-                         base language '{base_name}' is part of a circular chain"
-                    ),
-                )),
-                None => self.try_load_language_by_id(base_name),
-            };
-            if !base_result.success {
-                if config.parser.is_some() {
-                    return self.load_standalone_derived_language(
-                        derived_name,
-                        config,
-                        search_paths,
-                    );
-                }
-                return LanguageLoadResult::failure_with(LanguageEvent::log(
-                    LanguageLogLevel::Error,
-                    format!(
-                        "Cannot load derived language '{derived_name}': \
-                         base language '{base_name}' not found"
-                    ),
-                ));
-            }
+        if let Err(result) = self.ensure_base_loaded(
+            derived_name,
+            base_name,
+            config,
+            languages,
+            search_paths,
+            visiting,
+        ) {
+            return result;
         }
 
         // Get the base's Language object and register under derived name
-        let language = match self.language_registry.get(base_name) {
-            Some(lang) => lang,
-            None => {
-                return LanguageLoadResult::failure_with(LanguageEvent::log(
-                    LanguageLogLevel::Error,
-                    format!("Base language '{base_name}' was loaded but not found in registry"),
-                ));
-            }
+        let Some(language) = self.language_registry.get(base_name) else {
+            return LanguageLoadResult::failure_with(LanguageEvent::log(
+                LanguageLogLevel::Error,
+                format!("Base language '{base_name}' was loaded but not found in registry"),
+            ));
         };
 
         if let Some(base_config) = base_config
@@ -293,6 +259,64 @@ impl LanguageCoordinator {
         }
 
         LanguageLoadResult::success_with(events)
+    }
+
+    /// Ensure the base language is loaded into the registry.
+    ///
+    /// Returns `Ok(())` if the base is already loaded or was successfully loaded.
+    /// Returns `Err(LanguageLoadResult)` if loading failed — the caller should
+    /// return that result directly (it may be a standalone fallback or an error).
+    fn ensure_base_loaded(
+        &self,
+        derived_name: &str,
+        base_name: &str,
+        derived_config: &LanguageSettings,
+        languages: &HashMap<String, LanguageSettings>,
+        search_paths: &[PathBuf],
+        visiting: &mut HashSet<String>,
+    ) -> Result<(), LanguageLoadResult> {
+        if self.language_registry.contains(base_name) {
+            return Ok(());
+        }
+
+        let base_config = languages.get(base_name);
+        let base_result = match base_config {
+            Some(base_config) if !visiting.contains(base_name) => {
+                if base_config.base.is_some() {
+                    self.load_derived_language(
+                        base_name,
+                        base_config,
+                        languages,
+                        search_paths,
+                        visiting,
+                    )
+                } else {
+                    self.load_single_language(base_name, base_config, search_paths)
+                }
+            }
+            Some(_) => LanguageLoadResult::failure_with(LanguageEvent::log(
+                LanguageLogLevel::Error,
+                format!(
+                    "Cannot load derived language '{derived_name}': \
+                     base language '{base_name}' is part of a circular chain"
+                ),
+            )),
+            None => self.try_load_language_by_id(base_name),
+        };
+
+        if base_result.success {
+            Ok(())
+        } else if derived_config.parser.is_some() {
+            Err(self.load_standalone_derived_language(derived_name, derived_config, search_paths))
+        } else {
+            Err(LanguageLoadResult::failure_with(LanguageEvent::log(
+                LanguageLogLevel::Error,
+                format!(
+                    "Cannot load derived language '{derived_name}': \
+                     base language '{base_name}' not found"
+                ),
+            )))
+        }
     }
 
     fn load_standalone_derived_language(
