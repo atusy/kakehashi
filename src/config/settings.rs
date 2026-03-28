@@ -1634,4 +1634,28 @@ kind = "injections""#;
         assert!(agg.priorities.is_empty());
         assert_eq!(agg.max_fan_out, None);
     }
+
+    #[test]
+    fn default_strategy_is_concatenated_for_diagnostics() {
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/diagnostic"),
+            AggregationStrategy::Concatenated
+        );
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/publishDiagnostics"),
+            AggregationStrategy::Concatenated
+        );
+    }
+
+    #[test]
+    fn default_strategy_is_preferred_for_other_methods() {
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/hover"),
+            AggregationStrategy::Preferred
+        );
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/completion"),
+            AggregationStrategy::Preferred
+        );
+    }
 }

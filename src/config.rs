@@ -556,6 +556,167 @@ mod tests {
 }
 
 #[cfg(test)]
+mod strip_inherited_tests {
+    use super::*;
+    use settings::{AggregationConfig, AggregationStrategy, BridgeLanguageConfig};
+    use std::collections::HashMap;
+
+    // --- strip_inherited_language_settings ---
+
+    #[test]
+    fn strips_all_fields_when_matching_inherited() {
+        let inherited = LanguageSettings {
+            parser: Some("/path/to/parser".to_string()),
+            queries: Some(vec![]),
+            ..Default::default()
+        };
+        let current = inherited.clone();
+        let result = strip_inherited_language_settings(&inherited, &current);
+        assert_eq!(result.parser, None);
+        assert_eq!(result.queries, None);
+    }
+
+    #[test]
+    fn preserves_differing_fields() {
+        let inherited = LanguageSettings {
+            parser: Some("/path/to/base".to_string()),
+            ..Default::default()
+        };
+        let current = LanguageSettings {
+            parser: Some("/path/to/custom".to_string()),
+            ..Default::default()
+        };
+        let result = strip_inherited_language_settings(&inherited, &current);
+        assert_eq!(result.parser, Some("/path/to/custom".to_string()));
+    }
+
+    #[test]
+    fn preserves_base_field_always() {
+        let inherited = LanguageSettings::default();
+        let current = LanguageSettings {
+            base: Some("markdown".to_string()),
+            ..Default::default()
+        };
+        let result = strip_inherited_language_settings(&inherited, &current);
+        assert_eq!(result.base, Some("markdown".to_string()));
+    }
+
+    // --- strip_inherited_bridge_map ---
+
+    #[test]
+    fn bridge_map_none_returns_none() {
+        let result = strip_inherited_bridge_map(None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn bridge_map_empty_current_preserved() {
+        let result = strip_inherited_bridge_map(Some(&HashMap::new()), Some(&HashMap::new()));
+        assert_eq!(result, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn bridge_map_strips_matching_keys_keeps_differing() {
+        let inherited = HashMap::from([(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )]);
+        let current = HashMap::from([
+            (
+                "python".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lua".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let result = strip_inherited_bridge_map(Some(&inherited), Some(&current));
+        let result = result.unwrap();
+        assert!(
+            !result.contains_key("python"),
+            "python should be stripped (matches inherited)"
+        );
+        assert!(
+            result.contains_key("lua"),
+            "lua should be preserved (not in inherited)"
+        );
+    }
+
+    // --- strip_inherited_aggregation_map ---
+
+    #[test]
+    fn aggregation_map_strips_matching_preserves_differing() {
+        let inherited = HashMap::from([(
+            WILDCARD_KEY.to_string(),
+            AggregationConfig {
+                strategy: Some(AggregationStrategy::Preferred),
+                ..Default::default()
+            },
+        )]);
+        let current = HashMap::from([
+            (
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::Preferred),
+                    ..Default::default()
+                },
+            ),
+            (
+                "textDocument/diagnostic".to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::Concatenated),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let result = strip_inherited_aggregation_map(Some(&inherited), Some(&current));
+        let result = result.unwrap();
+        assert!(
+            !result.contains_key(WILDCARD_KEY),
+            "wildcard should be stripped (matches inherited)"
+        );
+        assert!(
+            result.contains_key("textDocument/diagnostic"),
+            "diagnostic should be preserved (strategy differs)"
+        );
+    }
+
+    #[test]
+    fn aggregation_config_strips_matching_priorities() {
+        let inherited = AggregationConfig {
+            priorities: Some(vec!["pyright".to_string()]),
+            strategy: Some(AggregationStrategy::Preferred),
+            max_fan_out: Some(2),
+        };
+        let current = AggregationConfig {
+            priorities: Some(vec!["pyright".to_string()]),
+            strategy: Some(AggregationStrategy::Concatenated),
+            max_fan_out: Some(2),
+        };
+        let result = strip_inherited_aggregation_config(&inherited, &current);
+        assert_eq!(result.priorities, None, "priorities match → stripped");
+        assert_eq!(
+            result.strategy,
+            Some(AggregationStrategy::Concatenated),
+            "strategy differs → preserved"
+        );
+        assert_eq!(result.max_fan_out, None, "max_fan_out matches → stripped");
+    }
+}
+
+#[cfg(test)]
 mod try_from_settings_tests {
     use super::*;
     use expand::make_env;
