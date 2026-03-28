@@ -3,6 +3,8 @@ pub(crate) mod expand;
 pub(crate) mod merge;
 pub mod settings;
 
+use std::collections::HashMap;
+
 #[cfg(test)]
 pub(crate) use expand::make_env;
 pub(crate) mod user;
@@ -70,8 +72,8 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
 }
 
 fn strip_inherited_languages(
-    languages: &std::collections::HashMap<String, LanguageSettings>,
-) -> std::collections::HashMap<String, LanguageSettings> {
+    languages: &HashMap<String, LanguageSettings>,
+) -> HashMap<String, LanguageSettings> {
     languages
         .iter()
         .map(|(name, language)| {
@@ -88,7 +90,7 @@ fn strip_inherited_languages(
 }
 
 fn inherited_language_settings<'a>(
-    languages: &'a std::collections::HashMap<String, LanguageSettings>,
+    languages: &'a HashMap<String, LanguageSettings>,
     name: &str,
     language: &LanguageSettings,
 ) -> Option<&'a LanguageSettings> {
@@ -127,16 +129,16 @@ fn strip_inherited_language_settings(
 }
 
 fn strip_inherited_bridge_map(
-    inherited: Option<&std::collections::HashMap<String, settings::BridgeLanguageConfig>>,
-    current: Option<&std::collections::HashMap<String, settings::BridgeLanguageConfig>>,
-) -> Option<std::collections::HashMap<String, settings::BridgeLanguageConfig>> {
+    inherited: Option<&HashMap<String, settings::BridgeLanguageConfig>>,
+    current: Option<&HashMap<String, settings::BridgeLanguageConfig>>,
+) -> Option<HashMap<String, settings::BridgeLanguageConfig>> {
     let current = current?;
 
     if current.is_empty() {
         return Some(current.clone());
     }
 
-    let mut stripped = std::collections::HashMap::new();
+    let mut stripped = HashMap::new();
     for (name, current_config) in current {
         let inherited_config = inherited.and_then(|base| {
             merge::resolve_with_wildcard(base, name, merge::merge_bridge_language_configs)
@@ -171,16 +173,16 @@ fn strip_inherited_bridge_language_config(
 }
 
 fn strip_inherited_aggregation_map(
-    inherited: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
-    current: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
-) -> Option<std::collections::HashMap<String, settings::AggregationConfig>> {
+    inherited: Option<&HashMap<String, settings::AggregationConfig>>,
+    current: Option<&HashMap<String, settings::AggregationConfig>>,
+) -> Option<HashMap<String, settings::AggregationConfig>> {
     let current = current?;
 
     if current.is_empty() {
         return Some(current.clone());
     }
 
-    let mut stripped = std::collections::HashMap::new();
+    let mut stripped = HashMap::new();
 
     for (method, current_config) in current {
         let inherited_config = inherited.and_then(|base| {
@@ -328,7 +330,6 @@ impl From<WorkspaceSettings> for RawWorkspaceSettings {
 mod tests {
     use super::*;
     use rstest::rstest;
-    use std::collections::HashMap;
 
     #[test]
     fn test_capture_mapping_handles_at_prefix() {
@@ -572,7 +573,6 @@ mod tests {
 mod strip_inherited_tests {
     use super::*;
     use settings::{AggregationConfig, AggregationStrategy, BridgeLanguageConfig};
-    use std::collections::HashMap;
 
     // --- strip_inherited_language_settings ---
 
@@ -734,7 +734,6 @@ mod try_from_settings_tests {
     use super::*;
     use expand::make_env;
     use settings::{QueryItem, QueryKind};
-    use std::collections::HashMap;
 
     #[test]
     fn expands_search_paths() {
