@@ -391,14 +391,13 @@ impl LanguageCoordinator {
     }
 
     fn config_warning_events(&self) -> Vec<LanguageEvent> {
-        let warnings = self
+        let mut warnings = self
             .config_warnings
-            .read()
+            .write()
             .recover_poison("LanguageCoordinator::config_warning_events");
 
         warnings
-            .iter()
-            .cloned()
+            .drain(..)
             .map(|message| LanguageEvent::show_message(LanguageLogLevel::Warning, message))
             .collect()
     }
