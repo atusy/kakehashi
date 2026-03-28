@@ -66,3 +66,20 @@ fn test_search_paths_returns_raw_template() {
         "raw searchPaths should preserve the template variable"
     );
 }
+
+/// When KAKEHASHI_DATA_DIR env var is set, effectiveConfiguration still shows
+/// the raw template — expansion happens internally, not in the raw config.
+#[test]
+fn test_env_var_does_not_affect_raw_search_paths() {
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_DATA_DIR", "/tmp/kakehashi_test_data")
+        .build();
+
+    let paths = get_effective_search_paths(&mut client);
+
+    assert_eq!(
+        paths,
+        vec!["${KAKEHASHI_DATA_DIR}"],
+        "raw searchPaths should still show template even with env var set"
+    );
+}
