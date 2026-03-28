@@ -111,14 +111,19 @@ impl LanguageCoordinator {
         }
 
         // Pass 2: For each language WITH base, register base's parser and queries
-        // under the derived name
+        // under the derived name.
+        // A single visiting set is shared across all iterations so that cycle
+        // detection spans the entire pass (each recursive load_derived_language
+        // call already shares the set via &mut, but a shared top-level set
+        // avoids redundant cycle re-discovery between iterations).
+        let mut visiting = HashSet::new();
         for (derived_name, config) in &derived_languages {
             let result = self.load_derived_language(
                 derived_name,
                 config,
                 &settings.languages,
                 &search_paths,
-                &mut HashSet::new(),
+                &mut visiting,
             );
             summary.record(derived_name, result);
         }
@@ -2333,6 +2338,54 @@ mod tests {
         assert!(
             summary.loaded.contains(&"derived-rust".to_string()),
             "derived-rust should be recorded as loaded, summary={summary:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_settings_detects_mutual_cycle_between_derived_languages() {
+        // Two derived languages that reference each other: A base=B, B base=A
+        // Neither has a parser, so neither can fall back to standalone loading.
+        // Both should fail with cycle/not-found errors (not hang or succeed silently).
+        let coordinator = LanguageCoordinator::new();
+
+        let unresolved_languages = HashMap::from([
+            (
+                "lang_a".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("lang_b".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lang_b".to_string(),
+                crate::config::settings::LanguageSettings {
+                    base: Some("lang_a".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = WorkspaceSettings {
+            languages: crate::config::merge::resolve_base_configs(&unresolved_languages),
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_settings(&settings);
+
+        assert!(
+            !coordinator.has_parser_available("lang_a"),
+            "lang_a should not load (mutual cycle), summary={summary:?}"
+        );
+        assert!(
+            !coordinator.has_parser_available("lang_b"),
+            "lang_b should not load (mutual cycle), summary={summary:?}"
+        );
+        assert!(
+            !summary.loaded.contains(&"lang_a".to_string()),
+            "lang_a should not be in loaded list, summary={summary:?}"
+        );
+        assert!(
+            !summary.loaded.contains(&"lang_b".to_string()),
+            "lang_b should not be in loaded list, summary={summary:?}"
         );
     }
 
