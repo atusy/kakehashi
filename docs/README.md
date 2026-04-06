@@ -1,6 +1,6 @@
 # kakehashi Documentation
 
-kakehashi is a Language Server Protocol (LSP) server that uses Tree-sitter for fast, accurate parsing. It provides semantic highlighting, selection ranges, and code actions for any language with a Tree-sitter grammar.
+kakehashi is a Language Server Protocol (LSP) server that uses Tree-sitter for fast, accurate parsing. It provides semantic highlighting and selection ranges for any language with a Tree-sitter grammar, and can bridge embedded regions to language-specific LSP servers for richer editor features.
 
 ## Features
 
@@ -16,25 +16,27 @@ Provides LSP semantic tokens based on Tree-sitter `highlights.scm` queries. Work
 
 Expand/shrink selection based on AST structure. Select increasingly larger syntax nodes with each invocation.
 
-### Code Actions
-
-- **Swap Parameters**: Reorder function parameters
-
 ### LSP Bridge
 
-Full LSP features in injection regions by bridging to language-specific servers. For example, get Rust completions and hover documentation inside Markdown code blocks.
+Bridge embedded regions to language-specific servers. For example, get Rust completions and hover documentation inside Markdown code blocks.
 
-**Supported Features:**
+Current bridge-backed requests include:
 - Completion
 - Signature Help
 - Go to Definition / Type Definition / Implementation / Declaration
 - Hover
 - Find References
+- Rename / Prepare Rename
+- Document Highlight / Document Symbol / Document Link
+- Moniker / Inlay Hint
+- Pull Diagnostics
+
+The server does not currently advertise `textDocument/codeAction`.
 
 **Limitations:**
 - **Same-region navigation only**: Cross-region jumps/edits (e.g., go to Definition, rename, ...) are not supported—these results are filtered out.
 
-See [Configuration: Bridge](#bridge) for setup instructions.
+See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
 ## Prerequisites
 
@@ -103,6 +105,8 @@ Parsers are stored in `{data_dir}/parser/` and queries in `{data_dir}/queries/`.
 
 Configuration is provided via LSP `initializationOptions`. All options are optional.
 
+This section is a practical reference. For the exhaustive field list and types, see `kakehashi config schema`.
+
 ### Configuration Options
 
 ```json
@@ -110,13 +114,26 @@ Configuration is provided via LSP `initializationOptions`. All options are optio
   "searchPaths": ["$HOME/.local/share/kakehashi", "/another/path"],
   "autoInstall": true,
   "languages": {
-    "lua": {
-      "parser": "$HOME/parsers/lua.so",
+    "typescript": {
+      "base": "ecma",
       "queries": [
         {"path": "~/queries/highlights.scm", "kind": "highlights"},
-        {"path": "/path/to/custom.scm", "kind": "highlights"},
-        {"path": "/path/to/injections.scm", "kind": "injections"}
+        {"path": "/path/to/custom.scm", "kind": "highlights"}
       ]
+    },
+    "markdown": {
+      "bridge": {
+        "rust": { "enabled": true }
+      }
+    }
+  },
+  "languageServers": {
+    "rust-analyzer": {
+      "cmd": ["rust-analyzer"],
+      "languages": ["rust"],
+      "initializationOptions": {
+        "cargo": { "allFeatures": true }
+      }
     }
   },
   "captureMappings": {
@@ -170,8 +187,11 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 
 | Field | Description |
 |-------|-------------|
+| `base` | Inherit parser, queries, and bridge configuration from another language |
 | `parser` | Explicit path to the parser library (`.so`, `.dylib`, `.dll`) |
 | `queries` | Array of query configurations with `path` and `kind` (highlights, locals, injections) |
+| `bridge` | Per-injection-language bridge filter and aggregation settings |
+| `aliases` | Deprecated alternative language IDs. Prefer `base` on the derived language instead. |
 
 #### `captureMappings`
 
@@ -195,6 +215,8 @@ Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildca
 }
 ```
 
+### Bridge Configuration
+
 #### `languageServers`
 
 Configure language servers for bridging LSP requests in injection regions.
@@ -204,7 +226,7 @@ Configure language servers for bridging LSP requests in injection regions.
   "languageServers": {
     "rust-analyzer": {
       "cmd": ["rust-analyzer"],
-      "languages": ["rust"],
+      "languages": ["rust"]
     },
     "pyright": {
       "cmd": ["pyright-langserver", "--stdio"],
@@ -239,6 +261,7 @@ Configure language servers for bridging LSP requests in injection regions.
 |-------|-------------|
 | `cmd` | Command and arguments to start the language server |
 | `languages` | Languages this server handles |
+| `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
 
 **Bridge Language Configuration:**
 
@@ -368,12 +391,17 @@ kakehashi language uninstall --all --force
 ### Configuration Management
 
 ```bash
-# Generate a default configuration file in current directory
+# Print a default configuration template to stdout
 kakehashi config init
 
-# Overwrite existing configuration file
-kakehashi config init --force
+# Write a template to a file
+kakehashi config init --output ./kakehashi.toml
+
+# Overwrite an existing file
+kakehashi config init --output ./kakehashi.toml --force
 ```
+
+`--force` only applies when `--output` is used.
 
 ## Editor Integration
 
@@ -424,7 +452,7 @@ require("lspconfig").kakehashi.setup({
 
 ### VS Code
 
-(Configuration for VS Code LSP clients would go here)
+kakehashi does not currently ship a first-party VS Code extension. If you use VS Code, register `kakehashi` through a generic LSP client extension and pass the same `initializationOptions` shown above.
 
 ### Other Editors
 
