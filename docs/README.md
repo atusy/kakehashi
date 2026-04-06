@@ -18,7 +18,7 @@ Expand/shrink selection based on AST structure. Select increasingly larger synta
 
 ### LSP Bridge
 
-Bridge embedded regions to language-specific servers. For example, get Rust completions and hover documentation inside Markdown code blocks.
+Bridge embedded regions to language-specific servers. For example, get Python completions and hover documentation inside Markdown code blocks.
 
 Current bridge-backed requests include:
 - Completion
@@ -123,16 +123,16 @@ This section is a practical reference. For the exhaustive field list and types, 
     },
     "markdown": {
       "bridge": {
-        "rust": { "enabled": true }
+        "python": { "enabled": true }
       }
     }
   },
   "languageServers": {
-    "rust-analyzer": {
-      "cmd": ["rust-analyzer"],
-      "languages": ["rust"],
+    "pyright": {
+      "cmd": ["pyright-langserver", "--stdio"],
+      "languages": ["python"],
       "initializationOptions": {
-        "cargo": { "allFeatures": true }
+        "python": { "analysis": { "typeCheckingMode": "basic" } }
       }
     }
   },
@@ -206,7 +206,7 @@ Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildca
         "function.builtin": "function.defaultLibrary"
       }
     },
-    "rust": {
+    "python": {
       "highlights": {
         "type.builtin": "type.defaultLibrary"
       }
@@ -224,23 +224,23 @@ Configure language servers for bridging LSP requests in injection regions.
 ```json
 {
   "languageServers": {
-    "rust-analyzer": {
-      "cmd": ["rust-analyzer"],
-      "languages": ["rust"]
-    },
     "pyright": {
       "cmd": ["pyright-langserver", "--stdio"],
       "languages": ["python"]
+    },
+    "lua-language-server": {
+      "cmd": ["lua-language-server"],
+      "languages": ["lua"]
     }
   },
   "languages": {
     "markdown": {
       "bridge": {
-        "rust": { "enabled": true },
-        "python": {
+        "python": { "enabled": true },
+        "lua": {
           "enabled": true,
           "aggregation": {
-            "_": { "priorities": ["pyright"] }
+            "_": { "priorities": ["lua-language-server"] }
           }
         }
       }
@@ -305,7 +305,7 @@ The `bridge` map in language configuration controls which injection languages ar
 
 | Value | Meaning |
 |-------|---------|
-| `{ "rust": { "enabled": true } }` | Bridge only enabled languages |
+| `{ "python": { "enabled": true } }` | Bridge only enabled languages |
 | `{}` | Disable bridging entirely for this host language |
 | `null` or omitted | Bridge all configured languages (default) |
 
@@ -355,7 +355,7 @@ The CLI uses a hierarchical subcommand structure: `kakehashi <resource> <action>
 kakehashi language install lua
 
 # Install with verbose output
-kakehashi language install rust --verbose
+kakehashi language install lua --verbose
 
 # Force reinstall
 kakehashi language install python --force
@@ -382,7 +382,7 @@ kakehashi --data-dir /custom/path language status
 kakehashi language uninstall lua
 
 # Uninstall without confirmation prompt
-kakehashi language uninstall rust --force
+kakehashi language uninstall lua --force
 
 # Uninstall all installed languages
 kakehashi language uninstall --all --force
@@ -416,17 +416,17 @@ vim.lsp.config.kakehashi = {
     autoInstall = true,
     -- LSP Bridge configuration (optional)
     languageServers = {
-      ["rust-analyzer"] = {
-        cmd = { "rust-analyzer" },
-        languages = { "rust" },
-      },
       pyright = {
         cmd = { "pyright-langserver", "--stdio" },
         languages = { "python" },
       },
+      ["lua-language-server"] = {
+        cmd = { "lua-language-server" },
+        languages = { "lua" },
+      },
     },
     languages = {
-      markdown = { bridge = { rust = { enabled = true }, python = { enabled = true } } },
+      markdown = { bridge = { python = { enabled = true }, lua = { enabled = true } } },
     },
   },
 }
