@@ -123,7 +123,11 @@ This section is a practical reference. For the exhaustive field list and types, 
     },
     "markdown": {
       "bridge": {
-        "python": { "enabled": true }
+        "python": {
+          "aggregation": {
+            "textDocument/completion": { "priorities": ["pyright"], "maxFanOut": 1 }
+          }
+        }
       }
     }
   },
@@ -236,9 +240,12 @@ Configure language servers for bridging LSP requests in injection regions.
   "languages": {
     "markdown": {
       "bridge": {
-        "python": { "enabled": true },
+        "python": {
+          "aggregation": {
+            "textDocument/completion": { "priorities": ["pyright"], "maxFanOut": 1 }
+          }
+        },
         "lua": {
-          "enabled": true,
           "aggregation": {
             "_": { "priorities": ["lua-language-server"] }
           }
@@ -247,8 +254,7 @@ Configure language servers for bridging LSP requests in injection regions.
     },
     "quarto": {
       "bridge": {
-        "python": { "enabled": true },
-        "r": { "enabled": true }
+        "r": { "enabled": false }
       }
     }
   }
@@ -288,7 +294,6 @@ Example with per-method priorities, strategy, and maxFanOut:
 {
   "bridge": {
     "python": {
-      "enabled": true,
       "aggregation": {
         "textDocument/completion": { "priorities": ["pyright", "pylsp"], "maxFanOut": 1 },
         "textDocument/diagnostic": { "strategy": "preferred", "priorities": ["pyright"] },
@@ -305,7 +310,8 @@ The `bridge` map in language configuration controls which injection languages ar
 
 | Value | Meaning |
 |-------|---------|
-| `{ "python": { "enabled": true } }` | Bridge only enabled languages |
+| `{ "_": { "enabled": false }, "python": { "enabled": true } }` | Bridge only Python injections |
+| `{ "r": { "enabled": false } }` | Bridge every configured injection language except R |
 | `{}` | Disable bridging entirely for this host language |
 | `null` or omitted | Bridge all configured languages (default) |
 
@@ -426,7 +432,20 @@ vim.lsp.config.kakehashi = {
       },
     },
     languages = {
-      markdown = { bridge = { python = { enabled = true }, lua = { enabled = true } } },
+      markdown = {
+        bridge = {
+          python = {
+            aggregation = {
+              ["textDocument/completion"] = { priorities = { "pyright" }, maxFanOut = 1 },
+            },
+          },
+          lua = {
+            aggregation = {
+              _ = { priorities = { "lua-language-server" } },
+            },
+          },
+        },
+      },
     },
   },
 }
