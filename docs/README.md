@@ -197,6 +197,48 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
 | `aliases` | Deprecated alternative language IDs. Prefer `base` on the derived language instead. |
 
+##### `languages[*].base`
+
+Use `base` when one language should reuse another language's parser, queries, and bridge settings while still allowing language-specific overrides.
+
+```json
+{
+  "languages": {
+    "rmd": {
+      "base": "markdown",
+      "bridge": {
+        "r": {
+          "aggregation": {
+            "textDocument/completion": { "priorities": ["languageserver"] }
+          }
+        }
+      }
+    },
+    "qmd": {
+      "base": "markdown",
+      "bridge": {
+        "julia": { "enabled": false }
+      }
+    }
+  }
+}
+```
+
+For `rmd`, kakehashi will try `rmd`-specific parser/query settings first and fall back through `markdown` and then `_`. Fields set on the derived language override inherited fields. Omitted fields inherit from the base chain; `queries: []` and `bridge: {}` explicitly clear inherited query and bridge settings.
+
+Set `base` to the same language name to make a self-contained language that does not inherit from `_`:
+
+```json
+{
+  "languages": {
+    "my_custom_lang": {
+      "base": "my_custom_lang",
+      "parser": "/path/to/my_custom_lang.so"
+    }
+  }
+}
+```
+
 #### `captureMappings`
 
 Remap Tree-sitter capture names to LSP semantic token types. Use `_` as a wildcard for all languages.
