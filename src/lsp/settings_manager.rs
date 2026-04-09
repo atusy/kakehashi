@@ -89,7 +89,13 @@ impl SettingsManager {
             home.as_deref(),
             with_kakehashi_defaults(|var| std::env::var(var).ok()),
         )
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            log::warn!(
+                target: "kakehashi::config",
+                "Default settings expansion failed ({e}); using empty defaults"
+            );
+            WorkspaceSettings::default()
+        });
 
         Self {
             root_path: ArcSwap::new(Arc::new(None)),

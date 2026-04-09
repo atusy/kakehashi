@@ -99,7 +99,7 @@ impl BridgeLanguageConfig {
     /// Look up the aggregation entry for a method with field-level wildcard merge.
     ///
     /// Uses [`crate::config::resolve_with_wildcard`] so that a method-specific entry
-    /// inherits any unset fields from the `_` wildcard entry (ADR-0024).
+    /// inherits any unset fields from the `_` wildcard entry (ADR-0011).
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
         let map = self.aggregation.as_ref()?;
         crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
@@ -181,6 +181,33 @@ pub enum QueryKind {
     Locals,
     /// Language injection queries (for embedded languages)
     Injections,
+}
+
+impl QueryKind {
+    /// All query kinds in standard processing order.
+    pub const ALL: [QueryKind; 3] = [
+        QueryKind::Highlights,
+        QueryKind::Locals,
+        QueryKind::Injections,
+    ];
+
+    /// The lowercase name used in filenames and log messages (e.g. `"highlights"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            QueryKind::Highlights => "highlights",
+            QueryKind::Locals => "locals",
+            QueryKind::Injections => "injections",
+        }
+    }
+
+    /// The query filename (e.g. `"highlights.scm"`).
+    pub fn filename(self) -> &'static str {
+        match self {
+            QueryKind::Highlights => "highlights.scm",
+            QueryKind::Locals => "locals.scm",
+            QueryKind::Injections => "injections.scm",
+        }
+    }
 }
 
 /// A single query file configuration entry.
@@ -1377,7 +1404,7 @@ kind = "injections""#;
     #[test]
     fn should_resolve_aggregation_entry_inherits_missing_fields_from_wildcard() {
         // When a method-specific AggregationConfig exists but has max_fan_out: None,
-        // the wildcard's max_fan_out IS applied via field-level merge (ADR-0024).
+        // the wildcard's max_fan_out IS applied via field-level merge (ADR-0011).
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([
@@ -1624,7 +1651,7 @@ kind = "injections""#;
     #[test]
     fn should_resolve_aggregation_defaults_to_preferred_without_explicit_strategy() {
         // When no aggregation config exists at all, the default strategy should be
-        // Preferred — hardcoded as the sensible fallback per ADR-0024.
+        // Preferred — the hardcoded default when no explicit strategy is configured.
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: None,
@@ -1633,5 +1660,29 @@ kind = "injections""#;
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
         assert!(agg.priorities.is_empty());
         assert_eq!(agg.max_fan_out, None);
+    }
+
+    #[test]
+    fn default_strategy_is_concatenated_for_diagnostics() {
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/diagnostic"),
+            AggregationStrategy::Concatenated
+        );
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/publishDiagnostics"),
+            AggregationStrategy::Concatenated
+        );
+    }
+
+    #[test]
+    fn default_strategy_is_preferred_for_other_methods() {
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/hover"),
+            AggregationStrategy::Preferred
+        );
+        assert_eq!(
+            default_aggregation_strategy_for_method("textDocument/completion"),
+            AggregationStrategy::Preferred
+        );
     }
 }

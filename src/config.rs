@@ -3,6 +3,8 @@ pub(crate) mod expand;
 pub(crate) mod merge;
 pub mod settings;
 
+use std::collections::HashMap;
+
 #[cfg(test)]
 pub(crate) use expand::make_env;
 pub(crate) mod user;
@@ -70,8 +72,8 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
 }
 
 fn strip_inherited_languages(
-    languages: &std::collections::HashMap<String, LanguageSettings>,
-) -> std::collections::HashMap<String, LanguageSettings> {
+    languages: &HashMap<String, LanguageSettings>,
+) -> HashMap<String, LanguageSettings> {
     languages
         .iter()
         .map(|(name, language)| {
@@ -88,7 +90,7 @@ fn strip_inherited_languages(
 }
 
 fn inherited_language_settings<'a>(
-    languages: &'a std::collections::HashMap<String, LanguageSettings>,
+    languages: &'a HashMap<String, LanguageSettings>,
     name: &str,
     language: &LanguageSettings,
 ) -> Option<&'a LanguageSettings> {
@@ -127,16 +129,16 @@ fn strip_inherited_language_settings(
 }
 
 fn strip_inherited_bridge_map(
-    inherited: Option<&std::collections::HashMap<String, settings::BridgeLanguageConfig>>,
-    current: Option<&std::collections::HashMap<String, settings::BridgeLanguageConfig>>,
-) -> Option<std::collections::HashMap<String, settings::BridgeLanguageConfig>> {
+    inherited: Option<&HashMap<String, settings::BridgeLanguageConfig>>,
+    current: Option<&HashMap<String, settings::BridgeLanguageConfig>>,
+) -> Option<HashMap<String, settings::BridgeLanguageConfig>> {
     let current = current?;
 
     if current.is_empty() {
         return Some(current.clone());
     }
 
-    let mut stripped = std::collections::HashMap::new();
+    let mut stripped = HashMap::new();
     for (name, current_config) in current {
         let inherited_config = inherited.and_then(|base| {
             merge::resolve_with_wildcard(base, name, merge::merge_bridge_language_configs)
@@ -171,16 +173,16 @@ fn strip_inherited_bridge_language_config(
 }
 
 fn strip_inherited_aggregation_map(
-    inherited: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
-    current: Option<&std::collections::HashMap<String, settings::AggregationConfig>>,
-) -> Option<std::collections::HashMap<String, settings::AggregationConfig>> {
+    inherited: Option<&HashMap<String, settings::AggregationConfig>>,
+    current: Option<&HashMap<String, settings::AggregationConfig>>,
+) -> Option<HashMap<String, settings::AggregationConfig>> {
     let current = current?;
 
     if current.is_empty() {
         return Some(current.clone());
     }
 
-    let mut stripped = std::collections::HashMap::new();
+    let mut stripped = HashMap::new();
 
     for (method, current_config) in current {
         let inherited_config = inherited.and_then(|base| {
@@ -250,7 +252,9 @@ impl WorkspaceSettings {
         let mut lang_names: Vec<_> = ws.languages.keys().cloned().collect();
         lang_names.sort();
         for name in lang_names {
-            let lang = ws.languages.get_mut(&name).unwrap();
+            let Some(lang) = ws.languages.get_mut(&name) else {
+                continue;
+            };
             if let Some(parser) = lang.parser.as_mut() {
                 match expand::expand_path(parser, home, &env_fn) {
                     Ok(expanded) => *parser = expanded,
@@ -272,6 +276,17 @@ impl WorkspaceSettings {
         } else {
             Err(expand::ExpandErrors(errors))
         }
+    }
+
+    /// Look up language settings for a host language, falling back to the
+    /// wildcard (`"_"`) entry when the host has no explicit configuration.
+    pub(crate) fn resolve_host_language_settings(
+        &self,
+        host_language: &str,
+    ) -> Option<&LanguageSettings> {
+        self.languages
+            .get(host_language)
+            .or_else(|| self.languages.get(WILDCARD_KEY))
     }
 }
 
@@ -315,7 +330,6 @@ impl From<WorkspaceSettings> for RawWorkspaceSettings {
 mod tests {
     use super::*;
     use rstest::rstest;
-    use std::collections::HashMap;
 
     #[test]
     fn test_capture_mapping_handles_at_prefix() {
@@ -556,11 +570,170 @@ mod tests {
 }
 
 #[cfg(test)]
+mod strip_inherited_tests {
+    use super::*;
+    use settings::{AggregationConfig, AggregationStrategy, BridgeLanguageConfig};
+
+    // --- strip_inherited_language_settings ---
+
+    #[test]
+    fn strips_all_fields_when_matching_inherited() {
+        let inherited = LanguageSettings {
+            parser: Some("/path/to/parser".to_string()),
+            queries: Some(vec![]),
+            ..Default::default()
+        };
+        let current = inherited.clone();
+        let result = strip_inherited_language_settings(&inherited, &current);
+        assert_eq!(result.parser, None);
+        assert_eq!(result.queries, None);
+    }
+
+    #[test]
+    fn preserves_differing_fields() {
+        let inherited = LanguageSettings {
+            parser: Some("/path/to/base".to_string()),
+            ..Default::default()
+        };
+        let current = LanguageSettings {
+            parser: Some("/path/to/custom".to_string()),
+            ..Default::default()
+        };
+        let result = strip_inherited_language_settings(&inherited, &current);
+        assert_eq!(result.parser, Some("/path/to/custom".to_string()));
+    }
+
+    #[test]
+    fn preserves_base_field_always() {
+        let inherited = LanguageSettings::default();
+        let current = LanguageSettings {
+            base: Some("markdown".to_string()),
+            ..Default::default()
+        };
+        let result = strip_inherited_language_settings(&inherited, &current);
+        assert_eq!(result.base, Some("markdown".to_string()));
+    }
+
+    // --- strip_inherited_bridge_map ---
+
+    #[test]
+    fn bridge_map_none_returns_none() {
+        let result = strip_inherited_bridge_map(None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn bridge_map_empty_current_preserved() {
+        let result = strip_inherited_bridge_map(Some(&HashMap::new()), Some(&HashMap::new()));
+        assert_eq!(result, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn bridge_map_strips_matching_keys_keeps_differing() {
+        let inherited = HashMap::from([(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )]);
+        let current = HashMap::from([
+            (
+                "python".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lua".to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let result = strip_inherited_bridge_map(Some(&inherited), Some(&current));
+        let result = result.unwrap();
+        assert!(
+            !result.contains_key("python"),
+            "python should be stripped (matches inherited)"
+        );
+        assert!(
+            result.contains_key("lua"),
+            "lua should be preserved (not in inherited)"
+        );
+    }
+
+    // --- strip_inherited_aggregation_map ---
+
+    #[test]
+    fn aggregation_map_strips_matching_preserves_differing() {
+        let inherited = HashMap::from([(
+            WILDCARD_KEY.to_string(),
+            AggregationConfig {
+                strategy: Some(AggregationStrategy::Preferred),
+                ..Default::default()
+            },
+        )]);
+        let current = HashMap::from([
+            (
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::Preferred),
+                    ..Default::default()
+                },
+            ),
+            (
+                "textDocument/diagnostic".to_string(),
+                AggregationConfig {
+                    strategy: Some(AggregationStrategy::Concatenated),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let result = strip_inherited_aggregation_map(Some(&inherited), Some(&current));
+        let result = result.unwrap();
+        assert!(
+            !result.contains_key(WILDCARD_KEY),
+            "wildcard should be stripped (matches inherited)"
+        );
+        assert!(
+            result.contains_key("textDocument/diagnostic"),
+            "diagnostic should be preserved (strategy differs)"
+        );
+    }
+
+    #[test]
+    fn aggregation_config_strips_matching_priorities() {
+        let inherited = AggregationConfig {
+            priorities: Some(vec!["pyright".to_string()]),
+            strategy: Some(AggregationStrategy::Preferred),
+            max_fan_out: Some(2),
+        };
+        let current = AggregationConfig {
+            priorities: Some(vec!["pyright".to_string()]),
+            strategy: Some(AggregationStrategy::Concatenated),
+            max_fan_out: Some(2),
+        };
+        let result = strip_inherited_aggregation_config(&inherited, &current);
+        assert_eq!(result.priorities, None, "priorities match → stripped");
+        assert_eq!(
+            result.strategy,
+            Some(AggregationStrategy::Concatenated),
+            "strategy differs → preserved"
+        );
+        assert_eq!(result.max_fan_out, None, "max_fan_out matches → stripped");
+    }
+}
+
+#[cfg(test)]
 mod try_from_settings_tests {
     use super::*;
     use expand::make_env;
     use settings::{QueryItem, QueryKind};
-    use std::collections::HashMap;
 
     #[test]
     fn expands_search_paths() {

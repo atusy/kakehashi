@@ -1,3 +1,4 @@
+use crate::config::settings::QueryKind;
 use crate::error::LockResultExt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -96,6 +97,24 @@ impl QueryStore {
             .recover_poison(format_args!("QueryStore::injection_query({})", lang_name))
             .get(lang_name)
             .cloned()
+    }
+
+    /// Insert a query by kind, dispatching to the appropriate store.
+    pub(crate) fn insert_query(&self, kind: QueryKind, lang_name: String, query: Arc<Query>) {
+        match kind {
+            QueryKind::Highlights => self.insert_highlight_query(lang_name, query),
+            QueryKind::Locals => self.insert_locals_query(lang_name, query),
+            QueryKind::Injections => self.insert_injection_query(lang_name, query),
+        }
+    }
+
+    /// Get a query by kind, dispatching to the appropriate store.
+    pub(crate) fn get_query(&self, kind: QueryKind, lang_name: &str) -> Option<Arc<Query>> {
+        match kind {
+            QueryKind::Highlights => self.highlight_query(lang_name),
+            QueryKind::Locals => self.locals_query(lang_name),
+            QueryKind::Injections => self.injection_query(lang_name),
+        }
     }
 }
 
