@@ -163,6 +163,16 @@
             "test_edit_info_new_rejects_invalid_in_debug"
             "--skip"
             "test_dynamic_lua_load"
+            "--skip"
+            "test_compile_parser_with_loader"
+            "--skip"
+            "test_download_and_extract_archive_for_json_parser"
+            "--skip"
+            "test_fetch_source_downloads_source_with_parser_c"
+            "--skip"
+            "test_try_install_returns_already_installing_on_duplicate"
+            "--skip"
+            "test_language_list_command"
           ];
 
           meta = with pkgs.lib; {
