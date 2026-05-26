@@ -163,11 +163,89 @@ impl Kakehashi {
 
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
-        let all_edits = all_edits?;
+        let mut all_edits = all_edits?;
+        // Per-region tasks complete in arbitrary order via JoinSet, so the
+        // concatenated TextEdit list is non-deterministic. Sort by start
+        // position to produce a stable LSP response (regions are disjoint,
+        // so this is a simple total order).
+        sort_edits_by_start_position(&mut all_edits);
         Ok(if all_edits.is_empty() {
             None
         } else {
             Some(all_edits)
         })
+    }
+}
+
+/// Sort `edits` in place by `range.start` (line, then character).
+///
+/// Formatting tasks for separate injection regions complete in arbitrary
+/// order via `JoinSet::join_next`, so without sorting the concatenated
+/// `TextEdit` vector is non-deterministic across runs. Since regions are
+/// disjoint, sorting by start position is a stable total order.
+fn sort_edits_by_start_position(edits: &mut [TextEdit]) {
+    edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::ls_types::{Position, Range};
+
+    fn edit(start_line: u32, start_char: u32, new_text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position {
+                    line: start_line,
+                    character: start_char,
+                },
+                end: Position {
+                    line: start_line,
+                    character: start_char,
+                },
+            },
+            new_text: new_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn sort_edits_orders_by_line_then_character() {
+        // Arrival order from JoinSet is arbitrary; pretend the two regions
+        // completed in reverse order.
+        let mut edits = vec![
+            edit(8, 0, "from_region_b"),
+            edit(2, 5, "from_region_a_second"),
+            edit(2, 0, "from_region_a_first"),
+        ];
+
+        sort_edits_by_start_position(&mut edits);
+
+        assert_eq!(edits[0].new_text, "from_region_a_first");
+        assert_eq!(edits[1].new_text, "from_region_a_second");
+        assert_eq!(edits[2].new_text, "from_region_b");
+    }
+
+    #[test]
+    fn sort_edits_is_stable_for_equal_start_positions() {
+        // Disjoint regions never produce equal starts in practice, but the
+        // sort should remain stable for any callers that happen to.
+        let mut edits = vec![
+            edit(3, 0, "first"),
+            edit(3, 0, "second"),
+            edit(3, 0, "third"),
+        ];
+
+        sort_edits_by_start_position(&mut edits);
+
+        assert_eq!(edits[0].new_text, "first");
+        assert_eq!(edits[1].new_text, "second");
+        assert_eq!(edits[2].new_text, "third");
+    }
+
+    #[test]
+    fn sort_edits_handles_empty_input() {
+        let mut edits: Vec<TextEdit> = Vec::new();
+        sort_edits_by_start_position(&mut edits);
+        assert!(edits.is_empty());
     }
 }
