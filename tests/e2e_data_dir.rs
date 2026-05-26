@@ -10,8 +10,24 @@
 
 mod helpers;
 
-use helpers::lsp_client::LspClient;
+use helpers::lsp_client::{LspClient, LspClientBuilder};
 use serde_json::json;
+use tempfile::TempDir;
+
+/// Create an `LspClientBuilder` that ignores the developer's user config.
+///
+/// The two assertions in this file pin the *default* raw `searchPaths`
+/// (`["${KAKEHASHI_DATA_DIR}"]`), so any non-default user config at
+/// `~/.config/kakehashi/kakehashi.toml` would silently corrupt these tests.
+/// Passing `--config-file <empty-toml>` short-circuits user config discovery
+/// and pins the binary to its built-in defaults.
+fn isolated_builder(tmp: &TempDir) -> LspClientBuilder {
+    let path = tmp.path().join("empty.toml");
+    std::fs::write(&path, "").expect("write empty config");
+    LspClient::builder()
+        .arg("--config-file")
+        .arg(path.to_str().expect("temp path is utf-8"))
+}
 
 /// Helper: initialize the LSP client and return the effective searchPaths.
 fn get_effective_search_paths(client: &mut LspClient) -> Vec<String> {
@@ -54,7 +70,8 @@ fn get_effective_search_paths(client: &mut LspClient) -> Vec<String> {
 /// still contains the `${KAKEHASHI_DATA_DIR}` template.
 #[test]
 fn test_search_paths_returns_raw_template() {
-    let mut client = LspClient::builder()
+    let tmp = TempDir::new().unwrap();
+    let mut client = isolated_builder(&tmp)
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
@@ -71,7 +88,8 @@ fn test_search_paths_returns_raw_template() {
 /// the raw template — expansion happens internally, not in the raw config.
 #[test]
 fn test_env_var_does_not_affect_raw_search_paths() {
-    let mut client = LspClient::builder()
+    let tmp = TempDir::new().unwrap();
+    let mut client = isolated_builder(&tmp)
         .env("KAKEHASHI_DATA_DIR", "/tmp/kakehashi_test_data")
         .build();
 
