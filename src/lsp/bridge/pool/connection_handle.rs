@@ -575,6 +575,12 @@ impl ConnectionHandle {
                 )
             }
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
+            "textDocument/formatting" => {
+                matches!(
+                    caps.document_formatting_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
             "textDocument/documentSymbol" => {
                 matches!(
                     caps.document_symbol_provider,
