@@ -18,14 +18,14 @@ use tower_lsp_server::ls_types::{
     CompletionItem, CompletionParams, CompletionResponse, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
-    DocumentHighlight, DocumentHighlightParams, DocumentLink, DocumentLinkParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-    InlayHintParams, Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    TextDocumentPositionParams, Uri, WorkspaceEdit,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentLink,
+    DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, Location, Moniker, MonikerParams,
+    PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 use url::Url;
@@ -408,6 +408,10 @@ impl LanguageServer for Kakehashi {
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         self.rename_impl(params).await
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        self.formatting_impl(params).await
     }
 
     async fn prepare_rename(

@@ -16,6 +16,7 @@ mod document_color;
 mod document_highlight;
 mod document_link;
 mod document_symbol;
+mod formatting;
 mod hover;
 mod implementation;
 mod inlay_hint;
