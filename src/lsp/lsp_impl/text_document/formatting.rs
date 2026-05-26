@@ -134,7 +134,12 @@ impl Kakehashi {
                                 .await
                         }
                     },
-                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    // `Some(vec![])` is an authoritative "no edits needed" from
+                    // the formatter (e.g., ruff signaling the code is already
+                    // formatted) — accept it instead of falling through to a
+                    // lower-priority server that might re-format the same code.
+                    // `None` still means "no response" and triggers fallback.
+                    |opt| opt.is_some(),
                     None,
                 )
                 .await;
