@@ -56,6 +56,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/formatting") {
             return Ok(None);
         }
+        let virtual_line_count = count_lines(virtual_content);
         self.execute_bridge_request_with_handle(
             handle,
             server_name,
@@ -66,10 +67,24 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| build_formatting_request(virtual_uri, options, request_id),
-            |response, ctx| transform_formatting_response_to_host(response, ctx.offset),
+            |response, ctx| {
+                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
+            },
         )
         .await
     }
+}
+
+/// Count the number of lines in `text`, with the LSP convention that a
+/// trailing newline introduces an extra (empty) line.
+///
+/// Returns 1 for the empty string (a single empty line, index 0).
+fn count_lines(text: &str) -> u32 {
+    // `matches('\n').count() + 1` gives the number of line "buckets" in the
+    // split — exactly what the LSP position model expects.
+    u32::try_from(text.matches('\n').count())
+        .unwrap_or(u32::MAX - 1)
+        .saturating_add(1)
 }
 
 /// Build a JSON-RPC formatting request for a downstream language server.
@@ -99,9 +114,25 @@ fn build_formatting_request(
 /// apply the region offset so the edit lines up with the corresponding bytes
 /// in the host. Per LSP, formatting returns `TextEdit[] | null`, so a `null`
 /// or missing `result` collapses to `None`.
+///
+/// # Boundary enforcement
+///
+/// Downstream formatters typically operate as if the virtual document were a
+/// real file and emit edits at its EOF (e.g., enforcing a trailing newline).
+/// When the virtual content sits inside a larger host (a markdown code fence,
+/// a string literal, …), the bytes immediately after the virtual EOF belong
+/// to the host. An edit whose range extends past the virtual line count
+/// would translate to a host position that overwrites those bytes — corrupting
+/// the closing ` ``` `, surrounding markdown, or string-literal quotes.
+///
+/// To prevent that, edits whose `range.end.line` is past the last virtual
+/// line are dropped before translation. `virtual_line_count` is the number of
+/// LSP lines in the virtual document (1 for an empty document, computed via
+/// [`count_lines`]).
 fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
+    virtual_line_count: u32,
 ) -> Option<Vec<TextEdit>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/formatting: {}", error);
@@ -113,6 +144,21 @@ fn transform_formatting_response_to_host(
     }
 
     let mut edits: Vec<TextEdit> = serde_json::from_value(result).ok()?;
+
+    // Drop edits whose end position is past the virtual document's last line.
+    // Such edits would corrupt host content beyond the injection region after
+    // offset translation (see function-level docs).
+    let before = edits.len();
+    edits.retain(|edit| edit.range.end.line < virtual_line_count);
+    let dropped = before - edits.len();
+    if dropped > 0 {
+        warn!(
+            target: "kakehashi::bridge",
+            "Dropped {} formatting edit(s) extending past virtual EOF (line {}); would corrupt host content beyond injection region",
+            dropped,
+            virtual_line_count
+        );
+    }
 
     for edit in &mut edits {
         translate_virtual_range_to_host(&mut edit.range, offset);
@@ -189,6 +235,10 @@ mod tests {
     // Formatting response transformation tests
     // ==========================================================================
 
+    /// Permissive line count used by tests that don't care about boundary
+    /// behavior — chosen large enough that no test edit is filtered out.
+    const UNBOUNDED: u32 = u32::MAX;
+
     #[test]
     fn formatting_response_transforms_text_edit_ranges_to_host_coordinates() {
         let response = json!({
@@ -213,7 +263,8 @@ mod tests {
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0)).unwrap();
+            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), UNBOUNDED)
+                .unwrap();
 
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].range.start.line, 10);
@@ -249,7 +300,8 @@ mod tests {
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 4)).unwrap();
+            transform_formatting_response_to_host(response, &RegionOffset::new(5, 4), UNBOUNDED)
+                .unwrap();
 
         // Line 0 in virtual → line 5 in host, character shifted by column offset 4
         assert_eq!(edits[0].range.start.line, 5);
@@ -267,7 +319,8 @@ mod tests {
     #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
     fn formatting_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
-        let transformed = transform_formatting_response_to_host(response, &RegionOffset::new(5, 0));
+        let transformed =
+            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED);
         assert!(transformed.is_none());
     }
 
@@ -276,37 +329,144 @@ mod tests {
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [] });
 
         let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0)).unwrap();
+            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED)
+                .unwrap();
         assert!(edits.is_empty());
     }
 
     #[test]
     fn formatting_response_transformation_saturates_on_overflow() {
+        // Use a high but in-bounds line and an `u32::MAX` character to keep
+        // the boundary filter happy while still exercising overflow saturation
+        // in the line/character translation path.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
             "result": [{
                 "range": {
-                    "start": { "line": u32::MAX, "character": 0 },
-                    "end": { "line": u32::MAX, "character": 5 }
+                    "start": { "line": 1, "character": u32::MAX },
+                    "end": { "line": 1, "character": u32::MAX }
                 },
                 "newText": "boom"
             }]
         });
 
         let edits =
-            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0)).unwrap();
+            transform_formatting_response_to_host(response, &RegionOffset::new(u32::MAX - 1, 0), 2)
+                .unwrap();
 
         assert_eq!(edits.len(), 1);
         assert_eq!(
             edits[0].range.start.line,
             u32::MAX,
-            "Overflow should saturate at u32::MAX, not panic"
+            "Line + offset overflow should saturate at u32::MAX, not panic"
         );
         assert_eq!(
-            edits[0].range.end.line,
+            edits[0].range.start.character,
             u32::MAX,
-            "Overflow should saturate at u32::MAX, not panic"
+            "Character at u32::MAX should remain saturated"
         );
+    }
+
+    // ==========================================================================
+    // Boundary enforcement tests (regression coverage for #303 review)
+    // ==========================================================================
+
+    #[test]
+    fn formatting_response_drops_edits_past_virtual_eof() {
+        // virtual_line_count = 3 → valid lines are 0, 1, 2.
+        // An edit ending at line 3 is past EOF and would translate to a host
+        // position that overwrites content beyond the injection region
+        // (e.g., the closing ``` of a markdown code fence).
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 2, "character": 6 },
+                        "end": { "line": 3, "character": 0 }
+                    },
+                    "newText": "\n"
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 3).unwrap();
+
+        assert!(
+            edits.is_empty(),
+            "edit ending past virtual EOF must be dropped to protect host content"
+        );
+    }
+
+    #[test]
+    fn formatting_response_keeps_zero_width_edit_at_virtual_eof() {
+        // The common "insert trailing newline at EOF" pattern: zero-width edit
+        // anchored at the last column of the last virtual line. Stays in
+        // bounds (end.line == last valid line index) so it must be preserved.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 2, "character": 6 },
+                        "end": { "line": 2, "character": 6 }
+                    },
+                    "newText": "\n"
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 3).unwrap();
+
+        assert_eq!(edits.len(), 1, "in-bounds zero-width EOF insert is kept");
+        assert_eq!(edits[0].new_text, "\n");
+    }
+
+    #[test]
+    fn formatting_response_keeps_in_bounds_drops_out_of_bounds() {
+        // Mixed batch: a valid edit on line 0 and a malformed edit whose end
+        // extends past EOF. Only the valid one survives.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end": { "line": 0, "character": 4 }
+                    },
+                    "newText": "    "
+                },
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 5, "character": 0 }
+                    },
+                    "newText": "wrong"
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 2).unwrap();
+
+        assert_eq!(edits.len(), 1, "only the in-bounds edit survives");
+        assert_eq!(edits[0].new_text, "    ");
+    }
+
+    #[rstest]
+    #[case::empty("", 1)]
+    #[case::single_line("abc", 1)]
+    #[case::two_lines("abc\ndef", 2)]
+    #[case::trailing_newline("abc\n", 2)]
+    #[case::two_trailing_newlines("abc\n\n", 3)]
+    #[case::only_newline("\n", 2)]
+    fn count_lines_matches_lsp_line_model(#[case] input: &str, #[case] expected: u32) {
+        assert_eq!(count_lines(input), expected);
     }
 }
