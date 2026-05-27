@@ -16,21 +16,31 @@
 //!
 //! # Multi-line edit limitation (host indentation)
 //!
-//! [`translate_virtual_range_to_host`] adds the per-line column offset only
-//! to virtual line 0. For lines >0 of a returned [`TextEdit`], host coords
-//! land at column 0. This is correct for *positions* (the virtual line model
-//! starts at column 0 for every line after the first), but it is **not**
-//! sufficient for the `new_text` payload of a multi-line edit inside an
-//! indented injection (e.g., an indented markdown code fence). The text
-//! itself still starts at column 0 of the embedded language, so when the
-//! formatter rewraps a function body the new lines insert at the host's
-//! column 0 instead of the host's indentation column.
+//! [`translate_virtual_range_to_host`] applies
+//! [`RegionOffset::column_for_line`] to every virtual line, so *positions*
+//! translate correctly in both injection shapes:
+//!
+//! - Non-blockquote (single-element `columns`, built via `RegionOffset::new`):
+//!   virtual line 0 gets the start column; line 1+ falls back to `0` because
+//!   the embedded text is dedented to column 0 of the host on those lines.
+//! - Blockquote (per-line `columns`, built via
+//!   `RegionOffset::with_per_line_offsets`): each virtual line gets its own
+//!   per-line column offset matching the blockquote prefix width (`> ` = 2).
+//!
+//! Position translation is correct in either case, but it is **not**
+//! sufficient for the `new_text` payload of a multi-line edit inside a
+//! prefixed injection (e.g., an indented markdown code fence or a
+//! blockquoted code block). The replacement text starts at column 0 of the
+//! embedded language, so when the formatter rewraps a function body the new
+//! lines insert at the host's column 0 instead of re-applying the host's
+//! indentation column or `> ` blockquote prefix.
 //!
 //! Single-line edits and zero-width inserts (the common case for
 //! `trimTrailingWhitespace` / `insertFinalNewline`) are unaffected. A full
-//! fix requires rewriting `new_text` to prepend the host indentation after
-//! every embedded newline; that is left as future work and tracked
-//! separately because it interacts with `trim_final_newlines` semantics.
+//! fix requires rewriting `new_text` to prepend the host indentation or
+//! blockquote prefix after every embedded newline; that is left as future
+//! work and tracked separately because it interacts with
+//! `trim_final_newlines` semantics.
 
 use std::io;
 
