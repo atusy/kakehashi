@@ -930,3 +930,27 @@ fn test_node_injection_positive_two_returns_null_when_stack_too_shallow() {
         result
     );
 }
+
+/// At a cursor that's NOT inside any injection, the injection stack
+/// contains only the host layer. `injection: 1` must therefore return
+/// null — there is no layer 1 to resolve.
+///
+/// We aim the cursor at the `#` of the ATX heading on line 0, char 0.
+/// tree-sitter-markdown injects `(inline)` content into `markdown_inline`,
+/// but the `atx_h1_marker` (`#`) is a sibling of the inline node, not a
+/// descendant of it, so byte 0 lies outside every injection range.
+#[test]
+fn test_node_injection_positive_one_returns_null_outside_any_injection() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_outside.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    let result = request_node_with_injection(&mut client, uri, 0, 0, json!(1));
+    assert!(
+        result.is_null(),
+        "injection=1 outside any injection must return null, got {:?}",
+        result
+    );
+}
