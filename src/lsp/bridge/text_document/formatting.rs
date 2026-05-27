@@ -182,7 +182,19 @@ fn transform_formatting_response_to_host(
         return None;
     }
 
-    let mut edits: Vec<TextEdit> = serde_json::from_value(result).ok()?;
+    // A non-null `result` that fails to deserialize as `Vec<TextEdit>` means
+    // the downstream server returned a malformed `textDocument/formatting`
+    // payload (wrong shape, missing fields, etc.). Returning `None` is the
+    // right user-facing behavior — the bridge has no edits to apply — but
+    // silently swallowing the parse error makes this class of bug invisible.
+    // Log it so operators can spot the misbehaving downstream from the log.
+    let mut edits: Vec<TextEdit> = match serde_json::from_value(result) {
+        Ok(edits) => edits,
+        Err(err) => {
+            warn!(target: "kakehashi::bridge", "Failed to deserialize textDocument/formatting result as TextEdit[]: {}", err);
+            return None;
+        }
+    };
 
     // Some formatters emit "insert final newline" as a zero-width edit
     // anchored at column 0 of the synthetic line *after* the last real line
