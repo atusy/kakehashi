@@ -1126,8 +1126,7 @@ mod tests {
 
     /// Verifies that when we look up host language settings using
     /// WorkspaceSettings.languages (HashMap<String, LanguageSettings>),
-    /// wildcard resolution is applied.
-    /// we should use wildcard resolution so that undefined languages inherit
+    /// wildcard resolution is applied so that undefined languages inherit
     /// from languages._ settings.
     #[test]
     fn test_language_settings_wildcard_lookup_blocks_bridging_for_undefined_host() {
