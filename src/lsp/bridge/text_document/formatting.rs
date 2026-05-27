@@ -150,7 +150,10 @@ fn transform_formatting_response_to_host(
     // offset translation (see function-level docs).
     let before = edits.len();
     edits.retain(|edit| edit.range.end.line < virtual_line_count);
-    let dropped = before - edits.len();
+    // `retain` never grows the vec so this can't underflow today, but
+    // saturating_sub keeps the count valid if the surrounding logic ever
+    // changes (e.g., a new clamping step that re-inserts edits).
+    let dropped = before.saturating_sub(edits.len());
     if dropped > 0 {
         warn!(
             target: "kakehashi::bridge",
