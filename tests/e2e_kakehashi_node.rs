@@ -47,6 +47,26 @@ fn open_markdown(client: &mut LspClient, uri: &str, text: &str) {
     );
 }
 
+/// Send `kakehashi/node/text` for an id and unwrap the `result` field.
+fn request_node_text(client: &mut LspClient, uri: &str, id: &str) -> Value {
+    let response = client.send_request(
+        "kakehashi/node/text",
+        json!({
+            "textDocument": { "uri": uri },
+            "id": id
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "kakehashi/node/text returned an error: {:?}",
+        response.get("error")
+    );
+    response
+        .get("result")
+        .cloned()
+        .expect("response must contain a result field")
+}
+
 /// Send `kakehashi/node` and unwrap the `result` field (which may be `null`).
 fn request_node(client: &mut LspClient, uri: &str, line: u32, character: u32) -> Value {
     let response = client.send_request(
@@ -76,6 +96,48 @@ fn assert_ulid_shaped(value: &Value) {
         "ULID must be alphanumeric, got {:?}",
         s
     );
+}
+
+/// Round-trip: acquire an id via `kakehashi/node`, then ask
+/// `kakehashi/node/text` for it and verify the returned slice matches the
+/// expected substring of the document.
+#[test]
+fn test_node_text_round_trips_for_known_id() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_text.md";
+    let text = "# Hello\n\nSome paragraph text.\n";
+    open_markdown(&mut client, uri, text);
+
+    // Cursor on the second line's paragraph text.
+    let node = request_node(&mut client, uri, 2, 2);
+    assert!(!node.is_null(), "expected a NodeInfo for paragraph text");
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id must be present");
+
+    let text_response = request_node_text(&mut client, uri, id);
+    assert!(
+        !text_response.is_null(),
+        "kakehashi/node/text must return a NodeText for a freshly issued id"
+    );
+
+    let returned_text = text_response
+        .get("text")
+        .and_then(Value::as_str)
+        .expect("response must contain a `text` field");
+
+    // The selected node must be a subsequence of the original document text.
+    assert!(
+        text.contains(returned_text),
+        "returned text {:?} should be a substring of the document {:?}",
+        returned_text,
+        text,
+    );
+    // Sanity: text is non-empty and contains at least one character from "paragraph".
+    assert!(!returned_text.is_empty(), "node text must be non-empty");
 }
 
 /// End-of-document exception: cursor exactly at `L` for a non-empty document
