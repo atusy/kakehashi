@@ -113,6 +113,19 @@ Semantics, given an injection stack `[host, layer₁, layer₂, ..., deepest]` a
 
 ### Boundary Semantics
 
+#### Position Encoding
+
+The boundary rules below are stated in terms of UTF-8 byte offsets (`b`, `[s, e)`, `L`), matching the representation used by tree-sitter internally. The API surface, however, accepts LSP `Position` values whose `character` field unit depends on the negotiated `positionEncoding`.
+
+**Kakehashi follows the LSP default**: the server does not advertise an explicit `positionEncoding` in `ServerCapabilities`, so per LSP 3.18 spec the client must treat `Position.character` as a **UTF-16 code unit** offset. The server converts each incoming `Position` to a UTF-8 byte offset (via `PositionMapper`) before applying any boundary rule. This conversion is transparent to clients, but two consequences matter:
+
+- For documents containing only ASCII, UTF-16 code units, UTF-8 bytes, and characters coincide — most boundary discussions remain intuitive.
+- For documents with non-ASCII characters (multi-byte in UTF-8, multi-code-unit in UTF-16 for surrogate pairs), clients must compute `Position.character` in UTF-16 code units. Sending a byte-based character count will misalign with the byte ranges resolved server-side, especially around emoji or CJK glyphs at injection or node boundaries.
+
+If a client requires a different encoding (UTF-8 or UTF-32), it should negotiate via `general.positionEncodings` in the initialize request. Kakehashi may choose to support those in the future, but currently does not.
+
+#### Half-Open Intervals
+
 All position-to-node resolution uses **half-open intervals** `[start, end)`:
 
 - A cursor at byte `b` lies inside a node `[s, e)` iff `s ≤ b < e`
@@ -125,22 +138,23 @@ This makes "cursor at the closing fence of a code block" unambiguously **outside
 
 LSP positions allow the cursor to sit **after the last byte** of the document (`b == L`, where `L` is the document length). This is the position users reach via End-of-file motions and is naturally produced when appending text. Under the strict half-open rule, no node — not even the root — would contain `b == L`, so every node query at end-of-document would return `null`. This breaks AST-walking commands at end-of-file.
 
-The boundary rule is therefore relaxed by exactly one case:
+The boundary rule is therefore relaxed by exactly one case, **gated on `L > 0`**:
 
-> A cursor at byte `b` is contained by a node `[s, e)` iff `s ≤ b < e`, **OR** (`b == L` and `e == L`).
+> A cursor at byte `b` is contained by a node `[s, e)` iff `s ≤ b < e`, **OR** (`L > 0` and `b == L` and `e == L`).
 
 Properties of this rule:
 
 - **Position is not modified**: unlike clamping `b` to `L - 1`, the cursor stays at `L`. This avoids surprising behavior when the last byte is a newline (clamping would place the cursor "inside the trailing newline").
-- **Only fires at document end**: the exception requires `e == L` exactly. Interior boundaries (cursor at the end of an injection but before the document end) keep the unmodified half-open behavior, so "cursor at closing fence" still falls out of the injection into the host.
+- **Only fires at document end of a non-empty document**: the exception requires `e == L` exactly and `L > 0`. Interior boundaries (cursor at the end of an injection but before the document end) keep the unmodified half-open behavior, so "cursor at closing fence" still falls out of the injection into the host.
 - **Smallest-wins still applies**: multiple nested nodes typically end at `L` (root → top-level block → last statement → ...). The standard "smallest containing node" rule selects the deepest among them.
+- **Empty document is excluded by construction**: if `L == 0`, the exception clause never fires regardless of any node's span, so empty documents always return `null` (see edge cases below). This avoids returning a degenerate root node spanning `[0, 0)`.
 
 Edge cases:
 
 | Cursor position | Behavior |
 |---|---|
-| `b == L`, document non-empty | Returns the smallest node with `e == L` (typically the rightmost branch down from root) |
-| Empty document (`L == 0`) | Root spans `[0, 0)` which is degenerate; returns `null` |
+| `b == L`, document non-empty (`L > 0`) | Returns the smallest node with `e == L` (typically the rightmost branch down from root) |
+| Empty document (`L == 0`) | Exception is gated off by `L > 0`; returns `null` |
 | `b > L` (out of bounds) | Returns `null` |
 
 ### Navigation Methods
