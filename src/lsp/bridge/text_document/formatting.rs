@@ -105,6 +105,27 @@ fn count_lines(text: &str) -> u32 {
         .saturating_add(1)
 }
 
+/// If `pos` is the "synthetic next-line anchor" (column 0 of the line
+/// immediately after `last_real_line`), rewrite it to (last_real_line,
+/// u32::MAX) so the editor's standard end-of-line clamping snaps it to the
+/// real last column. Used to accept the canonical insertFinalNewline shape
+/// without dropping it as past-EOF.
+///
+/// `virtual_line_count` is the synthetic-line index — i.e., the value that
+/// would be `last_real_line + 1` for non-empty docs. Passed in to avoid
+/// re-deriving it at each callsite and to keep the arithmetic safe under
+/// overflow (last_real_line + 1 would wrap at u32::MAX).
+fn clamp_synthetic_eof_anchor(
+    pos: &mut tower_lsp_server::ls_types::Position,
+    last_real_line: u32,
+    virtual_line_count: u32,
+) {
+    if pos.line == virtual_line_count && pos.character == 0 {
+        pos.line = last_real_line;
+        pos.character = u32::MAX;
+    }
+}
+
 /// Build a JSON-RPC formatting request for a downstream language server.
 ///
 /// Like `documentLink`/`documentSymbol`, formatting carries no position — only
@@ -163,9 +184,27 @@ fn transform_formatting_response_to_host(
 
     let mut edits: Vec<TextEdit> = serde_json::from_value(result).ok()?;
 
-    // Drop edits whose end position is past the virtual document's last line.
-    // Such edits would corrupt host content beyond the injection region after
-    // offset translation (see function-level docs).
+    // Some formatters emit "insert final newline" as a zero-width edit
+    // anchored at column 0 of the synthetic line *after* the last real line
+    // (end.line == virtual_line_count && end.character == 0). That is one
+    // past EOF in line space but cannot corrupt host bytes because the
+    // payload is inserted at end-of-content, not over any existing range.
+    // Clamp those anchors down to (last_real_line, u32::MAX) so the editor's
+    // standard past-end-of-line clamping snaps them to the line's actual
+    // length. Skipped for empty virtual docs (virtual_line_count == 0 is
+    // never produced by count_lines, but guard against it just in case).
+    if virtual_line_count > 0 {
+        let last_real_line = virtual_line_count - 1;
+        for edit in &mut edits {
+            clamp_synthetic_eof_anchor(&mut edit.range.start, last_real_line, virtual_line_count);
+            clamp_synthetic_eof_anchor(&mut edit.range.end, last_real_line, virtual_line_count);
+        }
+    }
+
+    // Drop edits whose end position is still past the virtual document's
+    // last line after clamping. Such edits would corrupt host content
+    // beyond the injection region after offset translation (see
+    // function-level docs).
     let before = edits.len();
     edits.retain(|edit| edit.range.end.line < virtual_line_count);
     // `retain` never grows the vec so this can't underflow today, but
@@ -394,11 +433,13 @@ mod tests {
     // ==========================================================================
 
     #[test]
-    fn formatting_response_drops_edits_past_virtual_eof() {
-        // virtual_line_count = 3 → valid lines are 0, 1, 2.
-        // An edit ending at line 3 is past EOF and would translate to a host
-        // position that overwrites content beyond the injection region
-        // (e.g., the closing ``` of a markdown code fence).
+    fn formatting_response_clamps_edits_at_synthetic_eof_anchor() {
+        // virtual_line_count = 3 → valid lines are 0, 1, 2. An edit ending at
+        // (3, 0) is the synthetic "next line column 0" anchor that formatters
+        // emit for insertFinalNewline / preserveFinalNewline. Per LSP position
+        // clamping it's equivalent to (2, eol-of-line-2), so clamp the end
+        // down to (2, u32::MAX) and let the editor snap it. The edit is kept
+        // (not dropped) — previous behavior was overly conservative.
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -416,10 +457,13 @@ mod tests {
         let edits =
             transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 3).unwrap();
 
-        assert!(
-            edits.is_empty(),
-            "edit ending past virtual EOF must be dropped to protect host content"
-        );
+        assert_eq!(edits.len(), 1, "synthetic-EOF-anchored edit is kept");
+        assert_eq!(edits[0].new_text, "\n");
+        // start unchanged (still on last real line); end clamped down by one.
+        assert_eq!(edits[0].range.start.line, 12);
+        assert_eq!(edits[0].range.start.character, 6);
+        assert_eq!(edits[0].range.end.line, 12, "end clamped down by one line");
+        assert_eq!(edits[0].range.end.character, u32::MAX);
     }
 
     #[test]
