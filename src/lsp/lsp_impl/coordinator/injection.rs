@@ -77,7 +77,7 @@ impl InjectionCoordinator {
     /// 1. Gets the injection query for `host_language`
     /// 2. Extracts the parse tree (minimal lock duration on document store)
     /// 3. Collects all injection regions via `collect_all_injections`
-    /// 4. Calculates stable region IDs via `RegionIdTracker` (ADR-0019)
+    /// 4. Calculates stable region IDs via `NodeTracker` (ADR-0019)
     ///
     /// Returns an empty Vec if no injections are found (no query, no tree,
     /// or no injection regions).
@@ -117,7 +117,7 @@ impl InjectionCoordinator {
             .iter()
             .map(|region| {
                 let region_id = InjectionResolver::calculate_region_id(
-                    self.bridge.region_id_tracker(),
+                    self.bridge.node_tracker(),
                     uri,
                     region,
                 );

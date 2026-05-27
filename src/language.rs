@@ -12,7 +12,7 @@ pub(crate) mod query_loader;
 pub(crate) mod query_pattern_splitter;
 pub(crate) mod query_predicates;
 pub(crate) mod query_store;
-pub(crate) mod region_id_tracker;
+pub(crate) mod node_tracker;
 pub(crate) mod registry;
 
 pub(crate) use coordinator::LanguageCoordinator;
@@ -24,5 +24,5 @@ pub(crate) use query_predicates::filter_captures;
 // Re-export injection types for semantic tokens
 pub(crate) use injection::InjectionResolver;
 
-// Re-export region ID tracking
-pub(crate) use region_id_tracker::RegionIdTracker;
+// Re-export node identity tracker
+pub(crate) use node_tracker::NodeTracker;

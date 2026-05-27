@@ -200,7 +200,7 @@ impl ParseCoordinator {
                     &tree,
                     &language_name,
                     &self.language,
-                    self.bridge.region_id_tracker(),
+                    self.bridge.node_tracker(),
                 );
 
                 if let Some(edited_tree) = pre_edit_tree {

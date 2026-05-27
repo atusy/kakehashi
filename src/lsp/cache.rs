@@ -42,7 +42,7 @@ use url::Url;
 
 use crate::analysis::{InjectionMap, InjectionTokenCache, SemanticTokenCache};
 use crate::language::LanguageCoordinator;
-use crate::language::RegionIdTracker;
+use crate::language::NodeTracker;
 use crate::language::injection::{CacheableInjectionRegion, collect_all_injections};
 
 use super::semantic_request_tracker::SemanticRequestTracker;
@@ -170,7 +170,7 @@ impl CacheCoordinator {
     /// Enables targeted cache invalidation: when an edit occurs, we can check
     /// which injection regions overlap and only invalidate those.
     ///
-    /// Region IDs are generated using `RegionIdTracker` which provides position-based
+    /// Region IDs are generated using `NodeTracker` which provides position-based
     /// ULIDs. The same (uri, start_byte, end_byte, kind) always produces the same ULID,
     /// enabling stable IDs across document edits when position adjustments are applied.
     ///
@@ -182,7 +182,7 @@ impl CacheCoordinator {
         tree: &Tree,
         language_name: &str,
         language: &LanguageCoordinator,
-        tracker: &RegionIdTracker,
+        tracker: &NodeTracker,
     ) {
         // Get the injection query for this language
         let injection_query = match language.injection_query(language_name) {
@@ -216,7 +216,7 @@ impl CacheCoordinator {
                 .map(|regions| regions.iter().map(|r| (r.region_id.as_str(), r)).collect());
 
             // Convert to CacheableInjectionRegion using position-based ULIDs
-            // RegionIdTracker provides stable IDs based on (uri, start_byte, end_byte, kind)
+            // NodeTracker provides stable IDs based on (uri, start_byte, end_byte, kind)
             let cacheable_regions: Vec<CacheableInjectionRegion> = regions
                 .iter()
                 .map(|info| {
@@ -472,17 +472,17 @@ mod tests {
     /// Integration test: language change with stable region_id triggers cache invalidation.
     ///
     /// This test exercises the production invalidation path in `populate_injections`:
-    /// - Uses `RegionIdTracker` with position-based ULIDs (not `next_result_id()`)
+    /// - Uses `NodeTracker` with position-based ULIDs (not `next_result_id()`)
     /// - Simulates a language change at a stable position
     /// - Verifies that cached tokens are invalidated when language changes
     ///
     /// See: Finding 1 in review - tests must exercise production behavior.
     #[test]
-    fn test_language_change_invalidates_cache_with_region_id_tracker() {
+    fn test_language_change_invalidates_cache_with_node_tracker() {
         use tree_sitter::{Parser, Query};
 
         let cache = CacheCoordinator::new();
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let coordinator = LanguageCoordinator::new();
         let uri = create_test_uri("test_lang_change.md");
 
@@ -563,7 +563,7 @@ print("hello")
 
         // CRITICAL: Apply the text diff to update tracker positions BEFORE re-parsing.
         // This is the production flow:
-        //   1. apply_text_diff() adjusts positions in RegionIdTracker
+        //   1. apply_text_diff() adjusts positions in NodeTracker
         //   2. parse with new text
         //   3. populate_injections() finds existing region_id via adjusted positions
         // Without this step, positions shift and we get a new region_id (no cache hit).
@@ -616,11 +616,11 @@ print("hello")
     ///
     /// Similar to the language change test, but tests content_changed path.
     #[test]
-    fn test_content_change_invalidates_cache_with_region_id_tracker() {
+    fn test_content_change_invalidates_cache_with_node_tracker() {
         use tree_sitter::{Parser, Query};
 
         let cache = CacheCoordinator::new();
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let coordinator = LanguageCoordinator::new();
         let uri = create_test_uri("test_content_change.md");
 
