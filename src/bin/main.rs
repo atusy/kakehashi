@@ -583,6 +583,7 @@ async fn run_lsp_server() {
         "kakehashi/internal/effectiveConfiguration",
         Kakehashi::effective_configuration,
     )
+    .custom_method("kakehashi/node", Kakehashi::kakehashi_node)
     .finish();
 
     // Wrap service with RequestIdCapture to:
