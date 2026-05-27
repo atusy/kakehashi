@@ -175,6 +175,8 @@ Edge cases:
 
 **Empty children**: A node that exists but has no children returns `[]` (not `null`).
 
+**Ordering**: Children are returned in **document order** — equivalent to ascending `start_byte` because direct siblings in a tree-sitter tree are non-overlapping by construction. This matches tree-sitter's native child iteration and gives clients a deterministic walk order for structural navigation, AST walks, fold computation, and "go to next/previous sibling" gestures. The ordering invariant is preserved across any future filtering (e.g., a `namedOnly` parameter): filters narrow the sequence, they do not reorder it.
+
 **Named vs anonymous**: `children` returns both named and anonymous children. A future request parameter (e.g., `namedOnly`) may restrict this if needed.
 
 ### Text Resolution: `kakehashi/node/text`
