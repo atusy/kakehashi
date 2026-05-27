@@ -98,6 +98,78 @@ fn assert_ulid_shaped(value: &Value) {
     );
 }
 
+/// Send a `textDocument/didChange` with a single full-text replacement.
+/// The version is bumped to `new_version` and the entire document text is
+/// replaced — equivalent to a full-document sync from the client.
+fn full_text_change(client: &mut LspClient, uri: &str, new_version: i64, new_text: &str) {
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": new_version },
+            "contentChanges": [{ "text": new_text }]
+        }),
+    );
+}
+
+/// Edit survival: acquire an id for a node, send a `didChange` that does NOT
+/// touch the node's START byte, and verify `kakehashi/node/text` reflects the
+/// post-edit content. ADR-0019's START-priority rule keeps the ULID alive,
+/// and ADR-0025's text endpoint must always slice from the *current* document.
+#[test]
+fn test_node_text_survives_edit_that_does_not_touch_start() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_survive.md";
+    // ATX heading occupies bytes [0, 9): "# Hello\n\n"; paragraph starts at byte 9.
+    let original = "# Hello\n\nparagraph one.\n";
+    open_markdown(&mut client, uri, original);
+
+    // Acquire an id for the heading via cursor on "Hello".
+    let node = request_node(&mut client, uri, 0, 4);
+    assert!(!node.is_null(), "expected NodeInfo for heading");
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id field must be a string")
+        .to_string();
+
+    // Capture the heading text BEFORE the edit so we can demand a change post-edit.
+    let before = request_node_text(&mut client, uri, &id);
+    let before_text = before
+        .get("text")
+        .and_then(Value::as_str)
+        .expect("pre-edit text must resolve")
+        .to_string();
+
+    // Append text after the paragraph — heading bytes are completely untouched,
+    // so its START stays at 0 and the ULID must survive.
+    let edited = "# Hello\n\nparagraph one.\nparagraph two.\n";
+    full_text_change(&mut client, uri, 2, edited);
+
+    let after = request_node_text(&mut client, uri, &id);
+    assert!(
+        !after.is_null(),
+        "id must survive an edit that does not touch its START byte"
+    );
+
+    let after_text = after
+        .get("text")
+        .and_then(Value::as_str)
+        .expect("post-edit text must resolve");
+
+    // Heading text is unchanged, so we expect to see the same heading string back.
+    assert_eq!(
+        after_text, before_text,
+        "heading text should remain stable when only later content is appended"
+    );
+    assert!(
+        edited.contains(after_text),
+        "post-edit text {:?} must be a substring of the new document {:?}",
+        after_text, edited
+    );
+}
+
 /// Round-trip: acquire an id via `kakehashi/node`, then ask
 /// `kakehashi/node/text` for it and verify the returned slice matches the
 /// expected substring of the document.
