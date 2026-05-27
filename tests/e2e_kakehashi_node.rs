@@ -1145,3 +1145,40 @@ fn test_node_injection_negative_two_three_layer_returns_middle_layer() {
         ty
     );
 }
+
+/// The spec defines `injection` as `boolean | number`. Anything else (string,
+/// array, object, fractional number) must collapse to `null` rather than
+/// silently coercing — ADR-0025's universal null semantics for unresolvable
+/// references covers malformed selectors too.
+#[test]
+fn test_node_injection_unsupported_shape_returns_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_invalid.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    // String — clearly not a bool or number.
+    let s = request_node_with_injection(&mut client, uri, 3, 4, json!("deepest"));
+    assert!(
+        s.is_null(),
+        "injection=<string> must return null, got {:?}",
+        s
+    );
+
+    // Object — also unsupported.
+    let o = request_node_with_injection(&mut client, uri, 3, 4, json!({"level": 1}));
+    assert!(
+        o.is_null(),
+        "injection=<object> must return null, got {:?}",
+        o
+    );
+
+    // Fractional number — not a representable integer index.
+    let f = request_node_with_injection(&mut client, uri, 3, 4, json!(1.5));
+    assert!(
+        f.is_null(),
+        "injection=<float> must return null, got {:?}",
+        f
+    );
+}
