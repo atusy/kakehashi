@@ -137,6 +137,36 @@ fn request_node(client: &mut LspClient, uri: &str, line: u32, character: u32) ->
         .expect("response must contain a result field")
 }
 
+/// Send `kakehashi/node` with an explicit `injection` parameter (ADR-0025 PR-4).
+/// `injection` is a `bool | number`; we accept any JSON value so the test
+/// fixtures can exercise the full parameter surface, including out-of-bounds
+/// indices and saturating `true`.
+fn request_node_with_injection(
+    client: &mut LspClient,
+    uri: &str,
+    line: u32,
+    character: u32,
+    injection: Value,
+) -> Value {
+    let response = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "injection": injection,
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "kakehashi/node returned an error: {:?}",
+        response.get("error")
+    );
+    response
+        .get("result")
+        .cloned()
+        .expect("response must contain a result field")
+}
+
 /// ULIDs are 26 uppercase Crockford-base32 characters.
 fn assert_ulid_shaped(value: &Value) {
     let s = value.as_str().expect("id should be a string");
@@ -733,5 +763,73 @@ fn test_node_children_returns_null_for_unknown_id() {
         result.is_null(),
         "unknown id must resolve to null (not []), got {:?}",
         result
+    );
+}
+
+// ============================================================
+// ADR-0025 PR-4: injection parameter
+//
+// The fixture below — a markdown document containing a fenced
+// `python` code block containing an `re.match(...)` call — drives
+// the layered-stack tests. It is intentionally tight so we can
+// reason about exact byte ranges in head: tree-sitter-markdown's
+// injection query maps `code_fence_content` → "python", and
+// tree-sitter-python's injection query maps the first string
+// argument of `re.match` → "regex", giving us a three-layer
+// stack at a cursor inside the regex pattern.
+// ============================================================
+
+/// Two-layer Markdown → Python fixture. The python code is on line 3
+/// (`y = 1 + 2`), so the cursor at (line: 3, character: 4) lands on the
+/// `=` sign — inside the python tree but unambiguously past the
+/// `code_fence_content` start.
+const MARKDOWN_WITH_PYTHON: &str = "# Heading\n\n```python\ny = 1 + 2\n```\n";
+
+/// Three-layer Markdown → Python → Regex fixture. The regex pattern is
+/// `"foo"` on line 4, so a cursor inside the string content reaches the
+/// regex tree.
+#[allow(dead_code)] // referenced by later PR-4 tests added in subsequent commits
+const MARKDOWN_WITH_PYTHON_REGEX: &str =
+    "# Heading\n\n```python\nimport re\nre.match(\"foo\", \"bar\")\n```\n";
+
+/// `injection: false` (or absence) selects the host layer. With a markdown
+/// document containing a python fenced code block, a cursor inside the
+/// python code must still resolve to a markdown node — the
+/// `code_fence_content` (or a markdown ancestor) — because the host layer
+/// is layer 0 by the ADR-0025 table.
+///
+/// PR-1 already returns the host node regardless of the `injection` value;
+/// this test pins that contract before PR-4 introduces the dispatch logic.
+#[test]
+fn test_node_injection_false_returns_host_node_inside_python_block() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_false.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    // Cursor inside the python code, on `y = 1 + 2` (line 3, char 4 is "=").
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(false));
+    assert!(
+        !result.is_null(),
+        "injection=false must always resolve at the host layer, got null"
+    );
+
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    // The host (markdown) node at that byte is some descendant of
+    // `fenced_code_block` — usually `code_fence_content` or an inline child
+    // of it. We assert on the markdown-side identifier set rather than pin
+    // the exact kind, so the test stays robust to upstream grammar tweaks.
+    assert!(
+        ty == "code_fence_content"
+            || ty == "fenced_code_block"
+            || ty == "block_continuation"
+            || ty == "text"
+            || ty == "inline",
+        "injection=false must return a markdown host node, got type={:?}",
+        ty
     );
 }
