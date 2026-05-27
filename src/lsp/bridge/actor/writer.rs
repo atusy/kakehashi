@@ -1,20 +1,9 @@
-//! Writer task for downstream language server stdin.
+//! Single-writer actor that drains the order queue into downstream stdin.
 //!
-//! This module provides the single-writer actor that consumes from the
-//! unified order queue and writes to the downstream server's stdin.
-//!
-//! # 3-Phase Shutdown Protocol
-//!
-//! The writer task supports graceful shutdown with a 3-phase protocol:
-//!
-//! 1. **Stop Signal**: Caller sends `()` on `stop_tx` to request shutdown
-//! 2. **Idle Confirmation**: Writer sends `()` on `idle_tx` when queue is drained
-//! 3. **Writer Return**: Writer sends itself on `writer_tx` for LSP shutdown sequence
-//!
-//! This protocol ensures:
-//! - Pending messages are delivered before shutdown
-//! - Caller can perform LSP shutdown/exit sequence with the returned writer
-//! - Writer is always returned if possible (dedicated channel)
+//! Graceful shutdown is a 3-phase protocol: caller signals `stop_tx`; writer
+//! drains the queue and signals `idle_tx`; writer then sends itself on a
+//! dedicated `writer_tx` so the caller can perform the LSP `shutdown`/`exit`
+//! sequence with the returned writer in hand.
 
 use std::sync::Arc;
 

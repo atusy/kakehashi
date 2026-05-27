@@ -1,24 +1,12 @@
-//! AutoInstallManager - Isolated coordinator for parser auto-installation.
+//! Parser auto-install coordinator: dedupes concurrent installs
+//! (`InstallingLanguages`), tracks crashed parsers (`FailedParserRegistry`),
+//! and runs the install.
 //!
-//! This module provides `AutoInstallManager`, which handles:
-//! - Deduplicating concurrent install attempts (`InstallingLanguages`)
-//! - Tracking crashed parsers (`FailedParserRegistry`)
-//! - Running the actual installation process
-//! - Generating events for Kakehashi to dispatch to ClientNotifier
-//!
-//! # Design Rationale
-//!
-//! `AutoInstallManager` returns `InstallResult` containing events rather than
-//! directly calling `ClientNotifier`. This keeps the coordinator fully isolated:
-//! - No dependency on `ClientNotifier` or `SettingsManager`
-//! - Pure installation logic + event generation
-//! - Fully unit-testable without mocking LSP infrastructure
-//!
-//! Kakehashi orchestrates by:
-//! 1. Checking `is_auto_install_enabled()` on SettingsManager
-//! 2. Calling `AutoInstallManager::try_install()`
-//! 3. Dispatching returned events to ClientNotifier
-//! 4. Handling post-install coordination (settings update, language reload)
+//! Returns `InstallResult` with events instead of calling `ClientNotifier`
+//! directly — keeps this module free of LSP infrastructure so it can be
+//! unit-tested in isolation. Kakehashi gates on `is_auto_install_enabled()`,
+//! calls `try_install()`, dispatches the events, and then handles
+//! post-install coordination (settings update, language reload).
 
 use std::path::PathBuf;
 use tower_lsp_server::ls_types::MessageType;

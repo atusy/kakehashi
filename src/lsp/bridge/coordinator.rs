@@ -74,35 +74,12 @@ struct EagerOpenBatch {
     handles: Vec<tokio::task::AbortHandle>,
 }
 
-/// Coordinator for bridge connections and region ID tracking.
+/// Bundles `LanguageServerPool` and `RegionIdTracker` so LSP handlers see one field.
+/// The pool is `Arc`'d so the cancel-forwarding middleware can share it.
 ///
-/// Consolidates the `LanguageServerPool` and `RegionIdTracker` into a single
-/// struct, reducing Kakehashi's field count from 9 to 8.
-///
-/// # Design Notes
-///
-/// The coordinator exposes internals via accessor methods (`pool()`, `region_id_tracker()`)
-/// for handlers that need direct access.
-///
-/// The pool is wrapped in `Arc` to enable sharing with the cancel forwarding middleware.
-///
-/// # API Design Pattern
-///
-/// Two access patterns coexist:
-///
-/// 1. **Direct pool access** (preferred for NEW code): Use `self.bridge.pool().*` to call
-///    pool methods directly. This is the primary pattern for LSP request handlers.
-///    - Pros: No coordinator changes needed, smaller API surface
-///    - Use for: send_*_request(), forward_cancel(), new pool operations
-///
-/// 2. **Delegating methods** (for common lifecycle operations): Methods like
-///    `close_host_document()`, `shutdown_all()`, etc. delegate to pool methods.
-///    - Pros: Semantic naming, hides pool implementation details
-///    - Use for: Document lifecycle (open/close), shutdown, region ID management
-///
-/// **Decision Guide**: Use direct pool access by default. Only add a delegating method
-/// if the operation is (a) used in 3+ places, (b) involves coordinator-level logic
-/// (e.g., combining pool + region_id_tracker), or (c) needs semantic naming for clarity.
+/// Prefer `self.bridge.pool().*` directly in new code; only add a delegating method
+/// here when the operation has 3+ callers, combines pool with region_id_tracker, or
+/// genuinely benefits from a semantic name (e.g., document lifecycle, shutdown).
 pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
     region_id_tracker: RegionIdTracker,
@@ -218,24 +195,12 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
-    /// Get bridge server config for a given injection language from settings.
-    ///
-    /// Looks up the bridge.servers configuration and finds a server that handles
-    /// the specified language. Returns `ResolvedServerConfig` which includes both
-    /// the server name (for connection pooling) and the config (for spawning).
-    ///
-    /// Returns None if:
-    /// - No server is configured for this injection language, OR
-    /// - The host language has a bridge filter that excludes this injection language
-    ///
-    /// Uses wildcard resolution (ADR-0011) for host language lookup:
-    /// - If host language is not defined, inherits from languages._ if present
-    /// - This allows setting default bridge filters for all hosts via languages._
-    ///
-    /// # Arguments
-    /// * `settings` - The current workspace settings
-    /// * `host_language` - The language of the host document (e.g., "markdown")
-    /// * `injection_language` - The injection language to bridge (e.g., "rust", "python")
+    /// Resolve `bridge.servers` for `injection_language`, returning the
+    /// `ResolvedServerConfig` (server name for pooling + spawn config) or
+    /// `None` when no server matches, or the host's bridge filter excludes
+    /// this injection. Host lookup uses wildcard resolution (ADR-0011):
+    /// undefined hosts inherit `languages._`, letting one default filter apply
+    /// to every host.
     pub(crate) fn get_config_for_language(
         &self,
         settings: &WorkspaceSettings,

@@ -1,24 +1,10 @@
-//! SelectionRange building from Tree-sitter AST nodes.
+//! Build LSP `SelectionRange` hierarchies from Tree-sitter AST nodes, with
+//! optional injection awareness (e.g. YAML in Markdown).
 //!
-//! This module provides the core functionality for building LSP SelectionRange
-//! hierarchies from Tree-sitter AST nodes. It handles both simple cases (pure AST
-//! traversal) and complex cases (language injections like YAML in Markdown).
-//!
-//! ## Entry Points
-//!
-//! - [`build`]: Main entry point. Detects injections and builds appropriate hierarchy.
-//! - [`build_from_node`]: Pure AST traversal, no injection awareness.
-//! - [`build_from_node_in_injection`]: For nodes already known to be in injected content.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! build()
-//!   ├── No injection detected → build_from_node()
-//!   └── Injection detected → parse injected content
-//!       ├── Success → build_from_node_in_injection() + chain to host
-//!       └── Failure → build_unparsed_fallback()
-//! ```
+//! Entry points: [`build`] (detects injections, falls back to AST), and the
+//! injection-naive [`build_from_node`] / injection-aware
+//! [`build_from_node_in_injection`]. When [`build`] sees an injection it parses
+//! the injected content; on parse failure it returns `build_unparsed_fallback`.
 
 use tower_lsp_server::ls_types::{Position, Range, SelectionRange};
 use tree_sitter::{Node, Parser, Tree};

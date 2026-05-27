@@ -1,46 +1,19 @@
-//! Formatting request handling for bridge connections.
+//! `textDocument/formatting` for downstream servers: translate each returned
+//! `TextEdit` range from virtual coordinates back to the host document, applying
+//! the injection's [`RegionOffset`] (including per-line column for the first line).
 //!
-//! This module provides `textDocument/formatting` functionality for downstream
-//! language servers, translating each returned `TextEdit` range from virtual
-//! document coordinates back to the host document.
+//! Uses `send_request()` for FIFO ordering with the single writer task (ADR-0015).
 //!
-//! Like `documentLink` and `documentSymbol`, formatting operates on an entire
-//! document — there is no cursor position. The injection region's
-//! [`RegionOffset`] is applied to every edit range, including the per-line
-//! column adjustment for the first line of the region.
+//! # Known limitation: multi-line edits drop host indentation
 //!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue requests via the channel-based
-//! writer task, ensuring FIFO ordering with other messages.
-//!
-//! # Multi-line edit limitation (host indentation)
-//!
-//! [`translate_virtual_range_to_host`] applies
-//! [`RegionOffset::column_for_line`] to every virtual line, so *positions*
-//! translate correctly in both injection shapes:
-//!
-//! - Non-blockquote (single-element `columns`, built via `RegionOffset::new`):
-//!   virtual line 0 gets the start column; line 1+ falls back to `0` because
-//!   the embedded text is dedented to column 0 of the host on those lines.
-//! - Blockquote (per-line `columns`, built via
-//!   `RegionOffset::with_per_line_offsets`): each virtual line gets its own
-//!   per-line column offset matching the blockquote prefix width (`> ` = 2).
-//!
-//! Position translation is correct in either case, but it is **not**
-//! sufficient for the `new_text` payload of a multi-line edit inside a
-//! prefixed injection (e.g., an indented markdown code fence or a
-//! blockquoted code block). The replacement text starts at column 0 of the
-//! embedded language, so when the formatter rewraps a function body the new
-//! lines insert at the host's column 0 instead of re-applying the host's
-//! indentation column or `> ` blockquote prefix.
-//!
-//! Single-line edits and zero-width inserts (the common case for
-//! `trimTrailingWhitespace` / `insertFinalNewline`) are unaffected. A full
-//! fix requires rewriting `new_text` to prepend the host indentation or
-//! blockquote prefix after every embedded newline; that is left as future
-//! work and tracked separately because it interacts with
-//! `trim_final_newlines` semantics.
+//! [`RegionOffset::column_for_line`] translates positions correctly for both
+//! `new()` (single-column) and `with_per_line_offsets()` (blockquote `> `) shapes.
+//! But `new_text` of a multi-line edit starts at column 0 of the embedded language,
+//! so replacement lines insert at host column 0 instead of re-applying the indent
+//! or `> ` prefix. Single-line edits and zero-width inserts (the common
+//! `trimTrailingWhitespace` / `insertFinalNewline` cases) are unaffected. Fixing
+//! this means rewriting `new_text` per embedded newline; deferred because it
+//! interacts with `trim_final_newlines` semantics.
 
 use std::io;
 
@@ -157,27 +130,15 @@ fn build_formatting_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/formatting", params)
 }
 
-/// Transform a formatting response from virtual to host document coordinates.
+/// Translate each `TextEdit` from virtual to host coordinates via `offset`.
+/// LSP returns `TextEdit[] | null`, so `null` or missing `result` collapses to `None`.
 ///
-/// Each returned `TextEdit` references a range inside the virtual document; we
-/// apply the region offset so the edit lines up with the corresponding bytes
-/// in the host. Per LSP, formatting returns `TextEdit[] | null`, so a `null`
-/// or missing `result` collapses to `None`.
-///
-/// # Boundary enforcement
-///
-/// Downstream formatters typically operate as if the virtual document were a
-/// real file and emit edits at its EOF (e.g., enforcing a trailing newline).
-/// When the virtual content sits inside a larger host (a markdown code fence,
-/// a string literal, …), the bytes immediately after the virtual EOF belong
-/// to the host. An edit whose range extends past the virtual line count
-/// would translate to a host position that overwrites those bytes — corrupting
-/// the closing ` ``` `, surrounding markdown, or string-literal quotes.
-///
-/// To prevent that, edits whose `range.end.line` is past the last virtual
-/// line are dropped before translation. `virtual_line_count` is the number of
-/// LSP lines in the virtual document (1 for an empty document, computed via
-/// [`count_lines`]).
+/// Edits whose `range.end.line > virtual_line_count - 1` are dropped before
+/// translation. Downstream formatters often emit edits past the virtual EOF
+/// (e.g. enforce trailing newline) as if it were a real file; the host bytes
+/// immediately past that EOF are the surrounding markdown/string-literal
+/// container, so applying such edits would corrupt the closing fence or quotes.
+/// `virtual_line_count` is the LSP line count (1 for empty), from [`count_lines`].
 fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

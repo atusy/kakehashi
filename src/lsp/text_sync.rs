@@ -17,26 +17,12 @@ use tree_sitter::InputEdit;
 
 use crate::text::PositionMapper;
 
-/// Apply content changes to text and build tree-sitter InputEdits.
+/// Apply LSP content changes to `old_text`, returning the updated text and the
+/// matching tree-sitter `InputEdit`s. Changes with `range` build an `InputEdit`;
+/// rangeless full-sync changes replace the whole text and emit no edit.
 ///
-/// Processes LSP TextDocumentContentChangeEvent items, handling both:
-/// - Incremental changes (with range) → builds InputEdit for tree-sitter
-/// - Full document changes (without range) → replaces entire text
-///
-/// # Arguments
-/// * `old_text` - The current document text
-/// * `content_changes` - LSP content change events from didChange notification
-///
-/// # Returns
-/// A tuple of:
-/// - The updated text after applying all changes
-/// - A vector of InputEdits for incremental tree-sitter parsing (empty for full sync)
-///
-/// # Branch Decision
-///
-/// The returned edits vector determines the parsing strategy:
-/// - **Non-empty edits**: Use incremental parsing with `apply_edits`
-/// - **Empty edits**: Use full re-parse with `apply_text_change`
+/// An empty returned edits vec is the caller's signal to do a full re-parse
+/// (`apply_text_change`); a non-empty vec means incremental (`apply_edits`).
 pub(crate) fn apply_content_changes_with_edits(
     old_text: &str,
     content_changes: Vec<TextDocumentContentChangeEvent>,

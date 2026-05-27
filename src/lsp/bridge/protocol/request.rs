@@ -38,26 +38,13 @@ pub(crate) fn build_text_document_position_params(
     )
 }
 
-/// Build a position-based JSON-RPC request for a downstream language server.
+/// Build a position-based JSON-RPC request (`hover`, `completion`, `definition`, …)
+/// for a downstream server: translate `host_position` via `offset` and wrap it
+/// for `method`.
 ///
-/// This is the core helper for building LSP requests that operate on a position
-/// (hover, completion, definition, etc.). It handles:
-/// - Translating host position to virtual coordinates
-/// - Building the JSON-RPC request structure
-///
-/// # Arguments
-/// * `virtual_uri` - The pre-built virtual document URI
-/// * `host_position` - The position in the host document
-/// * `offset` - The region offset for coordinate translation
-/// * `request_id` - The JSON-RPC request ID
-/// * `method` - The LSP method name (e.g., "textDocument/hover")
-///
-/// # Defensive Arithmetic
-///
-/// Uses `saturating_sub` for line translation to prevent panic on underflow.
-/// This can occur during race conditions when document edits invalidate region
-/// data while an LSP request is in flight. In such cases, the request will use
-/// line 0, which may produce incorrect results but won't crash the server.
+/// Line translation uses `saturating_sub` so an in-flight request whose region
+/// got invalidated by a concurrent edit clamps to line 0 — wrong result, not
+/// a panic.
 pub(crate) fn build_position_based_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: Position,

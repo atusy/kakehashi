@@ -22,27 +22,13 @@ use super::super::pool::{ConnectionHandle, ConnectionState, LanguageServerPool};
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 impl LanguageServerPool {
-    /// Forward didChange notifications to all opened virtual documents for a host document.
+    /// Send `didChange` to every already-opened virtual document for `host_uri`,
+    /// skipping injections that haven't been opened yet (`didOpen` happens on
+    /// their first request). Uses full content sync for simplicity.
     ///
-    /// When the host document (e.g., markdown file) changes, this method:
-    /// 1. Gets the list of opened virtual documents for the host
-    /// 2. For each injection that has an opened virtual document, sends didChange
-    /// 3. Skips injections that haven't been opened yet (didOpen will be sent on first request)
-    ///
-    /// Uses full content sync (TextDocumentSyncKind::Full) for simplicity.
-    ///
-    /// # Single-Writer Loop (ADR-0015)
-    ///
-    /// All didChange notifications are queued via `send_notification()` which ensures
-    /// FIFO ordering. This is non-blocking (fire-and-forget semantics) but maintains
-    /// proper message ordering, unlike the previous `tokio::spawn` approach.
-    ///
-    /// # Arguments
-    /// * `host_uri` - The host document URI
-    /// * `injections` - All injection regions in the host document
-    ///
-    // TODO: Support incremental didChange (TextDocumentSyncKind::Incremental) for better
-    // performance with large documents. Currently uses full sync for simplicity.
+    /// Notifications go through `send_notification()` (single writer task,
+    /// ADR-0015) for FIFO order — fire-and-forget but no reordering.
+    // TODO: switch to TextDocumentSyncKind::Incremental for large documents.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
         host_uri: &Url,

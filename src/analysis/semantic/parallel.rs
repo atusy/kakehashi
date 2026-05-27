@@ -188,23 +188,8 @@ impl ThreadLocalParserFactory {
     }
 }
 
-/// Process a single injection synchronously, collecting tokens.
-///
-/// This function parses the injection content and collects semantic tokens,
-/// including any nested injections (processed recursively in the same thread).
-///
-/// # Arguments
-/// * `ctx` - The injection context containing language and content info
-/// * `factory` - Thread-local parser factory for creating parsers
-/// * `coordinator` - Language coordinator for nested injection resolution
-/// * `capture_mappings` - Optional capture mappings for token type translation
-/// * `host_text` - The full host document text (for position calculations)
-/// * `host_lines` - Pre-split lines of the host document
-/// * `depth` - Current injection depth (0 = host document)
-/// * `supports_multiline` - Whether the client supports multiline tokens
-///
-/// # Returns
-/// Vector of raw tokens collected from this injection and any nested injections
+/// Parse one injection and collect its tokens (plus any nested injections,
+/// recursed on the same thread). `depth = 0` is the host document.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_injection_sync(
     ctx: &InjectionContext<'_>,
@@ -438,29 +423,13 @@ fn collect_injection_contexts_sync<'a>(
     (contexts, exclusion_ranges)
 }
 
-/// Collect semantic tokens from all injections in parallel using Rayon.
+/// Walk top-level injections of the host doc in parallel via Rayon work-stealing,
+/// returning `(raw_tokens_sorted_by_position, active_regions)`. Nested injections
+/// recurse on the same worker thread — no extra parallelism to avoid coordination
+/// overhead.
 ///
-/// This is the main entry point for parallel injection processing. It:
-/// 1. Collects all top-level injection contexts from the host document
-/// 2. Processes each injection in parallel using Rayon's work-stealing
-/// 3. Merges all tokens and returns them sorted by position
-///
-/// Nested injections are processed recursively within the same Rayon worker
-/// thread (no additional parallelism), avoiding coordination overhead.
-///
-/// # Arguments
-/// * `host_text` - The full text of the host document
-/// * `host_tree` - The parsed tree of the host document
-/// * `host_filetype` - The filetype of the host document (e.g., "markdown")
-/// * `coordinator` - Language coordinator for injection resolution
-/// * `capture_mappings` - Optional capture mappings for token type translation
-/// * `supports_multiline` - Whether the client supports multiline tokens
-///
-/// # Returns
-/// Tuple of (raw tokens from all injections sorted by position, active injection regions).
-///
-/// An injection region is **active** if at least one token was produced from it (depth ≥ 1).
-/// Inactive regions (injection resolved but no captures) don't suppress parent tokens.
+/// A region is *active* only if at least one token was produced from it (depth ≥ 1);
+/// resolved-but-empty injections don't suppress parent tokens.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_injection_tokens_parallel(
     host_text: &str,

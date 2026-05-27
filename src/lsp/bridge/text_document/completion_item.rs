@@ -1,25 +1,12 @@
-//! completionItem/resolve request handling for bridge connections.
+//! `completionItem/resolve`: route the request to the single downstream server
+//! identified by the Kakehashi envelope stored in `CompletionItem.data` during
+//! the original completion fan-out. Uses `send_request()` for FIFO ordering
+//! through the single writer task (ADR-0015).
 //!
-//! Routes a resolve request to the single downstream server that produced
-//! the completion item, identified by the Kakehashi envelope stored in
-//! `CompletionItem.data` during the original completion fan-out.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue messages via the
-//! channel-based writer task, ensuring FIFO ordering with other messages.
-//!
-//! # No didOpen
-//!
-//! Unlike other bridge handlers, this module does NOT call `ensure_document_opened`.
-//! The virtual document was already opened during the completion request that
-//! produced this item, so re-sending didOpen is unnecessary.
-//!
-//! **Edge case:** If the downstream server restarts (or the connection is
-//! re-created via `get_or_create_connection`) between the original completion
-//! and this resolve, the virtual document will not exist on the new server
-//! instance. The resolve will fail and the fallback path returns the
-//! unresolved item with its envelope intact — graceful degradation.
+//! No `didOpen` is sent here — the virtual document is already open from the
+//! completion that produced this item. If the downstream server has since
+//! restarted (or the connection was recreated), the resolve fails and we
+//! return the unresolved item with envelope intact: graceful degradation.
 
 use std::sync::Arc;
 

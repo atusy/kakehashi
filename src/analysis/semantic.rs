@@ -26,25 +26,10 @@ use token_collector::{RawToken, collect_host_tokens};
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
 
-/// Handle semantic tokens full request with Rayon parallel injection processing.
-///
-/// Uses Rayon's work-stealing parallelism for processing multiple injections
-/// concurrently. Thread-local parser caching eliminates the need for cross-thread
-/// synchronization during parsing. Runs CPU-bound work on tokio's blocking thread
-/// pool to avoid blocking the async runtime.
-///
-/// # Arguments
-/// * `text` - The source text (owned for moving into spawn_blocking)
-/// * `tree` - The parsed syntax tree (owned for moving into spawn_blocking)
-/// * `query` - The tree-sitter query for semantic highlighting (host language)
-/// * `filetype` - The filetype of the document being processed
-/// * `capture_mappings` - The capture mappings to apply
-/// * `coordinator` - Language coordinator for injection queries and language loading
-/// * `supports_multiline` - Whether client supports multiline tokens (per LSP 3.16.0+)
-///
-/// # Returns
-/// Semantic tokens for the entire document including injected content,
-/// or None if the task was cancelled or failed.
+/// Compute full-document semantic tokens (host + injections) on tokio's
+/// blocking pool, distributing injections across Rayon workers. Thread-local
+/// parser caches avoid cross-thread synchronization on parse. Returns `None`
+/// on cancellation/failure. `text` and `tree` are moved into `spawn_blocking`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     text: String,

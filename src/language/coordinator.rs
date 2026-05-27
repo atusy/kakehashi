@@ -763,23 +763,14 @@ impl LanguageCoordinator {
         self.language_registry.contains(language_name)
     }
 
-    /// ADR-0005: Unified detection fallback chain for both host documents and injections.
-    ///
-    /// Returns the first language for which a parser is available.
-    ///
-    /// Priority order (ADR-0005), two stages:
-    /// Each stage follows: detect → base resolution → availability check
-    /// 1. LSP languageId (if not "plaintext")
-    /// 2. Heuristic detection:
-    ///    - Explicit token (for injections, e.g., "py", "js")
-    ///    - Path-derived token (extension/basename via `extract_token_from_path`)
-    ///    - First-line content (shebang, mode line, Emacs markers)
-    ///
-    /// Usage:
-    /// - Host document: `detect_language(path, content, None, language_id)`
-    /// - Injection: `detect_language(token, content, Some(token), Some(token))`
-    ///
-    /// Visibility: pub(crate) - called by LSP layer and injection resolution.
+    /// ADR-0005 unified detection chain for host docs and injections; returns
+    /// the first language with an available parser. Each stage is
+    /// detect → base resolution → availability:
+    /// (1) LSP `languageId` (if not `"plaintext"`); (2) heuristics — explicit
+    /// token (`"py"`, `"js"`), path token via `extract_token_from_path`, then
+    /// first-line content (shebang, mode line, Emacs markers).
+    /// Host call: `detect_language(path, content, None, language_id)`;
+    /// injection call: `detect_language(token, content, Some(token), Some(token))`.
     pub(crate) fn detect_language(
         &self,
         path: &str,
@@ -894,23 +885,12 @@ impl LanguageCoordinator {
         (None, "none", last_candidate)
     }
 
-    /// ADR-0005: Resolve injection language using unified detection heuristics.
-    ///
-    /// Unlike `detect_language` which gates on parser availability, this function
-    /// uses the same detection heuristics but attempts to LOAD the detected language.
-    /// This is needed because injection discovery happens before we know which parsers
-    /// are needed.
-    ///
-    /// Detection chain (same order as `detect_language`):
-    /// 1. Direct identifier (try to load as-is)
-    /// 2. Syntect token normalization (py -> python, js -> javascript)
-    /// 3. First-line detection (shebang, mode line)
-    ///
-    /// Config-based base resolution (rmd -> markdown) is applied as a sub-step
-    /// after each detection method via `try_load_with_base`.
-    ///
-    /// Visibility: pub(crate) - called by analysis layer (semantic.rs) for
-    /// nested language injection support.
+    /// ADR-0005 injection-language detection. Same chain as `detect_language`
+    /// (1: direct id, 2: syntect normalisation `py→python`, `js→javascript`,
+    /// 3: first-line shebang/mode-line) but *loads* the parser instead of
+    /// only checking availability — injection discovery runs before we know
+    /// which parsers are needed. Each step runs through `try_load_with_base`
+    /// for config-based base resolution (e.g. `rmd→markdown`).
     pub(crate) fn resolve_injection_language(
         &self,
         identifier: &str,

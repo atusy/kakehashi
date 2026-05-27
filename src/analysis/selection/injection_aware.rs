@@ -83,26 +83,10 @@ pub fn calculate_effective_lsp_range(
     Range::new(start_pos, end_pos)
 }
 
-/// Check if cursor byte position is within the effective range after applying offset.
-///
-/// Used to determine if the cursor is inside the actual injection content after
-/// offset directives have been applied. For example, in Markdown frontmatter:
-/// ```markdown
-/// ---
-/// title: "hello"
-/// ---
-/// ```
-/// With offset `(1, 0, -1, 0)`, the cursor must be within `title: "hello"\n`
-/// (excluding the `---` boundary lines) for this to return true.
-///
-/// # Arguments
-/// * `text` - The full host document text
-/// * `content_node` - The injection content node
-/// * `cursor_byte` - The cursor position in bytes
-/// * `offset` - The offset to apply
-///
-/// # Returns
-/// `true` if cursor is within the effective range, `false` otherwise
+/// True iff `cursor_byte` lies inside the injection content after applying
+/// `offset` directives. Example: Markdown frontmatter with `(1, 0, -1, 0)`
+/// excludes the `---` boundary lines, so only positions inside `title: "hello"\n`
+/// qualify.
 pub fn is_cursor_within_effective_range(
     text: &str,
     content_node: &Node,
