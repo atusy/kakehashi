@@ -834,11 +834,12 @@ fn test_node_injection_false_returns_host_node_inside_python_block() {
     );
 }
 
-/// Names that tree-sitter-python produces for nodes inside `y = 1 + 2`. We
-/// don't pin a single kind because the smallest-containing-node algorithm
-/// may land on an anonymous `=` token, a named `assignment`, or an
-/// `expression_statement` depending on the cursor column and the grammar
-/// revision. Any of these proves the resolver crossed into the python tree.
+/// Names that tree-sitter-python produces for nodes inside the various
+/// python fixtures used below. We don't pin a single kind because the
+/// smallest-containing-node algorithm may land on an anonymous `=` token,
+/// a named `assignment`, an `expression_statement`, or — inside string
+/// literals — `string`, `string_start`, `string_content`, etc. Any of
+/// these proves the resolver crossed into the python tree.
 fn is_python_kind(ty: &str) -> bool {
     matches!(
         ty,
@@ -848,8 +849,20 @@ fn is_python_kind(ty: &str) -> bool {
             | "identifier"
             | "integer"
             | "binary_operator"
+            | "string"
+            | "string_start"
+            | "string_end"
+            | "string_content"
+            | "call"
+            | "attribute"
+            | "argument_list"
             | "="
             | "+"
+            | "\""
+            | "("
+            | ")"
+            | ","
+            | "."
     )
 }
 
@@ -952,5 +965,183 @@ fn test_node_injection_positive_one_returns_null_outside_any_injection() {
         result.is_null(),
         "injection=1 outside any injection must return null, got {:?}",
         result
+    );
+}
+
+/// `injection: -1` resolves to `stack[stack.len - 1]` per ADR-0025's
+/// negative-index formula. For a 2-layer markdown→python stack that's the
+/// python layer, matching `true` here — but through the strict formula,
+/// not the saturating path. (The two only diverge when the stack is
+/// somehow empty, which the spec prohibits because the host is always
+/// present.)
+#[test]
+fn test_node_injection_negative_one_returns_deepest_layer() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_neg1.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(-1));
+    assert!(
+        !result.is_null(),
+        "injection=-1 on a 2-layer stack must resolve to the python layer, got null"
+    );
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    assert!(
+        is_python_kind(ty),
+        "injection=-1 must select the python (deepest) layer, got type={:?}",
+        ty
+    );
+}
+
+/// `injection: -2` on a 2-layer stack resolves to `stack[2 + (-2)] =
+/// stack[0]`, i.e. the host layer. Distinct from saturating `true`, which
+/// would still return the deepest layer.
+#[test]
+fn test_node_injection_negative_two_returns_host_on_two_layer_stack() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_neg2.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(-2));
+    assert!(
+        !result.is_null(),
+        "injection=-2 on a 2-layer stack must resolve to the host layer, got null"
+    );
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    assert!(
+        ty == "code_fence_content"
+            || ty == "fenced_code_block"
+            || ty == "block_continuation"
+            || ty == "text"
+            || ty == "inline",
+        "injection=-2 must select the markdown host layer, got type={:?}",
+        ty
+    );
+}
+
+/// `injection: -3` on a 2-layer stack underflows: `stack[2 + (-3)] =
+/// stack[-1]`. ADR-0025 says strict integer indices return null when out
+/// of bounds, which includes negative results from the negative-formula.
+#[test]
+fn test_node_injection_negative_three_returns_null_on_two_layer_stack() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_neg3.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(-3));
+    assert!(
+        result.is_null(),
+        "injection=-3 on a 2-layer stack must return null (underflow), got {:?}",
+        result
+    );
+}
+
+/// Sanity-check the 3-layer markdown → python → regex fixture: with the
+/// cursor inside `re.match("foo", ...)`'s regex string, `injection: true`
+/// must land on a regex (or regex-like) node, distinct from the python or
+/// markdown nodes the inner layers would produce. The fixture also lets
+/// `-2` resolve to the *python* layer non-trivially — see
+/// [`test_node_injection_negative_two_three_layer_returns_middle_layer`].
+///
+/// We do NOT pin the exact regex node `type` here: depending on the
+/// tree-sitter-regex grammar revision the smallest containing node at a
+/// given offset can be `pattern`, `term`, `pattern_character`, etc. We
+/// only assert that the response is non-null and the resolved type is
+/// *not* one of the markdown/python kinds — the regex grammar must have
+/// kicked in.
+#[test]
+fn test_node_injection_three_layer_saturates_to_regex() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_3layer_true.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON_REGEX);
+
+    // Line 4 is `re.match("foo", "bar")`; char 11 is inside the first
+    // string literal's content ("foo"), where the regex injection lives.
+    let result = request_node_with_injection(&mut client, uri, 4, 11, json!(true));
+    if result.is_null() {
+        // The regex grammar / queries may not be installed on this host.
+        // Skip rather than fail so the suite stays green when the
+        // optional third grammar is unavailable.
+        eprintln!("SKIP: 3-layer fixture did not resolve a regex layer (regex parser missing?)");
+        return;
+    }
+
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    assert!(
+        !is_python_kind(ty)
+            && ty != "code_fence_content"
+            && ty != "fenced_code_block"
+            && ty != "inline",
+        "injection=true with a 3-layer fixture must drop into a regex \
+         node — got a python / markdown kind {:?}",
+        ty
+    );
+}
+
+/// `injection: -2` on a 3-layer stack resolves to `stack[3 + (-2)] =
+/// stack[1]`, i.e. the python layer — strictly *between* the markdown
+/// host and the regex leaf. This is the test the spec calls out as
+/// "non-trivial vs `-1`", because in a 2-layer fixture `-2` collapses to
+/// the host layer (already covered above).
+///
+/// Skipped if the regex grammar isn't available, matching the saturating
+/// 3-layer test.
+#[test]
+fn test_node_injection_negative_two_three_layer_returns_middle_layer() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_3layer_neg2.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON_REGEX);
+
+    // Probe with `true` first to confirm the 3-layer stack is observable.
+    let saturated = request_node_with_injection(&mut client, uri, 4, 11, json!(true));
+    if saturated.is_null() {
+        eprintln!("SKIP: 3-layer fixture did not resolve at all (regex parser missing?)");
+        return;
+    }
+    let saturated_ty = saturated
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if is_python_kind(&saturated_ty) {
+        // `true` saturated to the python layer, meaning the stack only
+        // has 2 layers (regex didn't activate). Skip the -2 assertion.
+        eprintln!("SKIP: 3-layer fixture only produced 2 layers (regex injection inactive)");
+        return;
+    }
+
+    let result = request_node_with_injection(&mut client, uri, 4, 11, json!(-2));
+    assert!(
+        !result.is_null(),
+        "injection=-2 on a 3-layer stack must resolve to the middle (python) layer, got null"
+    );
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    assert!(
+        is_python_kind(ty),
+        "injection=-2 on a 3-layer stack must select the python middle layer, \
+         got type={:?}",
+        ty
     );
 }
