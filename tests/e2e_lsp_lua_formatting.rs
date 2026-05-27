@@ -13,7 +13,10 @@
 //! **Requirements**: lua-language-server must be installed and in PATH.
 //! **Note**: lua-ls's stylua-style formatting is best-effort; the test
 //! tolerates `null` / empty-array responses and only asserts host-coordinate
-//! correctness when edits are returned.
+//! correctness when edits are returned. The bridge swallows downstream
+//! errors (e.g., lua-ls's `-32601`) into `FanInResult::NoResult` and
+//! surfaces them as a `null` result, so any top-level JSON-RPC `error`
+//! on this request indicates a kakehashi routing/handler bug.
 
 #![cfg(feature = "e2e")]
 
@@ -71,38 +74,45 @@ fn e2e_formatting_request_returns_host_coordinate_edits() {
         "Response should have id field"
     );
 
-    if let Some(error) = format_response.get("error") {
-        let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-        // -32601 (method not found) is acceptable from a downstream that
-        // doesn't implement formatting. Any other error is a kakehashi bug.
-        if code != -32601 {
-            panic!("Unexpected error from formatting request: {:?}", error);
-        }
-        println!("E2E: lua-ls returned method not found — bridge wiring still validated");
-    } else if let Some(result) = format_response.get("result") {
-        if result.is_null() {
-            println!("E2E: Got null result (formatter signalled no edits)");
-        } else {
-            let edits = result
-                .as_array()
-                .expect("formatting result must be null or TextEdit[]");
-            println!("E2E: Got {} TextEdit(s)", edits.len());
+    // The request goes to kakehashi, not lua-ls directly. The bridge
+    // converts a downstream `-32601` ("method not found") into a
+    // `FanInResult::NoResult` and returns `null` to the editor. So any
+    // top-level JSON-RPC error here means kakehashi itself failed to
+    // route/handle `textDocument/formatting` — a regression, not a
+    // tolerable downstream gap.
+    assert!(
+        format_response.get("error").is_none(),
+        "kakehashi must not surface a top-level error for textDocument/formatting; \
+         downstream errors are absorbed by the bridge. Got: {:?}",
+        format_response.get("error")
+    );
 
-            // Code fence opens on host line 2 (after "# Test Document\n\n```lua\n").
-            // Every returned edit's start must land at or after line 2 — any
-            // earlier line would indicate a coordinate-translation bug.
-            for edit in edits {
-                let start_line = edit["range"]["start"]["line"]
-                    .as_u64()
-                    .expect("TextEdit.range.start.line must be a number");
-                assert!(
-                    start_line >= 2,
-                    "Edit must reference host coordinates inside the code fence \
-                     (expected line >= 2, got {}). Full edit: {:?}",
-                    start_line,
-                    edit
-                );
-            }
+    let result = format_response
+        .get("result")
+        .expect("Response should carry a result field");
+
+    if result.is_null() {
+        println!("E2E: Got null result (formatter signalled no edits)");
+    } else {
+        let edits = result
+            .as_array()
+            .expect("formatting result must be null or TextEdit[]");
+        println!("E2E: Got {} TextEdit(s)", edits.len());
+
+        // Code fence opens on host line 2 (after "# Test Document\n\n```lua\n").
+        // Every returned edit's start must land at or after line 2 — any
+        // earlier line would indicate a coordinate-translation bug.
+        for edit in edits {
+            let start_line = edit["range"]["start"]["line"]
+                .as_u64()
+                .expect("TextEdit.range.start.line must be a number");
+            assert!(
+                start_line >= 2,
+                "Edit must reference host coordinates inside the code fence \
+                 (expected line >= 2, got {}). Full edit: {:?}",
+                start_line,
+                edit
+            );
         }
     }
 
