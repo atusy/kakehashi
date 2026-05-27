@@ -84,7 +84,25 @@ impl Kakehashi {
 
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
 
-        let cancel_token = make_fanout_token(cancel_rx);
+        // Fan one upstream cancel oneshot out to N+1 consumers (outer collector
+        // + per-region `dispatch_preferred`). `CancellationToken` is cloneable
+        // and broadcasts on cancel; the upstream rx isn't, so we forward it
+        // into the token once. When `subscribe_cancel` returns `None` (no
+        // upstream id, or duplicate subscription) there is no cancel source —
+        // leave the token as `None` so downstream consumers receive `None` for
+        // their `cancel_rx` and degrade to "no cancel" instead of being told
+        // "already cancelled". Using a pre-cancelled token here would abort
+        // every region task before it even started.
+        let cancel_token = cancel_rx.map(|rx| {
+            let token = CancellationToken::new();
+            let forward = token.clone();
+            tokio::spawn(async move {
+                // Fires on both real cancel and tx-drop (subscription guard).
+                let _ = rx.await;
+                forward.cancel();
+            });
+            token
+        });
 
         let pool = self.bridge.pool_arc();
 
@@ -119,8 +137,11 @@ impl Kakehashi {
             // Per-region cancel receiver derived from the shared token, so
             // the inner preferred() can abort its per-server JoinSet as soon
             // as $/cancelRequest arrives — not after the slowest formatter
-            // completes naturally.
-            let region_cancel_rx = cancel_rx_from_token(cancel_token.clone());
+            // completes naturally. `None` when no upstream cancel source
+            // exists, in which case the dispatcher disables cancel handling.
+            let region_cancel_rx = cancel_token
+                .as_ref()
+                .map(|t| cancel_rx_from_token(t.clone()));
 
             outer_join_set.spawn(async move {
                 let result = dispatch_preferred(
@@ -150,7 +171,7 @@ impl Kakehashi {
                     // lower-priority server that might re-format the same code.
                     // `None` still means "no response" and triggers fallback.
                     |opt| opt.is_some(),
-                    Some(region_cancel_rx),
+                    region_cancel_rx,
                 )
                 .await;
                 match result {
@@ -162,7 +183,7 @@ impl Kakehashi {
 
         let all_edits = crate::lsp::aggregation::region::collect_region_results_with_cancel(
             outer_join_set,
-            Some(cancel_rx_from_token(cancel_token)),
+            cancel_token.map(cancel_rx_from_token),
             |acc, opt: Option<Vec<TextEdit>>| {
                 if let Some(items) = opt {
                     acc.extend(items);
@@ -213,36 +234,6 @@ fn cancel_rx_from_token(token: CancellationToken) -> CancelReceiver {
         let _ = tx.send(());
     });
     rx
-}
-
-/// Build the shared cancellation token that fans out to every per-region
-/// dispatch and the outer collector.
-///
-/// The upstream cancel arrives as a single non-cloneable oneshot, but we need
-/// to observe cancel in N+1 places (outer collector + one per region's inner
-/// `dispatch_preferred`). A `CancellationToken` is cloneable, broadcastable,
-/// and zero-cost when no cancel arrives.
-///
-/// When `upstream_rx` is `None` (no `upstream_request_id`, or duplicate
-/// subscription), there is no source of cancellation — but the per-region and
-/// outer `cancel_rx_from_token` forwarders are still spawned and each awaits
-/// `token.cancelled()` indefinitely. Return an **already-cancelled** token so
-/// those forwarders fire immediately and exit cleanly, instead of leaking N+1
-/// tokio tasks per request.
-fn make_fanout_token(upstream_rx: Option<CancelReceiver>) -> CancellationToken {
-    let token = CancellationToken::new();
-    match upstream_rx {
-        None => token.cancel(),
-        Some(rx) => {
-            let forward = token.clone();
-            tokio::spawn(async move {
-                // Fires on both real cancel and tx-drop (subscription guard).
-                let _ = rx.await;
-                forward.cancel();
-            });
-        }
-    }
-    token
 }
 
 #[cfg(test)]
@@ -360,87 +351,5 @@ mod tests {
         // Token still owned by this scope — drop it explicitly so the spawned
         // forwarder task exits cleanly (no leaked task on test teardown).
         token.cancel();
-    }
-
-    // ==========================================================================
-    // make_fanout_token (review HIGH follow-up: no-upstream-subscription leak)
-    // ==========================================================================
-    //
-    // `formatting_impl` fans one upstream cancel oneshot out to N+1 consumers
-    // via a `CancellationToken`. When `subscribe_cancel` returns `None` (e.g.,
-    // no upstream_request_id, or duplicate subscription), the upstream
-    // forwarder that would call `token.cancel()` was never spawned — but the
-    // per-region/outer `cancel_rx_from_token(...)` forwarders WERE still
-    // spawned, each awaiting a token nobody would cancel. Result: 1 + N tasks
-    // leaked per request in that path.
-    //
-    // The fix: `make_fanout_token` returns a token that is **pre-cancelled**
-    // when `upstream_rx` is `None`, so every downstream forwarder fires
-    // immediately and exits cleanly. The common path (Some(rx)) keeps the
-    // original behavior: the token cancels when the upstream rx resolves
-    // (real cancel or subscription-guard drop).
-
-    #[tokio::test]
-    async fn make_fanout_token_is_pre_cancelled_when_no_upstream_subscription() {
-        // No-upstream path: token must already be cancelled so per-region and
-        // outer forwarders complete immediately rather than leak.
-        let token = make_fanout_token(None);
-        assert!(
-            token.is_cancelled(),
-            "no upstream subscription must yield an already-cancelled token \
-             so downstream cancel_rx_from_token forwarders exit immediately"
-        );
-    }
-
-    #[tokio::test]
-    async fn make_fanout_token_stays_alive_when_upstream_rx_pending() {
-        // Common path: upstream rx exists but no cancel arrives yet. Token
-        // must remain alive so downstream consumers keep waiting for cancel.
-        let (_tx, rx) = oneshot::channel();
-        let token = make_fanout_token(Some(rx));
-        assert!(
-            !token.is_cancelled(),
-            "token must stay alive while upstream cancel rx is pending"
-        );
-        // Cleanup: cancel so the spawned forwarder exits.
-        token.cancel();
-    }
-
-    #[tokio::test]
-    async fn make_fanout_token_cancels_when_upstream_rx_fires() {
-        // Common path: upstream cancel arrives → token must cancel so every
-        // downstream forwarder fires.
-        let (tx, rx) = oneshot::channel();
-        let token = make_fanout_token(Some(rx));
-
-        tx.send(()).unwrap();
-
-        // Spawned forwarder needs a tick to observe the send and call cancel.
-        let cancelled =
-            tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled_owned()).await;
-        assert!(
-            cancelled.is_ok(),
-            "token must cancel within 1s of upstream rx firing"
-        );
-    }
-
-    #[tokio::test]
-    async fn make_fanout_token_cancels_when_upstream_rx_dropped() {
-        // The subscription guard owning the upstream tx drops at the end of
-        // the handler — the rx then resolves with Err. The forwarder uses
-        // `let _ = rx.await; cancel()` so it cancels in either case, which
-        // is exactly what we want (no leaked downstream forwarders even on
-        // the natural drop path).
-        let (tx, rx) = oneshot::channel::<()>();
-        let token = make_fanout_token(Some(rx));
-
-        drop(tx);
-
-        let cancelled =
-            tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled_owned()).await;
-        assert!(
-            cancelled.is_ok(),
-            "token must cancel when upstream rx is dropped (guard-drop path)"
-        );
     }
 }
