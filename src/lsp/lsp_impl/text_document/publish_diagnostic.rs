@@ -1,30 +1,8 @@
-//! Synthetic push diagnostics for ADR-0020 Phase 2.
-//!
-//! This module contains the shared collection path for proactive
-//! `textDocument/publishDiagnostics` pushes. The scheduling entrypoints live in
-//! `DiagnosticScheduler`; this file keeps the fan-out and aggregation logic used
-//! by both immediate synthetic pushes and debounced didChange pushes.
-//!
-//! # Architecture
-//!
-//! ```text
-//! DiagnosticScheduler
-//!       │
-//!       ▼
-//! prepare_diagnostic_snapshot(uri)
-//!       │
-//! collect_push_diagnostics()
-//!       │
-//!       ▼
-//! JoinSet { collect_region_diagnostics() per region }
-//! ```
-//!
-//! # Superseding Pattern
-//!
-//! `DiagnosticScheduler` coordinates superseding via
-//! `SyntheticDiagnosticsManager` and `DebouncedDiagnosticsManager`. This module
-//! only handles the per-region collection and aggregation once a snapshot has
-//! already been prepared.
+//! Shared fan-out/aggregation for proactive `textDocument/publishDiagnostics`
+//! pushes (ADR-0020 Phase 2). `DiagnosticScheduler` schedules and handles
+//! superseding (via `SyntheticDiagnosticsManager` / `DebouncedDiagnosticsManager`);
+//! this module just collects per-region diagnostics from a prepared snapshot
+//! using a `JoinSet`.
 
 use std::sync::Arc;
 

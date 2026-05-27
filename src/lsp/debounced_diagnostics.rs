@@ -1,42 +1,12 @@
-//! Debounced diagnostic triggers for ADR-0020 Phase 3.
+//! Debounced synthetic-diagnostic triggers for `didChange` (ADR-0020 Phase 3).
 //!
-//! This module provides debouncing for `didChange` events, triggering synthetic
-//! diagnostics after a configurable delay. Each document has an independent
-//! debounce timer that resets on each change.
+//! Each document has its own timer that resets on every change; firing after the
+//! debounce delay (default 500ms) collects and publishes diagnostics.
 //!
-//! # Architecture
-//!
-//! ```text
-//! didChange event
-//!       │
-//!       ▼
-//! schedule_debounced_diagnostic()
-//!       │
-//!       ├─► Cancel previous timer (if any)
-//!       │
-//!       └─► Capture snapshot data immediately
-//!               │
-//!               └─► Spawn new timer task
-//!                       │
-//!                       ├─► Wait debounce duration (500ms default)
-//!                       │
-//!                       └─► Execute diagnostic collection and publish
-//! ```
-//!
-//! # Key Design Decision: Snapshot at Schedule Time
-//!
-//! The diagnostic snapshot data is captured when `schedule_debounced_diagnostic`
-//! is called, not when the timer fires. This ensures:
-//!
-//! 1. **Consistency**: The snapshot matches the document state that triggered the change
-//! 2. **Simplicity**: No need for `self` reference in the timer callback
-//! 3. **Correctness**: Even if document changes again, the superseding logic
-//!    (via `SyntheticDiagnosticsManager`) ensures only the latest diagnostics publish
-//!
-//! # Relationship to SyntheticDiagnosticsManager
-//!
-//! - `DebouncedDiagnosticsManager`: Debounce timers, cancellation on new change
-//! - `SyntheticDiagnosticsManager`: Task superseding (via AbortHandle), prevents stale publishes
+//! Snapshot data is captured at *schedule* time, not when the timer fires, so the
+//! published diagnostics match the document state that triggered them and the
+//! timer callback needs no `self` reference. Newer schedules supersede older
+//! in-flight publishes via `SyntheticDiagnosticsManager`'s `AbortHandle`.
 
 use std::sync::Arc;
 use std::time::Duration;

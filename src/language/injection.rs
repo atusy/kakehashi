@@ -286,28 +286,17 @@ pub(crate) fn compute_included_ranges(
     }
 }
 
-/// Sub-select parent `included_ranges` for a nested injection byte region.
+/// Clip the parent's `included_ranges` to the nested injection's byte window
+/// and re-relativize. Used when the nested injection's tree was parsed with
+/// `included_ranges` and has no `block_continuation` children of its own;
+/// both byte arguments are relative to `parent_ranges`' base (parent
+/// `content_text` start). Returns `None` if no parent range overlaps.
 ///
-/// When a nested injection has no `block_continuation` children of its own
-/// (because its tree was parsed with `included_ranges`), we inherit the parent's
-/// ranges by clipping them to the nested content region and re-relativizing.
-///
-/// Both `nested_start_byte` and `nested_end_byte` are relative to the same
-/// base as `parent_ranges` (the parent's `content_text` start).
-///
-/// Returns `Some(clipped_ranges)` if any parent ranges overlap the nested region,
-/// `None` otherwise.
-///
-/// # Known Limitation
-///
-/// When a range is clipped (byte boundaries adjusted by `max`/`min`), the
-/// `start_point`/`end_point` are NOT adjusted to match the clipped bytes.
-/// Tree-sitter's `set_included_ranges` validates only byte ordering, not
-/// point/byte consistency, so this does not cause errors. However, nodes
-/// parsed from clipped ranges may report slightly wrong column positions.
-/// In practice, nested injection boundaries almost always align with parent
-/// gap boundaries (both derived from tree-sitter node boundaries), so
-/// partial clipping is rare.
+/// Known limitation: when a range is clipped by `max`/`min`, only its bytes
+/// are adjusted — `start_point`/`end_point` are not. Tree-sitter accepts this
+/// (it validates byte ordering only), but nodes from clipped ranges may
+/// report slightly wrong columns. Rare in practice: nested boundaries
+/// usually align with parent gap boundaries.
 pub(crate) fn sub_select_included_ranges(
     parent_ranges: &[tree_sitter::Range],
     nested_start_byte: usize,
@@ -944,27 +933,11 @@ pub struct ResolvedInjection {
 pub struct InjectionResolver;
 
 impl InjectionResolver {
-    /// Resolve injection region at the given byte offset.
+    /// Resolve the injection region (if any) covering `byte_offset`. Shared by
+    /// LSP handlers (hover, completion, definition, …) at a cursor position.
     ///
-    /// Shared by LSP handlers (hover, completion, definition, etc.) that resolve
-    /// injection language at a cursor position.
-    ///
-    /// # Lock Safety
-    /// This function does not hold Document locks. All inputs (tree, text) must be
-    /// pre-cloned, typically via DocumentSnapshot.
-    ///
-    /// # Arguments
-    /// * `coordinator` - Language coordinator for resolving injection language
-    /// * `tracker` - Region ID tracker for stable ULID generation
-    /// * `uri` - Host document URI
-    /// * `tree` - Parsed syntax tree
-    /// * `text` - Document text content
-    /// * `injection_query` - Query for finding injection regions
-    /// * `byte_offset` - Byte offset to resolve
-    ///
-    /// # Returns
-    /// `Some(ResolvedInjection)` if position is within an injection region,
-    /// `None` otherwise.
+    /// Does not hold any Document lock: inputs (`tree`, `text`) must be pre-cloned,
+    /// typically via `DocumentSnapshot`.
     pub(crate) fn resolve_at_byte_offset(
         coordinator: &LanguageCoordinator,
         tracker: &RegionIdTracker,
@@ -1059,25 +1032,10 @@ impl InjectionResolver {
         }
     }
 
-    /// Resolve all injection regions in a document.
-    ///
-    /// This is used for whole-document operations like document_link that need
-    /// to iterate over all injection regions rather than finding one at a position.
-    ///
-    /// # Lock Safety
-    /// This function does not hold Document locks. All inputs (tree, text) must be
-    /// pre-cloned, typically via DocumentSnapshot.
-    ///
-    /// # Arguments
-    /// * `coordinator` - Language coordinator for resolving injection language
-    /// * `tracker` - Region ID tracker for stable ULID generation
-    /// * `uri` - Host document URI
-    /// * `tree` - Parsed syntax tree
-    /// * `text` - Document text content
-    /// * `injection_query` - Query for finding injection regions
-    ///
-    /// # Returns
-    /// Vector of resolved injections, may be empty if no injections found.
+    /// Resolve every injection region in the document (whole-doc operations
+    /// like `documentLink` use this rather than a position lookup). Holds no
+    /// Document lock — `tree`/`text` must already be cloned, typically via
+    /// `DocumentSnapshot`. Empty vec when nothing matches.
     pub(crate) fn resolve_all(
         coordinator: &LanguageCoordinator,
         tracker: &RegionIdTracker,

@@ -100,26 +100,17 @@ fn build_baseline_capabilities() -> ClientCapabilities {
 
 /// Merge upstream client capabilities into the bridge baseline.
 ///
-/// # Capability categories
+/// Bridge-controlled fields are never overridden because the bridge depends on
+/// them: `general.positionEncodings` (UTF-16), `insertReplaceSupport`, all
+/// `linkSupport` (we collapse `LocationLink` → `Location`),
+/// `hierarchicalDocumentSymbolSupport`, every `dynamicRegistration`.
 ///
-/// **Category A — Bridge-controlled** (never overridden):
-/// - `general.positionEncodings` — bridge requires UTF-16
-/// - `insertReplaceSupport` — bridge transforms insert/replace edits
-/// - All `linkSupport` fields — bridge transforms `LocationLink` → `Location`
-/// - `hierarchicalDocumentSymbolSupport` — bridge transforms symbol responses
-/// - All `dynamicRegistration` fields — bridge manages registration lifecycle
-///
-/// **Category B — Pass-through** (propagated from upstream when present):
-/// - `completionItem`: `documentationFormat`, `snippetSupport`, `deprecatedSupport`,
-///   `tagSupport`, `commitCharactersSupport`, `resolveSupport`,
-///   `insertTextModeSupport`, `labelDetailsSupport`, `preselectSupport`
-/// - `hover.contentFormat`
-/// - `signatureHelp.signatureInformation`
-///
-/// # Merge semantics
-///
-/// - **Replace**: upstream value fully replaces bridge default (preference order matters per LSP)
-/// - **Fallback**: when upstream is `None`, bridge default is kept
+/// Pass-through fields propagate from upstream when `Some` (otherwise the
+/// bridge default is kept; LSP order-sensitivity applies on replace):
+/// `completionItem.{documentationFormat, snippetSupport, deprecatedSupport,
+/// tagSupport, commitCharactersSupport, resolveSupport, insertTextModeSupport,
+/// labelDetailsSupport, preselectSupport}`, `hover.contentFormat`,
+/// `signatureHelp.signatureInformation`.
 fn merge_upstream_capabilities(
     mut base: ClientCapabilities,
     upstream: Option<&ClientCapabilities>,

@@ -1,21 +1,6 @@
-//! Settings management abstraction for LSP server.
-//!
-//! This module provides `SettingsManager`, which consolidates workspace settings,
-//! client capabilities, and root path management into a single cohesive struct.
-//!
-//! # Design Rationale
-//!
-//! Extracting settings management into a dedicated struct provides:
-//! - **Single Responsibility**: All configuration state in one place
-//! - **Testability**: Methods can be unit tested without full LSP setup
-//! - **Thread Safety**: Uses `ArcSwap` and `OnceLock` for concurrent access
-//!
-//! # Initialization Lifecycle
-//!
-//! The `SettingsManager` manages state that is set during `initialize()`:
-//! - `client_capabilities`: Set once via `set_capabilities()`
-//! - `root_path`: Set once via `set_root_path()`
-//! - `settings`: Can be updated via `apply_settings()`
+//! `SettingsManager`: workspace settings (`ArcSwap`, hot-swappable via
+//! `apply_settings`) plus initialize-only state — `client_capabilities` and
+//! `root_path` (both `OnceLock`, set once during `initialize()`).
 
 use arc_swap::ArcSwap;
 use path_clean::PathClean;

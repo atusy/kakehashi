@@ -1,20 +1,11 @@
-//! Pull diagnostics for Kakehashi (textDocument/diagnostic).
+//! `textDocument/diagnostic` (pull): ADR-0020 Phase 1 pull-first forwarding
+//! with multi-region aggregation via parallel fan-out. Push side lives in
+//! `publish_diagnostic.rs`.
 //!
-//! Implements ADR-0020 Phase 1: Pull-first diagnostic forwarding with
-//! multi-region aggregation via parallel fan-out.
-//!
-//! For synthetic push diagnostics (publishDiagnostics), see `publish_diagnostic.rs`.
-//!
-//! # Cancel Handling
-//!
-//! This module supports immediate cancellation of diagnostic requests:
-//! - When `$/cancelRequest` is received, the handler aborts and returns `RequestCancelled`
-//! - The JoinSet is dropped, aborting all spawned downstream tasks
-//! - Best-effort cancel forwarding to downstream servers (fire-and-forget via middleware)
-//!
-//! This is achieved using `tokio::select!` to race between:
-//! 1. Cancel notification (via `CancelForwarder::subscribe()`)
-//! 2. Result aggregation (collecting from all downstream tasks)
+//! `tokio::select!` races `CancelForwarder::subscribe()` against result
+//! aggregation: a `$/cancelRequest` returns `RequestCancelled`, dropping the
+//! `JoinSet` aborts all downstream tasks, and cancels are also forwarded
+//! downstream fire-and-forget via middleware.
 
 use std::sync::Arc;
 use std::time::Duration;

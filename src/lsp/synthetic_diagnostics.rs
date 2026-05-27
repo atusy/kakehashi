@@ -1,20 +1,9 @@
-//! Synthetic push diagnostics for ADR-0020 Phase 2.
+//! Background diagnostic collection on `didSave`/`didOpen` (ADR-0020 Phase 2):
+//! pull internally, push via `textDocument/publishDiagnostics`.
 //!
-//! This module provides background diagnostic collection triggered by
-//! `didSave` and `didOpen` events. It uses the pull-first approach internally
-//! but publishes results via `textDocument/publishDiagnostics` notification.
-//!
-//! # Superseding Pattern
-//!
-//! When multiple save events occur in rapid succession, only the latest
-//! diagnostic collection should complete and publish results. Earlier
-//! in-progress tasks are aborted via `AbortHandle` to prevent stale
-//! diagnostics from being published.
-//!
-//! # Thread Safety
-//!
-//! `SyntheticDiagnosticsManager` uses `DashMap` for concurrent access from
-//! multiple tokio tasks without explicit locking.
+//! Rapid-fire events supersede each other — `SyntheticDiagnosticsManager`
+//! aborts the prior in-flight task via `AbortHandle` so only the latest
+//! collection publishes, and uses `DashMap` for lock-free concurrent access.
 
 use dashmap::DashMap;
 use tokio::task::AbortHandle;

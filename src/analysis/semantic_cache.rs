@@ -1,40 +1,12 @@
-//! Semantic token caching with LSP result_id validation and injection region tracking.
+//! Semantic-token caches with `result_id` validation and injection-region tracking.
 //!
-//! This module provides three caching layers for semantic token performance:
-//!
-//! 1. **SemanticTokenCache** - Document-level token caching by URI with LSP result_id validation.
-//!    Used for cache hits when the document version matches.
-//!
-//! 2. **InjectionMap** - Tracks all injection regions per document URI.
-//!    Each `CacheableInjectionRegion` stores language, byte/line ranges, and a region_id (ULID).
-//!    Enables targeted invalidation: when an edit occurs, only regions overlapping
-//!    the edit need re-tokenization.
-//!    Uses interval tree (rust_lapper) for O(log n) overlap queries.
-//!
-//! 3. **InjectionTokenCache** - Per-injection token caching by (URI, region_id).
-//!    Stores tokens for individual code blocks, allowing cache reuse when
-//!    edits occur outside that injection region.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! Document edit arrives
-//!        |
-//!        v
-//! InjectionMap.find_overlapping(uri, start, end) -> Vec<CacheableInjectionRegion>
-//!        |
-//!        v
-//! O(log n) interval tree query for overlapping regions
-//!        |
-//!   +----+----+
-//!   |         |
-//!   v         v
-//! Overlapping:     Unchanged:
-//! Invalidate &     Reuse tokens from
-//! re-tokenize      InjectionTokenCache
-//! ```
-//!
-//! All caches use DashMap for thread-safe concurrent access.
+//! Three layers (all `DashMap`-backed for concurrent access):
+//! - `SemanticTokenCache`: per-URI tokens, served when LSP `result_id` matches.
+//! - `InjectionMap`: per-URI interval tree (rust_lapper) of injection regions
+//!   keyed by region_id (ULID), giving O(log n) overlap queries so an edit only
+//!   invalidates regions it actually touches.
+//! - `InjectionTokenCache`: per-(URI, region_id) tokens, reusable when an edit
+//!   lies outside that region.
 
 use crate::language::injection::CacheableInjectionRegion;
 use dashmap::DashMap;

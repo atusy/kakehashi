@@ -1,32 +1,14 @@
-//! Document symbol request handling for bridge connections.
+//! `textDocument/documentSymbol` for downstream servers (whole-document, no position).
+//! Uses `send_request()` for FIFO ordering with the single writer task (ADR-0015).
 //!
-//! This module provides document symbol request functionality for downstream language servers,
-//! handling the coordinate transformation between host and virtual documents.
+//! Both `DocumentSymbol[]` and `SymbolInformation[]` responses are normalized to
+//! `Vec<DocumentSymbol>` here so the lsp_impl handler works with one type and only
+//! decides the final wire format from client capabilities.
 //!
-//! Like document link, document symbol requests operate on the entire document -
-//! they don't take a position parameter.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue requests via the channel-based
-//! writer task, ensuring FIFO ordering with other messages.
-//!
-//! # Normalization
-//!
-//! Both DocumentSymbol[] and SymbolInformation[] responses from downstream servers
-//! are normalized to `Vec<DocumentSymbol>`. This pushes format awareness to the bridge
-//! layer, allowing the lsp_impl handler to work with a single type and decide the
-//! final response format based on client capabilities.
-//!
-//! # Known Limitations
-//!
-//! When downstream servers return `SymbolInformation[]`, each item's
-//! `container_name` is discarded during normalization to `DocumentSymbol`
-//! (which has no equivalent field — it uses `children` for hierarchy instead).
-//! If the response is later flattened back to `SymbolInformation[]` for clients
-//! without hierarchical support, the reconstructed items will have
-//! `container_name: None`. This is a rare path because the bridge declares
-//! `hierarchicalDocumentSymbolSupport: true` to downstream servers.
+//! Known limitation: `SymbolInformation.container_name` is dropped on normalization
+//! (`DocumentSymbol` has no equivalent — it uses `children`). Re-flattening for
+//! non-hierarchical clients therefore loses it. Rare in practice because we
+//! advertise `hierarchicalDocumentSymbolSupport: true` downstream.
 
 use std::io;
 
@@ -104,30 +86,14 @@ fn build_document_symbol_request(
     build_whole_document_request(virtual_uri, request_id, "textDocument/documentSymbol")
 }
 
-/// Transform a document symbol response from virtual to host document coordinates.
+/// Translate a documentSymbol response from virtual to host coordinates and
+/// normalize both LSP-spec response shapes (`DocumentSymbol[]` hierarchical,
+/// `SymbolInformation[]` flat) into `Vec<DocumentSymbol>`.
 ///
-/// Both DocumentSymbol[] and SymbolInformation[] responses are normalized to
-/// `Vec<DocumentSymbol>`. This allows the lsp_impl handler to work with a single
-/// type and decide the final response format based on client capabilities.
-///
-/// DocumentSymbol responses can be in two formats per LSP spec:
-/// - DocumentSymbol[] (hierarchical with range, selectionRange, and optional children)
-/// - SymbolInformation[] (flat with location.uri + location.range)
-///
-/// For DocumentSymbol format:
-/// - range and selectionRange are translated using the region offset
-/// - children are recursively processed
-///
-/// For SymbolInformation format:
-/// - Converted to DocumentSymbol with selection_range = range
-/// - Real file URIs are filtered out (per LSP spec, documentSymbol is for the requested document)
-/// - Cross-region virtual URIs are filtered out
-/// - Same-region virtual URIs are transformed to host coordinates
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `request_virtual_uri` - The virtual URI from the request
-/// * `offset` - The region offset for coordinate translation
+/// `DocumentSymbol`: translate `range`/`selectionRange` via `offset`, recurse
+/// into `children`. `SymbolInformation`: convert with `selectionRange = range`,
+/// drop entries whose `location.uri` is a real file or a different virtual
+/// region (documentSymbol is per-document), and translate same-region matches.
 fn transform_document_symbol_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,

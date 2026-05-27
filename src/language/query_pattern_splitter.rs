@@ -19,23 +19,11 @@ pub(crate) struct QueryPattern {
     pub end_line: usize,
 }
 
-/// Error that can occur when splitting patterns.
-///
-/// # Testing Note
-///
-/// Both variants represent defensive error handling for scenarios that are
-/// difficult or impossible to trigger in normal operation:
-///
-/// - `LanguageInit`: Requires `set_language()` to fail, which only happens if
-///   the tree-sitter-tsquery grammar is corrupted or incompatible. This cannot
-///   occur with a correctly built binary.
-///
-/// - `ParseFailed`: Requires `parser.parse()` to return `None`, which only
-///   happens in extreme edge cases (e.g., memory exhaustion, cancellation).
-///   The tree-sitter-tsquery parser is very lenient and accepts almost any input.
-///
-/// These variants exist to ensure graceful error handling rather than panicking
-/// if unexpected conditions occur.
+/// Defensive errors that should not occur in normal operation: `LanguageInit`
+/// (`set_language` fails — would mean a corrupt tree-sitter-tsquery grammar)
+/// and `ParseFailed` (`parser.parse` returns `None` — only on extreme cases
+/// like memory exhaustion or cancellation, since tsquery is very lenient).
+/// Modelled explicitly so we never panic if they do fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SplitError {
     /// Failed to initialize the tree-sitter-tsquery parser.

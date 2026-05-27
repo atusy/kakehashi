@@ -1,20 +1,9 @@
-//! Shared bridge request lifecycle execution.
-//!
-//! This module provides `execute_bridge_request_with_handle` on [`LanguageServerPool`]
-//! that encapsulates the common lifecycle boilerplate shared by all bridge request
-//! handlers (hover, definition, document_link, etc.).
-//!
-//! The lifecycle steps are:
-//! 1. Convert host URI to `lsp_types::Uri`
-//! 3. Build virtual document URI
-//! 4. Register upstream request for cancel forwarding
-//! 5. Register request with router to get oneshot receiver
-//! 6. Build the JSON-RPC request (via caller-provided closure)
-//! 7. Ensure document is opened (didOpen if needed)
-//! 8. Send the request
-//! 9. Wait for response
-//! 10. Unregister upstream request
-//! 11. Transform the response (via caller-provided closure)
+//! `execute_bridge_request_with_handle` on [`LanguageServerPool`]: shared
+//! end-to-end lifecycle for every bridge request (hover, definition,
+//! documentLink, …). Steps: convert host URI, build virtual URI, register
+//! upstream for cancel forwarding, register with router, build request (via
+//! callback), ensure `didOpen`, send, await, unregister upstream, transform
+//! the response (via callback).
 
 use std::io;
 use std::sync::Arc;
@@ -43,25 +32,11 @@ pub(crate) struct BridgeResponseContext<'a> {
 }
 
 impl LanguageServerPool {
-    /// Execute a bridge request through the full lifecycle with a pre-fetched connection handle.
-    ///
-    /// Accepts a pre-fetched `ConnectionHandle`, which callers obtain via
-    /// `get_or_create_connection` (typically needed for capability checking).
-    ///
-    /// # Arguments
-    ///
-    /// * `handle` - The pre-fetched connection handle
-    /// * `server_name` - The server name from config (still needed for document tracking)
-    /// * `host_uri` - The host document URI
-    /// * `injection_language` - The injection language (e.g., "lua")
-    /// * `region_id` - The unique region ID for this injection
-    /// * `offset` - The region offset for coordinate translation
-    /// * `virtual_content` - The content of the virtual document
-    /// * `upstream_request_id` - The original request ID from the upstream client
-    /// * `build_request` - Closure to build the JSON-RPC request from the
-    ///   virtual document URI and allocated request ID
-    /// * `transform_response` - Closure to transform the raw JSON-RPC response into the
-    ///   typed result, given the response context
+    /// Drive a bridge request end-to-end on a pre-fetched `ConnectionHandle`
+    /// (callers obtain it via `get_or_create_connection`, usually because they
+    /// need capability checks first). `build_request` shapes the JSON-RPC body
+    /// once the virtual URI and request ID are known; `transform_response`
+    /// projects the raw response onto the typed result.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,

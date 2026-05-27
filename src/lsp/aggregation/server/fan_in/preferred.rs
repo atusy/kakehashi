@@ -30,25 +30,14 @@ fn pick_best_buffered<T>(
     buffered_wins.shift_remove_index(0).map(|(_, v)| v)
 }
 
-/// Priority-aware collection of concurrent bridge results.
+/// Priority-aware fan-in: buffer results by server name, and on each arrival
+/// walk `priorities` highest-first — return the first non-empty buffered
+/// result, skipping servers that failed/returned empty, and waiting on
+/// servers that haven't responded yet. When all prioritized servers are
+/// exhausted, fall back to first-win among unprioritized servers.
 ///
-/// Buffers results by server name and walks the priority list after each arrival.
-/// Returns the highest-priority non-empty result, or falls back to first-win
-/// for servers not in the priority list.
-///
-/// # Priority resolution
-///
-/// After each result arrives:
-/// 1. Walk `priorities` in order (highest first)
-/// 2. If server has a buffered non-empty result → return it (abort rest)
-/// 3. If server failed/empty → skip to next priority
-/// 4. If server hasn't responded → wait (can't decide yet)
-/// 5. If all priority servers exhausted → check unprioritized buffer
-///
-/// # Panicked servers
-///
-/// JoinError (panic) can't be attributed to a specific server. Panicked priority
-/// servers remain "pending" until the JoinSet drains, then are treated as failed.
+/// `JoinError` can't be attributed to a server, so a panicked prioritized
+/// server stays "pending" until the JoinSet drains, then is treated as failed.
 pub(crate) async fn preferred<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     is_nonempty: impl Fn(&T) -> bool,

@@ -1,30 +1,8 @@
-//! Hash utilities for content-based caching.
-//!
-//! This module provides fast, non-cryptographic hash functions suitable for
-//! caching and deduplication of document content.
+//! Non-cryptographic hashes for content-based cache keys.
 
-/// Compute FNV-1a 64-bit hash of text content.
-///
-/// FNV-1a (Fowler-Noll-Vo) is a fast, non-cryptographic hash function with
-/// good distribution properties. It's suitable for:
-/// - Content-based cache keys
-/// - Change detection
-/// - Deduplication
-///
-/// **Not suitable for**:
-/// - Adversarial collision resistance (use SipHash)
-/// - Cryptographic purposes (use SHA-256, etc.)
-///
-/// # Example
-///
-/// ```ignore
-/// let hash1 = fnv1a_hash("hello world");
-/// let hash2 = fnv1a_hash("hello world");
-/// let hash3 = fnv1a_hash("different");
-///
-/// assert_eq!(hash1, hash2);
-/// assert_ne!(hash1, hash3);
-/// ```
+/// FNV-1a 64-bit hash. Fast and well-distributed enough for cache keys, change
+/// detection, and dedup; do **not** use for adversarial collision resistance
+/// (use SipHash) or cryptographic purposes (use SHA-256).
 #[inline]
 pub fn fnv1a_hash(text: &str) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;

@@ -33,29 +33,11 @@ pub(crate) enum RouteResult {
     NotFound,
 }
 
-/// Routes responses to pending requests via oneshot channels.
+/// Thread-safe router that delivers each downstream response to a registered
+/// oneshot waiter. Single Reader Task calls `route()` per incoming message.
 ///
-/// Thread-safe router that tracks in-flight requests and delivers responses
-/// to their waiters. Designed for use with a single Reader Task that calls
-/// `route()` for each incoming response.
-///
-/// # Cancel Forwarding Support
-///
-/// The router also maintains a bidirectional mapping between upstream and downstream
-/// request IDs via `upstream_to_downstream` and `downstream_to_upstream`. This enables
-/// O(1) $/cancelRequest forwarding and cleanup:
-/// - When a request is registered with an upstream ID, both mappings are stored
-/// - When a cancel notification arrives, `lookup_downstream_id()` translates it in O(1)
-/// - When a request completes (via `route()` or `remove()`), cleanup is O(1)
-///
-/// # Usage
-///
-/// ```ignore
-/// let router = ResponseRouter::new();
-/// let rx = router.register(request_id);  // Before sending request
-/// // ... send request to downstream server ...
-/// let response = rx.await?;  // Wait without holding Mutex
-/// ```
+/// Also keeps bidirectional `upstream ↔ downstream` ID maps so cancel
+/// forwarding (translate, send, cleanup) is O(1) at register, route, and remove.
 pub(crate) struct ResponseRouter {
     /// All router state protected by a single mutex to avoid lock contention
     /// and simplify reasoning about thread safety.
@@ -279,26 +261,14 @@ impl ResponseRouter {
         }
     }
 
-    /// Fail all pending requests with an internal error response.
+    /// Fail every pending request with an internal-error response (called on
+    /// reader panic, liveness timeout, …) so each waiter sees a response per
+    /// LSP guarantee, and clear both cancel-map directions.
     ///
-    /// Called when the connection fails (e.g., reader task panic, liveness timeout)
-    /// to ensure all waiters receive a response per LSP guarantee.
-    ///
-    /// # Cancel Map Cleanup
-    ///
-    /// This method clears both cancel map directions (upstream_to_downstream and
-    /// downstream_to_upstream) since all requests are being completed.
-    ///
-    /// Note: The `LanguageServerPool.upstream_request_registry` (which maps upstream
-    /// ID -> language) is NOT cleared by this method because:
-    /// 1. The ResponseRouter doesn't have access to the pool
-    /// 2. Stale entries are harmless - `forward_cancel_by_upstream_id()` checks
-    ///    connection state before forwarding, so stale entries fail gracefully
-    /// 3. Entries are cleaned up when new requests reuse the same upstream IDs
-    ///
-    /// This is an intentional design tradeoff: keeping the registry separate from
-    /// the per-connection router simplifies the architecture at the cost of
-    /// temporarily stale entries that have no runtime impact.
+    /// `LanguageServerPool.upstream_request_registry` is intentionally not
+    /// touched here — the router can't see the pool, and stale entries are
+    /// harmless because `forward_cancel_by_upstream_id` gates on connection
+    /// state and entries get overwritten when the next upstream ID reuses them.
     pub(crate) fn fail_all(&self, error_message: &str) {
         let mut state = self.state.lock().recover_poison("ResponseRouter::fail_all");
         let entries: Vec<_> = state.pending.drain().collect();

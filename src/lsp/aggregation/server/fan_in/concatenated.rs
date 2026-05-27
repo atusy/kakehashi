@@ -40,24 +40,15 @@ fn order_by_priority<T>(tagged: Vec<(String, T)>, priorities: &[String]) -> Vec<
     ordered
 }
 
-/// Collects all successful results from a JoinSet of concurrent bridge requests.
+/// Wait for **every** task in the JoinSet and return all successful values
+/// (unlike [`super::preferred::preferred()`], which short-circuits on the
+/// first non-empty hit). When `priorities` is non-empty, results sort
+/// priority-first with unlisted servers appended in arrival order.
 ///
-/// Unlike [`super::preferred::preferred()`] which short-circuits on the first non-empty
-/// result, this waits for **all** tasks and returns every successful value.
-///
-/// When `priorities` is non-empty, results are ordered by priority (highest first),
-/// with unlisted servers appended in insertion (arrival) order.
-///
-/// Returns:
-/// - `Done(vec)` when at least one task succeeds (even if others fail)
-/// - `Done(vec![])` when the JoinSet is empty
-/// - `NoResult { errors }` when all tasks fail
-/// - `Cancelled` when a cancel notification arrives before completion
-///
-/// # Abort semantics
-///
-/// Callers MUST call `pool.unregister_all_for_upstream_id()` after this function returns
-/// to clean up stale entries in the UpstreamRequestRegistry left by aborted tasks.
+/// `Done(vec)` on any success (empty JoinSet → `Done(vec![])`),
+/// `NoResult{errors}` when every task fails, `Cancelled` if a cancel arrives
+/// first. Callers MUST follow up with `pool.unregister_all_for_upstream_id()`
+/// to clean up entries left behind by aborted tasks.
 pub(crate) async fn concatenated<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     priorities: &[String],

@@ -25,53 +25,20 @@ impl LanguageServerPool {
         }
     }
 
-    /// Initiate graceful shutdown of all connections.
-    ///
-    /// Called during LSP server shutdown to cleanly terminate all downstream
-    /// language servers. Performs LSP shutdown/exit handshake per ADR-0017.
-    ///
-    /// # Usage
-    ///
-    /// This method should be called exactly once during the LSP `shutdown` handler.
-    /// Multiple concurrent calls are safe (due to state machine monotonicity) but
-    /// wasteful, as connections already in Closing/Closed state are skipped.
-    ///
-    /// # Shutdown Behavior by State
-    ///
-    /// - Ready/Initializing: Perform full LSP shutdown handshake
-    /// - Failed: Skip LSP handshake, go directly to Closed (stdin unavailable)
-    /// - Closing/Closed: Already shutting down, skip
-    ///
-    /// All shutdowns run in parallel with a global timeout (ADR-0017).
-    /// Uses the default GlobalShutdownTimeout (10s) per ADR-0018.
+    /// Graceful shutdown of every downstream connection (ADR-0017), parallel,
+    /// under the default 10s `GlobalShutdownTimeout` (ADR-0018). Per-state:
+    /// Ready/Initializing run the LSP shutdown handshake, Failed jumps straight
+    /// to Closed (stdin is gone), Closing/Closed are skipped. Concurrent calls
+    /// are safe (state machine is monotonic) but only the first does real work.
     pub(crate) async fn shutdown_all(&self) {
         self.shutdown_all_with_timeout(GlobalShutdownTimeout::default())
             .await;
     }
 
-    /// Initiate graceful shutdown of all connections with a global timeout.
-    ///
-    /// This is the primary shutdown method per ADR-0017. It wraps parallel shutdown
-    /// of all connections under a single global ceiling. When the timeout expires,
-    /// remaining connections are force-killed with SIGTERM->SIGKILL escalation.
-    ///
-    /// # Arguments
-    /// * `timeout` - Global shutdown timeout (5-15s per ADR-0018)
-    ///
-    /// # Behavior
-    ///
-    /// 1. All Ready/Initializing connections begin graceful shutdown in parallel
-    /// 2. Failed connections transition directly to Closed (skip LSP handshake)
-    /// 3. If global timeout expires before all complete:
-    ///    - Remaining connections receive force_kill (SIGTERM->SIGKILL on Unix)
-    ///    - All connections transition to Closed state
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let timeout = GlobalShutdownTimeout::new(Duration::from_secs(10))?;
-    /// pool.shutdown_all_with_timeout(timeout).await;
-    /// ```
+    /// Parallel graceful shutdown under a single global ceiling (ADR-0017).
+    /// Ready/Initializing connections run the LSP shutdown in parallel; Failed
+    /// ones jump straight to Closed. When `timeout` elapses, survivors are
+    /// force-killed (SIGTERM→SIGKILL on Unix) and all enter Closed.
     pub(crate) async fn shutdown_all_with_timeout(&self, timeout: GlobalShutdownTimeout) {
         // Track connections that were skipped for logging (minimize lock duration)
         let mut failed_connections: Vec<String> = Vec::new();
@@ -161,24 +128,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Force-kill all connections with platform-appropriate escalation.
+    /// Post-timeout fallback: terminate every non-closed connection in
+    /// parallel and mark it Closed (ADR-0017). Unix uses SIGTERM→SIGKILL with
+    /// a 2s grace period; Windows uses `TerminateProcess` directly.
     ///
-    /// This is the fallback when global shutdown timeout expires.
-    /// Per ADR-0017, this method terminates all non-closed connections and
-    /// transitions them to Closed state.
-    ///
-    /// # Platform-Specific Behavior
-    ///
-    /// **Unix**: Uses SIGTERM->SIGKILL escalation (2s grace period)
-    /// **Windows**: Uses TerminateProcess directly (no grace period)
-    ///
-    /// The method executes kills in parallel to minimize total shutdown time.
-    ///
-    /// # Single-Writer Loop (ADR-0015)
-    ///
-    /// Uses `graceful_shutdown()` with a short timeout (3s) to attempt clean
-    /// shutdown. If the timeout expires (e.g., writer task hung), we mark the
-    /// connection as Closed anyway. The OS will clean up orphaned processes.
+    /// Each kill goes through `graceful_shutdown` with a short (3s) cap so a
+    /// hung writer task can't stall this path — on expiry we mark Closed
+    /// anyway and let the OS reap the orphan (ADR-0015).
     async fn force_kill_all(&self) {
         /// Timeout for force-kill attempts.
         ///

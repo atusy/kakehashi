@@ -10,23 +10,11 @@ use super::super::pool::{ConnectionHandleSender, INIT_TIMEOUT_SECS, LanguageServ
 use super::super::protocol::VirtualDocumentUri;
 
 impl LanguageServerPool {
-    /// Eagerly open virtual documents on a downstream server.
-    ///
-    /// For each injection region, builds a `VirtualDocumentUri` and calls
-    /// `ensure_document_opened`. This sends `didOpen` notifications to the
-    /// downstream server so it can start analyzing immediately, rather than
-    /// waiting for the first user-initiated request.
-    ///
-    /// # Arguments
-    /// * `server_name` - The server name (for connection lookup)
-    /// * `server_config` - The server configuration (for spawning if needed)
-    /// * `host_uri` - The host document URI (e.g., markdown file)
-    /// * `host_uri_lsp` - The host URI in `ls_types::Uri` format
-    /// * `injections` - All injection regions to open on this server
-    ///
-    /// # Error Handling
-    /// Errors are logged at debug level and never propagated. This method is
-    /// fire-and-forget — a failure to open one document does not affect others.
+    /// Fire `didOpen` for every injection region's virtual URI so the downstream
+    /// server starts analyzing immediately instead of waiting for the first
+    /// user request. Fire-and-forget: per-document failures are logged at
+    /// debug level and never propagated; one open failing leaves the others
+    /// alone.
     pub(crate) async fn eager_open_virtual_documents(
         &self,
         server_name: &str,
