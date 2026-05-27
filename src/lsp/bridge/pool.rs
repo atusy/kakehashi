@@ -2764,12 +2764,9 @@ mod tests {
         );
     }
 
-    /// Test that response forwarding still works after cancel notification is sent.
-    ///
-    /// This is the key test for Subtask 6: Per LSP spec, a cancelled request should
-    /// still receive a response (either the normal result or an error with code -32800).
-    /// The cancel forwarding mechanism must preserve the pending entry so that when
-    /// the downstream server eventually responds, we can still deliver it.
+    /// Per LSP spec, a cancelled request still receives a response (either the normal
+    /// result or an error with code -32800). The cancel forwarding mechanism must
+    /// preserve the pending entry so the eventual downstream response can be delivered.
     #[tokio::test]
     async fn response_forwarding_works_after_cancel() {
         use std::sync::Arc;
@@ -3484,11 +3481,8 @@ mod tests {
     // forward_didchange multi-server tests
     // ============================================================
 
-    /// Test that forward_didchange_to_opened_docs sends to ALL servers.
-    ///
     /// When the same virtual doc is opened on two servers (e.g., emmylua and lua_ls),
-    /// didChange must be forwarded to both. Previously, only the first server found
-    /// by the old get_server_for_virtual_uri received the notification.
+    /// didChange must be forwarded to both.
     #[tokio::test]
     async fn forward_didchange_sends_to_all_servers() {
         let pool = Arc::new(LanguageServerPool::new());

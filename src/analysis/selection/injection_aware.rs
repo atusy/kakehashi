@@ -72,7 +72,7 @@ pub fn calculate_effective_lsp_range(
     let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
     let effective = calculate_effective_range(text, byte_range, offset);
 
-    // Convert byte positions to LSP positions (reusing cached mapper - Sprint 7 perf fix)
+    // Convert byte positions to LSP positions (reusing cached mapper)
     let start_pos = mapper
         .byte_to_position(effective.start)
         .unwrap_or_else(|| Position::new(0, 0));

@@ -82,13 +82,11 @@ struct EagerOpenBatch {
 /// # Design Notes
 ///
 /// The coordinator exposes internals via accessor methods (`pool()`, `region_id_tracker()`)
-/// for handlers that need direct access. This is a pragmatic trade-off for Phase 5:
-/// - Keeps handler changes minimal (just path changes, not signature changes)
-/// - Allows future phases to encapsulate these internals further
+/// for handlers that need direct access.
 ///
 /// The pool is wrapped in `Arc` to enable sharing with the cancel forwarding middleware.
 ///
-/// # API Design Pattern (Sprint 15 Retrospective)
+/// # API Design Pattern
 ///
 /// Two access patterns coexist:
 ///

@@ -29,11 +29,8 @@ use helpers::lua_bridge::{
 };
 use serde_json::json;
 
-/// E2E test: hover then complete on same Lua block shares virtual document URI
-///
-/// This verifies PBI-STABLE-REGION-ID acceptance criteria:
-/// - Hover and completion use the same virtual URI for the same injection region
-/// - First access sends didOpen, subsequent access sends didChange (not didOpen again)
+/// E2E: hover then completion on the same Lua block shares one virtual document URI.
+/// First access sends didOpen; subsequent accesses send didChange.
 #[test]
 fn e2e_hover_then_completion_on_same_lua_block_shares_uri() {
     if skip_if_lua_ls_unavailable() {

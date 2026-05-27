@@ -52,8 +52,8 @@ impl Kakehashi {
             self.bridge.apply_input_edits(&uri, &edit_infos)
         };
 
-        // Invalidate injection caches for regions overlapping with edits (AC4/AC5)
-        // Must be called BEFORE parse_document which updates the injection_map
+        // Invalidate injection caches for regions overlapping with edits.
+        // Must be called BEFORE parse_document which updates the injection_map.
         self.cache.invalidate_for_edits(&uri, &edits);
 
         // Parse the updated document with edit information

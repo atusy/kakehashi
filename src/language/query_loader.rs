@@ -717,9 +717,7 @@ mod tests {
         assert!(parsed.used_inheritance, "Should detect inheritance");
     }
 
-    // ============================================================
-    // Tests for query inheritance (PBI-020)
-    // ============================================================
+    // Tests for query inheritance
 
     #[test]
     fn test_parse_inherits_directive_single() {

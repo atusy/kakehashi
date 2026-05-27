@@ -1,13 +1,10 @@
-//! End-to-end tests for non-blocking initialization (PBI-304).
+//! End-to-end tests for non-blocking initialization.
 //!
-//! These tests verify that kakehashi responds quickly even when
-//! downstream language servers like lua-language-server are still initializing.
+//! kakehashi must respond quickly even while downstream language servers like
+//! lua-language-server are still initializing, and native features (selection
+//! range, etc.) must work throughout bridge init.
 //!
 //! Run with: `cargo test --test e2e_nonblocking_init --features e2e`
-//!
-//! **PBI-304 Acceptance Criteria**:
-//! - AC1: kakehashi responds without blocking during lua-ls startup
-//! - AC4: Native features (selection range, etc.) work during bridge init
 
 #![cfg(feature = "e2e")]
 
@@ -39,10 +36,7 @@ fn create_minimal_client() -> LspClient {
     client
 }
 
-/// E2E test: Native selection range works regardless of bridge state (AC4)
-///
-/// This test verifies that kakehashi native features like selection range
-/// work correctly even while bridge language servers might be initializing.
+/// E2E: native selection range works regardless of bridge state.
 #[test]
 fn e2e_native_selection_range_works_during_bridge_init() {
     let mut client = create_minimal_client();
@@ -104,16 +98,13 @@ end
         "Should have at least one selection range"
     );
 
-    println!("✓ E2E AC4: Native selection range works during bridge init");
+    println!("✓ Native selection range works during bridge init");
 
     // Clean shutdown
     shutdown_client(&mut client);
 }
 
-/// E2E test: Selection range in markdown with injection works (AC4 variant)
-///
-/// Tests that selection range works on markdown files with code blocks,
-/// even if those code blocks would trigger bridge initialization.
+/// E2E: selection range works on markdown with injected code blocks during bridge init.
 #[test]
 fn e2e_native_selection_range_works_in_markdown_with_injection() {
     if skip_if_lua_ls_unavailable() {
@@ -172,16 +163,13 @@ More text.
         "Result should be array of SelectionRange"
     );
 
-    println!("✓ E2E AC4: Selection range in markdown works during bridge init");
+    println!("✓ Selection range in markdown works during bridge init");
 
     // Clean shutdown
     shutdown_client(&mut client);
 }
 
-/// E2E test: Semantic tokens work during bridge initialization (AC4)
-///
-/// Tests that semantic token requests complete quickly without waiting
-/// for downstream language servers.
+/// E2E: semantic token requests complete without waiting for downstream language servers.
 #[test]
 fn e2e_native_semantic_tokens_work_during_bridge_init() {
     let mut client = create_minimal_client();
@@ -228,7 +216,7 @@ end
     let result = response.get("result").expect("Should have result");
     assert!(result.is_object(), "Result should be SemanticTokens object");
 
-    println!("✓ E2E AC4: Semantic tokens work during bridge init");
+    println!("✓ Semantic tokens work during bridge init");
 
     // Clean shutdown
     shutdown_client(&mut client);

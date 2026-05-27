@@ -1,17 +1,7 @@
 //! Context structs for SelectionRange building.
 //!
-//! This module provides context structs that bundle related parameters together,
-//! reducing the number of arguments needed for injection-aware selection building.
-//!
-//! ## Design Rationale
-//!
-//! The selection building functions previously had 8-11 parameters, which indicated
-//! missing abstractions. By grouping related parameters into context structs, we:
-//!
-//! 1. **Reduce cognitive load**: Function signatures become clearer
-//! 2. **Make dependencies explicit**: Each context has a clear responsibility
-//! 3. **Enable easier testing**: Contexts can be mocked or stubbed
-//! 4. **Improve code reuse**: Contexts can be passed through call chains
+//! Bundles related parameters together to keep injection-aware selection
+//! building function signatures small and dependencies explicit.
 
 use crate::language::injection::MAX_INJECTION_DEPTH;
 use crate::language::{DocumentParserPool, LanguageCoordinator};

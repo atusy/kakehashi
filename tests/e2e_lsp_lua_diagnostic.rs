@@ -237,16 +237,12 @@ More text.
     shutdown_client(&mut client);
 }
 
-/// E2E test: multi-region diagnostic aggregation with multiple Lua code blocks
-///
-/// Sprint 17: Verifies that diagnostics from multiple injection regions
-/// are aggregated into a single response.
+/// E2E: diagnostics from multiple injection regions aggregate into a single response.
 #[test]
 fn e2e_diagnostic_multi_region_aggregation() {
     let (mut client, _config_dir) = create_lua_configured_client();
 
-    // Open markdown document with MULTIPLE Lua code blocks
-    // This tests the Sprint 17 multi-region aggregation
+    // Open markdown document with multiple Lua code blocks to exercise multi-region aggregation.
     let markdown_content = r#"# Multi-Region Diagnostic Test
 
 First Lua block:

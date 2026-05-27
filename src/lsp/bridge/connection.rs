@@ -354,7 +354,7 @@ impl SplitConnectionWriter {
 
 impl Drop for SplitConnectionWriter {
     fn drop(&mut self) {
-        // Kill the child process to prevent orphans (AC3)
+        // Kill the child process to prevent orphans.
         if let Err(e) = self.child.start_kill() {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -467,8 +467,7 @@ impl AsyncBridgeConnection {
 
 impl Drop for AsyncBridgeConnection {
     fn drop(&mut self) {
-        // Kill the child process to prevent orphans (AC3)
-        // Child may be None if split() was called
+        // Kill the child process to prevent orphans (None if split() was called).
         if let Some(ref mut child) = self.child {
             if let Err(e) = child.start_kill() {
                 log::warn!(

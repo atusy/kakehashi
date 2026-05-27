@@ -647,7 +647,7 @@ mod tests {
         assert!(bridge.contains_key("javascript"));
     }
 
-    // PBI-153: Languages Wildcard Inheritance (ADR-0011)
+    // Languages wildcard inheritance (ADR-0011)
 
     #[test]
     fn test_specific_values_override_wildcards_at_both_levels() {
@@ -937,7 +937,7 @@ mod tests {
         );
     }
 
-    // PBI-154: languageServers Wildcard Inheritance (ADR-0011)
+    // languageServers wildcard inheritance (ADR-0011)
 
     /// ADR-0011: resolve_with_wildcard covers all 4 match arms for language servers.
     ///
@@ -1010,7 +1010,7 @@ mod tests {
         );
     }
 
-    // PBI-157: Deep merge for initialization_options (ADR-0010)
+    // Deep merge for initialization_options (ADR-0010)
 
     /// ADR-0010: initialization_options deep merge covers three behaviors:
     /// - Disjoint keys: both preserved (feature1 from base, feature2 from overlay)
@@ -1048,14 +1048,9 @@ mod tests {
         });
     }
 
-    // ========================================================================
-    // Tests moved from lsp_impl.rs (Phase 6.1)
-    // These test wildcard config resolution functions
-    // ========================================================================
+    // Wildcard config resolution tests
 
-    /// PBI-155 Subtask 2: Test wildcard language config inheritance
-    ///
-    /// This test verifies that languages._ (wildcard) settings are inherited
+    /// Verifies that languages._ (wildcard) settings are inherited
     /// by specific languages when looking up language configs.
     ///
     /// The key behavior:
@@ -1129,11 +1124,9 @@ mod tests {
         );
     }
 
-    /// PBI-155 Subtask 2: Test that LanguageSettings lookup uses wildcard resolution
-    ///
-    /// This test verifies the wiring: when we look up host language settings
-    /// using WorkspaceSettings.languages (HashMap<String, LanguageSettings>),
-    /// we should use wildcard resolution so that undefined languages inherit
+    /// Verifies that when we look up host language settings using
+    /// WorkspaceSettings.languages (HashMap<String, LanguageSettings>),
+    /// wildcard resolution is applied so that undefined languages inherit
     /// from languages._ settings.
     #[test]
     fn test_language_settings_wildcard_lookup_blocks_bridging_for_undefined_host() {
@@ -1165,11 +1158,9 @@ mod tests {
         );
     }
 
-    /// PBI-155 Subtask 3: Test that server lookup uses wildcard resolution
-    ///
-    /// This test verifies that when looking up a language server config by name,
-    /// the wildcard server settings (languageServers._) are merged with specific
-    /// server settings.
+    /// Verifies that when looking up a language server config by name,
+    /// the wildcard server settings (languageServers._) are merged with
+    /// specific server settings.
     ///
     /// Key behavior:
     /// - languageServers._ defines default initialization options

@@ -38,8 +38,8 @@ pub(super) fn tokens_equal(a: &SemanticToken, b: &SemanticToken) -> bool {
 /// 2. Finds the longest common suffix (from what remains), with safety check for line changes
 /// 3. Returns a single edit replacing the middle section
 ///
-/// The suffix matching is disabled when total line deltas differ, as tokens with
-/// identical delta encoding would be at different absolute positions (PBI-077 safety).
+/// Suffix matching is disabled when total line deltas differ, since tokens with
+/// identical delta encoding would be at different absolute positions.
 ///
 /// # Arguments
 /// * `previous` - The previous semantic tokens
@@ -71,9 +71,8 @@ pub(super) fn calculate_semantic_tokens_delta(
     let prev_suffix = &previous.data[common_prefix_len..];
     let curr_suffix = &current.data[common_prefix_len..];
 
-    // PBI-077 Safety: Check if total line count changed
-    // When lines are inserted/deleted, tokens with identical delta encoding
-    // are at different absolute positions - suffix matching would be incorrect
+    // When line count changes, identical delta encoding maps to different absolute
+    // positions, so suffix matching is unsafe.
     let prev_total_lines: u32 = previous.data.iter().map(|t| t.delta_line).sum();
     let curr_total_lines: u32 = current.data.iter().map(|t| t.delta_line).sum();
 

@@ -441,7 +441,7 @@ mod tests {
     #[case::explicit_true(Some(true), true)]
     #[case::explicit_false(Some(false), false)]
     fn test_auto_install(#[case] auto_install: Option<bool>, #[case] expected: bool) {
-        // PBI-019: autoInstall defaults to true for zero-config; explicit values honored
+        // autoInstall defaults to true for zero-config; explicit values honored
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
@@ -456,16 +456,8 @@ mod tests {
 
     #[test]
     fn test_default_search_paths_format() {
-        // PBI-028: default_search_paths() should return base directory only.
-        //
-        // resolve_library_path() appends "parser/" to each search path,
-        // so default_search_paths() should NOT include "parser" or "queries" subdirectories.
-        //
-        // WRONG: [".../kakehashi/parser", ".../kakehashi/queries"]
-        //   -> resolve_library_path looks for ".../kakehashi/parser/parser/lua.so" (FAILS)
-        //
-        // CORRECT: [".../kakehashi"]
-        //   -> resolve_library_path looks for ".../kakehashi/parser/lua.so" (WORKS)
+        // resolve_library_path() appends "parser/" itself, so default_search_paths()
+        // must return the base directory (not "/parser" or "/queries" subdirectories).
         let paths = default_search_paths();
 
         // Should have exactly one path (the base directory)
@@ -494,9 +486,7 @@ mod tests {
 
     #[test]
     fn test_bridge_router_respects_host_filter() {
-        // PBI-108 AC4: Bridge filtering is applied at request time before routing to language servers
-        // This test verifies that is_language_bridgeable is correctly integrated into
-        // the bridge routing logic.
+        // Bridge filtering is applied at request time before routing to language servers.
         use settings::BridgeLanguageConfig;
 
         // Host markdown with bridge filter: only python and r enabled

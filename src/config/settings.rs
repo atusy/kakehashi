@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn should_create_language_settings_with_parser_and_queries() {
-        // PBI-156: LanguageSettings uses parser (not library) and unified queries
+        // LanguageSettings uses parser (not library) and unified queries
         let settings = LanguageSettings {
             parser: Some("/path/to/parser.so".to_string()),
             queries: Some(vec![QueryItem {
@@ -832,8 +832,8 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_bridge_map_enabled() {
-        // PBI-120: LanguageSettings should parse bridge field as HashMap<String, BridgeLanguageConfig>
-        // Example: bridge = { python = { enabled = true }, r = { enabled = true } }
+        // bridge = { python = { enabled = true }, r = { enabled = true } } parses as
+        // HashMap<String, BridgeLanguageConfig>.
         let config_json = r#"{
             "parser": "/path/to/parser.so",
             "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}],
@@ -854,8 +854,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_empty_bridge_map() {
-        // PBI-120: Empty bridge map should disable all bridging
-        // bridge: {} disables all bridging for that host filetype
+        // Empty bridge map (`bridge: {}`) disables all bridging for that host filetype.
         let config_json = r#"{
             "parser": "/path/to/parser.so",
             "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}],
@@ -874,8 +873,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_without_bridge_field() {
-        // PBI-108: Omitted bridge field should be None (bridges all languages)
-        // AC3: bridge omitted or null bridges all configured languages
+        // Omitted bridge field should be None (bridges all configured languages).
         let config_json = r#"{
             "parser": "/path/to/parser.so",
             "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}]
@@ -991,7 +989,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_servers_empty() {
-        // PBI-119: Empty languageServers should be valid
+        // Empty languageServers map should be valid.
         let config_json = r#"{
             "languageServers": {}
         }"#;
@@ -1004,7 +1002,7 @@ mod tests {
 
     #[test]
     fn should_parse_without_language_servers() {
-        // PBI-119: Missing languageServers should be None (backward compatibility)
+        // Missing languageServers should deserialize as None.
         let config_json = r#"{
             "searchPaths": ["/usr/local/lib"]
         }"#;
@@ -1016,8 +1014,7 @@ mod tests {
 
     #[test]
     fn should_parse_bridge_language_config() {
-        // PBI-120: BridgeLanguageConfig should deserialize with enabled field
-        // Example: bridge = { python = { enabled = true } }
+        // BridgeLanguageConfig deserializes the `enabled` field.
         let config_json = r#"{
             "enabled": true
         }"#;
@@ -1035,8 +1032,7 @@ mod tests {
 
     #[test]
     fn should_parse_language_config_with_bridge_map() {
-        // PBI-120: LanguageSettings.bridge should be HashMap<String, BridgeLanguageConfig>
-        // Example: bridge = { python = { enabled = true }, r = { enabled = false } }
+        // LanguageSettings.bridge is a HashMap<String, BridgeLanguageConfig>.
         let config_json = r#"{
             "parser": "/path/to/parser.so",
             "queries": [{"path": "/path/to/highlights.scm", "kind": "highlights"}],
@@ -1055,7 +1051,6 @@ mod tests {
         assert_eq!(bridge.get("r").unwrap().enabled, Some(false));
     }
 
-    // PBI-151: Unified query configuration with QueryItem struct
     #[test]
     fn should_parse_query_item_with_path_and_kind() {
         // QueryItem should have path (required) and kind (optional) fields
@@ -1124,7 +1119,8 @@ kind = "injections""#;
         assert_eq!(queries[1].kind, Some(QueryKind::Locals));
     }
 
-    // PBI-151 Subtask 2: Type inference for query kinds
+    // Type inference for query kinds
+
     #[test]
     fn should_infer_highlights_from_filename_pattern() {
         // Only exact match "highlights.scm" -> Some(Highlights)
