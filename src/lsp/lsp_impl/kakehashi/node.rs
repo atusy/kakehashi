@@ -10,5 +10,6 @@
 //! Future PRs will add a `children` handler alongside these.
 
 mod entry;
+mod lookup;
 mod parent;
 mod text;
