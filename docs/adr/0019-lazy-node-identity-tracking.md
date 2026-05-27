@@ -105,7 +105,7 @@ All three have distinct keys and receive separate ULIDs.
 
 ### Bidirectional Indexing
 
-To support reverse lookups (e.g., `kakehashi/node/text` resolving `Ulid → range`), `NodeTracker` MUST maintain a bidirectional index:
+To support reverse lookups (e.g., `kakehashi/node/text` resolving `ULID → range`), `NodeTracker` MUST maintain a bidirectional index:
 
 ```
 forward:  PositionKey → Ulid    (assignment / dedup)
