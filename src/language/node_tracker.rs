@@ -18,8 +18,79 @@ use url::Url;
 /// and applies START-priority invalidation rules to maintain stable ULIDs across edits.
 /// Originally introduced for injection regions; generalized for the Node Reference
 /// Protocol ([ADR-0025](../../docs/adr/0025-node-reference-protocol.md)).
+///
+/// Maintains a bidirectional index per URI:
+/// - forward (`PositionKey -> Ulid`) for assignment / dedup on `get_or_create`
+/// - reverse (`Ulid -> PositionKey`) for resolving a held ULID back to a node
+///   range (used by `kakehashi/node/text` and future navigation methods).
+///
+/// Both directions are kept in sync across `get_or_create`, `adjust_for_edits`,
+/// and `cleanup` so an invalidated ULID becomes indistinguishable from a never-issued
+/// one (per ADR-0019 "no tombstone" rule).
 pub(crate) struct NodeTracker {
-    entries: DashMap<Url, HashMap<PositionKey, Ulid>>,
+    entries: DashMap<Url, UriEntries>,
+}
+
+/// Per-URI bidirectional index between `PositionKey` and `Ulid`.
+///
+/// The two maps describe the same set of (key, ulid) pairs from different
+/// directions and MUST stay in sync. All mutating methods on this struct
+/// enforce that invariant; outside callers should not touch the fields
+/// directly.
+#[derive(Default)]
+struct UriEntries {
+    forward: HashMap<PositionKey, Ulid>,
+    reverse: HashMap<Ulid, PositionKey>,
+}
+
+impl UriEntries {
+    /// Get or insert a ULID for a position key, keeping both maps in sync.
+    fn get_or_insert(&mut self, key: PositionKey) -> Ulid {
+        if let Some(existing) = self.forward.get(&key) {
+            return *existing;
+        }
+        let ulid = Ulid::new();
+        self.forward.insert(key.clone(), ulid);
+        self.reverse.insert(ulid, key);
+        ulid
+    }
+
+    /// Lookup a position key by ULID.
+    fn lookup(&self, ulid: &Ulid) -> Option<&PositionKey> {
+        self.reverse.get(ulid)
+    }
+
+    /// Returns the number of (key, ulid) pairs currently tracked.
+    fn len(&self) -> usize {
+        debug_assert_eq!(
+            self.forward.len(),
+            self.reverse.len(),
+            "NodeTracker forward/reverse indices out of sync"
+        );
+        self.forward.len()
+    }
+
+    /// Drain all (key, ulid) entries, clearing both maps.
+    fn drain(&mut self) -> impl Iterator<Item = (PositionKey, Ulid)> + '_ {
+        self.reverse.clear();
+        self.forward.drain()
+    }
+
+    /// Insert a (key, ulid) pair; both maps must remain in sync.
+    ///
+    /// Returns `Err(existing_ulid)` if a different ULID already occupies the
+    /// position. Caller decides what to do with the collision (the current
+    /// adjust_for_edits policy is "first wins").
+    fn insert(&mut self, key: PositionKey, ulid: Ulid) -> std::result::Result<(), Ulid> {
+        match self.forward.entry(key.clone()) {
+            Entry::Vacant(e) => {
+                e.insert(ulid);
+                self.reverse.insert(ulid, key);
+                Ok(())
+            }
+            Entry::Occupied(e) => Err(*e.get()),
+        }
+    }
 }
 
 /// Key for Phase 2 position-based tracking (ADR-0019 composite key).
@@ -188,18 +259,33 @@ impl NodeTracker {
         }
     }
 
-    /// Get or create a stable ULID for an injection region.
+    /// Get or create a stable ULID for a tree-sitter node.
     ///
-    /// Phase 2: Uses position-based lookup (ADR-0019 composite key).
-    /// Same (uri, start_byte, end_byte, kind) always returns the same ULID.
+    /// Uses ADR-0019 composite key `(start_byte, end_byte, kind)`: the same
+    /// (uri, start, end, kind) always returns the same ULID, while different
+    /// nodes at the same position (e.g. nested `document` / `section` / `paragraph`
+    /// at byte 0) receive distinct ULIDs.
+    ///
+    /// Updates both the forward and reverse index so the returned ULID can be
+    /// resolved back to its position via [`lookup_position`](Self::lookup_position).
     pub(crate) fn get_or_create(&self, uri: &Url, start: usize, end: usize, kind: &str) -> Ulid {
         let key = PositionKey::new(start, end, kind);
 
         // NOTE: Explicit two-step pattern to avoid DashMap lifetime ambiguity.
         let mut entry = self.entries.entry(uri.clone()).or_default();
-        // We need Ulid::new() to generate unique IDs, not Ulid::default() which returns Ulid(0)
-        #[allow(clippy::unwrap_or_default)]
-        *entry.entry(key).or_insert_with(Ulid::new)
+        entry.get_or_insert(key)
+    }
+
+    /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind)` triple.
+    ///
+    /// Returns `None` if the ULID was never issued for this URI, if it was
+    /// invalidated by an edit (START fell inside the edit range per ADR-0019),
+    /// or if the URI has been closed. These three cases are deliberately
+    /// indistinguishable — see ADR-0025 "Invalidate vs Not-Found".
+    pub(crate) fn lookup_position(&self, uri: &Url, ulid: &Ulid) -> Option<(usize, usize, String)> {
+        let entries = self.entries.get(uri)?;
+        let key = entries.lookup(ulid)?;
+        Some((key.start_byte, key.end_byte, key.kind.clone()))
     }
 
     /// Get the ULID for a position if it exists, without creating it.
@@ -209,7 +295,7 @@ impl NodeTracker {
     #[cfg(test)]
     fn get(&self, uri: &Url, start: usize, end: usize, kind: &str) -> Option<Ulid> {
         let key = PositionKey::new(start, end, kind);
-        self.entries.get(uri)?.get(&key).copied()
+        self.entries.get(uri)?.forward.get(&key).copied()
     }
 
     /// Apply text change and update region positions using START-priority invalidation.
@@ -453,6 +539,9 @@ impl NodeTracker {
     /// Apply a single edit operation with START-priority invalidation (ADR-0019).
     ///
     /// Returns ULIDs that were invalidated by this edit (for Phase 3 cleanup).
+    /// Both the forward and reverse indices for the URI are rebuilt in place,
+    /// so a ULID returned in the invalidated list will no longer resolve via
+    /// [`lookup_position`](Self::lookup_position).
     fn apply_single_edit(&self, uri: &Url, edit: &EditInfo) -> Vec<Ulid> {
         let delta = edit.delta();
         let mut invalidated = Vec::new();
@@ -461,8 +550,12 @@ impl NodeTracker {
             return invalidated;
         };
 
-        // Pre-size HashMap: most edits don't invalidate, so entries count is a good estimate
-        let mut new_entries = HashMap::with_capacity(entries.len());
+        // Pre-size new index: most edits don't invalidate, so the current count
+        // is a good estimate of the surviving entries.
+        let mut new_entries = UriEntries {
+            forward: HashMap::with_capacity(entries.len()),
+            reverse: HashMap::with_capacity(entries.len()),
+        };
 
         for (key, ulid) in entries.drain() {
             if Self::should_invalidate_node(&key, edit) {
@@ -489,20 +582,14 @@ impl NodeTracker {
             // 3. Collisions may indicate a bug in invalidation logic anyway
             //
             // Log at warn level for observability and debugging.
-            match new_entries.entry(new_key.clone()) {
-                Entry::Vacant(e) => {
-                    e.insert(ulid);
-                }
-                Entry::Occupied(_) => {
-                    // Collision: keep first entry, log dropped ULID for debugging
-                    warn!(
-                        target: "kakehashi::node_tracker",
-                        "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}",
-                        ulid, new_key.start_byte, new_key.end_byte, new_key.kind
-                    );
-                    // Note: Collided ULID is also invalidated (both nodes can't coexist)
-                    invalidated.push(ulid);
-                }
+            if let Err(_existing) = new_entries.insert(new_key.clone(), ulid) {
+                warn!(
+                    target: "kakehashi::node_tracker",
+                    "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}",
+                    ulid, new_key.start_byte, new_key.end_byte, new_key.kind
+                );
+                // Note: Collided ULID is also invalidated (both nodes can't coexist)
+                invalidated.push(ulid);
             }
         }
 
@@ -630,6 +717,97 @@ mod tests {
         assert_eq!(
             ulid1_before, ulid1_after,
             "Cleanup should not affect other documents"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_resolves_known_ulid() {
+        // Reverse index: get_or_create should make the ULID resolvable.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_known");
+
+        let ulid = tracker.get_or_create(&uri, 30, 50, "block");
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            Some((30, 50, "block".to_string())),
+            "Newly issued ULID must be resolvable via reverse index"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_returns_none_for_unknown_ulid() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_unknown");
+
+        // No entries exist for this URI yet.
+        let stray = Ulid::new();
+        assert_eq!(tracker.lookup_position(&uri, &stray), None);
+
+        // Adding an unrelated entry must not make the stray ULID resolvable.
+        let _ = tracker.get_or_create(&uri, 0, 5, "block");
+        assert_eq!(tracker.lookup_position(&uri, &stray), None);
+    }
+
+    #[test]
+    fn test_lookup_position_returns_none_after_cleanup() {
+        // didClose semantics: reverse index must be cleared together with forward index.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_cleanup");
+
+        let ulid = tracker.get_or_create(&uri, 10, 20, "block");
+        assert!(tracker.lookup_position(&uri, &ulid).is_some());
+
+        tracker.cleanup(&uri);
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            None,
+            "cleanup() must remove reverse index entries"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_after_edit_reflects_adjusted_range() {
+        // Reverse index must follow position adjustments performed by adjust_for_edits.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_adjusted");
+
+        let ulid = tracker.get_or_create(&uri, 60, 80, "block");
+
+        // Delete [30, 35) before the node → shift by -5.
+        let edits = vec![EditInfo::new(30, 35, 30)];
+        let invalidated = tracker.apply_input_edits(&uri, &edits);
+        assert!(invalidated.is_empty(), "edit before node must not invalidate");
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            Some((55, 75, "block".to_string())),
+            "lookup_position should follow adjusted node range"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_returns_none_after_invalidation() {
+        // After START-priority invalidation, the ULID becomes indistinguishable from
+        // never-issued (ADR-0019 no-tombstone rule, ADR-0025 invalidate-vs-not-found).
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_invalidated");
+
+        let ulid = tracker.get_or_create(&uri, 40, 60, "block");
+
+        // Edit covers the node's START → invalidate.
+        let edits = vec![EditInfo::new(35, 45, 35)];
+        let invalidated = tracker.apply_input_edits(&uri, &edits);
+        assert!(
+            invalidated.contains(&ulid),
+            "edit covering START must invalidate"
+        );
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            None,
+            "invalidated ULID must not be resolvable"
         );
     }
 
