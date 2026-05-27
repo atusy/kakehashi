@@ -121,6 +121,28 @@ All position-to-node resolution uses **half-open intervals** `[start, end)`:
 
 This makes "cursor at the closing fence of a code block" unambiguously **outside** the injection.
 
+#### End-of-Document Exception
+
+LSP positions allow the cursor to sit **after the last byte** of the document (`b == L`, where `L` is the document length). This is the position users reach via End-of-file motions and is naturally produced when appending text. Under the strict half-open rule, no node — not even the root — would contain `b == L`, so every node query at end-of-document would return `null`. This breaks AST-walking commands at end-of-file.
+
+The boundary rule is therefore relaxed by exactly one case:
+
+> A cursor at byte `b` is contained by a node `[s, e)` iff `s ≤ b < e`, **OR** (`b == L` and `e == L`).
+
+Properties of this rule:
+
+- **Position is not modified**: unlike clamping `b` to `L - 1`, the cursor stays at `L`. This avoids surprising behavior when the last byte is a newline (clamping would place the cursor "inside the trailing newline").
+- **Only fires at document end**: the exception requires `e == L` exactly. Interior boundaries (cursor at the end of an injection but before the document end) keep the unmodified half-open behavior, so "cursor at closing fence" still falls out of the injection into the host.
+- **Smallest-wins still applies**: multiple nested nodes typically end at `L` (root → top-level block → last statement → ...). The standard "smallest containing node" rule selects the deepest among them.
+
+Edge cases:
+
+| Cursor position | Behavior |
+|---|---|
+| `b == L`, document non-empty | Returns the smallest node with `e == L` (typically the rightmost branch down from root) |
+| Empty document (`L == 0`) | Root spans `[0, 0)` which is degenerate; returns `null` |
+| `b > L` (out of bounds) | Returns `null` |
+
 ### Navigation Methods
 
 ```jsonc
@@ -260,7 +282,7 @@ Include `range` in every `NodeInfo` returned.
 | **`NodeInfo` shape** | `{ id, type }` (no range) |
 | **Entry resolution** | Smallest containing node at selected injection layer |
 | **Injection selector** | `boolean \| number`, default `false` |
-| **Boundary** | Half-open `[start, end)` |
+| **Boundary** | Half-open `[start, end)`; end-of-document (`b == L`) is contained by nodes with `e == L` |
 | **Navigation scope** | Single language tree per call |
 | **Null semantics** | Universal "not currently resolvable" |
 | **Invalidate diagnostics** | Not provided (collapsed into `null`) |
