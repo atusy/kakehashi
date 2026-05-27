@@ -248,6 +248,7 @@ impl Kakehashi {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 #[cfg(feature = "experimental")]
                 color_provider: Some(ColorProviderCapability::Simple(true)),

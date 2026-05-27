@@ -118,6 +118,76 @@ pub(crate) fn resolve_aggregation_config_from_settings(
         .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
 }
 
+/// Find every (host_language, injection_language) pair whose configured
+/// aggregation strategy for `textDocument/formatting` is `Concatenated`.
+///
+/// The formatting handler intentionally ignores `Concatenated` — running
+/// multiple formatters over the same region produces overlapping `TextEdit`s
+/// and violates the LSP "edits must not overlap" rule. We warn the user once
+/// at settings-apply time (initialize + didChangeConfiguration) so the
+/// configuration mistake surfaces immediately rather than silently degrading
+/// every format request.
+///
+/// Walks the explicit configuration tree (not the resolved-with-wildcard
+/// view): both per-method (`textDocument/formatting`) and per-bridge wildcard
+/// (`_`) strategy entries are considered, with the per-method entry winning
+/// when both are present.
+pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec<(String, String)> {
+    use crate::config::settings::AggregationStrategy;
+
+    let mut pairs = Vec::new();
+    for (host_language, lang_settings) in &settings.languages {
+        let Some(bridge_map) = lang_settings.bridge.as_ref() else {
+            continue;
+        };
+        for (injection_language, bridge_cfg) in bridge_map {
+            let Some(agg_map) = bridge_cfg.aggregation.as_ref() else {
+                continue;
+            };
+            let method_strategy = agg_map
+                .get("textDocument/formatting")
+                .and_then(|a| a.strategy);
+            let wildcard_strategy = agg_map.get("_").and_then(|a| a.strategy);
+            // Per-method entry wins over wildcard, matching resolve_aggregation.
+            if method_strategy.or(wildcard_strategy) == Some(AggregationStrategy::Concatenated) {
+                pairs.push((host_language.clone(), injection_language.clone()));
+            }
+        }
+    }
+    pairs.sort();
+    pairs
+}
+
+/// Render the single aggregated client-facing warning for misconfigured
+/// `textDocument/formatting` aggregation strategies.
+///
+/// The previous implementation emitted one `window/logMessage` per
+/// (host, injection) pair — N notifications per initialize AND every
+/// `didChangeConfiguration` — which floods the editor log for workspaces
+/// that configure many bridge entries.
+///
+/// Returns `None` when `pairs` is empty (nothing to warn about); callers
+/// should skip emitting in that case. Pairs are listed in their incoming
+/// (already sorted) order so the message is deterministic across runs.
+pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)]) -> Option<String> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let listed = pairs
+        .iter()
+        .map(|(host, injection)| format!("{}->{}", host, injection))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Bridge config sets aggregation strategy 'concatenated' for \
+         textDocument/formatting on {} (host->injection) pair(s): {}. \
+         Formatting always uses 'preferred' to avoid overlapping TextEdits; \
+         the configured strategy is ignored.",
+        pairs.len(),
+        listed
+    ))
+}
+
 impl Kakehashi {
     /// Subscribe to cancel notifications for an upstream request.
     ///
@@ -342,5 +412,284 @@ impl Kakehashi {
         let document = self.preamble_to_document_context(preamble, method_name)?;
 
         Some(RangeRequestContext { document, range })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::{
+        AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
+    };
+    use std::collections::HashMap;
+
+    fn settings_with(languages: HashMap<String, LanguageSettings>) -> WorkspaceSettings {
+        WorkspaceSettings {
+            search_paths: Vec::new(),
+            languages,
+            capture_mappings: Default::default(),
+            auto_install: false,
+            language_servers: HashMap::new(),
+        }
+    }
+
+    fn lang_settings(bridge: HashMap<String, BridgeLanguageConfig>) -> LanguageSettings {
+        LanguageSettings {
+            base: None,
+            parser: None,
+            queries: None,
+            bridge: Some(bridge),
+            aliases: None,
+        }
+    }
+
+    fn bridge_cfg_with_aggregation(
+        method: &str,
+        strategy: AggregationStrategy,
+    ) -> BridgeLanguageConfig {
+        let mut agg = HashMap::new();
+        agg.insert(
+            method.to_string(),
+            AggregationConfig {
+                priorities: None,
+                strategy: Some(strategy),
+                max_fan_out: None,
+            },
+        );
+        BridgeLanguageConfig {
+            enabled: None,
+            aggregation: Some(agg),
+        }
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_finds_explicit_method_entry() {
+        // Host "markdown" → injection "python" with concatenated formatting.
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            bridge_cfg_with_aggregation(
+                "textDocument/formatting",
+                AggregationStrategy::Concatenated,
+            ),
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert_eq!(pairs, vec![("markdown".to_string(), "python".to_string())]);
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_finds_wildcard_method_entry() {
+        // Wildcard "_" method entry with Concatenated applies to formatting too.
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            bridge_cfg_with_aggregation("_", AggregationStrategy::Concatenated),
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert_eq!(
+            pairs,
+            vec![("markdown".to_string(), "python".to_string())],
+            "wildcard '_' aggregation entry must apply to formatting"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_method_entry_overrides_wildcard() {
+        // Wildcard says Concatenated, but explicit formatting entry says Preferred.
+        // Result: not warned (method entry wins).
+        let mut agg = HashMap::new();
+        agg.insert(
+            "_".to_string(),
+            AggregationConfig {
+                priorities: None,
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: None,
+                strategy: Some(AggregationStrategy::Preferred),
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "method-specific Preferred must override wildcard Concatenated"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_returns_empty_for_preferred() {
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            bridge_cfg_with_aggregation("textDocument/formatting", AggregationStrategy::Preferred),
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_ignores_other_methods() {
+        // Concatenated for diagnostic (its default) — must NOT warn.
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            bridge_cfg_with_aggregation(
+                "textDocument/diagnostic",
+                AggregationStrategy::Concatenated,
+            ),
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(pairs.is_empty());
+    }
+
+    // ==========================================================================
+    // format_concatenated_formatting_warning (review MEDIUM follow-up)
+    // ==========================================================================
+    //
+    // The previous emitter looped over pairs and called `log_warning` N times,
+    // spamming the editor log on every settings reload. The aggregated
+    // formatter renders a single message; these tests pin the shape so
+    // changes to the warning text remain deliberate.
+
+    #[test]
+    fn format_concatenated_formatting_warning_returns_none_for_empty_input() {
+        assert_eq!(
+            format_concatenated_formatting_warning(&[]),
+            None,
+            "no pairs => no warning to emit (caller skips log_warning entirely)"
+        );
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_lists_single_pair() {
+        let msg = format_concatenated_formatting_warning(&[(
+            "markdown".to_string(),
+            "python".to_string(),
+        )])
+        .expect("non-empty input must yield a message");
+        assert!(
+            msg.contains("1 (host->injection) pair(s)"),
+            "message must report count; got: {msg}"
+        );
+        assert!(
+            msg.contains("markdown->python"),
+            "message must contain the pair; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_aggregates_multiple_pairs_into_single_message() {
+        let pairs = vec![
+            ("markdown".to_string(), "lua".to_string()),
+            ("markdown".to_string(), "python".to_string()),
+            ("rust".to_string(), "python".to_string()),
+        ];
+
+        let msg = format_concatenated_formatting_warning(&pairs)
+            .expect("non-empty input must yield a message");
+
+        assert!(
+            msg.contains("3 (host->injection) pair(s)"),
+            "count must reflect input length; got: {msg}"
+        );
+        // All three pairs must appear, separated for readability. We don't
+        // pin the exact separator beyond "comma-separated" so future tidying
+        // can choose a different delimiter without breaking this test.
+        for needle in ["markdown->lua", "markdown->python", "rust->python"] {
+            assert!(msg.contains(needle), "missing '{needle}' in: {msg}");
+        }
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_preserves_input_order() {
+        // Caller passes a sorted vec; the message should list them in that
+        // order so consecutive emissions are byte-identical and editors can
+        // dedupe notifications. (Sorting at this layer would hide bugs in
+        // the upstream `concatenated_formatting_pairs.sort()` call.)
+        let pairs = vec![
+            ("zeta".to_string(), "alpha".to_string()),
+            ("alpha".to_string(), "zeta".to_string()),
+        ];
+
+        let msg = format_concatenated_formatting_warning(&pairs).unwrap();
+
+        let zeta_idx = msg.find("zeta->alpha").expect("first pair must appear");
+        let alpha_idx = msg.find("alpha->zeta").expect("second pair must appear");
+        assert!(
+            zeta_idx < alpha_idx,
+            "input order must be preserved verbatim; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_sorts_deterministically() {
+        // HashMap iteration order is non-deterministic; the function must
+        // sort the output so warnings are emitted in a stable order.
+        let mut langs = HashMap::new();
+        for (host, injection) in [
+            ("rust", "python"),
+            ("markdown", "lua"),
+            ("markdown", "python"),
+        ] {
+            let mut bridge = HashMap::new();
+            bridge.insert(
+                injection.to_string(),
+                bridge_cfg_with_aggregation(
+                    "textDocument/formatting",
+                    AggregationStrategy::Concatenated,
+                ),
+            );
+            langs
+                .entry(host.to_string())
+                .or_insert_with(|| lang_settings(HashMap::new()))
+                .bridge
+                .as_mut()
+                .unwrap()
+                .extend(bridge);
+        }
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert_eq!(
+            pairs,
+            vec![
+                ("markdown".to_string(), "lua".to_string()),
+                ("markdown".to_string(), "python".to_string()),
+                ("rust".to_string(), "python".to_string()),
+            ]
+        );
     }
 }

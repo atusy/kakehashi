@@ -18,14 +18,14 @@ use tower_lsp_server::ls_types::{
     CompletionItem, CompletionParams, CompletionResponse, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
-    DocumentHighlight, DocumentHighlightParams, DocumentLink, DocumentLinkParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverParams, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-    InlayHintParams, Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams,
-    RenameParams, SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    TextDocumentPositionParams, Uri, WorkspaceEdit,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentLink,
+    DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, Location, Moniker, MonikerParams,
+    PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 use url::Url;
@@ -243,6 +243,25 @@ impl Kakehashi {
             settings,
         )
         .await;
+        self.warn_on_unsupported_formatting_strategies().await;
+    }
+
+    /// Emit a single client-visible warning summarizing all (host, injection)
+    /// pairs whose configured `textDocument/formatting` aggregation strategy
+    /// is `Concatenated`. The formatting handler ignores `Concatenated`
+    /// because merging edits from multiple formatters produces overlapping
+    /// `TextEdit`s (an LSP spec violation); surfacing the mismatch at
+    /// settings-apply time avoids silent misbehavior on every format request.
+    ///
+    /// Previously this emitted one notification per pair, which floods the
+    /// editor log on `didChangeConfiguration` reloads for workspaces with
+    /// many bridge entries.
+    async fn warn_on_unsupported_formatting_strategies(&self) {
+        let settings = self.settings_manager.load_settings();
+        let pairs = bridge_context::concatenated_formatting_pairs(&settings);
+        if let Some(msg) = bridge_context::format_concatenated_formatting_warning(&pairs) {
+            self.notifier().log_warning(msg).await;
+        }
     }
 
     pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator {
@@ -408,6 +427,10 @@ impl LanguageServer for Kakehashi {
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         self.rename_impl(params).await
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        self.formatting_impl(params).await
     }
 
     async fn prepare_rename(
