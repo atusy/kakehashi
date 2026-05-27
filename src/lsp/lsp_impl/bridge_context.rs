@@ -158,6 +158,36 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
     pairs
 }
 
+/// Render the single aggregated client-facing warning for misconfigured
+/// `textDocument/formatting` aggregation strategies.
+///
+/// The previous implementation emitted one `window/logMessage` per
+/// (host, injection) pair — N notifications per initialize AND every
+/// `didChangeConfiguration` — which floods the editor log for workspaces
+/// that configure many bridge entries.
+///
+/// Returns `None` when `pairs` is empty (nothing to warn about); callers
+/// should skip emitting in that case. Pairs are listed in their incoming
+/// (already sorted) order so the message is deterministic across runs.
+pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)]) -> Option<String> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let listed = pairs
+        .iter()
+        .map(|(host, injection)| format!("{}->{}", host, injection))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Bridge config sets aggregation strategy 'concatenated' for \
+         textDocument/formatting on {} (host->injection) pair(s): {}. \
+         Formatting always uses 'preferred' to avoid overlapping TextEdits; \
+         the configured strategy is ignored.",
+        pairs.len(),
+        listed
+    ))
+}
+
 impl Kakehashi {
     /// Subscribe to cancel notifications for an upstream request.
     ///
@@ -543,6 +573,85 @@ mod tests {
         let pairs = concatenated_formatting_pairs(&settings_with(langs));
 
         assert!(pairs.is_empty());
+    }
+
+    // ==========================================================================
+    // format_concatenated_formatting_warning (review MEDIUM follow-up)
+    // ==========================================================================
+    //
+    // The previous emitter looped over pairs and called `log_warning` N times,
+    // spamming the editor log on every settings reload. The aggregated
+    // formatter renders a single message; these tests pin the shape so
+    // changes to the warning text remain deliberate.
+
+    #[test]
+    fn format_concatenated_formatting_warning_returns_none_for_empty_input() {
+        assert_eq!(
+            format_concatenated_formatting_warning(&[]),
+            None,
+            "no pairs => no warning to emit (caller skips log_warning entirely)"
+        );
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_lists_single_pair() {
+        let msg = format_concatenated_formatting_warning(&[(
+            "markdown".to_string(),
+            "python".to_string(),
+        )])
+        .expect("non-empty input must yield a message");
+        assert!(
+            msg.contains("1 (host->injection) pair(s)"),
+            "message must report count; got: {msg}"
+        );
+        assert!(
+            msg.contains("markdown->python"),
+            "message must contain the pair; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_aggregates_multiple_pairs_into_single_message() {
+        let pairs = vec![
+            ("markdown".to_string(), "lua".to_string()),
+            ("markdown".to_string(), "python".to_string()),
+            ("rust".to_string(), "python".to_string()),
+        ];
+
+        let msg = format_concatenated_formatting_warning(&pairs)
+            .expect("non-empty input must yield a message");
+
+        assert!(
+            msg.contains("3 (host->injection) pair(s)"),
+            "count must reflect input length; got: {msg}"
+        );
+        // All three pairs must appear, separated for readability. We don't
+        // pin the exact separator beyond "comma-separated" so future tidying
+        // can choose a different delimiter without breaking this test.
+        for needle in ["markdown->lua", "markdown->python", "rust->python"] {
+            assert!(msg.contains(needle), "missing '{needle}' in: {msg}");
+        }
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_preserves_input_order() {
+        // Caller passes a sorted vec; the message should list them in that
+        // order so consecutive emissions are byte-identical and editors can
+        // dedupe notifications. (Sorting at this layer would hide bugs in
+        // the upstream `concatenated_formatting_pairs.sort()` call.)
+        let pairs = vec![
+            ("zeta".to_string(), "alpha".to_string()),
+            ("alpha".to_string(), "zeta".to_string()),
+        ];
+
+        let msg = format_concatenated_formatting_warning(&pairs).unwrap();
+
+        let zeta_idx = msg.find("zeta->alpha").expect("first pair must appear");
+        let alpha_idx = msg.find("alpha->zeta").expect("second pair must appear");
+        assert!(
+            zeta_idx < alpha_idx,
+            "input order must be preserved verbatim; got: {msg}"
+        );
     }
 
     #[test]
