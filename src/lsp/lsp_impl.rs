@@ -243,6 +243,32 @@ impl Kakehashi {
             settings,
         )
         .await;
+        self.warn_on_unsupported_formatting_strategies().await;
+    }
+
+    /// Emit a client-visible warning for every (host, injection) pair whose
+    /// configured `textDocument/formatting` aggregation strategy is
+    /// `Concatenated`. The formatting handler ignores `Concatenated` because
+    /// merging edits from multiple formatters produces overlapping
+    /// `TextEdit`s (an LSP spec violation); surfacing the mismatch at
+    /// settings-apply time avoids silent misbehavior on every format request.
+    async fn warn_on_unsupported_formatting_strategies(&self) {
+        let settings = self.settings_manager.load_settings();
+        let pairs = bridge_context::concatenated_formatting_pairs(&settings);
+        if pairs.is_empty() {
+            return;
+        }
+        for (host, injection) in pairs {
+            self.notifier()
+                .log_warning(format!(
+                    "Bridge config sets aggregation strategy 'concatenated' for \
+                     textDocument/formatting (host='{}', injection='{}'); \
+                     formatting always uses 'preferred' to avoid overlapping \
+                     TextEdits. The configured strategy is ignored.",
+                    host, injection
+                ))
+                .await;
+        }
     }
 
     pub(super) fn parse_coordinator(&self) -> coordinator::ParseCoordinator {
