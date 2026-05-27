@@ -22,7 +22,9 @@
 
 mod helpers;
 
-use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
+use helpers::lua_bridge::{
+    create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
+};
 use serde_json::json;
 
 /// Default LSP `FormattingOptions` body — fixed tab size + spaces. Matches
@@ -35,6 +37,10 @@ fn default_formatting_options() -> serde_json::Value {
 /// and (if edits are returned) places every edit inside the host code-fence.
 #[test]
 fn e2e_formatting_request_returns_host_coordinate_edits() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
+
     let (mut client, _config_dir) = create_lua_configured_client();
 
     // Deliberately badly-formatted lua inside a markdown code fence — gives
@@ -123,6 +129,10 @@ fn e2e_formatting_request_returns_host_coordinate_edits() {
 /// `null` (per `formatting_impl`'s `all_regions.is_empty()` early-return).
 #[test]
 fn e2e_formatting_without_injections_returns_null() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
+
     let (mut client, _config_dir) = create_lua_configured_client();
 
     let markdown_content = "# Plain markdown\n\nNo code blocks here.\n";
