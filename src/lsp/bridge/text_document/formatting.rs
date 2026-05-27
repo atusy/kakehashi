@@ -201,12 +201,16 @@ fn transform_formatting_response_to_host(
         }
     }
 
-    // Drop edits whose end position is still past the virtual document's
-    // last line after clamping. Such edits would corrupt host content
-    // beyond the injection region after offset translation (see
-    // function-level docs).
+    // Drop edits whose start OR end position is still past the virtual
+    // document's last line after clamping. Such edits would corrupt host
+    // content beyond the injection region after offset translation (see
+    // function-level docs). Checking both endpoints handles both the common
+    // "formatter overshoots EOF" case and the malformed `start > virtual_eof`
+    // shape that would otherwise sneak through with an in-bounds `end`.
     let before = edits.len();
-    edits.retain(|edit| edit.range.end.line < virtual_line_count);
+    edits.retain(|edit| {
+        edit.range.start.line < virtual_line_count && edit.range.end.line < virtual_line_count
+    });
     // `retain` never grows the vec so this can't underflow today, but
     // saturating_sub keeps the count valid if the surrounding logic ever
     // changes (e.g., a new clamping step that re-inserts edits).
@@ -612,6 +616,38 @@ mod tests {
         assert_eq!(edits[0].range.start.character, 3);
         assert_eq!(edits[0].range.end.line, 1, "end clamped down by one line");
         assert_eq!(edits[0].range.end.character, u32::MAX);
+    }
+
+    #[test]
+    fn formatting_response_drops_edit_with_out_of_bounds_start_line() {
+        // Malformed edit shape (e.g., from a buggy or hostile formatter):
+        // `end.line` is in bounds but `start.line` overshoots EOF. The
+        // previous filter only checked `end.line`, so this edit slipped
+        // through and `translate_virtual_range_to_host` saturating-added
+        // the host offset, landing on real host bytes outside the injection.
+        // Guard against it explicitly.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 5, "character": 0 },
+                        "end":   { "line": 1, "character": 0 }
+                    },
+                    "newText": "wrong"
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(0, 0), 2).unwrap();
+
+        assert!(
+            edits.is_empty(),
+            "edit whose start.line is past virtual EOF must be dropped, \
+             even when end.line is in bounds"
+        );
     }
 
     #[test]
