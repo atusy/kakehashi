@@ -13,6 +13,24 @@
 //!
 //! This handler uses `send_request()` to queue requests via the channel-based
 //! writer task, ensuring FIFO ordering with other messages.
+//!
+//! # Multi-line edit limitation (host indentation)
+//!
+//! [`translate_virtual_range_to_host`] adds the per-line column offset only
+//! to virtual line 0. For lines >0 of a returned [`TextEdit`], host coords
+//! land at column 0. This is correct for *positions* (the virtual line model
+//! starts at column 0 for every line after the first), but it is **not**
+//! sufficient for the `new_text` payload of a multi-line edit inside an
+//! indented injection (e.g., an indented markdown code fence). The text
+//! itself still starts at column 0 of the embedded language, so when the
+//! formatter rewraps a function body the new lines insert at the host's
+//! column 0 instead of the host's indentation column.
+//!
+//! Single-line edits and zero-width inserts (the common case for
+//! `trimTrailingWhitespace` / `insertFinalNewline`) are unaffected. A full
+//! fix requires rewriting `new_text` to prepend the host indentation after
+//! every embedded newline; that is left as future work and tracked
+//! separately because it interacts with `trim_final_newlines` semantics.
 
 use std::io;
 
