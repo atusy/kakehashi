@@ -8,6 +8,7 @@
 
 **Related ADRs**:
 - [ADR-0007](0007-language-server-bridge-virtual-document-model.md) — Virtual document model for injection regions
+- [ADR-0025](0025-node-reference-protocol.md) — Protocol exposing tracked node identities to clients
 
 ## Context and Problem Statement
 
@@ -102,6 +103,19 @@ All three have distinct keys and receive separate ULIDs.
 
 **Invalidation with composite keys**: The START-priority rule applies to the `start_byte` component. When `start_byte ∈ [edit.start, edit.old_end)`, all entries with that `start_byte` are invalidated regardless of their `end_byte` or `kind`.
 
+### Bidirectional Indexing
+
+To support reverse lookups (e.g., `kakehashi/node/text` resolving `Ulid → range`), `NodeTracker` MUST maintain a bidirectional index:
+
+```
+forward:  PositionKey → Ulid    (assignment / dedup)
+reverse:  Ulid → PositionKey    (text/range resolution, parent/children navigation)
+```
+
+Both maps are kept in sync on `get_or_create`, `adjust_for_edits`, and `didClose`. The reverse direction is required because clients hold ULIDs as opaque references and have no way to reconstruct positions on their own.
+
+**Invalidate semantics**: When a node's START falls inside the edit range, both entries are removed. After removal, the ULID is **indistinguishable from "never issued"** — by design, no tombstone is kept, so memory stays bounded to live nodes only.
+
 ## Example: Markdown Code Block
 
 ``````markdown
@@ -190,4 +204,6 @@ Invalidate any node whose range overlaps with the edit range.
 | **Uniqueness key** | `(start_byte, end_byte, kind)` |
 | **Invalidation** | START-priority boundary-based |
 | **Storage** | Per-document |
+| **Indexing** | Bidirectional (`PositionKey ↔ Ulid`) |
 | **Core rule** | `node.start ∉ [edit.start, edit.old_end)` → identity preserved |
+| **Invalidate vs not-found** | Indistinguishable by design (no tombstone) |
