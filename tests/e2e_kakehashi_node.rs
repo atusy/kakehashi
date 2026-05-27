@@ -833,3 +833,53 @@ fn test_node_injection_false_returns_host_node_inside_python_block() {
         ty
     );
 }
+
+/// Names that tree-sitter-python produces for nodes inside `y = 1 + 2`. We
+/// don't pin a single kind because the smallest-containing-node algorithm
+/// may land on an anonymous `=` token, a named `assignment`, or an
+/// `expression_statement` depending on the cursor column and the grammar
+/// revision. Any of these proves the resolver crossed into the python tree.
+fn is_python_kind(ty: &str) -> bool {
+    matches!(
+        ty,
+        "module"
+            | "expression_statement"
+            | "assignment"
+            | "identifier"
+            | "integer"
+            | "binary_operator"
+            | "="
+            | "+"
+    )
+}
+
+/// `injection: true` saturates to the deepest layer at the cursor position
+/// (ADR-0025 §"`true` as saturation shorthand"). With a python fenced code
+/// block as the only injection, a cursor inside the python source must
+/// resolve to a python node — not a markdown host node.
+#[test]
+fn test_node_injection_true_returns_python_node_inside_python_block() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_true.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    // Cursor inside the python code, on `y = 1 + 2` (line 3, char 4 is "=").
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(true));
+    assert!(
+        !result.is_null(),
+        "injection=true must resolve at the deepest layer, got null"
+    );
+    assert_ulid_shaped(result.get("id").expect("id field"));
+
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    assert!(
+        is_python_kind(ty),
+        "injection=true must return a python node inside the code block, got type={:?}",
+        ty
+    );
+}

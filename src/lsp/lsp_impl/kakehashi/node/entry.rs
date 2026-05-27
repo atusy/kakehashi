@@ -1,16 +1,23 @@
 //! `kakehashi/node` — position → NodeInfo entry point (ADR-0025).
 //!
 //! Resolves a `Position` to the smallest tree-sitter node (named or anonymous)
-//! containing that byte under the **host** language. Injection-aware lookup is
-//! deferred to PR-4; for now, any client-supplied `injection` value is accepted
-//! but ignored — the handler always returns the host-language node.
+//! containing that byte at the layer selected by the `injection` parameter
+//! (ADR-0025 PR-4). When `injection` is absent or `false`/`0`, the host tree
+//! is used. When `injection` is `true`, the deepest layer at the cursor is
+//! used (saturating). When `injection` is a non-zero integer, the layer is
+//! resolved via `stack[n]` for positive `n` and `stack[stack.len() + n]` for
+//! negative `n`, with strict out-of-bounds returning `null`.
 //!
 //! Returns `null` (serialized as JSON `null`) when:
 //! - the URI is unknown,
 //! - the document has not yet been parsed (no tree),
 //! - the position cannot be converted to a byte offset,
-//! - the position is outside the document (`b > L`), or
-//! - the document is empty (`L == 0`).
+//! - the position is outside the document (`b > L`),
+//! - the document is empty (`L == 0`),
+//! - the requested `injection` layer does not exist at the position (strict
+//!   integer index out of bounds), or
+//! - the `injection` parameter has an unsupported JSON type (not bool, not
+//!   an integer number).
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,12 +25,16 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier};
 use url::Url;
 
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::injection_stack_at;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
 /// Request parameters for `kakehashi/node`.
 ///
-/// The `injection` field is parsed but ignored in PR-1; see module-level doc.
+/// The `injection` field is a `boolean | number` per ADR-0025 PR-4. We
+/// deserialize it as a raw `Value` and dispatch on the JSON shape ourselves
+/// because serde-tagged enums would reject the natural `true` / `1` / `-2`
+/// shorthand the spec mandates.
 ///
 /// `pub` is required because `Kakehashi::kakehashi_node` is registered as a
 /// custom LSP method in the `kakehashi` binary, which lives outside the
@@ -33,9 +44,74 @@ use crate::text::PositionMapper;
 pub struct NodeParams {
     pub text_document: TextDocumentIdentifier,
     pub position: Position,
-    /// Reserved for PR-4 (`boolean | number`). Accepted but ignored in PR-1.
+    /// `boolean | number` per ADR-0025 §"The `injection` Parameter". Absent /
+    /// `false` / `0` selects the host layer; `true` saturates to the deepest
+    /// layer; a non-zero integer indexes the stack strictly.
     #[serde(default)]
     pub injection: Option<Value>,
+}
+
+/// Layer selector parsed from the `injection` JSON parameter.
+///
+/// Keeping this as a small enum (rather than just an `i64`) lets the
+/// handler keep the `true` saturation case and the strict-index case
+/// visibly distinct — they share the result for `-1` but differ in
+/// the bounds-check semantics ADR-0025 spells out.
+enum InjectionSelector {
+    /// Host layer (stack[0]). Triggered by absent, `false`, or `0`.
+    Host,
+    /// Saturate to the deepest layer at the cursor (`true`).
+    Saturating,
+    /// Strict integer index. Positive `n` -> `stack[n]`; negative `n` ->
+    /// `stack[stack.len() + n]`. Out-of-bounds returns null at the caller.
+    Index(i64),
+    /// Unsupported JSON shape (non-bool / non-integer). Treated as null.
+    Invalid,
+}
+
+/// Parse the `injection` parameter into an [`InjectionSelector`].
+///
+/// Per ADR-0025: `false` and `0` are equivalent (host); `true` saturates;
+/// integer values index strictly. Anything else (string, array, fractional
+/// number) is rejected as `Invalid` so the handler returns null with a log
+/// warning, rather than silently coercing.
+fn parse_injection_selector(value: Option<&Value>) -> InjectionSelector {
+    match value {
+        None | Some(Value::Null) => InjectionSelector::Host,
+        Some(Value::Bool(true)) => InjectionSelector::Saturating,
+        Some(Value::Bool(false)) => InjectionSelector::Host,
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(0) => InjectionSelector::Host,
+            Some(i) => InjectionSelector::Index(i),
+            None => InjectionSelector::Invalid,
+        },
+        _ => InjectionSelector::Invalid,
+    }
+}
+
+/// Resolve a non-zero integer index against a stack of length `stack_len`,
+/// following ADR-0025 §"The `injection` Parameter":
+///
+/// - positive `n`: `stack[n]` directly, `null` if `n >= stack_len`
+/// - negative `n`: `stack[stack_len + n]`, `null` if the result is < 0
+///
+/// `stack_len` must be at least 1 in practice (the host layer is always
+/// present); we keep the signature general so callers can defensively
+/// short-circuit on an empty stack without panicking.
+fn resolve_index(n: i64, stack_len: usize) -> Option<usize> {
+    if n > 0 {
+        let idx = usize::try_from(n).ok()?;
+        if idx < stack_len { Some(idx) } else { None }
+    } else {
+        // n is negative (n == 0 is handled by the Host branch upstream).
+        // Convert via i64 arithmetic to avoid usize underflow on `len + n`.
+        let len_i64 = i64::try_from(stack_len).ok()?;
+        let resolved = len_i64.checked_add(n)?;
+        if resolved < 0 {
+            return None;
+        }
+        usize::try_from(resolved).ok()
+    }
 }
 
 impl Kakehashi {
@@ -43,6 +119,18 @@ impl Kakehashi {
     pub async fn kakehashi_node(&self, params: NodeParams) -> Result<Value> {
         let lsp_uri = params.text_document.uri;
         let position = params.position;
+        let injection = params.injection;
+
+        // Parse the injection selector up-front so an invalid JSON shape
+        // short-circuits before we touch the document store.
+        let selector = parse_injection_selector(injection.as_ref());
+        if matches!(selector, InjectionSelector::Invalid) {
+            log::warn!(
+                target: "kakehashi::node",
+                "unsupported injection parameter shape: {:?}", injection
+            );
+            return Ok(Value::Null);
+        }
 
         // URI conversion failure → null (ADR-0025 universal null semantics).
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -84,12 +172,58 @@ impl Kakehashi {
             return Ok(Value::Null);
         }
 
-        // Resolve smallest containing node under the host tree.
-        let Some(node) = smallest_containing_node(tree, byte, doc_len) else {
+        // Host layer fast path: skip the stack enumeration entirely. This
+        // keeps the no-injection request shape (the dominant case for plain
+        // documents) at PR-1 cost.
+        if matches!(selector, InjectionSelector::Host) {
+            return Ok(self.resolve_host_layer_node(&uri, tree, byte, doc_len));
+        }
+
+        // We need the host language to seed `injection_stack_at` with the
+        // right injection query. Detect it from the document store.
+        let Some(host_language) = self.document_language(&uri) else {
+            log::debug!(
+                target: "kakehashi::node",
+                "no host language detected for {} — cannot resolve injection layers",
+                uri
+            );
             return Ok(Value::Null);
         };
 
-        // Issue / reuse a stable ULID for this node via the NodeTracker.
+        // Ensure injection-language parsers are loaded. PR-1 only loaded
+        // the host parser on-demand; injection layers require their own
+        // grammars to be available before `injection_stack_at` can parse
+        // them. Skip the expensive load for the host-only path above.
+        self.ensure_injection_languages_loaded(&uri, &host_language, text)
+            .await;
+
+        let stack = injection_stack_at(&self.language, &host_language, text, tree, byte);
+
+        let layer_index = match selector {
+            InjectionSelector::Host => unreachable!("handled above"),
+            InjectionSelector::Invalid => unreachable!("handled above"),
+            InjectionSelector::Saturating => {
+                // `true` saturates to the deepest layer. The stack always
+                // contains at least the host (layer 0), so this never
+                // under-indexes.
+                stack.len() - 1
+            }
+            InjectionSelector::Index(n) => {
+                let Some(idx) = resolve_index(n, stack.len()) else {
+                    return Ok(Value::Null);
+                };
+                idx
+            }
+        };
+
+        let Some(layer) = stack.get(layer_index) else {
+            return Ok(Value::Null);
+        };
+
+        let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
+            return Ok(Value::Null);
+        };
+
         let ulid = self.bridge.node_tracker().get_or_create(
             &uri,
             node.start_byte(),
@@ -101,6 +235,58 @@ impl Kakehashi {
             "id": ulid.to_string(),
             "type": node.kind(),
         }))
+    }
+
+    /// Host-layer lookup, factored out so the no-injection request keeps
+    /// the same shape it had in PR-1.
+    fn resolve_host_layer_node(
+        &self,
+        uri: &Url,
+        tree: &tree_sitter::Tree,
+        byte: usize,
+        doc_len: usize,
+    ) -> Value {
+        let Some(node) = smallest_containing_node(tree, byte, doc_len) else {
+            return Value::Null;
+        };
+
+        let ulid = self.bridge.node_tracker().get_or_create(
+            uri,
+            node.start_byte(),
+            node.end_byte(),
+            node.kind(),
+        );
+
+        json!({
+            "id": ulid.to_string(),
+            "type": node.kind(),
+        })
+    }
+
+    /// Ensure parsers for every injection language reachable from this
+    /// document are loaded. `didOpen` triggers this via `process_injections`,
+    /// but a client may call `kakehashi/node` quickly enough to race that
+    /// load — re-invoke it here defensively so PR-4's injection-aware path
+    /// has a parser to work with.
+    ///
+    /// Cheap when languages are already loaded (`ensure_language_loaded`
+    /// short-circuits on a registry hit).
+    async fn ensure_injection_languages_loaded(&self, uri: &Url, host_language: &str, _text: &str) {
+        use std::collections::HashSet;
+
+        // Re-resolve the injection set from the host language's injection
+        // query. We could mine this from `injection_stack_at` but we'd then
+        // have to plumb it back; the duplicate work is negligible and keeps
+        // the stack helper synchronous-only.
+        let coordinator = self.injection_coordinator();
+        let injections = coordinator.resolve_injection_data(uri, host_language);
+        if injections.is_empty() {
+            return;
+        }
+        let languages: HashSet<String> = injections.into_iter().map(|i| i.language).collect();
+        coordinator
+            .check_injected_languages_auto_install(uri, &languages)
+            .await;
     }
 
     /// Parse the document on-demand if its tree has not been built yet.

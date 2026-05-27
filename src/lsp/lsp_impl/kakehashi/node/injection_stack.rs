@@ -25,7 +25,6 @@ use crate::language::injection::{
 /// and so the host layer can carry the document tree without cloning lifetime
 /// dependencies. Byte coordinates inside `tree` are in original-document
 /// space (the same space the host text uses).
-#[allow(dead_code)] // used in the next commit (4d/4e GREEN)
 pub(super) struct InjectionLayer {
     /// Tree-sitter syntax tree for this layer.
     pub(super) tree: tree_sitter::Tree,
@@ -45,7 +44,6 @@ pub(super) struct InjectionLayer {
 /// Returns `None` if the host layer cannot be cloned (`tree_sitter::Tree`
 /// clone is cheap and infallible in practice, so this currently never fires
 /// but is kept as a signature concession to future failure modes).
-#[allow(dead_code)] // used in the next commit (4d/4e GREEN)
 pub(super) fn injection_stack_at(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -168,7 +166,6 @@ pub(super) fn injection_stack_at(
 /// synchronous LSP handler code paths. Parser construction is cheap (each
 /// call instantiates a fresh `tree_sitter::Parser` and reads a few pointers
 /// from the registry); we re-evaluate if profiling shows this on a hot path.
-#[allow(dead_code)] // used in the next commit (4d/4e GREEN)
 fn parse_with_absolute_ranges(
     language: &tree_sitter::Language,
     text: &str,
