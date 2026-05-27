@@ -490,4 +490,111 @@ mod tests {
     fn count_lines_matches_lsp_line_model(#[case] input: &str, #[case] expected: u32) {
         assert_eq!(count_lines(input), expected);
     }
+
+    // ==========================================================================
+    // "Insert final newline" canonical shape (review MINOR follow-up)
+    // ==========================================================================
+    //
+    // Formatters commonly emit the trailing-newline insertion as a zero-width
+    // edit anchored at column 0 of the synthetic line *after* the last real
+    // line, i.e., end.line == virtual_line_count && end.character == 0. The
+    // boundary guard would drop these as "past EOF", even though they are
+    // structurally safe — they insert at the very end of the virtual content
+    // without overwriting any host bytes. Treat them as inserts at the last
+    // column of the last real line and let the editor's standard
+    // past-end-of-line clamping snap them into place.
+
+    #[test]
+    fn formatting_response_clamps_zero_width_insert_on_synthetic_eof_line() {
+        // virtual_line_count = 1 (e.g., "foo" with no trailing newline) →
+        // formatter emits (1,0)..(1,0) → "\n". Must be clamped to a zero-width
+        // insert on line 0 rather than dropped.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end":   { "line": 1, "character": 0 }
+                    },
+                    "newText": "\n"
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(10, 0), 1).unwrap();
+
+        assert_eq!(edits.len(), 1, "canonical insertFinalNewline shape kept");
+        assert_eq!(edits[0].new_text, "\n");
+        // After clamping virtual (1,0)..(1,0) → (0, u32::MAX)..(0, u32::MAX),
+        // then translation adds the region's line offset (10).
+        assert_eq!(edits[0].range.start.line, 10);
+        assert_eq!(edits[0].range.end.line, 10);
+        assert_eq!(
+            edits[0].range.start.character,
+            u32::MAX,
+            "u32::MAX signals 'end of line' per LSP position clamping"
+        );
+        assert_eq!(edits[0].range.end.character, u32::MAX);
+    }
+
+    #[test]
+    fn formatting_response_clamps_replacement_crossing_synthetic_eof_boundary() {
+        // virtual_line_count = 2 → valid lines are 0 and 1. Formatter emits
+        // (1, 3)..(2, 0) → "" — i.e., "replace the implicit empty trailing
+        // line with nothing". end.line=2 is the synthetic next-line anchor;
+        // only `end` needs clamping while `start` is already in-bounds.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 3 },
+                        "end":   { "line": 2, "character": 0 }
+                    },
+                    "newText": ""
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(0, 0), 2).unwrap();
+
+        assert_eq!(edits.len(), 1, "boundary-crossing replacement kept");
+        assert_eq!(edits[0].range.start.line, 1);
+        assert_eq!(edits[0].range.start.character, 3);
+        assert_eq!(edits[0].range.end.line, 1, "end clamped down by one line");
+        assert_eq!(edits[0].range.end.character, u32::MAX);
+    }
+
+    #[test]
+    fn formatting_response_still_drops_edits_two_or_more_lines_past_eof() {
+        // Regression guard: the new "synthetic-line-0" exception only relaxes
+        // a single-line overshoot. An edit ending two lines past EOF is still
+        // malformed and must be dropped to protect host content.
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "range": {
+                        "start": { "line": 0, "character": 0 },
+                        "end":   { "line": 5, "character": 0 }
+                    },
+                    "newText": "wrong"
+                }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &RegionOffset::new(0, 0), 2).unwrap();
+
+        assert!(
+            edits.is_empty(),
+            "edits ending more than one line past EOF must still be dropped"
+        );
+    }
 }
