@@ -78,6 +78,73 @@ fn assert_ulid_shaped(value: &Value) {
     );
 }
 
+/// End-of-document exception: cursor exactly at `L` for a non-empty document
+/// must resolve to the smallest node whose `end_byte == L`. Without the exception
+/// the half-open rule would return null and break end-of-file motions.
+#[test]
+fn test_node_at_end_of_document_returns_node_info() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_eod.md";
+    // Three lines, no trailing newline so the document's last byte is the final 'h'.
+    // doc_len = "# A\nfoo\nbah".len() = 11. The cursor sits past the 'h'.
+    let text = "# A\nfoo\nbah";
+    open_markdown(&mut client, uri, text);
+
+    // Cursor at (line 2, character 3) is past the last char of "bah", i.e., byte L=11.
+    let result = request_node(&mut client, uri, 2, 3);
+
+    assert!(
+        !result.is_null(),
+        "end-of-document position (b == L, L > 0) must resolve to a node, got null"
+    );
+    let id = result.get("id").expect("result must have id field");
+    assert_ulid_shaped(id);
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type must be a string");
+    assert!(!ty.is_empty(), "type field should be a non-empty kind");
+}
+
+/// Empty-document case: ADR-0025 gates the end-of-document exception on `L > 0`,
+/// so any query on a zero-length document must return null.
+#[test]
+fn test_node_in_empty_document_returns_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_empty.md";
+    open_markdown(&mut client, uri, "");
+
+    let result = request_node(&mut client, uri, 0, 0);
+    assert!(
+        result.is_null(),
+        "empty document must return null (L == 0 gates off the exception), got {:?}",
+        result
+    );
+}
+
+/// Out-of-bounds position: cursor past the actual document length must return null.
+#[test]
+fn test_node_position_past_eof_returns_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_oob.md";
+    let text = "# A\n";
+    open_markdown(&mut client, uri, text);
+
+    // Line 99 is well past the actual content.
+    let result = request_node(&mut client, uri, 99, 0);
+    assert!(
+        result.is_null(),
+        "position past EOF must return null, got {:?}",
+        result
+    );
+}
+
 /// `kakehashi/node` on a markdown heading returns a NodeInfo with the heading
 /// node's tree-sitter type and a ULID-shaped id.
 #[test]
