@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentFormattingParams, TextEdit};
 
@@ -23,6 +25,7 @@ use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::request_id::CancelReceiver;
 
 use super::super::{Kakehashi, uri_to_url};
 
@@ -81,6 +84,20 @@ impl Kakehashi {
 
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
 
+        // The upstream cancel arrives as a single non-cloneable oneshot, but
+        // we need to observe cancel in N+1 places (outer collector + one per
+        // region's inner dispatch_preferred). Fan it out through a
+        // CancellationToken — cloneable, broadcastable, and zero-cost when no
+        // cancel arrives.
+        let cancel_token = CancellationToken::new();
+        if let Some(rx) = cancel_rx {
+            let token = cancel_token.clone();
+            tokio::spawn(async move {
+                let _ = rx.await;
+                token.cancel();
+            });
+        }
+
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
@@ -111,6 +128,11 @@ impl Kakehashi {
             };
             let pool = Arc::clone(&pool);
             let options = options.clone();
+            // Per-region cancel receiver derived from the shared token, so
+            // the inner preferred() can abort its per-server JoinSet as soon
+            // as $/cancelRequest arrives — not after the slowest formatter
+            // completes naturally.
+            let region_cancel_rx = cancel_rx_from_token(cancel_token.clone());
 
             outer_join_set.spawn(async move {
                 let result = dispatch_preferred(
@@ -140,7 +162,7 @@ impl Kakehashi {
                     // lower-priority server that might re-format the same code.
                     // `None` still means "no response" and triggers fallback.
                     |opt| opt.is_some(),
-                    None,
+                    Some(region_cancel_rx),
                 )
                 .await;
                 match result {
@@ -152,7 +174,7 @@ impl Kakehashi {
 
         let all_edits = crate::lsp::aggregation::region::collect_region_results_with_cancel(
             outer_join_set,
-            cancel_rx,
+            Some(cancel_rx_from_token(cancel_token)),
             |acc, opt: Option<Vec<TextEdit>>| {
                 if let Some(items) = opt {
                     acc.extend(items);
@@ -185,6 +207,24 @@ impl Kakehashi {
 /// disjoint, sorting by start position is a stable total order.
 fn sort_edits_by_start_position(edits: &mut [TextEdit]) {
     edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+}
+
+/// Derive a single-use [`CancelReceiver`] (oneshot) that fires when `token`
+/// is cancelled.
+///
+/// `dispatch_preferred` and `collect_region_results_with_cancel` accept
+/// `Option<CancelReceiver>` (a oneshot), but the upstream cancel arrives as
+/// a single non-cloneable channel and we need to observe it from multiple
+/// places concurrently (one outer collector + one per region). Spawning a
+/// tiny forwarder per consumer turns the cloneable token back into the
+/// non-cloneable oneshot shape the aggregation layer expects.
+fn cancel_rx_from_token(token: CancellationToken) -> CancelReceiver {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        token.cancelled().await;
+        let _ = tx.send(());
+    });
+    rx
 }
 
 #[cfg(test)]
@@ -247,5 +287,60 @@ mod tests {
         let mut edits: Vec<TextEdit> = Vec::new();
         sort_edits_by_start_position(&mut edits);
         assert!(edits.is_empty());
+    }
+
+    // ==========================================================================
+    // cancel_rx_from_token (review MAJOR follow-up: cancel propagation)
+    // ==========================================================================
+
+    #[tokio::test]
+    async fn cancel_rx_from_token_resolves_when_token_is_cancelled() {
+        let token = CancellationToken::new();
+        let rx = cancel_rx_from_token(token.clone());
+
+        token.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "derived oneshot must fire on token cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_rx_from_token_supports_multiple_derived_receivers() {
+        // The whole point of the token shim: one upstream cancel must reach
+        // every consumer (outer collector + N region tasks).
+        let token = CancellationToken::new();
+        let rx_a = cancel_rx_from_token(token.clone());
+        let rx_b = cancel_rx_from_token(token.clone());
+        let rx_c = cancel_rx_from_token(token.clone());
+
+        token.cancel();
+
+        for (name, rx) in [("rx_a", rx_a), ("rx_b", rx_b), ("rx_c", rx_c)] {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx).await;
+            assert!(
+                matches!(result, Ok(Ok(()))),
+                "{} must fire on shared token cancel",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_rx_from_token_stays_pending_until_cancel() {
+        // Negative case: without cancellation the receiver must NOT fire.
+        let token = CancellationToken::new();
+        let rx = cancel_rx_from_token(token.clone());
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx).await;
+        assert!(
+            result.is_err(),
+            "receiver must remain pending while token is alive"
+        );
+        // Token still owned by this scope — drop it explicitly so the spawned
+        // forwarder task exits cleanly (no leaked task on test teardown).
+        token.cancel();
     }
 }
