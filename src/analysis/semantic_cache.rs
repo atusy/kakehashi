@@ -8,8 +8,8 @@
 //! 2. **InjectionMap** - Tracks all injection regions per document URI.
 //!    Each `CacheableInjectionRegion` stores language, byte/line ranges, and a region_id (ULID).
 //!    Enables targeted invalidation: when an edit occurs, only regions overlapping
-//!    the edit need re-tokenization (see PBI-083).
-//!    Uses interval tree (rust_lapper) for O(log n) overlap queries (PBI-167).
+//!    the edit need re-tokenization.
+//!    Uses interval tree (rust_lapper) for O(log n) overlap queries.
 //!
 //! 3. **InjectionTokenCache** - Per-injection token caching by (URI, region_id).
 //!    Stores tokens for individual code blocks, allowing cache reuse when
@@ -106,7 +106,7 @@ impl Default for SemanticTokenCache {
 ///
 /// Tracks all `CacheableInjectionRegion`s for each document URI,
 /// enabling targeted cache invalidation when only specific injections change.
-/// Uses interval tree (rust_lapper) for O(log n) overlap queries (PBI-167).
+/// Uses interval tree (rust_lapper) for O(log n) overlap queries.
 pub struct InjectionMap {
     /// Stores interval trees per document URI
     /// Each Interval contains the byte range and the full CacheableInjectionRegion as data
@@ -173,8 +173,7 @@ impl InjectionMap {
 
     /// Find all injection regions that overlap with the given byte range.
     ///
-    /// This is the key optimization (PBI-167): uses O(log n) interval tree query
-    /// instead of O(n) iteration through all regions.
+    /// Uses O(log n) interval tree query instead of O(n) iteration through all regions.
     ///
     /// Returns `Some(Vec)` with overlapping regions (may be empty), or `None` if URI unknown.
     pub fn find_overlapping(
@@ -613,9 +612,8 @@ mod tests {
     fn test_injection_map_find_overlapping_efficiently() {
         use crate::language::injection::CacheableInjectionRegion;
 
-        // PBI-167: Test that overlap query is efficient (O(log n) instead of O(n))
-        // This test verifies the API exists and works correctly.
-        // Performance characteristics are validated by the interval tree implementation.
+        // Verifies the overlap query API. Performance (O(log n)) is guaranteed
+        // by the interval tree implementation.
 
         let map = InjectionMap::new();
         let uri = Url::parse("file:///test_large.md").unwrap();

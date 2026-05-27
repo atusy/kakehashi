@@ -21,7 +21,7 @@ use helpers::lua_bridge::{
 };
 use serde_json::json;
 
-/// E2E test: hover on Lua function shows signature (AC2)
+/// E2E: hover on a Lua function shows its signature.
 #[test]
 fn e2e_hover_on_lua_function_shows_signature() {
     if skip_if_lua_ls_unavailable() {
@@ -96,7 +96,7 @@ More text.
     shutdown_client(&mut client);
 }
 
-/// E2E test: hover on Lua local variable shows type (AC1)
+/// E2E: hover on a Lua local variable shows its type.
 #[test]
 fn e2e_hover_on_lua_local_variable_shows_type() {
     if skip_if_lua_ls_unavailable() {

@@ -38,7 +38,7 @@ fn verify_signature_help_has_signatures(result: &serde_json::Value) -> bool {
     }
 }
 
-/// E2E test: signature help on string.format shows parameters (AC1)
+/// E2E: signature help on string.format shows parameters.
 #[test]
 fn e2e_signature_help_on_string_format_shows_parameters() {
     if skip_if_lua_ls_unavailable() {
@@ -123,7 +123,7 @@ More text.
     shutdown_client(&mut client);
 }
 
-/// E2E test: signature help on print function shows parameter (AC2)
+/// E2E: signature help on print shows its parameter.
 #[test]
 fn e2e_signature_help_on_print_shows_parameter() {
     if skip_if_lua_ls_unavailable() {
@@ -197,7 +197,7 @@ More text.
     shutdown_client(&mut client);
 }
 
-/// E2E test: signature help on custom function shows parameters (AC3)
+/// E2E: signature help on a user-defined function shows its parameters.
 #[test]
 fn e2e_signature_help_on_custom_function_shows_parameters() {
     if skip_if_lua_ls_unavailable() {

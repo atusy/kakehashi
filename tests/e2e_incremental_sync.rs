@@ -1,8 +1,7 @@
 //! End-to-end test for incremental sync (TextDocumentSyncKind::Incremental).
 //!
-//! This test verifies that when didChange uses incremental sync (with range),
-//! the apply_edits path (Phase 4) correctly processes the edit and updates
-//! region tracking without over-invalidating ULIDs.
+//! Verifies that range-based didChange goes through the apply_edits path,
+//! updating region tracking without over-invalidating ULIDs.
 //!
 //! Run with: `cargo test --test e2e_incremental_sync --features e2e`
 //!
@@ -18,16 +17,10 @@ use helpers::lua_bridge::{
 };
 use serde_json::json;
 
-/// E2E test: incremental sync (range-based didChange) works correctly
+/// E2E: range-based didChange preserves region tracking and ULIDs (apply_edits path).
 ///
-/// This test verifies Phase 4's apply_edits path:
-/// 1. Open a markdown document with a Lua block
-/// 2. Trigger hover to establish virtual document
-/// 3. Send incremental didChange (with range, not full text)
-/// 4. Verify hover still works (no error — region tracking correct, ULID preserved)
-///
-/// The key difference from e2e_didchange_forwarding is using incremental sync
-/// with `range` instead of full document replacement.
+/// Differs from `e2e_didchange_forwarding` by using incremental sync with `range`
+/// rather than full document replacement.
 #[test]
 fn e2e_incremental_sync_preserves_region_tracking() {
     if skip_if_lua_ls_unavailable() {

@@ -1021,9 +1021,8 @@ mod tests {
             None, // tree will be None until next parse
         );
 
-        // The cache should STILL contain the previous tokens
-        // (This is the key assertion - previously this would fail because
-        // didChange invalidated the cache)
+        // The cache must retain previous tokens after didChange — the delta
+        // calculation on the next semanticTokens request depends on them.
         let still_cached = server.cache.get_tokens_if_valid(&uri, &result_id);
         assert!(
             still_cached.is_some(),

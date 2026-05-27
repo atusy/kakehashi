@@ -269,11 +269,8 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    /// PBI-155 Subtask 1: Verify load_settings() uses 4-layer merge
-    ///
-    /// This test verifies that load_settings():
-    /// 1. Loads user config from XDG_CONFIG_HOME
-    /// 2. Merges 4 layers via reduce(merge_workspace_settings): defaults < user < project < InitializationOptions
+    /// load_settings() merges 4 layers via reduce(merge_workspace_settings):
+    /// defaults < user (XDG_CONFIG_HOME) < project < InitializationOptions.
     #[test]
     #[serial(xdg_env)]
     fn test_load_settings_merges_user_config_with_project_and_override() {
@@ -355,7 +352,7 @@ mod tests {
         );
     }
 
-    /// PBI-155: Verify override_settings (InitializationOptions) has highest precedence
+    /// override_settings (InitializationOptions) has highest precedence.
     #[test]
     #[serial(xdg_env)]
     fn test_load_settings_override_has_highest_precedence() {
@@ -434,7 +431,7 @@ mod tests {
         );
     }
 
-    /// PBI-155: Verify user config loading logs appropriate events
+    /// User config loading logs appropriate events.
     #[test]
     #[serial(xdg_env)]
     fn test_load_settings_logs_user_config_events() {

@@ -179,8 +179,6 @@ mod tests {
         assert!(LEGEND_MODIFIERS.iter().any(|m| m.as_str() == "readonly"));
     }
 
-    // PBI-152: Wildcard Config Inheritance for captureMappings
-
     #[test]
     fn resolve_capture_uses_wildcard_merge() {
         // ADR-0011: When both wildcard and specific key exist, merge them

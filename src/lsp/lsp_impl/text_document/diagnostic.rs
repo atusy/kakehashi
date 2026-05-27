@@ -1,7 +1,7 @@
 //! Pull diagnostics for Kakehashi (textDocument/diagnostic).
 //!
-//! Implements ADR-0020 Phase 1: Pull-first diagnostic forwarding.
-//! Sprint 17: Multi-region diagnostic aggregation with parallel fan-out.
+//! Implements ADR-0020 Phase 1: Pull-first diagnostic forwarding with
+//! multi-region aggregation via parallel fan-out.
 //!
 //! For synthetic push diagnostics (publishDiagnostics), see `publish_diagnostic.rs`.
 //!

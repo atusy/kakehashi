@@ -944,10 +944,10 @@ pub struct ResolvedInjection {
 pub struct InjectionResolver;
 
 impl InjectionResolver {
-    /// Resolve injection region at the given byte offset
+    /// Resolve injection region at the given byte offset.
     ///
-    /// This function centralizes the injection resolution logic that was previously
-    /// duplicated across 9 LSP handlers (hover, completion, definition, etc.).
+    /// Shared by LSP handlers (hover, completion, definition, etc.) that resolve
+    /// injection language at a cursor position.
     ///
     /// # Lock Safety
     /// This function does not hold Document locks. All inputs (tree, text) must be

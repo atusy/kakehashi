@@ -1228,9 +1228,8 @@ mod tests {
 
     #[test]
     fn test_end_clamping_prevents_range_collapse() {
-        // With end clamping, range collapse is prevented for Node A/B cases.
-        // Previously large deletes could cause end <= start, but now end is
-        // clamped to edit.new_end_byte, keeping a valid range.
+        // End is clamped to edit.new_end_byte so large deletes cannot make
+        // end <= start, keeping the range valid for Node A/B cases.
         let tracker = RegionIdTracker::new();
         let uri = test_uri("collapse");
 
@@ -2690,25 +2689,13 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // Phase 5: Regression Guard Test (Phase A - RED)
-    // This test captures the core behavioral difference of Phase 5.
-    // It should FAIL under Phase 4 (merged behavior) and PASS after Phase 5.
-    // =========================================================================
-
     #[test]
-    fn test_phase5_regression_middle_node_not_invalidated() {
-        // This test FAILS under Phase 4 (merged) behavior
-        // and PASSES under Phase 5 (individual) behavior.
-        //
+    fn test_individual_edits_keep_untouched_middle_node() {
         // Setup: "AAABBBCCC" with nodes at [0,3), [3,6), [6,9)
         // Edit:  "XBBBYY" - changes "AAA" to "X" and "CCC" to "YY"
         //
-        // Phase 4 (merged): Single EditInfo [0, 9) → [0, 6)
-        //   Node BBB START (3) is in [0, 9) → INVALIDATED (wrong!)
-        //
-        // Phase 5 (individual): Two EditInfos [0,3) and [6,9)
-        //   Node BBB START (3) is NOT in [0,3) and NOT in [6,9) → KEPT (correct!)
+        // With merged EditInfo [0,9), BBB's START (3) would fall inside and be
+        // invalidated. With individual EditInfos [0,3) and [6,9), BBB stays untouched.
         let tracker = RegionIdTracker::new();
         let uri = test_uri("regression");
 

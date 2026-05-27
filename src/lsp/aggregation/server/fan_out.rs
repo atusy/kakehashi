@@ -91,12 +91,9 @@ pub(crate) fn select_servers(
 
 /// Spawn one task per matching server, returning a `JoinSet` for collection.
 ///
-/// Centralises the per-server clone boilerplate that was previously duplicated
-/// in every fan-out handler. The caller supplies a closure that receives a
-/// [`FanOutTask`] and returns the handler-specific future.
-///
-/// Each task result is wrapped in [`TaggedResult`] so fan-in strategies
-/// can identify which server produced each result.
+/// The caller supplies a closure that receives a [`FanOutTask`] and returns
+/// the handler-specific future. Each task result is wrapped in [`TaggedResult`]
+/// so fan-in strategies can identify which server produced it.
 #[must_use = "the JoinSet must be passed to a collection strategy"]
 pub(crate) fn fan_out<T, F, Fut>(
     ctx: &DocumentRequestContext,

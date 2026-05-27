@@ -70,8 +70,7 @@ mod tests {
     /// - If the effective row is > 0, we've moved to a later row (e.g., after skipping
     ///   a fence line), so the column is absolute within the content.
     ///
-    /// Note: This function was used for Point-based calculation before Sprint 9.
-    /// It's now kept for test coverage but production code uses byte-based offsets.
+    /// Kept for test coverage; production code uses byte-based offsets instead.
     fn calculate_nested_start_position(
         parent_start: tree_sitter::Point,
         content_start: tree_sitter::Point,

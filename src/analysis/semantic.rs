@@ -187,10 +187,8 @@ mod tests {
         assert_eq!(all_tokens.data.len(), 4);
     }
 
-    /// Alias for acceptance criteria naming
     #[test]
     fn test_diff_tokens_no_change() {
-        // Same as test_semantic_tokens_delta_no_changes
         let tokens = SemanticTokens {
             result_id: Some("v1".to_string()),
             data: vec![SemanticToken {
@@ -321,10 +319,8 @@ mod tests {
         );
     }
 
-    /// Test that line insertion disables suffix optimization (PBI-077 safety).
-    ///
     /// When lines are inserted, tokens at the end have the same delta encoding
-    /// but are at different absolute positions. We must NOT match them as suffix.
+    /// but are at different absolute positions, so they must not match as suffix.
     #[test]
     fn test_diff_tokens_line_insertion_no_suffix() {
         // Before: 3 tokens on lines 0, 1, 2

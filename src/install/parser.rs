@@ -585,7 +585,7 @@ mod tests {
         );
     }
 
-    /// PBI-015: Test that clone_repo works with tag revisions (e.g., v0.25.0)
+    /// clone_repo works with tag revisions (e.g., v0.25.0).
     #[test]
     fn test_clone_repo_with_tag_revision() {
         let temp = tempdir().expect("Failed to create temp dir");

@@ -97,10 +97,10 @@ impl CacheCoordinator {
     /// Invalidate injection caches for regions that overlap with edits.
     ///
     /// Called BEFORE parse_document to use pre-edit byte offsets against pre-edit
-    /// injection regions. This implements AC4/AC5 (PBI-083): edits outside injections
-    /// preserve caches, edits inside invalidate only affected regions.
+    /// injection regions: edits outside injections preserve caches, edits inside
+    /// invalidate only affected regions.
     ///
-    /// PBI-167: Uses O(log n) interval tree query instead of O(n) iteration.
+    /// Uses an O(log n) interval tree query.
     pub(crate) fn invalidate_for_edits(&self, uri: &Url, edits: &[InputEdit]) {
         if edits.is_empty() {
             return;
@@ -167,8 +167,8 @@ impl CacheCoordinator {
 
     /// Populate InjectionMap with injection regions from the parsed tree.
     ///
-    /// This enables targeted cache invalidation (PBI-083): when an edit occurs,
-    /// we can check which injection regions overlap and only invalidate those.
+    /// Enables targeted cache invalidation: when an edit occurs, we can check
+    /// which injection regions overlap and only invalidate those.
     ///
     /// Region IDs are generated using `RegionIdTracker` which provides position-based
     /// ULIDs. The same (uri, start_byte, end_byte, kind) always produces the same ULID,
