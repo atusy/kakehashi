@@ -170,6 +170,48 @@ fn test_node_text_survives_edit_that_does_not_touch_start() {
     );
 }
 
+/// Invalidation: an edit whose range covers the node's START byte must drop the
+/// ULID per ADR-0019's START-priority rule. ADR-0025 collapses
+/// invalidated / never-issued / mismatched-URI cases into a single null
+/// response, so `kakehashi/node/text` must return null after the edit.
+#[test]
+fn test_node_text_returns_null_after_invalidating_edit() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_invalidate.md";
+    let original = "# Hello\n\nparagraph one.\n";
+    open_markdown(&mut client, uri, original);
+
+    // Acquire an id for the heading via cursor on "Hello".
+    let node = request_node(&mut client, uri, 0, 4);
+    assert!(!node.is_null(), "expected NodeInfo for heading");
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id must be a string")
+        .to_string();
+
+    // Sanity: id resolves before the edit.
+    let before = request_node_text(&mut client, uri, &id);
+    assert!(
+        !before.is_null(),
+        "id must resolve before the invalidating edit"
+    );
+
+    // Replace the entire document — every node's START is inside the edit range
+    // [0, original.len()), so all tracked ULIDs must be invalidated.
+    let replacement = "# Changed\n\ntotally different content.\n";
+    full_text_change(&mut client, uri, 2, replacement);
+
+    let after = request_node_text(&mut client, uri, &id);
+    assert!(
+        after.is_null(),
+        "id whose START is covered by the edit must resolve to null, got {:?}",
+        after
+    );
+}
+
 /// Round-trip: acquire an id via `kakehashi/node`, then ask
 /// `kakehashi/node/text` for it and verify the returned slice matches the
 /// expected substring of the document.
