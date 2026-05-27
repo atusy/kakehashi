@@ -93,11 +93,11 @@ Semantics, given an injection stack `[host, layer₁, layer₂, ..., deepest]` a
 | Value | Resolved layer | When stack is shallower |
 |---|---|---|
 | `false` (default) or `0` | host (layer 0) | (always succeeds — host always exists) |
-| `true` or `-1` | deepest layer (saturating) | (always succeeds — saturates to deepest) |
-| Positive `n` (`n ≥ 1`) | exactly layer `n` | `null` |
-| Negative `n` (`n ≤ -2`) | `n`-th layer from deepest (`stack[stack.len + n]`) | `null` |
+| `true` | deepest layer (saturating) | (always succeeds — saturates to deepest) |
+| Positive `n` (`n ≥ 1`) | exactly layer `n` (`stack[n]`) | `null` |
+| Negative `n` (`n ≤ -1`) | `n`-th layer from deepest (`stack[stack.len + n]`) | `null` |
 
-**Asymmetry note**: `true` saturates, but explicit integer indices are strict. This is deliberate — `true` expresses intent ("go as deep as you can"), while integers express a precise structural request that should fail predictably if the structure is absent.
+**`true` as saturation shorthand**: All integer indices resolve through a single formula — `stack[n]` for positive `n`, `stack[stack.len + n]` for negative `n` — returning `null` when the index is out of bounds. `true` is a convenience that explicitly saturates to the deepest layer, expressing intent ("go as deep as you can") without requiring the client to know the stack depth. The value `-1` happens to behave like `true` here because every in-bounds cursor has an injection stack containing at least the host (`stack.len ≥ 1`), so `stack[stack.len - 1]` is always valid — but conceptually they take different routes to the same result.
 
 **Example** (Markdown containing a Python code block containing a regex literal):
 
@@ -226,7 +226,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 - **N+1 for positions**: Clients building outline views must call `kakehashi/node/range` (future) once per node, or accept paying for it only when needed
 - **No invalidate diagnostics**: Clients cannot tell why an ID failed; they must re-acquire blindly
 - **Cross-injection navigation is two-step**: `parent` does not transparently cross into a host tree
-- **`injection` asymmetry**: `true` saturates while integer indices are strict — requires careful documentation
+- **`injection` mixed mode**: `true` saturates while integer indices are strict (resolve via a single formula, return `null` when out of bounds) — clients must remember which mode they want
 - **Unbounded tracker growth per URI**: Long editing sessions on large files accumulate IDs until `didClose` (no LRU per [ADR-0019](0019-lazy-node-identity-tracking.md))
 
 ### Neutral
