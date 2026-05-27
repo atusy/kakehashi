@@ -883,3 +883,50 @@ fn test_node_injection_true_returns_python_node_inside_python_block() {
         ty
     );
 }
+
+/// `injection: 1` selects exactly layer 1 (the first injection at the
+/// position). For a markdown→python stack the result must be a python node.
+/// Mirrors `true` here because the stack has only two layers, but the
+/// resolution goes through the strict-index path rather than the
+/// saturating one — verifying ADR-0025's formula for positive `n`.
+#[test]
+fn test_node_injection_positive_one_returns_python_node_inside_python_block() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_pos1.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(1));
+    assert!(
+        !result.is_null(),
+        "injection=1 with a 2-layer stack must resolve to the python layer, got null"
+    );
+    let ty = result
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string");
+    assert!(
+        is_python_kind(ty),
+        "injection=1 must select the python layer, got type={:?}",
+        ty
+    );
+}
+
+/// `injection: 2` indexes one past the deepest layer in a 2-layer stack;
+/// ADR-0025 says strict integer indices return `null` when out of bounds.
+#[test]
+fn test_node_injection_positive_two_returns_null_when_stack_too_shallow() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injection_pos2.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    let result = request_node_with_injection(&mut client, uri, 3, 4, json!(2));
+    assert!(
+        result.is_null(),
+        "injection=2 on a 2-layer stack must return null (out of bounds), got {:?}",
+        result
+    );
+}
