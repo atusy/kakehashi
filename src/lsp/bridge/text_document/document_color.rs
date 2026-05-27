@@ -1,15 +1,11 @@
-//! Document color request handling for bridge connections.
+//! Document color request handling for bridge connections, translating
+//! coordinates between host and virtual documents.
 //!
-//! This module provides document color request functionality for downstream language servers,
-//! handling the coordinate transformation between host and virtual documents.
+//! Unlike position-based requests (hover, definition, etc.), document color
+//! operates on the whole document and takes no position parameter.
 //!
-//! Unlike position-based requests (hover, definition, etc.), document color requests
-//! operate on the entire document - they don't take a position parameter.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue requests via the channel-based
-//! writer task, ensuring FIFO ordering with other messages.
+//! Requests go through `send_request()` so the single-writer task (ADR-0015)
+//! preserves FIFO ordering with other messages.
 
 use std::io;
 
@@ -79,13 +75,8 @@ fn build_document_color_request(
 
 /// Transform a document color response from virtual to host document coordinates.
 ///
-/// DocumentColor responses are arrays of ColorInformation items, each containing:
-/// - range: The range where the color was found (needs transformation)
-/// - color: The color value with RGBA components (preserved unchanged)
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `offset` - The region offset for coordinate translation
+/// Only each `ColorInformation.range` is translated by `offset`; the RGBA color
+/// value is preserved unchanged.
 fn transform_document_color_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

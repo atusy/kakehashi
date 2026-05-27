@@ -82,13 +82,7 @@ impl LanguageServerPool {
 
 /// Build a JSON-RPC rename request for a downstream language server.
 ///
-/// Rename extends the position-based request pattern with an additional
-/// `newName` parameter that specifies the new name for the symbol.
-///
-/// # Coordinate Translation
-///
-/// Uses `build_text_document_position_params` to handle host→virtual position
-/// translation, then wraps the result in `RenameParams` with the new name.
+/// Extends the position-based request pattern with the `newName` parameter.
 fn build_rename_request(
     virtual_uri: &VirtualDocumentUri,
     host_position: tower_lsp_server::ls_types::Position,
@@ -110,20 +104,10 @@ fn build_rename_request(
 
 /// Transform a WorkspaceEdit response from virtual to host document coordinates.
 ///
-/// WorkspaceEdit can have two formats per LSP spec:
-/// 1. `changes: { [uri: string]: TextEdit[] }` - A map from URI to text edits
-/// 2. `documentChanges: (TextDocumentEdit | CreateFile | RenameFile | DeleteFile)[]`
-///
-/// This function handles three cases for each URI in the response:
-/// 1. **Real file URI** (not a virtual URI): Preserved as-is with original coordinates
-/// 2. **Same virtual URI as request**: Transformed using request's context
-/// 3. **Different virtual URI** (cross-region): Filtered out from results
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `request_virtual_uri` - The virtual URI from the request
-/// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `offset` - The region offset for coordinate translation
+/// Per LSP spec a WorkspaceEdit may carry edits via `changes` (URI→TextEdit map) or
+/// `documentChanges`; both are handled. For each URI: real files pass through, the
+/// request's own virtual URI is translated, and other (cross-region) virtual URIs are
+/// filtered out.
 fn transform_workspace_edit_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,

@@ -5,17 +5,11 @@
 
 /// JSON-RPC request ID for LSP communication.
 ///
-/// Wraps `i64` to provide type safety and prevent confusion with other integer
-/// types (e.g., version numbers, line numbers). This newtype enables:
-/// - Clear semantics in function signatures
-/// - Safe HashMap key usage for `pending_requests` tracking (ADR-0015)
-/// - Centralized JSON extraction via `from_json()`
+/// Wraps `i64` to prevent confusion with other integer types (version numbers,
+/// line numbers) and to serve as a `pending_requests` HashMap key (ADR-0015).
 ///
-/// # Wire Format
-///
-/// LSP allows request IDs to be either numbers or strings. This implementation
-/// currently only supports numeric IDs (i64), which is sufficient for the bridge
-/// since we control the request ID generation.
+/// LSP allows numeric or string IDs; only numeric IDs are supported since the
+/// bridge controls request ID generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RequestId(i64);
 
@@ -27,8 +21,6 @@ impl RequestId {
     }
 
     /// Get the underlying i64 value.
-    ///
-    /// Used when serializing to JSON for wire transmission.
     #[inline]
     pub(crate) fn as_i64(self) -> i64 {
         self.0

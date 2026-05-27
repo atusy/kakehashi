@@ -113,20 +113,9 @@ pub(super) enum ConnectionAction {
 
 /// Decide what action to take based on existing connection state and panic history.
 ///
-/// This is a pure function that can be unit tested without spawning processes.
-///
-/// # State-based decisions per ADR-0015 Operation Gating:
-/// - `None`: No connection exists → SpawnNew (unless too many panics)
-/// - `Initializing`: Init in progress → FailFast (reject concurrent requests)
-/// - `Ready`: Connection available → ReturnExisting
-/// - `Failed`: Previous attempt failed → SpawnNew (unless too many panics)
-/// - `Closing`: Shutdown in progress → FailFast (reject new requests)
-/// - `Closed`: Connection terminated → SpawnNew (unless too many panics)
-///
-/// # Panic Protection
-///
-/// If `consecutive_panic_count >= MAX_CONSECUTIVE_PANICS`, returns FailFast
-/// to prevent infinite retry loops when a handshake consistently panics.
+/// State gating follows ADR-0015: `Initializing`/`Closing` reject concurrent/new
+/// requests via `FailFast`. The `consecutive_panic_count >= MAX_CONSECUTIVE_PANICS`
+/// check runs first to break infinite retry loops when a handshake consistently panics.
 pub(super) fn decide_connection_action(
     state: Option<ConnectionState>,
     consecutive_panic_count: u32,

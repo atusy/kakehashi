@@ -1,14 +1,5 @@
-//! Bridge coordinator for consolidating bridge pool and region ID tracking.
-//!
-//! This module provides the `BridgeCoordinator` which unifies the language server
-//! pool and region ID tracker into a single coherent API.
-//!
-//! # Responsibilities
-//!
-//! - Manages downstream language server connections via `LanguageServerPool`
-//! - Tracks stable ULID-based region IDs via `NodeTracker`
-//! - Provides bridge config lookup with wildcard resolution
-//! - Provides cancel notification support via `CancelForwarder`
+//! Bridge coordinator unifying the language server pool and region ID tracker
+//! into a single coherent API.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,15 +33,9 @@ pub(crate) struct BridgeInjection {
 
 /// Resolved server configuration with server name.
 ///
-/// Wraps `BridgeServerConfig` with the server name from the config key.
-/// This enables server-name-based pooling where multiple languages can
-/// share the same language server process (e.g., ts and tsx using tsgo).
-///
-/// # Design Rationale
-///
-/// Created during the language-to-server-name pooling migration to carry
-/// both the server name (for connection lookup) and the config (for server
-/// spawning) through the system.
+/// Carries both the server name (for connection lookup) and the config (for
+/// spawning) so multiple languages can share one server process (e.g., ts and
+/// tsx using tsgo).
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedServerConfig {
     /// The server name from the languageServers config key (e.g., "tsgo", "rust-analyzer")
@@ -74,35 +59,12 @@ struct EagerOpenBatch {
     handles: Vec<tokio::task::AbortHandle>,
 }
 
-/// Coordinator for bridge connections and region ID tracking.
+/// Bundles `LanguageServerPool` and `NodeTracker` so LSP handlers see one field.
+/// The pool is `Arc`'d so the cancel-forwarding middleware can share it.
 ///
-/// Consolidates the `LanguageServerPool` and `NodeTracker` into a single
-/// struct, reducing Kakehashi's field count from 9 to 8.
-///
-/// # Design Notes
-///
-/// The coordinator exposes internals via accessor methods (`pool()`, `node_tracker()`)
-/// for handlers that need direct access.
-///
-/// The pool is wrapped in `Arc` to enable sharing with the cancel forwarding middleware.
-///
-/// # API Design Pattern
-///
-/// Two access patterns coexist:
-///
-/// 1. **Direct pool access** (preferred for NEW code): Use `self.bridge.pool().*` to call
-///    pool methods directly. This is the primary pattern for LSP request handlers.
-///    - Pros: No coordinator changes needed, smaller API surface
-///    - Use for: send_*_request(), forward_cancel(), new pool operations
-///
-/// 2. **Delegating methods** (for common lifecycle operations): Methods like
-///    `close_host_document()`, `shutdown_all()`, etc. delegate to pool methods.
-///    - Pros: Semantic naming, hides pool implementation details
-///    - Use for: Document lifecycle (open/close), shutdown, region ID management
-///
-/// **Decision Guide**: Use direct pool access by default. Only add a delegating method
-/// if the operation is (a) used in 3+ places, (b) involves coordinator-level logic
-/// (e.g., combining pool + node_tracker), or (c) needs semantic naming for clarity.
+/// Prefer `self.bridge.pool().*` directly in new code; only add a delegating method
+/// here when the operation has 3+ callers, combines pool with node_tracker, or
+/// genuinely benefits from a semantic name (e.g., document lifecycle, shutdown).
 pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
     node_tracker: NodeTracker,
@@ -218,24 +180,12 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
-    /// Get bridge server config for a given injection language from settings.
-    ///
-    /// Looks up the bridge.servers configuration and finds a server that handles
-    /// the specified language. Returns `ResolvedServerConfig` which includes both
-    /// the server name (for connection pooling) and the config (for spawning).
-    ///
-    /// Returns None if:
-    /// - No server is configured for this injection language, OR
-    /// - The host language has a bridge filter that excludes this injection language
-    ///
-    /// Uses wildcard resolution (ADR-0011) for host language lookup:
-    /// - If host language is not defined, inherits from languages._ if present
-    /// - This allows setting default bridge filters for all hosts via languages._
-    ///
-    /// # Arguments
-    /// * `settings` - The current workspace settings
-    /// * `host_language` - The language of the host document (e.g., "markdown")
-    /// * `injection_language` - The injection language to bridge (e.g., "rust", "python")
+    /// Resolve `bridge.servers` for `injection_language`, returning the
+    /// `ResolvedServerConfig` (server name for pooling + spawn config) or
+    /// `None` when no server matches, or the host's bridge filter excludes
+    /// this injection. Host lookup uses wildcard resolution (ADR-0011):
+    /// undefined hosts inherit `languages._`, letting one default filter apply
+    /// to every host.
     pub(crate) fn get_config_for_language(
         &self,
         settings: &WorkspaceSettings,
@@ -418,20 +368,8 @@ impl BridgeCoordinator {
 
     /// Eagerly spawn language servers and open virtual documents for detected injections.
     ///
-    /// This method:
-    /// 1. Groups injections by server name using `get_config_for_language`
-    /// 2. Spawns one background task per server group
-    /// 3. Each task waits for server ready, then sends `didOpen` for all injections
-    ///
-    /// This replaces the old `eager_spawn_servers` which only did handshakes.
-    /// By also sending `didOpen`, downstream servers can start analyzing immediately,
-    /// resulting in faster diagnostic responses.
-    ///
-    /// # Arguments
-    /// * `settings` - Current workspace settings
-    /// * `host_language` - Language of the host document (e.g., "markdown")
-    /// * `host_uri` - URI of the host document
-    /// * `injections` - All injection regions detected in the host document
+    /// Sending `didOpen` up front (not just a handshake) lets downstream servers
+    /// start analyzing immediately, yielding faster diagnostics.
     pub(crate) fn eager_spawn_and_open_documents(
         &self,
         settings: &WorkspaceSettings,
@@ -513,20 +451,13 @@ impl BridgeCoordinator {
     // Eager-open task cancellation
     // ========================================
 
-    /// Supersede previous eager-open tasks for a URI.
+    /// Supersede previous eager-open tasks for a URI, returning the new batch's
+    /// generation counter (passed to `push_or_abort_eager_open_handle` to detect
+    /// stale pushes).
     ///
-    /// Uses `DashMap::entry()` for atomic URI-scoped access: abort previous
-    /// handles and reset to empty placeholder in a single shard lock, or
-    /// insert a new empty entry if none exists.
-    ///
-    /// Returns the generation counter for this batch. Callers pass this to
-    /// `push_or_abort_eager_open_handle` to detect stale pushes.
-    ///
-    /// Must be called BEFORE spawning new tasks to close the race window
+    /// Uses `DashMap::entry()` so the abort-and-reset happens under a single shard
+    /// lock. Must be called BEFORE spawning new tasks to close the race window
     /// between spawn and handle registration.
-    ///
-    /// # Arguments
-    /// * `uri` - The host document URI
     fn supersede_eager_open_tasks(&self, uri: &Url) -> u64 {
         let generation = self
             .eager_open_generation
@@ -567,15 +498,9 @@ impl BridgeCoordinator {
 
     /// Push an abort handle into an existing entry, or abort it if stale/removed.
     ///
-    /// Called immediately after each `tokio::spawn` to register the handle.
-    /// The handle is aborted (not registered) if:
-    /// - The entry was removed by a concurrent `cancel_eager_open`
-    /// - The entry's generation doesn't match (concurrent `supersede` replaced it)
-    ///
-    /// # Arguments
-    /// * `uri` - The host document URI
-    /// * `handle` - The AbortHandle to register
-    /// * `expected_generation` - The generation from the supersede that spawned this task
+    /// Called immediately after each `tokio::spawn`. The handle is aborted (not
+    /// registered) if the entry was removed by a concurrent `cancel_eager_open`,
+    /// or its generation doesn't match (a concurrent `supersede` replaced it).
     fn push_or_abort_eager_open_handle(
         &self,
         uri: &Url,
@@ -614,9 +539,6 @@ impl BridgeCoordinator {
     ///
     /// Called on didClose to prevent orphaned virtual documents when tasks
     /// are still waiting for server readiness.
-    ///
-    /// # Arguments
-    /// * `uri` - The host document URI
     pub(crate) fn cancel_eager_open(&self, uri: &Url) {
         if let Some((_, batch)) = self.eager_open_tasks.remove(uri) {
             log::debug!(

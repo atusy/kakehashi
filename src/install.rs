@@ -222,13 +222,8 @@ impl InstallResult {
 
 /// Install a language asynchronously (both parser and queries).
 ///
-/// This wraps the blocking install functions in `spawn_blocking` for use
-/// in async contexts like the LSP server.
-///
-/// # Arguments
-/// * `language` - The language to install (e.g., "lua", "rust")
-/// * `data_dir` - The base data directory for kakehashi
-/// * `force` - Whether to overwrite existing files
+/// Wraps the blocking install functions in `spawn_blocking` so it is safe to
+/// call from async contexts like the LSP server.
 pub(crate) async fn install_language_async(
     language: String,
     data_dir: PathBuf,

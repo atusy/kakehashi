@@ -1,20 +1,10 @@
-//! Synthetic push diagnostics for ADR-0020 Phase 2.
+//! Background diagnostic collection on `didSave`/`didOpen` (ADR-0020 Phase 2):
+//! pull internally, push via `textDocument/publishDiagnostics`.
 //!
-//! This module provides background diagnostic collection triggered by
-//! `didSave` and `didOpen` events. It uses the pull-first approach internally
-//! but publishes results via `textDocument/publishDiagnostics` notification.
-//!
-//! # Superseding Pattern
-//!
-//! When multiple save events occur in rapid succession, only the latest
-//! diagnostic collection should complete and publish results. Earlier
-//! in-progress tasks are aborted via `AbortHandle` to prevent stale
-//! diagnostics from being published.
-//!
-//! # Thread Safety
-//!
-//! `SyntheticDiagnosticsManager` uses `DashMap` for concurrent access from
-//! multiple tokio tasks without explicit locking.
+//! Rapid-fire events supersede each other — `SyntheticDiagnosticsManager`
+//! aborts the prior in-flight task via `AbortHandle` so only the latest
+//! collection publishes, and uses `DashMap` for concurrent access via sharded
+//! locks (no single global lock).
 
 use dashmap::DashMap;
 use tokio::task::AbortHandle;
@@ -40,16 +30,10 @@ impl SyntheticDiagnosticsManager {
         }
     }
 
-    /// Register a new diagnostic task for a document, superseding any existing task.
+    /// Register a new diagnostic task for a document, superseding (and aborting)
+    /// any existing task and returning its `AbortHandle`.
     ///
-    /// Also performs opportunistic cleanup of finished tasks to prevent memory buildup.
-    ///
-    /// # Arguments
-    /// * `uri` - The document URI
-    /// * `abort_handle` - The AbortHandle for the newly spawned task
-    ///
-    /// # Returns
-    /// The AbortHandle of the superseded task, if any (for logging/debugging).
+    /// Also opportunistically cleans up finished tasks to prevent memory buildup.
     pub(crate) fn register_task(&self, uri: Url, abort_handle: AbortHandle) -> Option<AbortHandle> {
         // Opportunistic cleanup: remove entries for tasks that have completed.
         // This prevents memory buildup from documents that were saved but not re-saved.

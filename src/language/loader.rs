@@ -44,14 +44,10 @@ impl ParserLoader {
         Self::default()
     }
 
-    /// Load a Tree-sitter language from a dynamic library
+    /// Load a Tree-sitter language from a dynamic library.
     ///
-    /// # Arguments
-    /// * `path` - Path to the dynamic library file
-    /// * `lang_name` - Name of the language (e.g., "rust", "javascript")
-    ///
-    /// # Returns
-    /// The loaded Language or an error
+    /// The exported symbol is derived as `tree_sitter_{lang_name}`, so `lang_name`
+    /// must match the grammar's symbol, not necessarily the registry key.
     pub(crate) fn load_language(
         &mut self,
         path: &Path,

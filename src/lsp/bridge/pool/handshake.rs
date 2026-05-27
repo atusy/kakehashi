@@ -23,26 +23,10 @@ use crate::lsp::bridge::protocol::{
     validate_initialize_response,
 };
 
-/// Perform the LSP initialize/initialized handshake.
-///
-/// Sends the initialize request, waits for the response, and sends the
-/// initialized notification. This function is called by `get_or_create_connection_with_timeout`
-/// after the connection is spawned and the reader task is running.
-///
-/// Uses the channel-based single-writer loop (ADR-0015) to ensure FIFO ordering.
-///
-/// # Arguments
-/// * `handle` - The connection handle (in Initializing state)
-/// * `init_request_id` - Pre-registered request ID (always 1)
-/// * `init_response_rx` - Pre-registered receiver for initialize response
-/// * `init_options` - Server-specific initialization options
-/// * `root_uri` - The workspace root URI (forwarded from upstream client)
-/// * `workspace_folders` - The workspace folders (forwarded from upstream client)
-/// * `client_capabilities` - Upstream client capabilities (merged into bridge defaults)
-///
-/// # Returns
-/// * `Ok(capabilities)` - Handshake completed, returns typed `ServerCapabilities`
-/// * `Err(e)` - Handshake failed (server error, I/O error)
+/// Send `initialize`, await the response, send `initialized`, return the typed
+/// `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
+/// once the connection has spawned and the reader task is up; goes through
+/// the single-writer channel (ADR-0015) for FIFO ordering.
 pub(super) async fn perform_lsp_handshake(
     handle: &ConnectionHandle,
     init_request_id: RequestId,

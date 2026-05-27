@@ -39,12 +39,9 @@ impl DiagnosticScheduler {
 
     /// Schedule a debounced diagnostic for a document (ADR-0020 Phase 3).
     ///
-    /// This schedules a diagnostic collection to run after a debounce delay.
-    /// If another change arrives before the delay expires, the previous timer
-    /// is cancelled and a new one is started.
-    ///
-    /// The diagnostic snapshot is captured immediately (at schedule time) to
-    /// ensure consistency with the document state that triggered the change.
+    /// A later change cancels and replaces the pending timer. The snapshot is
+    /// captured now, at schedule time, so diagnostics stay consistent with the
+    /// document state that triggered the change.
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url, lsp_uri: Uri) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
@@ -60,12 +57,10 @@ impl DiagnosticScheduler {
 
     /// Spawn a background task to collect and publish diagnostics.
     ///
-    /// ADR-0020 Phase 2: Synthetic push on didSave/didOpen.
-    ///
-    /// The task:
-    /// 1. Registers itself with `SyntheticDiagnosticsManager` (superseding any previous task)
-    /// 2. Collects diagnostics via fan-out to downstream servers
-    /// 3. Publishes diagnostics via `textDocument/publishDiagnostics`
+    /// ADR-0020 Phase 2: synthetic push on didSave/didOpen. The task registers
+    /// with `SyntheticDiagnosticsManager` (superseding any previous task), then
+    /// fans out to downstream servers and publishes via
+    /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url, lsp_uri: Uri) {
         let client = self.client.clone();
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
@@ -96,19 +91,12 @@ impl DiagnosticScheduler {
 
     /// Prepare per-region diagnostic contexts for a background task.
     ///
-    /// This extracts all necessary data synchronously before spawning,
-    /// avoiding lifetime issues with `self` references in async tasks.
-    /// Each region gets its own `DocumentRequestContext` with aggregation
-    /// priorities resolved for `"textDocument/publishDiagnostics"`.
-    ///
-    /// # Returns
-    ///
-    /// - `None`: Document doesn't exist, has no snapshot, or lacks language/injection configuration
-    /// - `Some(Vec::new())`: Document exists but has no injection regions (caller should clear diagnostics)
-    /// - `Some(vec![...])`: Injection regions found, ready for diagnostic requests
-    ///
-    /// Used by both immediate synthetic diagnostics (didSave/didOpen) and
-    /// debounced diagnostics (didChange).
+    /// Extracts all data synchronously before spawning to avoid lifetime issues
+    /// with `self` references in async tasks. The three return states are
+    /// distinct: `None` (document missing, no snapshot, or no
+    /// language/injection config), `Some(Vec::new())` (no injection regions —
+    /// caller should clear diagnostics), and `Some(vec![...])` (regions ready
+    /// for requests).
     pub(crate) fn prepare_diagnostic_snapshot(
         &self,
         uri: &Url,

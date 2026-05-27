@@ -1,24 +1,12 @@
-//! AutoInstallManager - Isolated coordinator for parser auto-installation.
+//! Parser auto-install coordinator: dedupes concurrent installs
+//! (`InstallingLanguages`), tracks crashed parsers (`FailedParserRegistry`),
+//! and runs the install.
 //!
-//! This module provides `AutoInstallManager`, which handles:
-//! - Deduplicating concurrent install attempts (`InstallingLanguages`)
-//! - Tracking crashed parsers (`FailedParserRegistry`)
-//! - Running the actual installation process
-//! - Generating events for Kakehashi to dispatch to ClientNotifier
-//!
-//! # Design Rationale
-//!
-//! `AutoInstallManager` returns `InstallResult` containing events rather than
-//! directly calling `ClientNotifier`. This keeps the coordinator fully isolated:
-//! - No dependency on `ClientNotifier` or `SettingsManager`
-//! - Pure installation logic + event generation
-//! - Fully unit-testable without mocking LSP infrastructure
-//!
-//! Kakehashi orchestrates by:
-//! 1. Checking `is_auto_install_enabled()` on SettingsManager
-//! 2. Calling `AutoInstallManager::try_install()`
-//! 3. Dispatching returned events to ClientNotifier
-//! 4. Handling post-install coordination (settings update, language reload)
+//! Returns `InstallResult` with events instead of calling `ClientNotifier`
+//! directly — keeps this module free of LSP infrastructure so it can be
+//! unit-tested in isolation. Kakehashi gates on `is_auto_install_enabled()`,
+//! calls `try_install()`, dispatches the events, and then handles
+//! post-install coordination (settings update, language reload).
 
 use std::path::PathBuf;
 use tower_lsp_server::ls_types::MessageType;
@@ -70,12 +58,10 @@ pub(crate) enum InstallOutcome {
 impl InstallOutcome {
     /// Check if the caller should skip parsing after this outcome.
     ///
-    /// Returns `true` for outcomes where the caller should NOT attempt to parse:
-    /// - `Success`, `SuccessWithWarnings`, `AlreadyExists`: Reload will handle parsing
-    /// - `AlreadyInstalling`: Another task is installing; caller should wait
-    ///
-    /// Returns `false` for outcomes where no installation happened or will happen:
-    /// - `ParserFailed`, `Unsupported`, `Failed`, `NoDataDir`
+    /// True when a reload will handle parsing (`Success`, `SuccessWithWarnings`,
+    /// `AlreadyExists`) or another task is mid-install (`AlreadyInstalling`);
+    /// false when no install happened or will (`ParserFailed`, `Unsupported`,
+    /// `Failed`, `NoDataDir`).
     pub(crate) fn should_skip_parse(&self) -> bool {
         matches!(
             self,
@@ -110,18 +96,11 @@ pub(crate) enum InstallEvent {
 
 /// Isolated coordinator for parser auto-installation.
 ///
-/// `AutoInstallManager` handles installation state and execution without
-/// dependencies on other coordinators. It returns events that Kakehashi
-/// dispatches to `ClientNotifier`.
-///
-/// # Thread Safety
-///
-/// `AutoInstallManager` is thread-safe:
-/// - `InstallingLanguages` uses `Arc<Mutex<HashSet>>` for concurrent access
-/// - `FailedParserRegistry` uses `DashSet` and `DashMap` for lock-free access
-///
-/// The struct is cheaply cloneable (all fields are `Arc`-based) for sharing
-/// across async tasks.
+/// Handles installation state and execution without depending on other
+/// coordinators, returning events that Kakehashi dispatches to `ClientNotifier`.
+/// Thread-safe and cheaply cloneable (all `Arc`-based) for sharing across async
+/// tasks: `InstallingLanguages` is `Arc<Mutex<HashSet>>` and
+/// `FailedParserRegistry` uses sharded-lock `DashSet`/`DashMap`.
 #[derive(Clone)]
 pub(crate) struct AutoInstallManager {
     /// Tracks languages currently being installed to prevent duplicates
@@ -141,10 +120,6 @@ impl std::fmt::Debug for AutoInstallManager {
 
 impl AutoInstallManager {
     /// Create a new `AutoInstallManager`.
-    ///
-    /// # Arguments
-    /// * `installing_languages` - Tracker for concurrent install deduplication
-    /// * `failed_parsers` - Registry of crashed parsers
     pub fn new(
         installing_languages: InstallingLanguages,
         failed_parsers: FailedParserRegistry,
@@ -210,18 +185,10 @@ impl AutoInstallManager {
 
     /// Attempt to install a language parser.
     ///
-    /// Returns `InstallResult` containing:
-    /// - `outcome`: What happened (success, failure, already installing, etc.)
-    /// - `events`: Log and progress events for Kakehashi to dispatch
-    ///
-    /// # Design
-    ///
-    /// This method is intentionally isolated - it does NOT:
-    /// - Call ClientNotifier (returns events instead)
-    /// - Access SettingsManager (Kakehashi checks settings before calling)
-    /// - Call reload_language_after_install (Kakehashi handles post-install)
-    ///
-    /// This enables unit testing without LSP infrastructure.
+    /// Intentionally isolated to enable unit testing without LSP infrastructure:
+    /// it does NOT call `ClientNotifier` (returns events instead), access
+    /// `SettingsManager` (Kakehashi checks settings first), or reload the
+    /// language (Kakehashi handles post-install).
     pub async fn try_install(&self, language: &str) -> InstallResult {
         let mut events = Vec::new();
 

@@ -45,15 +45,10 @@ impl InjectionCoordinator {
 
     /// Send didClose for invalidated virtual documents.
     ///
-    /// When region IDs are invalidated (e.g., due to edits touching their START),
-    /// the corresponding virtual documents become orphaned in downstream LSs.
-    /// This method cleans them up by:
-    ///
-    /// 1. Clearing injection token cache for invalidated ULIDs
-    /// 2. Delegating to BridgeCoordinator for tracking cleanup and didClose
-    ///
-    /// Documents that were never opened (not in host_to_virtual) are automatically
-    /// skipped - they don't need didClose since didOpen was never sent.
+    /// Region IDs invalidated by edits touching their START orphan their virtual
+    /// documents downstream; this clears their token cache and delegates didClose to
+    /// the BridgeCoordinator. Never-opened documents are skipped automatically (no
+    /// didOpen was sent).
     pub(crate) async fn close_invalidated_virtual_docs(
         &self,
         host_uri: &Url,
@@ -71,20 +66,11 @@ impl InjectionCoordinator {
             .await;
     }
 
-    /// Resolve all injection regions for a document.
+    /// Resolve all injection regions for a document, with stable region IDs from
+    /// `NodeTracker` (ADR-0019). Empty Vec when nothing matches.
     ///
-    /// This method:
-    /// 1. Gets the injection query for `host_language`
-    /// 2. Extracts the parse tree (minimal lock duration on document store)
-    /// 3. Collects all injection regions via `collect_all_injections`
-    /// 4. Calculates stable region IDs via `NodeTracker` (ADR-0019)
-    ///
-    /// Returns an empty Vec if no injections are found (no query, no tree,
-    /// or no injection regions).
-    ///
-    /// # Lock Safety
-    /// The document store lock is held only to clone the tree and text, then
-    /// released before the tree traversal. No DashMap deadlock risk.
+    /// Lock safety: the document store lock is held only long enough to clone the
+    /// tree and text, then released before the tree traversal — no DashMap deadlock risk.
     pub(crate) fn resolve_injection_data(
         &self,
         uri: &Url,
@@ -139,12 +125,8 @@ impl InjectionCoordinator {
     /// Process injected languages: resolve injection data, optionally forward didChange,
     /// auto-install missing parsers, and eagerly open virtual documents.
     ///
-    /// This resolves injection data **once** and uses it for:
-    /// 1. Forwarding didChange to already-opened virtual documents (when `forward_did_change` is true)
-    /// 2. Auto-install check for missing parsers
-    /// 3. Eager server spawn + didOpen for virtual documents
-    ///
-    /// Must be called AFTER parse_document so we have access to the AST.
+    /// Resolves injection data once and reuses it across all three steps. Must be
+    /// called AFTER parse_document so the AST is available.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
         let Some(host_language) = self.get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
@@ -171,14 +153,10 @@ impl InjectionCoordinator {
         self.eager_spawn_bridge_servers(uri, &host_language, injections);
     }
 
-    /// Check injected languages and handle missing parsers.
+    /// Check injected languages and handle missing parsers: auto-install when enabled,
+    /// otherwise notify the user.
     ///
-    /// This function:
-    /// 1. For each language, checks if it's already loaded
-    /// 2. If not loaded and auto-install is enabled, triggers maybe_auto_install_language()
-    /// 3. If not loaded and auto-install is disabled, notifies user
-    ///
-    /// The InstallingLanguages tracker in maybe_auto_install_language prevents
+    /// The `InstallingLanguages` tracker in `maybe_auto_install_language` prevents
     /// duplicate install attempts.
     pub(crate) async fn check_injected_languages_auto_install(
         &self,

@@ -1,24 +1,10 @@
-//! SelectionRange building from Tree-sitter AST nodes.
+//! Build LSP `SelectionRange` hierarchies from Tree-sitter AST nodes, with
+//! optional injection awareness (e.g. YAML in Markdown).
 //!
-//! This module provides the core functionality for building LSP SelectionRange
-//! hierarchies from Tree-sitter AST nodes. It handles both simple cases (pure AST
-//! traversal) and complex cases (language injections like YAML in Markdown).
-//!
-//! ## Entry Points
-//!
-//! - [`build`]: Main entry point. Detects injections and builds appropriate hierarchy.
-//! - [`build_from_node`]: Pure AST traversal, no injection awareness.
-//! - [`build_from_node_in_injection`]: For nodes already known to be in injected content.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! build()
-//!   ├── No injection detected → build_from_node()
-//!   └── Injection detected → parse injected content
-//!       ├── Success → build_from_node_in_injection() + chain to host
-//!       └── Failure → build_unparsed_fallback()
-//! ```
+//! Entry points: [`build`] (detects injections, falls back to AST), and the
+//! injection-naive [`build_from_node`] / injection-aware
+//! [`build_from_node_in_injection`]. When [`build`] sees an injection it parses
+//! the injected content; on parse failure it returns `build_unparsed_fallback`.
 
 use tower_lsp_server::ls_types::{Position, Range, SelectionRange};
 use tree_sitter::{Node, Parser, Tree};
@@ -38,15 +24,8 @@ use crate::text::PositionMapper;
 
 /// Convert tree-sitter Node to LSP Range with proper UTF-16 encoding.
 ///
-/// Tree-sitter stores positions as byte offsets, but LSP requires UTF-16 code units.
-/// This function uses the provided PositionMapper to perform the correct conversion.
-///
-/// # Arguments
-/// * `node` - The Tree-sitter node to convert
-/// * `mapper` - PositionMapper for byte-to-UTF16 position conversion
-///
-/// # Returns
-/// LSP Range with proper UTF-16 column positions
+/// Tree-sitter stores byte offsets, but LSP requires UTF-16 code units, so the
+/// `mapper` performs the conversion.
 pub fn node_to_range(node: Node, mapper: &PositionMapper) -> Range {
     let start = mapper
         .byte_to_position(node.start_byte())
@@ -59,16 +38,8 @@ pub fn node_to_range(node: Node, mapper: &PositionMapper) -> Range {
 
 /// Find the next parent node that has a different (larger) byte range than the current node.
 ///
-/// This ensures the LSP selection range hierarchy is strictly expanding.
-/// The function walks up the AST tree until it finds a parent whose byte range
-/// differs from the provided `current_range`.
-///
-/// # Arguments
-/// * `node` - The starting node
-/// * `current_range` - The byte range to compare against (typically the node's own range)
-///
-/// # Returns
-/// The first ancestor with a different byte range, or None if no such ancestor exists
+/// Skipping ancestors with identical ranges keeps the LSP selection-range
+/// hierarchy strictly expanding.
 pub fn find_distinct_parent<'a>(
     node: Node<'a>,
     current_range: &std::ops::Range<usize>,
@@ -86,19 +57,8 @@ pub fn find_distinct_parent<'a>(
 
 /// Build a SelectionRange hierarchy by pure AST traversal.
 ///
-/// Recursively constructs a chain of SelectionRange objects from the given node
-/// up to the root, ensuring each parent range is strictly larger than its child.
-/// Uses `find_distinct_parent` to skip nodes with identical ranges.
-///
-/// This function has no injection awareness - it simply walks up the AST.
-/// For injection-aware building, use [`build`] instead.
-///
-/// # Arguments
-/// * `node` - The starting Tree-sitter node
-/// * `mapper` - PositionMapper for UTF-16 column conversion
-///
-/// # Returns
-/// A SelectionRange with parent chain representing the AST hierarchy
+/// Walks from `node` to the root with no injection awareness; for
+/// injection-aware building, use [`build`] instead.
 pub fn build_from_node(node: Node, mapper: &PositionMapper) -> SelectionRange {
     let parent = find_distinct_parent(node, &node.byte_range())
         .map(|parent_node| Box::new(build_from_node(parent_node, mapper)));
@@ -108,17 +68,8 @@ pub fn build_from_node(node: Node, mapper: &PositionMapper) -> SelectionRange {
 
 /// Build SelectionRange for a node that is inside injected content.
 ///
-/// Similar to `build_from_node`, but adjusts all positions to be relative to
-/// the host document (not the injection slice). Used when we've already parsed
-/// the injected content and found a node within it.
-///
-/// # Arguments
-/// * `node` - The Tree-sitter node from the injected language parse tree
-/// * `content_start_byte` - Byte offset where injection content starts in host document
-/// * `mapper` - PositionMapper for the host document
-///
-/// # Returns
-/// SelectionRange hierarchy with positions adjusted to host document coordinates
+/// Like `build_from_node`, but adjusts positions from the injection slice back
+/// to host-document coordinates via `content_start_byte`.
 pub fn build_from_node_in_injection(
     node: Node,
     content_start_byte: usize,
@@ -173,19 +124,9 @@ fn parse_with_included_ranges(
 
 /// Build SelectionRange with automatic injection detection and handling.
 ///
-/// This is the main entry point for building selection ranges. It:
-/// 1. Checks if the cursor is within an injection region
-/// 2. If so, parses the injected content and builds a richer hierarchy
-/// 3. Falls back to pure AST traversal when no injection is detected
-///
-/// # Arguments
-/// * `node` - The node at cursor position in the host document
-/// * `doc_ctx` - Document context (text, mapper, root, base_language)
-/// * `inj_ctx` - Injection context (coordinator, parser_pool, depth tracking)
-/// * `cursor_byte` - The byte offset of cursor position
-///
-/// # Returns
-/// SelectionRange hierarchy, potentially spanning multiple language ASTs
+/// Main entry point: when the cursor is within an injection region, parses the
+/// injected content for a richer hierarchy spanning multiple language ASTs;
+/// otherwise falls back to pure AST traversal.
 pub fn build(
     node: Node,
     doc_ctx: &DocumentContext,

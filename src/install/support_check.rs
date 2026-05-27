@@ -52,16 +52,9 @@ const METADATA_CHECK_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// Check if a language should be skipped during auto-install because it's not supported.
 ///
-/// Returns a tuple of (should_skip, reason) where:
-/// - should_skip: true if the language is NOT supported by nvim-treesitter and should be skipped
-///   or when metadata could not be fetched within the timeout
-/// - reason: Some(message) explaining why installation was skipped or why metadata was unavailable
-///
-/// This function uses cached metadata from nvim-treesitter to avoid repeated HTTP requests.
-///
-/// # Arguments
-/// * `language` - The language name to check
-/// * `options` - FetchOptions for metadata caching (use with data_dir and use_cache: true)
+/// Skips (returns `should_skip = true`) when the language is unsupported by
+/// nvim-treesitter or when metadata can't be fetched within the timeout. Uses
+/// cached metadata to avoid repeated HTTP requests.
 pub async fn should_skip_unsupported_language(
     language: &str,
     options: Option<&FetchOptions<'_>>,

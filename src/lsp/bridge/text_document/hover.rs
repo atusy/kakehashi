@@ -84,14 +84,9 @@ fn build_hover_request(
 
 /// Parse a JSON-RPC hover response and transform coordinates to host document space.
 ///
-/// Instead of returning a modified JSON envelope, this deserializes the response
-/// into `Option<Hover>` with coordinates already transformed.
-///
-/// Returns `None` for: null results, missing results, and deserialization failures.
-///
-/// # Arguments
-/// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
-/// * `offset` - The region offset for coordinate translation
+/// Deserializes into `Option<Hover>` (not a modified JSON envelope) with
+/// coordinates already transformed. Returns `None` for null/missing results and
+/// deserialization failures.
 fn transform_hover_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

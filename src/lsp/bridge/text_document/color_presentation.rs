@@ -1,16 +1,7 @@
-//! Color presentation request handling for bridge connections.
-//!
-//! This module provides color presentation request functionality for downstream language servers,
-//! handling the bidirectional coordinate transformation between host and virtual documents.
-//!
-//! Like inlay hints, color presentation uses a range parameter in the request (the range
-//! where the color was found) and the response may contain textEdits and additionalTextEdits
-//! that need transformation back to host coordinates.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue requests via the channel-based
-//! writer task, ensuring FIFO ordering with other messages.
+//! Color presentation requests for downstream servers, handling the bidirectional
+//! host↔virtual coordinate transformation. Like inlay hints, the request carries a
+//! range (where the color was found) and the response may include textEdits and
+//! additionalTextEdits whose ranges must be translated back to host coordinates.
 
 use std::io;
 
@@ -78,15 +69,9 @@ impl LanguageServerPool {
     }
 }
 
-/// Build a JSON-RPC color presentation request for a downstream language server.
-///
-/// ColorPresentationParams has a range field that specifies the color's location
-/// in the document. This range needs to be translated from host to virtual coordinates.
-///
-/// # Defensive Arithmetic
-///
-/// Uses `saturating_sub` for line translation to prevent panic on underflow during
-/// race conditions when document edits invalidate region data.
+/// Build a JSON-RPC color presentation request, translating the color's range from
+/// host to virtual coordinates. Line translation uses `saturating_sub` to avoid an
+/// underflow panic when a concurrent edit invalidates region data.
 fn build_color_presentation_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
@@ -114,16 +99,9 @@ fn build_color_presentation_request(
     )
 }
 
-/// Transform a color presentation response from virtual to host document coordinates.
-///
-/// ColorPresentation responses are arrays of ColorPresentation items, each containing:
-/// - label: The presentation label (preserved unchanged)
-/// - textEdit: Optional TextEdit with range (needs transformation)
-/// - additionalTextEdits: Optional array of TextEdits (ranges need transformation)
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `offset` - The region offset for coordinate translation
+/// Transform a color presentation response from virtual to host coordinates,
+/// translating the ranges of each item's `textEdit` and `additionalTextEdits`
+/// while leaving the label unchanged.
 fn transform_color_presentation_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

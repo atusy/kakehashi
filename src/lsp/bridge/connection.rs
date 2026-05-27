@@ -1,17 +1,7 @@
-//! Async connection to downstream language server processes.
+//! Async connection to downstream language server processes via stdio.
 //!
-//! This module provides the core connection type for communicating with
-//! language servers via stdio using async I/O.
-//!
-//! # Structure
-//!
-//! - `BridgeWriter`: Handles writing LSP messages to stdin
-//! - `BridgeReader`: Handles reading LSP messages from stdout
-//! - `AsyncBridgeConnection`: Owns the child process and coordinates I/O
-//!
-//! The separation of reader/writer enables future Reader Task introduction
-//! (ADR-0015) where the reader runs in a dedicated task for non-blocking
-//! response routing.
+//! Reader and writer are separated so the reader can move to a dedicated
+//! Reader Task (ADR-0015) for non-blocking response routing.
 
 use std::io;
 use std::process::Stdio;
@@ -22,7 +12,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// Writer handle for sending LSP messages to downstream language server.
 ///
 /// Wraps `ChildStdin` to provide LSP message framing (Content-Length header).
-/// This type will be used directly when single-writer loop is introduced.
 pub(crate) struct BridgeWriter {
     stdin: ChildStdin,
 }
@@ -30,8 +19,7 @@ pub(crate) struct BridgeWriter {
 impl BridgeWriter {
     /// Write a JSON-RPC message to the downstream language server.
     ///
-    /// Formats the message with LSP Content-Length header:
-    /// `Content-Length: <length>\r\n\r\n<json>`
+    /// Formats with the LSP `Content-Length: <length>\r\n\r\n<json>` framing.
     pub(crate) async fn write_message(
         &mut self,
         message: &impl serde::Serialize,
@@ -49,9 +37,8 @@ impl BridgeWriter {
 
 /// Reader handle for receiving LSP messages from downstream language server.
 ///
-/// Wraps `BufReader<ChildStdout>` to provide LSP message parsing.
-/// This type is used by the Reader Task (ADR-0015) for
-/// non-blocking response routing via ResponseRouter.
+/// Wraps `BufReader<ChildStdout>` to provide LSP message parsing. Used by the
+/// Reader Task (ADR-0015) for non-blocking response routing via ResponseRouter.
 pub(crate) struct BridgeReader {
     stdout: BufReader<ChildStdout>,
 }
@@ -117,16 +104,9 @@ impl BridgeReader {
 
 /// Async connection to a downstream language server process.
 ///
-/// Manages the lifecycle of a child process running a language server,
-/// providing async I/O for LSP JSON-RPC communication over stdio.
-///
-/// # Architecture (ADR-0015)
-///
-/// This type can be split into separate writer and reader components:
-/// - Writer stays with the connection for serialized request sending
-/// - Reader moves to a dedicated Reader Task for non-blocking response routing
-///
-/// Use `split()` to separate writer and reader after initialization.
+/// `split()` separates the writer (stays for serialized request sending) from
+/// the reader (moves to a dedicated Reader Task for non-blocking response
+/// routing) after initialization (ADR-0015).
 pub(crate) struct AsyncBridgeConnection {
     child: Option<Child>,         // Option to support taking for split()
     writer: Option<BridgeWriter>, // Option to support taking for split()
@@ -152,17 +132,9 @@ impl SplitConnectionWriter {
 
     /// Force-kill the child process with platform-appropriate escalation.
     ///
-    /// # Platform-Specific Behavior
-    ///
-    /// **Unix (Linux, macOS)**:
-    /// 1. Send SIGTERM to allow graceful termination
-    /// 2. Wait for up to 2 seconds for the process to exit
-    /// 3. If still alive, send SIGKILL for forced termination
-    ///
-    /// **Windows**:
-    /// - Directly calls `TerminateProcess` via `start_kill()`
-    /// - No graceful period (Windows has no SIGTERM equivalent)
-    /// - Language servers should handle cleanup via LSP shutdown/exit handshake (ADR-0017)
+    /// Unix escalates SIGTERM→SIGKILL with a 2s grace period; Windows has no
+    /// SIGTERM equivalent so it terminates immediately via `start_kill()` and
+    /// relies on the LSP shutdown/exit handshake for cleanup (ADR-0017).
     pub(crate) async fn force_kill_with_escalation(&mut self) {
         #[cfg(unix)]
         {
@@ -175,12 +147,7 @@ impl SplitConnectionWriter {
         }
     }
 
-    /// Unix-specific force-kill with SIGTERM->SIGKILL escalation.
-    ///
-    /// Implements graceful shutdown with 2-second grace period:
-    /// 1. Send SIGTERM to allow graceful cleanup
-    /// 2. Wait up to 2 seconds for process exit
-    /// 3. Escalate to SIGKILL if still alive
+    /// Unix-specific force-kill with SIGTERM→SIGKILL escalation and a 2s grace period.
     #[cfg(unix)]
     async fn force_kill_with_escalation_unix(&mut self) {
         use nix::sys::signal::{Signal, kill};
@@ -305,8 +272,7 @@ impl SplitConnectionWriter {
 
     /// General (non-Unix) force-kill via direct process termination.
     ///
-    /// On non-Unix platforms (e.g., Windows), terminates the process immediately.
-    /// No graceful period is available as these platforms lack SIGTERM equivalent.
+    /// No graceful period: these platforms lack a SIGTERM equivalent.
     #[cfg(not(unix))]
     async fn force_kill_with_escalation_general(&mut self) {
         let Some(pid) = self.child.id() else {
@@ -372,13 +338,7 @@ impl Drop for SplitConnectionWriter {
 }
 
 impl AsyncBridgeConnection {
-    /// Spawn a new language server process.
-    ///
-    /// # Arguments
-    /// * `cmd` - Command and arguments to spawn (e.g., `["lua-language-server"]`)
-    ///
-    /// # Returns
-    /// A new `AsyncBridgeConnection` with stdio pipes connected to the child process.
+    /// Spawn a new language server process with stdio pipes connected.
     pub(crate) async fn spawn(cmd: Vec<String>) -> io::Result<Self> {
         let (program, args) = cmd.split_first().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "command must not be empty")
@@ -408,13 +368,9 @@ impl AsyncBridgeConnection {
         })
     }
 
-    /// Split into separate writer and reader components.
+    /// Split into a `SplitConnectionWriter` (holds the child process) and a
+    /// `BridgeReader` (goes to the Reader Task).
     ///
-    /// This takes ownership of the internal components and returns:
-    /// - `SplitConnectionWriter`: For sending messages (holds child process)
-    /// - `BridgeReader`: For receiving messages (goes to Reader Task)
-    ///
-    /// # Panics
     /// Panics if called more than once (components already taken).
     pub(crate) fn split(&mut self) -> (SplitConnectionWriter, BridgeReader) {
         let reader = self

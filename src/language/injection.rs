@@ -146,12 +146,10 @@ fn is_node_within(node: &Node, container: &Node) -> bool {
     node.start_byte() >= container.start_byte() && node.end_byte() <= container.end_byte()
 }
 
-/// Extracts the injection language from query properties or captures
+/// Extracts the injection language from query properties or captures.
 ///
-/// Handles three patterns:
-/// 1. Static: `#set! injection.language "language_name"`
-/// 2. Dynamic capture: `(language) @injection.language`
-/// 3. nvim-treesitter custom: `#set-lang-from-info-string! @capture` (uses capture text as language)
+/// Tries static `#set!`, then nvim-treesitter's `#set-lang-from-info-string!`,
+/// then a dynamic `@injection.language` capture, in that order.
 fn extract_injection_language(query: &Query, match_: &QueryMatch, text: &str) -> Option<String> {
     // First check for static language via #set! property
     if let Some(language) = extract_static_language(query, match_) {
@@ -286,28 +284,17 @@ pub(crate) fn compute_included_ranges(
     }
 }
 
-/// Sub-select parent `included_ranges` for a nested injection byte region.
+/// Clip the parent's `included_ranges` to the nested injection's byte window
+/// and re-relativize. Used when the nested injection's tree was parsed with
+/// `included_ranges` and has no `block_continuation` children of its own;
+/// both byte arguments are relative to `parent_ranges`' base (parent
+/// `content_text` start). Returns `None` if no parent range overlaps.
 ///
-/// When a nested injection has no `block_continuation` children of its own
-/// (because its tree was parsed with `included_ranges`), we inherit the parent's
-/// ranges by clipping them to the nested content region and re-relativizing.
-///
-/// Both `nested_start_byte` and `nested_end_byte` are relative to the same
-/// base as `parent_ranges` (the parent's `content_text` start).
-///
-/// Returns `Some(clipped_ranges)` if any parent ranges overlap the nested region,
-/// `None` otherwise.
-///
-/// # Known Limitation
-///
-/// When a range is clipped (byte boundaries adjusted by `max`/`min`), the
-/// `start_point`/`end_point` are NOT adjusted to match the clipped bytes.
-/// Tree-sitter's `set_included_ranges` validates only byte ordering, not
-/// point/byte consistency, so this does not cause errors. However, nodes
-/// parsed from clipped ranges may report slightly wrong column positions.
-/// In practice, nested injection boundaries almost always align with parent
-/// gap boundaries (both derived from tree-sitter node boundaries), so
-/// partial clipping is rare.
+/// Known limitation: when a range is clipped by `max`/`min`, only its bytes
+/// are adjusted — `start_point`/`end_point` are not. Tree-sitter accepts this
+/// (it validates byte ordering only), but nodes from clipped ranges may
+/// report slightly wrong columns. Rare in practice: nested boundaries
+/// usually align with parent gap boundaries.
 pub(crate) fn sub_select_included_ranges(
     parent_ranges: &[tree_sitter::Range],
     nested_start_byte: usize,
@@ -419,16 +406,11 @@ pub(crate) fn intersect_included_ranges(
     result
 }
 
-/// Extract clean injection content, stripping child node bytes when included_ranges present.
+/// Extract clean injection content, stripping child node bytes when `included_ranges` present.
 ///
 /// When `included_ranges` is `Some`, only the gap bytes (actual code content) are
 /// concatenated, effectively stripping blockquote prefixes like `> `. When `None`,
 /// returns the full content slice as-is.
-///
-/// # Arguments
-/// * `host_text` - The full host document text
-/// * `byte_range` - The byte range of the injection content node
-/// * `included_ranges` - Gap ranges from `compute_included_ranges()`, relative to node start
 pub(crate) fn extract_clean_content(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
@@ -448,20 +430,11 @@ pub(crate) fn extract_clean_content(
     }
 }
 
-/// Compute per-virtual-line column offsets from included ranges.
+/// Compute per-virtual-line UTF-16 column offsets from included ranges.
 ///
-/// For each virtual line in the injection, computes the UTF-16 column offset
-/// (the width of the blockquote prefix or other excluded content before the
-/// gap on that line).
-///
-/// When `included_ranges` is `None`, returns `vec![start_column]` (the
-/// non-blockquote fallback — only line 0 has a column offset).
-///
-/// # Arguments
-/// * `host_text` - The full host document text
-/// * `byte_range` - The byte range of the injection content node
-/// * `start_column` - UTF-16 column offset for the first line
-/// * `included_ranges` - Gap ranges from `compute_included_ranges()`, relative to node start
+/// Each offset is the width of the blockquote prefix (or other excluded content)
+/// before the gap on that line. When `included_ranges` is `None`, returns
+/// `vec![start_column]` — the non-blockquote fallback where only line 0 has an offset.
 pub(crate) fn compute_line_column_offsets(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
@@ -539,19 +512,10 @@ fn extract_virtual_content_and_offsets(
 
 /// Parse text with optional included ranges, resetting parser state afterward.
 ///
-/// This is the shared protocol for interacting with Tree-sitter's
-/// `set_included_ranges` API. Both the semantic tokens and selection range
-/// paths delegate here to avoid divergence.
-///
-/// # Behavior
-///
-/// 1. If `included_ranges` is `Some`, calls `parser.set_included_ranges()`
-/// 2. On failure, logs a warning, resets ranges, and returns `None`
-/// 3. Calls `parser.parse(text, None)`
-/// 4. Always resets `parser.set_included_ranges(&[])` after parsing
-///
-/// The unconditional reset ensures parsers returned to pools or caches
-/// never carry stale included-range state.
+/// Shared protocol for Tree-sitter's `set_included_ranges` API; both semantic
+/// tokens and selection range paths delegate here to avoid divergence. The reset
+/// to `&[]` is unconditional (even on the failure path) so parsers returned to
+/// pools or caches never carry stale included-range state.
 pub(crate) fn parse_with_ranges(
     parser: &mut tree_sitter::Parser,
     text: &str,
@@ -606,17 +570,10 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
     None
 }
 
-/// Extracts language from nvim-treesitter's #set-lang-from-info-string! predicate
+/// Extracts language from nvim-treesitter's `#set-lang-from-info-string!` predicate.
 ///
-/// This is a custom nvim-treesitter predicate that uses the text of a capture
-/// as the injection language. It's commonly used for markdown fenced code blocks:
-///
-/// ```scheme
-/// (fenced_code_block
-///   (info_string (language) @_lang)
-///   (code_fence_content) @injection.content
-///   (#set-lang-from-info-string! @_lang))
-/// ```
+/// This custom predicate uses a capture's text as the injection language, commonly
+/// for markdown fenced code blocks.
 fn extract_language_from_info_string(
     query: &Query,
     match_: &QueryMatch,
@@ -745,19 +702,11 @@ impl CacheableInjectionRegion {
     }
 }
 
-/// Collects all injection regions in the document
+/// Collects all injection regions in the document.
 ///
-/// Unlike `detect_injection` which requires a specific node,
-/// this function finds ALL injection regions in the entire document.
-/// Used for semantic tokens to highlight all injected content.
-///
-/// # Arguments
-/// * `root` - Root node of the document AST
-/// * `text` - The document text
-/// * `injection_query` - The injection query for detecting injections
-///
-/// # Returns
-/// Vector of injection region information, or None if no query
+/// Unlike `detect_injection` (which requires a specific node), this finds ALL
+/// injection regions in the whole document — used by semantic tokens to highlight
+/// every injected region. `None` when there is no query.
 pub fn collect_all_injections<'a>(
     root: &Node<'a>,
     text: &str,
@@ -907,15 +856,8 @@ fn extract_content_and_language<'a>(
 
 /// Find the injection region containing the given byte offset.
 ///
-/// Returns the index and reference to the matching region, or None if the position
-/// is not within any injection region.
-///
-/// # Arguments
-/// * `injections` - All injection regions in document order
-/// * `byte_offset` - The byte offset to search for
-///
-/// # Returns
-/// Option of (index, reference to region) for use with calculate_region_id
+/// Returns `(index, region)` for use with `calculate_region_id`, or `None` when the
+/// position is not within any injection region.
 pub(crate) fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
@@ -944,27 +886,11 @@ pub struct ResolvedInjection {
 pub struct InjectionResolver;
 
 impl InjectionResolver {
-    /// Resolve injection region at the given byte offset.
+    /// Resolve the injection region (if any) covering `byte_offset`. Shared by
+    /// LSP handlers (hover, completion, definition, …) at a cursor position.
     ///
-    /// Shared by LSP handlers (hover, completion, definition, etc.) that resolve
-    /// injection language at a cursor position.
-    ///
-    /// # Lock Safety
-    /// This function does not hold Document locks. All inputs (tree, text) must be
-    /// pre-cloned, typically via DocumentSnapshot.
-    ///
-    /// # Arguments
-    /// * `coordinator` - Language coordinator for resolving injection language
-    /// * `tracker` - Region ID tracker for stable ULID generation
-    /// * `uri` - Host document URI
-    /// * `tree` - Parsed syntax tree
-    /// * `text` - Document text content
-    /// * `injection_query` - Query for finding injection regions
-    /// * `byte_offset` - Byte offset to resolve
-    ///
-    /// # Returns
-    /// `Some(ResolvedInjection)` if position is within an injection region,
-    /// `None` otherwise.
+    /// Does not hold any Document lock: inputs (`tree`, `text`) must be pre-cloned,
+    /// typically via `DocumentSnapshot`.
     pub(crate) fn resolve_at_byte_offset(
         coordinator: &LanguageCoordinator,
         tracker: &NodeTracker,
@@ -987,15 +913,8 @@ impl InjectionResolver {
 
     /// Calculate a stable ULID-based region_id for an injection.
     ///
-    /// Phase 2 (ADR-0019): Uses position-based key (start_byte, end_byte, kind) for ULID lookup.
-    ///
-    /// # Arguments
-    /// * `tracker` - The region ID tracker for ULID generation/lookup
-    /// * `uri` - The host document URI
-    /// * `injection` - The injection region info
-    ///
-    /// # Returns
-    /// A stable ULID that remains constant for the same position key.
+    /// Phase 2 (ADR-0019): keyed on position (start_byte, end_byte, kind), so the
+    /// ULID stays constant for the same position key.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
         uri: &Url,
@@ -1059,25 +978,10 @@ impl InjectionResolver {
         }
     }
 
-    /// Resolve all injection regions in a document.
-    ///
-    /// This is used for whole-document operations like document_link that need
-    /// to iterate over all injection regions rather than finding one at a position.
-    ///
-    /// # Lock Safety
-    /// This function does not hold Document locks. All inputs (tree, text) must be
-    /// pre-cloned, typically via DocumentSnapshot.
-    ///
-    /// # Arguments
-    /// * `coordinator` - Language coordinator for resolving injection language
-    /// * `tracker` - Region ID tracker for stable ULID generation
-    /// * `uri` - Host document URI
-    /// * `tree` - Parsed syntax tree
-    /// * `text` - Document text content
-    /// * `injection_query` - Query for finding injection regions
-    ///
-    /// # Returns
-    /// Vector of resolved injections, may be empty if no injections found.
+    /// Resolve every injection region in the document (whole-doc operations
+    /// like `documentLink` use this rather than a position lookup). Holds no
+    /// Document lock — `tree`/`text` must already be cloned, typically via
+    /// `DocumentSnapshot`. Empty vec when nothing matches.
     pub(crate) fn resolve_all(
         coordinator: &LanguageCoordinator,
         tracker: &NodeTracker,

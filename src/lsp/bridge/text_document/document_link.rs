@@ -1,15 +1,11 @@
-//! Document link request handling for bridge connections.
+//! Document link request handling for bridge connections, with host/virtual
+//! coordinate transformation.
 //!
-//! This module provides document link request functionality for downstream language servers,
-//! handling the coordinate transformation between host and virtual documents.
+//! Unlike position-based requests (hover, definition, etc.), document link
+//! requests operate on the entire document — they take no position parameter.
 //!
-//! Unlike position-based requests (hover, definition, etc.), document link requests
-//! operate on the entire document - they don't take a position parameter.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue requests via the channel-based
-//! writer task, ensuring FIFO ordering with other messages.
+//! Requests are queued via the channel-based writer task (`send_request()`) for
+//! FIFO ordering with other messages (ADR-0015 single-writer loop).
 
 use std::io;
 
@@ -67,10 +63,6 @@ impl LanguageServerPool {
 }
 
 /// Build a JSON-RPC document link request for a downstream language server.
-///
-/// Unlike position-based requests (hover, definition, etc.), DocumentLinkParams
-/// only has a textDocument field - no position. The request asks for all links
-/// in the entire document.
 fn build_document_link_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
@@ -80,12 +72,8 @@ fn build_document_link_request(
 
 /// Transform a document link response from virtual to host document coordinates.
 ///
-/// DocumentLink responses are arrays of items with range, target, tooltip, and data fields.
-/// Only the range needs transformation - target, tooltip, and data are preserved unchanged.
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `offset` - The region offset for coordinate translation
+/// Only each link's `range` is translated by `offset`; target, tooltip, and
+/// data are preserved unchanged.
 fn transform_document_link_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

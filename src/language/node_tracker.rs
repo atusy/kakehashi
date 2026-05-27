@@ -145,9 +145,8 @@ pub(crate) struct EditInfo {
 impl EditInfo {
     /// Create a new EditInfo with byte positions.
     ///
-    /// # Debug Assertions
-    /// In debug builds, asserts that `old_end_byte >= start_byte`.
-    /// Invalid edits should never occur in correct LSP implementations.
+    /// Debug-asserts `old_end_byte >= start_byte`: a correct LSP client never
+    /// sends an inverted edit, so a violation signals a caller bug.
     pub(crate) fn new(start_byte: usize, old_end_byte: usize, new_end_byte: usize) -> Self {
         debug_assert!(
             old_end_byte >= start_byte,
@@ -170,8 +169,7 @@ impl EditInfo {
 
     /// Check if this is a zero-length (insertion-only) edit.
     ///
-    /// Zero-length edits have special handling in ADR-0019:
-    /// they insert content without deleting anything.
+    /// Zero-length edits get special invalidation handling in ADR-0019.
     fn is_insertion_only(&self) -> bool {
         self.start_byte == self.old_end_byte
     }
@@ -185,24 +183,16 @@ impl From<&tree_sitter::InputEdit> for EditInfo {
 
 /// Apply a signed delta to a byte position with overflow protection.
 ///
-/// Uses saturating arithmetic to prevent overflow/underflow:
-/// - Clamps result to 0 if delta would make it negative
-/// - Uses i64 internally to handle large negative deltas safely
+/// Computes in `i64` and saturates so large negative deltas can't underflow,
+/// clamping the result to 0 rather than wrapping.
 fn apply_delta(position: usize, delta: i64) -> usize {
     (position as i64).saturating_add(delta).max(0) as usize
 }
 
 /// Adjust a position key based on an edit operation (ADR-0019 position adjustment).
 ///
-/// Returns the adjusted PositionKey, or None if the range collapsed
-/// (indicating the node should be invalidated).
-///
-/// # Position Cases (ADR-0019)
-/// - **Node E**: AFTER edit (`start >= edit.old_end`) → shift both start and end
-/// - **Node A/B**: CONTAINS/OVERLAPS edit (`end > edit.start`) → adjust end
-///   - End inside edit range (`end <= edit.old_end`) → clamp to `edit.new_end_byte`
-///   - End after edit range (`end > edit.old_end`) → apply delta
-/// - **Node F**: BEFORE edit → unchanged
+/// Returns the adjusted `PositionKey`, or `None` if the range collapsed
+/// (the node should then be invalidated).
 fn adjust_position_for_edit(key: PositionKey, edit: &EditInfo, delta: i64) -> Option<PositionKey> {
     if key.start_byte >= edit.old_end_byte {
         // Node E: AFTER edit → shift both start and end
@@ -312,27 +302,14 @@ impl NodeTracker {
         self.entries.get(uri)?.forward.get(&key).copied()
     }
 
-    /// Apply text change and update region positions using START-priority invalidation.
+    /// Reconstruct character-level edits between `old_text` and `new_text` and
+    /// apply them right-to-left, returning every invalidated ULID so callers
+    /// can send `didClose` for orphaned virtual documents. Identical texts
+    /// fast-path to an empty result.
     ///
-    /// Phase 5: Reconstructs individual edits from character-level diff and processes
-    /// them in REVERSE order. This enables precise invalidation: middle content that
-    /// is unchanged between two edits is correctly preserved.
-    ///
-    /// Returns ULIDs that were invalidated by this edit (for Phase 3 cleanup).
-    /// The caller can use these to send didClose notifications for orphaned
-    /// virtual documents.
-    ///
-    /// # Fast path
-    /// If old_text == new_text, returns empty Vec without any processing.
-    ///
-    /// # Reverse Order Processing
-    ///
-    /// Unlike `apply_input_edits` which uses FORWARD order for LSP incremental edits
-    /// (because LSP edits use "running coordinates"), this method uses REVERSE order
-    /// because diff-reconstructed edits use ORIGINAL document coordinates.
-    ///
-    /// Processing from highest position to lowest ensures each edit's coordinates
-    /// remain valid in the original coordinate space.
+    /// Reverse order is used here (unlike `apply_input_edits`) because the
+    /// diff-reconstructed edits all reference *original* coordinates; applying
+    /// from highest position first keeps each subsequent edit's coordinates valid.
     pub(crate) fn apply_text_diff(&self, uri: &Url, old_text: &str, new_text: &str) -> Vec<Ulid> {
         // Fast path: identical texts need no processing
         if old_text == new_text {
@@ -402,18 +379,10 @@ impl NodeTracker {
     ///
     /// Returns edits in ascending position order. Caller MUST process in reverse.
     ///
-    /// # UTF-8 Handling
-    ///
-    /// `TextDiff::from_chars()` iterates by Unicode code points, producing one `Change`
-    /// per character. Each `change.value()` returns a `&str` (single-character string slice),
-    /// and `.len()` on `&str` returns the **byte length** of that UTF-8 encoded character.
-    ///
-    /// Examples:
-    /// - ASCII 'A': `.len()` = 1 byte
-    /// - Emoji '😀': `.len()` = 4 bytes
-    /// - CJK '漢': `.len()` = 3 bytes
-    ///
-    /// This correctly tracks byte offsets for position adjustment.
+    /// `TextDiff::from_chars()` yields one `Change` per code point, and `.len()`
+    /// on the resulting single-char `&str` is its UTF-8 byte length — so byte
+    /// offsets stay correct for multi-byte characters (emoji, CJK) without extra
+    /// conversion.
     #[must_use]
     fn reconstruct_individual_edits(old_text: &str, new_text: &str) -> Vec<EditInfo> {
         use similar::{ChangeTag, TextDiff};
@@ -456,32 +425,15 @@ impl NodeTracker {
         edits
     }
 
-    /// Apply multiple edits individually for precise invalidation.
+    /// Apply edits in array order, returning every invalidated ULID.
     ///
-    /// Each edit is applied sequentially in array order. The tracker updates
-    /// its internal node positions after each edit, so subsequent edits'
-    /// running coordinates naturally align with the tracker's state.
+    /// No coordinate conversion is needed: LSP edits are in *running* coordinates
+    /// (each relative to the doc state after previous edits) and `apply_single_edit`
+    /// updates node positions after each call, so they stay aligned.
     ///
-    /// # Why No Coordinate Conversion?
-    ///
-    /// LSP sends edits in "running coordinates" - each edit's positions are
-    /// relative to the document state after previous edits. The tracker's
-    /// `apply_single_edit` updates internal node positions after each call,
-    /// keeping them synchronized with the running coordinate space.
-    ///
-    /// # Edit Ordering
-    ///
-    /// **IMPORTANT**: LSP does NOT guarantee edits are in ascending position order.
-    /// VSCode sends multi-cursor edits in reverse order (bottom-to-top).
-    /// This method processes edits in **array order** as the LSP spec requires:
-    /// > "Apply the TextDocumentContentChangeEvents in the order you receive them."
-    ///
-    /// # Arguments
-    /// * `uri` - Document URI
-    /// * `edits` - EditInfo slice in application order (as received from LSP)
-    ///
-    /// # Returns
-    /// All ULIDs invalidated across all edits.
+    /// Array order is mandatory — LSP does not guarantee ascending positions
+    /// (VSCode sends multi-cursor edits bottom-to-top), and the spec requires
+    /// applying events in receive order.
     pub(crate) fn apply_input_edits(&self, uri: &Url, edits: &[EditInfo]) -> Vec<Ulid> {
         let mut all_invalidated = Vec::new();
 
@@ -515,31 +467,13 @@ impl NodeTracker {
         all_invalidated
     }
 
-    /// Determine if a node should be invalidated based on START-priority rule (ADR-0019).
+    /// START-priority invalidation (ADR-0019): invalidate when the node's START
+    /// lies in the half-open `[edit.start, edit.old_end)`.
     ///
-    /// # ADR-0019 START-Priority Rule
-    ///
-    /// A node is invalidated if its START position falls inside the edit range
-    /// `[edit.start, edit.old_end)` (half-open interval: start inclusive, end exclusive).
-    ///
-    /// # Zero-Length Edit Handling
-    ///
-    /// ADR-0019 line 74: "Zero-length edits: When edit.start == edit.old_end,
-    /// preserve identity only if the node's START in the new tree is unchanged."
-    ///
-    /// ## Conservative Simplification
-    ///
-    /// ADR-0019 strictly requires comparing old-tree START vs new-tree START.
-    /// However, NodeTracker doesn't have access to the parsed tree
-    /// (separation of concerns). We use a conservative approximation:
-    ///
-    /// - Zero-length insert AT node's START → always INVALIDATE
-    ///   (Rationale: insert shifts node down, so START changes in new tree)
-    /// - Zero-length insert BEFORE/AFTER node's START → KEEP
-    ///
-    /// This may over-invalidate in rare cases where the node's START
-    /// happens to remain unchanged despite being at the insert point,
-    /// but it's safe (never preserves stale identity).
+    /// For zero-length inserts the ADR compares old- vs new-tree START, but we
+    /// have no tree access here, so we conservatively invalidate iff the insert
+    /// lands exactly at the node's START. This may over-invalidate when the
+    /// start happens to remain stable, but never preserves stale identity.
     fn should_invalidate_node(key: &PositionKey, edit: &EditInfo) -> bool {
         if edit.is_insertion_only() {
             // Zero-length insert: invalidate if insert is AT node's START
@@ -2229,37 +2163,9 @@ mod tests {
 
     #[test]
     fn test_apply_input_edits_reverse_order_preserves_positions() {
-        // Strengthened VSCode reverse-order test: verify final positions are correct
-        //
-        // Scenario: Multiple nodes, reverse-order edits happen BEFORE them (not at START)
-        // All nodes should be preserved with correctly shifted positions
-        //
-        // Document layout (20 bytes each line for simplicity):
-        // Nodes: A [40, 50), B [80, 90), C [120, 130)
-        //
-        // VSCode sends edits in reverse order (bottom-to-top):
-        // Edit 1: insert 5 bytes at position 100 (between B and C)
-        // Edit 2: insert 3 bytes at position 60 (between A and B)
-        // Edit 3: insert 2 bytes at position 20 (before A)
-        //
-        // Running coordinate analysis:
-        // After Edit 1 (insert 5 at 100):
-        //   A [40, 50) → [40, 50) unchanged (before edit)
-        //   B [80, 90) → [80, 90) unchanged (before edit)
-        //   C [120, 130) → [125, 135) shifted +5
-        //
-        // After Edit 2 (insert 3 at 60, in post-edit-1 coords):
-        //   A [40, 50) → [40, 50) unchanged (before edit)
-        //   B [80, 90) → [83, 93) shifted +3
-        //   C [125, 135) → [128, 138) shifted +3
-        //
-        // After Edit 3 (insert 2 at 20, in post-edit-2 coords):
-        //   A [40, 50) → [42, 52) shifted +2
-        //   B [83, 93) → [85, 95) shifted +2
-        //   C [128, 138) → [130, 140) shifted +2
-        //
-        // Final positions: A [42, 52), B [85, 95), C [130, 140)
-        // Total shift: A +2, B +5, C +10 (cumulative from 3 edits)
+        // VSCode sends multi-cursor edits bottom-to-top in running coordinates.
+        // Nodes A=[40,50) B=[80,90) C=[120,130); inserts: +5@100, +3@60, +2@20.
+        // Expected after all three: A=[42,52) B=[85,95) C=[130,140) (cumulative +2/+5/+10).
         let tracker = NodeTracker::new();
         let uri = test_uri("vscode_reverse_positions");
 

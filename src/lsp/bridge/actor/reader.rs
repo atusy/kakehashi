@@ -73,25 +73,9 @@ fn new_liveness_timer(timeout: Duration) -> LivenessTimer {
     Box::pin(tokio::time::sleep(timeout))
 }
 
-/// Encapsulates liveness timer state and logic for the reader task.
-///
-/// This struct consolidates the timer state (active timer, timeout configuration)
-/// and provides methods for timer lifecycle management, improving cohesion
-/// compared to managing multiple variables separately.
-///
-/// # Timer States
-///
-/// - **Inactive**: `timer` is `None`, timeout may or may not be configured
-/// - **Active**: `timer` is `Some`, will fire after configured duration
-///
-/// # Usage Pattern
-///
-/// ```ignore
-/// let mut liveness = LivenessTimerState::new(Some(Duration::from_secs(60)));
-/// liveness.start(&lang_prefix);           // Starts timer when pending 0->1
-/// liveness.reset(&lang_prefix);           // Resets on message activity
-/// liveness.stop(&lang_prefix, "reason");  // Stops when pending returns to 0
-/// ```
+/// Reader-task liveness timer: `timer: Option<…>` (Some = armed) plus the
+/// configured `timeout`. Methods cover the `start` (pending 0→1) / `reset`
+/// (stdout activity) / `stop` (pending→0) lifecycle.
 struct LivenessTimerState {
     /// Active timer future, None when inactive.
     timer: Option<LivenessTimer>,
@@ -181,80 +165,26 @@ impl LivenessTimerState {
     }
 }
 
-/// Handle to a running Reader Task, managing its lifetime via RAII.
+/// RAII handle for a Reader task: dropping cancels and detaches the task.
 ///
-/// This struct owns the resources needed to control and clean up the reader task.
-/// The underscore-prefixed fields indicate they are held for their Drop semantics
-/// rather than being explicitly accessed.
-///
-/// # Lifecycle and Drop Behavior
-///
-/// When this handle is dropped:
-///
-/// 1. **CancellationToken is dropped** - This cancels the token, which signals the
-///    reader loop's `select!` to exit via `cancel_token.cancelled()`. The reader
-///    loop checks this signal on each iteration and breaks cleanly when cancelled.
-///
-/// 2. **JoinHandle is dropped without awaiting** - This is intentional and safe
-///    because:
-///    - The reader task will exit promptly once cancelled (the `select!` ensures
-///      cancellation is checked on every loop iteration)
-///    - The reader task also exits on EOF or read error, handling the case where
-///      the downstream process terminates
-///    - Tokio tasks are detached when their JoinHandle is dropped; they continue
-///      running but we don't need to await completion
-///    - The task performs no critical cleanup that requires awaiting
-///
-/// # Why Not Await the JoinHandle?
-///
-/// Awaiting would require this drop to be async, which is not possible in Rust.
-/// The reader task is designed to exit quickly on cancellation (within one loop
-/// iteration), so fire-and-forget cleanup is appropriate here.
-///
-/// # Cross-Task Coordination (ADR-0015)
-///
-/// The cancellation token enables coordination between reader and writer tasks.
-/// When the writer task fails, it cancels the shared token, causing the reader
-/// to exit and preventing CPU spin on orphaned channels. Conversely, when the
-/// reader handle is dropped (e.g., during connection shutdown), the reader task
-/// receives the cancellation signal and exits cleanly.
-///
-/// # Resource Cleanup Guarantee
-///
-/// - The reader task holds only borrowed/Arc'd resources (BridgeReader, ResponseRouter)
-/// - On cancellation: logs shutdown, breaks from loop, task completes
-/// - On EOF/error: fails all pending requests via router, then exits
-/// - No resources are leaked regardless of exit path
+/// Drop semantics: cancelling the token unblocks the reader loop's `select!`;
+/// the JoinHandle is not awaited because async drop does not exist and the
+/// reader exits within one loop iteration on cancel/EOF/error. The shared
+/// token also lets a failing writer task cancel the reader (ADR-0015),
+/// avoiding CPU spin on orphaned channels.
 pub(crate) struct ReaderTaskHandle {
-    /// Join handle for the spawned reader task.
-    ///
-    /// Dropped without awaiting when this struct is dropped. This is safe because
-    /// the reader task exits promptly on cancellation, EOF, or read error.
     _join_handle: JoinHandle<()>,
 
-    /// Cancellation token to signal graceful shutdown.
-    ///
-    /// When dropped, the token is automatically cancelled, causing the reader
-    /// loop's `cancel_token.cancelled()` future to complete. This ensures the
-    /// reader task exits when the handle is dropped (RAII cleanup).
+    /// Dropping cancels the token, signalling the reader loop to exit.
     _cancel_token: CancellationToken,
 
-    /// Sender for liveness timer start notifications.
-    ///
-    /// Used by ConnectionHandle to notify the reader when the first request
-    /// is registered (pending 0->1), triggering the liveness timer to start.
+    /// Notify reader when pending count goes 0→1 so it starts the liveness timer.
     liveness_start_tx: mpsc::Sender<()>,
 
-    /// Sender for liveness timer stop notifications (ADR-0018 Phase 4).
-    ///
-    /// Used by ConnectionHandle to stop the liveness timer when shutdown begins.
-    /// Global shutdown (Tier 3) overrides liveness timeout (Tier 2).
+    /// Stop the liveness timer at shutdown so Tier 3 (global) overrides Tier 2 (ADR-0018).
     liveness_stop_tx: mpsc::Sender<()>,
 
-    /// Receiver for liveness failure notification (ADR-0014 Phase 3).
-    ///
-    /// When the liveness timeout fires, the reader task sends () on this channel.
-    /// ConnectionHandle checks this to transition to Failed state.
+    /// Reader fires this when liveness times out; ConnectionHandle reads it to enter Failed (ADR-0014).
     liveness_failed_rx: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
 }
 
@@ -280,12 +210,10 @@ impl ReaderTaskHandle {
         let _ = self.liveness_stop_tx.try_send(());
     }
 
-    /// Check if a liveness failure has been signaled.
+    /// Check if a liveness failure has been signaled (ConnectionHandle uses this
+    /// to transition to Failed).
     ///
-    /// Returns true if the reader task signaled a liveness timeout failure.
-    /// This is a one-time check - once it returns true, subsequent calls return false.
-    ///
-    /// Used by ConnectionHandle to detect liveness timeout and transition to Failed state.
+    /// One-time check: once it returns true, subsequent calls return false.
     pub(crate) fn check_liveness_failed(&self) -> bool {
         let mut guard = self
             .liveness_failed_rx
@@ -314,15 +242,8 @@ impl ReaderTaskHandle {
 
 /// Spawn a reader task that reads from stdout and routes responses.
 ///
-/// This is a convenience wrapper for tests that don't need liveness timeout.
-/// Production code should use `spawn_reader_task_with_liveness` directly.
-///
-/// # Arguments
-/// * `reader` - The BridgeReader to read messages from
-/// * `router` - The ResponseRouter to route responses to waiters
-///
-/// # Returns
-/// A ReaderTaskHandle for managing the spawned task.
+/// Convenience wrapper for tests that don't need liveness timeout; production
+/// code should use `spawn_reader_task_with_liveness` directly.
 #[cfg(test)]
 pub(crate) fn spawn_reader_task(
     reader: BridgeReader,
@@ -333,18 +254,9 @@ pub(crate) fn spawn_reader_task(
 
 /// Spawn a reader task with optional liveness timeout (no language context).
 ///
-/// This is a convenience wrapper for tests that don't need structured logging
-/// with language identifiers. Production code should use `spawn_reader_task_for_language`.
-///
-/// Creates dummy channel and registry for tests that don't need server request handling.
-///
-/// # Arguments
-/// * `reader` - The BridgeReader to read messages from
-/// * `router` - The ResponseRouter to route responses to waiters
-/// * `liveness_timeout` - Optional timeout for hung server detection (ADR-0014)
-///
-/// # Returns
-/// A ReaderTaskHandle for managing the spawned task.
+/// Convenience wrapper for tests that don't need structured logging with
+/// language identifiers (ADR-0014 liveness timeout); production code should use
+/// `spawn_reader_task_for_language`.
 #[cfg(test)]
 pub(crate) fn spawn_reader_task_with_liveness(
     reader: BridgeReader,
@@ -365,16 +277,8 @@ pub(crate) fn spawn_reader_task_with_liveness(
     )
 }
 
-/// Spawn a reader task with liveness timeout and language identifier for logging.
-///
-/// # Arguments
-/// * `reader` - The BridgeReader to read messages from
-/// * `router` - The ResponseRouter to route responses to waiters
-/// * `liveness_timeout` - Optional timeout for hung server detection (ADR-0014)
-/// * `language` - Language identifier for structured logging (e.g., "lua", "python")
-///
-/// # Returns
-/// A ReaderTaskHandle for managing the spawned task.
+/// Spawn a reader task with liveness timeout (ADR-0014) and language identifier
+/// for structured logging.
 pub(crate) fn spawn_reader_task_for_language(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
@@ -460,20 +364,12 @@ async fn reader_loop(
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
 
-/// The main reader loop with optional liveness timeout support.
+/// The main reader loop with optional liveness timeout support (ADR-0014).
 ///
-/// # Liveness Timer (ADR-0014)
-///
-/// When `liveness_timeout` is Some:
-/// - Timer starts when a notification is received on `liveness_start_rx` (pending 0->1)
-/// - Timer resets on any message received (response or notification)
-/// - Timer stops when pending count returns to 0 OR when stop notification received
-/// - Timer firing triggers Ready->Failed transition via router.fail_all() and signals via liveness_failed_tx
-///
-/// # Observability
-///
-/// When `language` is provided, all log messages include the language identifier
-/// for easier filtering in production (e.g., `[lua]` prefix in log messages).
+/// The liveness timer (when configured) detects a hung server: firing triggers a
+/// Ready→Failed transition via `router.fail_all()` and signals `liveness_failed_tx`.
+/// Its start/reset/stop lifecycle is driven by the `liveness_*` channels and stdout
+/// activity (see `LivenessTimerState`).
 async fn reader_loop_with_liveness(
     mut reader: BridgeReader,
     router: Arc<ResponseRouter>,
@@ -654,16 +550,10 @@ async fn handle_message(
 
 /// Handle a server-initiated request by dispatching on its method.
 ///
-/// Server-initiated requests have both `"id"` and `"method"` fields.
-/// We must send a JSON-RPC response back for each request.
-///
-/// # Error Handling
-///
-/// When param parsing fails for known methods (registerCapability,
-/// unregisterCapability), we respond with a JSON-RPC InvalidParams error
-/// (-32602). This is spec-correct: the LSP allows error responses to any
-/// request. If a downstream server cannot handle an error to its own
-/// request, that is a server bug.
+/// Every server-initiated request (both `"id"` and `"method"`) must get a
+/// JSON-RPC response. On param-parse failure for known methods we reply with an
+/// InvalidParams error (-32602): the LSP spec allows error responses to any
+/// request, so a server that can't handle one to its own request is buggy.
 async fn handle_server_request(
     message: serde_json::Value,
     lang_prefix: &str,

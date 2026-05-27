@@ -1,32 +1,13 @@
-//! Thread-safe set for tracking in-progress operations.
-//!
-//! This module provides `InProgressSet<T>`, a generic concurrent set for
-//! tracking operations that are currently in progress to prevent duplicates.
+//! Thread-safe set for deduping in-progress operations.
 
 use crate::error::LockResultExt;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-/// A thread-safe set for tracking in-progress operations.
-///
-/// This type is cheaply cloneable via `Arc` for sharing across async tasks.
-/// It provides atomic "try to start" semantics that return whether the caller
-/// was the one to initiate the operation.
-///
-/// # Example
-///
-/// ```ignore
-/// let tracker: InProgressSet<String> = InProgressSet::new();
-///
-/// // First caller wins
-/// assert!(tracker.try_start("task1"));
-/// assert!(!tracker.try_start("task1")); // Already in progress
-///
-/// // Mark as complete
-/// tracker.finish("task1");
-/// assert!(tracker.try_start("task1")); // Can start again
-/// ```
+/// Concurrent set with atomic "try to start" semantics: `try_start` returns
+/// `true` only for the first caller for that key. Cheaply cloneable via `Arc`
+/// so async tasks can share it.
 #[derive(Clone)]
 pub struct InProgressSet<T> {
     items: Arc<Mutex<HashSet<T>>>,

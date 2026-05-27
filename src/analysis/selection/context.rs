@@ -10,14 +10,9 @@ use tree_sitter::Node;
 
 /// Document-level context for SelectionRange building.
 ///
-/// Bundles the host document's text, position mapper, and AST root node.
-/// These values remain constant throughout the selection building process,
-/// even when recursively processing nested injections.
-///
-/// # Lifetime
-///
-/// The `'a` lifetime ties this context to the document's text and AST.
-/// The context should not outlive the document it references.
+/// Bundles the host document's text, position mapper, and AST root node, which
+/// stay constant throughout selection building even when recursing into nested
+/// injections.
 #[derive(Clone, Copy)]
 pub struct DocumentContext<'a> {
     /// The full host document text
@@ -32,13 +27,6 @@ pub struct DocumentContext<'a> {
 
 impl<'a> DocumentContext<'a> {
     /// Create a new DocumentContext.
-    ///
-    /// # Arguments
-    ///
-    /// * `text` - The full host document text
-    /// * `mapper` - Position mapper for byte-to-UTF16 conversion
-    /// * `root` - Root node of the host document's AST
-    /// * `base_language` - Language identifier (e.g., "rust", "markdown")
     pub fn new(
         text: &'a str,
         mapper: &'a PositionMapper,
@@ -56,14 +44,8 @@ impl<'a> DocumentContext<'a> {
 
 /// Injection-aware context for managing language resources and recursion depth.
 ///
-/// This struct bundles:
-/// - Language coordinator for loading parsers and injection queries
-/// - Parser pool for acquiring/releasing parsers efficiently
-/// - Current recursion depth for nested injections
-///
-/// Unlike `DocumentContext`, this context is mutable because:
-/// - Parser pool state changes on acquire/release
-/// - Depth increments on each recursion level
+/// Unlike `DocumentContext`, this context is mutable: the parser pool changes on
+/// acquire/release and the depth increments at each recursion level.
 pub struct InjectionContext<'a> {
     /// Language coordinator for getting parsers and injection queries
     pub coordinator: &'a LanguageCoordinator,
@@ -75,11 +57,6 @@ pub struct InjectionContext<'a> {
 
 impl<'a> InjectionContext<'a> {
     /// Create a new InjectionContext at depth 0.
-    ///
-    /// # Arguments
-    ///
-    /// * `coordinator` - Language coordinator for language services
-    /// * `parser_pool` - Parser pool for parser acquisition
     pub fn new(
         coordinator: &'a LanguageCoordinator,
         parser_pool: &'a mut DocumentParserPool,

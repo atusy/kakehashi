@@ -133,20 +133,8 @@ pub(crate) struct ActiveInjectionBounds {
     pub end_col: usize,
 }
 
-/// Calculate byte offsets for a line within a multiline token.
-///
-/// This helper computes the start and end byte positions for a specific line (row)
-/// within a multiline token, handling both host document and injected content coordinates.
-///
-/// # Arguments
-/// * `row` - The current row being processed (relative to content)
-/// * `start_pos` - Token start position in content coordinates
-/// * `end_pos` - Token end position in content coordinates
-/// * `content_start_col` - Column offset where injection starts in host line (0 for host content)
-/// * `content_line_len` - Length of the content line at this row
-///
-/// # Returns
-/// Tuple of (line_start_byte, line_end_byte) in host document coordinates
+/// Calculate the `(line_start_byte, line_end_byte)` host-coordinate offsets for one
+/// row of a multiline token, mapping from injected-content to host coordinates.
 fn calculate_line_byte_offsets(
     row: usize,
     start_pos: tree_sitter::Point,
@@ -279,19 +267,11 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
     prefix_widths
 }
 
-/// Collect tokens from a single document's highlight query (no injection processing).
+/// Collect tokens from a single document's highlight query (no injection processing),
+/// mapping positions from content-local to host document coordinates.
 ///
-/// This is the common logic shared by both pool-based and local-parser-based
-/// recursive functions. It processes the given query against the tree and
-/// maps positions from content-local coordinates to host document coordinates.
-///
-/// # Multiline Token Handling
-///
-/// When `supports_multiline` is true (client declares `multilineTokenSupport`),
-/// tokens spanning multiple lines are emitted as-is per LSP 3.16.0+ spec.
-///
-/// When `supports_multiline` is false, multiline tokens are split into per-line
-/// tokens for compatibility with clients that don't support multiline tokens.
+/// When `supports_multiline` is false, multiline tokens are split into per-line tokens
+/// for clients that lack `multilineTokenSupport` (LSP 3.16.0+).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_host_tokens(
     text: &str,

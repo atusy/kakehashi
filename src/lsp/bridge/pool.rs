@@ -1,22 +1,10 @@
-//! Language server pool for downstream language servers.
+//! Pool of downstream language-server connections (ADR-0016), keyed by
+//! `server_name` rather than `languageId` so multiple languages can share one
+//! process (e.g. `typescript` + `typescriptreact` → `tsgo`). Routing:
+//! `languageId` → `server_name` (config) → connection.
 //!
-//! This module provides the LanguageServerPool which manages connections to
-//! downstream language servers per ADR-0016 (Server Pool Coordination).
-//!
-//! # Server-Name-Based Pooling
-//!
-//! The pool is keyed by `server_name`, not by `languageId`. This enables:
-//! - **Process sharing**: Multiple languages can share a single process
-//!   (e.g., `typescript` and `typescriptreact` both mapping to `tsgo`)
-//! - **Decoupling**: Language identity is separate from server identity
-//!
-//! Routing flow: `languageId` → `server_name` (via config) → connection
-//!
-//! # Key Types
-//!
-//! - [`LanguageServerPool`]: Main pool managing all downstream connections
-//! - [`ConnectionHandle`]: Handle to a single downstream connection (ADR-0014)
-//! - [`ConnectionState`]: State machine for connection lifecycle
+//! [`LanguageServerPool`] manages the connections; [`ConnectionHandle`]
+//! (ADR-0014) and [`ConnectionState`] track each connection's lifecycle.
 
 mod connection_action;
 mod connection_handle;
@@ -59,14 +47,9 @@ use crate::error::LockResultExt;
 
 use super::protocol::{JsonRpcNotification, VirtualDocumentUri, build_didopen_notification};
 
-/// Timeout for LSP initialize handshake (ADR-0018 Tier 0: 30-60s recommended).
-///
-/// Used for:
-/// - Handshake timeout when spawning new server connections
-/// - Wait-for-ready timeout when diagnostic requests wait for initializing servers
-///
-/// If a downstream language server does not respond to the initialize request
-/// within this duration, the connection attempt fails with a timeout error.
+/// Timeout for the LSP initialize handshake and for wait-for-ready on an
+/// initializing server (ADR-0018 Tier 0: 30-60s recommended). A downstream
+/// server that doesn't respond within this window fails with a timeout error.
 pub(crate) const INIT_TIMEOUT_SECS: u64 = 30;
 
 use super::actor::{
@@ -74,17 +57,9 @@ use super::actor::{
 };
 use super::connection::AsyncBridgeConnection;
 
-/// Upstream request ID type supporting both numeric and string IDs per LSP spec.
-///
-/// The LSP specification allows request IDs to be either integers or strings:
-/// `id: integer | string`. This type provides a unified way to handle both types
-/// in the cancel forwarding infrastructure.
-///
-/// # LSP Spec Compliance
-///
-/// Per LSP 3.17: "interface CancelParams { id: integer | string; }"
-/// This type ensures we can forward cancel requests for clients using either ID type.
-///
+/// Upstream request ID carrying both numeric and string variants, since LSP
+/// defines `id: integer | string` (LSP 3.17 `CancelParams`). Both must be
+/// supported so cancel forwarding works regardless of which ID type the client uses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum UpstreamId {
     /// Numeric request ID (most common)
@@ -166,8 +141,6 @@ impl CancelForwardingMetrics {
     }
 
     /// Get the current metrics snapshot.
-    ///
-    /// Returns (successful, failed_no_connection, failed_not_ready, failed_unknown_id, failed_not_in_registry).
     #[cfg(test)]
     fn snapshot(&self) -> (u64, u64, u64, u64, u64) {
         (
@@ -180,60 +153,32 @@ impl CancelForwardingMetrics {
     }
 }
 
-/// Pool of connections to downstream language servers (ADR-0016).
+/// Pool of connections to downstream language servers (ADR-0016), one per
+/// `server_name`, with connections lazily initialized via the LSP handshake and
+/// per-connection state embedded in each `ConnectionHandle` (ADR-0015).
 ///
-/// Each server_name maps to exactly one downstream server connection.
-/// Multiple injection languages can share the same server (e.g., "ts" and "tsx" → "tsgo").
-///
-/// Provides lazy initialization of connections and handles the LSP handshake
-/// (initialize/initialized) for each language server.
-///
-/// Connection state is embedded in each ConnectionHandle (ADR-0015 per-connection state).
-///
-/// # External Usage
-///
-/// This type is public to allow creating a shared pool for the cancel forwarding
-/// middleware. Normal usage should go through `BridgeCoordinator`.
+/// `pub` so a shared pool can be wired into the cancel forwarding middleware;
+/// normal usage should go through `BridgeCoordinator`.
 pub struct LanguageServerPool {
     /// Map of server_name -> connection handle (wraps connection with its state)
     connections: Mutex<HashMap<String, Arc<ConnectionHandle>>>,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
     document_tracker: DocumentTracker,
-    /// Maps upstream request ID -> set of server names for cancel forwarding (ADR-0015).
+    /// Upstream request ID → set of downstream servers, for fan-out cancel
+    /// forwarding (ADR-0015). Multiple servers can share an ID when a single
+    /// upstream request (e.g. diagnostic) targets several injected languages.
     ///
-    /// When a request is sent to downstream server(s), we record the mapping so that
-    /// when a $/cancelRequest notification arrives with the upstream ID, we can look up
-    /// which server(s) to forward it to.
-    ///
-    /// For fan-out requests (e.g., textDocument/diagnostic with multiple injection regions
-    /// using different language servers), multiple servers may be registered for the same
-    /// upstream ID. Cancel notifications are forwarded to all registered servers.
-    ///
-    /// # Cleanup Behavior
-    ///
-    /// Entries are cleaned up via `unregister_upstream_request(id, server_name)` when:
-    /// - A response is received from a specific server (normal completion)
-    /// - A request fails before being sent to a specific server
-    ///
-    /// The entry is fully removed when all servers have been unregistered.
-    ///
-    /// Note: When a connection fails (via `ResponseRouter::fail_all()`), entries in
-    /// this registry are NOT automatically cleaned up because the ResponseRouter
-    /// doesn't have access to the pool. This is intentional:
-    /// - Stale entries are harmless (`forward_cancel_by_upstream_id()` checks
-    ///   connection state and fails gracefully for stale entries)
-    /// - Entries are cleaned up when new requests reuse the same upstream IDs
-    /// - This keeps the architecture simpler by avoiding circular dependencies
+    /// Cleaned per-server via `unregister_upstream_request` on response or
+    /// pre-send failure; the entry is removed when the last server unregisters.
+    /// Connection failure via `ResponseRouter::fail_all()` deliberately leaves
+    /// entries dangling to avoid a router→pool back-reference — stale lookups
+    /// fail gracefully and IDs get reused.
     upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashSet<String>>>,
     /// Metrics for cancel forwarding observability.
     cancel_metrics: CancelForwardingMetrics,
-    /// Tracks consecutive handshake task panics per server.
-    ///
-    /// When a handshake task panics (JoinError), we increment this counter.
-    /// When handshake succeeds, we reset it to 0.
-    /// If panic count reaches MAX_CONSECUTIVE_PANICS, we stop retrying.
-    ///
-    /// This prevents infinite retry loops when a server's handshake consistently panics.
+    /// Consecutive handshake-task panics per server (reset to 0 on success).
+    /// At `MAX_CONSECUTIVE_PANICS` we stop retrying, preventing an infinite
+    /// retry loop when a server's handshake consistently panics.
     consecutive_panic_counts: std::sync::Mutex<HashMap<String, u32>>,
     /// Workspace root URI forwarded from upstream client.
     ///
@@ -273,18 +218,9 @@ impl Default for LanguageServerPool {
 impl LanguageServerPool {
     /// Create a new language server pool.
     ///
-    /// This is public for cancel forwarding middleware setup. Create a shared
-    /// `Arc<LanguageServerPool>` and pass it to both `Kakehashi::with_pool()`
-    /// and `CancelForwarder::new()`.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let pool = Arc::new(LanguageServerPool::new());
-    /// let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
-    /// let kakehashi = Kakehashi::with_pool(pool);
-    /// let service = RequestIdCapture::with_cancel_forwarder(kakehashi, cancel_forwarder);
-    /// ```
+    /// `pub` for cancel forwarding middleware setup: a shared
+    /// `Arc<LanguageServerPool>` is passed to both `Kakehashi::with_pool()` and
+    /// `CancelForwarder::new()`.
     pub fn new() -> Self {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -404,15 +340,9 @@ impl LanguageServerPool {
 
     /// Take virtual documents matching the given ULIDs, removing them from tracking.
     ///
-    /// This is atomic: lookup and removal happen in a single lock acquisition,
-    /// preventing race conditions with concurrent didOpen requests.
-    ///
-    /// Returns the removed documents (for sending didClose). Documents that
-    /// were never opened (not in host_to_virtual) are not returned.
-    ///
-    /// # Arguments
-    /// * `host_uri` - The host document URI
-    /// * `invalidated_ulids` - ULIDs to match against virtual document URIs
+    /// Atomic: lookup and removal happen in a single lock acquisition, preventing
+    /// races with concurrent didOpen requests. Documents that were never opened
+    /// (not in `host_to_virtual`) are not returned.
     pub(crate) async fn remove_matching_virtual_docs(
         &self,
         host_uri: &Url,
@@ -423,16 +353,7 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Remove a document from all tracking state.
-    ///
-    /// Removes the document from version tracking and opened state.
-    /// Used by did_close module for cleanup and by
-    /// close_invalidated_virtual_docs for invalidated region cleanup.
-    ///
-    /// # Arguments
-    ///
-    /// * `virtual_uri` - The virtual document URI
-    /// * `server_name` - The server name for HashMap lookup
+    /// Remove a document from all tracking state (version tracking and opened state).
     pub(crate) async fn untrack_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -443,14 +364,11 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Check if a document has been claimed or opened on a downstream server (ADR-0015).
+    /// Whether a document has been claimed or opened on a downstream server (ADR-0015).
     ///
-    /// This is a fast, synchronous check used by request handlers and didChange
-    /// forwarding to gate operations on documents not yet known downstream.
-    ///
-    /// Returns true if `try_claim_for_open()` has been called for this document
-    /// (claims happen before the actual didOpen send, with rollback on failure).
-    /// Returns false if the document hasn't been claimed yet.
+    /// Fast synchronous check used to gate operations on documents not yet known
+    /// downstream. True once `try_claim_for_open()` has run — claims happen before
+    /// the didOpen send (with rollback on failure), so this can be true pre-send.
     pub(crate) fn is_document_opened(&self, virtual_uri: &VirtualDocumentUri) -> bool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
@@ -483,37 +401,17 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Ensure document is opened before sending a request.
+    /// Send `didOpen` for the virtual document if not already opened, registering
+    /// all tracking state on success. Callers handle error cleanup (router entry
+    /// and upstream-request registry).
     ///
-    /// Sends didOpen if the document hasn't been opened yet (side-effect-free check).
-    /// On success, registers all tracking state.
+    /// Uses `try_claim_for_open()` as a compare-and-swap so concurrent callers
+    /// skip the second didOpen. Registration of `host_to_virtual` happens before
+    /// the send so `close_host_document` can still find the doc if the task is
+    /// aborted between register and send; both are rolled back on send failure.
     ///
-    /// Callers are responsible for cleanup on error (removing router entry and
-    /// unregistering from upstream request registry).
-    ///
-    /// # Arguments
-    ///
-    /// * `sender` - Message sender for sending didOpen (either direct writer or channel)
-    /// * `host_uri` - The host document URI
-    /// * `virtual_uri` - The virtual document URI
-    /// * `virtual_content` - Content for the didOpen notification
-    /// * `server_name` - Server name for document tracking
-    ///
-    /// # Claim-Register-Send Pattern
-    ///
-    /// Uses `try_claim_for_open()` as an atomic compare-and-swap:
-    /// - First caller claims the URI (returns true)
-    /// - Concurrent callers see the claim and skip (returns false)
-    /// - Registration (host_to_virtual) happens BEFORE send, so
-    ///   `close_host_document` can find the document even if the task
-    ///   is aborted after registration
-    /// - On send failure, both claim and registration are rolled back
-    ///
-    /// # MessageSender Trait (ADR-0015)
-    ///
-    /// This function is generic over `MessageSender` for channel-based sends:
-    /// - `mpsc::Sender<OutboundMessage>`: Direct channel sender
-    /// - `ConnectionHandleSender`: Wrapper around `Arc<ConnectionHandle>`
+    /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
+    /// the single-writer-loop architecture (ADR-0015).
     pub(crate) async fn ensure_document_opened<S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
@@ -550,14 +448,8 @@ impl LanguageServerPool {
         Ok(())
     }
 
-    /// Increment the version of a virtual document and return the new version.
-    ///
-    /// Returns None if the document has not been opened.
-    ///
-    /// # Arguments
-    ///
-    /// * `virtual_uri` - The virtual document URI
-    /// * `server_name` - Server name for HashMap lookup
+    /// Increment the version of a virtual document and return the new version,
+    /// or `None` if the document has not been opened.
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -568,16 +460,8 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Get or create a connection for the specified server.
-    ///
-    /// If no connection exists, spawns the language server and performs
-    /// the LSP initialize/initialized handshake with default timeout.
-    ///
-    /// Returns the ConnectionHandle which wraps both the connection and its state.
-    ///
-    /// # Arguments
-    /// * `server_name` - The server name from config (e.g., "tsgo", "rust-analyzer")
-    /// * `server_config` - The server configuration containing command and options
+    /// Get or create a connection for the specified server, spawning the server
+    /// and running the LSP handshake with the default timeout on a miss.
     pub(super) async fn get_or_create_connection(
         &self,
         server_name: &str,
@@ -613,22 +497,9 @@ impl LanguageServerPool {
             .await;
     }
 
-    /// Get or create a connection, waiting for it to be ready if initializing.
-    ///
-    /// Unlike `get_or_create_connection()` which fails fast for initializing servers,
-    /// this method waits for the server to become Ready before returning.
-    ///
-    /// This is useful for diagnostic requests where waiting for server initialization
-    /// provides a better UX than immediately returning empty results.
-    ///
-    /// # Arguments
-    /// * `server_name` - The server name from config (e.g., "tsgo", "rust-analyzer")
-    /// * `server_config` - The server configuration containing command and options
-    /// * `timeout` - Maximum time to wait for the server to become ready
-    ///
-    /// # Returns
-    /// * `Ok(handle)` - Connection is Ready
-    /// * `Err` - Spawn failed, initialization failed, or timeout waiting for Ready
+    /// Get or create a connection, waiting (up to `timeout`) for it to reach Ready
+    /// instead of failing fast like `get_or_create_connection()`. Used by diagnostic
+    /// requests, where waiting through initialization beats returning empty results.
     pub(crate) async fn get_or_create_connection_wait_ready(
         &self,
         server_name: &str,
@@ -678,30 +549,11 @@ impl LanguageServerPool {
 }
 
 impl LanguageServerPool {
-    /// Get or create a connection for the specified server with custom timeout.
-    ///
-    /// If no connection exists, spawns the language server and stores the connection
-    /// in Initializing state immediately. A background task performs the LSP handshake.
-    /// Requests during initialization fail fast with "bridge: downstream server initializing".
-    ///
-    /// Returns the ConnectionHandle which wraps both the connection and its state.
-    /// State transitions per ADR-0015 Operation Gating:
-    /// - Initializing: fast-fail with REQUEST_FAILED
-    /// - Ready: proceed with request
-    /// - Failed: remove from pool and respawn
-    ///
-    /// # Architecture (ADR-0015 Fast-Fail)
-    ///
-    /// 1. Spawn server process
-    /// 2. Split into writer + reader immediately
-    /// 3. Store ConnectionHandle in Initializing state
-    /// 4. Spawn background task for LSP handshake
-    /// 5. Background task transitions to Ready or Failed
-    ///
-    /// # Arguments
-    /// * `server_name` - The server name from config (e.g., "tsgo", "rust-analyzer")
-    /// * `server_config` - The server configuration containing command and options
-    /// * `timeout` - Timeout for the LSP initialize handshake
+    /// Fast-fail get-or-spawn (ADR-0015): on miss, start the process, split
+    /// reader+writer, store the handle as `Initializing`, and run the LSP
+    /// initialize handshake in a background task that transitions Ready or
+    /// Failed. Requests against Initializing fail with REQUEST_FAILED; Failed
+    /// causes removal and respawn on the next call.
     async fn get_or_create_connection_with_timeout(
         &self,
         server_name: &str,
@@ -931,31 +783,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Forward a $/cancelRequest notification to a downstream language server.
+    /// Translate `upstream_id` to the downstream ID via the cancel map and send
+    /// `$/cancelRequest` to `server_name`. The pending entry stays in place: the
+    /// server may still respond with a result or `REQUEST_CANCELLED` (-32800).
     ///
-    /// Translates the upstream (client) request ID to the downstream (language server)
-    /// request ID using the cancel map, then sends the cancel notification.
-    ///
-    /// Per LSP spec, this does NOT remove the pending request entry - the server may
-    /// still respond with either a result or a REQUEST_CANCELLED error (-32800).
-    ///
-    /// # Arguments
-    /// * `server_name` - The server name from config (e.g., "tsgo", "rust-analyzer")
-    /// * `upstream_id` - The original request ID from the upstream client
-    ///
-    /// # Returns
-    /// * `Ok(())` - Cancel was forwarded, or silently dropped if not forwardable
-    /// * `Err(e)` - I/O error occurred while writing to the downstream server
-    ///
-    /// # Silent Drop Cases (Best-Effort Semantics)
-    ///
-    /// Per LSP spec, `$/cancelRequest` is a notification with best-effort semantics.
-    /// The following cases are silently dropped (return `Ok(())`) rather than failing:
-    /// - No connection exists for the server
-    /// - Connection is not in Ready state (still initializing or failed)
-    /// - Upstream ID not found in router (request already completed)
-    ///
-    /// Actual I/O errors when writing to the downstream server are propagated as `Err`.
+    /// Returns `Ok(())` when the cancel is unforwardable (no connection, not
+    /// Ready, or unknown upstream ID) per LSP best-effort semantics; only real
+    /// I/O write failures bubble up as `Err`.
     pub(crate) async fn forward_cancel(
         &self,
         server_name: &str,
@@ -1050,35 +884,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Forward a $/cancelRequest notification using only the upstream request ID.
+    /// Fan out `$/cancelRequest` to every server registered for `upstream_id`.
+    /// Invoked by `RequestIdCapture` when the client cancels.
     ///
-    /// This method looks up ALL server names from the upstream request registry,
-    /// then delegates to `forward_cancel(server_name, upstream_id)` for each server.
-    ///
-    /// For fan-out requests (e.g., diagnostic with multiple injection languages),
-    /// the cancel notification is forwarded to all registered servers. Individual
-    /// server failures are ignored (best-effort semantics).
-    ///
-    /// Called by the RequestIdCapture middleware when it intercepts a $/cancelRequest
-    /// notification from the client.
-    ///
-    /// # Arguments
-    /// * `upstream_id` - The request ID from the client's cancel notification
-    ///
-    /// # Returns
-    /// * `Ok(())` - Cancel was forwarded to all servers, or silently dropped if not forwardable
-    ///
-    /// # Silent Drop Cases (Best-Effort Semantics)
-    ///
-    /// Per LSP spec, `$/cancelRequest` is a notification with best-effort semantics.
-    /// The following cases are silently dropped (return `Ok(())`) rather than failing:
-    /// - Upstream ID not in registry (request not yet registered or already completed)
-    /// - Connection still initializing (can't forward cancels during handshake)
-    /// - Downstream ID not found (request already completed)
-    /// - Individual server failures (continues to next server)
-    ///
-    /// This prevents race conditions where canceling an in-flight request could
-    /// break server initialization.
+    /// LSP cancel is best-effort, so we silently return `Ok(())` (rather than
+    /// erroring) when: the ID is unknown, the connection is still initializing,
+    /// the downstream ID was already cleaned up, or an individual server send
+    /// fails. This avoids racing cancel against handshake completion.
     pub(crate) async fn forward_cancel_by_upstream_id(
         &self,
         upstream_id: UpstreamId,
@@ -1125,44 +937,16 @@ impl LanguageServerPool {
         Ok(())
     }
 
-    /// Register an upstream request ID -> server_name mapping for cancel forwarding.
+    /// Record `upstream_id → server_name` so `$/cancelRequest` from the client
+    /// can be forwarded to every downstream server handling that ID.
     ///
-    /// Called when a request is sent to a downstream server to enable $/cancelRequest
-    /// forwarding. When a cancel notification arrives from the client with the upstream ID,
-    /// we use this mapping to route the cancel to the correct downstream language server(s).
+    /// For fan-out (e.g. diagnostics dispatched to multiple injected languages),
+    /// callers register the same `upstream_id` once per server; the `HashSet`
+    /// ensures cancel reaches all of them.
     ///
-    /// For fan-out requests (e.g., diagnostic with multiple injection languages), this
-    /// method may be called multiple times with the same upstream_id but different
-    /// server_names. The HashSet ensures cancel is forwarded to all registered servers.
-    ///
-    /// # Cancel Forwarding Flow (Single Server)
-    ///
-    /// 1. Client sends request with ID 42
-    /// 2. Bridge creates downstream request with ID 7 and calls this method
-    /// 3. Client sends `$/cancelRequest { id: 42 }`
-    /// 4. Bridge looks up 42 in registry -> finds {"tsgo"}
-    /// 5. Bridge looks up 42 in ResponseRouter -> finds downstream ID 7
-    /// 6. Bridge sends `$/cancelRequest { id: 7 }` to tsgo server
-    ///
-    /// # Cancel Forwarding Flow (Multi-Server Fan-Out)
-    ///
-    /// 1. Client sends diagnostic request with ID 42
-    /// 2. Bridge sends to lua-ls and pyright, calling this method for each
-    /// 3. Registry now has: 42 -> {"lua-ls", "pyright"}
-    /// 4. Client sends `$/cancelRequest { id: 42 }`
-    /// 5. Bridge iterates over all servers and forwards cancel to each
-    ///
-    /// # Cleanup
-    ///
-    /// Callers MUST call `unregister_upstream_request(id, server_name)` when the request
-    /// completes for a specific server (whether success, error, or timeout). This is
-    /// typically done:
-    /// - After `wait_for_response()` returns
-    /// - In error cleanup callbacks passed to `ensure_document_opened()`
-    ///
-    /// # Arguments
-    /// * `upstream_id` - The original request ID from the upstream client
-    /// * `server_name` - The server name handling this request (e.g., "tsgo", "rust-analyzer")
+    /// Callers MUST call `unregister_upstream_request` per server on completion
+    /// (success, error, or timeout) — typically after `wait_for_response()` or
+    /// in `ensure_document_opened()` error cleanup — to avoid leaking entries.
     pub(crate) fn register_upstream_request(&self, upstream_id: UpstreamId, server_name: &str) {
         let mut registry = self
             .upstream_request_registry
@@ -1174,15 +958,9 @@ impl LanguageServerPool {
             .insert(server_name.to_string());
     }
 
-    /// Unregister an upstream request ID from the registry for a specific server.
-    ///
-    /// Called when a response is received (or error occurs) to clean up the mapping.
-    /// Removes only the specified server from the set; the entry is fully removed when
-    /// all servers have been unregistered.
-    ///
-    /// # Arguments
-    /// * `upstream_id` - The request ID to unregister
-    /// * `server_name` - The server name to remove from the set
+    /// Unregister an upstream request ID for a specific server on response/error.
+    /// Removes only that server from the set; the entry is fully removed once all
+    /// servers have been unregistered.
     pub(crate) fn unregister_upstream_request(&self, upstream_id: &UpstreamId, server_name: &str) {
         let mut registry = self
             .upstream_request_registry

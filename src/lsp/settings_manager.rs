@@ -1,21 +1,6 @@
-//! Settings management abstraction for LSP server.
-//!
-//! This module provides `SettingsManager`, which consolidates workspace settings,
-//! client capabilities, and root path management into a single cohesive struct.
-//!
-//! # Design Rationale
-//!
-//! Extracting settings management into a dedicated struct provides:
-//! - **Single Responsibility**: All configuration state in one place
-//! - **Testability**: Methods can be unit tested without full LSP setup
-//! - **Thread Safety**: Uses `ArcSwap` and `OnceLock` for concurrent access
-//!
-//! # Initialization Lifecycle
-//!
-//! The `SettingsManager` manages state that is set during `initialize()`:
-//! - `client_capabilities`: Set once via `set_capabilities()`
-//! - `root_path`: Set once via `set_root_path()`
-//! - `settings`: Can be updated via `apply_settings()`
+//! `SettingsManager`: workspace settings (`ArcSwap`, hot-swappable via
+//! `apply_settings`) plus initialize-only state — `client_capabilities` and
+//! `root_path` (both `OnceLock`, set once during `initialize()`).
 
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
@@ -31,19 +16,6 @@ use crate::config::{RawWorkspaceSettings, WorkspaceSettings};
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 
 /// Centralized manager for workspace settings, capabilities, and configuration.
-///
-/// `SettingsManager` encapsulates all configuration state, providing a clean API for:
-/// - Storing and retrieving workspace settings
-/// - Managing client capabilities (set once during initialize)
-/// - Tracking workspace root path
-/// - Checking capability-dependent features (e.g., semantic tokens refresh)
-/// - Auto-install configuration validation
-///
-/// # Thread Safety
-///
-/// `SettingsManager` is thread-safe:
-/// - `ArcSwap` for atomic updates to settings and root_path
-/// - `OnceLock` for one-time initialization of capabilities
 #[derive(Debug)]
 pub(crate) struct SettingsSnapshot {
     pub(crate) raw_settings: Arc<RawWorkspaceSettings>,
@@ -75,12 +47,7 @@ impl Default for SettingsManager {
 }
 
 impl SettingsManager {
-    /// Create a new `SettingsManager` with default settings.
-    ///
-    /// The manager starts with:
-    /// - Empty root path
-    /// - Default workspace settings
-    /// - Unset client capabilities (until initialize() calls set_capabilities)
+    /// Create a new `SettingsManager` with default settings and unset capabilities.
     pub(crate) fn new() -> Self {
         let raw_settings = crate::config::defaults::default_settings();
         let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
@@ -109,11 +76,8 @@ impl SettingsManager {
 
     /// Store client capabilities from initialize().
     ///
-    /// This should be called exactly once during the LSP initialize handshake.
-    /// Subsequent calls are ignored (OnceLock semantics).
-    ///
-    /// # Arguments
-    /// * `caps` - The client capabilities received in InitializeParams
+    /// Called once during the LSP initialize handshake; subsequent calls are
+    /// ignored (OnceLock semantics).
     pub(crate) fn set_capabilities(&self, caps: ClientCapabilities) {
         // OnceLock::set() returns Err if already set - ignore since LSP spec guarantees
         // initialize() is called exactly once per session.
@@ -141,23 +105,16 @@ impl SettingsManager {
     /// Called during initialize() to store the workspace root derived from
     /// `workspace_folders`, `root_uri` (deprecated but supported for backward
     /// compatibility), or the current working directory.
-    ///
-    /// # Arguments
-    /// * `path` - The workspace root path, or None if it couldn't be determined
     pub(crate) fn set_root_path(&self, path: Option<PathBuf>) {
         self.root_path.store(Arc::new(path));
     }
 
     /// Get the current workspace root path.
-    ///
-    /// Returns an Arc containing the optional path for efficient sharing.
     pub(crate) fn root_path(&self) -> Arc<Option<PathBuf>> {
         self.root_path.load_full()
     }
 
     /// Load the current workspace settings.
-    ///
-    /// Returns an Arc containing the settings for efficient sharing.
     pub(crate) fn load_settings(&self) -> Arc<WorkspaceSettings> {
         Arc::clone(&self.settings_snapshot.load().settings)
     }
@@ -172,12 +129,7 @@ impl SettingsManager {
         self.settings_snapshot.load_full()
     }
 
-    /// Apply new workspace settings.
-    ///
-    /// This stores the settings for later retrieval via `load_settings()`.
-    ///
-    /// # Arguments
-    /// * `settings` - The new workspace settings to apply
+    /// Apply new workspace settings for later retrieval via `load_settings()`.
     pub(crate) fn apply_settings(&self, settings: WorkspaceSettings) {
         let raw_settings = RawWorkspaceSettings::from(&settings);
         self.apply_settings_with_raw(raw_settings, settings);

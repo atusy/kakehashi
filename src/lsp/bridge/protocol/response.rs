@@ -1,20 +1,10 @@
-//! Response transformers for LSP bridge communication.
-//!
-//! This module provides type-safe functions to transform JSON-RPC responses from
-//! downstream language servers back to host document coordinates by applying a
-//! `RegionOffset` (line offset + first-line column adjustment) to coordinates.
-//!
-//! ## Function Signature Pattern
-//!
-//! Transform functions use the signature:
-//! `fn(response, request_virtual_uri, host_uri, offset: RegionOffset)`
-//!
-//! They return strongly-typed LSP types instead of JSON, with URI-based filtering:
-//! - Real file URIs → keep as-is (cross-file jumps)
-//! - Same virtual URI as request → transform coordinates
-//! - Different virtual URI → filter out (cross-region, can't transform safely)
-//!
-//! Examples: goto definition/type_definition/implementation/declaration
+//! Translate JSON-RPC responses from downstream servers back to host
+//! coordinates via `RegionOffset` (line offset + first-line column adjust),
+//! returning strongly-typed LSP values. All transformers share the signature
+//! `fn(response, request_virtual_uri, host_uri, offset: &RegionOffset)` and
+//! the same URI filter: keep real files (cross-file jumps), translate
+//! request-virtual-URI matches, drop other virtual URIs (cross-region offsets
+//! are unsafe). Used by goto definition/type_definition/implementation/declaration.
 
 use log::warn;
 
@@ -26,28 +16,14 @@ use tower_lsp_server::ls_types::{Location, LocationLink, Uri};
 // Type-safe goto-family transformers
 // =============================================================================
 
-/// Transform goto-family responses to typed Vec<LocationLink> format.
+/// Normalize the `Location | Location[] | LocationLink[]` shapes returned by
+/// goto-family endpoints (definition, type_definition, implementation, declaration)
+/// into `Vec<LocationLink>`, filtering URIs in the process: keep real files
+/// (cross-file jumps), translate matches on the request's virtual URI, drop
+/// other virtual URIs since cross-region offsets are unsafe.
 ///
-/// This function handles all goto-style endpoints (definition, type_definition,
-/// implementation, declaration) that return Location | Location[] | LocationLink[].
-///
-/// All response variants are normalized to Vec<LocationLink> for internal consistency,
-/// with proper URI filtering and coordinate transformation.
-///
-/// # URI Filtering Logic
-///
-/// - Real file URIs → keep as-is (cross-file jumps)
-/// - Same virtual URI as request → transform coordinates
-/// - Different virtual URI → filter out (cross-region, can't transform safely)
-///
-/// Empty arrays after filtering are preserved to distinguish "searched, found nothing"
-/// from "search failed" (None).
-///
-/// # Arguments
-/// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
-/// * `request_virtual_uri` - The virtual URI from the request
-/// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `offset` - The region offset for coordinate translation
+/// An empty filtered vec is preserved (not collapsed to `None`) so callers can
+/// distinguish "searched, no results" from "search failed".
 pub(crate) fn transform_goto_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
@@ -144,15 +120,8 @@ pub(crate) fn location_link_to_location(link: LocationLink) -> Location {
     }
 }
 
-/// Transform a single Location to host coordinates for goto endpoints.
-///
-/// Returns `None` if the location should be filtered out (cross-region virtual URI).
-///
-/// # URI Filtering Logic
-///
-/// 1. Real file URI → preserve as-is (cross-file jump to real file) - KEEP
-/// 2. Same virtual URI as request → transform using request's context - KEEP
-/// 3. Different virtual URI → cross-region jump - FILTER OUT
+/// Transform a single Location to host coordinates for goto endpoints, returning
+/// `None` to filter out a cross-region virtual URI (its offsets are unsafe here).
 pub(crate) fn transform_location_for_goto(
     mut location: Location,
     request_virtual_uri: &str,
@@ -177,12 +146,9 @@ pub(crate) fn transform_location_for_goto(
     None
 }
 
-/// Transform a single LocationLink to host coordinates for goto endpoints.
-///
-/// Returns `None` if the location should be filtered out (cross-region virtual URI).
-///
-/// All ranges (targetRange, targetSelectionRange, originSelectionRange) are in virtual
-/// coordinates from the downstream server and need the region offset applied.
+/// Transform a single LocationLink to host coordinates for goto endpoints, applying
+/// the region offset to all of its ranges (targetRange, targetSelectionRange,
+/// originSelectionRange) and returning `None` to filter out a cross-region virtual URI.
 fn transform_location_link_for_goto(
     mut link: LocationLink,
     request_virtual_uri: &str,

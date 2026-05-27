@@ -83,11 +83,8 @@ fn build_moniker_request(
 
 /// Transform a moniker response from the downstream language server.
 ///
-/// Moniker responses are arrays of items with scheme, identifier, unique, and kind.
-/// These are non-coordinate data, so no line transformation is needed.
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
+/// Moniker fields (scheme, identifier, unique, kind) are non-coordinate data,
+/// so no line/range transformation is needed.
 fn transform_moniker_response_to_host(mut response: serde_json::Value) -> Option<Vec<Moniker>> {
     if let Some(error) = response.get("error") {
         warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/moniker: {}", error);

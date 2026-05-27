@@ -21,14 +21,9 @@ use crate::lsp::bridge::protocol::JsonRpcNotification;
 
 /// Abstraction for sending messages to a downstream language server.
 ///
-/// This trait provides a unified interface for channel-based message sending
-/// per ADR-0015 (single-writer loop pattern).
-///
-/// # Error Handling
-///
-/// The `send_notification` method returns `io::Result<()>`:
-/// - `ErrorKind::BrokenPipe` if the channel is closed
-/// - `ErrorKind::WouldBlock` if the channel is full (non-blocking backpressure)
+/// Unified channel-based sending per ADR-0015 (single-writer loop). Errors map
+/// to `ErrorKind::BrokenPipe` (channel closed) and `ErrorKind::WouldBlock`
+/// (channel full — non-blocking backpressure).
 pub(crate) trait MessageSender: Send {
     /// Send a notification to the downstream language server.
     ///

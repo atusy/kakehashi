@@ -44,15 +44,9 @@ pub fn is_range_strictly_larger(a: &Range, b: &Range) -> bool {
 
 /// Skip host selection ranges until we find one that is strictly larger than the tail range.
 ///
-/// This ensures LSP selection ranges are strictly expanding (no duplicates or contained ranges).
-/// Used when chaining injected selection hierarchies to host document hierarchies.
-///
-/// # Arguments
-/// * `host` - The starting host selection range (may be None)
-/// * `tail_range` - The range to compare against
-///
-/// # Returns
-/// The first SelectionRange in the host chain that strictly contains `tail_range`, or None
+/// Enforces the LSP requirement that selection ranges strictly expand (no
+/// duplicates or contained ranges) when chaining an injected hierarchy onto
+/// the host document hierarchy.
 pub fn skip_to_distinct_host(
     host: Option<SelectionRange>,
     tail_range: &Range,
@@ -70,16 +64,9 @@ pub fn skip_to_distinct_host(
 
 /// Chain the injected selection hierarchy to the host document hierarchy.
 ///
-/// This function finds the tail (root) of the injected selection chain and connects
-/// it to the first host selection range that is strictly larger. This ensures the
-/// combined hierarchy has strictly expanding ranges as required by LSP spec.
-///
-/// # Arguments
-/// * `injected` - The injected selection range (will be modified)
-/// * `host` - The host document's selection range to connect to
-///
-/// # Returns
-/// The injected SelectionRange with its tail connected to the appropriate host range
+/// Connects the tail (root) of the injected chain to the first host range that
+/// is strictly larger, so the combined hierarchy keeps the strictly-expanding
+/// ranges the LSP spec requires.
 pub fn chain_injected_to_host(
     mut injected: SelectionRange,
     host: Option<SelectionRange>,
