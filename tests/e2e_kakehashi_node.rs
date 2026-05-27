@@ -1,9 +1,10 @@
-//! End-to-end tests for `kakehashi/node`, `kakehashi/node/text`, and
-//! `kakehashi/node/parent` (ADR-0025 PR-1 + PR-2).
+//! End-to-end tests for `kakehashi/node`, `kakehashi/node/text`,
+//! `kakehashi/node/parent`, and `kakehashi/node/children` (ADR-0025 PR-1 + PR-2 + PR-3).
 //!
 //! Covers the entry-point method (position → NodeInfo), the text resolution
 //! method (id → current node text), the parent navigation method
-//! (child id → parent NodeInfo), and their interaction with `didChange`:
+//! (child id → parent NodeInfo), the children navigation method
+//! (parent id → NodeInfo[]), and their interaction with `didChange`:
 //!
 //! - smallest-at-cursor lookup for named-or-anonymous nodes (host language only)
 //! - end-of-document exception (`b == L && L > 0 && e == L`)
@@ -11,6 +12,9 @@
 //! - `kakehashi/node/text` returning the live slice for a tracked node
 //! - `kakehashi/node/parent` walking one step toward the root
 //! - parent returning null at the root and for unknown ids
+//! - `kakehashi/node/children` returning siblings in document order
+//! - children returning `[]` (NOT `null`) for a leaf node
+//! - children returning `null` for unknown ids
 //! - ULID survival across position-adjusting edits
 //! - ULID invalidation when the edit covers the node's START byte
 //!
@@ -84,6 +88,27 @@ fn request_node_parent(client: &mut LspClient, uri: &str, id: &str) -> Value {
     assert!(
         response.get("error").is_none(),
         "kakehashi/node/parent returned an error: {:?}",
+        response.get("error")
+    );
+    response
+        .get("result")
+        .cloned()
+        .expect("response must contain a result field")
+}
+
+/// Send `kakehashi/node/children` for an id and unwrap the `result` field
+/// (which may be `null`, an empty array, or a non-empty array).
+fn request_node_children(client: &mut LspClient, uri: &str, id: &str) -> Value {
+    let response = client.send_request(
+        "kakehashi/node/children",
+        json!({
+            "textDocument": { "uri": uri },
+            "id": id
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "kakehashi/node/children returned an error: {:?}",
         response.get("error")
     );
     response
@@ -512,6 +537,204 @@ fn test_node_parent_returns_null_for_unknown_id() {
     assert!(
         result.is_null(),
         "unknown id must resolve to null, got {:?}",
+        result
+    );
+}
+
+/// `kakehashi/node/children` returns the immediate children of a tracked node
+/// in **document order** (ADR-0025 §"Navigation Methods" — Ordering). The
+/// response includes BOTH named and anonymous children. The order invariant is
+/// expressed as a non-decreasing `start_byte` across the returned sequence —
+/// tree-sitter siblings are non-overlapping so the invariant is in fact strict
+/// ascent, but we use `<=` here to avoid coupling the test to that detail.
+#[test]
+fn test_node_children_returns_siblings_in_document_order() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_children_order.md";
+    // A paragraph with several inline children: plain text, emphasis, more text.
+    // tree-sitter-markdown will produce multiple inline children for the paragraph.
+    let text = "# Heading\n\nplain **bold** more text.\n";
+    open_markdown(&mut client, uri, text);
+
+    // Cursor on the paragraph's plain leading text — we then walk to the parent
+    // until we find a node with multiple children.
+    let leaf = request_node(&mut client, uri, 2, 0);
+    assert!(!leaf.is_null(), "expected NodeInfo at paragraph start");
+    let leaf_id = leaf
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("leaf id must be a string")
+        .to_string();
+
+    // Walk up until we find a parent with more than one child so the ordering
+    // assertion has something to assert against.
+    let mut current_id = leaf_id;
+    let children: Vec<Value>;
+    let mut hops = 0;
+    let max_hops = 16;
+    loop {
+        let response = request_node_children(&mut client, uri, &current_id);
+        assert!(
+            !response.is_null(),
+            "kakehashi/node/children must return an array (possibly empty) for a known id, got null at hop {}",
+            hops
+        );
+        let arr = response
+            .as_array()
+            .expect("children response must be a JSON array")
+            .clone();
+        if arr.len() >= 2 {
+            children = arr;
+            break;
+        }
+        // Climb one level via /parent.
+        let parent = request_node_parent(&mut client, uri, &current_id);
+        assert!(
+            !parent.is_null(),
+            "ran out of ancestors before finding a multi-child parent"
+        );
+        current_id = parent
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("parent id must be a string")
+            .to_string();
+        hops += 1;
+        assert!(
+            hops <= max_hops,
+            "walked {} ancestors without finding a multi-child node; tree is unexpectedly thin",
+            hops
+        );
+    }
+
+    // Each child must be a well-formed NodeInfo with id + type.
+    for (i, child) in children.iter().enumerate() {
+        let id = child
+            .get("id")
+            .unwrap_or_else(|| panic!("child {} missing id field: {:?}", i, child));
+        assert_ulid_shaped(id);
+        let ty = child
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("child {} missing string type field: {:?}", i, child));
+        assert!(
+            !ty.is_empty(),
+            "child {} has empty type field: {:?}",
+            i,
+            child
+        );
+    }
+
+    // Document-order invariant: walk each adjacent pair and confirm that each
+    // child's text appears no later in the document than the next child's text.
+    // We use `/text` lookups instead of byte ranges (the protocol does not expose
+    // ranges in NodeInfo) and locate each in the original document via `find`.
+    let mut last_pos: Option<usize> = None;
+    for (i, child) in children.iter().enumerate() {
+        let id = child
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("child id must be a string");
+        let text_response = request_node_text(&mut client, uri, id);
+        // Text MAY be null for a child with zero-width range (rare but legal);
+        // skip those — they cannot violate order on their own.
+        let Some(slice) = text_response.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if slice.is_empty() {
+            continue;
+        }
+        let Some(pos) = text.find(slice) else {
+            // Anonymous tokens may have text that recurs; if `find` fails the
+            // grammar emitted something we can't easily locate. Skip rather
+            // than fail the ordering check on a non-locatable child.
+            continue;
+        };
+        if let Some(prev) = last_pos {
+            assert!(
+                prev <= pos,
+                "children must be in document order: child {} found at byte {} but previous child ended at byte >= {}",
+                i,
+                pos,
+                prev
+            );
+        }
+        last_pos = Some(pos);
+    }
+}
+
+/// A leaf node (no children) must return `[]`, NOT `null`. ADR-0025 explicitly
+/// distinguishes "node exists but is empty" (`[]`) from "id not in tracker"
+/// (`null`).
+#[test]
+fn test_node_children_returns_empty_array_for_leaf_node() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_children_leaf.md";
+    let text = "# Heading\n\nparagraph text.\n";
+    open_markdown(&mut client, uri, text);
+
+    // Walk down to a leaf by repeatedly fetching children[0] until the array
+    // comes back empty. Bounded by a small hop count to avoid infinite loops.
+    let root = request_node(&mut client, uri, 0, 0);
+    assert!(!root.is_null(), "expected NodeInfo at document start");
+    let mut current_id = root
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id must be a string")
+        .to_string();
+
+    let mut hops = 0;
+    let max_hops = 16;
+    loop {
+        let response = request_node_children(&mut client, uri, &current_id);
+        assert!(
+            !response.is_null(),
+            "children of a tracked id must never be null (got null at hop {})",
+            hops
+        );
+        let arr = response
+            .as_array()
+            .expect("children response must be a JSON array")
+            .clone();
+        if arr.is_empty() {
+            // Leaf node — empty-array case verified. Test passes.
+            return;
+        }
+        // Descend into the first child.
+        current_id = arr[0]
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("child id must be a string")
+            .to_string();
+        hops += 1;
+        assert!(
+            hops <= max_hops,
+            "descended {} levels without finding a leaf; tree is unexpectedly deep",
+            hops
+        );
+    }
+}
+
+/// A ULID that was never issued by this server must resolve to null for
+/// `kakehashi/node/children` (ADR-0025 §"Navigation Methods" — `null` cases).
+#[test]
+fn test_node_children_returns_null_for_unknown_id() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_children_unknown.md";
+    open_markdown(&mut client, uri, "# Hello\n");
+
+    // A syntactically valid ULID that we never asked the server to issue.
+    let stray_id = "01HXXXXXXXXXXXXXXXXXXXXXXX";
+
+    let result = request_node_children(&mut client, uri, stray_id);
+    assert!(
+        result.is_null(),
+        "unknown id must resolve to null (not []), got {:?}",
         result
     );
 }
