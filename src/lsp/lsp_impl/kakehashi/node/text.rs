@@ -54,30 +54,33 @@ impl Kakehashi {
         };
 
         // Slice the current document text. The tracker keeps positions in sync
-        // with didChange (ADR-0019 adjust_for_edits), so start/end should land on
-        // UTF-8 boundaries; guard against unexpected out-of-range or mid-char
-        // values defensively.
-        let Some(doc) = self.documents.get(&uri) else {
-            return Ok(Value::Null);
-        };
-        let text = doc.text();
-        if end > text.len() || start > end {
-            // Defensive: tracker entry drifted past current document length.
-            log::warn!(
-                target: "kakehashi::node::text",
-                "tracked range [{}, {}) exceeds document length {} for {}",
-                start, end, text.len(), uri
-            );
-            return Ok(Value::Null);
-        }
-        let Some(slice) = text.get(start..end) else {
-            // Range lands inside a multi-byte character — bail rather than panic.
-            log::warn!(
-                target: "kakehashi::node::text",
-                "tracked range [{}, {}) is not on UTF-8 boundaries for {}",
-                start, end, uri
-            );
-            return Ok(Value::Null);
+        // with didChange (ADR-0019 adjust_for_edits), so start/end should land
+        // on UTF-8 boundaries; guard against unexpected out-of-range or mid-
+        // char values defensively. Scope the DashMap read guard to the slice
+        // extraction only so concurrent writers (didChange) are not blocked by
+        // the JSON serialization afterwards.
+        let slice = {
+            let Some(doc) = self.documents.get(&uri) else {
+                return Ok(Value::Null);
+            };
+            let text = doc.text();
+            if end > text.len() || start > end {
+                log::warn!(
+                    target: "kakehashi::node::text",
+                    "tracked range [{}, {}) exceeds document length {} for {}",
+                    start, end, text.len(), uri
+                );
+                return Ok(Value::Null);
+            }
+            let Some(slice) = text.get(start..end) else {
+                log::warn!(
+                    target: "kakehashi::node::text",
+                    "tracked range [{}, {}) is not on UTF-8 boundaries for {}",
+                    start, end, uri
+                );
+                return Ok(Value::Null);
+            };
+            slice.to_string()
         };
 
         Ok(json!({ "text": slice }))

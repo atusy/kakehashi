@@ -145,8 +145,27 @@ impl Kakehashi {
             .await;
 
         if let Some(tree) = parsed {
-            self.documents
-                .update_document(uri.clone(), text, Some(tree));
+            // Race guard: between the text snapshot above and parse completion,
+            // a didChange may have updated the document. Storing our tree would
+            // associate it with stale text, breaking the (text, tree) consistency
+            // invariant. Compare against the current text and discard if it has
+            // moved; the next request will re-trigger the parse against the
+            // newer text.
+            let text_unchanged = self
+                .documents
+                .get(uri)
+                .map(|doc| doc.text() == text)
+                .unwrap_or(false);
+            if text_unchanged {
+                self.documents
+                    .update_document(uri.clone(), text, Some(tree));
+            } else {
+                log::debug!(
+                    target: "kakehashi::node",
+                    "discarding on-demand parse for {} — text changed during parse",
+                    uri
+                );
+            }
         }
     }
 }
@@ -171,7 +190,17 @@ fn smallest_containing_node(
         // Tree-sitter's `descendant_for_byte_range(L, L)` returns None at end-of-document
         // because no node strictly contains the past-the-end byte. Walk the right spine
         // of the root manually instead.
-        return Some(deepest_node_ending_at(root, doc_len));
+        //
+        // Guard against pathological trees whose root end_byte < doc_len (trailing
+        // bytes that the parser failed to attach to any node, e.g. an unparsed
+        // tail after an error). In that case there is no node whose end coincides
+        // with the document end and the exception cannot apply.
+        let candidate = deepest_node_ending_at(root, doc_len);
+        return if candidate.end_byte() == doc_len {
+            Some(candidate)
+        } else {
+            None
+        };
     }
 
     // Standard half-open lookup: smallest node with start_byte <= byte < end_byte.
