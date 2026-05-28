@@ -116,11 +116,8 @@ impl InjectionCoordinator {
         regions
             .iter()
             .map(|region| {
-                let region_id = InjectionResolver::calculate_region_id(
-                    self.bridge.node_tracker(),
-                    uri,
-                    region,
-                );
+                let region_id =
+                    InjectionResolver::calculate_region_id(self.bridge.node_tracker(), uri, region);
                 let included_ranges = crate::language::injection::compute_included_ranges(
                     &region.content_node,
                     region.include_children,

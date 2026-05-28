@@ -1,7 +1,7 @@
 use crate::language::LanguageCoordinator;
+use crate::language::node_tracker::NodeTracker;
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
 use crate::language::query_predicates::check_predicate;
-use crate::language::node_tracker::NodeTracker;
 use crate::text::fnv1a_hash;
 use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingIterator, Tree};
 use ulid::Ulid;

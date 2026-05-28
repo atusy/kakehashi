@@ -349,8 +349,7 @@ impl BridgeCoordinator {
     /// Used when InputEdits are not available (full document sync).
     /// Returns ULIDs that were invalidated.
     pub(crate) fn apply_text_diff(&self, uri: &Url, old_text: &str, new_text: &str) -> Vec<Ulid> {
-        self.node_tracker
-            .apply_text_diff(uri, old_text, new_text)
+        self.node_tracker.apply_text_diff(uri, old_text, new_text)
     }
 
     /// Remove all tracked regions for a document.

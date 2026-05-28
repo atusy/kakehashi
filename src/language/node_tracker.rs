@@ -778,7 +778,10 @@ mod tests {
         // Delete [30, 35) before the node → shift by -5.
         let edits = vec![EditInfo::new(30, 35, 30)];
         let invalidated = tracker.apply_input_edits(&uri, &edits);
-        assert!(invalidated.is_empty(), "edit before node must not invalidate");
+        assert!(
+            invalidated.is_empty(),
+            "edit before node must not invalidate"
+        );
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),

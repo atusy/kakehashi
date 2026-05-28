@@ -166,7 +166,8 @@ fn test_node_text_survives_edit_that_does_not_touch_start() {
     assert!(
         edited.contains(after_text),
         "post-edit text {:?} must be a substring of the new document {:?}",
-        after_text, edited
+        after_text,
+        edited
     );
 }
 

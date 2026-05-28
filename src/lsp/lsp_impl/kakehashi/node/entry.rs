@@ -145,7 +145,8 @@ impl Kakehashi {
             .await;
 
         if let Some(tree) = parsed {
-            self.documents.update_document(uri.clone(), text, Some(tree));
+            self.documents
+                .update_document(uri.clone(), text, Some(tree));
         }
     }
 }
