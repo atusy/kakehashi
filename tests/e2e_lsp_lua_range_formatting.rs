@@ -111,19 +111,27 @@ fn e2e_range_formatting_request_returns_host_coordinate_edits() {
             .expect("range formatting result must be null or TextEdit[]");
         println!("E2E: Got {} TextEdit(s)", edits.len());
 
-        // Code fence opens on host line 2 (after "# Test Document\n\n```lua\n").
-        // Every returned edit's start must land at or after line 2 — any
-        // earlier line would indicate a coordinate-translation bug. The
-        // requested range ended at line 5, so an edit at line >= 6 would
-        // mean the formatter overran our request.
+        // Host line layout:
+        //   line 0: "# Test Document"
+        //   line 1: ""
+        //   line 2: "```lua"          ← fence open (NOT inside the injection)
+        //   line 3: "local  x   =   1" ← injected lua, content line
+        //   line 4: "local y=2"        ← injected lua, content line
+        //   line 5: "```"              ← fence close (NOT inside the injection)
+        //
+        // The request range is (3, 0)..(5, 0): exclusive at line 5, so
+        // valid edit starts cover only lines 3..=4. Allowing line 2 or 5
+        // would mean a range-clipping / coordinate-translation bug
+        // produced edits outside the user's selection. Allowing line < 2
+        // would mean the bridge translated past the fence open.
         for edit in edits {
             let start_line = edit["range"]["start"]["line"]
                 .as_u64()
                 .expect("TextEdit.range.start.line must be a number");
             assert!(
-                (2..=5).contains(&start_line),
-                "Edit must land inside the code fence and within the requested range \
-                 (expected 2..=5, got {}). Full edit: {:?}",
+                (3..=4).contains(&start_line),
+                "Edit must land on a content line inside the user's selection \
+                 (expected 3..=4, got {}). Full edit: {:?}",
                 start_line,
                 edit
             );

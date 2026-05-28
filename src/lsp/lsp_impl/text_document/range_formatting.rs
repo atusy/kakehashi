@@ -3,19 +3,19 @@
 //! Range formatting is the partial-document counterpart of full formatting:
 //! it carries a `Range` and is expected to return edits that only modify
 //! that range. Implementation reuses the full-formatting fan-out shape (one
-//! `dispatch_preferred` per injection region) but pre-filters regions to
-//! those that overlap the requested range and **clips the request range to
-//! each region's bounds** before dispatching. Without that clip, an
-//! injection that the request only partially covers would be asked to
-//! format outside the user's selection.
+//! `dispatch_preferred` per injection region) but clips the request to
+//! each region's `byte_range` before dispatching — so an inline injection
+//! (`start_column > 0`) that the request only partially covers is never
+//! asked to format positions outside the injected content.
 //!
-//! Edits returned for non-overlapping regions are skipped entirely.
+//! Regions whose byte range is disjoint from the request are skipped
+//! entirely; no downstream request is sent.
 
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentRangeFormattingParams, Position, Range, TextEdit};
+use tower_lsp_server::ls_types::{DocumentRangeFormattingParams, Range, TextEdit};
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
@@ -85,44 +85,44 @@ impl Kakehashi {
         let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
 
-        // Byte-level overlap pre-check uses the actual host text. The
-        // line-only `clip_request_range_to_region` below is correct for
-        // multi-line injections (code fences etc., `start_column == 0`),
-        // but for inline injections (`start_column > 0`, e.g. backtick
-        // code inside a markdown paragraph) it would treat the same line
-        // as overlapping even when the request is entirely before the
-        // injected content. Using the region's `byte_range` against the
-        // request's byte span filters those out before we ask a
-        // downstream formatter for a zero-width / before-injection range.
+        // Clip the request to each region's actual byte bounds (not just
+        // its line span). Line-only clipping is incorrect for two cases
+        // that matter for inline injections (`start_column > 0`):
+        //
+        // 1. Request shares a line with the injection but lies entirely
+        //    before/after the injected content. Byte intersection
+        //    correctly skips the region; line-only would mis-overlap.
+        // 2. Request straddles an injection boundary (e.g., starts before
+        //    the injection's opening column, ends past its closing
+        //    column on the same line). Byte intersection clips the
+        //    endpoints to the injected content; line-only would pass the
+        //    out-of-bounds columns to `translate_host_range_to_virtual`,
+        //    where `saturating_sub` produces a virtual range past the
+        //    virtual document's actual columns and the downstream
+        //    formatter may error or format more than the user selected.
+        //
+        // Multi-line code-fence injections (`start_column == 0`) are
+        // unchanged because their line and byte bounds are equivalent.
         let mapper = PositionMapper::new(snapshot.text());
-        let request_bytes = mapper
+        let Some(request_bytes) = mapper
             .position_to_byte(host_range.start)
             .zip(mapper.position_to_byte(host_range.end))
-            .map(|(start, end)| start..end);
+            .map(|(start, end)| start..end)
+        else {
+            log::debug!(
+                target: "kakehashi::rangeFormatting",
+                "Could not map request range to byte offsets for {}",
+                uri
+            );
+            return Ok(None);
+        };
 
         let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
         for resolved in all_regions {
-            // Skip regions whose host byte range does not actually overlap
-            // the request — protects against inline-injection
-            // false-positives that the line-only clip below would miss.
-            if let Some(ref req_bytes) = request_bytes
-                && (req_bytes.end <= resolved.region.byte_range.start
-                    || req_bytes.start >= resolved.region.byte_range.end)
-            {
-                continue;
-            }
-
-            // Clip the editor-supplied range to this region's host line
-            // bounds. After the byte-level overlap check above, this is
-            // safe to do in line space — any column saturation inside
-            // `translate_host_range_to_virtual` only fires on partial
-            // overlaps that already passed the byte check.
-            let Some(clipped_host_range) = clip_request_range_to_region(
-                host_range,
-                resolved.region.line_range.start,
-                resolved.region.line_range.end,
-            ) else {
+            let Some(clipped_host_range) =
+                clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
+            else {
                 continue;
             };
 
@@ -197,66 +197,33 @@ impl Kakehashi {
     }
 }
 
-/// Clip an editor-supplied `Range` to a region's host-line bounds.
+/// Intersect a request's byte range with a region's byte range and map the
+/// result back to host LSP positions.
 ///
-/// `region_line_lo..region_line_hi_exclusive` describes the region's host
-/// line span (matching `CacheableInjectionRegion::line_range`, which is
-/// half-open). Returns `None` when the request range does not overlap the
-/// region at all — the handler skips such regions outright.
+/// Returns `None` when the intervals are disjoint — the handler skips such
+/// regions. Returns the clipped host `Range` otherwise, with both endpoints
+/// converted from byte offsets back to LSP `Position`s via `mapper`.
 ///
-/// Overlap is computed in line space using half-open intervals:
-///
-/// - Region span: `[region_line_lo, region_line_hi_exclusive)`
-/// - Request span: `[req.start.line, req.end.line)` when `req.end.character == 0`;
-///   otherwise `[req.start.line, req.end.line + 1)` so a selection ending
-///   mid-line still counts that line as covered.
-///
-/// The returned range preserves the request's endpoints whenever they lie
-/// inside the region; endpoints that fall outside snap to the region's
-/// boundary at column 0 (start of the boundary line).
-fn clip_request_range_to_region(
-    request: Range,
-    region_line_lo: u32,
-    region_line_hi_exclusive: u32,
+/// Byte-precision clipping is what makes `range_formatting_impl` safe for
+/// inline injections (`start_column > 0`). A line-only clip would
+/// (1) treat a same-line request that lies entirely before/after the
+/// injected content as overlapping, and (2) pass host columns outside the
+/// injected content to `translate_host_range_to_virtual`, where
+/// `saturating_sub` would produce a virtual range past the virtual
+/// document's actual columns.
+fn clip_request_to_region(
+    request_bytes: &std::ops::Range<usize>,
+    region_bytes: &std::ops::Range<usize>,
+    mapper: &PositionMapper,
 ) -> Option<Range> {
-    let req_lo = request.start.line;
-    // Per LSP, `Range.end` is exclusive. When `end.character == 0`, the end
-    // sits at the start of a line — that line is NOT included in the
-    // selection. For all other end characters, the end line IS covered.
-    let req_hi_exclusive = if request.end.character == 0 {
-        request.end.line
-    } else {
-        request.end.line.saturating_add(1)
-    };
-
-    let clipped_lo = req_lo.max(region_line_lo);
-    let clipped_hi_exclusive = req_hi_exclusive.min(region_line_hi_exclusive);
-
-    if clipped_lo >= clipped_hi_exclusive {
+    let clipped_start = request_bytes.start.max(region_bytes.start);
+    let clipped_end = request_bytes.end.min(region_bytes.end);
+    if clipped_start >= clipped_end {
         return None;
     }
-
-    let clipped_start = if clipped_lo == req_lo {
-        request.start
-    } else {
-        Position {
-            line: clipped_lo,
-            character: 0,
-        }
-    };
-    let clipped_end = if clipped_hi_exclusive == req_hi_exclusive {
-        request.end
-    } else {
-        Position {
-            line: clipped_hi_exclusive,
-            character: 0,
-        }
-    };
-
-    Some(Range {
-        start: clipped_start,
-        end: clipped_end,
-    })
+    let start = mapper.byte_to_position(clipped_start)?;
+    let end = mapper.byte_to_position(clipped_end)?;
+    Some(Range { start, end })
 }
 
 #[cfg(test)]
@@ -264,7 +231,9 @@ mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Position;
 
-    fn range(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Range {
+    /// Build a `Range` from line/character endpoints. Tests use this for
+    /// readability against expected output.
+    fn pos_range(start_line: u32, start_char: u32, end_line: u32, end_char: u32) -> Range {
         Range {
             start: Position {
                 line: start_line,
@@ -277,60 +246,69 @@ mod tests {
         }
     }
 
+    /// Build a request byte range from positions using the same mapper the
+    /// handler would use, so tests stay in sync with the helper's contract.
+    fn bytes(mapper: &PositionMapper, range: Range) -> std::ops::Range<usize> {
+        mapper.position_to_byte(range.start).unwrap()..mapper.position_to_byte(range.end).unwrap()
+    }
+
     #[test]
     fn clip_returns_request_unchanged_when_fully_inside_region() {
-        let clipped = clip_request_range_to_region(range(5, 2, 9, 4), 3, 12).unwrap();
-        assert_eq!(
-            clipped.start,
-            Position {
-                line: 5,
-                character: 2
-            }
-        );
-        assert_eq!(
-            clipped.end,
-            Position {
-                line: 9,
-                character: 4
-            }
-        );
+        // Three-line document; region spans the second line entirely.
+        // Request is fully inside the region's content.
+        let text = "first line\nsecond line\nthird line\n";
+        let mapper = PositionMapper::new(text);
+        let req = pos_range(1, 2, 1, 7);
+        let region = bytes(&mapper, pos_range(1, 0, 2, 0));
+
+        let clipped = clip_request_to_region(&bytes(&mapper, req), &region, &mapper).unwrap();
+        assert_eq!(clipped, req);
     }
 
     #[test]
     fn clip_snaps_start_when_request_begins_before_region() {
-        // Request: lines 0..10; region: lines 4..15. Start clipped to (4, 0).
-        let clipped = clip_request_range_to_region(range(0, 0, 10, 0), 4, 15).unwrap();
+        // Request starts on line 0; region starts at line 1 col 0.
+        let text = "first line\nsecond line\nthird line\n";
+        let mapper = PositionMapper::new(text);
+        let req = pos_range(0, 0, 1, 7);
+        let region = bytes(&mapper, pos_range(1, 0, 2, 0));
+
+        let clipped = clip_request_to_region(&bytes(&mapper, req), &region, &mapper).unwrap();
         assert_eq!(
             clipped.start,
             Position {
-                line: 4,
+                line: 1,
                 character: 0
             }
         );
         assert_eq!(
             clipped.end,
             Position {
-                line: 10,
-                character: 0
+                line: 1,
+                character: 7
             }
         );
     }
 
     #[test]
     fn clip_snaps_end_when_request_extends_past_region() {
-        // Request: lines 2..20; region: lines 0..12. End clipped to (12, 0).
-        let clipped = clip_request_range_to_region(range(2, 0, 20, 5), 0, 12).unwrap();
+        let text = "first line\nsecond line\nthird line\n";
+        let mapper = PositionMapper::new(text);
+        let req = pos_range(1, 2, 2, 5);
+        let region = bytes(&mapper, pos_range(1, 0, 2, 0));
+
+        let clipped = clip_request_to_region(&bytes(&mapper, req), &region, &mapper).unwrap();
         assert_eq!(
             clipped.start,
             Position {
-                line: 2,
-                character: 0
+                line: 1,
+                character: 2
             }
         );
         assert_eq!(
             clipped.end,
             Position {
-                line: 12,
+                line: 2,
                 character: 0
             }
         );
@@ -338,62 +316,70 @@ mod tests {
 
     #[test]
     fn clip_returns_none_when_request_is_entirely_before_region() {
-        let clipped = clip_request_range_to_region(range(0, 0, 3, 0), 5, 10);
-        assert!(clipped.is_none(), "no overlap → no work");
+        let text = "first\nsecond\nthird\n";
+        let mapper = PositionMapper::new(text);
+        let req = bytes(&mapper, pos_range(0, 0, 0, 3));
+        let region = bytes(&mapper, pos_range(1, 0, 2, 0));
+
+        assert!(clip_request_to_region(&req, &region, &mapper).is_none());
     }
 
     #[test]
     fn clip_returns_none_when_request_is_entirely_after_region() {
-        let clipped = clip_request_range_to_region(range(20, 0, 25, 0), 5, 10);
-        assert!(clipped.is_none(), "no overlap → no work");
+        let text = "first\nsecond\nthird\n";
+        let mapper = PositionMapper::new(text);
+        let req = bytes(&mapper, pos_range(2, 0, 2, 3));
+        let region = bytes(&mapper, pos_range(0, 0, 1, 0));
+
+        assert!(clip_request_to_region(&req, &region, &mapper).is_none());
     }
 
     #[test]
-    fn clip_returns_none_when_request_touches_region_boundary_at_start() {
-        // Request: lines 0..5 with end.character == 0 → covers [0, 5),
-        // region: [5, 10). No overlap.
-        let clipped = clip_request_range_to_region(range(0, 0, 5, 0), 5, 10);
-        assert!(clipped.is_none());
+    fn clip_skips_inline_injection_when_request_is_before_injected_content() {
+        // Inline injection on a single line: paragraph text with backtick
+        // code starting mid-line (`start_column > 0`). A line-only clip
+        // would falsely overlap; byte-precision correctly skips.
+        //
+        //   "say `lua_inline` here"
+        //    ^cols 0..3 "say"
+        //         ^col 4..5 "`"
+        //          ^cols 5..15 "lua_inline"  ← injection content
+        //                    ^col 15..16 "`"
+        let text = "say `lua_inline` here\n";
+        let mapper = PositionMapper::new(text);
+        let req = bytes(&mapper, pos_range(0, 0, 0, 3)); // "say"
+        let region = bytes(&mapper, pos_range(0, 5, 0, 15)); // "lua_inline"
+
+        assert!(
+            clip_request_to_region(&req, &region, &mapper).is_none(),
+            "request before the inline injection must not be dispatched"
+        );
     }
 
     #[test]
-    fn clip_covers_single_line_with_mid_line_end_character() {
-        // Request: line 3, characters 0..5 → covers line 3.
-        // Region: lines 3..4. Overlap covers exactly line 3.
-        let clipped = clip_request_range_to_region(range(3, 0, 3, 5), 3, 4).unwrap();
+    fn clip_clamps_inline_injection_when_request_straddles_boundary() {
+        // Inline injection same as above; request straddles both ends.
+        let text = "say `lua_inline` here\n";
+        let mapper = PositionMapper::new(text);
+        let req = bytes(&mapper, pos_range(0, 3, 0, 18)); // " `lua_inline` h"
+        let region = bytes(&mapper, pos_range(0, 5, 0, 15)); // "lua_inline"
+
+        let clipped = clip_request_to_region(&req, &region, &mapper).unwrap();
         assert_eq!(
             clipped.start,
             Position {
-                line: 3,
-                character: 0
-            }
-        );
-        assert_eq!(
-            clipped.end,
-            Position {
-                line: 3,
+                line: 0,
                 character: 5
-            }
-        );
-    }
-
-    #[test]
-    fn clip_snaps_both_endpoints_when_request_spans_region() {
-        // Request: lines 0..100; region: lines 10..20. Result: (10,0)..(20,0).
-        let clipped = clip_request_range_to_region(range(0, 0, 100, 0), 10, 20).unwrap();
-        assert_eq!(
-            clipped.start,
-            Position {
-                line: 10,
-                character: 0
-            }
+            },
+            "start snaps to injection's start_column"
         );
         assert_eq!(
             clipped.end,
             Position {
-                line: 20,
-                character: 0
-            }
+                line: 0,
+                character: 15
+            },
+            "end snaps to injection's end column"
         );
     }
 }
