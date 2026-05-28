@@ -581,6 +581,12 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/rangeFormatting" => {
+                matches!(
+                    caps.document_range_formatting_provider,
+                    Some(OneOf::Left(true) | OneOf::Right(_))
+                )
+            }
             "textDocument/documentSymbol" => {
                 matches!(
                     caps.document_symbol_provider,

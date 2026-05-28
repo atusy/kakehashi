@@ -26,6 +26,7 @@ mod implementation;
 mod inlay_hint;
 mod moniker;
 mod prepare_rename;
+mod range_formatting;
 mod references;
 mod rename;
 mod signature_help;
