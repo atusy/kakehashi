@@ -111,8 +111,21 @@ impl Kakehashi {
     /// see `snapshot()` return `None`. This helper mirrors the on-demand
     /// parsing path used by `selection_range_impl`: load the language,
     /// parse via the shared pool, and update the document store atomically.
+    ///
+    /// Race protection: an in-flight `didChange` parse sets `has_tree=false`
+    /// via `mark_parse_started` while the old `Document::tree()` may briefly
+    /// remain populated. Waiting on `wait_for_parse_completion` first guarantees
+    /// the snapshot returned by the caller is the *current* (text, tree) pair,
+    /// not a stale combination produced mid-parse. The timeout matches the
+    /// `semantic_tokens` budget so this helper stays responsive even if the
+    /// parser hangs on a pathological input.
     async fn ensure_parsed_for_node_lookup(&self, uri: &Url) {
-        // If we already have a tree, nothing to do.
+        self.documents
+            .wait_for_parse_completion(uri, std::time::Duration::from_millis(200))
+            .await;
+
+        // If a tree is now available (either it always was, or didChange's
+        // parse just finished), nothing to do.
         if let Some(doc) = self.documents.get(uri)
             && doc.tree().is_some()
         {
