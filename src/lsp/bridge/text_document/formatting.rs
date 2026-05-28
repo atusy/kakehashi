@@ -1,13 +1,17 @@
-//! Formatting request handling for bridge connections.
+//! `textDocument/formatting` bridge handler and helpers shared with
+//! `textDocument/rangeFormatting`.
 //!
-//! This module provides `textDocument/formatting` functionality for downstream
-//! language servers, translating each returned `TextEdit` range from virtual
-//! document coordinates back to the host document.
+//! Both endpoints return `TextEdit[] | null` and share the same virtual→host
+//! coordinate translation hazards (synthetic-EOF anchors, out-of-bounds
+//! edits). The shared response transformer
+//! ([`transform_formatting_response_to_host`]) and EOF helpers
+//! ([`count_lines`]) are exposed via `pub(super)` so the range handler in
+//! [`super::range_formatting`] can reuse them.
 //!
-//! Like `documentLink` and `documentSymbol`, formatting operates on an entire
-//! document — there is no cursor position. The injection region's
-//! [`RegionOffset`] is applied to every edit range, including the per-line
-//! column adjustment for the first line of the region.
+//! `textDocument/formatting` itself operates on an entire document — there
+//! is no cursor position. The injection region's [`RegionOffset`] is
+//! applied to every edit range, including the per-line column adjustment
+//! for the first line of the region.
 //!
 //! # Single-Writer Loop (ADR-0015)
 //!
@@ -107,7 +111,7 @@ impl LanguageServerPool {
 /// trailing newline introduces an extra (empty) line.
 ///
 /// Returns 1 for the empty string (a single empty line, index 0).
-fn count_lines(text: &str) -> u32 {
+pub(super) fn count_lines(text: &str) -> u32 {
     // `matches('\n').count() + 1` gives the number of line "buckets" in the
     // split — exactly what the LSP position model expects.
     u32::try_from(text.matches('\n').count())
@@ -178,13 +182,13 @@ fn build_formatting_request(
 /// line are dropped before translation. `virtual_line_count` is the number of
 /// LSP lines in the virtual document (1 for an empty document, computed via
 /// [`count_lines`]).
-fn transform_formatting_response_to_host(
+pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     virtual_line_count: u32,
 ) -> Option<Vec<TextEdit>> {
     if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/formatting: {}", error);
+        warn!(target: "kakehashi::bridge", "Downstream server returned error for formatting-style request: {}", error);
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 
@@ -201,7 +205,7 @@ fn transform_formatting_response_to_host(
     let mut edits: Vec<TextEdit> = match serde_json::from_value(result) {
         Ok(edits) => edits,
         Err(err) => {
-            warn!(target: "kakehashi::bridge", "Failed to deserialize textDocument/formatting result as TextEdit[]: {}", err);
+            warn!(target: "kakehashi::bridge", "Failed to deserialize formatting-style result as TextEdit[]: {}", err);
             return None;
         }
     };
