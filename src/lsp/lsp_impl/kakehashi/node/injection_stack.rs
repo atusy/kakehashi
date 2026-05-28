@@ -14,9 +14,11 @@
 //! `parent` / `children` / `text` calls and `didChange` adjustments line
 //! up across layers.
 
+use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges,
+    parse_offset_directive_for_pattern,
 };
 
 /// One layer in the injection stack at a position.
@@ -81,27 +83,31 @@ pub(super) fn injection_stack_at(
             break;
         };
 
-        let mut containing: Vec<_> = injections
-            .into_iter()
-            .filter(|r| {
-                let s = r.content_node.start_byte();
-                let e = r.content_node.end_byte();
-                // ADR-0025 §"End-of-Document Exception": when the cursor sits
-                // exactly at the document end (`byte == L && L > 0`), inclusion
-                // is widened to `byte == e` for nodes whose `e == L`. Everywhere
-                // else, the half-open `byte < e` rule applies. The exception is
-                // gated on byte == host_text.len() so it never affects interior
-                // boundaries (e.g., the byte just before a closing code fence).
-                if byte == host_text.len() {
-                    s <= byte && byte <= e
-                } else {
-                    s <= byte && byte < e
-                }
-            })
-            .collect();
-        // Smallest range wins — that's the most specific injection at the cursor.
-        containing.sort_by_key(|r| r.content_node.end_byte() - r.content_node.start_byte());
-        let Some(region) = containing.into_iter().next() else {
+        // Materialise the effective absolute ranges for every candidate so the
+        // containment check considers the bytes the injection parser will
+        // actually see — not the raw `@injection.content` span:
+        //   - apply any `#offset!` directive so prefixes / suffixes excluded by
+        //     the query (e.g., frontmatter fences, string quotes) are out;
+        //   - intersect with `compute_included_ranges` so blockquote `> `
+        //     prefixes (`block_continuation` children) are out.
+        // A cursor on an excluded byte must NOT push a new injection layer —
+        // ADR-0025 §"Half-Open Intervals" works against the effective ranges.
+        let host_len = host_text.len();
+        let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
+        for region in injections {
+            let absolute_ranges = build_effective_ranges(&region, host_text, &injection_query);
+            if absolute_ranges.is_empty() {
+                continue;
+            }
+            if !ranges_contain_byte(&absolute_ranges, byte, host_len) {
+                continue;
+            }
+            candidates.push((region, absolute_ranges));
+        }
+        // Smallest effective span wins — that's the most specific injection at
+        // the cursor after offset/include adjustments.
+        candidates.sort_by_key(|(_, ranges)| total_span(ranges));
+        let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
             break;
         };
 
@@ -117,45 +123,6 @@ pub(super) fn injection_stack_at(
         let Some(language) = registry.get(&resolved_lang) else {
             break;
         };
-
-        // Build absolute included ranges (doc-coord) for parsing. When the
-        // injection has `compute_included_ranges` gaps (e.g., blockquote
-        // prefix exclusion), shift each gap by `content_node.start_byte()`
-        // and `content_node.start_position()` to land in host coordinates.
-        let content_start = region.content_node.start_byte();
-        let content_start_pos = region.content_node.start_position();
-        let absolute_ranges: Vec<tree_sitter::Range> =
-            match compute_included_ranges(&region.content_node, region.include_children) {
-                Some(gaps) => gaps
-                    .into_iter()
-                    .map(|r| tree_sitter::Range {
-                        start_byte: content_start + r.start_byte,
-                        end_byte: content_start + r.end_byte,
-                        start_point: tree_sitter::Point {
-                            row: content_start_pos.row + r.start_point.row,
-                            column: if r.start_point.row == 0 {
-                                content_start_pos.column + r.start_point.column
-                            } else {
-                                r.start_point.column
-                            },
-                        },
-                        end_point: tree_sitter::Point {
-                            row: content_start_pos.row + r.end_point.row,
-                            column: if r.end_point.row == 0 {
-                                content_start_pos.column + r.end_point.column
-                            } else {
-                                r.end_point.column
-                            },
-                        },
-                    })
-                    .collect(),
-                None => vec![tree_sitter::Range {
-                    start_byte: region.content_node.start_byte(),
-                    end_byte: region.content_node.end_byte(),
-                    start_point: region.content_node.start_position(),
-                    end_point: region.content_node.end_position(),
-                }],
-            };
 
         let Some(injected_tree) =
             parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
@@ -194,4 +161,133 @@ fn parse_with_absolute_ranges(
         return None;
     }
     parser.parse(text, None)
+}
+
+/// Compute the absolute byte-range list that the injection parser would see
+/// for `region` given the host's `@injection.content` node, any `#offset!`
+/// directive on the pattern, and `compute_included_ranges` gap exclusions.
+///
+/// Returns an empty `Vec` when:
+/// - the offset-adjusted range is degenerate (`start >= end`); or
+/// - `compute_included_ranges` returns gaps that all fall outside the
+///   offset-adjusted span (intersection is empty).
+fn build_effective_ranges(
+    region: &crate::language::injection::InjectionRegionInfo<'_>,
+    host_text: &str,
+    injection_query: &tree_sitter::Query,
+) -> Vec<tree_sitter::Range> {
+    // 1. Apply #offset! to the raw content_node span.
+    let offset = parse_offset_directive_for_pattern(injection_query, region.pattern_index);
+    let (eff_start, eff_end) = match offset {
+        Some(off) => {
+            let byte_range = ByteRange::new(
+                region.content_node.start_byte(),
+                region.content_node.end_byte(),
+            );
+            let eff = calculate_effective_range(host_text, byte_range, off);
+            (eff.start, eff.end)
+        }
+        None => (
+            region.content_node.start_byte(),
+            region.content_node.end_byte(),
+        ),
+    };
+    if eff_start >= eff_end {
+        return Vec::new();
+    }
+
+    // 2. Compute compute_included_ranges gap list (relative coords inside
+    // content_node) and shift to absolute. Intersect each gap with the
+    // offset-adjusted span so blockquote prefixes excluded by the gap list and
+    // bytes trimmed by the offset directive are both honoured.
+    //
+    // Skip the include-gap step when an offset directive is active: gaps from
+    // `compute_included_ranges` are relative to `content_node.start_byte()`,
+    // but the offset may have moved the effective start away from there, and
+    // mixing the two coordinate frames would yield wrong ranges. The semantic-
+    // tokens parallel collector takes the same trade-off (see parallel.rs).
+    let content_start = region.content_node.start_byte();
+    let content_start_pos = region.content_node.start_position();
+    let absolute_ranges: Vec<tree_sitter::Range> = if offset.is_some() {
+        vec![tree_sitter::Range {
+            start_byte: eff_start,
+            end_byte: eff_end,
+            start_point: byte_to_point(host_text, eff_start),
+            end_point: byte_to_point(host_text, eff_end),
+        }]
+    } else {
+        match compute_included_ranges(&region.content_node, region.include_children) {
+            Some(gaps) => gaps
+                .into_iter()
+                .map(|r| tree_sitter::Range {
+                    start_byte: content_start + r.start_byte,
+                    end_byte: content_start + r.end_byte,
+                    start_point: tree_sitter::Point {
+                        row: content_start_pos.row + r.start_point.row,
+                        column: if r.start_point.row == 0 {
+                            content_start_pos.column + r.start_point.column
+                        } else {
+                            r.start_point.column
+                        },
+                    },
+                    end_point: tree_sitter::Point {
+                        row: content_start_pos.row + r.end_point.row,
+                        column: if r.end_point.row == 0 {
+                            content_start_pos.column + r.end_point.column
+                        } else {
+                            r.end_point.column
+                        },
+                    },
+                })
+                .collect(),
+            None => vec![tree_sitter::Range {
+                start_byte: region.content_node.start_byte(),
+                end_byte: region.content_node.end_byte(),
+                start_point: region.content_node.start_position(),
+                end_point: region.content_node.end_position(),
+            }],
+        }
+    };
+
+    absolute_ranges
+}
+
+/// Half-open containment over a list of disjoint ranges, with ADR-0025's
+/// end-of-document exception (`byte == host_len` includes nodes whose
+/// `end_byte == host_len`).
+fn ranges_contain_byte(ranges: &[tree_sitter::Range], byte: usize, host_len: usize) -> bool {
+    let at_eod = byte == host_len;
+    ranges.iter().any(|r| {
+        let s = r.start_byte;
+        let e = r.end_byte;
+        if at_eod {
+            s <= byte && byte <= e
+        } else {
+            s <= byte && byte < e
+        }
+    })
+}
+
+/// Total byte length covered by `ranges`. Used as the smallest-injection
+/// tiebreaker — narrower effective spans win.
+fn total_span(ranges: &[tree_sitter::Range]) -> usize {
+    ranges
+        .iter()
+        .map(|r| r.end_byte.saturating_sub(r.start_byte))
+        .sum()
+}
+
+/// Convert an absolute byte offset to a `tree_sitter::Point`. Used when an
+/// offset directive shifts the injection boundary away from a known node
+/// position, so we can't reuse the content node's start/end points.
+fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
+    let clamped = byte.min(text.len());
+    let prefix = &text[..clamped];
+    let row = prefix.bytes().filter(|b| *b == b'\n').count();
+    let last_nl = prefix.rfind('\n');
+    let column = match last_nl {
+        Some(idx) => clamped - idx - 1,
+        None => clamped,
+    };
+    tree_sitter::Point { row, column }
 }
