@@ -59,6 +59,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
+        // Ensure the document is parsed before snapshotting — same race as in
+        // `kakehashi/node`: didOpen schedules an async parse, a client that
+        // immediately follows up with `parent` must not see `tree: None`.
+        self.ensure_parsed_for_node_lookup(&uri).await;
+
         // Snapshot the document so we operate on a consistent (text, tree) pair.
         let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
             log::debug!(target: "kakehashi::node::parent", "no parsed document for {}", uri);
@@ -114,11 +119,21 @@ fn find_node_at<'tree>(
     end: usize,
     kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
+    // Defensive: reject obviously-invalid ranges before handing them to
+    // tree-sitter. A stale tracker entry (or future bug) could pass a range
+    // outside the parsed tree's bounds; the underlying C bindings have, at
+    // various tree-sitter versions, exhibited surprising behavior for such
+    // inputs. Returning None preserves the caller's null-collapse semantics.
+    let root = tree.root_node();
+    if start > end || end > root.end_byte() {
+        return None;
+    }
+
     // `descendant_for_byte_range(start, end)` returns the smallest node whose
     // byte range contains `[start, end)`. For a tracked node, that's the node
     // itself; for stale ranges it returns the containing node, in which case
     // the upward walk below will fail to find a match (and we return None).
-    let mut current = tree.root_node().descendant_for_byte_range(start, end)?;
+    let mut current = root.descendant_for_byte_range(start, end)?;
 
     loop {
         if current.start_byte() == start && current.end_byte() == end && current.kind() == kind {
