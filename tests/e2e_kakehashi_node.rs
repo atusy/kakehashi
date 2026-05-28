@@ -438,12 +438,16 @@ fn test_node_parent_returns_immediate_parent_for_nested_node() {
         "parent type field should be the tree-sitter parent kind, got empty string"
     );
 
-    // Sanity: a single parent hop should not loop back to the same kind for
-    // this fixture (paragraph text's parent is not itself "text"/"inline" at
-    // the same depth). We don't pin the exact grammar-derived name to keep the
-    // test resilient to upstream tree-sitter-markdown changes, but a same-type
-    // identity hop would indicate the handler is returning the input node.
-    let _ = child_type; // referenced for clarity; assertion is positional below.
+    // Sanity: the parent must be structurally distinct from the child. We
+    // don't pin the exact grammar-derived names (tree-sitter-markdown's tag
+    // names can change across versions), but if the parent's type equals the
+    // child's type at the same span the handler is suspiciously returning the
+    // input node rather than its parent.
+    assert_ne!(
+        parent_type, child_type,
+        "parent's type ({:?}) must differ from child's type ({:?}); same-type hop suggests the handler returned the input node",
+        parent_type, child_type
+    );
 }
 
 /// Walking `kakehashi/node/parent` repeatedly from any in-document node must
