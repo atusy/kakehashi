@@ -193,25 +193,23 @@ fn smallest_containing_node(
 
 /// Walk down the right spine of `node`, returning the deepest descendant whose
 /// `end_byte` equals `target_end`. Used for the end-of-document exception.
+///
+/// Implementation note: tree-sitter direct siblings are non-overlapping with
+/// monotonically non-decreasing `end_byte`, so among children only the LAST
+/// can match `target_end == parent.end_byte()`. Navigating to the last child
+/// via a `TreeCursor` is O(children-per-level), giving overall O(depth × max
+/// breadth) instead of the O(N²) `current.child(i).rev()` pattern.
 fn deepest_node_ending_at(node: tree_sitter::Node<'_>, target_end: usize) -> tree_sitter::Node<'_> {
+    let mut cursor = node.walk();
     let mut current = node;
-    loop {
-        // Pick the last child whose end_byte == target_end and dive into it.
-        // ADR-0025 §"End-of-Document Exception" guarantees `e == L` is allowed,
-        // and "smallest-wins still applies", so we want the deepest such node.
-        let mut next = None;
-        let child_count = current.child_count() as u32;
-        for i in (0..child_count).rev() {
-            if let Some(child) = current.child(i)
-                && child.end_byte() == target_end
-            {
-                next = Some(child);
-                break;
-            }
-        }
-        match next {
-            Some(child) => current = child,
-            None => return current,
+    while cursor.goto_first_child() {
+        while cursor.goto_next_sibling() {}
+        let last_child = cursor.node();
+        if last_child.end_byte() == target_end {
+            current = last_child;
+        } else {
+            break;
         }
     }
+    current
 }
