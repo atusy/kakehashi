@@ -138,51 +138,13 @@ mod tests {
         .expect("condition should become true");
     }
 
-    /// RAII guard that restores `KAKEHASHI_DATA_DIR` to its original value on
-    /// drop, even on panic. Pairs with `#[serial(kakehashi_data_dir_env)]`
-    /// so the env-var mutation is serialized against other tests that read
-    /// it.
-    struct DataDirEnvGuard {
-        original: Option<String>,
-    }
-
-    impl Drop for DataDirEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: callers gate this guard with `#[serial(kakehashi_data_dir_env)]`,
-            // which prevents concurrent modification of `KAKEHASHI_DATA_DIR`
-            // by other tests in the same serial group.
-            unsafe {
-                match self.original.take() {
-                    Some(val) => std::env::set_var("KAKEHASHI_DATA_DIR", val),
-                    None => std::env::remove_var("KAKEHASHI_DATA_DIR"),
-                }
-            }
-        }
-    }
-
     #[tokio::test]
-    #[serial_test::serial(kakehashi_data_dir_env)]
     async fn did_open_parses_before_eager_opening_injected_virtual_documents() {
-        // Point `AutoInstallManager::init_failed_parser_registry()` (called
-        // by `Kakehashi::new`) at a per-test crash-recovery directory so a
-        // poisoned `parsing_in_progress` left behind by an earlier E2E
-        // shutdown does not pre-mark "markdown" as failed and short-circuit
-        // `parse_document` — and so this test doesn't touch the developer's
-        // real `~/.local/share/kakehashi/` either.
-        //
-        // `default_data_dir()` reads `KAKEHASHI_DATA_DIR`, so we override it
-        // for the duration of this test. The env var is process-wide;
-        // `#[serial(kakehashi_data_dir_env)]` prevents other tests in this
-        // serial group from racing on it.
-        let data_dir = tempfile::TempDir::new().expect("create temp data dir");
-        let _env_guard = DataDirEnvGuard {
-            original: std::env::var("KAKEHASHI_DATA_DIR").ok(),
-        };
-        // SAFETY: see `DataDirEnvGuard`'s `Drop` impl.
-        unsafe {
-            std::env::set_var("KAKEHASHI_DATA_DIR", data_dir.path());
-        }
-
+        // Test isolation is automatic via the `cfg(test)` branch in
+        // `kakehashi::install::default_data_dir()`, which redirects every
+        // `Kakehashi::new` call in this binary to a project-local data dir
+        // under `deps/kakehashi-test-data/` and clears stale crash-recovery
+        // state once per process. No env-var dance or per-test setup needed.
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
 
