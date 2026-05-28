@@ -10,9 +10,14 @@
 /// Find a tree-sitter node in `tree` whose `(start_byte, end_byte, kind)`
 /// matches the tracked triple.
 ///
-/// Starts from the smallest descendant covering `[start, end)` (which is the
-/// usual case for a tracked node) and walks up to the root looking for an
-/// exact match. The walk is bounded by tree depth and runs in `O(depth)` time.
+/// `descendant_for_byte_range` returns the smallest node containing `[start,
+/// end)`. If that node's range is not exactly `(start, end)`, no ancestor can
+/// match either (ancestors only grow), so we bail immediately. When the range
+/// matches but the kind doesn't, we walk upward but stop as soon as the
+/// ancestor's range diverges from `(start, end)` — this handles the rare case
+/// where multiple nodes share a span (e.g., a `document` wrapping a `section`
+/// that wraps a `paragraph` all starting at byte 0) without doing useless work
+/// on truly larger ancestors. The walk runs in O(depth-of-same-span chain).
 ///
 /// Returns `None` when no node along that ancestry chain matches — typically a
 /// sign that the tracker entry has drifted relative to the current tree (which
@@ -34,26 +39,22 @@ pub(super) fn find_node_at<'tree>(
     }
 
     // `descendant_for_byte_range(start, end)` returns the smallest node whose
-    // byte range contains `[start, end)`. For a tracked node, that's the node
-    // itself; for stale ranges it returns the containing node, in which case
-    // the upward walk below will fail to find a match (and we return None).
+    // byte range contains `[start, end)`. If its range does not match exactly,
+    // no node in the tree has `(start, end)` and we can stop here.
     let mut current = root.descendant_for_byte_range(start, end)?;
+    if current.start_byte() != start || current.end_byte() != end {
+        return None;
+    }
 
     loop {
-        let c_start = current.start_byte();
-        let c_end = current.end_byte();
-        if c_start == start && c_end == end && current.kind() == kind {
+        if current.kind() == kind {
             return Some(current);
         }
-        // Parents can only have equal or larger ranges. Once `current` exceeds
-        // the target on either side, no ancestor can ever match exactly, so
-        // bail out instead of climbing all the way to the root.
-        if c_start < start || c_end > end {
-            return None;
-        }
         match current.parent() {
-            Some(parent) => current = parent,
-            None => return None,
+            Some(parent) if parent.start_byte() == start && parent.end_byte() == end => {
+                current = parent;
+            }
+            _ => return None,
         }
     }
 }
