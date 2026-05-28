@@ -5,19 +5,23 @@
 //! returns a [`NodeInfo`](../../../../../docs/adr/0025-node-reference-protocol.md#nodeinfo-type)
 //! for its tree-sitter parent.
 //!
-//! Per ADR-0025 §"Navigation Methods", navigation stays within a single language
-//! tree: calling `parent` on the root of an injected tree must **not** cross
-//! into the host node that contains the injection. This handler currently only
-//! operates on the host tree (matching PR-1); PR-4 will extend the protocol with
-//! explicit injection-layer addressing.
+//! Per ADR-0025 §"Navigation Methods", navigation stays within a single
+//! language tree: calling `parent` on the root of an injected tree must **not**
+//! cross into the host node that contains the injection. To find the node in
+//! the correct tree we search the host tree first and then each injected layer
+//! at the tracked `start_byte` (see
+//! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — that
+//! way a node minted by `kakehashi/node` against an injected layer remains
+//! navigable from the same layer that produced it.
 //!
 //! Returns `null` (serialized as JSON `null`) when:
 //! - the URI is unknown or invalid,
 //! - the ULID is malformed or was never issued / has been invalidated,
 //! - the document has not yet been parsed,
-//! - the tracked range cannot be matched against a node in the current tree
-//!   (defensive: should not happen while the tracker is in sync), or
-//! - the matched node is the root of the tree (no parent).
+//! - the tracked range cannot be matched against a node in the host tree or
+//!   any injected layer, or
+//! - the matched node is the root of its tree (no parent — applies to host
+//!   root AND to the root of any injected tree, per the Scope rule).
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,7 +29,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::TextDocumentIdentifier;
 use ulid::Ulid;
 
-use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// Request parameters for `kakehashi/node/parent`.
@@ -70,39 +74,52 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node::parent", "no parsed document for {}", uri);
             return Ok(Value::Null);
         };
-        let tree = snapshot.tree();
+        let host_text = snapshot.text();
+        let host_tree = snapshot.tree();
 
-        // Find the tree-sitter node matching the tracked (start, end, kind).
-        // Defensive: the tracker stays in sync with didChange, so this should
-        // always succeed for a non-null lookup.
-        let Some(node) = find_node_at(tree, start, end, kind) else {
-            log::warn!(
-                target: "kakehashi::node::parent",
-                "tracker hit but no matching node in tree for ulid={} uri={} range=[{},{}) kind={}",
-                ulid, uri, start, end, kind
-            );
+        let Some(host_language) = self.document_language(&uri) else {
+            log::debug!(target: "kakehashi::node::parent", "no host language for {}", uri);
             return Ok(Value::Null);
         };
 
-        // ADR-0025 "Scope rule": parent navigation stays within a single tree.
-        // tree-sitter's `node.parent()` returns None for the tree root, which is
-        // the exact semantics we want — do NOT chase into an enclosing host
-        // injection node.
-        let Some(parent) = node.parent() else {
+        // Search the host tree first, then injected layers at `start`. ADR-0025
+        // "Scope rule" applies per layer: tree-sitter's `node.parent()` returns
+        // None for any tree root (host root AND injected root), which is the
+        // intended semantics — do NOT chase into the host node that contains
+        // the injection.
+        let parent_info = with_resolved_node(
+            &self.language,
+            &host_language,
+            host_text,
+            host_tree,
+            start,
+            end,
+            kind,
+            |node| {
+                node.parent()
+                    .map(|p| (p.start_byte(), p.end_byte(), p.kind()))
+            },
+        );
+        let Some(Some((p_start, p_end, p_kind))) = parent_info else {
+            if parent_info.is_none() {
+                log::warn!(
+                    target: "kakehashi::node::parent",
+                    "tracker hit but no matching node in any layer for ulid={} uri={} range=[{},{}) kind={}",
+                    ulid, uri, start, end, kind
+                );
+            }
             return Ok(Value::Null);
         };
 
         // Issue / reuse a stable ULID for the parent (ADR-0019 lazy assignment).
-        let parent_ulid = self.bridge.node_tracker().get_or_create(
-            &uri,
-            parent.start_byte(),
-            parent.end_byte(),
-            parent.kind(),
-        );
+        let parent_ulid = self
+            .bridge
+            .node_tracker()
+            .get_or_create(&uri, p_start, p_end, p_kind);
 
         Ok(json!({
             "id": parent_ulid.to_string(),
-            "type": parent.kind(),
+            "type": p_kind,
         }))
     }
 }
