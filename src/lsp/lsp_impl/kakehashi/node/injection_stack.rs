@@ -20,6 +20,7 @@ use crate::language::injection::{
     MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges,
     parse_offset_directive_for_pattern,
 };
+use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
 /// One layer in the injection stack at a position.
 ///
@@ -95,6 +96,21 @@ pub(super) fn injection_stack_at(
         let host_len = host_text.len();
         let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
         for region in injections {
+            // Fast bounds check: the effective ranges can only ever be a
+            // sub-range of the raw content node, so a cursor outside the raw
+            // span cannot possibly be inside the effective ranges. Reject
+            // before the expensive build_effective_ranges call (which parses
+            // the #offset! directive and computes include-children gaps).
+            let raw_start = region.content_node.start_byte();
+            let raw_end = region.content_node.end_byte();
+            let outside_raw = if byte == host_len {
+                byte < raw_start || byte > raw_end
+            } else {
+                byte < raw_start || byte >= raw_end
+            };
+            if outside_raw {
+                continue;
+            }
             let absolute_ranges = build_effective_ranges(&region, host_text, &injection_query);
             if absolute_ranges.is_empty() {
                 continue;
@@ -137,6 +153,51 @@ pub(super) fn injection_stack_at(
     }
 
     stack
+}
+
+/// Resolve a tracked `(start, end, kind)` triple to a tree-sitter node by
+/// searching the host tree first, then each injected layer at `start`.
+///
+/// Tracker entries store only `(uri, start_byte, end_byte, kind)` — they do
+/// not record which language tree the node originated from. A node minted
+/// by `kakehashi/node` against an injected layer (e.g. a Python `assignment`
+/// inside a markdown code block) would otherwise be unreachable from
+/// navigation handlers that only look at the host tree. Walking the stack
+/// here lets `parent` and `children` follow injected nodes in the same
+/// layer that produced them.
+///
+/// `f` is invoked at most once, with the matching `Node`. Returning `None`
+/// from `f` is distinguishable from the "no layer matched" outcome only by
+/// the caller's outer `Option` — both surface as `Option<R>` because the
+/// outer call returns `None` when no layer matched. Callers that need to
+/// distinguish "found node but operation returned nothing" (e.g. parent of
+/// a root) from "no match" should use a richer `R` like `Option<T>`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn with_resolved_node<R>(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+    start: usize,
+    end: usize,
+    kind: &'static str,
+    mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
+) -> Option<R> {
+    // Fast path: the most common case is a node living in the host tree.
+    if let Some(node) = find_node_at(host_tree, start, end, kind) {
+        return Some(f(node));
+    }
+
+    // Walk injected layers. `stack[0]` is the host (already tried above), so
+    // skip it.
+    let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
+    for layer in stack.iter().skip(1) {
+        if let Some(node) = find_node_at(&layer.tree, start, end, kind) {
+            return Some(f(node));
+        }
+    }
+
+    None
 }
 
 /// Parse `text` with a fresh tree-sitter parser configured for `language`,
@@ -281,7 +342,16 @@ fn total_span(ranges: &[tree_sitter::Range]) -> usize {
 /// offset directive shifts the injection boundary away from a known node
 /// position, so we can't reuse the content node's start/end points.
 fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
-    let clamped = byte.min(text.len());
+    // Clamp first, then walk back to the nearest UTF-8 character boundary.
+    // The byte values reaching this helper can come from #offset! directives
+    // (i32 row/column shifts then converted to bytes), which are not
+    // guaranteed to land on character boundaries. Slicing &text[..clamped]
+    // on a mid-character byte would panic and crash the LSP server, so
+    // round-down to the nearest valid boundary.
+    let mut clamped = byte.min(text.len());
+    while clamped > 0 && !text.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
     let prefix = &text[..clamped];
     let row = prefix.bytes().filter(|b| *b == b'\n').count();
     let last_nl = prefix.rfind('\n');
