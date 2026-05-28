@@ -99,12 +99,16 @@ fn parse_injection_selector(value: Option<&Value>) -> InjectionSelector {
 /// present); we keep the signature general so callers can defensively
 /// short-circuit on an empty stack without panicking.
 fn resolve_index(n: i64, stack_len: usize) -> Option<usize> {
-    if n > 0 {
+    if n >= 0 {
+        // Non-negative: direct stack[n] lookup. n == 0 is normally routed
+        // through the Host branch upstream, but accepting it here makes the
+        // helper self-contained — `stack[0]` is the host layer, so the result
+        // is correct either way.
         let idx = usize::try_from(n).ok()?;
         if idx < stack_len { Some(idx) } else { None }
     } else {
-        // n is negative (n == 0 is handled by the Host branch upstream).
-        // Convert via i64 arithmetic to avoid usize underflow on `len + n`.
+        // Negative: stack[stack.len + n]. Convert via i64 to avoid usize
+        // underflow when |n| > stack_len.
         let len_i64 = i64::try_from(stack_len).ok()?;
         let resolved = len_i64.checked_add(n)?;
         if resolved < 0 {

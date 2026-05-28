@@ -86,7 +86,17 @@ pub(super) fn injection_stack_at(
             .filter(|r| {
                 let s = r.content_node.start_byte();
                 let e = r.content_node.end_byte();
-                s <= byte && byte < e
+                // ADR-0025 §"End-of-Document Exception": when the cursor sits
+                // exactly at the document end (`byte == L && L > 0`), inclusion
+                // is widened to `byte == e` for nodes whose `e == L`. Everywhere
+                // else, the half-open `byte < e` rule applies. The exception is
+                // gated on byte == host_text.len() so it never affects interior
+                // boundaries (e.g., the byte just before a closing code fence).
+                if byte == host_text.len() {
+                    s <= byte && byte <= e
+                } else {
+                    s <= byte && byte < e
+                }
             })
             .collect();
         // Smallest range wins — that's the most specific injection at the cursor.
@@ -95,7 +105,12 @@ pub(super) fn injection_stack_at(
             break;
         };
 
-        let Some((resolved_lang, _)) = coordinator.resolve_injection_language(&region.language, "")
+        // Pass the actual injection content to the language resolver so its
+        // shebang / first-line heuristics (ADR-0005) can fire for nested
+        // injections — passing "" would silently disable detection.
+        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let Some((resolved_lang, _)) =
+            coordinator.resolve_injection_language(&region.language, content)
         else {
             break;
         };
