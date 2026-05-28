@@ -74,7 +74,7 @@ impl Kakehashi {
         // Find the tree-sitter node matching the tracked (start, end, kind).
         // Defensive: the tracker stays in sync with didChange, so this should
         // always succeed for a non-null lookup.
-        let Some(node) = find_node_at(tree, start, end, &kind) else {
+        let Some(node) = find_node_at(tree, start, end, kind) else {
             log::warn!(
                 target: "kakehashi::node::parent",
                 "tracker hit but no matching node in tree for ulid={} uri={} range=[{},{}) kind={}",
