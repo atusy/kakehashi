@@ -12,7 +12,6 @@
 - [ADR-0008](0008-language-server-bridge-request-strategies.md) — Per-method bridge strategies
 - [ADR-0011](0011-wildcard-config-inheritance.md) — Wildcard config inheritance (foundation for `_self` resolution)
 - [ADR-0020](0020-pull-first-diagnostic-forwarding.md) — Diagnostic forwarding
-- [ADR-0021](0021-semantic-token-overlap-resolution.md) — Sweep-line semantic token resolution
 
 ## Context
 
@@ -22,14 +21,12 @@ Extending bridging to host documents unlocks:
 
 1. **Whole-document LSP for prose/structured formats**: marksman/markdown-ls on `.md`, yaml-language-server on `.yaml`, etc., while injections continue to be served by virt bridges.
 2. **Same-language host + virt**: pyright serving both `.py` files (host) and Python injections inside `.md` (virt) through one coherent config.
-3. **Per-method composition**: hover of the cursor inside an injection answered by the injection LS first, while document-symbol of the whole file is anchored on the host LS skeleton.
 
 Design challenges:
 
 1. The existing `bridge` map (`HashMap<String, BridgeLanguageConfig>`) is keyed by **injection language**. There is no slot for "the host language itself."
-2. Host and virt LSes can both answer the same LSP method at the same position. Responses need a deterministic combine order.
-3. The LS catalog (`languageServers.<name>`) currently has no notion of "host-capable" vs "virt-capable." Adding flags risks surface bloat; omitting them risks ambiguity.
-4. Backward compatibility: existing configs must keep current behavior, since host bridging is a new feature.
+2. The LS catalog (`languageServers.<name>`) currently has no notion of "host-capable" vs "virt-capable." Adding flags risks surface bloat; omitting them risks ambiguity.
+3. Backward compatibility: existing configs must keep current behavior, since host bridging is a new feature.
 
 ## Decision Drivers
 
@@ -41,7 +38,7 @@ Design challenges:
 
 ## Decision Outcome
 
-**Chosen approach**: Reserve `_self` as a special key in the `bridge` map. It represents the host language acting as its own bridge target. `BridgeLanguageConfig` is reused unchanged. Defaults are declared explicitly at `languages._.bridge._self` (enabled = false) and `languages._.bridge._` (enabled = true), so the existing wildcard merge naturally yields the right answers without special-case resolver logic. Host/virt combine order is governed per-method by a built-in table; user override is left as a future extension.
+**Chosen approach**: Reserve `_self` as a special key in the `bridge` map. It represents the host language acting as its own bridge target. `BridgeLanguageConfig` is reused unchanged. Defaults are declared explicitly at `languages._.bridge._self` (enabled = false) and `languages._.bridge._` (enabled = true), so the existing wildcard merge naturally yields the right answers without special-case resolver logic.
 
 ### Schema
 
@@ -98,22 +95,6 @@ The same LS naturally serves both roles when applicable. `pyright` with `languag
 
 No new fields on `BridgeServerConfig`. An LS that should not act as host for a given language is excluded by leaving `bridge._self.enabled = false` for that language, or by not listing the language in its `languages` field.
 
-### Per-Method Combine Order
-
-For methods that can receive both host and virt responses at the same cursor position, ordering is governed by an internal `default_role_order_for_method` table:
-
-| Method | Default order | Rationale |
-|---|---|---|
-| `textDocument/hover` | VirtFirst | Cursor in injection → injection-language answer is closer to user intent |
-| `textDocument/completion` | VirtFirst (concatenated) | Language-specific completions surface first; host items appended |
-| `textDocument/definition` / `references` | VirtFirst | Symbols within injection scope take precedence |
-| `textDocument/documentSymbol` | HostFirst | Host carries the document skeleton; virt fills inline regions |
-| `textDocument/formatting` / `rangeFormatting` | HostOnly | Virt formatters would damage host structure (indentation, fences, frontmatter) |
-| `textDocument/diagnostic` / `publishDiagnostics` | Concatenated | Ranges are typically disjoint; both contribute |
-| `textDocument/semanticTokens` | Sweep-line (see ADR-0021) | Existing depth-based priority absorbs both roles naturally |
-
-The table lives in code, not configuration. Users currently cannot override it; see *Future Extensions* for the planned escape hatch.
-
 ### Wildcard Merge Safety
 
 Concern: under [ADR-0011](0011-wildcard-config-inheritance.md), `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. If `_.enabled = true` and `_self.enabled` were absent, the wildcard would silently turn host bridging on.
@@ -143,7 +124,7 @@ User: languages.markdown.bridge._self.enabled = true
                 → Some(true)               ✓ host bridging on
 ```
 
-The same reasoning extends to any future `_self`-meaningful field (e.g., a `roleOrder` discussed below): as long as the field has an explicit default at `languages._.bridge._self`, the wildcard merge is safe without resolver changes.
+The same reasoning extends to any future `_self`-meaningful field: as long as the field carries an explicit default at `languages._.bridge._self`, the wildcard merge is safe without resolver changes.
 
 ### URI and Coordinate Handling
 
@@ -166,8 +147,9 @@ Practical consequences:
 
 ### Out of Scope
 
+- **Combine logic for host/virt responses at request time**: this ADR defines only the schema for declaring host and virt bridges. How responses from both roles are ordered, merged, or routed per method is a separate concern decided at dispatch time, not encoded in the configuration shape.
 - **Editor connecting to the same LS directly**: if the user's editor talks to marksman in parallel with kakehashi, marksman sees duplicate `didOpen` events. Resolving this is the user's responsibility (route only through kakehashi). Kakehashi does not attempt to detect or mediate.
-- **Cross-language priority lists in a single fan-in**: virt bridges for different injection languages do not share a priority list (they never co-occur at the same cursor). Host adds one new co-occurrence axis (host ⊕ virt), handled by the per-method combine table — not by mixed `priorities` entries.
+- **Cross-language priority mixing in `priorities` entries**: the `priorities` field remains a `Vec<String>` of LS names within a single bridge target (`bridge.<inj>` or `bridge._self`). Mixing names from different bridge targets in one list is not supported by this schema.
 
 ## Consequences
 
@@ -184,14 +166,12 @@ Practical consequences:
 ### Negative
 
 - **Two-line opt-in**: users must write both `bridge._self.enabled = true` and per-method `aggregation.<method>.priorities`. Forgetting `enabled = true` produces silent no-response.
-- **Combine order is hard-coded**: per-method defaults live in `default_role_order_for_method` with no user override. If a user needs to invert the order for a specific method, a follow-up ADR will be required.
 - **Reserved key cost**: a hypothetical user language literally named `_self` cannot be addressed via `bridge.<lang>`. Acceptable; `_` is already reserved on the same axis, and `_`-prefix names are conventionally reserved.
 
 ### Neutral
 
 - **`_self` joins `_` as the second reserved key** in the `bridge` map. The "`_`-prefixed = reserved" convention is preserved and leaves room for future reservations.
 - **Host bridging is opt-in even with a candidate LS configured**: `[languageServers.marksman] languages = ["markdown"]` alone does nothing until `bridge._self.enabled = true` is set for some host language. This is the intended behavior — capability declaration is not consent to use.
-- **HostOnly methods** (e.g., formatting) skip virt fan-out entirely.
 
 ## Alternatives Considered
 
@@ -210,9 +190,8 @@ priorities = [
 
 **Rejected because**:
 - Requires extending `AggregationConfig.priorities` from `Vec<String>` to a tagged structure (or a string-mini-DSL), bumping the type surface.
-- The actual cross-cutting need is narrow: at any given cursor position, only **one** injection language is in play, so the host-vs-virt ordering question is binary, not a free permutation across many roles.
-- The per-method `default_role_order_for_method` table covers the binary decision without burdening every user with role tags.
-- If users ever need to override the table per-method, a smaller `roleOrder` enum field (a follow-up ADR) is enough.
+- Cross-target priority mixing is explicitly out of scope (see *Out of Scope*); `priorities` stays scoped to a single bridge target.
+- Host/virt ordering is a dispatch-time concern, not a configuration shape, so encoding role in the schema does not match the responsibility split this ADR establishes.
 
 ### B. Separate `host_bridge` field parallel to `bridge`
 
@@ -228,7 +207,6 @@ priorities = ["pyright"]
 
 **Rejected because**:
 - Introduces a parallel field with semantically identical structure to `bridge.<key>`. Two resolvers, two wildcard rules, two `enabled` flags to keep in sync — for no expressive gain.
-- A hypothetical third slot (`combined_aggregation`) would be needed to govern host/virt mixing, since neither parallel field naturally owns that cross-cutting concern. Three slots for what is conceptually one map.
 - Loses the symmetry that host and virt are both "bridges" — only the LS-matching rule differs.
 
 ### C. Top-level `aggregation` field on `LanguageSettings`
