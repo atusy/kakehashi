@@ -50,7 +50,7 @@ impl UriEntries {
             return *existing;
         }
         let ulid = Ulid::new();
-        self.forward.insert(key.clone(), ulid);
+        self.forward.insert(key, ulid);
         self.reverse.insert(ulid, key);
         ulid
     }
@@ -82,7 +82,7 @@ impl UriEntries {
     /// position. Caller decides what to do with the collision (the current
     /// adjust_for_edits policy is "first wins").
     fn insert(&mut self, key: PositionKey, ulid: Ulid) -> std::result::Result<(), Ulid> {
-        match self.forward.entry(key.clone()) {
+        match self.forward.entry(key) {
             Entry::Vacant(e) => {
                 e.insert(ulid);
                 self.reverse.insert(ulid, key);
@@ -98,25 +98,29 @@ impl UriEntries {
 /// Note: Language is NOT part of the key per ADR-0019 specification.
 /// Same position with different language gets different ULID because
 /// kind will differ in the AST (e.g., fenced_code_block vs code_block).
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 struct PositionKey {
     start_byte: usize,
     end_byte: usize,
-    kind: String,
+    /// tree-sitter node kinds are interned in the grammar's static data, so
+    /// every call site we accept input from (`Node::kind()`) returns a
+    /// `&'static str`. Storing the static slice avoids an allocation per
+    /// tracker entry without losing any genuinely owned data.
+    kind: &'static str,
 }
 
 impl PositionKey {
     /// Create a new position key from byte range and node kind.
-    fn new(start: usize, end: usize, kind: &str) -> Self {
+    fn new(start: usize, end: usize, kind: &'static str) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
-            kind: kind.to_string(),
+            kind,
         }
     }
 
     /// Create a position key with adjusted positions (for edit operations).
-    fn with_positions(start: usize, end: usize, kind: String) -> Self {
+    fn with_positions(start: usize, end: usize, kind: &'static str) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
@@ -268,7 +272,13 @@ impl NodeTracker {
     ///
     /// Updates both the forward and reverse index so the returned ULID can be
     /// resolved back to its position via [`lookup_position`](Self::lookup_position).
-    pub(crate) fn get_or_create(&self, uri: &Url, start: usize, end: usize, kind: &str) -> Ulid {
+    pub(crate) fn get_or_create(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+    ) -> Ulid {
         let key = PositionKey::new(start, end, kind);
 
         // NOTE: Explicit two-step pattern to avoid DashMap lifetime ambiguity.
@@ -282,10 +292,14 @@ impl NodeTracker {
     /// invalidated by an edit (START fell inside the edit range per ADR-0019),
     /// or if the URI has been closed. These three cases are deliberately
     /// indistinguishable — see ADR-0025 "Invalidate vs Not-Found".
-    pub(crate) fn lookup_position(&self, uri: &Url, ulid: &Ulid) -> Option<(usize, usize, String)> {
+    pub(crate) fn lookup_position(
+        &self,
+        uri: &Url,
+        ulid: &Ulid,
+    ) -> Option<(usize, usize, &'static str)> {
         let entries = self.entries.get(uri)?;
         let key = entries.lookup(ulid)?;
-        Some((key.start_byte, key.end_byte, key.kind.clone()))
+        Some((key.start_byte, key.end_byte, key.kind))
     }
 
     /// Get the ULID for a position if it exists, without creating it.
@@ -293,7 +307,7 @@ impl NodeTracker {
     /// Returns None if no entry exists for this position.
     /// Used in tests to verify position adjustment without side effects.
     #[cfg(test)]
-    fn get(&self, uri: &Url, start: usize, end: usize, kind: &str) -> Option<Ulid> {
+    fn get(&self, uri: &Url, start: usize, end: usize, kind: &'static str) -> Option<Ulid> {
         let key = PositionKey::new(start, end, kind);
         self.entries.get(uri)?.forward.get(&key).copied()
     }
@@ -582,7 +596,7 @@ impl NodeTracker {
             // 3. Collisions may indicate a bug in invalidation logic anyway
             //
             // Log at warn level for observability and debugging.
-            if let Err(_existing) = new_entries.insert(new_key.clone(), ulid) {
+            if let Err(_existing) = new_entries.insert(new_key, ulid) {
                 warn!(
                     target: "kakehashi::node_tracker",
                     "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}",
@@ -617,6 +631,14 @@ mod tests {
 
     fn test_uri(name: &str) -> Url {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
+    }
+
+    /// Produce a `&'static str` kind for a numeric index by intentionally
+    /// leaking a short formatted string. Used in tests that need distinct
+    /// dynamic kinds; tree-sitter's real grammars already provide static
+    /// interned kinds, so production code never goes through this path.
+    fn leak_kind(i: usize) -> &'static str {
+        Box::leak(format!("{}", i).into_boxed_str())
     }
 
     #[test]
@@ -730,7 +752,7 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((30, 50, "block".to_string())),
+            Some((30, 50, "block")),
             "Newly issued ULID must be resolvable via reverse index"
         );
     }
@@ -785,7 +807,7 @@ mod tests {
 
         assert_eq!(
             tracker.lookup_position(&uri, &ulid),
-            Some((55, 75, "block".to_string())),
+            Some((55, 75, "block")),
             "lookup_position should follow adjusted node range"
         );
     }
@@ -3329,7 +3351,7 @@ mod tests {
 
         // "AAABBBCCCDDDEEE" with nodes at each segment
         let nodes: Vec<_> = (0..5)
-            .map(|i| tracker.get_or_create(&uri, i * 3, (i + 1) * 3, &format!("{}", i)))
+            .map(|i| tracker.get_or_create(&uri, i * 3, (i + 1) * 3, leak_kind(i)))
             .collect();
 
         // Remove AAA (delta=-3) and CCC (delta=-3)
@@ -3422,7 +3444,7 @@ mod tests {
 
         // Create nodes at alternating positions
         let nodes: Vec<_> = (0..9)
-            .map(|i| tracker.get_or_create(&uri, i * 2, i * 2 + 1, &format!("{}", i)))
+            .map(|i| tracker.get_or_create(&uri, i * 2, i * 2 + 1, leak_kind(i)))
             .collect();
 
         // "AXBXCXDXEXFXGXHXI" → "AYBYCYDYEYFYGYHYI"
@@ -3455,7 +3477,7 @@ mod tests {
 
         // Create 1000 nodes
         let nodes: Vec<_> = (0..1000)
-            .map(|i| tracker.get_or_create(&uri, i * 10, i * 10 + 5, &format!("{}", i)))
+            .map(|i| tracker.get_or_create(&uri, i * 10, i * 10 + 5, leak_kind(i)))
             .collect();
 
         // Large document: 10000 bytes
