@@ -47,8 +47,28 @@ pub struct NodeParams {
     /// `boolean | number` per ADR-0025 §"The `injection` Parameter". Absent /
     /// `false` / `0` selects the host layer; `true` saturates to the deepest
     /// layer; a non-zero integer indexes the stack strictly.
-    #[serde(default)]
+    ///
+    /// We deserialize via a custom helper so that explicit JSON `null`
+    /// reaches the handler as `Some(Value::Null)` (rejected as invalid) while
+    /// an absent field stays `None` (defaults to host). Plain
+    /// `Option<Value>` would collapse the two — serde's default Option
+    /// deserialization treats `null` and missing identically — which would
+    /// silently accept an unsupported shape against ADR-0025.
+    #[serde(default, deserialize_with = "deserialize_present_value")]
     pub injection: Option<Value>,
+}
+
+/// Deserialize a field as `Some(Value)` whenever it's *present* in the JSON,
+/// even when the value is explicit `null`. Combined with `#[serde(default)]`
+/// this lets the caller distinguish a missing field (`None`) from an
+/// explicit `null` (`Some(Value::Null)`).
+fn deserialize_present_value<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// Layer selector parsed from the `injection` JSON parameter.
@@ -73,11 +93,12 @@ enum InjectionSelector {
 ///
 /// Per ADR-0025: `false` and `0` are equivalent (host); `true` saturates;
 /// integer values index strictly. Anything else (string, array, fractional
-/// number) is rejected as `Invalid` so the handler returns null with a log
-/// warning, rather than silently coercing.
+/// number, **explicit JSON `null`**) is rejected as `Invalid` so the handler
+/// returns null with a log warning, rather than silently coercing. An absent
+/// field (`None`) defaults to host per the spec.
 fn parse_injection_selector(value: Option<&Value>) -> InjectionSelector {
     match value {
-        None | Some(Value::Null) => InjectionSelector::Host,
+        None => InjectionSelector::Host,
         Some(Value::Bool(true)) => InjectionSelector::Saturating,
         Some(Value::Bool(false)) => InjectionSelector::Host,
         Some(Value::Number(n)) => match n.as_i64() {
