@@ -626,11 +626,14 @@ fn test_node_children_returns_siblings_in_document_order() {
         );
     }
 
-    // Document-order invariant: walk each adjacent pair and confirm that each
-    // child's text appears no later in the document than the next child's text.
-    // We use `/text` lookups instead of byte ranges (the protocol does not expose
-    // ranges in NodeInfo) and locate each in the original document via `find`.
-    let mut last_pos: Option<usize> = None;
+    // Document-order invariant: each child's text must appear in the document
+    // after the previous child's text. We use `/text` lookups instead of byte
+    // ranges (the protocol does not expose ranges in NodeInfo) and search
+    // forward from the end of the previous match. Searching from byte 0 every
+    // time (via `text.find`) would falsely succeed on duplicate substrings or
+    // falsely fail when a later child's text happens to appear earlier in the
+    // document.
+    let mut search_start: usize = 0;
     for (i, child) in children.iter().enumerate() {
         let id = child
             .get("id")
@@ -645,22 +648,16 @@ fn test_node_children_returns_siblings_in_document_order() {
         if slice.is_empty() {
             continue;
         }
-        let Some(pos) = text.find(slice) else {
-            // Anonymous tokens may have text that recurs; if `find` fails the
-            // grammar emitted something we can't easily locate. Skip rather
-            // than fail the ordering check on a non-locatable child.
-            continue;
-        };
-        if let Some(prev) = last_pos {
-            assert!(
-                prev <= pos,
-                "children must be in document order: child {} found at byte {} but previous child ended at byte >= {}",
-                i,
-                pos,
-                prev
+        let Some(offset) = text[search_start..].find(slice) else {
+            panic!(
+                "children must be in document order: child {} text {:?} not found in document after byte {}",
+                i, slice, search_start
             );
-        }
-        last_pos = Some(pos);
+        };
+        // Advance past this match so the next child must appear at or after the
+        // end of this one. Equal positions are tolerated (zero-width overlap is
+        // not possible here because empty slices are skipped above).
+        search_start += offset + slice.len();
     }
 }
 

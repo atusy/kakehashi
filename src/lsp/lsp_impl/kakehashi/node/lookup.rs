@@ -23,15 +23,33 @@ pub(super) fn find_node_at<'tree>(
     end: usize,
     kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
+    // Defensive: reject obviously-invalid ranges before handing them to
+    // tree-sitter. A stale tracker entry (or future bug) could pass a range
+    // outside the parsed tree's bounds; the underlying C bindings have, at
+    // various tree-sitter versions, exhibited surprising behavior for such
+    // inputs. Returning None preserves the caller's null-collapse semantics.
+    let root = tree.root_node();
+    if start > end || end > root.end_byte() {
+        return None;
+    }
+
     // `descendant_for_byte_range(start, end)` returns the smallest node whose
     // byte range contains `[start, end)`. For a tracked node, that's the node
     // itself; for stale ranges it returns the containing node, in which case
     // the upward walk below will fail to find a match (and we return None).
-    let mut current = tree.root_node().descendant_for_byte_range(start, end)?;
+    let mut current = root.descendant_for_byte_range(start, end)?;
 
     loop {
-        if current.start_byte() == start && current.end_byte() == end && current.kind() == kind {
+        let c_start = current.start_byte();
+        let c_end = current.end_byte();
+        if c_start == start && c_end == end && current.kind() == kind {
             return Some(current);
+        }
+        // Parents can only have equal or larger ranges. Once `current` exceeds
+        // the target on either side, no ancestor can ever match exactly, so
+        // bail out instead of climbing all the way to the root.
+        if c_start < start || c_end > end {
+            return None;
         }
         match current.parent() {
             Some(parent) => current = parent,

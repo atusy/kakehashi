@@ -88,7 +88,7 @@ impl Kakehashi {
         // requires for PR-3. A leaf node yields an empty iterator, which we
         // serialize as `[]` (NOT `null`).
         let tracker = self.bridge.node_tracker();
-        let mut cursor = tree.walk();
+        let mut cursor = node.walk();
         let infos: Vec<Value> = node
             .children(&mut cursor)
             .map(|child| {
