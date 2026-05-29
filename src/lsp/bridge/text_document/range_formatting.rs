@@ -40,10 +40,12 @@ impl LanguageServerPool {
     ///
     /// `host_range` is the **already-clipped** host range — the caller is
     /// responsible for intersecting the editor-supplied range with the
-    /// injection region's line span (see
+    /// injection region's `byte_range` (see
     /// `lsp_impl::text_document::range_formatting` for the clipping logic).
-    /// This handler simply translates that range from host to virtual
-    /// coordinates and forwards.
+    /// Byte-precision clipping (not just the region's line span) is what
+    /// avoids false overlaps for inline injections that share a line with
+    /// surrounding host text. This handler simply translates that range from
+    /// host to virtual coordinates and forwards.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_range_formatting_request(
         &self,
