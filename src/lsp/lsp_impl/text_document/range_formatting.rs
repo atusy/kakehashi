@@ -104,18 +104,7 @@ impl Kakehashi {
         // Multi-line code-fence injections (`start_column == 0`) are
         // unchanged because their line and byte bounds are equivalent.
         let mapper = PositionMapper::new(snapshot.text());
-        let Some(request_bytes) = mapper
-            .position_to_byte(host_range.start)
-            .zip(mapper.position_to_byte(host_range.end))
-            .map(|(start, end)| start..end)
-        else {
-            log::debug!(
-                target: "kakehashi::rangeFormatting",
-                "Could not map request range to byte offsets for {}",
-                uri
-            );
-            return Ok(None);
-        };
+        let request_bytes = clamp_request_to_document(&mapper, host_range, snapshot.text().len());
 
         let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
@@ -197,6 +186,25 @@ impl Kakehashi {
     }
 }
 
+/// Map a host request `Range` to a byte range, clamping endpoints that fall
+/// outside the document to its length.
+///
+/// Editors routinely send a range that runs past EOF when formatting "to the
+/// end of the file" (often `u32::MAX`), and `position_to_byte` returns `None`
+/// for such positions. Dropping the whole request on an unmappable endpoint
+/// would silently skip formatting of otherwise-valid regions, so we treat an
+/// out-of-bounds endpoint as the document end instead. A start past EOF
+/// collapses to an empty range that `clip_request_to_region` skips harmlessly.
+fn clamp_request_to_document(
+    mapper: &PositionMapper,
+    range: Range,
+    doc_len: usize,
+) -> std::ops::Range<usize> {
+    let start = mapper.position_to_byte(range.start).unwrap_or(doc_len);
+    let end = mapper.position_to_byte(range.end).unwrap_or(doc_len);
+    start..end
+}
+
 /// Intersect a request's byte range with a region's byte range and map the
 /// result back to host LSP positions.
 ///
@@ -250,6 +258,31 @@ mod tests {
     /// handler would use, so tests stay in sync with the helper's contract.
     fn bytes(mapper: &PositionMapper, range: Range) -> std::ops::Range<usize> {
         mapper.position_to_byte(range.start).unwrap()..mapper.position_to_byte(range.end).unwrap()
+    }
+
+    #[test]
+    fn request_bytes_clamps_out_of_bounds_end_to_document_length() {
+        // Editors send a range that runs past EOF when formatting "to the
+        // end of the file" (often `u32::MAX`). The end must clamp to the
+        // document length instead of dropping the whole request.
+        let text = "first line\nsecond line\n";
+        let mapper = PositionMapper::new(text);
+        let range = pos_range(0, 0, 999, 0);
+
+        let bytes = clamp_request_to_document(&mapper, range, text.len());
+        assert_eq!(bytes, 0..text.len());
+    }
+
+    #[test]
+    fn request_bytes_clamps_out_of_bounds_start_to_document_length() {
+        // A start past EOF clamps to the document end, yielding an empty
+        // (degenerate) range that downstream clipping skips harmlessly.
+        let text = "first line\nsecond line\n";
+        let mapper = PositionMapper::new(text);
+        let range = pos_range(999, 0, 999, 5);
+
+        let bytes = clamp_request_to_document(&mapper, range, text.len());
+        assert_eq!(bytes, text.len()..text.len());
     }
 
     #[test]
