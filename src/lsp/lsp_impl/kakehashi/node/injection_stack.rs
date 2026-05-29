@@ -39,6 +39,13 @@ pub(super) struct InjectionLayer {
     pub(super) ranges: Vec<tree_sitter::Range>,
 }
 
+/// Whether `pattern_index` carries an `#offset!` directive. Used to decide if
+/// the raw-content-node fast bounds check is safe: an offset can extend the
+/// effective range past the raw node, so the shortcut only holds without one.
+fn pattern_has_offset(injection_query: &tree_sitter::Query, pattern_index: usize) -> bool {
+    parse_offset_directive_for_pattern(injection_query, pattern_index).is_some()
+}
+
 /// Build the full-document range used to seed the host layer.
 fn whole_document_range(host_text: &str) -> tree_sitter::Range {
     tree_sitter::Range {
@@ -115,20 +122,26 @@ pub(super) fn injection_stack_at(
         let host_len = host_text.len();
         let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
         for region in injections {
-            // Fast bounds check: the effective ranges can only ever be a
-            // sub-range of the raw content node, so a cursor outside the raw
-            // span cannot possibly be inside the effective ranges. Reject
-            // before the expensive build_effective_ranges call (which parses
-            // the #offset! directive and computes include-children gaps).
-            let raw_start = region.content_node.start_byte();
-            let raw_end = region.content_node.end_byte();
-            let outside_raw = if byte == host_len {
-                byte < raw_start || byte > raw_end
-            } else {
-                byte < raw_start || byte >= raw_end
-            };
-            if outside_raw {
-                continue;
+            // Fast bounds check: when there is no `#offset!` directive the
+            // effective ranges can only ever be a *sub*-range of the raw
+            // content node (include-children gaps only remove bytes), so a
+            // cursor outside the raw span cannot be inside them — reject before
+            // the expensive build_effective_ranges call. We must NOT apply this
+            // shortcut when an offset directive is present: positive end /
+            // negative start offsets can *extend* the effective range past the
+            // raw content node, so containment has to be judged on the
+            // effective ranges alone.
+            if !pattern_has_offset(&injection_query, region.pattern_index) {
+                let raw_start = region.content_node.start_byte();
+                let raw_end = region.content_node.end_byte();
+                let outside_raw = if byte == host_len {
+                    byte < raw_start || byte > raw_end
+                } else {
+                    byte < raw_start || byte >= raw_end
+                };
+                if outside_raw {
+                    continue;
+                }
             }
             let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
             if own_ranges.is_empty() {
