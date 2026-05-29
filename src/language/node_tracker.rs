@@ -1,7 +1,9 @@
-//! Stable region ID tracking for injection regions.
+//! Stable node identity tracking (ADR-0019).
 //!
-//! This module provides ULID-based identifiers for injection regions
-//! that remain stable across document edits (Phase 2: position-based with START-priority).
+//! This module provides ULID-based identifiers for tree-sitter nodes (originally
+//! used for injection regions, generalized for [ADR-0025](../../docs/adr/0025-node-reference-protocol.md))
+//! that remain stable across document edits using position-based composite keys
+//! with START-priority invalidation.
 
 use dashmap::DashMap;
 use log::{error, warn};
@@ -10,12 +12,85 @@ use std::collections::hash_map::Entry;
 use ulid::Ulid;
 use url::Url;
 
-/// Tracks stable ULID-based identifiers for injection regions.
+/// Tracks stable ULID-based identifiers for tree-sitter nodes.
 ///
-/// Phase 2: Uses position-based keys (start_byte, end_byte, kind) per ADR-0019.
-/// Applies START-priority invalidation rules to maintain stable ULIDs across edits.
-pub(crate) struct RegionIdTracker {
-    entries: DashMap<Url, HashMap<PositionKey, Ulid>>,
+/// Uses position-based composite keys (start_byte, end_byte, kind) per ADR-0019
+/// and applies START-priority invalidation rules to maintain stable ULIDs across edits.
+/// Originally introduced for injection regions; generalized for the Node Reference
+/// Protocol ([ADR-0025](../../docs/adr/0025-node-reference-protocol.md)).
+///
+/// Maintains a bidirectional index per URI:
+/// - forward (`PositionKey -> Ulid`) for assignment / dedup on `get_or_create`
+/// - reverse (`Ulid -> PositionKey`) for resolving a held ULID back to a node
+///   range (used by `kakehashi/node/text` and future navigation methods).
+///
+/// Both directions are kept in sync across `get_or_create`, `adjust_for_edits`,
+/// and `cleanup` so an invalidated ULID becomes indistinguishable from a never-issued
+/// one (per ADR-0019 "no tombstone" rule).
+pub(crate) struct NodeTracker {
+    entries: DashMap<Url, UriEntries>,
+}
+
+/// Per-URI bidirectional index between `PositionKey` and `Ulid`.
+///
+/// The two maps describe the same set of (key, ulid) pairs from different
+/// directions and MUST stay in sync. All mutating methods on this struct
+/// enforce that invariant; outside callers should not touch the fields
+/// directly.
+#[derive(Default)]
+struct UriEntries {
+    forward: HashMap<PositionKey, Ulid>,
+    reverse: HashMap<Ulid, PositionKey>,
+}
+
+impl UriEntries {
+    /// Get or insert a ULID for a position key, keeping both maps in sync.
+    fn get_or_insert(&mut self, key: PositionKey) -> Ulid {
+        if let Some(existing) = self.forward.get(&key) {
+            return *existing;
+        }
+        let ulid = Ulid::new();
+        self.forward.insert(key, ulid);
+        self.reverse.insert(ulid, key);
+        ulid
+    }
+
+    /// Lookup a position key by ULID.
+    fn lookup(&self, ulid: &Ulid) -> Option<&PositionKey> {
+        self.reverse.get(ulid)
+    }
+
+    /// Returns the number of (key, ulid) pairs currently tracked.
+    fn len(&self) -> usize {
+        debug_assert_eq!(
+            self.forward.len(),
+            self.reverse.len(),
+            "NodeTracker forward/reverse indices out of sync"
+        );
+        self.forward.len()
+    }
+
+    /// Drain all (key, ulid) entries, clearing both maps.
+    fn drain(&mut self) -> impl Iterator<Item = (PositionKey, Ulid)> + '_ {
+        self.reverse.clear();
+        self.forward.drain()
+    }
+
+    /// Insert a (key, ulid) pair; both maps must remain in sync.
+    ///
+    /// Returns `Err(existing_ulid)` if a different ULID already occupies the
+    /// position. Caller decides what to do with the collision (the current
+    /// adjust_for_edits policy is "first wins").
+    fn insert(&mut self, key: PositionKey, ulid: Ulid) -> std::result::Result<(), Ulid> {
+        match self.forward.entry(key) {
+            Entry::Vacant(e) => {
+                e.insert(ulid);
+                self.reverse.insert(ulid, key);
+                Ok(())
+            }
+            Entry::Occupied(e) => Err(*e.get()),
+        }
+    }
 }
 
 /// Key for Phase 2 position-based tracking (ADR-0019 composite key).
@@ -23,25 +98,29 @@ pub(crate) struct RegionIdTracker {
 /// Note: Language is NOT part of the key per ADR-0019 specification.
 /// Same position with different language gets different ULID because
 /// kind will differ in the AST (e.g., fenced_code_block vs code_block).
-#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 struct PositionKey {
     start_byte: usize,
     end_byte: usize,
-    kind: String,
+    /// tree-sitter node kinds are interned in the grammar's static data, so
+    /// every call site we accept input from (`Node::kind()`) returns a
+    /// `&'static str`. Storing the static slice avoids an allocation per
+    /// tracker entry without losing any genuinely owned data.
+    kind: &'static str,
 }
 
 impl PositionKey {
     /// Create a new position key from byte range and node kind.
-    fn new(start: usize, end: usize, kind: &str) -> Self {
+    fn new(start: usize, end: usize, kind: &'static str) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
-            kind: kind.to_string(),
+            kind,
         }
     }
 
     /// Create a position key with adjusted positions (for edit operations).
-    fn with_positions(start: usize, end: usize, kind: String) -> Self {
+    fn with_positions(start: usize, end: usize, kind: &'static str) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
@@ -53,7 +132,7 @@ impl PositionKey {
 /// Edit position information for region ID tracking.
 ///
 /// Represents byte positions of a text edit. Used to decouple
-/// RegionIdTracker from tree_sitter::InputEdit.
+/// NodeTracker from tree_sitter::InputEdit.
 ///
 /// Fields are intentionally private - use `new()` or `From<&InputEdit>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,7 +255,7 @@ fn adjust_position_for_edit(key: PositionKey, edit: &EditInfo, delta: i64) -> Op
     }
 }
 
-impl RegionIdTracker {
+impl NodeTracker {
     /// Create a new empty tracker.
     pub(crate) fn new() -> Self {
         Self {
@@ -184,18 +263,43 @@ impl RegionIdTracker {
         }
     }
 
-    /// Get or create a stable ULID for an injection region.
+    /// Get or create a stable ULID for a tree-sitter node.
     ///
-    /// Phase 2: Uses position-based lookup (ADR-0019 composite key).
-    /// Same (uri, start_byte, end_byte, kind) always returns the same ULID.
-    pub(crate) fn get_or_create(&self, uri: &Url, start: usize, end: usize, kind: &str) -> Ulid {
+    /// Uses ADR-0019 composite key `(start_byte, end_byte, kind)`: the same
+    /// (uri, start, end, kind) always returns the same ULID, while different
+    /// nodes at the same position (e.g. nested `document` / `section` / `paragraph`
+    /// at byte 0) receive distinct ULIDs.
+    ///
+    /// Updates both the forward and reverse index so the returned ULID can be
+    /// resolved back to its position via [`lookup_position`](Self::lookup_position).
+    pub(crate) fn get_or_create(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+    ) -> Ulid {
         let key = PositionKey::new(start, end, kind);
 
         // NOTE: Explicit two-step pattern to avoid DashMap lifetime ambiguity.
         let mut entry = self.entries.entry(uri.clone()).or_default();
-        // We need Ulid::new() to generate unique IDs, not Ulid::default() which returns Ulid(0)
-        #[allow(clippy::unwrap_or_default)]
-        *entry.entry(key).or_insert_with(Ulid::new)
+        entry.get_or_insert(key)
+    }
+
+    /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind)` triple.
+    ///
+    /// Returns `None` if the ULID was never issued for this URI, if it was
+    /// invalidated by an edit (START fell inside the edit range per ADR-0019),
+    /// or if the URI has been closed. These three cases are deliberately
+    /// indistinguishable — see ADR-0025 "Invalidate vs Not-Found".
+    pub(crate) fn lookup_position(
+        &self,
+        uri: &Url,
+        ulid: &Ulid,
+    ) -> Option<(usize, usize, &'static str)> {
+        let entries = self.entries.get(uri)?;
+        let key = entries.lookup(ulid)?;
+        Some((key.start_byte, key.end_byte, key.kind))
     }
 
     /// Get the ULID for a position if it exists, without creating it.
@@ -203,9 +307,9 @@ impl RegionIdTracker {
     /// Returns None if no entry exists for this position.
     /// Used in tests to verify position adjustment without side effects.
     #[cfg(test)]
-    fn get(&self, uri: &Url, start: usize, end: usize, kind: &str) -> Option<Ulid> {
+    fn get(&self, uri: &Url, start: usize, end: usize, kind: &'static str) -> Option<Ulid> {
         let key = PositionKey::new(start, end, kind);
-        self.entries.get(uri)?.get(&key).copied()
+        self.entries.get(uri)?.forward.get(&key).copied()
     }
 
     /// Apply text change and update region positions using START-priority invalidation.
@@ -244,7 +348,7 @@ impl RegionIdTracker {
             // Next full parse will correct positions anyway.
             debug_assert!(false, "No edits from diff despite old_text != new_text");
             warn!(
-                target: "kakehashi::region_tracker",
+                target: "kakehashi::node_tracker",
                 "No edits from diff despite old_text != new_text (uri={}). \
                  This may indicate a similar crate bug.",
                 uri
@@ -259,7 +363,7 @@ impl RegionIdTracker {
         if has_overlap {
             // Use error! level - this path should be unreachable if similar crate behaves correctly
             error!(
-                target: "kakehashi::region_tracker",
+                target: "kakehashi::node_tracker",
                 "Overlapping edits from diff (uri={}, edit_count={}). \
                  Falling back to whole-document invalidation. \
                  This may indicate a similar crate bug or version incompatibility.",
@@ -396,7 +500,7 @@ impl RegionIdTracker {
             // Defensive: skip invalid edits in production (graceful degradation)
             if edit.old_end_byte < edit.start_byte {
                 warn!(
-                    target: "kakehashi::region_tracker",
+                    target: "kakehashi::node_tracker",
                     "Skipping invalid edit: old_end_byte ({}) < start_byte ({})",
                     edit.old_end_byte, edit.start_byte
                 );
@@ -426,7 +530,7 @@ impl RegionIdTracker {
     /// ## Conservative Simplification
     ///
     /// ADR-0019 strictly requires comparing old-tree START vs new-tree START.
-    /// However, RegionIdTracker doesn't have access to the parsed tree
+    /// However, NodeTracker doesn't have access to the parsed tree
     /// (separation of concerns). We use a conservative approximation:
     ///
     /// - Zero-length insert AT node's START → always INVALIDATE
@@ -449,6 +553,9 @@ impl RegionIdTracker {
     /// Apply a single edit operation with START-priority invalidation (ADR-0019).
     ///
     /// Returns ULIDs that were invalidated by this edit (for Phase 3 cleanup).
+    /// Both the forward and reverse indices for the URI are rebuilt in place,
+    /// so a ULID returned in the invalidated list will no longer resolve via
+    /// [`lookup_position`](Self::lookup_position).
     fn apply_single_edit(&self, uri: &Url, edit: &EditInfo) -> Vec<Ulid> {
         let delta = edit.delta();
         let mut invalidated = Vec::new();
@@ -457,8 +564,12 @@ impl RegionIdTracker {
             return invalidated;
         };
 
-        // Pre-size HashMap: most edits don't invalidate, so entries count is a good estimate
-        let mut new_entries = HashMap::with_capacity(entries.len());
+        // Pre-size new index: most edits don't invalidate, so the current count
+        // is a good estimate of the surviving entries.
+        let mut new_entries = UriEntries {
+            forward: HashMap::with_capacity(entries.len()),
+            reverse: HashMap::with_capacity(entries.len()),
+        };
 
         for (key, ulid) in entries.drain() {
             if Self::should_invalidate_node(&key, edit) {
@@ -485,20 +596,14 @@ impl RegionIdTracker {
             // 3. Collisions may indicate a bug in invalidation logic anyway
             //
             // Log at warn level for observability and debugging.
-            match new_entries.entry(new_key.clone()) {
-                Entry::Vacant(e) => {
-                    e.insert(ulid);
-                }
-                Entry::Occupied(_) => {
-                    // Collision: keep first entry, log dropped ULID for debugging
-                    warn!(
-                        target: "kakehashi::region_tracker",
-                        "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}",
-                        ulid, new_key.start_byte, new_key.end_byte, new_key.kind
-                    );
-                    // Note: Collided ULID is also invalidated (both nodes can't coexist)
-                    invalidated.push(ulid);
-                }
+            if let Err(_existing) = new_entries.insert(new_key, ulid) {
+                warn!(
+                    target: "kakehashi::node_tracker",
+                    "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}",
+                    ulid, new_key.start_byte, new_key.end_byte, new_key.kind
+                );
+                // Note: Collided ULID is also invalidated (both nodes can't coexist)
+                invalidated.push(ulid);
             }
         }
 
@@ -514,7 +619,7 @@ impl RegionIdTracker {
     }
 }
 
-impl Default for RegionIdTracker {
+impl Default for NodeTracker {
     fn default() -> Self {
         Self::new()
     }
@@ -528,9 +633,17 @@ mod tests {
         Url::parse(&format!("file:///test/{}.md", name)).unwrap()
     }
 
+    /// Produce a `&'static str` kind for a numeric index by intentionally
+    /// leaking a short formatted string. Used in tests that need distinct
+    /// dynamic kinds; tree-sitter's real grammars already provide static
+    /// interned kinds, so production code never goes through this path.
+    fn leak_kind(i: usize) -> &'static str {
+        Box::leak(format!("{}", i).into_boxed_str())
+    }
+
     #[test]
     fn test_new_tracker_is_empty() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         // No direct way to check emptiness, but get_or_create should work
         let uri = test_uri("empty");
         let ulid = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -539,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_same_position_returns_same_ulid() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("same");
 
         let ulid1 = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -550,7 +663,7 @@ mod tests {
 
     #[test]
     fn test_different_start_returns_different_ulid() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("start");
 
         let ulid0 = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -564,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_different_kind_returns_different_ulid() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("kind");
 
         let block_ulid = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -578,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_different_uri_returns_different_ulid() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri1 = test_uri("doc1");
         let uri2 = test_uri("doc2");
 
@@ -590,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_removes_document_entries() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("cleanup");
 
         // Create some entries
@@ -610,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_does_not_affect_other_documents() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri1 = test_uri("keep");
         let uri2 = test_uri("remove");
 
@@ -630,8 +743,102 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_position_resolves_known_ulid() {
+        // Reverse index: get_or_create should make the ULID resolvable.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_known");
+
+        let ulid = tracker.get_or_create(&uri, 30, 50, "block");
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            Some((30, 50, "block")),
+            "Newly issued ULID must be resolvable via reverse index"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_returns_none_for_unknown_ulid() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_unknown");
+
+        // No entries exist for this URI yet.
+        let stray = Ulid::new();
+        assert_eq!(tracker.lookup_position(&uri, &stray), None);
+
+        // Adding an unrelated entry must not make the stray ULID resolvable.
+        let _ = tracker.get_or_create(&uri, 0, 5, "block");
+        assert_eq!(tracker.lookup_position(&uri, &stray), None);
+    }
+
+    #[test]
+    fn test_lookup_position_returns_none_after_cleanup() {
+        // didClose semantics: reverse index must be cleared together with forward index.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_cleanup");
+
+        let ulid = tracker.get_or_create(&uri, 10, 20, "block");
+        assert!(tracker.lookup_position(&uri, &ulid).is_some());
+
+        tracker.cleanup(&uri);
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            None,
+            "cleanup() must remove reverse index entries"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_after_edit_reflects_adjusted_range() {
+        // Reverse index must follow position adjustments performed by adjust_for_edits.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_adjusted");
+
+        let ulid = tracker.get_or_create(&uri, 60, 80, "block");
+
+        // Delete [30, 35) before the node → shift by -5.
+        let edits = vec![EditInfo::new(30, 35, 30)];
+        let invalidated = tracker.apply_input_edits(&uri, &edits);
+        assert!(
+            invalidated.is_empty(),
+            "edit before node must not invalidate"
+        );
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            Some((55, 75, "block")),
+            "lookup_position should follow adjusted node range"
+        );
+    }
+
+    #[test]
+    fn test_lookup_position_returns_none_after_invalidation() {
+        // After START-priority invalidation, the ULID becomes indistinguishable from
+        // never-issued (ADR-0019 no-tombstone rule, ADR-0025 invalidate-vs-not-found).
+        let tracker = NodeTracker::new();
+        let uri = test_uri("reverse_invalidated");
+
+        let ulid = tracker.get_or_create(&uri, 40, 60, "block");
+
+        // Edit covers the node's START → invalidate.
+        let edits = vec![EditInfo::new(35, 45, 35)];
+        let invalidated = tracker.apply_input_edits(&uri, &edits);
+        assert!(
+            invalidated.contains(&ulid),
+            "edit covering START must invalidate"
+        );
+
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            None,
+            "invalidated ULID must not be resolvable"
+        );
+    }
+
+    #[test]
     fn test_ulid_format_is_valid() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("format");
 
         let ulid = tracker.get_or_create(&uri, 0, 10, "code_block");
@@ -650,7 +857,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = test_uri("concurrent");
 
         // Spawn 10 threads that all try to get_or_create the same key
@@ -678,7 +885,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = test_uri("concurrent_diff");
 
         // Spawn threads that get_or_create different positions
@@ -722,7 +929,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = test_uri("concurrent_edit");
 
         // Pre-populate with several nodes
@@ -776,7 +983,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
 
         // Each thread works on its own URI
         let handles: Vec<_> = (0..5)
@@ -819,7 +1026,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = test_uri("interleaved");
 
         // Pre-populate with one stable node that won't be affected by edits
@@ -895,7 +1102,7 @@ mod tests {
     #[test]
     fn test_node_a_start_before_edit_end_after_keeps_ulid_adjusts_end() {
         // ADR-0019 Node A: Node START before edit, END after edit → KEEP (adjust end)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_a");
 
         // Create node at [30, 50)
@@ -938,7 +1145,7 @@ mod tests {
         // - START 20 is NOT in [40, 60) → KEEP
         // - END 50 is inside [40, 60) → clamp to edit.new_end_byte = 40
         // - New node: [20, 40) - valid range, ULID preserved
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_b");
 
         // Create node at [20, 50)
@@ -973,7 +1180,7 @@ mod tests {
     #[test]
     fn test_node_b_end_exactly_at_edit_end_keeps_ulid() {
         // ADR-0019 Node B variant: Node END exactly at edit end → KEEP
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_b_exact");
 
         // Create node at [30, 50)
@@ -1008,7 +1215,7 @@ mod tests {
     #[test]
     fn test_node_c_start_inside_edit_invalidates() {
         // ADR-0019 Node C: Node START inside edit range → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_c");
 
         // Create node at [40, 60)
@@ -1033,7 +1240,7 @@ mod tests {
     #[test]
     fn test_node_d_fully_inside_edit_invalidates() {
         // ADR-0019 Node D: Node fully inside edit → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_d");
 
         // Create node at [40, 45)
@@ -1057,7 +1264,7 @@ mod tests {
     #[test]
     fn test_node_e_after_edit_keeps_ulid_shifts_position() {
         // ADR-0019 Node E: Node after edit → KEEP (shift position)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_e");
 
         // Create node at [60, 80)
@@ -1092,7 +1299,7 @@ mod tests {
     #[test]
     fn test_node_f_before_edit_unchanged_keeps_ulid() {
         // ADR-0019 Node F: Node before edit, no overlap → KEEP (unchanged)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("node_f");
 
         // Create node at [10, 20)
@@ -1116,7 +1323,7 @@ mod tests {
     #[test]
     fn test_boundary_start_at_edit_start_invalidates() {
         // Boundary condition: Node START exactly at edit.start (inclusive) → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("boundary_start");
 
         // Create node at [35, 50)
@@ -1140,7 +1347,7 @@ mod tests {
     #[test]
     fn test_boundary_start_at_edit_old_end_keeps_ulid() {
         // Boundary condition: Node START exactly at edit.old_end (exclusive) → KEEP
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("boundary_end");
 
         // Create node at [40, 60)
@@ -1173,7 +1380,7 @@ mod tests {
     #[test]
     fn test_zero_length_insert_at_node_start_invalidates() {
         // Zero-length insert AT node START → INVALIDATE (conservative)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("zero_at_start");
 
         // Create node at [40, 60)
@@ -1197,7 +1404,7 @@ mod tests {
     #[test]
     fn test_zero_length_insert_before_node_keeps_ulid() {
         // Zero-length insert BEFORE node START → KEEP (shift)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("zero_before");
 
         // Create node at [40, 60)
@@ -1230,7 +1437,7 @@ mod tests {
     fn test_end_clamping_prevents_range_collapse() {
         // End is clamped to edit.new_end_byte so large deletes cannot make
         // end <= start, keeping the range valid for Node A/B cases.
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("collapse");
 
         // Create node at [30, 50)
@@ -1280,7 +1487,7 @@ mod tests {
     fn test_utf8_multibyte_edit_before_node_shifts_correctly() {
         // Test: Delete multi-byte characters before a node
         // Emoji 🦀 is 4 bytes, so deleting it should shift by 4, not 1
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_before");
 
         // Text: "abc🦀def" where 🦀 is at bytes [3, 7)
@@ -1315,7 +1522,7 @@ mod tests {
     #[test]
     fn test_utf8_multibyte_edit_inside_node_adjusts_end() {
         // Test: Delete multi-byte characters inside a node
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_inside");
 
         // Text: "start日本語end" where:
@@ -1349,7 +1556,7 @@ mod tests {
     #[test]
     fn test_utf8_multibyte_node_start_inside_edit_invalidates() {
         // Test: Node START falls inside edit range containing multi-byte chars
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_start_inside");
 
         // Text: "前🎉後text" where:
@@ -1381,7 +1588,7 @@ mod tests {
     #[test]
     fn test_utf8_insert_multibyte_shifts_correctly() {
         // Test: Insert multi-byte characters, verify shift
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_insert");
 
         // Text: "abcdef"
@@ -1408,7 +1615,7 @@ mod tests {
     #[test]
     fn test_utf8_mixed_ascii_and_multibyte() {
         // Test: Complex edit with mixed ASCII and multi-byte
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_mixed");
 
         // Text: "Hello世界World" where:
@@ -1460,7 +1667,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_returns_invalidated_ulids() {
         // Phase 3: Verify apply_text_diff returns the invalidated ULIDs
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("phase3_return");
 
         // Create node at [40, 60) - will be invalidated
@@ -1487,7 +1694,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_returns_multiple_invalidated_ulids() {
         // Phase 3: Multiple nodes invalidated by a single edit
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("phase3_multiple");
 
         // Create multiple nodes that will be invalidated by overlapping start
@@ -1527,7 +1734,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_returns_empty_when_no_invalidation() {
         // Phase 3: Edit that doesn't invalidate any node
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("phase3_no_invalidation");
 
         // Create node at [50, 60)
@@ -1549,7 +1756,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_returns_empty_for_identical_texts() {
         // Phase 3: Fast path when texts are identical
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("phase3_identical");
 
         let _ulid = tracker.get_or_create(&uri, 10, 20, "block");
@@ -1566,7 +1773,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_returns_empty_for_unknown_uri() {
         // Phase 3: Unknown URI returns empty (no entries to invalidate)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("phase3_unknown");
 
         let old_text = text_with_markers(50);
@@ -1625,7 +1832,7 @@ mod tests {
         // ADR-0019 Node A case: Edit INSIDE node → KEEP (adjust end)
         // Node [10, 20), Edit [15, 18) → [15, 25)
         // START 10 NOT in [15, 18) → KEEP
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("edit_inside");
 
         let ulid = tracker.get_or_create(&uri, 10, 20, "block");
@@ -1653,7 +1860,7 @@ mod tests {
         // Edit starts at node's START → INVALIDATE
         // Node [20, 40), Edit [20, 25) → [20, 30)
         // START 20 in [20, 25) → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("edit_at_start");
 
         let ulid = tracker.get_or_create(&uri, 20, 40, "block");
@@ -1673,7 +1880,7 @@ mod tests {
         // Delete exactly matching node range → INVALIDATE
         // Node [30, 50), Edit [30, 50) delete all
         // START 30 in [30, 50) → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("exact_match");
 
         let ulid = tracker.get_or_create(&uri, 30, 50, "block");
@@ -1693,7 +1900,7 @@ mod tests {
         // Edit BEFORE node → KEEP and shift
         // Node [50, 70), Edit [20, 30) delete 10 bytes
         // START 50 NOT in [20, 30) → KEEP, shift to [40, 60)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("edit_before");
 
         let ulid = tracker.get_or_create(&uri, 50, 70, "block");
@@ -1720,7 +1927,7 @@ mod tests {
         // Boundary: Node START exactly at edit.old_end → KEEP (shift)
         // Node [50, 70), Edit [30, 50) delete
         // START 50 NOT in [30, 50) because interval is [30, 50) exclusive
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("at_old_end");
 
         let ulid = tracker.get_or_create(&uri, 50, 70, "block");
@@ -1759,7 +1966,7 @@ mod tests {
         //   - Node 2 at [55, 65): START 55 NOT in [60, 63) → KEEP
         //     - END 65 > 60, adjust end: 65 + (-3) = 62
         //     - Final: [55, 62)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("multi_edit");
 
         let ulid1 = tracker.get_or_create(&uri, 10, 20, "block1");
@@ -1798,7 +2005,7 @@ mod tests {
     #[test]
     fn test_apply_input_edits_zero_length_insert_at_start_invalidates() {
         // ADR-0019: Zero-length insert AT node START → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("zero_at_start");
 
         let ulid = tracker.get_or_create(&uri, 20, 40, "block");
@@ -1816,7 +2023,7 @@ mod tests {
     #[test]
     fn test_apply_input_edits_zero_length_insert_before_node_shifts() {
         // Zero-length insert BEFORE node START → KEEP and shift
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("zero_before");
 
         let ulid = tracker.get_or_create(&uri, 30, 50, "block");
@@ -1840,7 +2047,7 @@ mod tests {
 
     #[test]
     fn test_apply_input_edits_empty_slice() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("empty");
 
         tracker.get_or_create(&uri, 10, 20, "block");
@@ -1856,7 +2063,7 @@ mod tests {
     #[test]
     fn test_apply_input_edits_unknown_uri_returns_empty() {
         // Unknown URI should return empty Vec (no entries to invalidate)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("unknown");
 
         let edits = vec![EditInfo::new(10, 20, 15)];
@@ -1883,7 +2090,7 @@ mod tests {
         //   - Node A: [20, 30) unchanged
         //   - Node B: invalidated
         //   - Node C: [60-20, 70-20) = [40, 50)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("multi_node");
 
         let ulid_a = tracker.get_or_create(&uri, 20, 30, "blockA");
@@ -1934,7 +2141,7 @@ mod tests {
         // IMPORTANT: This requires adjust_position_for_edit to clamp end when:
         //   edit.start_byte < node.end_byte <= edit.old_end_byte
         // Instead of applying delta (which would cause range collapse).
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("end_absorbed");
 
         let ulid = tracker.get_or_create(&uri, 20, 30, "block");
@@ -1962,7 +2169,7 @@ mod tests {
         // Edit range larger than node → should still invalidate
         // Node [40, 50), Edit [30, 60) delete
         // START 40 in [30, 60) → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("larger_edit");
 
         let ulid = tracker.get_or_create(&uri, 40, 50, "block");
@@ -1995,7 +2202,7 @@ mod tests {
         // Edit 2: insert at [0, 0) → [0, 1) (running coords after Edit 1)
         //   - Node A: already invalidated? No, A wasn't invalidated
         //   - Node A [0, 5): START 0 == 0 (zero-length at START) → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("vscode_multicursor");
 
         let ulid_a = tracker.get_or_create(&uri, 0, 5, "line1");
@@ -2053,7 +2260,7 @@ mod tests {
         //
         // Final positions: A [42, 52), B [85, 95), C [130, 140)
         // Total shift: A +2, B +5, C +10 (cumulative from 3 edits)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("vscode_reverse_positions");
 
         let ulid_a = tracker.get_or_create(&uri, 40, 50, "block");
@@ -2121,7 +2328,7 @@ mod tests {
     #[cfg(not(debug_assertions))]
     fn test_apply_input_edits_invalid_edit_skipped() {
         // Invalid edit (old_end < start) should be skipped with warning
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("invalid_edit");
 
         let ulid = tracker.get_or_create(&uri, 30, 50, "block");
@@ -2181,7 +2388,7 @@ mod tests {
         //   - Therefore collapse condition can never be satisfied
         // The range collapse check in adjust_position_for_edit is kept
         // as defense-in-depth against unexpected edge cases.
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("start_in_edit");
 
         let ulid = tracker.get_or_create(&uri, 10, 12, "block");
@@ -2199,7 +2406,7 @@ mod tests {
     #[test]
     fn test_apply_input_edits_zero_length_insert_after_node_keeps_unchanged() {
         // Zero-length insert AFTER node → KEEP unchanged
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("zero_after");
 
         let ulid = tracker.get_or_create(&uri, 20, 40, "block");
@@ -2231,7 +2438,7 @@ mod tests {
         // - START 20 NOT in [25, 55) → KEEP
         // - END 55 == old_end 55 → condition (end <= old_end) is TRUE → clamp to 25
         // - Final: [20, 25)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("end_at_old_end");
 
         let ulid = tracker.get_or_create(&uri, 20, 55, "block");
@@ -2259,7 +2466,7 @@ mod tests {
         // Node [20, 25), Edit: delete [25, 55) → [25, 25)
         // - Branch check: end > edit.start? → 25 > 25? NO
         // - Falls to else branch (Node F) → unchanged
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("end_at_start");
 
         let ulid = tracker.get_or_create(&uri, 20, 25, "block");
@@ -2289,7 +2496,7 @@ mod tests {
         // - END 40 > edit.start 30 → enters Node A/B branch
         // - END 40 <= old_end 30? NO (40 > 30) → apply delta +5
         // - Final: [20, 45)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("insert_inside");
 
         let ulid = tracker.get_or_create(&uri, 20, 40, "block");
@@ -2327,7 +2534,7 @@ mod tests {
     fn test_apply_input_edits_utf8_delete_emoji_before_node_shifts() {
         // Delete 4-byte emoji before node → shift by -4
         // Mirrors test_utf8_multibyte_edit_before_node_shifts_correctly
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("apply_input_edits_utf8_before");
 
         // Text: "abc🦀def" where 🦀 is at bytes [3, 7)
@@ -2352,7 +2559,7 @@ mod tests {
     fn test_apply_input_edits_utf8_delete_inside_node_adjusts_end() {
         // Delete 3-byte character inside node → end shrinks
         // Node [0, 17), delete bytes [8, 11) → [0, 14)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("apply_input_edits_utf8_inside");
 
         // Text: "start日本語end" (17 bytes)
@@ -2377,7 +2584,7 @@ mod tests {
     fn test_apply_input_edits_utf8_start_inside_edit_invalidates() {
         // Node START inside edit range → INVALIDATE
         // Node [7, 14), edit [3, 10) → START 7 ∈ [3, 10) → INVALIDATE
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("apply_input_edits_utf8_invalidate");
 
         // Text: "前🎉後text" - node [7, 14) covers "後text"
@@ -2400,7 +2607,7 @@ mod tests {
     #[test]
     fn test_apply_input_edits_utf8_insert_emoji_shifts_node() {
         // Insert 4-byte emoji before node → shift by +4
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("apply_input_edits_utf8_insert");
 
         // Text: "abcdef", node [3, 6) covers "def"
@@ -2425,7 +2632,7 @@ mod tests {
     fn test_apply_input_edits_utf8_mixed_operations() {
         // Multiple UTF-8 aware edits in sequence
         // Tests running coordinate updates with multi-byte deltas
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("apply_input_edits_utf8_mixed");
 
         // Three nodes: [0, 5), [10, 15), [20, 25)
@@ -2474,7 +2681,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = test_uri("concurrent_apply_input_edits");
 
         // Pre-populate with several nodes spread across the document
@@ -2523,7 +2730,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
 
         // Each thread works on its own URI
         let handles: Vec<_> = (0..5)
@@ -2564,7 +2771,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = test_uri("apply_input_edits_interleaved");
 
         // Pre-populate with one stable node that won't be affected by edits
@@ -2673,7 +2880,7 @@ mod tests {
         //
         // This is important because touching edits mean there's no preserved
         // content between them, so similar treats them as one contiguous change.
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("touching");
 
         // Node exactly at what would be the "boundary" if edits were separate
@@ -2696,7 +2903,7 @@ mod tests {
         //
         // With merged EditInfo [0,9), BBB's START (3) would fall inside and be
         // invalidated. With individual EditInfos [0,3) and [6,9), BBB stays untouched.
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("regression");
 
         let n_middle = tracker.get_or_create(&uri, 3, 6, "B");
@@ -2721,7 +2928,7 @@ mod tests {
     #[test]
     fn test_reconstruct_single_replacement() {
         // "ABC" → "XYZ": single contiguous replacement
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("single_replace");
 
         let n = tracker.get_or_create(&uri, 0, 3, "block");
@@ -2734,7 +2941,7 @@ mod tests {
     #[test]
     fn test_reconstruct_two_separate_edits() {
         // "AAABBBCCC" → "XBBBYY": two separate edits with preserved middle
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("two_edits");
 
         let n1 = tracker.get_or_create(&uri, 0, 3, "A");
@@ -2758,7 +2965,7 @@ mod tests {
     #[test]
     fn test_reconstruct_pure_insertion() {
         // "AB" → "AXB": pure insertion at position 1
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("insert");
 
         // Node after insert point should shift
@@ -2776,7 +2983,7 @@ mod tests {
     #[test]
     fn test_reconstruct_pure_deletion() {
         // "ABC" → "AC": pure deletion of 'B'
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("delete");
 
         let n_before = tracker.get_or_create(&uri, 0, 1, "A");
@@ -2805,7 +3012,7 @@ mod tests {
     #[test]
     fn test_reconstruct_empty_to_content() {
         // "" → "ABC": insert into empty document
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("empty_to_content");
 
         // No nodes to track initially
@@ -2819,7 +3026,7 @@ mod tests {
     #[test]
     fn test_reconstruct_content_to_empty() {
         // "ABC" → "": delete all content
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("content_to_empty");
 
         let n = tracker.get_or_create(&uri, 0, 3, "block");
@@ -2834,7 +3041,7 @@ mod tests {
     #[test]
     fn test_reconstruct_emoji() {
         // "A😀B" → "AXB": multi-byte character handling
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("emoji");
 
         // 😀 is 4 bytes, so original positions are: A[0,1), 😀[1,5), B[5,6)
@@ -2863,7 +3070,7 @@ mod tests {
     #[test]
     fn test_reconstruct_identical() {
         // "ABC" → "ABC": fast path, no processing
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("identical");
 
         let n = tracker.get_or_create(&uri, 0, 3, "block");
@@ -2876,7 +3083,7 @@ mod tests {
     #[test]
     fn test_reconstruct_crlf_newlines() {
         // Test CRLF byte offset handling
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("crlf");
 
         // "line1\r\nline2" has \r\n at bytes [5,7)
@@ -2900,7 +3107,7 @@ mod tests {
         let old = format!("{}_X_BBB", prefix);
         let new = format!("{}_Y_BBB", prefix);
 
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("long_prefix");
 
         // Node at the changing position (after 1000 A's + underscore)
@@ -2925,7 +3132,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_preserves_unaffected_node() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("preserve");
 
         let _n1 = tracker.get_or_create(&uri, 0, 3, "A");
@@ -2939,7 +3146,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_correct_final_position() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("final_pos");
 
         let n2 = tracker.get_or_create(&uri, 3, 6, "B");
@@ -2959,7 +3166,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_empty_to_content() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("empty_start");
 
         let invalidated = tracker.apply_text_diff(&uri, "", "New content");
@@ -2971,7 +3178,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_content_to_empty() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("to_empty");
 
         let n = tracker.get_or_create(&uri, 0, 10, "block");
@@ -2985,7 +3192,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_identical_returns_empty() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("identical_fast");
 
         let n = tracker.get_or_create(&uri, 0, 5, "block");
@@ -2998,7 +3205,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_touching_edits() {
         // When edits touch [0,3)+[3,6), similar merges them
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("touching");
 
         let n = tracker.get_or_create(&uri, 3, 6, "middle");
@@ -3010,7 +3217,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_single_byte_node() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("single_byte");
 
         // Single byte node at position 5
@@ -3029,7 +3236,7 @@ mod tests {
 
     #[test]
     fn test_apply_text_diff_adjacent_nodes_large_delete() {
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("adjacent_delete");
 
         let n1 = tracker.get_or_create(&uri, 0, 10, "A");
@@ -3060,7 +3267,7 @@ mod tests {
     #[test]
     fn test_node_end_exactly_at_edit_start() {
         // Node [0,30), Edit [30,40) → node unchanged
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("boundary_end_at_start");
 
         let n = tracker.get_or_create(&uri, 0, 30, "block");
@@ -3076,7 +3283,7 @@ mod tests {
     #[test]
     fn test_node_end_exactly_at_edit_old_end() {
         // Node [0,40), Edit [30,40) → end adjustment edge case
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("boundary_end_at_old_end");
 
         let n = tracker.get_or_create(&uri, 0, 40, "block");
@@ -3098,7 +3305,7 @@ mod tests {
     #[test]
     fn test_edit_start_exactly_at_node_end() {
         // Node [0,10), Edit [10,20) → node unchanged
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("edit_at_node_end");
 
         let n = tracker.get_or_create(&uri, 0, 10, "block");
@@ -3113,7 +3320,7 @@ mod tests {
     #[test]
     fn test_edit_fully_inside_node() {
         // Node [0,30), Edit [10,20) → start unchanged, end adjusted
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("edit_inside");
 
         let n = tracker.get_or_create(&uri, 0, 30, "block");
@@ -3139,12 +3346,12 @@ mod tests {
     #[test]
     fn test_apply_text_diff_cumulative_delta_verification() {
         // Multiple edits accumulate delta correctly in reverse order
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("cumulative");
 
         // "AAABBBCCCDDDEEE" with nodes at each segment
         let nodes: Vec<_> = (0..5)
-            .map(|i| tracker.get_or_create(&uri, i * 3, (i + 1) * 3, &format!("{}", i)))
+            .map(|i| tracker.get_or_create(&uri, i * 3, (i + 1) * 3, leak_kind(i)))
             .collect();
 
         // Remove AAA (delta=-3) and CCC (delta=-3)
@@ -3171,7 +3378,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_prepend_content() {
         // "BBBCCC" → "AAABBBCCC": prepend content
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("prepend");
 
         let n1 = tracker.get_or_create(&uri, 0, 3, "B");
@@ -3193,7 +3400,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_edit_at_document_end() {
         // Append to document: existing nodes unchanged
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("append");
 
         let n = tracker.get_or_create(&uri, 0, 10, "existing");
@@ -3208,7 +3415,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_multiple_zero_length_inserts() {
         // Multiple insertions at different positions
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("multi_insert");
 
         let n1 = tracker.get_or_create(&uri, 1, 2, "B");
@@ -3232,12 +3439,12 @@ mod tests {
     #[test]
     fn test_reconstruct_many_alternating() {
         // 18 chars with 9 changes: alternating pattern
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("alternating");
 
         // Create nodes at alternating positions
         let nodes: Vec<_> = (0..9)
-            .map(|i| tracker.get_or_create(&uri, i * 2, i * 2 + 1, &format!("{}", i)))
+            .map(|i| tracker.get_or_create(&uri, i * 2, i * 2 + 1, leak_kind(i)))
             .collect();
 
         // "AXBXCXDXEXFXGXHXI" → "AYBYCYDYEYFYGYHYI"
@@ -3265,12 +3472,12 @@ mod tests {
     #[test]
     fn test_apply_text_diff_large_document() {
         // Performance sanity check with large document
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("large");
 
         // Create 1000 nodes
         let nodes: Vec<_> = (0..1000)
-            .map(|i| tracker.get_or_create(&uri, i * 10, i * 10 + 5, &format!("{}", i)))
+            .map(|i| tracker.get_or_create(&uri, i * 10, i * 10 + 5, leak_kind(i)))
             .collect();
 
         // Large document: 10000 bytes
@@ -3308,7 +3515,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = Url::parse("file:///concurrent_individual.md").unwrap();
 
         // Create many nodes
@@ -3341,7 +3548,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(RegionIdTracker::new());
+        let tracker = Arc::new(NodeTracker::new());
         let uri = Url::parse("file:///race_individual.md").unwrap();
 
         // Initial nodes
@@ -3397,7 +3604,7 @@ mod tests {
         // CRITICAL: Test that position collision is handled correctly
         // When two nodes collapse to the same position after an edit,
         // one wins (non-deterministic) and the other is invalidated.
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("collision");
 
         // Setup: Two nodes with same start but different end
@@ -3442,7 +3649,7 @@ mod tests {
     fn test_apply_input_edits_empty_slice_preserves_nodes() {
         // MAJOR: Test that empty edit slice is handled gracefully
         // (complements existing test_apply_input_edits_empty_slice)
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("empty_edits_preserve");
 
         // Multiple nodes should all be preserved
@@ -3474,7 +3681,7 @@ mod tests {
         // LSP incremental edits use RUNNING coordinates - each edit's position is
         // relative to document state AFTER previous edits, so they must be
         // processed sequentially in array order.
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("lsp_order");
 
         // Document: "AABBCCDD" (8 bytes)
@@ -3510,7 +3717,7 @@ mod tests {
     fn test_reconstruct_produces_correct_edit_info_values() {
         // CRITICAL: Indirectly test reconstruct_individual_edits by verifying
         // the exact EditInfo values through apply_text_diff behavior
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("reconstruct_verify");
 
         // Create nodes at strategic positions to verify edit boundaries
@@ -3560,7 +3767,7 @@ mod tests {
     fn test_reconstruct_multibyte_utf8_boundary_handling() {
         // HIGH PRIORITY: Test byte offset tracking across multi-byte UTF-8 characters
         // Emojis are 4 bytes each in UTF-8, CJK characters are typically 3 bytes
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_multibyte");
 
         // "A😀B" is 6 bytes: A(1) + 😀(4) + B(1)
@@ -3604,7 +3811,7 @@ mod tests {
     #[test]
     fn test_apply_text_diff_multibyte_replacement() {
         // Additional UTF-8 test: Replacement involving multi-byte characters
-        let tracker = RegionIdTracker::new();
+        let tracker = NodeTracker::new();
         let uri = test_uri("utf8_replacement");
 
         // "Hello世界" is 11 bytes: Hello(5) + 世(3) + 界(3)

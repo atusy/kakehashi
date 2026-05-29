@@ -11,7 +11,7 @@
 //! | ID Type | Source | Format | Purpose |
 //! |---------|--------|--------|---------|
 //! | `result_id` | `next_result_id()` (this module) | Sequential integers ("1", "2", ...) | LSP delta computation - client uses to request deltas from a known baseline |
-//! | `region_id` | `RegionIdTracker::get_or_create()` | Position-based ULIDs | Injection region identity - bridge server uses to route requests to correct virtual document |
+//! | `region_id` | `NodeTracker::get_or_create()` | Position-based ULIDs | Injection region identity - bridge server uses to route requests to correct virtual document |
 //!
 //! ## result_id (this module)
 //!
@@ -20,7 +20,7 @@
 //! - **Used for**: `SemanticTokens.result_id` and `SemanticTokensDelta.result_id` in LSP responses
 //! - **Consumer**: LSP client (e.g., VSCode, Neovim)
 //!
-//! ## region_id (RegionIdTracker)
+//! ## region_id (NodeTracker)
 //!
 //! - **Scope**: Per-injection-region, keyed by (uri, start_byte, end_byte, node_kind)
 //! - **Stability**: Stable across edits if region position is adjusted correctly
@@ -42,7 +42,7 @@ static TOKEN_RESULT_COUNTER: AtomicU64 = AtomicU64::new(1);
 ///
 /// # See Also
 ///
-/// - `RegionIdTracker::get_or_create()` for injection region IDs (position-based ULIDs)
+/// - `NodeTracker::get_or_create()` for injection region IDs (position-based ULIDs)
 pub fn next_result_id() -> String {
     TOKEN_RESULT_COUNTER
         .fetch_add(1, Ordering::SeqCst)

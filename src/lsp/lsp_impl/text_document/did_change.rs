@@ -3,7 +3,7 @@
 use tower_lsp_server::ls_types::DidChangeTextDocumentParams;
 
 use super::super::{Kakehashi, uri_to_url};
-use crate::language::region_id_tracker::EditInfo;
+use crate::language::node_tracker::EditInfo;
 use crate::lsp::text_sync::apply_content_changes_with_edits;
 
 impl Kakehashi {

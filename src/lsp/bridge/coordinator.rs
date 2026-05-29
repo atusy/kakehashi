@@ -6,7 +6,7 @@
 //! # Responsibilities
 //!
 //! - Manages downstream language server connections via `LanguageServerPool`
-//! - Tracks stable ULID-based region IDs via `RegionIdTracker`
+//! - Tracks stable ULID-based region IDs via `NodeTracker`
 //! - Provides bridge config lookup with wildcard resolution
 //! - Provides cancel notification support via `CancelForwarder`
 
@@ -21,7 +21,7 @@ use crate::config::{
     WorkspaceSettings, merge_bridge_server_configs, resolve_with_wildcard,
     settings::BridgeServerConfig,
 };
-use crate::language::region_id_tracker::{EditInfo, RegionIdTracker};
+use crate::language::node_tracker::{EditInfo, NodeTracker};
 use crate::lsp::request_id::CancelForwarder;
 
 use super::LanguageServerPool;
@@ -76,12 +76,12 @@ struct EagerOpenBatch {
 
 /// Coordinator for bridge connections and region ID tracking.
 ///
-/// Consolidates the `LanguageServerPool` and `RegionIdTracker` into a single
+/// Consolidates the `LanguageServerPool` and `NodeTracker` into a single
 /// struct, reducing Kakehashi's field count from 9 to 8.
 ///
 /// # Design Notes
 ///
-/// The coordinator exposes internals via accessor methods (`pool()`, `region_id_tracker()`)
+/// The coordinator exposes internals via accessor methods (`pool()`, `node_tracker()`)
 /// for handlers that need direct access.
 ///
 /// The pool is wrapped in `Arc` to enable sharing with the cancel forwarding middleware.
@@ -102,10 +102,10 @@ struct EagerOpenBatch {
 ///
 /// **Decision Guide**: Use direct pool access by default. Only add a delegating method
 /// if the operation is (a) used in 3+ places, (b) involves coordinator-level logic
-/// (e.g., combining pool + region_id_tracker), or (c) needs semantic naming for clarity.
+/// (e.g., combining pool + node_tracker), or (c) needs semantic naming for clarity.
 pub(crate) struct BridgeCoordinator {
     pool: Arc<LanguageServerPool>,
-    region_id_tracker: RegionIdTracker,
+    node_tracker: NodeTracker,
     /// Cancel forwarder for upstream cancel notification and downstream forwarding.
     ///
     /// This is shared with the `RequestIdCapture` middleware via `cancel_forwarder()`.
@@ -139,7 +139,7 @@ impl BridgeCoordinator {
         let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
         Self {
             pool,
-            region_id_tracker: RegionIdTracker::new(),
+            node_tracker: NodeTracker::new(),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
@@ -159,7 +159,7 @@ impl BridgeCoordinator {
     ) -> Self {
         Self {
             pool,
-            region_id_tracker: RegionIdTracker::new(),
+            node_tracker: NodeTracker::new(),
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
@@ -173,8 +173,8 @@ impl BridgeCoordinator {
     /// Access the underlying region ID tracker.
     ///
     /// Used by handlers for `InjectionResolver::resolve_at_byte_offset()`.
-    pub(crate) fn region_id_tracker(&self) -> &RegionIdTracker {
-        &self.region_id_tracker
+    pub(crate) fn node_tracker(&self) -> &NodeTracker {
+        &self.node_tracker
     }
 
     /// Access the underlying language server pool.
@@ -341,7 +341,7 @@ impl BridgeCoordinator {
     ///
     /// Returns ULIDs that were invalidated by this edit (for cleanup).
     pub(crate) fn apply_input_edits(&self, uri: &Url, edits: &[EditInfo]) -> Vec<Ulid> {
-        self.region_id_tracker.apply_input_edits(uri, edits)
+        self.node_tracker.apply_input_edits(uri, edits)
     }
 
     /// Apply text diff to update region positions.
@@ -349,15 +349,14 @@ impl BridgeCoordinator {
     /// Used when InputEdits are not available (full document sync).
     /// Returns ULIDs that were invalidated.
     pub(crate) fn apply_text_diff(&self, uri: &Url, old_text: &str, new_text: &str) -> Vec<Ulid> {
-        self.region_id_tracker
-            .apply_text_diff(uri, old_text, new_text)
+        self.node_tracker.apply_text_diff(uri, old_text, new_text)
     }
 
     /// Remove all tracked regions for a document.
     ///
     /// Called on didClose to prevent memory leaks.
     pub(crate) fn cleanup(&self, uri: &Url) {
-        self.region_id_tracker.cleanup(uri)
+        self.node_tracker.cleanup(uri)
     }
 
     // ========================================
@@ -670,7 +669,7 @@ impl std::fmt::Debug for BridgeCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeCoordinator")
             .field("pool", &"LanguageServerPool")
-            .field("region_id_tracker", &"RegionIdTracker")
+            .field("node_tracker", &"NodeTracker")
             .field("cancel_forwarder", &"CancelForwarder")
             .field(
                 "eager_open_tasks",

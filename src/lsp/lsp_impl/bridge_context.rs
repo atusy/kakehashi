@@ -297,7 +297,7 @@ impl Kakehashi {
 
         let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
-            self.bridge.region_id_tracker(),
+            self.bridge.node_tracker(),
             &uri,
             snapshot.tree(),
             snapshot.text(),
