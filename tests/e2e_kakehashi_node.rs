@@ -1203,3 +1203,129 @@ fn test_node_injection_unsupported_shape_returns_null() {
         n
     );
 }
+
+/// `kakehashi/node/parent` on an id minted from an injected layer must keep
+/// navigating *inside that injected tree* (ADR-0025 §"Navigation Methods" —
+/// Scope rule), never crossing back into the markdown host. Walk the parent
+/// chain from a python node up to the python root; every hop must stay a
+/// python kind, and the hop past the injected root must return `null` rather
+/// than surfacing the enclosing markdown `code_fence_content`.
+#[test]
+fn test_node_parent_on_injected_id_stays_in_injected_tree() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injected_parent.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    // Mint a python node at the `=` (line 3, char 4) via saturation.
+    let seed = request_node_with_injection(&mut client, uri, 3, 4, json!(true));
+    assert!(!seed.is_null(), "injection=true must resolve a python node");
+    let seed_ty = seed
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("type field");
+    assert!(
+        is_python_kind(seed_ty),
+        "seed must be a python node, got {:?}",
+        seed_ty
+    );
+
+    // Walk parents. Every non-null hop must remain a python kind — a markdown
+    // kind appearing here would mean the handler crossed the injection
+    // boundary. Terminate when a hop returns null (the injected root has no
+    // parent within its tree).
+    let mut current_id = seed
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id field")
+        .to_string();
+    let mut hops = 0;
+    let mut reached_root_null = false;
+    for _ in 0..32 {
+        let parent = request_node_parent(&mut client, uri, &current_id);
+        if parent.is_null() {
+            reached_root_null = true;
+            break;
+        }
+        let ty = parent
+            .get("type")
+            .and_then(Value::as_str)
+            .expect("parent type field");
+        assert!(
+            is_python_kind(ty),
+            "parent hop {} left the injected tree: got non-python kind {:?}",
+            hops,
+            ty
+        );
+        current_id = parent
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("parent id field")
+            .to_string();
+        hops += 1;
+    }
+    assert!(
+        reached_root_null,
+        "walking parents from an injected node must eventually return null at the injected root (did not within 32 hops)"
+    );
+    assert!(
+        hops >= 1,
+        "expected at least one python→python parent hop before the root"
+    );
+}
+
+/// `kakehashi/node/children` on an id minted from an injected layer must list
+/// children from the injected tree, not the markdown host. Mint the python
+/// root via the deepest-saturating walk, then assert its children are python.
+#[test]
+fn test_node_children_on_injected_id_stays_in_injected_tree() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_injected_children.md";
+    open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
+
+    // Walk up to the injected root: the last python node before /parent
+    // returns null.
+    let seed = request_node_with_injection(&mut client, uri, 3, 4, json!(true));
+    assert!(!seed.is_null(), "injection=true must resolve a python node");
+    let mut root_id = seed
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("id field")
+        .to_string();
+    for _ in 0..32 {
+        let parent = request_node_parent(&mut client, uri, &root_id);
+        if parent.is_null() {
+            break;
+        }
+        root_id = parent
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("parent id field")
+            .to_string();
+    }
+
+    // Children of the injected root must be python nodes (the injected tree's
+    // top-level statements), proving children navigation stays in-layer.
+    let children = request_node_children(&mut client, uri, &root_id);
+    let arr = children
+        .as_array()
+        .expect("children of a resolvable id must be an array");
+    assert!(
+        !arr.is_empty(),
+        "the python root must have at least one child"
+    );
+    for child in arr {
+        let ty = child
+            .get("type")
+            .and_then(Value::as_str)
+            .expect("child type field");
+        assert!(
+            is_python_kind(ty),
+            "children of an injected node must stay in the injected tree, got {:?}",
+            ty
+        );
+    }
+}
