@@ -219,8 +219,37 @@ impl Kakehashi {
         // the host parser on-demand; injection layers require their own
         // grammars to be available before `injection_stack_at` can parse
         // them. Skip the expensive load for the host-only path above.
+        //
+        // The pre-await snapshot (`text` / `tree` / `byte`) is fine for
+        // *discovering* which grammars to install, but must NOT be reused to
+        // mint a ULID: a `didChange` processed while grammars install would
+        // adjust the tracker, leaving our stale byte ranges un-adjusted and
+        // minting an id for bytes the edit moved.
         self.ensure_injection_languages_loaded(&uri, &host_language, text, tree)
             .await;
+
+        // Re-snapshot after the await and recompute the position mapping. From
+        // here on we operate strictly on the post-await document state.
+        let snapshot = match self.documents.get(&uri).and_then(|doc| doc.snapshot()) {
+            Some(s) => s,
+            None => {
+                log::debug!(target: "kakehashi::node", "no parsed document for {} after load", uri);
+                return Ok(Value::Null);
+            }
+        };
+        let text = snapshot.text();
+        let tree = snapshot.tree();
+        let doc_len = text.len();
+        if doc_len == 0 {
+            return Ok(Value::Null);
+        }
+        let mapper = PositionMapper::new(text);
+        let Some(byte) = mapper.position_to_byte(position) else {
+            return Ok(Value::Null);
+        };
+        if byte > doc_len {
+            return Ok(Value::Null);
+        }
 
         let stack = injection_stack_at(&self.language, &host_language, text, tree, byte);
 
