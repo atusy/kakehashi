@@ -207,14 +207,15 @@ impl Kakehashi {
 /// a single-line request into later injection regions); a line past EOF clamps
 /// to the document end.
 ///
-/// `start.min(end)` guards against an inverted result: a malformed client may
-/// send `start` after `end`, and clamping the start's line could otherwise
-/// push it past an in-bounds end. A collapsed (empty) range is skipped
-/// harmlessly by `clip_request_to_region`.
+/// A malformed client may send `start` after `end` (or clamping the start's
+/// line could push it past an in-bounds end). We normalize such an inverted
+/// pair to `[min, max]` rather than collapsing it to an empty range — the two
+/// positions still describe the span the user selected, so formatting it is
+/// more useful than silently doing nothing.
 fn clamp_request_to_document(mapper: &PositionMapper, range: Range) -> std::ops::Range<usize> {
     let start = mapper.position_to_byte_clamped(range.start);
     let end = mapper.position_to_byte_clamped(range.end);
-    start.min(end)..end
+    start.min(end)..start.max(end)
 }
 
 /// Intersect a request's byte range with a region's byte range and map the
@@ -313,15 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn request_bytes_never_inverts_when_start_is_after_end() {
-        // Malformed client: start positioned after end. The result must not
-        // invert (start <= end) so downstream clipping behaves sanely.
+    fn request_bytes_normalizes_inverted_range_to_forward_span() {
+        // Malformed client: start positioned after end. The pair is
+        // normalized to [min, max] (the span the user selected) rather than
+        // collapsing to an empty range, so formatting still happens.
+        // "first line\n" is 11 bytes; (0,2) -> byte 2, (1,5) -> byte 16.
         let text = "first line\nsecond line\n";
         let mapper = PositionMapper::new(text);
         let range = pos_range(1, 5, 0, 2);
 
         let bytes = clamp_request_to_document(&mapper, range);
-        assert!(bytes.start <= bytes.end, "byte range must not invert");
+        assert_eq!(bytes, 2..16);
     }
 
     #[test]
