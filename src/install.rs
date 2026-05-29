@@ -159,15 +159,22 @@ pub mod test_support {
         };
         let mut all_ok = true;
         for lang in TEST_LANGUAGES {
-            if let Err(e) = parser::install_parser(lang, &parser_options) {
-                eprintln!("[test setup] install_parser({}) failed: {}", lang, e);
-                all_ok = false;
+            // `AlreadyExists` means the artifact is present from an earlier
+            // run — success for setup purposes, not a failure. Treating it as
+            // failure would make a partial prior run unrecoverable: if parsers
+            // installed but a query failed (so the marker was never written),
+            // every later run would see `AlreadyExists` for the parser and
+            // could never write the marker without deleting files by hand.
+            match parser::install_parser(lang, &parser_options) {
+                Ok(_) | Err(parser::ParserInstallError::AlreadyExists(_)) => {}
+                Err(e) => {
+                    eprintln!("[test setup] install_parser({}) failed: {}", lang, e);
+                    all_ok = false;
+                }
             }
-            if let Err(e) = queries::install_queries(lang, data_dir, false) {
-                let msg = e.to_string();
-                // An "already exists" error means the queries are present —
-                // that is success for setup purposes, not a failure.
-                if !msg.contains("already exists") {
+            match queries::install_queries(lang, data_dir, false) {
+                Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
+                Err(e) => {
                     eprintln!("[test setup] install_queries({}) failed: {}", lang, e);
                     all_ok = false;
                 }
