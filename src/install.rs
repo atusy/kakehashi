@@ -89,13 +89,16 @@ pub(crate) fn test_data_dir() -> PathBuf {
 
 /// Test-support helpers exposed to integration tests under `tests/`.
 ///
-/// Integration tests can't see `cfg(test)`-gated items in the lib (they
-/// link against the non-test build), so the shared test-data-dir wiring
-/// lives in a regular `pub` module and is just routed through
-/// `test_data_dir()` for lib unit tests.
+/// Gated to test-only builds: lib unit tests reach it via `cfg(test)`, and
+/// the E2E integration crate reaches it via `feature = "e2e"`. Plain
+/// `cfg(test)` alone would not work — integration tests link against the
+/// non-test lib build and can't see `cfg(test)`-gated items — so the gate
+/// also opts in the `e2e` feature. The production library/binary build (no
+/// `cfg(test)`, no `e2e`) compiles without this module.
 ///
 /// Not part of the public LSP-server API — intended only for the
 /// in-tree test harness.
+#[cfg(any(test, feature = "e2e"))]
 pub mod test_support {
     use super::{parser, queries};
     use std::path::{Path, PathBuf};
