@@ -70,7 +70,7 @@ impl Kakehashi {
 
         let all_regions = InjectionResolver::resolve_all(
             &self.language,
-            self.bridge.region_id_tracker(),
+            self.bridge.node_tracker(),
             &uri,
             snapshot.tree(),
             snapshot.text(),
