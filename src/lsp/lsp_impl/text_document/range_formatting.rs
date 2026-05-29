@@ -104,7 +104,7 @@ impl Kakehashi {
         // Multi-line code-fence injections (`start_column == 0`) are
         // unchanged because their line and byte bounds are equivalent.
         let mapper = PositionMapper::new(snapshot.text());
-        let request_bytes = clamp_request_to_document(&mapper, host_range, snapshot.text().len());
+        let request_bytes = clamp_request_to_document(&mapper, host_range);
 
         let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
@@ -186,23 +186,26 @@ impl Kakehashi {
     }
 }
 
-/// Map a host request `Range` to a byte range, clamping endpoints that fall
-/// outside the document to its length.
+/// Map a host request `Range` to a byte range, clamping out-of-bounds
+/// endpoints to the nearest valid offset instead of dropping the request.
 ///
-/// Editors routinely send a range that runs past EOF when formatting "to the
-/// end of the file" (often `u32::MAX`), and `position_to_byte` returns `None`
-/// for such positions. Dropping the whole request on an unmappable endpoint
-/// would silently skip formatting of otherwise-valid regions, so we treat an
-/// out-of-bounds endpoint as the document end instead. A start past EOF
-/// collapses to an empty range that `clip_request_to_region` skips harmlessly.
-fn clamp_request_to_document(
-    mapper: &PositionMapper,
-    range: Range,
-    doc_len: usize,
-) -> std::ops::Range<usize> {
-    let start = mapper.position_to_byte(range.start).unwrap_or(doc_len);
-    let end = mapper.position_to_byte(range.end).unwrap_or(doc_len);
-    start..end
+/// Editors routinely send positions past the document or line bounds: a range
+/// that runs "to the end of the file" (often `u32::MAX`), or a character index
+/// past a line's end. `position_to_byte` returns `None` for both, which would
+/// silently skip formatting of otherwise-valid regions. `position_to_byte_clamped`
+/// resolves each endpoint precisely — a character past a line's end clamps to
+/// that line's end (within the line; not the document end, which would balloon
+/// a single-line request into later injection regions); a line past EOF clamps
+/// to the document end.
+///
+/// `start.min(end)` guards against an inverted result: a malformed client may
+/// send `start` after `end`, and clamping the start's line could otherwise
+/// push it past an in-bounds end. A collapsed (empty) range is skipped
+/// harmlessly by `clip_request_to_region`.
+fn clamp_request_to_document(mapper: &PositionMapper, range: Range) -> std::ops::Range<usize> {
+    let start = mapper.position_to_byte_clamped(range.start);
+    let end = mapper.position_to_byte_clamped(range.end);
+    start.min(end)..end
 }
 
 /// Intersect a request's byte range with a region's byte range and map the
@@ -269,7 +272,7 @@ mod tests {
         let mapper = PositionMapper::new(text);
         let range = pos_range(0, 0, 999, 0);
 
-        let bytes = clamp_request_to_document(&mapper, range, text.len());
+        let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, 0..text.len());
     }
 
@@ -281,8 +284,35 @@ mod tests {
         let mapper = PositionMapper::new(text);
         let range = pos_range(999, 0, 999, 5);
 
-        let bytes = clamp_request_to_document(&mapper, range, text.len());
+        let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, text.len()..text.len());
+    }
+
+    #[test]
+    fn request_bytes_clamps_overlong_character_to_line_end_not_document_end() {
+        // A character past a valid line's end must clamp to that line's end,
+        // not the document end — otherwise a single-line request would
+        // broaden into later lines and dispatch to regions the user did not
+        // select. Line 0 is "first line\n" (bytes 0..11), so col 999 clamps
+        // to byte 11 (start of line 1), well short of the document end (23).
+        let text = "first line\nsecond line\n";
+        let mapper = PositionMapper::new(text);
+        let range = pos_range(0, 0, 0, 999);
+
+        let bytes = clamp_request_to_document(&mapper, range);
+        assert_eq!(bytes, 0..11);
+    }
+
+    #[test]
+    fn request_bytes_never_inverts_when_start_is_after_end() {
+        // Malformed client: start positioned after end. The result must not
+        // invert (start <= end) so downstream clipping behaves sanely.
+        let text = "first line\nsecond line\n";
+        let mapper = PositionMapper::new(text);
+        let range = pos_range(1, 5, 0, 2);
+
+        let bytes = clamp_request_to_document(&mapper, range);
+        assert!(bytes.start <= bytes.end, "byte range must not invert");
     }
 
     #[test]
