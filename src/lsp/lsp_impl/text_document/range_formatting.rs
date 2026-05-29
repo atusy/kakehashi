@@ -114,6 +114,16 @@ impl Kakehashi {
             else {
                 continue;
             };
+            // The byte-range clip can still leave an endpoint inside a
+            // stripped per-line prefix (e.g. blockquoted code's `> `); pull
+            // both endpoints onto the actual injected content.
+            let Some(clipped_host_range) = clamp_range_to_content_columns(
+                clipped_host_range,
+                resolved.region.line_range.start,
+                &resolved.line_column_offsets,
+            ) else {
+                continue;
+            };
 
             let configs = self.bridge_configs_for_injection_language(
                 &language_name,
@@ -247,6 +257,46 @@ fn clip_request_to_region(
     Some(Range { start, end })
 }
 
+/// Clamp a clipped host range so neither endpoint sits inside an injection's
+/// stripped per-line prefix (e.g. the `> ` of a blockquoted code block).
+///
+/// `clip_request_to_region` intersects against the injection's *raw*
+/// `byte_range`, but that range still contains the per-line prefix bytes that
+/// `extract_clean_content` strips out of `virtual_content`. An endpoint left
+/// inside such a prefix would be carried into `translate_host_range_to_virtual`,
+/// whose `saturating_sub` collapses it to virtual column 0 — so the clip alone
+/// is not aligned with the bytes that actually became the virtual document.
+///
+/// `line_column_offsets[v]` is the host column where content begins on virtual
+/// line `v` (the same per-line offset the bridge subtracts during translation).
+/// Clamping each endpoint up to its line's content-start column keeps the
+/// request inside the injected content, and lets a selection lying entirely in
+/// prefix bytes collapse to an empty range that the caller skips instead of
+/// dispatching a no-op downstream request.
+///
+/// No-op for the common cases: code-fence injections have all-zero offsets, and
+/// inline injections already start at content (their prefix bytes lie outside
+/// `byte_range`), so neither is altered.
+fn clamp_range_to_content_columns(
+    mut range: Range,
+    base_line: u32,
+    line_column_offsets: &[u32],
+) -> Option<Range> {
+    let content_col = |host_line: u32| -> u32 {
+        let virtual_line = host_line.saturating_sub(base_line) as usize;
+        line_column_offsets.get(virtual_line).copied().unwrap_or(0)
+    };
+    range.start.character = range.start.character.max(content_col(range.start.line));
+    range.end.character = range.end.character.max(content_col(range.end.line));
+
+    // Empty or inverted after clamping means nothing inside the content is
+    // selected on this region — skip it rather than dispatch an empty request.
+    if (range.start.line, range.start.character) >= (range.end.line, range.end.character) {
+        return None;
+    }
+    Some(range)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +375,45 @@ mod tests {
 
         let bytes = clamp_request_to_document(&mapper, range);
         assert_eq!(bytes, 2..16);
+    }
+
+    #[test]
+    fn content_clamp_is_noop_for_zero_offsets() {
+        // Code-fence injection: all per-line offsets are 0, so nothing moves.
+        let r = pos_range(2, 0, 4, 3);
+        let clamped = clamp_range_to_content_columns(r, 2, &[0, 0, 0]).unwrap();
+        assert_eq!(clamped, r);
+    }
+
+    #[test]
+    fn content_clamp_pulls_prefix_start_onto_content() {
+        // Blockquoted code: content starts at host col 2 on each line.
+        // Region begins at host line 1; a start at (1,0) sits in the `> `
+        // prefix and must clamp to col 2; the in-content end is untouched.
+        let r = pos_range(1, 0, 2, 5);
+        let clamped = clamp_range_to_content_columns(r, 1, &[2, 2]).unwrap();
+        assert_eq!(
+            clamped.start,
+            Position {
+                line: 1,
+                character: 2
+            }
+        );
+        assert_eq!(
+            clamped.end,
+            Position {
+                line: 2,
+                character: 5
+            }
+        );
+    }
+
+    #[test]
+    fn content_clamp_skips_prefix_only_selection() {
+        // Whole selection lies within the `> ` prefix of one line → after
+        // clamping both endpoints to col 2 the range is empty → skipped.
+        let r = pos_range(1, 0, 1, 1);
+        assert!(clamp_range_to_content_columns(r, 1, &[2, 2]).is_none());
     }
 
     #[test]
