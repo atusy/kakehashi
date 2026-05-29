@@ -200,6 +200,73 @@ pub(super) fn with_resolved_node<R>(
     None
 }
 
+/// Collect every injection language reachable in `host_tree`, at all depths
+/// that are currently parseable.
+///
+/// A language is *recorded* as soon as its `@injection.language` is resolved,
+/// even if its parser is not yet loaded. But the walk only *descends* into a
+/// layer whose parser is already in the registry — parsing requires a loaded
+/// grammar. This makes the function a single fixpoint step: callers that
+/// auto-install the returned set and call again will, on the next pass, be
+/// able to parse one level deeper and surface the next tier of languages.
+/// Iterating to a fixpoint discovers the full nested chain
+/// (Markdown → Python → Regex …) without ever parsing with a missing grammar.
+///
+/// Bounded by [`MAX_INJECTION_DEPTH`] per branch so a misconfigured grammar
+/// cycle cannot loop forever.
+pub(super) fn collect_injection_languages(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+) -> std::collections::HashSet<String> {
+    let registry = coordinator.language_registry_for_parallel();
+    let mut languages = std::collections::HashSet::new();
+
+    // (language, tree, depth) work items. Trees are owned so each item is
+    // self-contained; the host tree is cheap to clone (refcounted).
+    let mut work: Vec<(String, tree_sitter::Tree, usize)> =
+        vec![(host_language.to_string(), host_tree.clone(), 0)];
+
+    while let Some((lang, tree, depth)) = work.pop() {
+        if depth >= MAX_INJECTION_DEPTH {
+            continue;
+        }
+        let Some(injection_query) = coordinator.injection_query(&lang) else {
+            continue;
+        };
+        let root = tree.root_node();
+        let Some(regions) = collect_all_injections(&root, host_text, Some(&injection_query)) else {
+            continue;
+        };
+        for region in regions {
+            let content =
+                &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+            let Some((resolved_lang, _)) =
+                coordinator.resolve_injection_language(&region.language, content)
+            else {
+                continue;
+            };
+            languages.insert(resolved_lang.clone());
+
+            // Only descend if the parser is already loaded; otherwise leave it
+            // for the next fixpoint pass (after the caller auto-installs it).
+            if let Some(language) = registry.get(&resolved_lang) {
+                let ranges = build_effective_ranges(&region, host_text, &injection_query);
+                if ranges.is_empty() {
+                    continue;
+                }
+                if let Some(child_tree) = parse_with_absolute_ranges(&language, host_text, &ranges)
+                {
+                    work.push((resolved_lang, child_tree, depth + 1));
+                }
+            }
+        }
+    }
+
+    languages
+}
+
 /// Parse `text` with a fresh tree-sitter parser configured for `language`,
 /// restricted to `ranges` (absolute doc-coord). Returns `None` if the parser
 /// cannot be initialised, the ranges are rejected, or parsing fails.
@@ -270,11 +337,24 @@ fn build_effective_ranges(
     let content_start = region.content_node.start_byte();
     let content_start_pos = region.content_node.start_position();
     let absolute_ranges: Vec<tree_sitter::Range> = if offset.is_some() {
+        // #offset! shifts are byte arithmetic over i32 deltas, so the effective
+        // bounds can land mid-codepoint. Align both ends down to a UTF-8
+        // boundary before handing them to tree-sitter — passing a mid-char
+        // byte to set_included_ranges is UB / panic territory, and it would
+        // also desync from byte_to_point (which aligns internally).
+        let aligned_start = align_down(host_text, eff_start);
+        let aligned_end = align_down(host_text, eff_end);
+        // The alignment could, in pathological cases, collapse the range
+        // (e.g. both ends fall inside the same multi-byte char). Guard so we
+        // never emit a zero/negative-width range to the parser.
+        if aligned_start >= aligned_end {
+            return Vec::new();
+        }
         vec![tree_sitter::Range {
-            start_byte: eff_start,
-            end_byte: eff_end,
-            start_point: byte_to_point(host_text, eff_start),
-            end_point: byte_to_point(host_text, eff_end),
+            start_byte: aligned_start,
+            end_byte: aligned_end,
+            start_point: byte_to_point(host_text, aligned_start),
+            end_point: byte_to_point(host_text, aligned_end),
         }]
     } else {
         match compute_included_ranges(&region.content_node, region.include_children) {
@@ -338,20 +418,26 @@ fn total_span(ranges: &[tree_sitter::Range]) -> usize {
         .sum()
 }
 
+/// Clamp `byte` into `text` and round down to the nearest UTF-8 character
+/// boundary. Byte values derived from `#offset!` directives (i32 deltas in
+/// byte space) are not guaranteed to land on boundaries; feeding a mid-char
+/// byte to tree-sitter's `set_included_ranges` or to a string slice would
+/// panic. Rounding down keeps the offset inside the intended content.
+fn align_down(text: &str, byte: usize) -> usize {
+    let mut aligned = byte.min(text.len());
+    while aligned > 0 && !text.is_char_boundary(aligned) {
+        aligned -= 1;
+    }
+    aligned
+}
+
 /// Convert an absolute byte offset to a `tree_sitter::Point`. Used when an
 /// offset directive shifts the injection boundary away from a known node
 /// position, so we can't reuse the content node's start/end points.
 fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
-    // Clamp first, then walk back to the nearest UTF-8 character boundary.
-    // The byte values reaching this helper can come from #offset! directives
-    // (i32 row/column shifts then converted to bytes), which are not
-    // guaranteed to land on character boundaries. Slicing &text[..clamped]
-    // on a mid-character byte would panic and crash the LSP server, so
-    // round-down to the nearest valid boundary.
-    let mut clamped = byte.min(text.len());
-    while clamped > 0 && !text.is_char_boundary(clamped) {
-        clamped -= 1;
-    }
+    // Align first — slicing `&text[..clamped]` on a mid-character byte would
+    // panic and crash the LSP server.
+    let clamped = align_down(text, byte);
     let prefix = &text[..clamped];
     let row = prefix.bytes().filter(|b| *b == b'\n').count();
     let last_nl = prefix.rfind('\n');

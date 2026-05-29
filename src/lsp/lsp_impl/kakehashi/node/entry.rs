@@ -219,7 +219,7 @@ impl Kakehashi {
         // the host parser on-demand; injection layers require their own
         // grammars to be available before `injection_stack_at` can parse
         // them. Skip the expensive load for the host-only path above.
-        self.ensure_injection_languages_loaded(&uri, &host_language, text)
+        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree)
             .await;
 
         let stack = injection_stack_at(&self.language, &host_language, text, tree, byte);
@@ -289,29 +289,51 @@ impl Kakehashi {
     }
 
     /// Ensure parsers for every injection language reachable from this
-    /// document are loaded. `didOpen` triggers this via `process_injections`,
-    /// but a client may call `kakehashi/node` quickly enough to race that
-    /// load — re-invoke it here defensively so PR-4's injection-aware path
-    /// has a parser to work with.
+    /// document — **at every nesting depth** — are loaded. `didOpen` triggers
+    /// a first-level load via `process_injections`, but a client may call
+    /// `kakehashi/node` quickly enough to race it, and nested grammars
+    /// (Markdown → Python → Regex) are never first-level. Re-run defensively
+    /// here so PR-4's injection-aware path has parsers for the whole chain.
     ///
-    /// Cheap when languages are already loaded (`ensure_language_loaded`
-    /// short-circuits on a registry hit).
-    async fn ensure_injection_languages_loaded(&self, uri: &Url, host_language: &str, _text: &str) {
+    /// Discovery is a fixpoint: `collect_injection_languages` can only parse
+    /// *into* layers whose grammar is already loaded, so each round surfaces
+    /// the next tier. We auto-install each round's newly-seen languages, then
+    /// recollect — converging once a round adds nothing new (or the depth cap
+    /// is hit). Cheap once everything is loaded: `collect` short-circuits on
+    /// loaded grammars and `check_injected_languages_auto_install` is a no-op
+    /// when there is nothing to install.
+    async fn ensure_injection_languages_loaded(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        text: &str,
+        host_tree: &tree_sitter::Tree,
+    ) {
         use std::collections::HashSet;
 
-        // Re-resolve the injection set from the host language's injection
-        // query. We could mine this from `injection_stack_at` but we'd then
-        // have to plumb it back; the duplicate work is negligible and keeps
-        // the stack helper synchronous-only.
         let coordinator = self.injection_coordinator();
-        let injections = coordinator.resolve_injection_data(uri, host_language);
-        if injections.is_empty() {
-            return;
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Bound the outer loop independently of the per-branch depth cap inside
+        // `collect_injection_languages`; MAX rounds is generous since each
+        // round must reveal at least one new language to continue.
+        for _round in 0..crate::language::injection::MAX_INJECTION_DEPTH {
+            let discovered =
+                crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_injection_languages(
+                    &self.language,
+                    host_language,
+                    text,
+                    host_tree,
+                );
+            let fresh: HashSet<String> = discovered.difference(&seen).cloned().collect();
+            if fresh.is_empty() {
+                break;
+            }
+            coordinator
+                .check_injected_languages_auto_install(uri, &fresh)
+                .await;
+            seen.extend(fresh);
         }
-        let languages: HashSet<String> = injections.into_iter().map(|i| i.language).collect();
-        coordinator
-            .check_injected_languages_auto_install(uri, &languages)
-            .await;
     }
 
     /// Parse the document on-demand if its tree has not been built yet.
