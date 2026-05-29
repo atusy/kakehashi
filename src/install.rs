@@ -132,13 +132,20 @@ pub mod test_support {
     }
 
     /// Install every language in [`TEST_LANGUAGES`] into `data_dir` if
-    /// the `.installed` marker is missing, then write the marker.
+    /// the `.installed` marker is missing, writing the marker only when
+    /// every required install succeeded.
     ///
     /// Mirrors the install loop in `make deps/tree-sitter/.installed`.
     /// Both `install_parser` and `install_queries` short-circuit when a
     /// language is up-to-date; any genuine failure is logged so tests
     /// depending on that language fail with a clearer error rather than
     /// the whole suite panicking in setup.
+    ///
+    /// A transient failure (network, file lock, compile error) must not
+    /// leave the marker behind: a marker over a half-populated data dir
+    /// would make every later test process skip setup, turning a one-off
+    /// failure into a persistent one until the marker is deleted by hand.
+    /// So the marker is written only after all installs succeed.
     pub fn ensure_test_languages_installed(data_dir: &Path) -> std::io::Result<()> {
         let marker = data_dir.join(".installed");
         if marker.exists() {
@@ -150,18 +157,26 @@ pub mod test_support {
             verbose: false,
             no_cache: false,
         };
+        let mut all_ok = true;
         for lang in TEST_LANGUAGES {
             if let Err(e) = parser::install_parser(lang, &parser_options) {
                 eprintln!("[test setup] install_parser({}) failed: {}", lang, e);
+                all_ok = false;
             }
             if let Err(e) = queries::install_queries(lang, data_dir, false) {
                 let msg = e.to_string();
+                // An "already exists" error means the queries are present —
+                // that is success for setup purposes, not a failure.
                 if !msg.contains("already exists") {
                     eprintln!("[test setup] install_queries({}) failed: {}", lang, e);
+                    all_ok = false;
                 }
             }
         }
-        std::fs::write(&marker, "")
+        if all_ok {
+            std::fs::write(&marker, "")?;
+        }
+        Ok(())
     }
 }
 
