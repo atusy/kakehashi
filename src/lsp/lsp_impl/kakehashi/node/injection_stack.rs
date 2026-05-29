@@ -18,7 +18,7 @@ use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges,
-    parse_offset_directive_for_pattern,
+    intersect_included_ranges, parse_offset_directive_for_pattern,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -31,6 +31,22 @@ use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 pub(super) struct InjectionLayer {
     /// Tree-sitter syntax tree for this layer.
     pub(super) tree: tree_sitter::Tree,
+    /// Absolute ranges in host coordinates that this layer's tree was parsed
+    /// against. The host layer spans the whole document; each deeper layer's
+    /// ranges are the intersection of its own effective ranges with its
+    /// parent's, so container exclusions (e.g. blockquote `> ` prefixes) are
+    /// inherited down the nesting chain.
+    pub(super) ranges: Vec<tree_sitter::Range>,
+}
+
+/// Build the full-document range used to seed the host layer.
+fn whole_document_range(host_text: &str) -> tree_sitter::Range {
+    tree_sitter::Range {
+        start_byte: 0,
+        end_byte: host_text.len(),
+        start_point: tree_sitter::Point { row: 0, column: 0 },
+        end_point: byte_to_point(host_text, host_text.len()),
+    }
 }
 
 /// Enumerate the injection stack at `byte` in `host_text`.
@@ -57,6 +73,7 @@ pub(super) fn injection_stack_at(
     let mut stack: Vec<InjectionLayer> = Vec::new();
     stack.push(InjectionLayer {
         tree: host_tree.clone(),
+        ranges: vec![whole_document_range(host_text)],
     });
 
     let registry = coordinator.language_registry_for_parallel();
@@ -73,12 +90,14 @@ pub(super) fn injection_stack_at(
         // Take the **current deepest** layer's tree, ask it which injections
         // overlap the cursor, and pick the smallest containing one. Using
         // the deepest tree (rather than always the host) ensures we discover
-        // injections nested inside an already-injected region.
-        let deepest_tree = &stack
+        // injections nested inside an already-injected region. We also carry
+        // the parent layer's ranges so a nested injection inherits container
+        // exclusions (blockquote prefixes etc.) from every ancestor.
+        let parent_layer = stack
             .last()
-            .expect("stack always contains at least the host layer")
-            .tree;
-        let root = deepest_tree.root_node();
+            .expect("stack always contains at least the host layer");
+        let parent_ranges = parent_layer.ranges.clone();
+        let root = parent_layer.tree.root_node();
         let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query))
         else {
             break;
@@ -111,7 +130,15 @@ pub(super) fn injection_stack_at(
             if outside_raw {
                 continue;
             }
-            let absolute_ranges = build_effective_ranges(&region, host_text, &injection_query);
+            let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
+            if own_ranges.is_empty() {
+                continue;
+            }
+            // Inherit parent exclusions: a byte the parent layer already
+            // excluded (e.g. a blockquote `> ` prefix on an intermediate line)
+            // must stay excluded for the nested parser. For the host layer the
+            // parent range is the whole document, so this is a no-op there.
+            let absolute_ranges = intersect_included_ranges(&parent_ranges, &own_ranges);
             if absolute_ranges.is_empty() {
                 continue;
             }
@@ -148,6 +175,7 @@ pub(super) fn injection_stack_at(
 
         stack.push(InjectionLayer {
             tree: injected_tree,
+            ranges: absolute_ranges,
         });
         current_language = resolved_lang;
     }
@@ -223,12 +251,19 @@ pub(super) fn collect_injection_languages(
     let registry = coordinator.language_registry_for_parallel();
     let mut languages = std::collections::HashSet::new();
 
-    // (language, tree, depth) work items. Trees are owned so each item is
-    // self-contained; the host tree is cheap to clone (refcounted).
-    let mut work: Vec<(String, tree_sitter::Tree, usize)> =
-        vec![(host_language.to_string(), host_tree.clone(), 0)];
+    // (language, tree, parent_ranges, depth) work items. Trees are owned so
+    // each item is self-contained; the host tree is cheap to clone
+    // (refcounted). parent_ranges carries the inherited container exclusions so
+    // a nested layer is parsed against the same effective span the stack walk
+    // would use — keeping discovery and the per-position stack consistent.
+    let mut work: Vec<(String, tree_sitter::Tree, Vec<tree_sitter::Range>, usize)> = vec![(
+        host_language.to_string(),
+        host_tree.clone(),
+        vec![whole_document_range(host_text)],
+        0,
+    )];
 
-    while let Some((lang, tree, depth)) = work.pop() {
+    while let Some((lang, tree, parent_ranges, depth)) = work.pop() {
         if depth >= MAX_INJECTION_DEPTH {
             continue;
         }
@@ -252,13 +287,14 @@ pub(super) fn collect_injection_languages(
             // Only descend if the parser is already loaded; otherwise leave it
             // for the next fixpoint pass (after the caller auto-installs it).
             if let Some(language) = registry.get(&resolved_lang) {
-                let ranges = build_effective_ranges(&region, host_text, &injection_query);
+                let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
+                let ranges = intersect_included_ranges(&parent_ranges, &own_ranges);
                 if ranges.is_empty() {
                     continue;
                 }
                 if let Some(child_tree) = parse_with_absolute_ranges(&language, host_text, &ranges)
                 {
-                    work.push((resolved_lang, child_tree, depth + 1));
+                    work.push((resolved_lang, child_tree, ranges, depth + 1));
                 }
             }
         }
