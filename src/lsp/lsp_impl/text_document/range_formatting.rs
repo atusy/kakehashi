@@ -12,6 +12,7 @@
 //! entirely; no downstream request is sent.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
@@ -41,6 +42,16 @@ impl Kakehashi {
         };
 
         log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
+
+        // Tower-LSP runs requests concurrently, so a rangeFormatting call can
+        // arrive before didOpen/didChange has finished parsing. Wait briefly
+        // for any in-flight parse to land a tree before snapshotting, matching
+        // the read-handler pattern (semantic tokens, node lookups); otherwise
+        // an otherwise-valid request would degrade to `Ok(None)` purely due to
+        // a parse race.
+        self.documents
+            .wait_for_parse_completion(&uri, Duration::from_millis(200))
+            .await;
 
         let snapshot = match self.documents.get(&uri) {
             None => {
