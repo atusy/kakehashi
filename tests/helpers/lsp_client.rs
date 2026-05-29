@@ -96,19 +96,24 @@ impl LspClientBuilder {
     pub fn build(self) -> LspClient {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
         cmd.args(&self.args)
-            // Isolate the spawned binary from the developer's real
-            // platform data dir before any user-supplied env / args
-            // override takes effect.
-            .env("KAKEHASHI_DATA_DIR", test_data_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        for (key, value) in &self.envs {
-            cmd.env(key, value);
-        }
+        // Order matters for isolation. Apply removals to the *inherited*
+        // environment first, then set the isolation default, then explicit
+        // per-test values. This way `.env_remove("KAKEHASHI_DATA_DIR")` (used
+        // by tests that exercise the "no env var" config path) drops only the
+        // developer's inherited value — the default below still keeps the
+        // spawned binary off the real platform data dir. Were removals applied
+        // last, they would strip the isolation default and the binary would
+        // fall back to the developer/platform data dir.
         for key in &self.env_removes {
             cmd.env_remove(key);
+        }
+        cmd.env("KAKEHASHI_DATA_DIR", test_data_dir());
+        for (key, value) in &self.envs {
+            cmd.env(key, value);
         }
 
         let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
