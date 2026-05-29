@@ -1,12 +1,16 @@
-//! End-to-end tests for `kakehashi/node` and `kakehashi/node/text` (ADR-0025 PR-1).
+//! End-to-end tests for `kakehashi/node`, `kakehashi/node/text`, and
+//! `kakehashi/node/parent` (ADR-0025 PR-1 + PR-2).
 //!
-//! Covers the entry-point method (position → NodeInfo) plus the text resolution
-//! method (id → current node text) and their interaction with `didChange`:
+//! Covers the entry-point method (position → NodeInfo), the text resolution
+//! method (id → current node text), the parent navigation method
+//! (child id → parent NodeInfo), and their interaction with `didChange`:
 //!
 //! - smallest-at-cursor lookup for named-or-anonymous nodes (host language only)
 //! - end-of-document exception (`b == L && L > 0 && e == L`)
 //! - empty document and out-of-bounds returning `null`
 //! - `kakehashi/node/text` returning the live slice for a tracked node
+//! - `kakehashi/node/parent` walking one step toward the root
+//! - parent returning null at the root and for unknown ids
 //! - ULID survival across position-adjusting edits
 //! - ULID invalidation when the edit covers the node's START byte
 //!
@@ -59,6 +63,27 @@ fn request_node_text(client: &mut LspClient, uri: &str, id: &str) -> Value {
     assert!(
         response.get("error").is_none(),
         "kakehashi/node/text returned an error: {:?}",
+        response.get("error")
+    );
+    response
+        .get("result")
+        .cloned()
+        .expect("response must contain a result field")
+}
+
+/// Send `kakehashi/node/parent` for an id and unwrap the `result` field
+/// (which may be `null`).
+fn request_node_parent(client: &mut LspClient, uri: &str, id: &str) -> Value {
+    let response = client.send_request(
+        "kakehashi/node/parent",
+        json!({
+            "textDocument": { "uri": uri },
+            "id": id
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "kakehashi/node/parent returned an error: {:?}",
         response.get("error")
     );
     response
@@ -355,5 +380,138 @@ fn test_node_at_heading_returns_node_info() {
     assert!(
         !ty.is_empty(),
         "type field should be the tree-sitter node kind, got empty string"
+    );
+}
+
+/// `kakehashi/node/parent` walks one step toward the root of the same language
+/// tree (ADR-0025 §"Navigation Methods"). Acquiring an id deep inside a nested
+/// markdown structure and asking for its parent must yield a NodeInfo whose id
+/// is distinct from the child's and whose type is the kind of the immediate
+/// tree-sitter parent.
+#[test]
+fn test_node_parent_returns_immediate_parent_for_nested_node() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_parent_nested.md";
+    // Nested structure: document → section → paragraph → inline → text.
+    let text = "# Heading\n\nSome paragraph text.\n";
+    open_markdown(&mut client, uri, text);
+
+    // Cursor inside the paragraph text on the second non-empty line.
+    let child = request_node(&mut client, uri, 2, 5);
+    assert!(!child.is_null(), "expected NodeInfo for paragraph text");
+    let child_id = child
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("child id must be a string")
+        .to_string();
+    let child_type = child
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("child type must be a string")
+        .to_string();
+
+    let parent = request_node_parent(&mut client, uri, &child_id);
+    assert!(
+        !parent.is_null(),
+        "a non-root node must have a parent, got null"
+    );
+
+    let parent_id = parent.get("id").expect("parent must have id field");
+    assert_ulid_shaped(parent_id);
+    let parent_id_str = parent_id
+        .as_str()
+        .expect("parent id must be a string")
+        .to_string();
+    assert_ne!(
+        parent_id_str, child_id,
+        "parent id must differ from the child id"
+    );
+
+    let parent_type = parent
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("parent type must be a non-empty string");
+    assert!(
+        !parent_type.is_empty(),
+        "parent type field should be the tree-sitter parent kind, got empty string"
+    );
+
+    // Sanity: the parent must be structurally distinct from the child. We
+    // don't pin the exact grammar-derived names (tree-sitter-markdown's tag
+    // names can change across versions), but if the parent's type equals the
+    // child's type at the same span the handler is suspiciously returning the
+    // input node rather than its parent.
+    assert_ne!(
+        parent_type, child_type,
+        "parent's type ({:?}) must differ from child's type ({:?}); same-type hop suggests the handler returned the input node",
+        parent_type, child_type
+    );
+}
+
+/// Walking `kakehashi/node/parent` repeatedly from any in-document node must
+/// eventually surface the root, at which point one more `parent` call returns
+/// null (ADR-0025 §"Navigation Methods" — "id refers to a root node").
+#[test]
+fn test_node_parent_returns_null_at_root() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_parent_root.md";
+    // A small document — chosen so the tree is shallow enough that we hit the
+    // root within a bounded number of hops.
+    let text = "# A\n";
+    open_markdown(&mut client, uri, text);
+
+    // Start at the document's first byte and walk up.
+    let mut current = request_node(&mut client, uri, 0, 0);
+    assert!(!current.is_null(), "expected NodeInfo for document start");
+
+    // Bounded walk. tree-sitter-markdown's depth at byte 0 of "# A\n" is on the
+    // order of a handful of nodes; 32 is comfortably above that ceiling.
+    let mut hops = 0;
+    let max_hops = 32;
+    loop {
+        let id = current
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("id must be a string")
+            .to_string();
+
+        let next = request_node_parent(&mut client, uri, &id);
+        if next.is_null() {
+            // Reached the root — its parent must be null. Test passes.
+            return;
+        }
+        hops += 1;
+        assert!(
+            hops <= max_hops,
+            "walked {} parent hops without reaching root; tree depth seems pathological",
+            hops
+        );
+        current = next;
+    }
+}
+
+/// A ULID that was never issued by this server must resolve to null
+/// (ADR-0025 §"Invalidate vs Not-Found" — never-issued / invalidated /
+/// mismatched URI collapse to a single null).
+#[test]
+fn test_node_parent_returns_null_for_unknown_id() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_parent_unknown.md";
+    open_markdown(&mut client, uri, "# Hello\n");
+
+    // A syntactically valid ULID that we never asked the server to issue.
+    let stray_id = "01HXXXXXXXXXXXXXXXXXXXXXXX";
+
+    let result = request_node_parent(&mut client, uri, stray_id);
+    assert!(
+        result.is_null(),
+        "unknown id must resolve to null, got {:?}",
+        result
     );
 }

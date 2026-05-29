@@ -585,6 +585,7 @@ async fn run_lsp_server() {
     )
     .custom_method("kakehashi/node", Kakehashi::kakehashi_node)
     .custom_method("kakehashi/node/text", Kakehashi::kakehashi_node_text)
+    .custom_method("kakehashi/node/parent", Kakehashi::kakehashi_node_parent)
     .finish();
 
     // Wrap service with RequestIdCapture to:

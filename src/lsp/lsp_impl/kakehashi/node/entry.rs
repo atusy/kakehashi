@@ -119,7 +119,7 @@ impl Kakehashi {
     /// not a stale combination produced mid-parse. The timeout matches the
     /// `semantic_tokens` budget so this helper stays responsive even if the
     /// parser hangs on a pathological input.
-    async fn ensure_parsed_for_node_lookup(&self, uri: &Url) {
+    pub(super) async fn ensure_parsed_for_node_lookup(&self, uri: &Url) {
         self.documents
             .wait_for_parse_completion(uri, std::time::Duration::from_millis(200))
             .await;
