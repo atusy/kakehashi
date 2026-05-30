@@ -10,6 +10,13 @@
 //!
 //! Regions whose byte range is disjoint from the request are skipped
 //! entirely; no downstream request is sent.
+//!
+//! When the request fully covers a region (its byte span encloses the whole
+//! `byte_range`), the handler dispatches a full `textDocument/formatting`
+//! request for that region instead of `rangeFormatting`: the two are
+//! equivalent when the entire injected document is selected, and full
+//! formatting is also honored by downstream servers that implement
+//! `formatting` but not `rangeFormatting`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,6 +143,13 @@ impl Kakehashi {
                 continue;
             };
 
+            // When the request encloses the whole region, format the entire
+            // virtual document instead of range-formatting the clipped span:
+            // the two are equivalent here, and a full-format request is also
+            // honored by downstream servers that support `formatting` but not
+            // `rangeFormatting`.
+            let covers_region = request_covers_region(&request_bytes, &resolved.region.byte_range);
+
             let configs = self.bridge_configs_for_injection_language(
                 &language_name,
                 &resolved.injection_language,
@@ -178,20 +192,36 @@ impl Kakehashi {
                     move |t| {
                         let options = options.clone();
                         async move {
-                            t.pool
-                                .send_range_formatting_request(
-                                    &t.server_name,
-                                    &t.server_config,
-                                    &t.uri,
-                                    &t.injection_language,
-                                    &t.region_id,
-                                    t.offset,
-                                    &t.virtual_content,
-                                    clipped_host_range,
-                                    options,
-                                    t.upstream_id,
-                                )
-                                .await
+                            if covers_region {
+                                t.pool
+                                    .send_formatting_request(
+                                        &t.server_name,
+                                        &t.server_config,
+                                        &t.uri,
+                                        &t.injection_language,
+                                        &t.region_id,
+                                        t.offset,
+                                        &t.virtual_content,
+                                        options,
+                                        t.upstream_id,
+                                    )
+                                    .await
+                            } else {
+                                t.pool
+                                    .send_range_formatting_request(
+                                        &t.server_name,
+                                        &t.server_config,
+                                        &t.uri,
+                                        &t.injection_language,
+                                        &t.region_id,
+                                        t.offset,
+                                        &t.virtual_content,
+                                        clipped_host_range,
+                                        options,
+                                        t.upstream_id,
+                                    )
+                                    .await
+                            }
                         }
                     },
                     // Same semantics as full formatting: `Some(vec![])` is
@@ -268,6 +298,21 @@ fn clip_request_to_region(
     Some(Range { start, end })
 }
 
+/// Whether the request fully covers the injection region — i.e. the request's
+/// byte span encloses the region's entire `byte_range`.
+///
+/// When this holds, the user selected the whole injected document, so a full
+/// `textDocument/formatting` request is equivalent to range-formatting the
+/// clipped span — and is honored by downstream servers that implement
+/// `formatting` but not `rangeFormatting`. The handler dispatches full
+/// formatting in that case and range formatting otherwise.
+fn request_covers_region(
+    request_bytes: &std::ops::Range<usize>,
+    region_bytes: &std::ops::Range<usize>,
+) -> bool {
+    request_bytes.start <= region_bytes.start && request_bytes.end >= region_bytes.end
+}
+
 /// Clamp a clipped host range so neither endpoint sits inside an injection's
 /// stripped per-line prefix (e.g. the `> ` of a blockquoted code block).
 ///
@@ -332,6 +377,31 @@ mod tests {
     /// handler would use, so tests stay in sync with the helper's contract.
     fn bytes(mapper: &PositionMapper, range: Range) -> std::ops::Range<usize> {
         mapper.position_to_byte(range.start).unwrap()..mapper.position_to_byte(range.end).unwrap()
+    }
+
+    #[test]
+    fn covers_region_true_when_request_encloses_region() {
+        assert!(request_covers_region(&(0..100), &(10..20)));
+    }
+
+    #[test]
+    fn covers_region_true_when_request_equals_region() {
+        assert!(request_covers_region(&(10..20), &(10..20)));
+    }
+
+    #[test]
+    fn covers_region_false_when_request_starts_after_region_start() {
+        assert!(!request_covers_region(&(12..20), &(10..20)));
+    }
+
+    #[test]
+    fn covers_region_false_when_request_ends_before_region_end() {
+        assert!(!request_covers_region(&(10..18), &(10..20)));
+    }
+
+    #[test]
+    fn covers_region_false_for_partial_overlap() {
+        assert!(!request_covers_region(&(0..15), &(10..20)));
     }
 
     #[test]
