@@ -12,11 +12,13 @@
 //! entirely; no downstream request is sent.
 //!
 //! When the request fully covers a region (its byte span encloses the whole
-//! `byte_range`), the handler dispatches a full `textDocument/formatting`
-//! request for that region instead of `rangeFormatting`: the two are
-//! equivalent when the entire injected document is selected, and full
-//! formatting is also honored by downstream servers that implement
-//! `formatting` but not `rangeFormatting`.
+//! `byte_range`), the handler prefers a full `textDocument/formatting` request
+//! for that region: the two are equivalent when the entire injected document
+//! is selected, and full formatting is also honored by downstream servers that
+//! implement `formatting` but not `rangeFormatting`. If such a covering
+//! request finds the server has no `documentFormattingProvider` (full
+//! formatting returns no result), it falls back to `rangeFormatting` so
+//! range-only servers still format.
 
 use std::sync::Arc;
 use std::time::Duration;
