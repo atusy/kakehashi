@@ -225,7 +225,7 @@ impl Kakehashi {
         // mint a ULID: a `didChange` processed while grammars install would
         // adjust the tracker, leaving our stale byte ranges un-adjusted and
         // minting an id for bytes the edit moved.
-        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree)
+        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte)
             .await;
 
         // Re-snapshot after the await and recompute the position mapping. From
@@ -317,26 +317,27 @@ impl Kakehashi {
         })
     }
 
-    /// Ensure parsers for every injection language reachable from this
-    /// document — **at every nesting depth** — are loaded. `didOpen` triggers
-    /// a first-level load via `process_injections`, but a client may call
-    /// `kakehashi/node` quickly enough to race it, and nested grammars
-    /// (Markdown → Python → Regex) are never first-level. Re-run defensively
-    /// here so PR-4's injection-aware path has parsers for the whole chain.
+    /// Ensure parsers for every injection language **along the cursor's
+    /// injection path** are loaded. `didOpen` triggers a first-level load via
+    /// `process_injections`, but a client may call `kakehashi/node` quickly
+    /// enough to race it, and nested grammars (Markdown → Python → Regex) are
+    /// never first-level. Re-run defensively here so PR-4's injection-aware
+    /// path has parsers for the whole chain at `byte`.
     ///
-    /// Discovery is a fixpoint: `collect_injection_languages` can only parse
-    /// *into* layers whose grammar is already loaded, so each round surfaces
-    /// the next tier. We auto-install each round's newly-seen languages, then
-    /// recollect — converging once a round adds nothing new (or the depth cap
-    /// is hit). Cheap once everything is loaded: `collect` short-circuits on
-    /// loaded grammars and `check_injected_languages_auto_install` is a no-op
-    /// when there is nothing to install.
+    /// Discovery is a fixpoint over `collect_injection_languages_at`, which can
+    /// only parse *into* layers whose grammar is already loaded, so each round
+    /// surfaces the next language on the cursor's path. We auto-install each
+    /// round's newly-seen languages, then recollect — converging once a round
+    /// adds nothing new (or the depth cap is hit). Localized to `byte` so the
+    /// cost scales with nesting depth, not the number of injections in the
+    /// document.
     async fn ensure_injection_languages_loaded(
         &self,
         uri: &Url,
         host_language: &str,
         text: &str,
         host_tree: &tree_sitter::Tree,
+        byte: usize,
     ) {
         use std::collections::HashSet;
 
@@ -345,15 +346,16 @@ impl Kakehashi {
         let mut seen: HashSet<String> = HashSet::new();
 
         // Bound the outer loop independently of the per-branch depth cap inside
-        // `collect_injection_languages`; MAX rounds is generous since each
+        // `collect_injection_languages_at`; MAX rounds is generous since each
         // round must reveal at least one new language to continue.
         for _round in 0..crate::language::injection::MAX_INJECTION_DEPTH {
             let discovered =
-                crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_injection_languages(
+                crate::lsp::lsp_impl::kakehashi::node::injection_stack::collect_injection_languages_at(
                     &self.language,
                     host_language,
                     text,
                     host_tree,
+                    byte,
                 );
             // Only languages that are still missing need a round: an
             // already-loaded language was *also* descended into during this
