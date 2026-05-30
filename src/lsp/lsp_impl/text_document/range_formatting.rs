@@ -127,28 +127,41 @@ impl Kakehashi {
         let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
         for resolved in all_regions {
-            let Some(clipped_host_range) =
-                clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
-            else {
-                continue;
-            };
-            // The byte-range clip can still leave an endpoint inside a
-            // stripped per-line prefix (e.g. blockquoted code's `> `); pull
-            // both endpoints onto the actual injected content.
-            let Some(clipped_host_range) = clamp_range_to_content_columns(
-                clipped_host_range,
-                resolved.region.line_range.start,
-                &resolved.line_column_offsets,
-            ) else {
-                continue;
-            };
-
-            // When the request encloses the whole region, format the entire
-            // virtual document instead of range-formatting the clipped span:
-            // the two are equivalent here, and a full-format request is also
-            // honored by downstream servers that support `formatting` but not
-            // `rangeFormatting`.
-            let covers_region = request_covers_region(&request_bytes, &resolved.region.byte_range);
+            // Decide full-vs-range *before* any range-clipping work. When the
+            // request encloses the whole region we format the entire virtual
+            // document instead of range-formatting the clipped span: the two
+            // are equivalent here, and a full-format request is also honored by
+            // downstream servers that support `formatting` but not
+            // `rangeFormatting`. A covering request is always relevant to the
+            // region, so it must not be skipped by the clip/clamp guards (which
+            // only decide whether a *partial* selection has a sub-range to
+            // format).
+            let clipped_host_range =
+                if request_covers_region(&request_bytes, &resolved.region.byte_range) {
+                    // Full-formatting path: no sub-range needed.
+                    None
+                } else {
+                    let Some(clipped) = clip_request_to_region(
+                        &request_bytes,
+                        &resolved.region.byte_range,
+                        &mapper,
+                    ) else {
+                        continue;
+                    };
+                    // The byte-range clip can still leave an endpoint inside a
+                    // stripped per-line prefix (e.g. blockquoted code's `> `); pull
+                    // both endpoints onto the actual injected content. If the
+                    // selection lies entirely in prefix bytes the range collapses
+                    // and the region is skipped.
+                    let Some(clipped) = clamp_range_to_content_columns(
+                        clipped,
+                        resolved.region.line_range.start,
+                        &resolved.line_column_offsets,
+                    ) else {
+                        continue;
+                    };
+                    Some(clipped)
+                };
 
             let configs = self.bridge_configs_for_injection_language(
                 &language_name,
@@ -192,35 +205,40 @@ impl Kakehashi {
                     move |t| {
                         let options = options.clone();
                         async move {
-                            if covers_region {
-                                t.pool
-                                    .send_formatting_request(
-                                        &t.server_name,
-                                        &t.server_config,
-                                        &t.uri,
-                                        &t.injection_language,
-                                        &t.region_id,
-                                        t.offset,
-                                        &t.virtual_content,
-                                        options,
-                                        t.upstream_id,
-                                    )
-                                    .await
-                            } else {
-                                t.pool
-                                    .send_range_formatting_request(
-                                        &t.server_name,
-                                        &t.server_config,
-                                        &t.uri,
-                                        &t.injection_language,
-                                        &t.region_id,
-                                        t.offset,
-                                        &t.virtual_content,
-                                        clipped_host_range,
-                                        options,
-                                        t.upstream_id,
-                                    )
-                                    .await
+                            match clipped_host_range {
+                                // Partial selection: range-format the clipped span.
+                                Some(range) => {
+                                    t.pool
+                                        .send_range_formatting_request(
+                                            &t.server_name,
+                                            &t.server_config,
+                                            &t.uri,
+                                            &t.injection_language,
+                                            &t.region_id,
+                                            t.offset,
+                                            &t.virtual_content,
+                                            range,
+                                            options,
+                                            t.upstream_id,
+                                        )
+                                        .await
+                                }
+                                // Request covers the whole region: full-format it.
+                                None => {
+                                    t.pool
+                                        .send_formatting_request(
+                                            &t.server_name,
+                                            &t.server_config,
+                                            &t.uri,
+                                            &t.injection_language,
+                                            &t.region_id,
+                                            t.offset,
+                                            &t.virtual_content,
+                                            options,
+                                            t.upstream_id,
+                                        )
+                                        .await
+                                }
                             }
                         }
                     },
