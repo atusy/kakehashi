@@ -9,8 +9,46 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// Project-local persistent data directory used by every spawned
+/// `kakehashi` binary in this test process.
+///
+/// Mirrors the `cfg(test)` redirection done inside the lib (see
+/// `kakehashi::install::default_data_dir`). Lives under `deps/`
+/// (already gitignored). Parser/query installs persist across runs to
+/// avoid re-downloading.
+///
+/// The expensive, idempotent setup (dir creation + parser/query install) is
+/// cached once per process via `OnceLock`. The transient crash-recovery files
+/// (`parsing_in_progress`, `failed_parsers`), however, are cleared on **every**
+/// call — i.e. before every client spawn — not just the first: an E2E binary
+/// spawns several clients in one process, and a client that shuts down
+/// mid-parse leaves those files behind, which would otherwise poison later
+/// clients in the same binary.
+///
+/// We always set `KAKEHASHI_DATA_DIR` on the spawned binary to this
+/// path — the binary itself runs without `cfg(test)`, so it cannot
+/// auto-redirect like lib unit tests do.
+fn test_data_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        // Shares the same path and install logic as the lib-side
+        // `kakehashi::install::test_data_dir` so unit tests and
+        // E2E-spawned binaries reuse one cached parser/query install.
+        let dir = kakehashi::install::test_support::test_data_dir_path();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = kakehashi::install::test_support::ensure_test_languages_installed(&dir);
+        dir
+    });
+    // Clear crash-recovery state before every spawn, not just the first.
+    let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
+    let _ = std::fs::remove_file(dir.join("failed_parsers"));
+    dir.as_path()
+}
 
 /// LSP client for communicating with kakehashi binary.
 ///
@@ -69,11 +107,20 @@ impl LspClientBuilder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        for (key, value) in &self.envs {
-            cmd.env(key, value);
-        }
+        // Order matters for isolation. Apply removals to the *inherited*
+        // environment first, then set the isolation default, then explicit
+        // per-test values. This way `.env_remove("KAKEHASHI_DATA_DIR")` (used
+        // by tests that exercise the "no env var" config path) drops only the
+        // developer's inherited value — the default below still keeps the
+        // spawned binary off the real platform data dir. Were removals applied
+        // last, they would strip the isolation default and the binary would
+        // fall back to the developer/platform data dir.
         for key in &self.env_removes {
             cmd.env_remove(key);
+        }
+        cmd.env("KAKEHASHI_DATA_DIR", test_data_dir());
+        for (key, value) in &self.envs {
+            cmd.env(key, value);
         }
 
         let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
@@ -108,7 +155,8 @@ impl LspClient {
         // `CARGO_BIN_EXE_kakehashi` is set by Cargo's test harness for integration tests
         // and points to the built `kakehashi` binary, so we don't hardcode its path here.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
-        cmd.stdin(Stdio::piped())
+        cmd.env("KAKEHASHI_DATA_DIR", test_data_dir())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 

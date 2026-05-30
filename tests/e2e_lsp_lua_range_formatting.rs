@@ -1,0 +1,201 @@
+//! End-to-end test for Lua textDocument/rangeFormatting in Markdown code blocks
+//! via the kakehashi binary.
+//!
+//! This is the range-formatting counterpart to `e2e_lsp_lua_formatting.rs` and
+//! exercises the same bridge pipeline (injection resolution → virtual document
+//! → downstream LS → host coordinate translation) with the added requirement
+//! that the request and resulting edits respect a caller-supplied `Range`.
+//!
+//! Like the full-formatting E2E test, lua-language-server's stylua-style range
+//! formatting is best-effort; the test tolerates `null` / empty-array
+//! responses and only asserts host-coordinate correctness when edits are
+//! returned. The bridge swallows downstream method-not-found errors and
+//! surfaces them as `null` results, so any top-level JSON-RPC `error` on this
+//! request indicates a kakehashi routing/handler bug.
+//!
+//! Run with: `cargo test --test e2e_lsp_lua_range_formatting --features e2e`
+//!
+//! **Requirements**: lua-language-server must be installed and in PATH.
+
+#![cfg(feature = "e2e")]
+
+mod helpers;
+
+use helpers::lua_bridge::{
+    create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
+};
+use serde_json::json;
+
+/// Default LSP `FormattingOptions` body — fixed tab size + spaces. Matches
+/// what most editors send out of the box; sufficient to exercise the bridge.
+fn default_formatting_options() -> serde_json::Value {
+    json!({ "tabSize": 4, "insertSpaces": true })
+}
+
+/// E2E test: range formatting through the bridge completes without errors
+/// and (if edits are returned) places every edit inside the host code-fence.
+///
+/// The request range covers the entire lua code fence interior (host lines
+/// 3..5 inclusive — the two `local` declarations).
+#[test]
+fn e2e_range_formatting_request_returns_host_coordinate_edits() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
+
+    let (mut client, _config_dir) = create_lua_configured_client();
+
+    // Deliberately badly-formatted lua inside a markdown code fence — gives
+    // the downstream formatter something to rewrite. The fence opens on line
+    // 2 of the host doc, so any returned TextEdit must reference line >= 2.
+    let markdown_content = "# Test Document\n\n```lua\nlocal  x   =   1\nlocal y=2\n```\n";
+
+    let markdown_uri = "file:///test_range_formatting.md";
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": markdown_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": markdown_content
+            }
+        }),
+    );
+
+    // Give lua-ls time to process the virtual document didOpen.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    let format_response = client.send_request(
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            // Cover both lua lines: from start of `local  x ...` to end of
+            // `local y=2`. End is exclusive of the closing fence line.
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end":   { "line": 5, "character": 0 }
+            },
+            "options": default_formatting_options(),
+        }),
+    );
+
+    println!("Range formatting response: {:?}", format_response);
+
+    assert!(
+        format_response.get("id").is_some(),
+        "Response should have id field"
+    );
+
+    // Before the handler is wired, tower-lsp returns `method_not_found` as a
+    // top-level JSON-RPC error — exactly the failure mode this test guards
+    // against. Once the handler is implemented, the bridge converts any
+    // downstream `-32601` into a `null` result instead.
+    assert!(
+        format_response.get("error").is_none(),
+        "kakehashi must not surface a top-level error for textDocument/rangeFormatting; \
+         downstream errors are absorbed by the bridge. Got: {:?}",
+        format_response.get("error")
+    );
+
+    let result = format_response
+        .get("result")
+        .expect("Response should carry a result field");
+
+    if result.is_null() {
+        println!("E2E: Got null result (formatter signalled no edits)");
+    } else {
+        let edits = result
+            .as_array()
+            .expect("range formatting result must be null or TextEdit[]");
+        println!("E2E: Got {} TextEdit(s)", edits.len());
+
+        // Host line layout:
+        //   line 0: "# Test Document"
+        //   line 1: ""
+        //   line 2: "```lua"          ← fence open (NOT inside the injection)
+        //   line 3: "local  x   =   1" ← injected lua, content line
+        //   line 4: "local y=2"        ← injected lua, content line
+        //   line 5: "```"              ← fence close (NOT inside the injection)
+        //
+        // The request range is (3, 0)..(5, 0): exclusive at line 5, so
+        // valid edit starts cover only lines 3..=4. Allowing line 2 or 5
+        // would mean a range-clipping / coordinate-translation bug
+        // produced edits outside the user's selection. Allowing line < 2
+        // would mean the bridge translated past the fence open.
+        for edit in edits {
+            let start_line = edit["range"]["start"]["line"]
+                .as_u64()
+                .expect("TextEdit.range.start.line must be a number");
+            assert!(
+                (3..=4).contains(&start_line),
+                "Edit must land on a content line inside the user's selection \
+                 (expected 3..=4, got {}). Full edit: {:?}",
+                start_line,
+                edit
+            );
+        }
+    }
+
+    shutdown_client(&mut client);
+}
+
+/// E2E test: range formatting on a markdown document with no injection
+/// regions returns `null` (no regions to format).
+#[test]
+fn e2e_range_formatting_without_injections_returns_null() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
+
+    let (mut client, _config_dir) = create_lua_configured_client();
+
+    let markdown_content = "# Plain markdown\n\nNo code blocks here.\n";
+    let markdown_uri = "file:///test_range_formatting_plain.md";
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": markdown_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": markdown_content
+            }
+        }),
+    );
+
+    let format_response = client.send_request(
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 2, "character": 0 }
+            },
+            "options": default_formatting_options(),
+        }),
+    );
+
+    println!(
+        "Range formatting (no injections) response: {:?}",
+        format_response
+    );
+
+    assert!(
+        format_response.get("error").is_none(),
+        "Should not error for markdown without injections"
+    );
+
+    let result = format_response
+        .get("result")
+        .expect("Response should carry a result field");
+    assert!(
+        result.is_null(),
+        "Range formatting without injections must return null, got {:?}",
+        result
+    );
+
+    shutdown_client(&mut client);
+}

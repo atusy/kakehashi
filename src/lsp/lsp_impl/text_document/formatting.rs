@@ -1,4 +1,5 @@
-//! Formatting method for Kakehashi.
+//! `textDocument/formatting` handler and helpers shared with
+//! `textDocument/rangeFormatting`.
 //!
 //! `textDocument/formatting` resolves every injection region in the document
 //! and asks the configured downstream language servers to format each one.
@@ -12,6 +13,14 @@
 //! over the same range, so merging them would violate the LSP "edits must not
 //! overlap" rule. If multiple servers are configured, configure a priority
 //! ordering (or rely on first-win) to pick one.
+//!
+//! # Shared helpers exposed to `range_formatting`
+//!
+//! [`Kakehashi::setup_formatting_cancel_token`] + [`FormattingCancelState`]
+//! package the multi-consumer cancel pattern and
+//! [`finalize_formatting_edits`] funnels per-region `JoinSet` results into
+//! a single sorted edit vector. Both are `pub(super)` so the sibling range
+//! handler in [`super::range_formatting`] reuses them verbatim.
 
 use std::sync::Arc;
 
@@ -22,10 +31,12 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentFormattingParams, TextEdit};
 
 use crate::language::InjectionResolver;
+use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::bridge::UpstreamId;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
-use crate::lsp::request_id::CancelReceiver;
+use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 
 use super::super::{Kakehashi, uri_to_url};
 
@@ -81,29 +92,7 @@ impl Kakehashi {
         }
 
         let upstream_request_id = crate::lsp::current_upstream_id();
-
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_request_id.as_ref());
-
-        // Fan one upstream cancel oneshot out to N+1 consumers (outer collector
-        // + per-region `dispatch_preferred`). `CancellationToken` is cloneable
-        // and broadcasts on cancel; the upstream rx isn't, so we forward it
-        // into the token once. When `subscribe_cancel` returns `None` (no
-        // upstream id, or duplicate subscription) there is no cancel source —
-        // leave the token as `None` so downstream consumers receive `None` for
-        // their `cancel_rx` and degrade to "no cancel" instead of being told
-        // "already cancelled". Using a pre-cancelled token here would abort
-        // every region task before it even started.
-        let cancel_token = cancel_rx.map(|rx| {
-            let token = CancellationToken::new();
-            let forward = token.clone();
-            tokio::spawn(async move {
-                // Fires on both real cancel and tx-drop (subscription guard).
-                let _ = rx.await;
-                forward.cancel();
-            });
-            token
-        });
-
+        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
@@ -134,14 +123,7 @@ impl Kakehashi {
             };
             let pool = Arc::clone(&pool);
             let options = options.clone();
-            // Per-region cancel receiver derived from the shared token, so
-            // the inner preferred() can abort its per-server JoinSet as soon
-            // as $/cancelRequest arrives — not after the slowest formatter
-            // completes naturally. `None` when no upstream cancel source
-            // exists, in which case the dispatcher disables cancel handling.
-            let region_cancel_rx = cancel_token
-                .as_ref()
-                .map(|t| cancel_rx_from_token(t.clone()));
+            let region_cancel_rx = cancel_state.derive_receiver();
 
             outer_join_set.spawn(async move {
                 let result = dispatch_preferred(
@@ -181,30 +163,9 @@ impl Kakehashi {
             });
         }
 
-        let all_edits = crate::lsp::aggregation::region::collect_region_results_with_cancel(
-            outer_join_set,
-            cancel_token.map(cancel_rx_from_token),
-            |acc, opt: Option<Vec<TextEdit>>| {
-                if let Some(items) = opt {
-                    acc.extend(items);
-                }
-            },
-        )
-        .await;
-
+        let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
-
-        let mut all_edits = all_edits?;
-        // Per-region tasks complete in arbitrary order via JoinSet, so the
-        // concatenated TextEdit list is non-deterministic. Sort by start
-        // position to produce a stable LSP response (regions are disjoint,
-        // so this is a simple total order).
-        sort_edits_by_start_position(&mut all_edits);
-        Ok(if all_edits.is_empty() {
-            None
-        } else {
-            Some(all_edits)
-        })
+        response
     }
 }
 
@@ -243,6 +204,106 @@ fn cancel_rx_from_token(token: CancellationToken) -> CancelReceiver {
         }
     });
     rx
+}
+
+/// Multi-consumer cancel state for a formatting / rangeFormatting fan-out.
+///
+/// Wraps the cloneable [`CancellationToken`] that every per-region task and
+/// the outer collector subscribe to, plus the [`CancelSubscriptionGuard`]
+/// that keeps the upstream subscription alive for the duration of the
+/// request. The guard is bound to the lifetime of the parent `&Kakehashi`.
+pub(super) struct FormattingCancelState<'a> {
+    /// `None` when no upstream cancel source exists (no upstream id or
+    /// duplicate subscription). Per-region consumers should treat this as
+    /// "no cancel" rather than a pre-cancelled token, otherwise every
+    /// region task would abort before starting.
+    pub(super) token: Option<CancellationToken>,
+    /// Held alive for the lifetime of the request; dropping it unsubscribes
+    /// from the cancel forwarder. `None` when there is no upstream
+    /// subscription to manage.
+    _guard: Option<CancelSubscriptionGuard<'a>>,
+}
+
+impl<'a> FormattingCancelState<'a> {
+    /// Derive a fresh per-consumer [`CancelReceiver`] from the token, if any.
+    pub(super) fn derive_receiver(&self) -> Option<CancelReceiver> {
+        self.token.as_ref().map(|t| cancel_rx_from_token(t.clone()))
+    }
+}
+
+impl Kakehashi {
+    /// Wire up the multi-consumer cancel pattern used by both formatting
+    /// fan-outs.
+    ///
+    /// Subscribes to upstream cancel notifications (returning `None` when
+    /// no upstream id is present or the subscription is a duplicate), then
+    /// forwards that single-use oneshot into a cloneable
+    /// [`CancellationToken`]. Per-region tasks call
+    /// [`FormattingCancelState::derive_receiver`] to get their own oneshot
+    /// receiver, so cancel propagates to every dispatcher simultaneously —
+    /// not after the slowest formatter completes naturally.
+    ///
+    /// When `subscribe_cancel` returns `None`, the token stays `None` so
+    /// downstream consumers receive `None` for their `cancel_rx` and
+    /// degrade to "no cancel" instead of being told "already cancelled".
+    /// Using a pre-cancelled token here would abort every region task
+    /// before it even started.
+    pub(super) fn setup_formatting_cancel_token(
+        &self,
+        upstream_request_id: Option<&UpstreamId>,
+    ) -> FormattingCancelState<'_> {
+        let (cancel_rx, guard) = self.subscribe_cancel(upstream_request_id);
+        let token = cancel_rx.map(|rx| {
+            let token = CancellationToken::new();
+            let forward = token.clone();
+            tokio::spawn(async move {
+                // Fires on both real cancel and tx-drop (subscription guard).
+                let _ = rx.await;
+                forward.cancel();
+            });
+            token
+        });
+        FormattingCancelState {
+            token,
+            _guard: guard,
+        }
+    }
+}
+
+/// Collect per-region `JoinSet` results, sort the concatenated edits, and
+/// shape into the LSP-spec response (`None` when there are no edits).
+///
+/// Both formatting handlers funnel their per-region futures into a single
+/// `JoinSet<Option<Vec<TextEdit>>>` and need to:
+///
+/// 1. Cancel-aware collect every region's edits (regions whose dispatcher
+///    cancelled or returned no result contribute nothing).
+/// 2. Sort by start position so the concatenated response is deterministic
+///    across `JoinSet::join_next` arrival order.
+/// 3. Map `vec![]` to `Ok(None)` per the LSP convention that empty edit
+///    lists are equivalent to no response.
+pub(super) async fn finalize_formatting_edits(
+    outer_join_set: JoinSet<Option<Vec<TextEdit>>>,
+    cancel_token: Option<CancellationToken>,
+) -> Result<Option<Vec<TextEdit>>> {
+    let all_edits = collect_region_results_with_cancel(
+        outer_join_set,
+        cancel_token.map(cancel_rx_from_token),
+        |acc, opt: Option<Vec<TextEdit>>| {
+            if let Some(items) = opt {
+                acc.extend(items);
+            }
+        },
+    )
+    .await;
+
+    let mut all_edits = all_edits?;
+    sort_edits_by_start_position(&mut all_edits);
+    Ok(if all_edits.is_empty() {
+        None
+    } else {
+        Some(all_edits)
+    })
 }
 
 #[cfg(test)]

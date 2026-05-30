@@ -23,6 +23,7 @@ mod inlay_hint;
 mod moniker;
 mod prepare_rename;
 pub(crate) mod publish_diagnostic;
+mod range_formatting;
 mod references;
 mod rename;
 mod selection_range;

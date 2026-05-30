@@ -36,11 +36,155 @@ use std::path::PathBuf;
 /// - macOS: ~/Library/Application Support/kakehashi/
 /// - Windows: %APPDATA%/kakehashi/
 pub fn default_data_dir() -> Option<PathBuf> {
-    // --data-dir CLI flag override (highest priority)
-    if let Some(dir) = crate::config::expand::data_dir_override() {
-        return Some(dir.to_path_buf());
+    // In `cfg(test)`, redirect every caller (Kakehashi::new -> failed
+    // parser registry, search-path defaulting, etc.) to a project-local
+    // persistent dir under `deps/` so the developer's real
+    // `~/.local/share/kakehashi/` is never read or written. The dir is
+    // shared across the test process to keep parser/query installs
+    // cached between runs; transient crash-recovery files
+    // (`parsing_in_progress`, `failed_parsers`) are cleared once per
+    // process at first call so a prior E2E shutdown can't taint this run.
+    #[cfg(test)]
+    {
+        return Some(test_data_dir());
     }
-    resolve_data_dir(|var| std::env::var(var).ok())
+
+    #[cfg_attr(test, allow(unreachable_code))]
+    {
+        // --data-dir CLI flag override (highest priority)
+        if let Some(dir) = crate::config::expand::data_dir_override() {
+            return Some(dir.to_path_buf());
+        }
+        resolve_data_dir(|var| std::env::var(var).ok())
+    }
+}
+
+/// Project-local persistent data directory used by unit tests.
+///
+/// Lives under `deps/` (already gitignored). Parser/query installs persist
+/// across runs to avoid re-downloading, while crash-recovery state files
+/// are cleared once per test process so a previous test's leftovers
+/// (typically from an E2E binary that exited mid-parse) don't poison this
+/// run. Returns the same path every call within a process via `OnceLock`.
+#[cfg(test)]
+pub(crate) fn test_data_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = test_support::test_data_dir_path();
+        let _ = std::fs::create_dir_all(&dir);
+        // Crash-recovery state can be left over from a previous E2E
+        // shutdown; clear it once per test process so init() doesn't
+        // pre-mark languages as failed.
+        let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
+        let _ = std::fs::remove_file(dir.join("failed_parsers"));
+        // Auto-install required parsers + queries on first call per
+        // process. Cached on disk via the `.installed` marker so
+        // subsequent test processes are fast.
+        let _ = test_support::ensure_test_languages_installed(&dir);
+        dir
+    })
+    .clone()
+}
+
+/// Test-support helpers exposed to integration tests under `tests/`.
+///
+/// Gated to test-only builds: lib unit tests reach it via `cfg(test)`, and
+/// the E2E integration crate reaches it via `feature = "e2e"`. Plain
+/// `cfg(test)` alone would not work — integration tests link against the
+/// non-test lib build and can't see `cfg(test)`-gated items — so the gate
+/// also opts in the `e2e` feature. The production library/binary build (no
+/// `cfg(test)`, no `e2e`) compiles without this module.
+///
+/// Not part of the public LSP-server API — intended only for the
+/// in-tree test harness.
+#[cfg(any(test, feature = "e2e"))]
+pub mod test_support {
+    use super::{parser, queries};
+    use std::path::{Path, PathBuf};
+
+    /// Languages whose parsers and queries every kakehashi test relies on.
+    ///
+    /// Mirrors the `make deps/tree-sitter/.installed` Makefile target.
+    /// Tests that open lua / markdown / rust / yaml documents expect
+    /// parsers and highlight queries to already be present; without
+    /// them, semantic-tokens and similar end-to-end tests come back
+    /// empty.
+    pub const TEST_LANGUAGES: &[&str] = &[
+        "lua",
+        "markdown",
+        "markdown_inline",
+        "python",
+        "rust",
+        "yaml",
+    ];
+
+    /// Project-local persistent test data directory under `deps/test/`.
+    ///
+    /// `/deps` is already gitignored, so this dir doesn't pollute git.
+    /// Leaf is `kakehashi` so search-path defaulting (which asserts the
+    /// dir name) still matches production semantics.
+    pub fn test_data_dir_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("deps")
+            .join("test")
+            .join("kakehashi")
+    }
+
+    /// Install every language in [`TEST_LANGUAGES`] into `data_dir` if
+    /// the `.installed` marker is missing, writing the marker only when
+    /// every required install succeeded.
+    ///
+    /// Mirrors the install loop in `make deps/tree-sitter/.installed`.
+    /// Both `install_parser` and `install_queries` short-circuit when a
+    /// language is up-to-date; any genuine failure is logged so tests
+    /// depending on that language fail with a clearer error rather than
+    /// the whole suite panicking in setup.
+    ///
+    /// A transient failure (network, file lock, compile error) must not
+    /// leave the marker behind: a marker over a half-populated data dir
+    /// would make every later test process skip setup, turning a one-off
+    /// failure into a persistent one until the marker is deleted by hand.
+    /// So the marker is written only after all installs succeed.
+    pub fn ensure_test_languages_installed(data_dir: &Path) -> std::io::Result<()> {
+        let marker = data_dir.join(".installed");
+        if marker.exists() {
+            return Ok(());
+        }
+        let parser_options = parser::InstallOptions {
+            data_dir: data_dir.to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+        };
+        let mut all_ok = true;
+        for lang in TEST_LANGUAGES {
+            // `AlreadyExists` means the artifact is present from an earlier
+            // run — success for setup purposes, not a failure. Treating it as
+            // failure would make a partial prior run unrecoverable: if parsers
+            // installed but a query failed (so the marker was never written),
+            // every later run would see `AlreadyExists` for the parser and
+            // could never write the marker without deleting files by hand.
+            match parser::install_parser(lang, &parser_options) {
+                Ok(_) | Err(parser::ParserInstallError::AlreadyExists(_)) => {}
+                Err(e) => {
+                    eprintln!("[test setup] install_parser({}) failed: {}", lang, e);
+                    all_ok = false;
+                }
+            }
+            match queries::install_queries(lang, data_dir, false) {
+                Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
+                Err(e) => {
+                    eprintln!("[test setup] install_queries({}) failed: {}", lang, e);
+                    all_ok = false;
+                }
+            }
+        }
+        if all_ok {
+            std::fs::write(&marker, "")?;
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the data directory from an env lookup and platform default.

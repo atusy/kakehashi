@@ -140,6 +140,12 @@ mod tests {
 
     #[tokio::test]
     async fn did_open_parses_before_eager_opening_injected_virtual_documents() {
+        // Test isolation is automatic via the `cfg(test)` branch in
+        // `kakehashi::install::default_data_dir()`, which redirects every
+        // `Kakehashi::new` call in this binary to a project-local data dir
+        // under `deps/test/kakehashi/` (see `test_support::test_data_dir_path`)
+        // and clears stale crash-recovery state once per process. No env-var
+        // dance or per-test setup needed.
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
 
