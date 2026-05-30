@@ -1069,39 +1069,59 @@ fn test_node_injection_three_layer_saturates_to_regex() {
     let uri = "file:///test_kakehashi_node_injection_3layer_true.md";
     open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON_REGEX);
 
-    // Line 4 is `re.match("foo", "bar")`; char 11 is inside the first
-    // string literal's content ("foo"), where the regex injection lives.
-    let result = request_node_with_injection(&mut client, uri, 4, 11, json!(true));
+    // Line 4 is `re.match("foo", "bar")`; char 11 is inside the first string
+    // literal's content ("foo"), where the regex injection lives.
+    //
+    // Differential check that doesn't depend on knowing regex grammar node
+    // kinds: at this position the stack is [markdown, python, regex] when the
+    // regex grammar is installed, else [markdown, python].
+    //   - `injection: 1`    → always the python layer (stack[1]).
+    //   - `injection: true` → the deepest layer (stack[2]=regex, or stack[1]=
+    //                         python if regex is unavailable, by saturation).
+    // So if `true` resolves to a *different* node than `1`, saturation reached
+    // a layer deeper than python — i.e. the regex grammar kicked in. If they
+    // resolve to the same node (same ULID), the stack stopped at python and we
+    // skip (optional grammar not present).
+    let python = request_node_with_injection(&mut client, uri, 4, 11, json!(1));
+    let deepest = request_node_with_injection(&mut client, uri, 4, 11, json!(true));
 
-    // `injection: true` saturates to whichever layer is the deepest one
-    // successfully parsed. If the optional regex grammar isn't installed,
-    // `injection_stack_at` stops at the python layer (or even just the
-    // markdown host) and we get one of those node kinds back, NOT null.
-    // Distinguish these two outcomes:
-    //   - null              → no layer matched at all (unexpected here)
-    //   - markdown / python → regex grammar unavailable → SKIP
-    //   - regex node        → assertion target
-    if result.is_null() {
-        eprintln!("SKIP: 3-layer fixture did not resolve any injection (markdown parser missing?)");
+    if python.is_null() {
+        eprintln!("SKIP: python layer did not resolve at the cursor (python grammar missing?)");
         return;
     }
-    let ty = result
+    assert!(
+        !deepest.is_null(),
+        "injection=true must resolve at least the python layer when injection=1 did"
+    );
+
+    let python_id = python.get("id").and_then(Value::as_str).expect("python id");
+    let deepest_id = deepest
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("deepest id");
+    let deepest_ty = deepest
         .get("type")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
-    if is_python_kind(ty)
-        || ty == "code_fence_content"
-        || ty == "fenced_code_block"
-        || ty == "inline"
-    {
+        .expect("deepest type");
+
+    if deepest_id == python_id {
         eprintln!(
-            "SKIP: 3-layer fixture saturated to a non-regex layer ({:?}); regex grammar likely unavailable",
-            ty
+            "SKIP: injection=true saturated to the python layer (type={:?}); regex grammar unavailable",
+            deepest_ty
         );
-        // We landed in markdown / python — regex grammar likely missing.
-        // Skip the regex-specific assertion below.
+        return;
     }
-    // We landed inside the regex grammar (or skipped above) — spec contract holds.
+
+    // `true` reached a node strictly deeper than the python layer — the regex
+    // injection. It must not be a python (or markdown host) kind.
+    assert!(
+        !is_python_kind(deepest_ty)
+            && deepest_ty != "code_fence_content"
+            && deepest_ty != "fenced_code_block"
+            && deepest_ty != "inline",
+        "injection=true saturated past python but to an unexpected non-regex kind {:?}",
+        deepest_ty
+    );
 }
 
 /// `injection: -2` on a 3-layer stack resolves to `stack[3 + (-2)] =

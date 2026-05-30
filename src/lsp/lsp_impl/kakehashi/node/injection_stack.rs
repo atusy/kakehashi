@@ -63,9 +63,11 @@ fn whole_document_range(host_text: &str) -> tree_sitter::Range {
 /// when the byte lies strictly inside an injection's content range
 /// (half-open `[start, end)` per ADR-0025).
 ///
-/// `host_language` selects the injection query used at each level — the same
-/// query is consulted recursively for nested injections, matching the
-/// semantic-tokens parallel collector's behavior.
+/// `host_language` selects the injection query for layer 0 only. Each deeper
+/// level uses the **language resolved for the layer above it** (the previous
+/// layer's `@injection.language`) to pick its query, so a Markdown → Python →
+/// Regex chain consults the markdown, then python, then regex injection
+/// queries in turn — matching the semantic-tokens parallel collector.
 ///
 /// The returned `Vec` always contains at least the host layer (layer 0); the
 /// function never fails — a parse/registry miss at any depth simply stops the
