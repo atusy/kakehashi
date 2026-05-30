@@ -249,76 +249,108 @@ pub(super) fn with_resolved_node<R>(
     None
 }
 
-/// Collect every injection language reachable in `host_tree`, at all depths
-/// that are currently parseable.
+/// Collect the injection languages along the cursor's injection path at
+/// `byte`, at all depths that are currently parseable.
+///
+/// Unlike a whole-document scan, this follows only the single smallest-
+/// containing injection at each level — exactly the path `injection_stack_at`
+/// would take — so its cost is O(depth at the cursor) rather than O(all
+/// injections in the document). That matters for large files with many code
+/// blocks: we only need grammars for the layers that actually wrap the cursor.
 ///
 /// A language is *recorded* as soon as its `@injection.language` is resolved,
 /// even if its parser is not yet loaded. But the walk only *descends* into a
 /// layer whose parser is already in the registry — parsing requires a loaded
 /// grammar. This makes the function a single fixpoint step: callers that
 /// auto-install the returned set and call again will, on the next pass, be
-/// able to parse one level deeper and surface the next tier of languages.
-/// Iterating to a fixpoint discovers the full nested chain
+/// able to parse one level deeper and surface the next language on the path.
+/// Iterating to a fixpoint discovers the full nested chain at the cursor
 /// (Markdown → Python → Regex …) without ever parsing with a missing grammar.
 ///
-/// Bounded by [`MAX_INJECTION_DEPTH`] per branch so a misconfigured grammar
-/// cycle cannot loop forever.
-pub(super) fn collect_injection_languages(
+/// Bounded by [`MAX_INJECTION_DEPTH`] so a misconfigured grammar cycle cannot
+/// loop forever.
+pub(super) fn collect_injection_languages_at(
     coordinator: &LanguageCoordinator,
     host_language: &str,
     host_text: &str,
     host_tree: &tree_sitter::Tree,
+    byte: usize,
 ) -> std::collections::HashSet<String> {
     let registry = coordinator.language_registry_for_parallel();
     let mut languages = std::collections::HashSet::new();
 
-    // (language, tree, parent_ranges, depth) work items. Trees are owned so
-    // each item is self-contained; the host tree is cheap to clone
-    // (refcounted). parent_ranges carries the inherited container exclusions so
-    // a nested layer is parsed against the same effective span the stack walk
-    // would use — keeping discovery and the per-position stack consistent.
-    let mut work: Vec<(String, tree_sitter::Tree, Vec<tree_sitter::Range>, usize)> = vec![(
-        host_language.to_string(),
-        host_tree.clone(),
-        vec![whole_document_range(host_text)],
-        0,
-    )];
+    let mut current_lang = host_language.to_string();
+    let mut current_tree = host_tree.clone();
+    let mut parent_ranges = vec![whole_document_range(host_text)];
+    let host_len = host_text.len();
 
-    while let Some((lang, tree, parent_ranges, depth)) = work.pop() {
-        if depth >= MAX_INJECTION_DEPTH {
-            continue;
-        }
-        let Some(injection_query) = coordinator.injection_query(&lang) else {
-            continue;
+    for _depth in 0..MAX_INJECTION_DEPTH {
+        let Some(injection_query) = coordinator.injection_query(&current_lang) else {
+            break;
         };
-        let root = tree.root_node();
-        let Some(regions) = collect_all_injections(&root, host_text, Some(&injection_query)) else {
-            continue;
+        let root = current_tree.root_node();
+        let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query))
+        else {
+            break;
         };
-        for region in regions {
-            let content =
-                &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
-            let Some((resolved_lang, _)) =
-                coordinator.resolve_injection_language(&region.language, content)
-            else {
-                continue;
-            };
-            languages.insert(resolved_lang.clone());
 
-            // Only descend if the parser is already loaded; otherwise leave it
-            // for the next fixpoint pass (after the caller auto-installs it).
-            if let Some(language) = registry.get(&resolved_lang) {
-                let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
-                let ranges = intersect_included_ranges(&parent_ranges, &own_ranges);
-                if ranges.is_empty() {
+        // Pick the smallest injection that actually contains the cursor — the
+        // same selection `injection_stack_at` makes — so discovery follows the
+        // one path the per-position stack will walk.
+        let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
+        for region in injections {
+            if !pattern_has_offset(&injection_query, region.pattern_index) {
+                let raw_start = region.content_node.start_byte();
+                let raw_end = region.content_node.end_byte();
+                let outside_raw = if byte == host_len {
+                    byte < raw_start || byte > raw_end
+                } else {
+                    byte < raw_start || byte >= raw_end
+                };
+                if outside_raw {
                     continue;
                 }
-                if let Some(child_tree) = parse_with_absolute_ranges(&language, host_text, &ranges)
-                {
-                    work.push((resolved_lang, child_tree, ranges, depth + 1));
-                }
             }
+            let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
+            if own_ranges.is_empty() {
+                continue;
+            }
+            let absolute_ranges = intersect_included_ranges(&parent_ranges, &own_ranges);
+            if absolute_ranges.is_empty() {
+                continue;
+            }
+            if !ranges_contain_byte(&absolute_ranges, byte, host_len) {
+                continue;
+            }
+            candidates.push((region, absolute_ranges));
         }
+        candidates.sort_by_key(|(_, ranges)| total_span(ranges));
+        let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
+            break;
+        };
+
+        let content =
+            &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let Some((resolved_lang, _)) =
+            coordinator.resolve_injection_language(&region.language, content)
+        else {
+            break;
+        };
+        languages.insert(resolved_lang.clone());
+
+        // Descend only if the parser is loaded; otherwise stop and let the
+        // caller install it, then re-run for the next tier (fixpoint).
+        let Some(language) = registry.get(&resolved_lang) else {
+            break;
+        };
+        let Some(injected_tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+        else {
+            break;
+        };
+
+        current_tree = injected_tree;
+        parent_ranges = absolute_ranges;
+        current_lang = resolved_lang;
     }
 
     languages
