@@ -67,9 +67,9 @@ fn whole_document_range(host_text: &str) -> tree_sitter::Range {
 /// query is consulted recursively for nested injections, matching the
 /// semantic-tokens parallel collector's behavior.
 ///
-/// Returns `None` if the host layer cannot be cloned (`tree_sitter::Tree`
-/// clone is cheap and infallible in practice, so this currently never fires
-/// but is kept as a signature concession to future failure modes).
+/// The returned `Vec` always contains at least the host layer (layer 0); the
+/// function never fails — a parse/registry miss at any depth simply stops the
+/// walk and returns the layers gathered so far.
 pub(super) fn injection_stack_at(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -224,6 +224,14 @@ pub(super) fn with_resolved_node<R>(
     kind: &'static str,
     mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
 ) -> Option<R> {
+    // Reject obviously-invalid ranges up front — same guard `find_node_at`
+    // applies internally, but checking here also avoids the expensive
+    // `injection_stack_at` walk (which clones and re-parses layers) for a
+    // stale tracker entry whose range no longer fits the document.
+    if start > end || end > host_text.len() {
+        return None;
+    }
+
     // Fast path: the most common case is a node living in the host tree.
     if let Some(node) = find_node_at(host_tree, start, end, kind) {
         return Some(f(node));

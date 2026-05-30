@@ -341,6 +341,7 @@ impl Kakehashi {
         use std::collections::HashSet;
 
         let coordinator = self.injection_coordinator();
+        let registry = self.language.language_registry_for_parallel();
         let mut seen: HashSet<String> = HashSet::new();
 
         // Bound the outer loop independently of the per-branch depth cap inside
@@ -354,7 +355,19 @@ impl Kakehashi {
                     text,
                     host_tree,
                 );
-            let fresh: HashSet<String> = discovered.difference(&seen).cloned().collect();
+            // Only languages that are still missing need a round: an
+            // already-loaded language was *also* descended into during this
+            // same `collect` call, so it never gates discovery of a deeper
+            // tier. Filtering them out means the loop ends in a single round
+            // when every required grammar is already present (the common case),
+            // instead of spending a second `collect` pass to confirm it.
+            // `seen` still guards against re-attempting an install that failed
+            // (registry stays empty for it, so it would otherwise reappear).
+            let fresh: HashSet<String> = discovered
+                .into_iter()
+                .filter(|lang| registry.get(lang).is_none())
+                .filter(|lang| !seen.contains(lang))
+                .collect();
             if fresh.is_empty() {
                 break;
             }
