@@ -85,7 +85,6 @@ pub(super) fn injection_stack_at(
         ranges: vec![whole_document_range(host_text)],
     });
 
-    let registry = coordinator.language_registry_for_parallel();
     let mut current_language: String = host_language.to_string();
 
     // Walk one injection deeper per iteration. The depth cap mirrors the
@@ -178,7 +177,14 @@ pub(super) fn injection_stack_at(
         else {
             break;
         };
-        let Some(language) = registry.get(&resolved_lang) else {
+        // `get` clones the grammar out (owned `Language`) and releases its
+        // internal DashMap ref before returning, so there is no read guard to
+        // scope around the parse below. Fetched inline (not via a function-
+        // level binding) to keep that intent obvious.
+        let Some(language) = coordinator
+            .language_registry_for_parallel()
+            .get(&resolved_lang)
+        else {
             break;
         };
 
@@ -278,7 +284,6 @@ pub(super) fn collect_injection_languages_at(
     host_tree: &tree_sitter::Tree,
     byte: usize,
 ) -> std::collections::HashSet<String> {
-    let registry = coordinator.language_registry_for_parallel();
     let mut languages = std::collections::HashSet::new();
 
     let mut current_lang = host_language.to_string();
@@ -342,7 +347,12 @@ pub(super) fn collect_injection_languages_at(
 
         // Descend only if the parser is loaded; otherwise stop and let the
         // caller install it, then re-run for the next tier (fixpoint).
-        let Some(language) = registry.get(&resolved_lang) else {
+        // `get` returns an owned `Language` (clones out, drops its DashMap ref
+        // internally), so no read guard spans the parse; fetched inline.
+        let Some(language) = coordinator
+            .language_registry_for_parallel()
+            .get(&resolved_lang)
+        else {
             break;
         };
         let Some(injected_tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
