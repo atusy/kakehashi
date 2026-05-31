@@ -336,8 +336,7 @@ pub(super) fn collect_injection_languages_at(
             break;
         };
 
-        let content =
-            &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
         let Some((resolved_lang, _)) =
             coordinator.resolve_injection_language(&region.language, content)
         else {
@@ -355,7 +354,8 @@ pub(super) fn collect_injection_languages_at(
         else {
             break;
         };
-        let Some(injected_tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+        let Some(injected_tree) =
+            parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
         else {
             break;
         };
