@@ -29,7 +29,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::TextDocumentIdentifier;
 use ulid::Ulid;
 
-use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// Request parameters for `kakehashi/node/children`.
@@ -77,38 +77,54 @@ impl Kakehashi {
             log::debug!(target: "kakehashi::node::children", "no parsed document for {}", uri);
             return Ok(Value::Null);
         };
-        let tree = snapshot.tree();
+        let host_text = snapshot.text();
+        let host_tree = snapshot.tree();
 
-        // Find the tree-sitter node matching the tracked (start, end, kind).
-        // Defensive: the tracker stays in sync with didChange, so this should
-        // always succeed for a non-null lookup.
-        let Some(node) = find_node_at(tree, start, end, kind) else {
+        let Some(host_language) = self.document_language(&uri) else {
+            log::debug!(target: "kakehashi::node::children", "no host language for {}", uri);
+            return Ok(Value::Null);
+        };
+
+        // Search the host tree first, then injected layers at `start`. ADR-0025
+        // "Navigation Methods": children stay within a single language tree, so
+        // an injected node's children come from the injected tree — not from
+        // the host node that contains the injection.
+        //
+        // tree-sitter's `Node::children(&mut cursor)` iterates BOTH named and
+        // anonymous children in document order. A leaf node yields an empty
+        // iterator, which we serialize as `[]` (NOT `null`).
+        let child_infos: Option<Vec<(usize, usize, &'static str)>> = with_resolved_node(
+            &self.language,
+            &host_language,
+            host_text,
+            host_tree,
+            start,
+            end,
+            kind,
+            |node| {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .map(|child| (child.start_byte(), child.end_byte(), child.kind()))
+                    .collect()
+            },
+        );
+        let Some(child_infos) = child_infos else {
             log::warn!(
                 target: "kakehashi::node::children",
-                "tracker hit but no matching node in tree for ulid={} uri={} range=[{},{}) kind={}",
+                "tracker hit but no matching node in any layer for ulid={} uri={} range=[{},{}) kind={}",
                 ulid, uri, start, end, kind
             );
             return Ok(Value::Null);
         };
 
-        // tree-sitter's `Node::children(&mut cursor)` iterates BOTH named and
-        // anonymous children in document order — exactly the contract ADR-0025
-        // requires for PR-3. A leaf node yields an empty iterator, which we
-        // serialize as `[]` (NOT `null`).
         let tracker = self.bridge.node_tracker();
-        let mut cursor = node.walk();
-        let infos: Vec<Value> = node
-            .children(&mut cursor)
-            .map(|child| {
-                // Cache child.kind() — tree-sitter returns the same &'static
-                // str on every call, but the FFI hop is non-zero, and we
-                // both register and emit the kind below.
-                let kind = child.kind();
-                let child_ulid =
-                    tracker.get_or_create(&uri, child.start_byte(), child.end_byte(), kind);
+        let infos: Vec<Value> = child_infos
+            .into_iter()
+            .map(|(c_start, c_end, c_kind)| {
+                let child_ulid = tracker.get_or_create(&uri, c_start, c_end, c_kind);
                 json!({
                     "id": child_ulid.to_string(),
-                    "type": kind,
+                    "type": c_kind,
                 })
             })
             .collect();

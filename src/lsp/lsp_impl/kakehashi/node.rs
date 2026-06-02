@@ -10,6 +10,7 @@
 
 mod children;
 mod entry;
+mod injection_stack;
 mod lookup;
 mod parent;
 mod text;
