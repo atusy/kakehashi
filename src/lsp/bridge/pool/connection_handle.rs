@@ -1,17 +1,8 @@
-//! Connection handle for downstream language servers.
+//! Per-connection wrapper for downstream language servers — state management,
+//! request routing, and shutdown logic (ADR-0015).
 //!
-//! This module provides the per-connection wrapper with state management,
-//! request routing, and shutdown logic per ADR-0015.
-//!
-//! # Single-Writer Loop Architecture (ADR-0015)
-//!
-//! Each connection uses a channel-based single-writer pattern:
-//! - `tx`: mpsc channel sender for outbound messages (FIFO ordering)
-//! - `writer_handle`: Owns the SplitConnectionWriter, manages writer task
-//!
-//! Messages flow: Handler → tx channel → Writer Task → stdin
-//!
-//! This ensures strict FIFO ordering and non-blocking sends.
+//! Outbound messages flow Handler → `tx` channel → writer task → stdin through a
+//! single-writer loop, giving strict FIFO ordering and non-blocking sends.
 
 use std::io;
 use std::sync::Arc;
@@ -55,26 +46,14 @@ pub(crate) enum NotificationSendResult {
     SerializationFailed,
 }
 
-/// Handle wrapping a connection with its state (ADR-0015 per-connection state).
+/// Per-connection state + I/O actors (ADR-0015 single-writer loop).
 ///
-/// Each connection has its own lifecycle state that transitions:
-/// - Initializing: spawn started, awaiting initialize response
-/// - Ready: initialize/initialized handshake complete
-/// - Failed: initialization failed (timeout, error, etc.)
-///
-/// # Architecture (ADR-0015 Single-Writer Loop)
-///
-/// Uses channel-based message passing for FIFO-ordered writes:
-/// - `tx`: Channel sender for outbound messages (notifications and requests)
-/// - `writer_handle`: Manages the writer task lifecycle and provides graceful shutdown
-/// - `router`: Routes responses to oneshot waiters
-/// - `reader_handle`: Background task reading from stdout
-///
-/// Request flow:
-/// 1. Register request ID with router to get oneshot receiver
-/// 2. Queue message via `send_request()` (non-blocking)
-/// 3. Writer task writes to stdin in FIFO order
-/// 4. Await oneshot receiver (no Mutex held)
+/// Lifecycle: `Initializing` → `Ready` (after initialize/initialized) or
+/// `Failed` (timeout/error). Shutdown then drives `begin_shutdown`
+/// (`Initializing`/`Ready` → `Closing`) and `complete_shutdown`
+/// (`Closing`/`Failed` → `Closed`, terminal). FIFO writes flow `tx` → writer
+/// task → stdin; the reader task pushes incoming responses through `router` to
+/// oneshot waiters so callers can await without holding any Mutex.
 pub(crate) struct ConnectionHandle {
     /// Connection state - uses std::sync::RwLock for fast, synchronous state checks
     state: std::sync::RwLock<ConnectionState>,
@@ -89,33 +68,20 @@ pub(crate) struct ConnectionHandle {
     /// All notifications and requests are queued here and written to stdin
     /// by the writer task in FIFO order.
     tx: mpsc::Sender<OutboundMessage>,
-    /// Handle to the writer task (ADR-0015).
-    ///
-    /// Manages the writer task lifecycle:
-    /// - Owns the SplitConnectionWriter (including child process handle)
-    /// - Provides graceful shutdown via 3-phase protocol
-    /// - RAII cleanup on drop
+    /// Writer task handle (ADR-0015): owns the `SplitConnectionWriter` (and child
+    /// process), drives the 3-phase graceful shutdown, and does RAII cleanup on drop.
     writer_handle: std::sync::Mutex<Option<WriterTaskHandle>>,
     /// Router for pending request tracking
     router: Arc<ResponseRouter>,
-    /// Handle to the reader task.
-    ///
-    /// Used for:
-    /// - RAII cleanup on drop (cancels reader task)
-    /// - Liveness timer start notification (pending 0->1)
+    /// Reader task handle: RAII cancels the task on drop and signals the liveness
+    /// timer start on the pending 0->1 transition.
     reader_handle: ReaderTaskHandle,
-    /// Atomic counter for generating unique downstream request IDs.
-    ///
-    /// Each upstream request may have the same ID (from different contexts),
-    /// so we generate unique IDs for downstream requests to avoid
-    /// "duplicate request ID" errors in the ResponseRouter.
+    /// Atomic counter for unique downstream request IDs. Upstream requests from
+    /// different contexts may share an ID, so we mint fresh downstream IDs to avoid
+    /// "duplicate request ID" collisions in the ResponseRouter.
     next_request_id: AtomicI64,
-    /// Server capabilities from the initialize response.
-    ///
-    /// Set once after successful LSP handshake, read by request handlers
-    /// to skip requests for unsupported capabilities.
-    /// Uses OnceLock for "set once, read many" semantics
-    /// (same pattern as SettingsManager::client_capabilities).
+    /// Server capabilities from the initialize response, used to skip unsupported
+    /// requests. `OnceLock` for set-once/read-many.
     server_capabilities: OnceLock<ServerCapabilities>,
     /// Dynamic capability registrations from server-initiated `client/registerCapability` requests.
     ///
@@ -147,22 +113,9 @@ impl ConnectionHandle {
         )
     }
 
-    /// Create a new ConnectionHandle with a specific initial state.
-    ///
-    /// Spawns the writer task to consume outbound messages from the channel.
-    /// The writer task owns the SplitConnectionWriter and writes messages
-    /// to stdin in FIFO order.
-    ///
-    /// # Writer Task Lifetime (ADR-0015)
-    ///
-    /// The writer task is spawned when the ConnectionHandle is created. All messages,
-    /// including those sent during the LSP handshake, flow through the channel to
-    /// ensure FIFO ordering and eliminate race conditions.
-    ///
-    /// # State Transitions (ADR-0015)
-    /// - Start in `Initializing` state during LSP handshake
-    /// - Transition to `Ready` on successful initialization
-    /// - Transition to `Failed` on timeout or error
+    /// Create a new ConnectionHandle with a specific initial state, spawning the
+    /// writer task (ADR-0015). Even handshake messages flow through the channel so
+    /// all writes keep FIFO ordering and avoid races against the writer task.
     pub(super) fn with_state(
         writer: SplitConnectionWriter,
         router: Arc<ResponseRouter>,
@@ -193,12 +146,9 @@ impl ConnectionHandle {
         }
     }
 
-    /// Generate a unique downstream request ID.
-    ///
-    /// Each call returns the next ID in the sequence (2, 3, 4, ...).
-    /// ID=1 is reserved for the initialize request.
-    /// This ensures unique IDs for the ResponseRouter even when multiple
-    /// upstream requests have the same ID.
+    /// Generate a unique downstream request ID (from 2; ID=1 is reserved for
+    /// initialize). Uniqueness keeps the ResponseRouter unambiguous even when
+    /// multiple upstream requests share the same ID.
     pub(crate) fn next_request_id(&self) -> i64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -207,23 +157,10 @@ impl ConnectionHandle {
     // Message Sending (ADR-0015 Single-Writer Loop)
     // ========================================
 
-    /// Send a notification to the downstream server.
-    ///
-    /// Non-blocking: if the queue is full, the notification is dropped with WARN logging.
-    /// This is per ADR-0015 backpressure semantics - notifications are fire-and-forget.
-    ///
-    /// # Returns
-    /// - `NotificationSendResult::Queued` if the notification was queued successfully
-    /// - `NotificationSendResult::QueueFull` if the queue is full (temporary backpressure)
-    /// - `NotificationSendResult::ChannelClosed` if the channel is closed (terminal failure)
-    /// - `NotificationSendResult::SerializationFailed` if the payload could not be serialized
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let notification = build_initialized_notification();
-    /// handle.send_notification(notification); // Fire-and-forget
-    /// ```
+    /// Queue a notification (fire-and-forget). Non-blocking: if the queue is
+    /// full, the notification is dropped with WARN logging per ADR-0015
+    /// backpressure semantics; see `NotificationSendResult` for the
+    /// success/queue-full/channel-closed/serialization-failed outcomes.
     pub(crate) fn send_notification<P: serde::Serialize>(
         &self,
         notification: JsonRpcNotification<P>,
@@ -258,41 +195,10 @@ impl ConnectionHandle {
         }
     }
 
-    /// Send a request to the downstream server.
-    ///
-    /// Non-blocking: if the queue is full, returns `BridgeError::QueueFull`.
-    /// The request must already be registered with the router before calling this.
-    ///
-    /// # Cleanup Guarantee
-    ///
-    /// On failure, this method removes the router registration. The `router.remove()`
-    /// call is idempotent, so it's safe even if the writer task has already cleaned
-    /// up this entry due to a concurrent failure.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The typed JSON-RPC request
-    /// * `request_id` - The request ID (must be pre-registered with router)
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` if the request was queued successfully
-    /// * `Err(BridgeError::QueueFull)` if the queue is full
-    /// * `Err(BridgeError::ChannelClosed)` if the writer channel is closed
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // First register with router to get the response channel
-    /// let (request_id, response_rx) = handle.register_request()?;
-    /// let request = build_hover_request(request_id, ...);
-    ///
-    /// // Then queue the request
-    /// handle.send_request(request, request_id)?;
-    ///
-    /// // Finally wait for response
-    /// let response = handle.wait_for_response(request_id, response_rx).await?;
-    /// ```
+    /// Queue a pre-registered request for the writer task. Non-blocking; returns
+    /// `QueueFull` immediately rather than awaiting capacity. On any send error
+    /// the router entry is removed (`router.remove()` is idempotent, so this is
+    /// safe against concurrent cleanup by the writer task).
     pub(crate) fn send_request<P: serde::Serialize>(
         &self,
         request: JsonRpcRequest<P>,
@@ -356,32 +262,15 @@ impl ConnectionHandle {
         }
     }
 
-    /// Get the current connection state.
-    ///
-    /// Uses std::sync::RwLock for fast, non-blocking read access.
-    /// Recovers from poisoned locks with logging per project convention.
+    /// Get the current connection state. Uses a `std::sync::RwLock` for fast
+    /// synchronous reads and recovers from poisoned locks per project convention.
     pub(crate) fn state(&self) -> ConnectionState {
         *self.state.read().recover_poison("ConnectionHandle::state")
     }
 
-    /// Wait for the connection to reach Ready state with timeout.
-    ///
-    /// This method is useful for diagnostic requests that want to wait for
-    /// an initializing server instead of failing fast.
-    ///
-    /// # Returns
-    /// - `Ok(())` if the connection reaches Ready state
-    /// - `Err` with:
-    ///   - `ErrorKind::TimedOut` if the timeout expires
-    ///   - `ErrorKind::Other` if the server fails or shuts down during wait
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Wait up to 30s for server to be ready
-    /// handle.wait_for_ready(Duration::from_secs(30)).await?;
-    /// // Now safe to send requests
-    /// ```
+    /// Await `Ready` (up to `timeout`) instead of failing fast — used by
+    /// diagnostic requests that prefer to wait through initialization.
+    /// `TimedOut` on expiry; `Other` if the connection fails or shuts down.
     pub(crate) async fn wait_for_ready(&self, timeout: Duration) -> io::Result<()> {
         let mut receiver = self.state_watch.subscribe();
 
@@ -416,14 +305,8 @@ impl ConnectionHandle {
             })?
     }
 
-    /// Set the connection state.
-    ///
-    /// Used for state transitions during async initialization:
-    /// - Initializing -> Ready (on successful init)
-    /// - Initializing -> Failed (on timeout/error)
-    ///
-    /// Recovers from poisoned locks with logging per project convention.
-    /// Also notifies all watchers of the state change via the watch channel.
+    /// Set the connection state, recovering from poisoned locks per project
+    /// convention and notifying watchers via the watch channel.
     pub(super) fn set_state(&self, new_state: ConnectionState) {
         *self
             .state
@@ -458,35 +341,13 @@ impl ConnectionHandle {
         &self.dynamic_capabilities
     }
 
-    /// Check if the downstream server supports a given LSP method,
-    /// either via static capabilities (initialize response) or dynamic registration.
+    /// Whether the downstream server supports `method`, via dynamic registration
+    /// (preferred — may arrive after initialize) or static initialize capabilities.
     ///
-    /// Dynamic registrations take precedence since they may arrive after initialize.
-    ///
-    /// # Capability check patterns
-    ///
-    /// Static capability fields use two different check patterns depending on the
-    /// LSP type's shape:
-    ///
-    /// - **`is_some()`** — for struct-only types (`completion_provider`, `signature_help_provider`,
-    ///   `diagnostic_provider`). These have no boolean/`false` variant; `Some(…)` always
-    ///   means "supported".
-    ///
-    /// - **`matches!(…)`** — for boolean-or-struct enums (`HoverProviderCapability`,
-    ///   `OneOf<bool, …>`, `ColorProviderCapability`, etc.). These contain a `Simple(false)` /
-    ///   `Left(false)` variant that explicitly disables the capability, so a bare `is_some()`
-    ///   would incorrectly treat `Some(Simple(false))` as supported.
-    ///
-    /// To add a new method, add a match arm using the appropriate pattern for its type:
-    /// ```ignore
-    /// // Struct-only — no false variant exists
-    /// "textDocument/completion" => caps.completion_provider.is_some(),
-    /// // Boolean-or-struct enum — must reject the false variant
-    /// "textDocument/hover" => matches!(
-    ///     caps.hover_provider,
-    ///     Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
-    /// ),
-    /// ```
+    /// When extending the match: use `is_some()` only for struct-only fields
+    /// (e.g. `completion_provider`); fields that are a `bool`-or-struct enum
+    /// (e.g. `HoverProviderCapability`, `OneOf<bool, …>`) must use `matches!`
+    /// to reject the explicit `false` / `Simple(false)` variant.
     pub(crate) fn has_capability(&self, method: &str) -> bool {
         // Check dynamic registrations first (may arrive after initialize)
         if self.dynamic_capabilities().has_registration(method) {
@@ -605,17 +466,11 @@ impl ConnectionHandle {
         }
     }
 
-    /// Begin graceful shutdown of the connection.
-    ///
-    /// Transitions the connection to Closing state, which:
-    /// - Rejects new requests with "bridge: connection closing" error
-    /// - Signals that LSP shutdown/exit handshake should begin
-    /// - Stops the liveness timer (ADR-0018: global shutdown overrides liveness)
-    ///
-    /// Note: The reader task continues running to receive the shutdown response.
-    /// Only the liveness timer is disabled, not the entire reader.
-    ///
-    /// Valid from Ready or Initializing states per ADR-0015/ADR-0017.
+    /// Begin graceful shutdown: transition to Closing (rejecting new requests) and
+    /// stop the liveness timer, since global shutdown (Tier 3) overrides liveness
+    /// (Tier 2) per ADR-0018. Only the timer is stopped — the reader task keeps
+    /// running to receive the shutdown response. Valid from Ready or Initializing
+    /// (ADR-0015/ADR-0017).
     pub(crate) fn begin_shutdown(&self) {
         // Stop the liveness timer (but not the reader task) per ADR-0018
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
@@ -634,44 +489,15 @@ impl ConnectionHandle {
         self.set_state(ConnectionState::Closed);
     }
 
-    /// Perform graceful shutdown with LSP handshake (ADR-0017).
+    /// LSP graceful shutdown: Closing → stop writer → shutdown/exit → force-kill → Closed (ADR-0017).
     ///
-    /// Implements the LSP shutdown sequence:
-    /// 1. Transition to Closing state (new operations rejected)
-    /// 2. Stop writer task and reclaim the writer via 3-phase protocol
-    /// 3. Send LSP "shutdown" request directly and wait for response
-    /// 4. Send LSP "exit" notification directly
-    /// 5. Force kill process (Unix: SIGTERM→SIGKILL escalation)
-    /// 6. Transition to Closed state
+    /// The writer task is reclaimed via a 3-phase stop (signal → idle confirm → receive)
+    /// before sending `shutdown`/`exit` so nothing else writes to stdin concurrently (ADR-0015).
+    /// Force-kill and the `Closed` transition always run even if the LSP handshake fails,
+    /// so a stuck server cannot leave us in `Closing`.
     ///
-    /// # Writer Task Synchronization (ADR-0015)
-    ///
-    /// The writer task must be stopped BEFORE sending shutdown/exit to ensure
-    /// no concurrent writes to stdin. The 3-phase protocol:
-    /// 1. Signal stop to writer task
-    /// 2. Wait for idle confirmation (queue drained)
-    /// 3. Receive writer back for direct use
-    ///
-    /// # Cleanup Guarantee
-    ///
-    /// Steps 5-6 (force kill and state transition) are **always executed**,
-    /// even if the LSP handshake fails. This prevents connections from getting
-    /// stuck in the Closing state.
-    ///
-    /// # Returns
-    /// - Ok(()) if shutdown completed (gracefully or via force-kill)
-    /// - Err only if the method couldn't complete at all (shouldn't happen)
-    ///
-    /// # Timeout Behavior
-    ///
-    /// This method has **no internal timeout** per ADR-0018. It waits indefinitely
-    /// for the shutdown response. The caller (shutdown_all_with_timeout) is
-    /// responsible for enforcing the global shutdown timeout.
-    ///
-    /// This design ensures:
-    /// - Fast servers complete quickly without artificial delays
-    /// - Slow servers use remaining time from the global budget
-    /// - Single timeout ceiling prevents timeout multiplication (N * 5s)
+    /// No internal timeout (ADR-0018): the caller (`shutdown_all_with_timeout`) enforces the
+    /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
         // 1. Transition to Closing state
         self.begin_shutdown();
@@ -770,29 +596,18 @@ impl ConnectionHandle {
         &self.router
     }
 
-    /// Register a new request and return (request_id, response_receiver).
-    ///
-    /// Generates a unique request ID and registers it with the router.
-    /// If this is the first pending request (pending 0->1), notifies the reader
-    /// task to start the liveness timer (ADR-0014).
-    ///
-    /// Returns error if registration fails (should never happen with unique IDs).
+    /// Register a new request and return (request_id, response_receiver). On the
+    /// first pending request (0->1), notifies the reader to start the liveness
+    /// timer (ADR-0014). Errors only on a duplicate ID (should never happen).
     pub(crate) fn register_request(
         &self,
     ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
         self.register_request_with_upstream(None)
     }
 
-    /// Register a new request with upstream ID mapping for cancel forwarding.
-    ///
-    /// Like `register_request()`, but also stores a mapping from the upstream (client)
-    /// request ID to the downstream (language server) request ID in the router's cancel_map.
-    /// This enables $/cancelRequest forwarding by translating upstream IDs to downstream IDs.
-    ///
-    /// # Arguments
-    /// * `upstream_id` - The original request ID from the upstream client (None for internal requests)
-    ///
-    /// Returns error if registration fails (should never happen with unique IDs).
+    /// Like `register_request()`, but also records the upstream→downstream ID
+    /// mapping in the router's cancel_map so `$/cancelRequest` can be translated
+    /// and forwarded (`None` for internal requests).
     pub(crate) fn register_request_with_upstream(
         &self,
         upstream_id: Option<UpstreamId>,
@@ -821,13 +636,9 @@ impl ConnectionHandle {
         Ok((request_id, response_rx))
     }
 
-    /// Wait for a response with timeout, cleaning up on timeout.
-    ///
-    /// Takes the oneshot receiver and request ID, waits for response with
-    /// 30-second timeout. On timeout, removes the pending entry from router.
-    ///
-    /// Also checks for liveness timeout failure and transitions to Failed state
-    /// if the reader task signaled a liveness timeout (ADR-0014 Phase 3).
+    /// Wait for a response with a 30-second timeout, removing the pending router
+    /// entry on timeout. If the reader signaled a liveness timeout, transitions
+    /// the connection to Failed (ADR-0014 Phase 3).
     pub(crate) async fn wait_for_response(
         &self,
         request_id: RequestId,

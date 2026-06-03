@@ -90,8 +90,8 @@ impl InstallCoordinator {
 
     /// Dispatch install events to ClientNotifier.
     ///
-    /// This method bridges AutoInstallManager (isolated) with ClientNotifier.
-    /// AutoInstallManager returns events, Kakehashi dispatches them.
+    /// Bridges the isolated `AutoInstallManager` (which only returns events) to the
+    /// `ClientNotifier` that performs the actual client-facing side effects.
     pub(crate) async fn dispatch_install_events(&self, language: &str, events: &[InstallEvent]) {
         let notifier = self.notifier();
         for event in events {
@@ -146,19 +146,9 @@ impl InstallCoordinator {
 
     /// Try to auto-install a language if not already being installed.
     ///
-    /// Delegates to `AutoInstallManager::try_install()` and handles coordination:
-    /// 1. Dispatches install events to ClientNotifier
-    /// 2. Triggers `reload_language_after_install()` on success
-    ///
-    /// # Arguments
-    /// * `language` - The language to install
-    /// * `uri` - The document URI that triggered the install
-    /// * `text` - The document text
-    /// * `is_injection` - True if this is an injection language (not the document's main language)
-    ///
-    /// # Returns
-    /// `true` if installation was triggered (caller should skip parse_document),
-    /// `false` if installation was not triggered (caller should proceed with parse_document)
+    /// Delegates to `AutoInstallManager::try_install()`, dispatches its events, and
+    /// reloads on success. Returns `true` when installation was triggered, signaling
+    /// the caller to skip `parse_document` (a re-parse happens after reload).
     pub(crate) async fn maybe_auto_install_language(
         &self,
         language: &str,

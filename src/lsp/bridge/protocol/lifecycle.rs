@@ -16,12 +16,8 @@ use super::request_id::RequestId;
 
 /// Build an LSP initialize request.
 ///
-/// # Arguments
-/// * `request_id` - The JSON-RPC request ID
-/// * `initialization_options` - Server-specific initialization options
-/// * `root_uri` - The workspace root URI (forwarded from upstream client)
-/// * `workspace_folders` - The workspace folders (forwarded from upstream client)
-/// * `upstream_capabilities` - The upstream client's capabilities (merged into bridge defaults)
+/// `root_uri` and `workspace_folders` are forwarded from the upstream client;
+/// `upstream_capabilities` are merged into the bridge defaults.
 pub(crate) fn build_initialize_request(
     request_id: RequestId,
     initialization_options: Option<serde_json::Value>,
@@ -60,9 +56,6 @@ pub(crate) fn build_initialized_notification() -> JsonRpcNotification<Initialize
 }
 
 /// Build an LSP shutdown request.
-///
-/// # Arguments
-/// * `request_id` - The JSON-RPC request ID
 pub(crate) fn build_shutdown_request(request_id: RequestId) -> JsonRpcRequest<()> {
     JsonRpcRequest::new(request_id.as_i64(), "shutdown", ())
 }
@@ -75,9 +68,6 @@ pub(crate) fn build_exit_notification() -> JsonRpcNotification<()> {
 }
 
 /// Build a textDocument/didClose notification.
-///
-/// # Arguments
-/// * `uri` - The URI of the document being closed
 pub(crate) fn build_didclose_notification(
     uri: &str,
 ) -> Option<JsonRpcNotification<DidCloseTextDocumentParams>> {
@@ -101,14 +91,9 @@ pub(crate) fn build_didclose_notification(
 
 /// Validates a JSON-RPC initialize response.
 ///
-/// Uses lenient interpretation to maximize compatibility with non-conformant servers:
-/// - Prioritizes error field if present and non-null
-/// - Accepts result with null error field (`{"result": {...}, "error": null}`)
-/// - Rejects null or missing result field
-///
-/// # Returns
-/// * `Ok(())` - Response is valid (has non-null result, no error)
-/// * `Err(e)` - Response has error or missing/null result
+/// Uses lenient interpretation to maximize compatibility with non-conformant
+/// servers: a non-null `error` field is prioritized, a null `error` alongside a
+/// result is accepted, and a null/missing result is rejected.
 pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std::io::Result<()> {
     // 1. Check for error response (prioritize error if present)
     if let Some(error) = response.get("error").filter(|e| !e.is_null()) {

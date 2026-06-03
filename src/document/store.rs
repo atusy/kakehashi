@@ -170,17 +170,9 @@ impl DocumentStore {
 
     /// Update document with an edited previous tree for proper changed_ranges() support.
     ///
-    /// This method should be called when parsing was done with an edited old tree (via tree.edit()).
-    /// The edited_previous_tree allows tree-sitter's changed_ranges() to accurately compute
-    /// the byte ranges that changed between versions.
-    ///
-    /// Uses entry() API for atomic check-and-update/insert operations.
-    ///
-    /// # Arguments
-    /// * `uri` - Document URI
-    /// * `text` - New document text
-    /// * `new_tree` - Newly parsed tree
-    /// * `edited_previous_tree` - The previous tree after tree.edit() was applied
+    /// Call when parsing used an edited old tree (via `tree.edit()`): the
+    /// `edited_previous_tree` lets tree-sitter's `changed_ranges()` accurately
+    /// compute the byte ranges that changed between versions.
     pub fn update_document_with_edited_tree(
         &self,
         uri: Url,

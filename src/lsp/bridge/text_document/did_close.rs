@@ -1,12 +1,8 @@
 //! didClose notification handling for bridge connections.
 //!
-//! This module provides didClose notification functionality for downstream language servers,
-//! handling cleanup when host documents are closed or regions are invalidated.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_notification()` to queue didClose notifications via the
-//! channel-based writer task, ensuring FIFO ordering.
+//! Cleans up when host documents are closed or regions are invalidated.
+//! Notifications are queued via the channel-based writer task (ADR-0015) for
+//! FIFO ordering.
 
 use std::io;
 use std::sync::Arc;
@@ -21,19 +17,10 @@ use super::super::protocol::{VirtualDocumentUri, build_didclose_notification};
 impl LanguageServerPool {
     /// Send a didClose notification for a virtual document.
     ///
-    /// This method sends a didClose notification to the downstream language server
-    /// for the specified virtual document URI. The connection is NOT closed after
-    /// sending - it remains available for other documents.
-    ///
-    /// Uses the channel-based single-writer loop (ADR-0015) for FIFO ordering.
-    ///
-    /// Returns Ok(()) if the notification was sent successfully, or if no connection
-    /// exists for the server (nothing to do).
-    ///
-    /// # Arguments
-    ///
-    /// * `virtual_uri` - The virtual document URI to close
-    /// * `server_name` - The server name for connection lookup (enables process sharing)
+    /// The connection is NOT closed after sending — it stays available for other
+    /// documents. Uses the channel-based single-writer loop (ADR-0015) for FIFO
+    /// ordering. Returns `Ok(())` on success or when no connection exists for the
+    /// server (nothing to do).
     pub(crate) async fn send_didclose_notification(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -99,18 +86,10 @@ impl LanguageServerPool {
             .await;
     }
 
-    /// Close all virtual documents associated with a host document.
+    /// Close all virtual documents associated with a host document, returning them.
     ///
-    /// When a host document (e.g., markdown file) is closed, this method:
-    /// 1. Looks up all virtual documents that were opened for the host
-    /// 2. Sends didClose notification for each virtual document
-    /// 3. Removes the virtual documents from document_versions tracking
-    /// 4. Removes the host entry from host_to_virtual
-    ///
-    /// The connection to downstream language servers remains open - only the
+    /// The connection to downstream language servers remains open — only the
     /// virtual documents are closed.
-    ///
-    /// Returns the list of closed virtual documents (useful for logging).
     pub(crate) async fn close_host_document(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
         // 1. Remove and get all virtual docs for this host
         let virtual_docs = self.remove_host_virtual_docs(host_uri).await;
@@ -129,18 +108,9 @@ impl LanguageServerPool {
 
     /// Close invalidated virtual documents (Phase 3).
     ///
-    /// When region IDs are invalidated by edits, their corresponding virtual
-    /// documents become orphaned in downstream LSs. This method:
-    ///
-    /// 1. Atomically removes matching docs from host_to_virtual tracking
-    /// 2. Sends didClose notifications for each (best effort)
-    /// 3. Removes from document_versions tracking
-    ///
-    /// Documents that were never opened are automatically skipped.
-    ///
-    /// # Arguments
-    /// * `host_uri` - The host document URI
-    /// * `invalidated_ulids` - ULIDs that were invalidated by edits
+    /// When region IDs are invalidated by edits, their virtual documents become
+    /// orphaned in downstream LSs. Matching docs are atomically removed from
+    /// tracking and sent didClose (best effort); docs never opened are skipped.
     pub(crate) async fn close_invalidated_docs(&self, host_uri: &Url, invalidated_ulids: &[Ulid]) {
         // Atomically remove matching docs from host_to_virtual
         let to_close = self

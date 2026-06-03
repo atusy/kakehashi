@@ -1,23 +1,9 @@
-//! Client notification abstraction for LSP communication.
+//! `ClientNotifier`: thin wrapper over `tower_lsp_server::Client` for logging,
+//! progress, and semantic-token refresh requests.
 //!
-//! This module provides `ClientNotifier`, a wrapper around `tower_lsp_server::Client`
-//! that centralizes all client-facing communication: logging, progress notifications,
-//! and semantic token refresh requests.
-//!
-//! # Design Rationale
-//!
-//! Extracting client communication into a dedicated struct provides:
-//! - **Single Responsibility**: All client notification logic in one place
-//! - **Testability**: Methods can be unit tested without full LSP setup
-//! - **Consistency**: Uniform logging and notification patterns across the codebase
-//!
-//! # Initialization Lifecycle
-//!
-//! The `ClientNotifier` wraps the LSP `Client` and a reference to `ClientCapabilities`
-//! stored in an `OnceLock`. This allows capability-dependent behavior (like semantic
-//! tokens refresh) to work correctly both before and after `initialize()`:
-//! - Before `initialize()`: Capabilities are not set, so refresh is skipped (safe default)
-//! - After `initialize()`: Capabilities are checked to determine if refresh is supported
+//! Holds `ClientCapabilities` in a `OnceLock` so capability-gated calls (like
+//! semantic-token refresh) work safely before `initialize()` — pre-init,
+//! capabilities are absent and the call is skipped instead of panicking.
 
 use std::sync::OnceLock;
 use tower_lsp_server::Client;
@@ -44,25 +30,13 @@ pub(crate) fn check_semantic_tokens_refresh_support(caps: &ClientCapabilities) -
         .unwrap_or(false)
 }
 
-/// Wrapper around LSP client for centralized notification handling.
+/// Server→client notifier: logging, progress, semantic-token refresh. `Clone`
+/// and thread-safe (the underlying `Client` synchronizes internally, and
+/// `client_capabilities` is a shared `OnceLock`).
 ///
-/// `ClientNotifier` encapsulates all communication from server to client,
-/// providing a clean API for:
-/// - Log messages at various severity levels
-/// - Progress notifications for long-running operations
-/// - Semantic token refresh requests
-///
-/// # Thread Safety
-///
-/// `ClientNotifier` is `Clone` and thread-safe. The underlying `Client`
-/// uses internal synchronization, and capabilities are read from a shared
-/// `OnceLock` reference.
-///
-/// # Capability Checking
-///
-/// Capability-dependent operations (like semantic tokens refresh) check the
-/// `client_capabilities` OnceLock. Before `initialize()` sets capabilities,
-/// these operations safely default to no-op behavior.
+/// Capability-gated calls (e.g. semantic-tokens refresh) inspect the
+/// `OnceLock`; before `initialize()` populates it they no-op instead of
+/// panicking.
 #[derive(Clone)]
 pub(crate) struct ClientNotifier<'a> {
     client: Client,
@@ -82,10 +56,6 @@ impl std::fmt::Debug for ClientNotifier<'_> {
 
 impl<'a> ClientNotifier<'a> {
     /// Create a new `ClientNotifier` wrapping the given LSP client.
-    ///
-    /// # Arguments
-    /// * `client` - The tower-lsp Client for server-to-client communication
-    /// * `client_capabilities` - Reference to the OnceLock storing client capabilities
     pub(crate) fn new(
         client: Client,
         client_capabilities: &'a OnceLock<ClientCapabilities>,
@@ -127,11 +97,8 @@ impl<'a> ClientNotifier<'a> {
 
     /// Handle language events by logging messages and triggering refresh requests.
     ///
-    /// This processes events emitted by `LanguageCoordinator` operations:
-    /// - `Log` events are sent as log messages to the client
-    /// - `ShowMessage` events are surfaced to the user via window/showMessage
-    /// - `SemanticTokensRefresh` events trigger workspace/semanticTokens/refresh
-    ///   (only if client declared support via capabilities)
+    /// `SemanticTokensRefresh` only fires when the client declared support, since
+    /// sending the request unconditionally would violate the LSP capability gate.
     pub(crate) async fn log_language_events(&self, events: &[LanguageEvent]) {
         for event in events {
             match event {
@@ -214,7 +181,6 @@ impl<'a> ClientNotifier<'a> {
 
     /// Send a progress begin notification for parser installation.
     ///
-    /// Creates a `$/progress` notification with `WorkDoneProgressBegin` payload.
     /// The progress token is `kakehashi/install/{language}`.
     pub(crate) async fn progress_begin(&self, language: &str) {
         self.client
@@ -222,10 +188,8 @@ impl<'a> ClientNotifier<'a> {
             .await;
     }
 
-    /// Send a progress end notification for parser installation.
-    ///
-    /// Creates a `$/progress` notification with `WorkDoneProgressEnd` payload.
-    /// The message indicates success or failure.
+    /// Send a progress end notification for parser installation, reporting
+    /// success or failure in the message.
     pub(crate) async fn progress_end(&self, language: &str, success: bool) {
         self.client
             .send_notification::<Progress>(create_progress_end(language, success))

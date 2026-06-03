@@ -1,12 +1,8 @@
-//! Signature help request handling for bridge connections.
+//! Signature help request handling for bridge connections, translating
+//! coordinates between host and virtual documents.
 //!
-//! This module provides signature help request functionality for downstream language servers,
-//! handling the coordinate transformation between host and virtual documents.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` to queue requests via the channel-based
-//! writer task, ensuring FIFO ordering with other messages.
+//! Requests go through `send_request()` so the single-writer task (ADR-0015)
+//! preserves FIFO ordering with other messages.
 
 use std::io;
 
@@ -40,17 +36,9 @@ fn build_signature_help_request(
 
 /// Transform a signature help response from virtual to host document coordinates.
 ///
-/// SignatureHelp responses contain activeSignature and activeParameter indices,
-/// not coordinates, so no transformation is needed. This function extracts the
-/// SignatureHelp from the JSON-RPC response and returns it typed.
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `_offset` - The region offset (unused, kept for API consistency)
-///
-/// # Returns
-/// * `Some(SignatureHelp)` if the response contains valid signature help data
-/// * `None` if the result is null or cannot be parsed
+/// No coordinate transform is actually needed: SignatureHelp carries
+/// `activeSignature`/`activeParameter` indices, not ranges. The `offset` is kept
+/// only for API consistency with the other bridge transformers.
 fn transform_signature_help_response_to_host(
     mut response: serde_json::Value,
     _offset: &RegionOffset,

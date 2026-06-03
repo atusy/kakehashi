@@ -1,20 +1,9 @@
-//! Writer task for downstream language server stdin.
+//! Single-writer actor that drains the order queue into downstream stdin.
 //!
-//! This module provides the single-writer actor that consumes from the
-//! unified order queue and writes to the downstream server's stdin.
-//!
-//! # 3-Phase Shutdown Protocol
-//!
-//! The writer task supports graceful shutdown with a 3-phase protocol:
-//!
-//! 1. **Stop Signal**: Caller sends `()` on `stop_tx` to request shutdown
-//! 2. **Idle Confirmation**: Writer sends `()` on `idle_tx` when queue is drained
-//! 3. **Writer Return**: Writer sends itself on `writer_tx` for LSP shutdown sequence
-//!
-//! This protocol ensures:
-//! - Pending messages are delivered before shutdown
-//! - Caller can perform LSP shutdown/exit sequence with the returned writer
-//! - Writer is always returned if possible (dedicated channel)
+//! Graceful shutdown is a 3-phase protocol: caller signals `stop_tx`; writer
+//! drains the queue and signals `idle_tx`; writer then sends itself on a
+//! dedicated `writer_tx` so the caller can perform the LSP `shutdown`/`exit`
+//! sequence with the returned writer in hand.
 
 use std::sync::Arc;
 
@@ -34,16 +23,13 @@ pub(crate) const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 
 /// Handle to a running Writer Task, managing its lifetime via RAII.
 ///
-/// This handle enables the 3-phase graceful shutdown protocol:
-/// 1. Signal stop via `stop_and_reclaim()`
-/// 2. Wait for idle confirmation
-/// 3. Receive writer back for LSP shutdown sequence
+/// Drives the 3-phase graceful shutdown protocol (stop → idle → reclaim writer)
+/// via the oneshot channels below.
 pub(crate) struct WriterTaskHandle {
     /// Held to prevent the task from becoming fully detached.
     ///
-    /// While we coordinate shutdown via oneshot channels (not by awaiting this handle),
-    /// storing it ensures the task remains associated with this struct for debugging
-    /// and prevents accidental task detachment if refactored.
+    /// Shutdown is coordinated via the oneshot channels, not by awaiting this
+    /// handle; keeping it just guards against accidental detachment if refactored.
     _join_handle: tokio::task::JoinHandle<()>,
     /// For signaling graceful stop
     stop_tx: Option<oneshot::Sender<()>>,
@@ -58,13 +44,9 @@ pub(crate) struct WriterTaskHandle {
 impl WriterTaskHandle {
     /// Initiate graceful shutdown and wait to reclaim the writer.
     ///
-    /// Implements the 3-phase shutdown protocol:
-    /// 1. Send stop signal
-    /// 2. Wait for idle confirmation (queue drained)
-    /// 3. Receive writer back for LSP shutdown sequence
-    ///
-    /// Returns `Some(writer)` on success, `None` if writer task panicked or
-    /// channels were already consumed.
+    /// Runs the 3-phase protocol (stop → await idle/queue-drained → reclaim
+    /// writer). Returns `None` if the writer task panicked or the channels were
+    /// already consumed.
     pub(crate) async fn stop_and_reclaim(&mut self) -> Option<SplitConnectionWriter> {
         // Phase 1: Send stop signal
         if let Some(stop_tx) = self.stop_tx.take() {
@@ -103,14 +85,6 @@ impl Drop for WriterTaskHandle {
 }
 
 /// Spawn a writer task that writes messages from the queue to stdin.
-///
-/// # Arguments
-/// * `writer` - The SplitConnectionWriter for stdin writes
-/// * `rx` - Receiver for outbound messages
-/// * `router` - ResponseRouter for cleanup on write errors
-///
-/// # Returns
-/// A WriterTaskHandle for managing the spawned task.
 pub(crate) fn spawn_writer_task(
     writer: SplitConnectionWriter,
     rx: mpsc::Receiver<OutboundMessage>,
@@ -139,10 +113,9 @@ pub(crate) fn spawn_writer_task(
 
 /// The main writer loop - writes messages from queue to stdin.
 ///
-/// This function handles three shutdown scenarios:
-/// 1. Graceful shutdown: stop_rx receives, drain queue, return writer
-/// 2. Cancellation: cancel_token cancelled, drain and fail pending
-/// 3. Channel closed: all senders dropped, clean up and exit
+/// Handles three shutdown paths: graceful stop drains the queue and returns the
+/// writer; cancellation drains and fails pending requests without returning the
+/// writer; channel close fails all pending and exits.
 async fn writer_loop(
     mut writer: SplitConnectionWriter,
     mut rx: mpsc::Receiver<OutboundMessage>,

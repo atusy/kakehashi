@@ -110,14 +110,9 @@ impl Document {
 
     /// Update tree and text with an explicit edited previous tree.
     ///
-    /// This is the preferred method when the previous tree was edited via `tree.edit()`
-    /// before parsing. The edited tree allows `changed_ranges()` to accurately compute
-    /// the byte ranges that changed between the old and new parse trees.
-    ///
-    /// # Arguments
-    /// * `new_tree` - The newly parsed tree
-    /// * `new_text` - The new document text
-    /// * `edited_previous_tree` - The previous tree after `tree.edit()` was applied
+    /// Preferred when the previous tree was edited via `tree.edit()` before
+    /// parsing: the edited tree lets `changed_ranges()` accurately compute the
+    /// byte ranges changed between the old and new parse trees.
     pub(crate) fn update_with_edited_tree(
         &mut self,
         new_tree: Tree,

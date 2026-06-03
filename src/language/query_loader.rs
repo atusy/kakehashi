@@ -12,19 +12,9 @@ const INHERITS_DIRECTIVE_PREFIX: &str = "; inherits:";
 
 /// Information about a pattern that was skipped during tolerant parsing.
 ///
-/// This is returned alongside the successfully parsed query to allow
-/// callers to log or report which patterns failed.
-///
-/// # Line Number Limitation
-///
-/// When queries use inheritance (e.g., TypeScript's `; inherits: ecma`),
-/// line numbers refer to positions in the **combined** query string, not the
-/// original source file. For example, if `ecma/highlights.scm` has 100 lines
-/// and is inherited by `typescript/highlights.scm`, a pattern on line 5 of
-/// the TypeScript file would be reported as line 105.
-///
-/// This is a known limitation of the current implementation. Future versions
-/// may track source file information to provide more accurate diagnostics.
+/// Known limitation: when queries use inheritance (e.g. `; inherits: ecma`),
+/// line numbers refer to the **combined** query string, not the original source
+/// file (a pattern on line 5 of a child whose parent has 100 lines reports 105).
 #[derive(Debug, Clone)]
 pub(crate) struct SkippedPattern {
     /// The pattern text that failed to compile
@@ -43,10 +33,7 @@ pub(crate) struct SkippedPattern {
     pub error: String,
 }
 
-/// Reason why tolerant parsing produced no query.
-///
-/// This enum provides semantic information about why `ParseResult.query`
-/// is `None`, allowing callers to log appropriate messages or take different actions.
+/// Reason why tolerant parsing produced no query (i.e. why `ParseResult.query` is `None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParseFailure {
     /// The query file couldn't be split into patterns (malformed query syntax).
@@ -57,14 +44,10 @@ pub(crate) enum ParseFailure {
     AllPatternsInvalid,
     /// All patterns validated individually but combining them failed.
     ///
-    /// This is a defensive code path that handles theoretical edge cases such as:
-    /// - Capture name conflicts across patterns
-    /// - Internal tree-sitter limitations when combining patterns
-    ///
-    /// In practice, this scenario is difficult to trigger because tree-sitter's
-    /// pattern validation is consistent - patterns that compile individually
-    /// typically combine successfully. This variant exists to ensure graceful
-    /// handling rather than panicking if such a case ever occurs.
+    /// Defensive: tree-sitter's pattern validation is consistent, so patterns that
+    /// compile individually typically combine successfully. This variant exists to
+    /// degrade gracefully (rather than panic) on theoretical edge cases such as
+    /// capture-name conflicts across patterns.
     CombinationFailed(String),
 }
 
@@ -117,19 +100,10 @@ impl QueryLoader {
 
     /// Resolve query inheritance and return the combined query content.
     ///
-    /// Recursively resolves parent queries and concatenates them in the correct order
-    /// (parents first, then child). Removes the `; inherits:` directive from the output.
-    ///
-    /// # Arguments
-    /// * `runtime_bases` - Search paths for query files
-    /// * `lang_name` - The language to resolve
-    /// * `file_name` - The query file name (e.g., "highlights.scm")
-    /// * `preloaded_content` - If provided, use this content instead of loading from disk.
-    ///   This is used to avoid double-loading when the caller already has the content.
-    /// * `visited` - Set of already-visited languages for circular dependency detection
-    ///
-    /// # Returns
-    /// Combined query content with all inherited queries.
+    /// Recursively resolves parent queries, concatenating parents-first then child,
+    /// and removes the `; inherits:` directive. `preloaded_content` lets the caller
+    /// skip a re-read when it already has the content; `visited` guards against
+    /// circular inheritance.
     fn resolve_query_recursive<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
@@ -188,11 +162,8 @@ impl QueryLoader {
 
     /// Parse the `; inherits: lang1,lang2` directive from query content.
     ///
-    /// nvim-treesitter queries can inherit from other queries using this directive
-    /// on the first line. This function extracts the list of parent languages.
-    ///
-    /// # Returns
-    /// A vector of parent language names (empty if no inheritance).
+    /// nvim-treesitter queries declare inheritance via this first-line directive;
+    /// returns the parent language names (empty if absent).
     fn parse_inherits_directive(content: &str) -> Vec<String> {
         let first_line = content.lines().next().unwrap_or("");
         if let Some(rest) = first_line.strip_prefix(INHERITS_DIRECTIVE_PREFIX) {
@@ -271,15 +242,6 @@ impl QueryLoader {
     /// First attempts full compilation (fast path). If that fails, splits the
     /// query into individual patterns, validates each separately, and combines
     /// only the valid ones.
-    ///
-    /// # Arguments
-    /// * `language` - The tree-sitter language
-    /// * `query_str` - The full query string
-    /// * `used_inheritance` - Whether this query was resolved using inheritance
-    ///
-    /// # Returns
-    /// A `ParseResult` containing the compiled query (if any patterns
-    /// were valid) and a list of skipped patterns with their errors.
     pub(crate) fn parse_query(
         language: &Language,
         query_str: &str,
@@ -374,13 +336,8 @@ impl QueryLoader {
 
     /// Load and parse a query from explicit paths with fault tolerance.
     ///
-    /// Loads query content from the specified paths and uses tolerant parsing
-    /// to skip invalid patterns instead of failing the entire query.
-    ///
-    /// # Returns
-    /// - `Ok(ParseResult)` if the query files were found and at least
-    ///   partially parsed
-    /// - `Err` if any query file could not be found or read
+    /// Tolerant parsing skips invalid patterns instead of failing the whole query;
+    /// errors only on a missing/unreadable file.
     pub(crate) fn load_query_from_paths<P: AsRef<Path>>(
         language: &Language,
         paths: &[P],
@@ -391,20 +348,10 @@ impl QueryLoader {
 
     /// Load and parse a query with inheritance resolution and fault tolerance.
     ///
-    /// This resolves `; inherits:` directives, concatenates parent queries,
-    /// and uses tolerant parsing to skip invalid patterns instead of failing
-    /// the entire query.
-    ///
-    /// # Line Number Limitation
-    ///
-    /// When inheritance is used, line numbers in [`SkippedPattern`] refer to the
-    /// combined query string (parent + child), not the original source file.
-    /// See [`SkippedPattern`] documentation for details.
-    ///
-    /// # Returns
-    /// - `Ok(ParseResult)` if the query file was found and at least
-    ///   partially parsed
-    /// - `Err` if the query file could not be found or read
+    /// Resolves `; inherits:` directives, concatenates parent queries, and skips
+    /// invalid patterns instead of failing the whole query. When inheritance is
+    /// used, line numbers in [`SkippedPattern`] refer to the combined query string,
+    /// not the original source file.
     pub(crate) fn load_query_with_inheritance<P: AsRef<Path>>(
         language: &Language,
         runtime_bases: &[P],
@@ -428,19 +375,11 @@ impl QueryLoader {
 
     /// Resolve library path for a language.
     ///
-    /// If an explicit `library` path is provided, it is normalized and returned.
-    /// Otherwise, searches `search_paths` for `<base>/parser/<language>.<ext>`.
-    ///
-    /// # Arguments
-    /// * `library` - Optional explicit path string to the parser shared library.
-    ///   Remains `&str` because it comes from `LanguageSettings.parser: Option<String>`.
-    /// * `language` - The language name used for search-path-based discovery
-    /// * `search_paths` - Directories to search for `parser/<language>.<ext>`.
-    ///   Generic over `AsRef<Path>` to accept both `PathBuf` (from `ConfigStore`)
-    ///   and `String` (from `WorkspaceSettings`).
-    ///
-    /// # Returns
-    /// The resolved `PathBuf` if found, or `None` if no matching parser exists.
+    /// An explicit `library` is normalized and returned as-is; otherwise searches
+    /// `search_paths` for `<base>/parser/<language>.<ext>`. `library` stays `&str`
+    /// because it comes from `LanguageSettings.parser: Option<String>`; `search_paths`
+    /// is generic over `AsRef<Path>` to accept both `PathBuf` (from `ConfigStore`)
+    /// and `String` (from `WorkspaceSettings`).
     pub(crate) fn resolve_library_path<P: AsRef<Path>>(
         library: Option<&str>,
         language: &str,

@@ -15,24 +15,9 @@ use tree_sitter::{Query, Tree};
 
 use super::handle_semantic_tokens_full;
 
-/// Handle semantic tokens range request with Rayon parallel injection processing (async).
-///
-/// This is an async version of `handle_semantic_tokens_range` that uses
-/// `tokio::task::spawn_blocking` to run the CPU-bound Rayon work.
-///
-/// # Arguments
-/// * `text` - The source text (owned for moving into spawn_blocking)
-/// * `tree` - The parsed syntax tree (owned for moving into spawn_blocking)
-/// * `query` - The tree-sitter query for semantic highlighting (host language)
-/// * `range` - The range to get tokens for (LSP positions)
-/// * `filetype` - The filetype of the document being processed
-/// * `capture_mappings` - The capture mappings to apply
-/// * `coordinator` - Language coordinator for injection queries and language loading
-/// * `supports_multiline` - Whether client supports multiline tokens (per LSP 3.16.0+)
-///
-/// # Returns
-/// Semantic tokens for the specified range including injected content,
-/// or None if the task was cancelled or failed.
+/// Async variant of `handle_semantic_tokens_range`: runs the Rayon work via
+/// `spawn_blocking` so the CPU-bound path doesn't block the runtime. `text`
+/// and `tree` are moved in; `None` on cancellation/failure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_range_parallel_async(
     text: String,

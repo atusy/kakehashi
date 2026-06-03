@@ -1,48 +1,20 @@
-//! Atomic result_id generation for LSP SemanticTokens responses.
+//! Monotonic `result_id` for LSP `SemanticTokens` responses — lets the client
+//! request `semanticTokens/full/delta` against a known baseline.
 //!
-//! Provides sequential, thread-safe result IDs exclusively for LSP semantic token responses.
-//! These IDs enable efficient delta computation between `textDocument/semanticTokens/full`
-//! and `textDocument/semanticTokens/full/delta` requests.
-//!
-//! # Two ID Systems in This Codebase
-//!
-//! This codebase uses **two distinct ID systems** for different purposes:
-//!
-//! | ID Type | Source | Format | Purpose |
-//! |---------|--------|--------|---------|
-//! | `result_id` | `next_result_id()` (this module) | Sequential integers ("1", "2", ...) | LSP delta computation - client uses to request deltas from a known baseline |
-//! | `region_id` | `NodeTracker::get_or_create()` | Position-based ULIDs | Injection region identity - bridge server uses to route requests to correct virtual document |
-//!
-//! ## result_id (this module)
-//!
-//! - **Scope**: Per-response, global counter
-//! - **Stability**: Never stable - always increments
-//! - **Used for**: `SemanticTokens.result_id` and `SemanticTokensDelta.result_id` in LSP responses
-//! - **Consumer**: LSP client (e.g., VSCode, Neovim)
-//!
-//! ## region_id (NodeTracker)
-//!
-//! - **Scope**: Per-injection-region, keyed by (uri, start_byte, end_byte, node_kind)
-//! - **Stability**: Stable across edits if region position is adjusted correctly
-//! - **Used for**: `CacheableInjectionRegion.region_id`, virtual document URIs
-//! - **Consumer**: Bridge server for downstream language server communication
+//! Not to be confused with `region_id` (`NodeTracker`): `result_id` is a
+//! global sequential integer per response (always changes), used by the LSP
+//! client; `region_id` is a position-keyed ULID per injection region (stable
+//! across edits when positions shift correctly), used internally to route to
+//! the right virtual document.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TOKEN_RESULT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Generate a unique, monotonically increasing result_id for LSP SemanticTokens.
-///
-/// This function is thread-safe and returns sequential string IDs like "1", "2", "3", etc.
-///
-/// # Usage
-///
-/// Used exclusively for the `result_id` field in `SemanticTokens` and
-/// `SemanticTokensDelta` LSP responses. Not for injection region identification.
-///
-/// # See Also
-///
-/// - `NodeTracker::get_or_create()` for injection region IDs (position-based ULIDs)
+/// Generate a unique, monotonically increasing `result_id` (thread-safe) for the
+/// `result_id` field of `SemanticTokens`/`SemanticTokensDelta` responses. Not for
+/// injection region identification — see `NodeTracker::get_or_create()` for those
+/// (position-based ULIDs).
 pub fn next_result_id() -> String {
     TOKEN_RESULT_COUNTER
         .fetch_add(1, Ordering::SeqCst)

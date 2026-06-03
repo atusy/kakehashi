@@ -33,16 +33,11 @@ use super::super::protocol::{
 impl LanguageServerPool {
     /// Send a diagnostic request and wait for the response.
     ///
-    /// # Wait-for-Ready Behavior
-    ///
     /// Unlike other request types that fail fast when a server is initializing,
-    /// diagnostic requests wait for the server to become Ready. This provides
-    /// better UX — users see diagnostics appear once the server is ready rather
-    /// than seeing empty results.
-    ///
-    /// After the wait-for-ready and capability check, delegates to
-    /// [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the standard
-    /// lifecycle.
+    /// diagnostic requests wait for the server to become Ready so users see
+    /// diagnostics appear rather than empty results. After the wait and capability
+    /// check, delegates to
+    /// [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_diagnostic_request(
         &self,
@@ -101,13 +96,8 @@ impl LanguageServerPool {
 
 /// Build a JSON-RPC diagnostic request for a downstream language server.
 ///
-/// Like DocumentSymbolParams, DocumentDiagnosticParams operates on the entire document.
-/// The request may include an optional previousResultId for incremental updates.
-///
-/// # Arguments
-/// * `virtual_uri` - The pre-built virtual document URI
-/// * `request_id` - The JSON-RPC request ID
-/// * `previous_result_id` - Optional previous result ID for incremental updates
+/// Like DocumentSymbolParams, DocumentDiagnosticParams operates on the entire
+/// document; an optional `previous_result_id` enables incremental updates.
 fn build_diagnostic_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
@@ -127,16 +117,10 @@ fn build_diagnostic_request(
 
 /// Parse a JSON-RPC diagnostic response and transform coordinates to host document space.
 ///
-/// Instead of returning a modified JSON envelope, this deserializes the response
-/// into `Vec<Diagnostic>` with coordinates already transformed.
-///
-/// Returns empty `Vec` for: null results, unchanged reports, missing items, and
-/// deserialization failures.
-///
-/// # Arguments
-/// * `response` - Raw JSON-RPC response envelope (`{"result": {"kind":"full","items":[...]}}`)
-/// * `offset` - The region offset for coordinate translation
-/// * `host_uri` - The host document URI; only related info matching this URI gets transformed
+/// Deserializes into `Vec<Diagnostic>` with coordinates already transformed,
+/// returning an empty `Vec` for null results, unchanged reports, missing items,
+/// and deserialization failures. Only related info matching `host_uri` is
+/// transformed.
 fn transform_diagnostic_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

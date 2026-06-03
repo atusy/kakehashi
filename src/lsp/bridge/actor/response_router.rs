@@ -1,14 +1,8 @@
 //! Response routing for pending LSP requests.
 //!
-//! This module provides the ResponseRouter which tracks pending requests
-//! and routes incoming responses to their corresponding waiters via oneshot channels.
-//!
-//! # Architecture (ADR-0015)
-//!
-//! The ResponseRouter enables non-blocking response waiting:
-//! - Before sending a request, register it via `register(id)` to get a oneshot Receiver
-//! - The Reader Task calls `route(response)` when a response arrives
-//! - The original requester awaits on the Receiver without holding any Mutex
+//! Tracks pending requests and routes incoming responses to their waiters via
+//! oneshot channels (ADR-0015). A requester registers before sending, then awaits
+//! the receiver without holding any Mutex; the Reader Task calls `route()` on arrival.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,29 +27,11 @@ pub(crate) enum RouteResult {
     NotFound,
 }
 
-/// Routes responses to pending requests via oneshot channels.
+/// Thread-safe router that delivers each downstream response to a registered
+/// oneshot waiter. Single Reader Task calls `route()` per incoming message.
 ///
-/// Thread-safe router that tracks in-flight requests and delivers responses
-/// to their waiters. Designed for use with a single Reader Task that calls
-/// `route()` for each incoming response.
-///
-/// # Cancel Forwarding Support
-///
-/// The router also maintains a bidirectional mapping between upstream and downstream
-/// request IDs via `upstream_to_downstream` and `downstream_to_upstream`. This enables
-/// O(1) $/cancelRequest forwarding and cleanup:
-/// - When a request is registered with an upstream ID, both mappings are stored
-/// - When a cancel notification arrives, `lookup_downstream_id()` translates it in O(1)
-/// - When a request completes (via `route()` or `remove()`), cleanup is O(1)
-///
-/// # Usage
-///
-/// ```ignore
-/// let router = ResponseRouter::new();
-/// let rx = router.register(request_id);  // Before sending request
-/// // ... send request to downstream server ...
-/// let response = rx.await?;  // Wait without holding Mutex
-/// ```
+/// Also keeps bidirectional `upstream ↔ downstream` ID maps so cancel
+/// forwarding (translate, send, cleanup) is O(1) at register, route, and remove.
 pub(crate) struct ResponseRouter {
     /// All router state protected by a single mutex to avoid lock contention
     /// and simplify reasoning about thread safety.
@@ -103,15 +79,9 @@ impl ResponseRouter {
 
     /// Register a pending request with upstream ID mapping for cancel forwarding.
     ///
-    /// Like `register()`, but also stores a mapping from the upstream (client) request ID
-    /// to the downstream (language server) request ID. This enables $/cancelRequest
-    /// forwarding by translating upstream IDs to downstream IDs.
-    ///
-    /// # Arguments
-    /// * `downstream_id` - The request ID used for the downstream language server
-    /// * `upstream_id` - The original request ID from the upstream client (None for internal requests)
-    ///
-    /// Returns `None` if a request with this downstream ID is already pending.
+    /// Like `register()`, but also stores an upstream→downstream ID mapping so
+    /// `$/cancelRequest` can be translated and forwarded. `upstream_id` is `None`
+    /// for internal requests. Returns `None` if the downstream ID is already pending.
     pub(crate) fn register_with_upstream(
         &self,
         downstream_id: RequestId,
@@ -141,12 +111,11 @@ impl ResponseRouter {
         Some(rx)
     }
 
-    /// Look up the downstream request ID for an upstream request ID.
+    /// Look up the downstream request ID for an upstream request ID (O(1)).
     ///
-    /// Used by $/cancelRequest forwarding to translate the client's request ID
-    /// to the language server's request ID. O(1) lookup.
-    ///
-    /// Returns `None` if no mapping exists (request not found or already completed).
+    /// Used by `$/cancelRequest` forwarding to translate the client's request ID
+    /// to the language server's. Does NOT remove the entry — a cancelled request
+    /// must still receive its response.
     pub(crate) fn lookup_downstream_id(&self, upstream_id: &UpstreamId) -> Option<RequestId> {
         let state = self
             .state
@@ -155,17 +124,8 @@ impl ResponseRouter {
         state.upstream_to_downstream.get(upstream_id).copied()
     }
 
-    /// Route a response to its pending request.
-    ///
-    /// Extracts the request ID from the response and sends it to the
-    /// corresponding waiter. Returns a `RouteResult` indicating what happened.
-    ///
-    /// Also cleans up the bidirectional cancel map entries for this request ID in O(1).
-    ///
-    /// # Returns
-    /// - `RouteResult::Delivered` - Response was delivered to the waiting receiver
-    /// - `RouteResult::ReceiverDropped` - ID was found but receiver was dropped (requester cancelled)
-    /// - `RouteResult::NotFound` - No pending request for this ID
+    /// Route a response to its pending request, also cleaning up both cancel-map
+    /// directions for this ID in O(1).
     pub(crate) fn route(&self, response: serde_json::Value) -> RouteResult {
         let id = match RequestId::from_json(&response) {
             Some(id) => id,
@@ -190,12 +150,9 @@ impl ResponseRouter {
         }
     }
 
-    /// Remove bidirectional cancel map entries for a downstream request ID.
+    /// Remove both cancel-map directions for a downstream request ID (O(1)).
     ///
-    /// O(1) cleanup: looks up upstream ID via downstream_to_upstream, then removes
-    /// both directions.
-    ///
-    /// Note: This is an internal helper that requires the caller to hold the lock.
+    /// Caller must hold the lock.
     fn remove_cancel_mapping_inner(state: &mut ResponseRouterState, downstream_id: RequestId) {
         if let Some(upstream_id) = state.downstream_to_upstream.remove(&downstream_id) {
             state.upstream_to_downstream.remove(&upstream_id);
@@ -234,20 +191,13 @@ impl ResponseRouter {
 
     /// Fail a single pending request with an error response.
     ///
-    /// Called when a write fails or the connection is closing (ADR-0015). The request
-    /// is removed from pending and the waiter receives an error response.
+    /// Called when a write fails or the connection is closing (ADR-0015). Uses
+    /// `REQUEST_FAILED` (-32803) for queue/write errors, distinct from the
+    /// `INTERNAL_ERROR` (-32603) `fail_all()` uses for connection failures.
     ///
-    /// Uses `REQUEST_FAILED` (-32803) for queue/write errors, which is distinct
-    /// from `INTERNAL_ERROR` (-32603) used by `fail_all()` for connection failures.
-    ///
-    /// Returns `true` if the request was found and failed, `false` if not pending.
-    ///
-    /// # Idempotency
-    ///
-    /// This method is idempotent: calling it multiple times for the same request ID
-    /// is safe and will simply return `false` on subsequent calls. This property is
-    /// critical for avoiding double-cleanup races between sender cleanup and writer
-    /// task cleanup (see ADR-0015 Appendix A).
+    /// Idempotent: subsequent calls for the same ID return `false`. This is critical
+    /// for avoiding double-cleanup races between sender and writer task cleanup
+    /// (ADR-0015 Appendix A).
     pub(crate) fn fail_request(&self, id: RequestId, reason: &str) -> bool {
         let mut state = self
             .state
@@ -279,26 +229,14 @@ impl ResponseRouter {
         }
     }
 
-    /// Fail all pending requests with an internal error response.
+    /// Fail every pending request with an internal-error response (called on
+    /// reader panic, liveness timeout, …) so each waiter sees a response per
+    /// LSP guarantee, and clear both cancel-map directions.
     ///
-    /// Called when the connection fails (e.g., reader task panic, liveness timeout)
-    /// to ensure all waiters receive a response per LSP guarantee.
-    ///
-    /// # Cancel Map Cleanup
-    ///
-    /// This method clears both cancel map directions (upstream_to_downstream and
-    /// downstream_to_upstream) since all requests are being completed.
-    ///
-    /// Note: The `LanguageServerPool.upstream_request_registry` (which maps upstream
-    /// ID -> language) is NOT cleared by this method because:
-    /// 1. The ResponseRouter doesn't have access to the pool
-    /// 2. Stale entries are harmless - `forward_cancel_by_upstream_id()` checks
-    ///    connection state before forwarding, so stale entries fail gracefully
-    /// 3. Entries are cleaned up when new requests reuse the same upstream IDs
-    ///
-    /// This is an intentional design tradeoff: keeping the registry separate from
-    /// the per-connection router simplifies the architecture at the cost of
-    /// temporarily stale entries that have no runtime impact.
+    /// `LanguageServerPool.upstream_request_registry` is intentionally not
+    /// touched here — the router can't see the pool, and stale entries are
+    /// harmless because `forward_cancel_by_upstream_id` gates on connection
+    /// state and entries get overwritten when the next upstream ID reuses them.
     pub(crate) fn fail_all(&self, error_message: &str) {
         let mut state = self.state.lock().recover_poison("ResponseRouter::fail_all");
         let entries: Vec<_> = state.pending.drain().collect();

@@ -1,23 +1,10 @@
-//! Request ID capture for bridging upstream request IDs to downstream servers.
+//! Tower middleware that stores each incoming LSP request ID in task-local
+//! storage so downstream bridge requests can reuse the upstream ID (ADR-0016).
 //!
-//! This module provides a tower Service wrapper that captures the request ID
-//! from incoming LSP requests and makes it available via task-local storage.
-//! This enables downstream bridge requests to use the same ID as the upstream
-//! client per ADR-0016 (Server Pool Coordination).
-//!
-//! # Cancel Forwarding
-//!
-//! The middleware also intercepts `$/cancelRequest` notifications and forwards
-//! them to downstream language servers via the `CancelForwarder`. This ensures
-//! that when a client cancels a request, the cancel is propagated to the
-//! downstream server that is processing it.
-//!
-//! # Upstream Cancel Notification
-//!
-//! Handlers can subscribe to cancel notifications for their request ID using
-//! `CancelForwarder::subscribe()`. When a `$/cancelRequest` arrives for that ID,
-//! the subscriber is notified via a oneshot channel. This enables handlers to
-//! immediately abort their work and return `RequestCancelled` error to the client.
+//! Also intercepts `$/cancelRequest`: forwards it to downstream servers via
+//! `CancelForwarder`, and notifies any handler that subscribed with
+//! `CancelForwarder::subscribe()` via a oneshot so it can abort and return
+//! `RequestCancelled`.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -51,23 +38,10 @@ tokio::task_local! {
 /// - The sender is dropped (e.g., the request completes normally)
 pub(crate) type CancelReceiver = oneshot::Receiver<()>;
 
-/// Error returned when attempting to subscribe to a request ID that already has a subscriber.
-///
-/// This error indicates a programming error where the same request ID was subscribed twice
-/// without unsubscribing first. Each request ID can only have one active subscriber.
-///
-/// # Future Enhancement
-///
-/// If multiple subscribers per request ID become necessary (e.g., multiple handlers
-/// processing the same request), refactor the registry from:
-/// ```ignore
-/// HashMap<UpstreamId, oneshot::Sender<()>>
-/// ```
-/// to:
-/// ```ignore
-/// HashMap<UpstreamId, Vec<oneshot::Sender<()>>>
-/// ```
-/// and update `notify_cancel()` to iterate and send to all subscribers.
+/// Returned when a request ID already has an active subscriber: each ID
+/// supports only one. Hitting this is a programming error (subscribed twice
+/// without unsubscribing). To allow multiple, switch the registry to
+/// `HashMap<UpstreamId, Vec<oneshot::Sender<()>>>` and iterate in `notify_cancel`.
 #[derive(Debug, Clone)]
 pub(crate) struct AlreadySubscribedError(pub(crate) UpstreamId);
 
@@ -120,58 +94,19 @@ impl CancelForwarder {
         }
     }
 
-    /// Forward a cancel request to the downstream server.
-    ///
-    /// Looks up the language from the upstream request registry and forwards
-    /// the cancel notification to the appropriate downstream server.
-    ///
-    /// Supports both numeric and string request IDs per LSP spec.
-    ///
-    /// # Returns
-    /// * `Ok(())` - Cancel was forwarded, or silently dropped if not forwardable
-    ///   (e.g., upstream ID not in registry, connection not ready)
-    /// * `Err(e)` - I/O error occurred while writing to the downstream server
-    ///
-    /// Per LSP spec, `$/cancelRequest` uses best-effort semantics, so most
-    /// "not forwardable" cases return `Ok(())` rather than an error.
+    /// Forward a cancel request to the downstream server(s) for `upstream_id`.
+    /// Per LSP best-effort semantics, "not forwardable" cases (ID not in registry,
+    /// connection not ready) return `Ok(())`; only real I/O write errors are `Err`.
     pub(crate) async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
         self.pool.forward_cancel_by_upstream_id(upstream_id).await
     }
 
-    /// Subscribe to cancel notifications for a specific upstream request ID.
+    /// Return a oneshot receiver that fires when `$/cancelRequest` arrives for
+    /// `upstream_id`. Race it against the request future with `tokio::select!`.
     ///
-    /// Returns a receiver that completes when a `$/cancelRequest` notification
-    /// arrives for this request ID. The receiver can be used with `tokio::select!`
-    /// to race between request completion and cancellation.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let cancel_rx = cancel_forwarder.subscribe(upstream_id)?;
-    /// tokio::select! {
-    ///     biased;
-    ///     _ = cancel_rx => {
-    ///         // Request was cancelled - abort and return error
-    ///         return Err(Error::request_cancelled());
-    ///     }
-    ///     result = do_work() => {
-    ///         // Normal completion
-    ///         return result;
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AlreadySubscribedError`] if a subscriber already exists for this request ID.
-    /// This prevents silent overwrites that would leave the previous receiver orphaned.
-    ///
-    /// # Notes
-    ///
-    /// - Only one subscriber is supported per request ID. See [`AlreadySubscribedError`]
-    ///   documentation for future enhancement notes on supporting multiple subscribers.
-    /// - The subscriber is automatically removed when the cancel is received or
-    ///   when `unsubscribe()` is called.
+    /// Returns [`AlreadySubscribedError`] if a subscriber is already registered
+    /// — we reject rather than overwrite so the prior receiver isn't orphaned.
+    /// The entry is removed automatically on cancel delivery or `unsubscribe()`.
     pub(crate) fn subscribe(
         &self,
         upstream_id: UpstreamId,
@@ -192,14 +127,10 @@ impl CancelForwarder {
         Ok(rx)
     }
 
-    /// Unsubscribe from cancel notifications for a specific upstream request ID.
-    ///
-    /// This should be called when the request completes normally to clean up
-    /// the subscriber entry. If not called, the entry is cleaned up when:
-    /// - A cancel notification arrives (subscriber is notified and removed)
-    /// - The `CancelForwarder` is dropped
-    ///
-    /// Calling this after receiving a cancel notification is harmless (no-op).
+    /// Unsubscribe from cancel notifications for an upstream request ID, called on
+    /// normal completion to drop the subscriber entry. Otherwise the entry is
+    /// cleaned up on cancel delivery or when the `CancelForwarder` is dropped;
+    /// calling it after a cancel notification is a harmless no-op.
     pub(crate) fn unsubscribe(&self, upstream_id: &UpstreamId) {
         let mut subscribers = self
             .subscribers
@@ -208,14 +139,9 @@ impl CancelForwarder {
         subscribers.remove(upstream_id);
     }
 
-    /// Notify a subscriber that their request was cancelled.
-    ///
-    /// Called by `RequestIdCapture` when a `$/cancelRequest` notification arrives.
-    /// If a subscriber exists for this ID, they are notified and removed from the registry.
-    ///
-    /// # Returns
-    /// - `true` if a subscriber was notified
-    /// - `false` if no subscriber existed for this ID
+    /// Notify a subscriber that their request was cancelled, returning whether one
+    /// existed. Called by `RequestIdCapture` on `$/cancelRequest`; a matched
+    /// subscriber is notified and removed from the registry.
     pub(crate) fn notify_cancel(&self, upstream_id: &UpstreamId) -> bool {
         let sender = {
             let mut subscribers = self
@@ -234,25 +160,9 @@ impl CancelForwarder {
     }
 }
 
-/// RAII guard that automatically unsubscribes from cancel notifications on drop.
-///
-/// This guard automatically calls `unsubscribe()` when dropped, preventing
-/// subscription leaks on early return paths. The unsubscribe is idempotent,
-/// so it's safe to call even after the subscription was already cleaned up
-/// by cancel notification.
-///
-/// # Example
-///
-/// ```ignore
-/// let (cancel_rx, _guard) = match cancel_forwarder.subscribe(upstream_id.clone()) {
-///     Ok(rx) => {
-///         let guard = CancelSubscriptionGuard::new(cancel_forwarder, upstream_id);
-///         (Some(rx), Some(guard))
-///     }
-///     Err(_) => (None, None),
-/// };
-/// // _guard is dropped here, automatically unsubscribing
-/// ```
+/// RAII: drop calls `unsubscribe()`, so an early return on a code path that
+/// took a cancel subscription doesn't leak it. `unsubscribe()` is idempotent,
+/// so cancel-then-drop is safe.
 pub(crate) struct CancelSubscriptionGuard<'a> {
     cancel_forwarder: &'a CancelForwarder,
     upstream_id: UpstreamId,

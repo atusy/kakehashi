@@ -67,15 +67,6 @@ pub struct QueryInstallResult {
 }
 
 /// Download and install query files for a language.
-///
-/// # Arguments
-/// * `language` - The language to install queries for (e.g., "lua", "rust")
-/// * `data_dir` - The base data directory for kakehashi
-/// * `force` - Whether to overwrite existing queries
-///
-/// # Returns
-/// * `Ok(QueryInstallResult)` - Installation succeeded
-/// * `Err(QueryInstallError)` - Installation failed
 pub fn install_queries(
     language: &str,
     data_dir: &Path,

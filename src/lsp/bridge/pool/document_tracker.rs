@@ -31,24 +31,15 @@ pub(crate) struct OpenedVirtualDoc {
     pub(crate) server_name: String,
 }
 
-/// Tracks virtual document state for downstream language servers.
+/// Per-server virtual document state: versions (for `didChange`),
+/// host→virtual mappings (for `didClose` propagation), and opened state
+/// (for LSP spec compliance, ADR-0015).
 ///
-/// Manages three related concerns:
-/// - Document versions (for didChange notifications)
-/// - Host-to-virtual mappings (for didClose propagation)
-/// - Opened state (for LSP spec compliance - ADR-0015)
-///
-/// # Server-Name-Based Keying
-///
-/// Document versions are keyed by `server_name`, not by language. This enables
-/// process sharing for related languages (e.g., ts and tsx sharing one tsgo server).
-/// VirtualDocumentUri still uses `injection_language` for URI construction (file extension).
-///
-/// # Lock Strategy
-///
-/// Each Mutex (`document_versions`, `host_to_virtual`) is acquired and released
-/// independently — never held simultaneously. The DashMap `opened_documents`
-/// provides lock-free concurrent reads with internal sharded locking.
+/// Keyed by `server_name` (not language) so related languages can share one
+/// process (e.g. ts/tsx → tsgo); the URI itself still uses `injection_language`
+/// for the file extension. The two `Mutex`es are acquired independently —
+/// never held simultaneously — and `opened_documents` is a `DashMap` whose
+/// internal sharding lets reads contend per-shard instead of on one global lock.
 pub(crate) struct DocumentTracker {
     /// Map of server_name -> (virtual document URI -> version).
     ///
@@ -63,7 +54,7 @@ pub(crate) struct DocumentTracker {
     /// Incremented at claim time (`try_claim_for_open`), before the actual didOpen send.
     /// Rolled back via `unclaim_document` if the send fails.
     /// Reference-counted: multiple servers may open the same virtual URI.
-    /// Uses DashMap for lock-free concurrent reads with internal sharded locking (ADR-0015).
+    /// Uses DashMap for concurrent reads via internal sharded locking (ADR-0015).
     opened_documents: DashMap<String, usize>,
     /// Reverse index: virtual URI string → server names that have this doc open.
     ///
@@ -164,23 +155,14 @@ impl DocumentTracker {
         self.remove_from_reverse_index(&uri_string, server_name);
     }
 
-    /// Register a document's host_to_virtual mapping.
+    /// Record the host→virtual mapping, bump opened ref-count, and seed the
+    /// version. Called BEFORE the `didOpen` send in `ensure_document_opened`
+    /// so `close_host_document` can find the doc even if the task is aborted
+    /// in between; callers roll back via `unregister_virtual_doc` on send fail.
     ///
-    /// Called BEFORE the didOpen send in `ensure_document_opened`, so that
-    /// `close_host_document` can find the document even if the task is
-    /// aborted after registration. On send failure, the caller rolls back
-    /// via `unregister_virtual_doc()`.
-    ///
-    /// Records tracking state:
-    /// - Document version (safety net via `or_insert` — primary initialization
-    ///   happens in `try_claim_for_open()` to close the race window)
-    /// - Host-to-virtual mapping (with dedup check for idempotency)
-    /// - Opened state (reference count increment)
-    ///
-    /// Note: Both `opened_documents` `or_insert(1)` and version `or_insert(1)` are
-    /// safety nets. `try_claim_for_open()` already performs both operations.
-    /// They are kept here for test helpers that call `register_opened_document`
-    /// directly without going through the claim path.
+    /// The version and opened-state `or_insert(1)`s are safety nets:
+    /// `try_claim_for_open` already initialises both. They exist so test
+    /// helpers can call this directly without going through the claim path.
     pub(super) async fn register_opened_document(
         &self,
         host_uri: &Url,
@@ -228,12 +210,7 @@ impl DocumentTracker {
 
     /// Increment the version of a virtual document and return the new version.
     ///
-    /// Returns None if the document has not been opened.
-    ///
-    /// # Arguments
-    ///
-    /// * `virtual_uri` - The virtual document URI
-    /// * `server_name` - The server name for HashMap lookup
+    /// Returns `None` if the document has not been opened.
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -251,20 +228,11 @@ impl DocumentTracker {
         None
     }
 
-    /// Remove a document from all tracking state.
+    /// Remove a document from `document_versions` and `opened_documents`.
     ///
-    /// Removes the document from:
-    /// - `document_versions` (version tracking for didChange)
-    /// - `opened_documents` (opened state for LSP compliance)
-    ///
-    /// Note: Does NOT remove from `host_to_virtual`. That cleanup is handled
+    /// Does NOT remove from `host_to_virtual` — that cleanup is handled
     /// separately by `remove_host_virtual_docs()` or `remove_matching_virtual_docs()`,
-    /// which are called before this method in the close flow.
-    ///
-    /// # Arguments
-    ///
-    /// * `virtual_uri` - The virtual document URI
-    /// * `server_name` - The server name for HashMap lookup
+    /// which run before this method in the close flow.
     pub(crate) async fn untrack_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
@@ -323,15 +291,9 @@ impl DocumentTracker {
 
     /// Take virtual documents matching the given ULIDs, removing them from tracking.
     ///
-    /// This is atomic: lookup and removal happen in a single lock acquisition,
-    /// preventing race conditions with concurrent didOpen requests.
-    ///
-    /// Returns the removed documents (for sending didClose). Documents that
-    /// were never opened (not in host_to_virtual) are not returned.
-    ///
-    /// # Arguments
-    /// * `host_uri` - The host document URI
-    /// * `invalidated_ulids` - ULIDs to match against virtual document URIs
+    /// Atomic: lookup and removal happen in a single lock acquisition, preventing
+    /// races with concurrent didOpen requests. Returns the removed documents (for
+    /// sending didClose); documents never opened are not returned.
     pub(crate) async fn remove_matching_virtual_docs(
         &self,
         host_uri: &Url,

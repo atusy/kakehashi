@@ -101,15 +101,12 @@ pub(super) async fn apply_shared_settings(
         .await;
 }
 
-/// Convert url::Url to ls_types::Uri
+/// Convert url::Url to ls_types::Uri, the reverse conversion for bridge protocol
+/// functions that need ls_types::Uri while internal storage holds url::Url.
 ///
-/// This is the reverse conversion, needed when calling bridge protocol functions
-/// that expect ls_types::Uri but we have url::Url from internal storage.
-///
-/// # Errors
-/// Returns `LspError::Internal` if conversion fails. Both `url::Url` and
-/// `fluent_uri::Uri` implement RFC 3986, so failure indicates an edge case
-/// difference between the URI parsers (should be extremely rare in practice).
+/// Both `url::Url` and `fluent_uri::Uri` implement RFC 3986, so an `Err`
+/// (`LspError::Internal`) indicates an edge-case parser difference and should be
+/// extremely rare.
 pub(crate) fn url_to_uri(url: &Url) -> std::result::Result<Uri, crate::error::LspError> {
     use std::str::FromStr;
     Uri::from_str(url.as_str()).map_err(|e| {

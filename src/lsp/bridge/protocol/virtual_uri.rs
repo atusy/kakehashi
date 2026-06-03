@@ -37,24 +37,13 @@ pub(crate) struct VirtualDocumentUri {
 }
 
 impl VirtualDocumentUri {
-    /// Create a new virtual document URI for an injection region.
+    /// Build a virtual document URI for an injection region.
     ///
-    /// # Arguments
-    /// * `host_uri` - The URI of the host document (e.g., markdown file)
-    /// * `language` - The injection language (e.g., "lua", "python"). Must not be empty.
-    /// * `region_id` - Unique identifier for this injection region within the host. Must not be empty.
-    ///
-    /// # Panics (debug builds only)
-    /// Panics if `language` or `region_id` is empty. These are programming errors
-    /// as callers should always provide valid identifiers.
-    ///
-    /// # Upstream Guarantees
-    /// In practice, these parameters are guaranteed valid by upstream sources:
-    /// - `region_id` comes from ULID generation (26-char alphanumeric strings)
-    /// - `language` comes from Tree-sitter injection queries (non-empty language names)
-    ///
-    /// In release builds, invalid inputs are accepted without validation to avoid
-    /// runtime overhead. Unknown languages produce `.txt` extensions as a safe fallback.
+    /// `language` and `region_id` must be non-empty: callers always have valid
+    /// values (ULID for `region_id`, Tree-sitter query name for `language`), so
+    /// emptiness is a programming error. Debug builds assert; release builds
+    /// accept invalid input (no per-call validation overhead) and unknown
+    /// languages fall back to `.txt` for the extension.
     pub(crate) fn new(
         host_uri: &tower_lsp_server::ls_types::Uri,
         language: &str,
@@ -98,15 +87,10 @@ impl VirtualDocumentUri {
 
     /// Check if a URI string represents a virtual document.
     ///
-    /// Virtual document URIs have the filename pattern `kakehashi-virtual-uri-{region_id}.{ext}`.
-    /// This is used to distinguish virtual URIs from real file URIs in responses.
-    ///
-    /// Checks the filename (not path) for the `kakehashi-virtual-uri-` prefix with at least
-    /// one `.` for the extension. The prefix is distinctive enough to avoid false positives
-    /// with real files.
-    ///
-    /// Uses proper URL parsing to handle edge cases like query strings containing slashes
-    /// (e.g., `?path=/foo/bar`) which would confuse naive string splitting.
+    /// Matches the filename (not the path) against `kakehashi-virtual-uri-{region_id}.{ext}`;
+    /// the distinctive prefix plus a non-empty extension avoids false positives with real
+    /// files. Uses URL parsing rather than string splitting so query strings containing
+    /// slashes (e.g. `?path=/foo/bar`) don't confuse filename extraction.
     pub(crate) fn is_virtual_uri(uri: &str) -> bool {
         // Parse URI using the url crate for proper RFC 3986 handling
         let Ok(url) = url::Url::parse(uri) else {
@@ -127,23 +111,15 @@ impl VirtualDocumentUri {
                 .is_some_and(|(_name, ext)| !ext.is_empty())
     }
 
-    /// Convert to a URI string.
-    ///
-    /// Format: `file:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`
-    ///
-    /// Uses file:// scheme placing the virtual file in the same directory as the host
-    /// document. This enables downstream language servers to:
-    /// - Resolve relative imports (e.g., `from .utils import foo`)
-    /// - Find project configuration files (pyproject.toml, tsconfig.json, etc.)
-    ///
-    /// The `kakehashi-virtual-uri-` prefix is distinctive and unlikely to conflict with
-    /// real files. The region_id (ULID) provides global uniqueness.
-    ///
-    /// The file extension is derived from the language to help downstream language servers
-    /// recognize the file type (e.g., lua-language-server needs `.lua` extension).
-    ///
-    /// The region_id is percent-encoded by the url crate to ensure URI-safe characters.
-    /// While ULIDs only contain alphanumeric characters, this provides defense-in-depth.
+    /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,
+    /// preserving the host URI's scheme (file://, https://, …) and directory so
+    /// downstream servers can resolve relative imports and discover project
+    /// configs (pyproject.toml, tsconfig.json, …). Cannot-be-a-base host schemes
+    /// (untitled:, mailto:, data:) fall back to `kakehashi:///virtual/{encoded_host}/…`.
+    /// The distinctive prefix avoids real-file collisions; the ULID `region_id`
+    /// gives global uniqueness and the language-derived extension lets servers
+    /// like lua-language-server recognize the file type. The url crate
+    /// percent-encodes `region_id` (defense-in-depth; ULIDs are alphanumeric).
     pub(crate) fn to_uri_string(&self) -> String {
         let extension = Self::language_to_extension(&self.language);
         let virtual_filename = format!("{VIRTUAL_URI_PREFIX}{}.{extension}", self.region_id);
@@ -173,16 +149,11 @@ impl VirtualDocumentUri {
         format!("kakehashi:///virtual/{encoded_host}/{virtual_filename}")
     }
 
-    /// Map language name to file extension.
+    /// Map language name to file extension (downstream servers like
+    /// lua-language-server key off the extension to enable language features).
     ///
-    /// Downstream language servers (e.g., lua-language-server) often use file extension
-    /// to determine file type and enable appropriate language features.
-    ///
-    /// # Returns
-    /// The file extension (without leading dot) for the given language.
-    /// For unknown languages, returns the language name itself as the extension,
-    /// which works for many languages where the name matches the extension
-    /// (e.g., "zig" → ".zig", "nix" → ".nix").
+    /// Unknown languages fall back to the language name itself, which works where
+    /// name matches extension (e.g. "zig" → ".zig", "nix" → ".nix").
     fn language_to_extension(language: &str) -> &str {
         match language {
             "python" => "py",

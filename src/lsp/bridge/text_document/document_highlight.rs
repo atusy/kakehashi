@@ -87,12 +87,8 @@ fn build_document_highlight_request(
 
 /// Transform a document highlight response from virtual to host document coordinates.
 ///
-/// DocumentHighlight responses are arrays of items with range and optional kind.
-/// This function transforms each range using the region offset.
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `offset` - The region offset for coordinate translation
+/// DocumentHighlight responses are arrays of items with range and optional kind;
+/// each range is translated by the region offset.
 fn transform_document_highlight_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

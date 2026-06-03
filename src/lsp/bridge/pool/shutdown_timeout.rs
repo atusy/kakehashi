@@ -5,25 +5,10 @@
 
 use std::time::Duration;
 
-/// Global shutdown timeout for all connections (ADR-0018 Tier 3: 5-15s).
-///
-/// This is the single ceiling for the entire shutdown sequence across all
-/// connections. Per ADR-0017, all connections shut down in parallel under
-/// this global timeout. When the timeout expires, remaining connections
-/// receive force_kill_all() with SIGTERM->SIGKILL escalation.
-///
-/// # Valid Range
-///
-/// - Minimum: 5 seconds (allows graceful LSP handshake for fast servers)
-/// - Maximum: 15 seconds (bounds user wait time during shutdown)
-/// - Default: 10 seconds (balance between graceful exit and user experience)
-///
-/// # Usage
-///
-/// ```ignore
-/// let timeout = GlobalShutdownTimeout::new(Duration::from_secs(10))?;
-/// pool.shutdown_all_with_timeout(timeout).await;
-/// ```
+/// Tier-3 global shutdown ceiling for all connections (ADR-0018, 5–15s,
+/// default 10s). Parallel shutdown under one timeout (ADR-0017); on expiry,
+/// survivors get `force_kill_all` (SIGTERM→SIGKILL). The 5s floor lets fast
+/// servers finish the LSP handshake; the 15s ceiling caps user wait time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GlobalShutdownTimeout(Duration);
 
@@ -39,30 +24,12 @@ impl GlobalShutdownTimeout {
     #[cfg(test)]
     const MAX_SECS: u64 = 15;
 
-    /// Create a new GlobalShutdownTimeout with validation.
+    /// Construct with range check; production currently uses `default()` and
+    /// this only runs in tests until the timeout is exposed in config.
     ///
-    /// # Arguments
-    /// * `duration` - The timeout duration (must be 5-15 seconds)
-    ///
-    /// # Returns
-    /// - `Ok(GlobalShutdownTimeout)` if duration is within valid range
-    /// - `Err(io::Error)` with InvalidInput kind if duration is out of range
-    ///
-    /// # Boundary Behavior
-    ///
-    /// Sub-second precision is supported within the valid range:
-    /// - `5.0s` to `15.0s` inclusive are valid
-    /// - `4.999s` is rejected (floor is 5 whole seconds)
-    /// - `15.001s` is rejected (ceiling is exactly 15 seconds)
-    /// - `5.5s`, `10.123s`, etc. are accepted
-    ///
-    /// This asymmetry is intentional: the minimum ensures adequate time for
-    /// LSP handshake (5 whole seconds), while the maximum strictly bounds
-    /// user wait time (not even 1ms over 15s).
-    ///
-    /// # Note
-    /// Currently only used in tests. Production code uses `default()`.
-    /// This method will be used when configurable timeout is exposed via config.
+    /// Asymmetric bounds: lower bound uses whole-second floor (accept ≥5.0s,
+    /// reject 4.999s) so the LSP handshake always has at least 5s; upper bound
+    /// is strict (reject 15.001s) so user wait time can't drift past 15s.
     #[cfg(test)]
     pub(crate) fn new(duration: Duration) -> std::io::Result<Self> {
         let secs = duration.as_secs();

@@ -64,17 +64,6 @@ pub(super) enum CaptureResult {
 ///
 /// Looks up the capture name in user-configured mappings (filetype-specific,
 /// then wildcard), and falls back to the built-in legend.
-///
-/// # Arguments
-/// * `capture_name` - The original capture name from the tree-sitter query
-/// * `filetype` - The filetype of the document being processed
-/// * `capture_mappings` - The full capture mappings configuration
-///
-/// # Returns
-/// - `CaptureResult::Mapped(name)` for known token types (base type in LEGEND_TYPES)
-/// - `CaptureResult::Transparent` for unknown types — breakpoint-only tokens
-/// - `CaptureResult::NoneCapture` for `@none` captures — handled by @none pre-processing
-/// - `CaptureResult::Suppressed` when user explicitly maps a capture to `""` (suppress entirely)
 pub(super) fn resolve_capture(
     capture_name: &str,
     filetype: Option<&str>,
@@ -133,14 +122,10 @@ pub(super) fn resolve_capture(
     }
 }
 
-/// Map capture names from tree-sitter queries to LSP semantic token types and modifiers
+/// Map a capture name to LSP semantic token type and modifier indices.
 ///
-/// Capture names can be in the format "type.modifier1.modifier2" where:
-/// - The first part is the token type (e.g., "variable", "function")
-/// - Following parts are modifiers (e.g., "readonly", "defaultLibrary")
-///
-/// Returns `None` for unknown token types (not in LEGEND_TYPES).
-/// Unknown modifiers are ignored.
+/// Names follow `type.modifier1.modifier2`. Returns `None` for unknown types
+/// (not in LEGEND_TYPES); unknown modifiers are silently ignored.
 pub(super) fn map_capture_to_token_type_and_modifiers(capture_name: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = capture_name.split('.').collect();
     let token_type_name = parts.first().copied().filter(|s| !s.is_empty())?;

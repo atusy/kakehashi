@@ -80,15 +80,10 @@ impl LanguageServerPool {
 
 /// Build a JSON-RPC inlay hint request for a downstream language server.
 ///
-/// Unlike position-based requests (hover, definition, etc.), InlayHintParams
-/// has a range field that specifies the visible document range for which
-/// inlay hints should be computed. This range needs to be translated from
-/// host to virtual coordinates.
-///
-/// # Defensive Arithmetic
-///
-/// Uses `saturating_sub` for line translation to prevent panic on underflow during
-/// race conditions when document edits invalidate region data.
+/// Unlike position-based requests, `InlayHintParams` carries a range (the visible
+/// document range), translated here from host to virtual coordinates. Line
+/// translation uses `saturating_sub` to avoid panicking on underflow when a
+/// concurrent edit has invalidated the region data.
 fn build_inlay_hint_request(
     virtual_uri: &VirtualDocumentUri,
     host_range: Range,
@@ -109,24 +104,11 @@ fn build_inlay_hint_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/inlayHint", params)
 }
 
-/// Transform an inlay hint response from virtual to host document coordinates.
-///
-/// InlayHint responses are arrays of items where each hint has:
-/// - position: The position where the hint should appear (needs transformation)
-/// - label: The hint text (string or InlayHintLabelPart[] with optional location)
-/// - textEdits: Optional array of TextEdit (needs transformation)
-///
-/// When label is an array of InlayHintLabelPart, each part may have a location field
-/// that needs URI and range transformation:
-/// 1. **Real file URI** → preserved as-is
-/// 2. **Same virtual URI as request** → transform coordinates, replace URI with host URI
-/// 3. **Different virtual URI** (cross-region) → label part filtered out
-///
-/// # Arguments
-/// * `response` - The JSON-RPC response from the downstream language server
-/// * `request_virtual_uri` - The virtual URI from the request
-/// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `offset` - The region offset for coordinate translation
+/// Translate inlay-hint response items from virtual to host coordinates:
+/// `position` and any `textEdits` go through `offset`. For `InlayHintLabelPart`
+/// labels, each part's `location` is rewritten with the same URI filter as
+/// other handlers — keep real files, translate same-virtual-URI matches and
+/// swap to the host URI, drop cross-region virtual URIs.
 fn transform_inlay_hint_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,

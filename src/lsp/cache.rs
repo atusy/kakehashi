@@ -1,38 +1,11 @@
-//! Cache coordination for semantic token operations.
+//! `CacheCoordinator` unifies the four semantic-token caches under one API:
+//! `SemanticTokenCache`, `InjectionMap`, `InjectionTokenCache`, and
+//! `SemanticRequestTracker` (in-flight cancellation).
 //!
-//! This module provides `CacheCoordinator` which unifies four cache structures
-//! under a single coherent API with clear document lifecycle management:
-//!
-//! - `SemanticTokenCache` - Document-level token caching by URI with result_id validation
-//! - `InjectionMap` - Tracks injection regions per document using interval trees
-//! - `InjectionTokenCache` - Per-injection semantic tokens by (URI, region_id)
-//! - `SemanticRequestTracker` - Cancellation support for in-flight requests
-//!
-//! ## Architecture
-//!
-//! ```text
-//!                     CacheCoordinator
-//!                           │
-//!     ┌─────────────────────┼─────────────────────┐
-//!     │         │           │          │          │
-//!     ▼         ▼           ▼          ▼          ▼
-//! Semantic   Injection   Injection   Request    Document
-//! Cache      Map         TokenCache  Tracker    Lifecycle
-//! ```
-//!
-//! The coordinator provides:
-//! - Document lifecycle management (remove_document for did_close)
-//! - Edit handling (invalidate_for_edits for injection regions)
-//! - Injection map operations (populate, get, find_overlapping)
-//! - Semantic token operations (get, store)
-//! - Request tracking (start, is_active, finish, cancel)
-//!
-//! ## Semantic Token Cache Lifecycle
-//!
-//! The semantic token cache is NOT invalidated on `didChange`. This is intentional:
-//! - Cached tokens are needed for `semanticTokens/full/delta` requests
-//! - The `result_id` validation at lookup ensures stale tokens aren't returned
-//! - Invalidating on edit would prevent delta calculations entirely
+//! The semantic-token cache is intentionally **not** invalidated on `didChange`
+//! — `semanticTokens/full/delta` needs the previous version, and `result_id`
+//! validation at lookup time rejects stale hits. Dropping it on every edit
+//! would disable delta calculations entirely.
 
 use std::collections::{HashMap, HashSet};
 

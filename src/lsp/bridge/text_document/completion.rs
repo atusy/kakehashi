@@ -1,12 +1,8 @@
 //! Completion request handling for bridge connections.
 //!
-//! This module provides completion request functionality for downstream language servers,
-//! handling the coordinate transformation between host and virtual documents.
-//!
-//! # Single-Writer Loop (ADR-0015)
-//!
-//! This handler uses `send_request()` and `send_notification()` to queue messages via
-//! the channel-based writer task, ensuring FIFO ordering with other messages.
+//! Handles the coordinate transformation between host and virtual documents.
+//! Messages are queued via the channel-based writer task (ADR-0015) for FIFO
+//! ordering with other messages.
 
 use std::io;
 
@@ -99,15 +95,10 @@ fn build_completion_request(
 
 /// Parse a JSON-RPC completion response and transform coordinates to host document space.
 ///
-/// Normalizes all responses to `CompletionList` format. If the server returns an array,
-/// it's wrapped as `CompletionList { isIncomplete: false, items }`.
-///
-/// Returns `None` for: null results, missing results, and deserialization failures.
-///
-/// # Arguments
-/// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
-/// * `offset` - The region offset for coordinate translation
-/// * `envelope_ctx` - If `Some`, each item's `data` is wrapped in a routing envelope
+/// Normalizes all responses to `CompletionList` (an array result is wrapped as
+/// `CompletionList { isIncomplete: false, items }`). Returns `None` for null
+/// results, missing results, and deserialization failures. When `envelope_ctx`
+/// is `Some`, each item's `data` is wrapped in a routing envelope.
 fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,

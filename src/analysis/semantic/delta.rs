@@ -33,20 +33,8 @@ pub(super) fn tokens_equal(a: &SemanticToken, b: &SemanticToken) -> bool {
 
 /// Calculate delta between two sets of semantic tokens using prefix-suffix matching.
 ///
-/// This algorithm:
-/// 1. Finds the longest common prefix
-/// 2. Finds the longest common suffix (from what remains), with safety check for line changes
-/// 3. Returns a single edit replacing the middle section
-///
 /// Suffix matching is disabled when total line deltas differ, since tokens with
 /// identical delta encoding would be at different absolute positions.
-///
-/// # Arguments
-/// * `previous` - The previous semantic tokens
-/// * `current` - The current semantic tokens
-///
-/// # Returns
-/// Semantic tokens delta containing the edits needed to transform previous to current
 pub(super) fn calculate_semantic_tokens_delta(
     previous: &SemanticTokens,
     current: &SemanticTokens,

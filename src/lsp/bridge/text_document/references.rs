@@ -85,26 +85,11 @@ impl LanguageServerPool {
     }
 }
 
-/// Transform references response to typed Vec<Location> format.
-///
-/// This function handles the references endpoint response which returns
-/// Location[] | null according to the LSP spec.
-///
-/// # URI Filtering Logic
-///
-/// Same as goto endpoints:
-/// - Real file URIs → keep as-is (cross-file jumps)
-/// - Same virtual URI as request → transform coordinates
-/// - Different virtual URI → filter out (cross-region, can't transform safely)
-///
-/// Empty arrays after filtering are preserved to distinguish "searched, found nothing"
-/// from "search failed" (None).
-///
-/// # Arguments
-/// * `response` - Raw JSON-RPC response envelope (`{"result": {...}}`)
-/// * `request_virtual_uri` - The virtual URI from the request
-/// * `host_uri` - The pre-parsed host URI to use in transformed responses
-/// * `offset` - The region offset for coordinate translation
+/// Normalize a `references` response (`Location[] | null`) into `Vec<Location>`,
+/// applying the same URI filter as goto: keep real-file URIs, translate matches
+/// on the request's virtual URI, drop other virtual URIs (cross-region offsets
+/// are unsafe). An empty filtered vec is preserved (not `None`) so callers can
+/// tell "no results" from "search failed".
 fn transform_references_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,

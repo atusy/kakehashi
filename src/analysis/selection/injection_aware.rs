@@ -15,19 +15,9 @@ use crate::text::position::PositionMapper;
 
 /// Adjust a node's range from injection-relative to host-document-relative coordinates.
 ///
-/// When working with injected language content, Tree-sitter parses the injection
-/// as a standalone document starting at byte 0. This function translates those
-/// byte positions back to the host document's coordinate space.
-///
-/// Uses byte offsets and PositionMapper to ensure correct UTF-16 column conversion.
-///
-/// # Arguments
-/// * `node` - The Tree-sitter node from the injected language parse tree
-/// * `content_start_byte` - The byte offset where the injection content starts in the host document
-/// * `mapper` - PositionMapper for the host document (byte-to-UTF16 conversion)
-///
-/// # Returns
-/// LSP Range in host document coordinates with proper UTF-16 positions
+/// Tree-sitter parses an injection as a standalone document starting at byte 0,
+/// so node byte positions are translated back to the host coordinate space.
+/// Goes through byte offsets and `PositionMapper` to keep UTF-16 columns correct.
 pub fn adjust_range_to_host(
     node: Node,
     content_start_byte: usize,
@@ -52,17 +42,8 @@ pub fn adjust_range_to_host(
 /// Calculate the effective LSP Range after applying offset to content node.
 ///
 /// Offset directives (like `#offset! @injection.content 1 0 -1 0`) adjust where
-/// the injection content actually starts and ends. This function applies those
-/// offsets and converts the result to an LSP Range with proper UTF-16 positions.
-///
-/// # Arguments
-/// * `text` - The full host document text
-/// * `mapper` - PositionMapper for byte-to-UTF16 conversion
-/// * `content_node` - The injection content node
-/// * `offset` - The offset to apply (row and column adjustments)
-///
-/// # Returns
-/// LSP Range representing the effective injection boundaries
+/// the injection content actually starts and ends, then the result is converted
+/// to an LSP Range with proper UTF-16 positions.
 pub fn calculate_effective_lsp_range(
     text: &str,
     mapper: &PositionMapper,
@@ -83,26 +64,10 @@ pub fn calculate_effective_lsp_range(
     Range::new(start_pos, end_pos)
 }
 
-/// Check if cursor byte position is within the effective range after applying offset.
-///
-/// Used to determine if the cursor is inside the actual injection content after
-/// offset directives have been applied. For example, in Markdown frontmatter:
-/// ```markdown
-/// ---
-/// title: "hello"
-/// ---
-/// ```
-/// With offset `(1, 0, -1, 0)`, the cursor must be within `title: "hello"\n`
-/// (excluding the `---` boundary lines) for this to return true.
-///
-/// # Arguments
-/// * `text` - The full host document text
-/// * `content_node` - The injection content node
-/// * `cursor_byte` - The cursor position in bytes
-/// * `offset` - The offset to apply
-///
-/// # Returns
-/// `true` if cursor is within the effective range, `false` otherwise
+/// True iff `cursor_byte` lies inside the injection content after applying
+/// `offset` directives. Example: Markdown frontmatter with `(1, 0, -1, 0)`
+/// excludes the `---` boundary lines, so only positions inside `title: "hello"\n`
+/// qualify.
 pub fn is_cursor_within_effective_range(
     text: &str,
     content_node: &Node,
@@ -116,16 +81,8 @@ pub fn is_cursor_within_effective_range(
 
 /// Check if a node's range is already present in the selection chain.
 ///
-/// Used to determine if we need to splice the injection content node into
-/// the hierarchy, or if it's already there from a previous traversal.
-///
-/// # Arguments
-/// * `selection` - The root of the SelectionRange chain to search
-/// * `target_node` - The node whose range we're looking for
-/// * `mapper` - PositionMapper for converting node to LSP Range
-///
-/// # Returns
-/// `true` if the node's range appears somewhere in the chain, `false` otherwise
+/// Used to decide whether the injection content node must be spliced into the
+/// hierarchy, or if a previous traversal already placed it there.
 pub fn is_node_in_selection_chain(
     selection: &SelectionRange,
     target_node: &Node,
