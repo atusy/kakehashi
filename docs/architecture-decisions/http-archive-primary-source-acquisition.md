@@ -1,4 +1,4 @@
-# ADR-0023: HTTP Archive as Primary Source Acquisition for Parsers
+# HTTP Archive Primary Source Acquisition
 
 | | |
 |---|---|
@@ -65,5 +65,5 @@ The `fetch_source()` function implements the strategy:
 
 ## More Information
 
-* [ADR-0022](0022-replace-tree-sitter-cli-with-loader.md) — Related: replaced tree-sitter-cli with tree-sitter-loader
+* [replace-tree-sitter-cli-with-loader](replace-tree-sitter-cli-with-loader.md) — Related: replaced tree-sitter-cli with tree-sitter-loader
 * GitHub archive URL format: `https://github.com/{owner}/{repo}/archive/{ref}.tar.gz`

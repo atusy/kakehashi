@@ -1,4 +1,4 @@
-# ADR-0026: Host Document Bridge via `_self` Reserved Key
+# Host Document Bridge
 
 | | |
 |---|---|
@@ -6,12 +6,12 @@
 | **Status** | Proposed |
 | **Type** | Configuration Schema Extension |
 
-**Related ADRs**:
-- [ADR-0006](0006-language-server-bridge.md) — Bridge concept introduction
-- [ADR-0007](0007-language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)
-- [ADR-0008](0008-language-server-bridge-request-strategies.md) — Per-method bridge strategies
-- [ADR-0011](0011-wildcard-config-inheritance.md) — Wildcard config inheritance (foundation for `_self` resolution)
-- [ADR-0020](0020-pull-first-diagnostic-forwarding.md) — Diagnostic forwarding
+**Related Decisions**:
+- [language-server-bridge](language-server-bridge.md) — Bridge concept introduction
+- [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)
+- [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method bridge strategies
+- [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard config inheritance (foundation for `_self` resolution)
+- [pull-first-diagnostic-forwarding](pull-first-diagnostic-forwarding.md) — Diagnostic forwarding
 
 ## Context
 
@@ -31,7 +31,7 @@ Design challenges:
 ## Decision Drivers
 
 - **Minimal schema disruption**: no new types in `BridgeServerConfig`, `BridgeLanguageConfig`, or `AggregationConfig`.
-- **Reuse wildcard machinery**: [ADR-0011](0011-wildcard-config-inheritance.md)'s `resolve_with_wildcard` should apply uniformly across host and virt entries.
+- **Reuse wildcard machinery**: [wildcard-config-inheritance](wildcard-config-inheritance.md)'s `resolve_with_wildcard` should apply uniformly across host and virt entries.
 - **Capability vs. policy separation**: `languageServers.*` declares *what* an LS can do; `languages.*.bridge.*` decides *whether and how* it is used.
 - **Opt-in for new behavior**: host bridging defaults *off* so existing configs are unchanged.
 - **Symmetric mental model**: host and virt are both "bridges" — only the LS-matching rule differs.
@@ -48,7 +48,7 @@ Design challenges:
 enabled = false              # Host bridging is opt-in.
 
 [languages._.bridge._]
-enabled = true               # Virt bridging stays default-on (ADR-0011).
+enabled = true               # Virt bridging stays default-on (wildcard-config-inheritance).
 
 # ---- User opts markdown into host bridging ----
 [languages.markdown.bridge._self]
@@ -82,7 +82,7 @@ languages = ["python"]
 | `_self` | "host language itself" (host target) | falls back into `_` during normal merge, but explicit `languages._.bridge._self` defaults keep `enabled` / role-relevant fields key-specific |
 | `<language>` | "specific injection target" (virt) | inherits from `_` |
 
-The `_self` ⊕ `_` merge is *not* special-cased in the resolver. It works correctly because, after language-level wildcard merge, `bridge._self.enabled` is always `Some(false)` (from the built-in default), and ADR-0011's key-specific-wins rule ensures it overrides the virt default of `Some(true)` when both are present in the same `bridge` map. See "Wildcard Merge Safety" below.
+The `_self` ⊕ `_` merge is *not* special-cased in the resolver. It works correctly because, after language-level wildcard merge, `bridge._self.enabled` is always `Some(false)` (from the built-in default), and wildcard-config-inheritance's key-specific-wins rule ensures it overrides the virt default of `Some(true)` when both are present in the same `bridge` map. See "Wildcard Merge Safety" below.
 
 ### LS Dispatch Rules
 
@@ -97,7 +97,7 @@ No new fields on `BridgeServerConfig`. An LS that should not act as host for a g
 
 ### Wildcard Merge Safety
 
-Concern: under [ADR-0011](0011-wildcard-config-inheritance.md), `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. If `_.enabled = true` and `_self.enabled` were absent, the wildcard would silently turn host bridging on.
+Concern: under [wildcard-config-inheritance](wildcard-config-inheritance.md), `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. If `_.enabled = true` and `_self.enabled` were absent, the wildcard would silently turn host bridging on.
 
 Resolution: built-in defaults at `languages._.bridge._self.enabled = false` and `languages._.bridge._.enabled = true` mean that after the *outer* wildcard merge (language layer), every `bridge` map sees `_self` populated with `Some(false)`. During the *inner* wildcard merge (`_self ⊕ _`), key-specific fields win — `_self.enabled = Some(false)` beats `_.enabled = Some(true)`. No special case is needed.
 
@@ -128,7 +128,7 @@ The same reasoning extends to any future `_self`-meaningful field: as long as th
 
 ### URI and Coordinate Handling
 
-Host bridges use the **real URI** as sent by the client. This is the key distinction from virt bridges ([ADR-0007](0007-language-server-bridge-virtual-document-model.md)):
+Host bridges use the **real URI** as sent by the client. This is the key distinction from virt bridges ([language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md)):
 
 | Aspect | Virt bridge | Host bridge |
 |---|---|---|
@@ -147,7 +147,7 @@ Practical consequences:
 
 ### Out of Scope
 
-- **Combine logic for host/virt responses at request time**: this ADR defines only the schema for declaring host and virt bridges. How responses from both roles are ordered, merged, or routed per method is a separate concern decided at dispatch time, not encoded in the configuration shape.
+- **Combine logic for host/virt responses at request time**: this decision defines only the schema for declaring host and virt bridges. How responses from both roles are ordered, merged, or routed per method is a separate concern decided at dispatch time, not encoded in the configuration shape.
 - **Editor connecting to the same LS directly**: if the user's editor talks to marksman in parallel with kakehashi, marksman sees duplicate `didOpen` events. Resolving this is the user's responsibility (route only through kakehashi). Kakehashi does not attempt to detect or mediate.
 - **Cross-language priority mixing in `priorities` entries**: the `priorities` field remains a `Vec<String>` of LS names within a single bridge target (`bridge.<inj>` or `bridge._self`). Mixing names from different bridge targets in one list is not supported by this schema.
 
@@ -156,7 +156,7 @@ Practical consequences:
 ### Positive
 
 - **Zero new types**: `BridgeServerConfig`, `BridgeLanguageConfig`, `AggregationConfig` all unchanged.
-- **Reuses wildcard machinery**: ADR-0011's `resolve_with_wildcard` applies uniformly, no host-specific resolver path.
+- **Reuses wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` applies uniformly, no host-specific resolver path.
 - **Backward compatible**: `_self.enabled = false` default keeps existing configs inert.
 - **Granular control**: host bridging is per-host-language; aggregation/priorities are per-method.
 - **Symmetric mental model**: virt and host live in the same `bridge` map, with the only operational difference being LS-match key (injection language vs. host language).
@@ -191,7 +191,7 @@ priorities = [
 **Rejected because**:
 - Requires extending `AggregationConfig.priorities` from `Vec<String>` to a tagged structure (or a string-mini-DSL), bumping the type surface.
 - Cross-target priority mixing is explicitly out of scope (see *Out of Scope*); `priorities` stays scoped to a single bridge target.
-- Host/virt ordering is a dispatch-time concern, not a configuration shape, so encoding role in the schema does not match the responsibility split this ADR establishes.
+- Host/virt ordering is a dispatch-time concern, not a configuration shape, so encoding role in the schema does not match the responsibility split this decision establishes.
 
 ### B. Separate `host_bridge` field parallel to `bridge`
 
@@ -225,7 +225,7 @@ priorities = ["pyright"]
 - Splits bridge configuration into two non-uniform shapes: `bridge.<inj>.aggregation` (nested) vs. `aggregation` (flat). Resolvers diverge.
 - `LanguageSettings.aggregation` requires its own `resolve_aggregation` method, duplicating logic on `BridgeLanguageConfig`.
 - **Less extensibility**: the value type is `AggregationConfig`, so host inherits only fields defined on `AggregationConfig`. Fields on `BridgeLanguageConfig` itself — most notably `enabled` — have no host counterpart, forcing either an ad-hoc parallel field on `LanguageSettings` (e.g., `host_enabled`) or coverage gaps. Any future `BridgeLanguageConfig` field reopens the same asymmetry.
-- Subsumed by treating "host" as just another bridge target (one map, one resolver) per the decision in this ADR.
+- Subsumed by treating "host" as just another bridge target (one map, one resolver) per the decision in this decision.
 
 ### D. Role flags on `BridgeServerConfig`
 

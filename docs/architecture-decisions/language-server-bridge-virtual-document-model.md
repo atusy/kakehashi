@@ -1,12 +1,18 @@
-# ADR-0007: Virtual Document Model for Injection Regions
+# Language Server Bridge Virtual Document Model
 
 ## Status
 
-Proposed (isolation=true implemented; isolation=false deferred)
+Proposed
+
+## Decision–Implementation Gap
+
+`isolation=true` (one virtual document per injection region) is implemented.
+`isolation=false` (combining same-language injections into a single virtual
+document) is deferred and not implemented.
 
 ## Context
 
-When bridging LSP requests for injection regions (see [ADR-0006](0006-language-server-bridge.md)), we need to represent injection content to language servers. A host document may contain multiple injection regions of the same language (e.g., multiple Rust code blocks in Markdown).
+When bridging LSP requests for injection regions (see [language-server-bridge](language-server-bridge.md)), we need to represent injection content to language servers. A host document may contain multiple injection regions of the same language (e.g., multiple Rust code blocks in Markdown).
 
 The key question: **Should multiple injections of the same language be isolated (each in its own virtual document), or combined into a single virtual document?**
 
@@ -76,7 +82,7 @@ isolation = true
 isolation = false
 ```
 
-The `_` wildcard matches any host or injection language, enabling layered defaults (see [ADR-0011](0011-wildcard-config-inheritance.md)):
+The `_` wildcard matches any host or injection language, enabling layered defaults (see [wildcard-config-inheritance](wildcard-config-inheritance.md)):
 
 | Host | Bridge Config | Meaning |
 |------|---------------|---------|
@@ -118,7 +124,7 @@ Possible approaches:
 - **Heuristic matching**: Match "similar" injections across parses (same language, overlapping range) and assign persistent IDs
 - **Accept instability**: URI changes trigger close/reopen; simple but loses server-side state
 
-The choice affects implementation complexity vs. user experience. This ADR does not prescribe a specific scheme.
+The choice affects implementation complexity vs. user experience. This decision does not prescribe a specific scheme.
 
 ### Virtual Document Materialization
 
@@ -143,7 +149,7 @@ Virtual documents may be **logical** (in-memory only) or **materialized** (writt
 **Why materialization is sometimes required**: Some language servers (notably rust-analyzer) index from the filesystem rather than relying solely on `didOpen` content. They return `null` for queries when files don't exist on disk or lack project context.
 
 For materialized documents:
-- Create temporary project structure (see [ADR-0006](0006-language-server-bridge.md#server-specific-workspace-provisioning))
+- Create temporary project structure (see [language-server-bridge](language-server-bridge.md#server-specific-workspace-provisioning))
 - Write injection content to real file
 - Use real file URI in LSP communication
 - Clean up on document close or server shutdown
@@ -200,5 +206,5 @@ One language server process handles **all virtual documents** for that language,
 
 ## Related Decisions
 
-- [ADR-0006](0006-language-server-bridge.md): Core LSP bridge architecture
-- [ADR-0008](0008-language-server-bridge-request-strategies.md): Per-method bridge strategies
+- [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
+- [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Per-method bridge strategies

@@ -1,4 +1,4 @@
-# ADR-0014: LS Bridge Async Connection
+# LS Bridge Async Connection
 
 | | |
 |---|---|
@@ -8,17 +8,17 @@
 
 ## Scope
 
-This ADR defines how to communicate with **a single downstream language server** via stdio. It covers:
+This decision defines how to communicate with **a single downstream language server** via stdio. It covers:
 - Process spawning and I/O primitives
 - Async reader/writer task patterns
 - Connection-level timeout mechanisms
 - Pending request lifecycle
 
-**Out of Scope**: Coordination of multiple language servers (single-LS vs multi-LS per language) is covered by ADR-0016.
+**Out of Scope**: Coordination of multiple language servers (single-LS vs multi-LS per language) is covered by ls-bridge-server-pool-coordination.
 
 ## Context
 
-The LSP bridge connects injection regions to external language servers via stdio (ADR-0006). A language server is spawned as a child process with stdin/stdout streams for LSP JSON-RPC communication. The bridge must handle I/O from multiple concurrent requests on a single connection without blocking.
+The LSP bridge connects injection regions to external language servers via stdio (language-server-bridge). A language server is spawned as a child process with stdin/stdout streams for LSP JSON-RPC communication. The bridge must handle I/O from multiple concurrent requests on a single connection without blocking.
 
 ### Key Requirements
 
@@ -131,7 +131,7 @@ async fn send_request(&self, request: Request) -> Result<Response> {
 }
 ```
 
-**Error Code Mapping**: `Error::ConnectionNotReady` maps to `REQUEST_FAILED` (-32803) with state-specific messages. See ADR-0015 § Operation Gating for the complete mapping.
+**Error Code Mapping**: `Error::ConnectionNotReady` maps to `REQUEST_FAILED` (-32803) with state-specific messages. See ls-bridge-message-ordering § Operation Gating for the complete mapping.
 
 ### Timeout Architecture
 
@@ -159,12 +159,12 @@ The system uses two distinct timeout mechanisms with different purposes:
 - **Timer Management**:
   - **Start**: When initialize request sent (Connection state: Initializing)
   - **Stop**: When initialize response received (transition to Ready)
-  - **Cancel**: On shutdown signal (global shutdown timeout takes over, see ADR-0018)
+  - **Cancel**: On shutdown signal (global shutdown timeout takes over, see ls-bridge-timeout-hierarchy)
 - **Behavior on Timeout**: Connection transitions to Failed state
 
 **Independence**: The two timeouts serve different purposes and never overlap (liveness disabled during Initializing; initialization timeout disabled once Ready).
 
-**Coordination with Other Timeouts**: See [ADR-0018](0018-ls-bridge-timeout-hierarchy.md) for precedence rules when shutdown timeout is active.
+**Coordination with Other Timeouts**: See [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) for precedence rules when shutdown timeout is active.
 
 ## Consequences
 
@@ -240,11 +240,11 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 
 ## Related Decisions
 
-- **ADR-0006**: Core LSP bridge architecture (pooling, spawn strategy)
-- **[ADR-0015](0015-ls-bridge-message-ordering.md)**: Message Ordering (built on this I/O layer)
-- **[ADR-0016](0016-ls-bridge-server-pool-coordination.md)**: Server Pool Coordination (uses this I/O foundation for N servers)
-- **[ADR-0017](0017-ls-bridge-graceful-shutdown.md)**: Graceful Shutdown (uses shutdown signal from `select!`, adds LSP handshake and process cleanup)
-- **[ADR-0018](0018-ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy (coordinates liveness timeout with other timeout systems)
+- **language-server-bridge**: Core LSP bridge architecture (pooling, spawn strategy)
+- **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Message Ordering (built on this I/O layer)
+- **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination (uses this I/O foundation for N servers)
+- **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown (uses shutdown signal from `select!`, adds LSP handshake and process cleanup)
+- **[ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy (coordinates liveness timeout with other timeout systems)
 
 ## Notes
 
@@ -259,5 +259,5 @@ Use standard library's `std::process` with one blocking OS thread per server rea
 
 ## Amendment History
 
-- **2026-01-06**: Merged [Amendment 001](0013-async-io-layer-amendment-001.md) - Added pending request cleanup requirements and race prevention pattern to prevent indefinite client hangs on reader task exit
-- **2026-01-06**: Merged [Amendment 002](0013-async-io-layer-amendment-002.md) - Added state-based liveness timeout gating and separate initialization timeout mechanism to prevent liveness timeout from firing during slow initialization
+- **2026-01-06**: Merged Amendment 001 - Added pending request cleanup requirements and race prevention pattern to prevent indefinite client hangs on reader task exit
+- **2026-01-06**: Merged Amendment 002 - Added state-based liveness timeout gating and separate initialization timeout mechanism to prevent liveness timeout from firing during slow initialization

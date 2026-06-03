@@ -1,16 +1,21 @@
-# ADR-0008: Request-Specific Bridge Strategies
+# Language Server Bridge Request Strategies
 
 ## Status
 
-Accepted (Partially superseded by [ADR-0012](0012-multi-ls-async-bridge-architecture.md) for multi-LS aspects)
+Accepted. The single-LS, per-method strategies defined here remain in effect.
+Multi-LS routing, aggregation, and initialization-window handling are covered by
+[ls-bridge-message-ordering](ls-bridge-message-ordering.md) and
+[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md).
 
-**Implementation**: 8 of 11 features implemented (definition, hover, signatureHelp, completion, references, rename, codeAction, formatting)
+## Decision–Implementation Gap
 
-**Note**: Single-LS per-method strategies remain valid. See ADR-0012 for multi-LS routing, aggregation, and initialization window handling.
+8 of the 11 per-method strategies described below are implemented (definition,
+hover, signatureHelp, completion, references, rename, codeAction, formatting).
+The remaining three are not yet implemented.
 
 ## Context
 
-When bridging LSP requests for injection regions (see [ADR-0006](0006-language-server-bridge.md)), different LSP methods have different characteristics:
+When bridging LSP requests for injection regions (see [language-server-bridge](language-server-bridge.md)), different LSP methods have different characteristics:
 
 | Method | Latency Sensitivity | kakehashi Capability | Language Server Value |
 |--------|---------------------|--------------------------|----------------------|
@@ -337,5 +342,5 @@ The original priority order (for reference):
 
 ## Related Decisions
 
-- [ADR-0006](0006-language-server-bridge.md): Core LSP bridge architecture
-- [ADR-0007](0007-language-server-bridge-virtual-document-model.md): How injections are represented as virtual documents
+- [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
+- [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How injections are represented as virtual documents

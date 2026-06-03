@@ -1,4 +1,4 @@
-# ADR-0017: LS Bridge Graceful Shutdown
+# LS Bridge Graceful Shutdown
 
 | | |
 |---|---|
@@ -7,7 +7,7 @@
 
 ## Context
 
-ADR-0014 (Async Bridge Connection), ADR-0015 (Message Ordering), and ADR-0016 (Server Pool Coordination) establish the communication architecture but do not specify shutdown behavior.
+ls-bridge-async-connection (Async Bridge Connection), ls-bridge-message-ordering (Message Ordering), and ls-bridge-server-pool-coordination (Server Pool Coordination) establish the communication architecture but do not specify shutdown behavior.
 
 ### Critical Gaps Without Shutdown Specification
 
@@ -30,7 +30,7 @@ ADR-0014 (Async Bridge Connection), ADR-0015 (Message Ordering), and ADR-0016 (S
 
 ### Connection State for Shutdown
 
-This ADR defines behavior for `Closing` and `Closed` states. See [ADR-0015 § Connection State Tracking](0015-ls-bridge-message-ordering.md#4-connection-state-tracking) for the complete ConnectionState enum.
+This decision defines behavior for `Closing` and `Closed` states. See [ls-bridge-message-ordering § Connection State Tracking](ls-bridge-message-ordering.md#4-connection-state-tracking) for the complete ConnectionState enum.
 
 **Shutdown-Specific Transitions:**
 ```
@@ -384,18 +384,18 @@ Skip synchronization, just send shutdown request whenever ready.
 
 **Why synchronization is essential**: Protocol correctness requires serialized stdin writes.
 
-## Related ADRs
+## Related Decisions
 
-- **[ADR-0014](0014-ls-bridge-async-connection.md)**: Async Bridge Connection
+- **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Async Bridge Connection
   - Uses shutdown signal from `select!` pattern
-  - ADR-0017 adds LSP handshake and process cleanup
-- **[ADR-0015](0015-ls-bridge-message-ordering.md)**: Message Ordering
+  - ls-bridge-graceful-shutdown adds LSP handshake and process cleanup
+- **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Message Ordering
   - Extends ConnectionState enum with Closing/Closed states
   - Defines operation disposal for pending requests
-- **[ADR-0016](0016-ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
-  - ADR-0017 defines router shutdown coordination strategy
+- **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
+  - ls-bridge-graceful-shutdown defines router shutdown coordination strategy
   - Parallel shutdown with global timeout
-- **[ADR-0018](0018-ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy
+- **[ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy
   - Global shutdown timeout takes precedence over other timeouts
   - Liveness timeout disabled during Closing state
 
@@ -411,4 +411,4 @@ Skip synchronization, just send shutdown request whenever ready.
 
 ## Amendment History
 
-- **2026-01-06**: Merged [Amendment 001](0016-graceful-shutdown-amendment-001.md) - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
+- **2026-01-06**: Merged Amendment 001 - Added three-phase writer loop shutdown synchronization to prevent stdin corruption during concurrent shutdown writes
