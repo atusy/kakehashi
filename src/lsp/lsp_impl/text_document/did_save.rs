@@ -7,7 +7,7 @@ use super::super::{Kakehashi, uri_to_url};
 impl Kakehashi {
     /// Handle textDocument/didSave notification.
     ///
-    /// ADR-0020 Phase 2: Triggers synthetic diagnostic push.
+    /// pull-first-diagnostic-forwarding Phase 2: Triggers synthetic diagnostic push.
     /// Collects diagnostics from downstream servers and publishes via publishDiagnostics.
     pub(crate) async fn did_save_impl(&self, params: DidSaveTextDocumentParams) {
         let lsp_uri = params.text_document.uri;

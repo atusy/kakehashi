@@ -53,7 +53,7 @@ pub struct AggregationConfig {
 /// should be bridged and how results are aggregated.
 /// Example: `{ python = { enabled = true, aggregation = { "_" = { priorities = ["pyright"] } } } }`.
 ///
-/// Omitted fields inherit from the wildcard `_` entry (see ADR-0011).
+/// Omitted fields inherit from the wildcard `_` entry (see wildcard-config-inheritance).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
 pub struct BridgeLanguageConfig {
     /// Whether bridging is enabled for this language.
@@ -99,7 +99,7 @@ impl BridgeLanguageConfig {
     /// Look up the aggregation entry for a method with field-level wildcard merge.
     ///
     /// Uses [`crate::config::resolve_with_wildcard`] so that a method-specific entry
-    /// inherits any unset fields from the `_` wildcard entry (ADR-0011).
+    /// inherits any unset fields from the `_` wildcard entry (wildcard-config-inheritance).
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
         let map = self.aggregation.as_ref()?;
         crate::config::resolve_with_wildcard(map, method, crate::config::merge_aggregation_configs)
@@ -1400,7 +1400,7 @@ kind = "injections""#;
     #[test]
     fn should_resolve_aggregation_entry_inherits_missing_fields_from_wildcard() {
         // When a method-specific AggregationConfig exists but has max_fan_out: None,
-        // the wildcard's max_fan_out IS applied via field-level merge (ADR-0011).
+        // the wildcard's max_fan_out IS applied via field-level merge (wildcard-config-inheritance).
         let config = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([

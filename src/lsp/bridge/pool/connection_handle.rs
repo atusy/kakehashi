@@ -1,5 +1,5 @@
 //! Per-connection wrapper for downstream language servers — state management,
-//! request routing, and shutdown logic (ADR-0015).
+//! request routing, and shutdown logic (ls-bridge-message-ordering).
 //!
 //! Outbound messages flow Handler → `tx` channel → writer task → stdin through a
 //! single-writer loop, giving strict FIFO ordering and non-blocking sends.
@@ -46,7 +46,7 @@ pub(crate) enum NotificationSendResult {
     SerializationFailed,
 }
 
-/// Per-connection state + I/O actors (ADR-0015 single-writer loop).
+/// Per-connection state + I/O actors (ls-bridge-message-ordering single-writer loop).
 ///
 /// Lifecycle: `Initializing` → `Ready` (after initialize/initialized) or
 /// `Failed` (timeout/error). Shutdown then drives `begin_shutdown`
@@ -63,12 +63,12 @@ pub(crate) struct ConnectionHandle {
     /// using `wait_for_ready()`. The Sender is stored here; receivers are created
     /// via `state_watch.subscribe()`.
     state_watch: tokio::sync::watch::Sender<ConnectionState>,
-    /// Channel sender for outbound messages (ADR-0015 single-writer pattern).
+    /// Channel sender for outbound messages (ls-bridge-message-ordering single-writer pattern).
     ///
     /// All notifications and requests are queued here and written to stdin
     /// by the writer task in FIFO order.
     tx: mpsc::Sender<OutboundMessage>,
-    /// Writer task handle (ADR-0015): owns the `SplitConnectionWriter` (and child
+    /// Writer task handle (ls-bridge-message-ordering): owns the `SplitConnectionWriter` (and child
     /// process), drives the 3-phase graceful shutdown, and does RAII cleanup on drop.
     writer_handle: std::sync::Mutex<Option<WriterTaskHandle>>,
     /// Router for pending request tracking
@@ -114,7 +114,7 @@ impl ConnectionHandle {
     }
 
     /// Create a new ConnectionHandle with a specific initial state, spawning the
-    /// writer task (ADR-0015). Even handshake messages flow through the channel so
+    /// writer task (ls-bridge-message-ordering). Even handshake messages flow through the channel so
     /// all writes keep FIFO ordering and avoid races against the writer task.
     pub(super) fn with_state(
         writer: SplitConnectionWriter,
@@ -154,11 +154,11 @@ impl ConnectionHandle {
     }
 
     // ========================================
-    // Message Sending (ADR-0015 Single-Writer Loop)
+    // Message Sending (ls-bridge-message-ordering Single-Writer Loop)
     // ========================================
 
     /// Queue a notification (fire-and-forget). Non-blocking: if the queue is
-    /// full, the notification is dropped with WARN logging per ADR-0015
+    /// full, the notification is dropped with WARN logging per ls-bridge-message-ordering
     /// backpressure semantics; see `NotificationSendResult` for the
     /// success/queue-full/channel-closed/serialization-failed outcomes.
     pub(crate) fn send_notification<P: serde::Serialize>(
@@ -468,11 +468,11 @@ impl ConnectionHandle {
 
     /// Begin graceful shutdown: transition to Closing (rejecting new requests) and
     /// stop the liveness timer, since global shutdown (Tier 3) overrides liveness
-    /// (Tier 2) per ADR-0018. Only the timer is stopped — the reader task keeps
+    /// (Tier 2) per ls-bridge-timeout-hierarchy. Only the timer is stopped — the reader task keeps
     /// running to receive the shutdown response. Valid from Ready or Initializing
-    /// (ADR-0015/ADR-0017).
+    /// (ls-bridge-message-ordering/ls-bridge-graceful-shutdown).
     pub(crate) fn begin_shutdown(&self) {
-        // Stop the liveness timer (but not the reader task) per ADR-0018
+        // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
@@ -484,19 +484,19 @@ impl ConnectionHandle {
     /// Transitions the connection to Closed state (terminal).
     /// Called after LSP shutdown/exit handshake completes or times out.
     ///
-    /// Valid from Closing or Failed states per ADR-0015/ADR-0017.
+    /// Valid from Closing or Failed states per ls-bridge-message-ordering/ls-bridge-graceful-shutdown.
     pub(crate) fn complete_shutdown(&self) {
         self.set_state(ConnectionState::Closed);
     }
 
-    /// LSP graceful shutdown: Closing → stop writer → shutdown/exit → force-kill → Closed (ADR-0017).
+    /// LSP graceful shutdown: Closing → stop writer → shutdown/exit → force-kill → Closed (ls-bridge-graceful-shutdown).
     ///
     /// The writer task is reclaimed via a 3-phase stop (signal → idle confirm → receive)
-    /// before sending `shutdown`/`exit` so nothing else writes to stdin concurrently (ADR-0015).
+    /// before sending `shutdown`/`exit` so nothing else writes to stdin concurrently (ls-bridge-message-ordering).
     /// Force-kill and the `Closed` transition always run even if the LSP handshake fails,
     /// so a stuck server cannot leave us in `Closing`.
     ///
-    /// No internal timeout (ADR-0018): the caller (`shutdown_all_with_timeout`) enforces the
+    /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
         // 1. Transition to Closing state
@@ -539,7 +539,7 @@ impl ConnectionHandle {
             writer.write_message(&shutdown_request).await?;
 
             // Wait for shutdown response (no timeout - global timeout handles this)
-            // Per ADR-0018: graceful_shutdown has no internal timeout
+            // Per ls-bridge-timeout-hierarchy: graceful_shutdown has no internal timeout
             match response_rx.await {
                 Ok(_response) => {
                     log::debug!(
@@ -598,7 +598,7 @@ impl ConnectionHandle {
 
     /// Register a new request and return (request_id, response_receiver). On the
     /// first pending request (0->1), notifies the reader to start the liveness
-    /// timer (ADR-0014). Errors only on a duplicate ID (should never happen).
+    /// timer (ls-bridge-async-connection). Errors only on a duplicate ID (should never happen).
     pub(crate) fn register_request(
         &self,
     ) -> io::Result<(RequestId, tokio::sync::oneshot::Receiver<serde_json::Value>)> {
@@ -638,7 +638,7 @@ impl ConnectionHandle {
 
     /// Wait for a response with a 30-second timeout, removing the pending router
     /// entry on timeout. If the reader signaled a liveness timeout, transitions
-    /// the connection to Failed (ADR-0014 Phase 3).
+    /// the connection to Failed (ls-bridge-async-connection Phase 3).
     pub(crate) async fn wait_for_response(
         &self,
         request_id: RequestId,
@@ -651,7 +651,7 @@ impl ConnectionHandle {
         match timeout(REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(response)) => {
                 // Check if this was an error response from liveness timeout
-                // If so, transition to Failed state (ADR-0014 Phase 3)
+                // If so, transition to Failed state (ls-bridge-async-connection Phase 3)
                 if self.reader_handle.check_liveness_failed() {
                     self.set_state(ConnectionState::Failed);
                 }
@@ -659,7 +659,7 @@ impl ConnectionHandle {
             }
             Ok(Err(_)) => {
                 // Channel closed - check if due to liveness timeout
-                // If so, transition to Failed state (ADR-0014 Phase 3)
+                // If so, transition to Failed state (ls-bridge-async-connection Phase 3)
                 if self.reader_handle.check_liveness_failed() {
                     self.set_state(ConnectionState::Failed);
                 }
@@ -726,7 +726,7 @@ mod tests {
         assert_eq!(id3, 4, "Third user request ID should be 4");
     }
 
-    /// Test that ConnectionHandle wraps connection with state (ADR-0015).
+    /// Test that ConnectionHandle wraps connection with state (ls-bridge-message-ordering).
     /// State should start as Ready (since constructor is called after init handshake),
     /// and can transition via set_state().
     #[tokio::test]
@@ -763,7 +763,7 @@ mod tests {
             "State should transition to Failed"
         );
 
-        // Can send notification via channel (ADR-0015)
+        // Can send notification via channel (ls-bridge-message-ordering)
         let notification = JsonRpcNotification::new("test", serde_json::json!({}));
         let result = handle.send_notification(notification);
         assert_eq!(
@@ -777,7 +777,7 @@ mod tests {
         // Router is accessible (test passes if no panic)
     }
 
-    /// Test that liveness timeout triggers Ready->Failed state transition (ADR-0014 Phase 3).
+    /// Test that liveness timeout triggers Ready->Failed state transition (ls-bridge-async-connection Phase 3).
     ///
     /// When the liveness timer fires:
     /// 1. router.fail_all() sends error responses to pending requests
@@ -852,7 +852,7 @@ mod tests {
         );
     }
 
-    /// Test that begin_shutdown() cancels the active liveness timer (ADR-0018 Phase 4).
+    /// Test that begin_shutdown() cancels the active liveness timer (ls-bridge-timeout-hierarchy Phase 4).
     ///
     /// When global shutdown begins, the liveness timer should be disabled because
     /// global shutdown (Tier 3) overrides liveness timeout (Tier 2).
@@ -910,7 +910,7 @@ mod tests {
         );
     }
 
-    /// Test that liveness timer does not start in Closing state (ADR-0018 Phase 4).
+    /// Test that liveness timer does not start in Closing state (ls-bridge-timeout-hierarchy Phase 4).
     ///
     /// Once shutdown begins, new requests should not start the liveness timer
     /// because global shutdown (Tier 3) overrides liveness timeout (Tier 2).
@@ -974,7 +974,7 @@ mod tests {
 
     /// Integration test: liveness timer resets on response activity.
     ///
-    /// ADR-0014: Timer resets on any stdout activity.
+    /// ls-bridge-async-connection: Timer resets on any stdout activity.
     /// This verifies the full stack: request -> response -> timer reset.
     ///
     /// Test strategy: Send requests that will be echoed back, verify that
@@ -1076,7 +1076,7 @@ mod tests {
 
     /// Test that register_request_with_upstream passes upstream ID to ResponseRouter.
     ///
-    /// ADR-0015 Cancel Forwarding: When registering a request with an upstream ID,
+    /// ls-bridge-message-ordering Cancel Forwarding: When registering a request with an upstream ID,
     /// the router should store the mapping so we can later look up the downstream ID.
     #[tokio::test]
     async fn register_request_with_upstream_stores_mapping() {

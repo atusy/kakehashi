@@ -3,7 +3,7 @@
 //! This module provides didChange notification forwarding for downstream language servers,
 //! propagating document changes from host documents to their virtual documents.
 //!
-//! # Single-Writer Loop (ADR-0015)
+//! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
 //! This handler uses `send_notification()` to queue didChange notifications via the
 //! channel-based writer task. This replaces the previous `tokio::spawn` fire-and-forget
@@ -27,7 +27,7 @@ impl LanguageServerPool {
     /// their first request). Uses full content sync for simplicity.
     ///
     /// Notifications go through `send_notification()` (single writer task,
-    /// ADR-0015) for FIFO order — fire-and-forget but no reordering.
+    /// ls-bridge-message-ordering) for FIFO order — fire-and-forget but no reordering.
     // TODO: switch to TextDocumentSyncKind::Incremental for large documents.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
@@ -97,7 +97,7 @@ impl LanguageServerPool {
                     continue;
                 };
 
-                // Send didChange notification via single-writer loop (ADR-0015).
+                // Send didChange notification via single-writer loop (ls-bridge-message-ordering).
                 // This is non-blocking and maintains FIFO ordering.
                 Self::send_didchange_for_virtual_doc(
                     &handle,
@@ -111,7 +111,7 @@ impl LanguageServerPool {
 
     /// Send a didChange notification for a virtual document.
     ///
-    /// Uses the channel-based single-writer loop (ADR-0015): non-blocking, and
+    /// Uses the channel-based single-writer loop (ls-bridge-message-ordering): non-blocking, and
     /// if the queue is full the notification is dropped with a warning log.
     fn send_didchange_for_virtual_doc(
         handle: &Arc<ConnectionHandle>,

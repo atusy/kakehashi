@@ -1,7 +1,7 @@
 //! Shutdown coordination for downstream language servers.
 //!
 //! This module contains the shutdown-related methods for LanguageServerPool,
-//! implementing graceful and forced shutdown per ADR-0017 (Graceful Shutdown).
+//! implementing graceful and forced shutdown per ls-bridge-graceful-shutdown (Graceful Shutdown).
 
 use std::sync::Arc;
 
@@ -25,8 +25,8 @@ impl LanguageServerPool {
         }
     }
 
-    /// Graceful shutdown of every downstream connection (ADR-0017), parallel,
-    /// under the default 10s `GlobalShutdownTimeout` (ADR-0018). Per-state:
+    /// Graceful shutdown of every downstream connection (ls-bridge-graceful-shutdown), parallel,
+    /// under the default 10s `GlobalShutdownTimeout` (ls-bridge-timeout-hierarchy). Per-state:
     /// Ready/Initializing run the LSP shutdown handshake, Failed jumps straight
     /// to Closed (stdin is gone), Closing/Closed are skipped. Concurrent calls
     /// are safe (state machine is monotonic) but only the first does real work.
@@ -35,7 +35,7 @@ impl LanguageServerPool {
             .await;
     }
 
-    /// Parallel graceful shutdown under a single global ceiling (ADR-0017).
+    /// Parallel graceful shutdown under a single global ceiling (ls-bridge-graceful-shutdown).
     /// Ready/Initializing connections run the LSP shutdown in parallel; Failed
     /// ones jump straight to Closed. When `timeout` elapses, survivors are
     /// force-killed (SIGTERM→SIGKILL on Unix) and all enter Closed.
@@ -129,12 +129,12 @@ impl LanguageServerPool {
     }
 
     /// Post-timeout fallback: terminate every non-closed connection in
-    /// parallel and mark it Closed (ADR-0017). Unix uses SIGTERM→SIGKILL with
+    /// parallel and mark it Closed (ls-bridge-graceful-shutdown). Unix uses SIGTERM→SIGKILL with
     /// a 2s grace period; Windows uses `TerminateProcess` directly.
     ///
     /// Each kill goes through `graceful_shutdown` with a short (3s) cap so a
     /// hung writer task can't stall this path — on expiry we mark Closed
-    /// anyway and let the OS reap the orphan (ADR-0015).
+    /// anyway and let the OS reap the orphan (ls-bridge-message-ordering).
     async fn force_kill_all(&self) {
         /// Timeout for force-kill attempts.
         ///

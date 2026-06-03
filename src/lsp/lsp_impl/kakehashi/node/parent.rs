@@ -1,11 +1,11 @@
-//! `kakehashi/node/parent` — id → immediate-parent NodeInfo (ADR-0025).
+//! `kakehashi/node/parent` — id → immediate-parent NodeInfo (node-reference-protocol).
 //!
 //! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind)`
 //! triple, locates the matching tree-sitter node in the current parse tree, and
-//! returns a [`NodeInfo`](../../../../../docs/adr/0025-node-reference-protocol.md#nodeinfo-type)
+//! returns a [`NodeInfo`](../../../../../docs/architecture-decisions/node-reference-protocol.md#nodeinfo-type)
 //! for its tree-sitter parent.
 //!
-//! Per ADR-0025 §"Navigation Methods", navigation stays within a single
+//! Per node-reference-protocol §"Navigation Methods", navigation stays within a single
 //! language tree: calling `parent` on the root of an injected tree must **not**
 //! cross into the host node that contains the injection. To find the node in
 //! the correct tree we search the host tree first and then each injected layer
@@ -52,7 +52,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Malformed ULID collapses to null per ADR-0025 §"Invalidate vs Not-Found".
+        // Malformed ULID collapses to null per node-reference-protocol §"Invalidate vs Not-Found".
         let Ok(ulid) = params.id.parse::<Ulid>() else {
             return Ok(Value::Null);
         };
@@ -82,7 +82,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Search the host tree first, then injected layers at `start`. ADR-0025
+        // Search the host tree first, then injected layers at `start`. node-reference-protocol
         // "Scope rule" applies per layer: tree-sitter's `node.parent()` returns
         // None for any tree root (host root AND injected root), which is the
         // intended semantics — do NOT chase into the host node that contains
@@ -111,7 +111,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Issue / reuse a stable ULID for the parent (ADR-0019 lazy assignment).
+        // Issue / reuse a stable ULID for the parent (lazy-node-identity-tracking lazy assignment).
         let parent_ulid = self
             .bridge
             .node_tracker()

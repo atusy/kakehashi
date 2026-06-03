@@ -1,15 +1,15 @@
 //! Async Bridge Connection for LSP language server integration
 //!
-//! This module implements the async bridge architecture (ADR-0014) for communicating
+//! This module implements the async bridge architecture (ls-bridge-async-connection) for communicating
 //! with downstream language servers via stdio.
 //!
 //! # Module Structure
 //!
-//! - `actor` - Actor components (ResponseRouter, Reader task) for async I/O (ADR-0015)
+//! - `actor` - Actor components (ResponseRouter, Reader task) for async I/O (ls-bridge-message-ordering)
 //! - `connection` - AsyncBridgeConnection for process spawning and I/O
 //! - `coordinator` - BridgeCoordinator for unified pool + region ID tracking
 //! - `protocol` - VirtualDocumentUri, request building, and response transformation
-//! - `pool` - LanguageServerPool for server pool coordination (ADR-0016)
+//! - `pool` - LanguageServerPool for server pool coordination (ls-bridge-server-pool-coordination)
 
 mod actor;
 mod connection;

@@ -1,7 +1,7 @@
 //! `completionItem/resolve`: route the request to the single downstream server
 //! identified by the Kakehashi envelope stored in `CompletionItem.data` during
 //! the original completion fan-out. Uses `send_request()` for FIFO ordering
-//! through the single writer task (ADR-0015).
+//! through the single writer task (ls-bridge-message-ordering).
 //!
 //! No `didOpen` is sent here — the virtual document is already open from the
 //! completion that produced this item. If the downstream server has since

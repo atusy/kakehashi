@@ -1,7 +1,7 @@
 //! Response routing for pending LSP requests.
 //!
 //! Tracks pending requests and routes incoming responses to their waiters via
-//! oneshot channels (ADR-0015). A requester registers before sending, then awaits
+//! oneshot channels (ls-bridge-message-ordering). A requester registers before sending, then awaits
 //! the receiver without holding any Mutex; the Reader Task calls `route()` on arrival.
 
 use std::collections::HashMap;
@@ -161,7 +161,7 @@ impl ResponseRouter {
 
     /// Get the number of pending requests.
     ///
-    /// Used for liveness timeout management (ADR-0014):
+    /// Used for liveness timeout management (ls-bridge-async-connection):
     /// - Timer starts when pending transitions 0 -> 1
     /// - Timer stops when pending transitions to 0
     pub(crate) fn pending_count(&self) -> usize {
@@ -191,13 +191,13 @@ impl ResponseRouter {
 
     /// Fail a single pending request with an error response.
     ///
-    /// Called when a write fails or the connection is closing (ADR-0015). Uses
+    /// Called when a write fails or the connection is closing (ls-bridge-message-ordering). Uses
     /// `REQUEST_FAILED` (-32803) for queue/write errors, distinct from the
     /// `INTERNAL_ERROR` (-32603) `fail_all()` uses for connection failures.
     ///
     /// Idempotent: subsequent calls for the same ID return `false`. This is critical
     /// for avoiding double-cleanup races between sender and writer task cleanup
-    /// (ADR-0015 Appendix A).
+    /// (ls-bridge-message-ordering Appendix A).
     pub(crate) fn fail_request(&self, id: RequestId, reason: &str) -> bool {
         let mut state = self
             .state
@@ -470,7 +470,7 @@ mod tests {
     }
 
     // ========================================
-    // CancelMap tests (ADR-0015 Cancel Forwarding)
+    // CancelMap tests (ls-bridge-message-ordering Cancel Forwarding)
     // ========================================
 
     /// Test that register_with_upstream stores upstream->downstream mapping.
@@ -713,7 +713,7 @@ mod tests {
     }
 
     // ========================================
-    // fail_request tests (ADR-0015 Single-Writer Loop)
+    // fail_request tests (ls-bridge-message-ordering Single-Writer Loop)
     // ========================================
 
     /// Test that fail_request sends REQUEST_FAILED error to waiter.
@@ -753,7 +753,7 @@ mod tests {
 
     /// Test that fail_request is idempotent (critical for double-cleanup races).
     ///
-    /// ADR-0015 Appendix A: Cleanup operations MUST be idempotent to handle
+    /// ls-bridge-message-ordering Appendix A: Cleanup operations MUST be idempotent to handle
     /// concurrent cleanup from sender and writer task.
     #[test]
     fn fail_request_is_idempotent() {
@@ -794,7 +794,7 @@ mod tests {
 
     /// Test double cleanup is safe (both remove and fail_request on same ID).
     ///
-    /// ADR-0015 Appendix A: When a request fails, cleanup can happen from two places:
+    /// ls-bridge-message-ordering Appendix A: When a request fails, cleanup can happen from two places:
     /// 1. Sender cleanup: send_request() failure calls router.remove()
     /// 2. Writer cleanup: writer task calls router.fail_request() on write error
     ///

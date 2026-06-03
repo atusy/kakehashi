@@ -1,7 +1,7 @@
 //! didClose notification handling for bridge connections.
 //!
 //! Cleans up when host documents are closed or regions are invalidated.
-//! Notifications are queued via the channel-based writer task (ADR-0015) for
+//! Notifications are queued via the channel-based writer task (ls-bridge-message-ordering) for
 //! FIFO ordering.
 
 use std::io;
@@ -18,7 +18,7 @@ impl LanguageServerPool {
     /// Send a didClose notification for a virtual document.
     ///
     /// The connection is NOT closed after sending — it stays available for other
-    /// documents. Uses the channel-based single-writer loop (ADR-0015) for FIFO
+    /// documents. Uses the channel-based single-writer loop (ls-bridge-message-ordering) for FIFO
     /// ordering. Returns `Ok(())` on success or when no connection exists for the
     /// server (nothing to do).
     pub(crate) async fn send_didclose_notification(
@@ -43,7 +43,7 @@ impl LanguageServerPool {
         let handle = Arc::clone(handle);
         drop(connections); // Release lock before I/O
 
-        // Build and send the didClose notification via single-writer loop (ADR-0015)
+        // Build and send the didClose notification via single-writer loop (ls-bridge-message-ordering)
         let Some(notification) = build_didclose_notification(&uri_string) else {
             return Ok(());
         };

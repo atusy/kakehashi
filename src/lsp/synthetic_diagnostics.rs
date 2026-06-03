@@ -1,4 +1,4 @@
-//! Background diagnostic collection on `didSave`/`didOpen` (ADR-0020 Phase 2):
+//! Background diagnostic collection on `didSave`/`didOpen` (pull-first-diagnostic-forwarding Phase 2):
 //! pull internally, push via `textDocument/publishDiagnostics`.
 //!
 //! Rapid-fire events supersede each other — `SyntheticDiagnosticsManager`

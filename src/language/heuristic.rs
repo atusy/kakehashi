@@ -6,7 +6,7 @@
 //! - Emacs/Vim mode lines (e.g., `# -*- mode: ruby -*-`)
 //!
 //! Uses syntect's Sublime Text syntax definitions for comprehensive coverage.
-//! Part of the detection fallback chain (ADR-0005).
+//! Part of the detection fallback chain (language-detection-fallback-chain).
 //!
 //! ## Token Extraction from Paths
 //!

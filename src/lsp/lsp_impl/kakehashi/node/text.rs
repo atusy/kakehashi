@@ -1,14 +1,14 @@
-//! `kakehashi/node/text` — id → current node text (ADR-0025).
+//! `kakehashi/node/text` — id → current node text (node-reference-protocol).
 //!
 //! Resolves a previously-issued ULID back to its tracked byte range via
 //! [`NodeTracker::lookup_position`] and slices the current document text at
-//! that range. Because [ADR-0019](../../../../../docs/adr/0019-lazy-node-identity-tracking.md)
+//! that range. Because [lazy-node-identity-tracking](../../../../../docs/architecture-decisions/lazy-node-identity-tracking.md)
 //! adjusts the tracker synchronously inside `didChange`, the returned slice is
 //! always consistent with the document state the client most recently saw.
 //!
 //! Returns `null` for any unresolvable reference — never-issued, invalidated,
 //! mismatched URI, or stale byte range falling outside the current text. The
-//! three cases are deliberately indistinguishable (ADR-0025 §"Invalidate vs
+//! three cases are deliberately indistinguishable (node-reference-protocol §"Invalidate vs
 //! Not-Found").
 
 use serde::Deserialize;
@@ -39,7 +39,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Malformed ULID: ADR-0025 says any unresolvable reference collapses to null,
+        // Malformed ULID: node-reference-protocol says any unresolvable reference collapses to null,
         // so we treat a parse failure the same as a never-issued ULID rather than
         // raising an LSP error.
         let Ok(ulid) = params.id.parse::<Ulid>() else {
@@ -54,7 +54,7 @@ impl Kakehashi {
         };
 
         // Slice the current document text. The tracker keeps positions in sync
-        // with didChange (ADR-0019 adjust_for_edits), so start/end should land
+        // with didChange (lazy-node-identity-tracking adjust_for_edits), so start/end should land
         // on UTF-8 boundaries; guard against unexpected out-of-range or mid-
         // char values defensively. Scope the DashMap read guard to the slice
         // extraction only so concurrent writers (didChange) are not blocked by

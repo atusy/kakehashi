@@ -1,4 +1,4 @@
-//! End-to-end test for synthetic push diagnostics (ADR-0020 Phase 2).
+//! End-to-end test for synthetic push diagnostics (pull-first-diagnostic-forwarding Phase 2).
 //!
 //! This test verifies that `textDocument/publishDiagnostics` notifications
 //! are sent automatically on `didSave` and `didOpen` events.

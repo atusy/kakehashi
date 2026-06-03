@@ -168,7 +168,7 @@ impl Kakehashi {
             // Resolve aggregation under "textDocument/formatting", not
             // "textDocument/rangeFormatting". Range formatting is the
             // partial-document counterpart of full formatting and shares its
-            // server priorities and strategy (see ADR-0008, which groups the
+            // server priorities and strategy (see language-server-bridge-request-strategies, which groups the
             // two). There is no separate rangeFormatting config key, and
             // `resolve_aggregation_entry` only falls back method → `_`
             // wildcard — never formatting → rangeFormatting — so keying off

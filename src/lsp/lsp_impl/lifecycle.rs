@@ -256,7 +256,7 @@ impl Kakehashi {
                 #[cfg(not(feature = "experimental"))]
                 color_provider: None,
                 moniker_provider: Some(OneOf::Left(true)),
-                // ADR-0020: Pull-first diagnostic forwarding
+                // pull-first-diagnostic-forwarding: Pull-first diagnostic forwarding
                 diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
                     DiagnosticOptions {
                         inter_file_dependencies: false,
@@ -295,10 +295,10 @@ impl Kakehashi {
             );
         }
 
-        // Abort all synthetic diagnostic tasks (ADR-0020 Phase 2)
+        // Abort all synthetic diagnostic tasks (pull-first-diagnostic-forwarding Phase 2)
         self.synthetic_diagnostics.abort_all();
 
-        // Cancel all debounced diagnostic timers (ADR-0020 Phase 3)
+        // Cancel all debounced diagnostic timers (pull-first-diagnostic-forwarding Phase 3)
         self.debounced_diagnostics.cancel_all();
 
         // Abort all eager-open tasks to prevent orphaned didOpen during shutdown
@@ -308,7 +308,7 @@ impl Kakehashi {
         // Without this, the task only exits when all senders are dropped.
         self.shutdown_token.cancel();
 
-        // Graceful shutdown of all downstream language server connections (ADR-0017)
+        // Graceful shutdown of all downstream language server connections (ls-bridge-graceful-shutdown)
         // - Transitions to Closing state, sends LSP shutdown/exit handshake
         // - Escalates to SIGTERM/SIGKILL for unresponsive servers (Unix)
         self.bridge.shutdown_all().await;

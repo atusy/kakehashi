@@ -2,7 +2,7 @@
 //!
 //! This module provides the `OutboundMessage` enum that represents messages
 //! to be sent to a downstream language server via the single-writer loop
-//! (ADR-0015).
+//! (ls-bridge-message-ordering).
 //!
 //! All messages pass through the unified order queue to ensure FIFO ordering.
 //! The writer task consumes these and writes to stdin.
@@ -12,7 +12,7 @@ use crate::lsp::bridge::protocol::RequestId;
 /// Message to be sent to a downstream language server.
 ///
 /// All messages pass through the unified order queue to ensure FIFO ordering
-/// per ADR-0015. The writer task consumes these and writes to stdin.
+/// per ls-bridge-message-ordering. The writer task consumes these and writes to stdin.
 ///
 /// The variants reflect whether the ResponseRouter tracks the message:
 /// - `Untracked`: fire-and-forget (notifications, server-request responses)

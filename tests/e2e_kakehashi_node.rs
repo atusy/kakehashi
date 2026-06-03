@@ -1,5 +1,5 @@
 //! End-to-end tests for `kakehashi/node`, `kakehashi/node/text`,
-//! `kakehashi/node/parent`, and `kakehashi/node/children` (ADR-0025 PR-1 + PR-2 + PR-3).
+//! `kakehashi/node/parent`, and `kakehashi/node/children` (node-reference-protocol PR-1 + PR-2 + PR-3).
 //!
 //! Covers the entry-point method (position → NodeInfo), the text resolution
 //! method (id → current node text), the parent navigation method
@@ -137,7 +137,7 @@ fn request_node(client: &mut LspClient, uri: &str, line: u32, character: u32) ->
         .expect("response must contain a result field")
 }
 
-/// Send `kakehashi/node` with an explicit `injection` parameter (ADR-0025 PR-4).
+/// Send `kakehashi/node` with an explicit `injection` parameter (node-reference-protocol PR-4).
 /// `injection` is a `bool | number`; we accept any JSON value so the test
 /// fixtures can exercise the full parameter surface, including out-of-bounds
 /// indices and saturating `true`.
@@ -193,8 +193,8 @@ fn full_text_change(client: &mut LspClient, uri: &str, new_version: i64, new_tex
 
 /// Edit survival: acquire an id for a node, send a `didChange` that does NOT
 /// touch the node's START byte, and verify `kakehashi/node/text` reflects the
-/// post-edit content. ADR-0019's START-priority rule keeps the ULID alive,
-/// and ADR-0025's text endpoint must always slice from the *current* document.
+/// post-edit content. The lazy-node-identity-tracking decision's START-priority rule keeps the ULID alive,
+/// and the node-reference-protocol decision's text endpoint must always slice from the *current* document.
 #[test]
 fn test_node_text_survives_edit_that_does_not_touch_start() {
     let mut client = LspClient::new();
@@ -252,7 +252,7 @@ fn test_node_text_survives_edit_that_does_not_touch_start() {
 }
 
 /// Invalidation: an edit whose range covers the node's START byte must drop the
-/// ULID per ADR-0019's START-priority rule. ADR-0025 collapses
+/// ULID per the lazy-node-identity-tracking decision's START-priority rule. node-reference-protocol collapses
 /// invalidated / never-issued / mismatched-URI cases into a single null
 /// response, so `kakehashi/node/text` must return null after the edit.
 #[test]
@@ -365,7 +365,7 @@ fn test_node_at_end_of_document_returns_node_info() {
     assert!(!ty.is_empty(), "type field should be a non-empty kind");
 }
 
-/// Empty-document case: ADR-0025 gates the end-of-document exception on `L > 0`,
+/// Empty-document case: node-reference-protocol gates the end-of-document exception on `L > 0`,
 /// so any query on a zero-length document must return null.
 #[test]
 fn test_node_in_empty_document_returns_null() {
@@ -439,7 +439,7 @@ fn test_node_at_heading_returns_node_info() {
 }
 
 /// `kakehashi/node/parent` walks one step toward the root of the same language
-/// tree (ADR-0025 §"Navigation Methods"). Acquiring an id deep inside a nested
+/// tree (node-reference-protocol §"Navigation Methods"). Acquiring an id deep inside a nested
 /// markdown structure and asking for its parent must yield a NodeInfo whose id
 /// is distinct from the child's and whose type is the kind of the immediate
 /// tree-sitter parent.
@@ -507,7 +507,7 @@ fn test_node_parent_returns_immediate_parent_for_nested_node() {
 
 /// Walking `kakehashi/node/parent` repeatedly from any in-document node must
 /// eventually surface the root, at which point one more `parent` call returns
-/// null (ADR-0025 §"Navigation Methods" — "id refers to a root node").
+/// null (node-reference-protocol §"Navigation Methods" — "id refers to a root node").
 #[test]
 fn test_node_parent_returns_null_at_root() {
     let mut client = LspClient::new();
@@ -550,7 +550,7 @@ fn test_node_parent_returns_null_at_root() {
 }
 
 /// A ULID that was never issued by this server must resolve to null
-/// (ADR-0025 §"Invalidate vs Not-Found" — never-issued / invalidated /
+/// (node-reference-protocol §"Invalidate vs Not-Found" — never-issued / invalidated /
 /// mismatched URI collapse to a single null).
 #[test]
 fn test_node_parent_returns_null_for_unknown_id() {
@@ -572,7 +572,7 @@ fn test_node_parent_returns_null_for_unknown_id() {
 }
 
 /// `kakehashi/node/children` returns the immediate children of a tracked node
-/// in **document order** (ADR-0025 §"Navigation Methods" — Ordering). The
+/// in **document order** (node-reference-protocol §"Navigation Methods" — Ordering). The
 /// response includes BOTH named and anonymous children. The order invariant is
 /// expressed as a non-decreasing `start_byte` across the returned sequence —
 /// tree-sitter siblings are non-overlapping so the invariant is in fact strict
@@ -691,7 +691,7 @@ fn test_node_children_returns_siblings_in_document_order() {
     }
 }
 
-/// A leaf node (no children) must return `[]`, NOT `null`. ADR-0025 explicitly
+/// A leaf node (no children) must return `[]`, NOT `null`. node-reference-protocol explicitly
 /// distinguishes "node exists but is empty" (`[]`) from "id not in tracker"
 /// (`null`).
 #[test]
@@ -746,7 +746,7 @@ fn test_node_children_returns_empty_array_for_leaf_node() {
 }
 
 /// A ULID that was never issued by this server must resolve to null for
-/// `kakehashi/node/children` (ADR-0025 §"Navigation Methods" — `null` cases).
+/// `kakehashi/node/children` (node-reference-protocol §"Navigation Methods" — `null` cases).
 #[test]
 fn test_node_children_returns_null_for_unknown_id() {
     let mut client = LspClient::new();
@@ -767,7 +767,7 @@ fn test_node_children_returns_null_for_unknown_id() {
 }
 
 // ============================================================
-// ADR-0025 PR-4: injection parameter
+// node-reference-protocol PR-4: injection parameter
 //
 // The fixture below — a markdown document containing a fenced
 // `python` code block containing an `re.match(...)` call — drives
@@ -796,7 +796,7 @@ const MARKDOWN_WITH_PYTHON_REGEX: &str =
 /// document containing a python fenced code block, a cursor inside the
 /// python code must still resolve to a markdown node — the
 /// `code_fence_content` (or a markdown ancestor) — because the host layer
-/// is layer 0 by the ADR-0025 table.
+/// is layer 0 by the node-reference-protocol table.
 ///
 /// PR-1 already returns the host node regardless of the `injection` value;
 /// this test pins that contract before PR-4 introduces the dispatch logic.
@@ -867,7 +867,7 @@ fn is_python_kind(ty: &str) -> bool {
 }
 
 /// `injection: true` saturates to the deepest layer at the cursor position
-/// (ADR-0025 §"`true` as saturation shorthand"). With a python fenced code
+/// (node-reference-protocol §"`true` as saturation shorthand"). With a python fenced code
 /// block as the only injection, a cursor inside the python source must
 /// resolve to a python node — not a markdown host node.
 #[test]
@@ -901,7 +901,7 @@ fn test_node_injection_true_returns_python_node_inside_python_block() {
 /// position). For a markdown→python stack the result must be a python node.
 /// Mirrors `true` here because the stack has only two layers, but the
 /// resolution goes through the strict-index path rather than the
-/// saturating one — verifying ADR-0025's formula for positive `n`.
+/// saturating one — verifying the node-reference-protocol decision's formula for positive `n`.
 #[test]
 fn test_node_injection_positive_one_returns_python_node_inside_python_block() {
     let mut client = LspClient::new();
@@ -927,7 +927,7 @@ fn test_node_injection_positive_one_returns_python_node_inside_python_block() {
 }
 
 /// `injection: 2` indexes one past the deepest layer in a 2-layer stack;
-/// ADR-0025 says strict integer indices return `null` when out of bounds.
+/// node-reference-protocol says strict integer indices return `null` when out of bounds.
 #[test]
 fn test_node_injection_positive_two_returns_null_when_stack_too_shallow() {
     let mut client = LspClient::new();
@@ -968,7 +968,7 @@ fn test_node_injection_positive_one_returns_null_outside_any_injection() {
     );
 }
 
-/// `injection: -1` resolves to `stack[stack.len - 1]` per ADR-0025's
+/// `injection: -1` resolves to `stack[stack.len - 1]` per the node-reference-protocol decision's
 /// negative-index formula. For a 2-layer markdown→python stack that's the
 /// python layer, matching `true` here — but through the strict formula,
 /// not the saturating path. (The two only diverge when the stack is
@@ -1030,7 +1030,7 @@ fn test_node_injection_negative_two_returns_host_on_two_layer_stack() {
 }
 
 /// `injection: -3` on a 2-layer stack underflows: `stack[2 + (-3)] =
-/// stack[-1]`. ADR-0025 says strict integer indices return null when out
+/// stack[-1]`. node-reference-protocol says strict integer indices return null when out
 /// of bounds, which includes negative results from the negative-formula.
 #[test]
 fn test_node_injection_negative_three_returns_null_on_two_layer_stack() {
@@ -1177,7 +1177,7 @@ fn test_node_injection_negative_two_three_layer_returns_middle_layer() {
 
 /// The spec defines `injection` as `boolean | number`. Anything else (string,
 /// array, object, fractional number) must collapse to `null` rather than
-/// silently coercing — ADR-0025's universal null semantics for unresolvable
+/// silently coercing — the node-reference-protocol decision's universal null semantics for unresolvable
 /// references covers malformed selectors too.
 #[test]
 fn test_node_injection_unsupported_shape_returns_null() {
@@ -1225,7 +1225,7 @@ fn test_node_injection_unsupported_shape_returns_null() {
 }
 
 /// `kakehashi/node/parent` on an id minted from an injected layer must keep
-/// navigating *inside that injected tree* (ADR-0025 §"Navigation Methods" —
+/// navigating *inside that injected tree* (node-reference-protocol §"Navigation Methods" —
 /// Scope rule), never crossing back into the markdown host. Walk the parent
 /// chain from a python node up to the python root; every hop must stay a
 /// python kind, and the hop past the injected root must return `null` rather

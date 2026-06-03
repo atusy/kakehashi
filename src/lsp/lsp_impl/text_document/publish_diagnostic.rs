@@ -1,5 +1,5 @@
 //! Shared fan-out/aggregation for proactive `textDocument/publishDiagnostics`
-//! pushes (ADR-0020 Phase 2). `DiagnosticScheduler` schedules and handles
+//! pushes (pull-first-diagnostic-forwarding Phase 2). `DiagnosticScheduler` schedules and handles
 //! superseding (via `SyntheticDiagnosticsManager` / `DebouncedDiagnosticsManager`);
 //! this module just collects per-region diagnostics from a prepared snapshot
 //! using a `JoinSet`.

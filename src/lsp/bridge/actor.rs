@@ -1,7 +1,7 @@
 //! Actor components for async bridge connection.
 //!
 //! This module provides the actor-based infrastructure for non-blocking
-//! communication with downstream language servers (ADR-0015).
+//! communication with downstream language servers (ls-bridge-message-ordering).
 //!
 //! # Components
 //!

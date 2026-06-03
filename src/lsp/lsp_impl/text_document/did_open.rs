@@ -96,7 +96,7 @@ impl Kakehashi {
             .process_injections(&uri, false)
             .await;
 
-        // ADR-0020 Phase 2: Trigger synthetic diagnostic push on didOpen
+        // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
         // Note: We use the already-cloned lsp_uri here (it was cloned at the start of the method).
         self.diagnostic_scheduler()

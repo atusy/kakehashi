@@ -37,7 +37,7 @@ impl DiagnosticScheduler {
         }
     }
 
-    /// Schedule a debounced diagnostic for a document (ADR-0020 Phase 3).
+    /// Schedule a debounced diagnostic for a document (pull-first-diagnostic-forwarding Phase 3).
     ///
     /// A later change cancels and replaces the pending timer. The snapshot is
     /// captured now, at schedule time, so diagnostics stay consistent with the
@@ -57,7 +57,7 @@ impl DiagnosticScheduler {
 
     /// Spawn a background task to collect and publish diagnostics.
     ///
-    /// ADR-0020 Phase 2: synthetic push on didSave/didOpen. The task registers
+    /// pull-first-diagnostic-forwarding Phase 2: synthetic push on didSave/didOpen. The task registers
     /// with `SyntheticDiagnosticsManager` (superseding any previous task), then
     /// fans out to downstream servers and publishes via
     /// `textDocument/publishDiagnostics`.

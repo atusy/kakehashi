@@ -6,7 +6,7 @@
 /// JSON-RPC request ID for LSP communication.
 ///
 /// Wraps `i64` to prevent confusion with other integer types (version numbers,
-/// line numbers) and to serve as a `pending_requests` HashMap key (ADR-0015).
+/// line numbers) and to serve as a `pending_requests` HashMap key (ls-bridge-message-ordering).
 ///
 /// LSP allows numeric or string IDs; only numeric IDs are supported since the
 /// bridge controls request ID generation.

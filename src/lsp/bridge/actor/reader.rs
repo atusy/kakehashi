@@ -3,14 +3,14 @@
 //! This module provides the background task that reads LSP messages from
 //! the downstream server's stdout and routes responses to waiting requesters.
 //!
-//! # Architecture (ADR-0015)
+//! # Architecture (ls-bridge-message-ordering)
 //!
 //! The Reader Task:
 //! - Runs in a spawned tokio task
 //! - Reads messages from stdout using BridgeReader
 //! - Routes responses via ResponseRouter to oneshot waiters
 //! - Logs notifications (they don't have waiters)
-//! - Manages liveness timer for hung server detection (ADR-0014)
+//! - Manages liveness timer for hung server detection (ls-bridge-async-connection)
 //! - Gracefully shuts down on EOF, error, or cancellation signal
 
 use std::sync::Arc;
@@ -170,7 +170,7 @@ impl LivenessTimerState {
 /// Drop semantics: cancelling the token unblocks the reader loop's `select!`;
 /// the JoinHandle is not awaited because async drop does not exist and the
 /// reader exits within one loop iteration on cancel/EOF/error. The shared
-/// token also lets a failing writer task cancel the reader (ADR-0015),
+/// token also lets a failing writer task cancel the reader (ls-bridge-message-ordering),
 /// avoiding CPU spin on orphaned channels.
 pub(crate) struct ReaderTaskHandle {
     _join_handle: JoinHandle<()>,
@@ -181,10 +181,10 @@ pub(crate) struct ReaderTaskHandle {
     /// Notify reader when pending count goes 0→1 so it starts the liveness timer.
     liveness_start_tx: mpsc::Sender<()>,
 
-    /// Stop the liveness timer at shutdown so Tier 3 (global) overrides Tier 2 (ADR-0018).
+    /// Stop the liveness timer at shutdown so Tier 3 (global) overrides Tier 2 (ls-bridge-timeout-hierarchy).
     liveness_stop_tx: mpsc::Sender<()>,
 
-    /// Reader fires this when liveness times out; ConnectionHandle reads it to enter Failed (ADR-0014).
+    /// Reader fires this when liveness times out; ConnectionHandle reads it to enter Failed (ls-bridge-async-connection).
     liveness_failed_rx: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
 }
 
@@ -198,7 +198,7 @@ impl ReaderTaskHandle {
         let _ = self.liveness_start_tx.try_send(());
     }
 
-    /// Stop the liveness timer without canceling the reader task (ADR-0018 Phase 4).
+    /// Stop the liveness timer without canceling the reader task (ls-bridge-timeout-hierarchy Phase 4).
     ///
     /// Called by ConnectionHandle when shutdown begins. Global shutdown (Tier 3)
     /// overrides liveness timeout (Tier 2), but the reader task continues running
@@ -255,7 +255,7 @@ pub(crate) fn spawn_reader_task(
 /// Spawn a reader task with optional liveness timeout (no language context).
 ///
 /// Convenience wrapper for tests that don't need structured logging with
-/// language identifiers (ADR-0014 liveness timeout); production code should use
+/// language identifiers (ls-bridge-async-connection liveness timeout); production code should use
 /// `spawn_reader_task_for_language`.
 #[cfg(test)]
 pub(crate) fn spawn_reader_task_with_liveness(
@@ -277,7 +277,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
     )
 }
 
-/// Spawn a reader task with liveness timeout (ADR-0014) and language identifier
+/// Spawn a reader task with liveness timeout (ls-bridge-async-connection) and language identifier
 /// for structured logging.
 pub(crate) fn spawn_reader_task_for_language(
     reader: BridgeReader,
@@ -364,7 +364,7 @@ async fn reader_loop(
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
 
-/// The main reader loop with optional liveness timeout support (ADR-0014).
+/// The main reader loop with optional liveness timeout support (ls-bridge-async-connection).
 ///
 /// The liveness timer (when configured) detects a hung server: firing triggers a
 /// Ready→Failed transition via `router.fail_all()` and signals `liveness_failed_tx`.
@@ -392,7 +392,7 @@ async fn reader_loop_with_liveness(
         .map(|l| format!("[{}] ", l))
         .unwrap_or_default();
 
-    // Consolidated liveness timer state (ADR-0014)
+    // Consolidated liveness timer state (ls-bridge-async-connection)
     let mut liveness = LivenessTimerState::new(liveness_timeout);
 
     loop {
@@ -423,7 +423,7 @@ async fn reader_loop_with_liveness(
                     pending_count
                 );
                 router.fail_all("bridge: liveness timeout - server unresponsive");
-                // Signal liveness failure for state transition (ADR-0014 Phase 3)
+                // Signal liveness failure for state transition (ls-bridge-async-connection Phase 3)
                 let _ = liveness_failed_tx.send(());
                 break;
             }
@@ -433,7 +433,7 @@ async fn reader_loop_with_liveness(
                 liveness.start(&lang_prefix);
             }
 
-            // Check for liveness timer stop notification (shutdown began - ADR-0018 Phase 4)
+            // Check for liveness timer stop notification (shutdown began - ls-bridge-timeout-hierarchy Phase 4)
             Some(()) = liveness_stop_rx.recv() => {
                 liveness.stop(&lang_prefix, "shutdown began");
             }
@@ -442,7 +442,7 @@ async fn reader_loop_with_liveness(
             result = reader.read_message() => {
                 match result {
                     Ok(message) => {
-                        // Reset liveness timer on any message activity (ADR-0014)
+                        // Reset liveness timer on any message activity (ls-bridge-async-connection)
                         liveness.reset(&lang_prefix);
 
                         handle_message(message, &router, &lang_prefix, &server_request_deps).await;
@@ -1503,12 +1503,12 @@ mod tests {
     }
 
     // ============================================================
-    // Liveness Timer Tests (ADR-0014)
+    // Liveness Timer Tests (ls-bridge-async-connection)
     // ============================================================
 
     /// Test that liveness timer starts when notified (pending 0->1 transition).
     ///
-    /// ADR-0014: Timer starts when pending count transitions 0 to 1.
+    /// ls-bridge-async-connection: Timer starts when pending count transitions 0 to 1.
     /// This verifies that sending a start notification activates the timer.
     #[tokio::test]
     async fn liveness_timer_starts_on_notification() {
@@ -1555,7 +1555,7 @@ mod tests {
 
     /// Test that liveness timer resets on message activity.
     ///
-    /// ADR-0014: Timer resets on any stdout activity (response or notification).
+    /// ls-bridge-async-connection: Timer resets on any stdout activity (response or notification).
     /// This verifies that receiving a message resets the timer to full duration.
     ///
     /// Uses paused time for deterministic testing - avoids CI flakiness from
@@ -1616,7 +1616,7 @@ mod tests {
 
     /// Test that liveness timer stops when pending count returns to 0.
     ///
-    /// ADR-0014: Timer stops when pending count returns to 0.
+    /// ls-bridge-async-connection: Timer stops when pending count returns to 0.
     /// This verifies that when the last response is received, the timer is deactivated.
     #[tokio::test]
     async fn liveness_timer_stops_when_pending_zero() {
@@ -1674,7 +1674,7 @@ mod tests {
 
     /// Test that liveness timeout fires and fails pending requests.
     ///
-    /// ADR-0014: Ready to Failed transition on liveness timeout expiry.
+    /// ls-bridge-async-connection: Ready to Failed transition on liveness timeout expiry.
     /// When timeout fires while pending > 0, router.fail_all() is called.
     #[tokio::test]
     async fn liveness_timeout_fires_and_fails_pending_requests() {

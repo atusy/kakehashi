@@ -1,7 +1,7 @@
 //! Async connection to downstream language server processes via stdio.
 //!
 //! Reader and writer are separated so the reader can move to a dedicated
-//! Reader Task (ADR-0015) for non-blocking response routing.
+//! Reader Task (ls-bridge-message-ordering) for non-blocking response routing.
 
 use std::io;
 use std::process::Stdio;
@@ -38,7 +38,7 @@ impl BridgeWriter {
 /// Reader handle for receiving LSP messages from downstream language server.
 ///
 /// Wraps `BufReader<ChildStdout>` to provide LSP message parsing. Used by the
-/// Reader Task (ADR-0015) for non-blocking response routing via ResponseRouter.
+/// Reader Task (ls-bridge-message-ordering) for non-blocking response routing via ResponseRouter.
 pub(crate) struct BridgeReader {
     stdout: BufReader<ChildStdout>,
 }
@@ -106,7 +106,7 @@ impl BridgeReader {
 ///
 /// `split()` separates the writer (stays for serialized request sending) from
 /// the reader (moves to a dedicated Reader Task for non-blocking response
-/// routing) after initialization (ADR-0015).
+/// routing) after initialization (ls-bridge-message-ordering).
 pub(crate) struct AsyncBridgeConnection {
     child: Option<Child>,         // Option to support taking for split()
     writer: Option<BridgeWriter>, // Option to support taking for split()
@@ -134,7 +134,7 @@ impl SplitConnectionWriter {
     ///
     /// Unix escalates SIGTERM→SIGKILL with a 2s grace period; Windows has no
     /// SIGTERM equivalent so it terminates immediately via `start_kill()` and
-    /// relies on the LSP shutdown/exit handshake for cleanup (ADR-0017).
+    /// relies on the LSP shutdown/exit handshake for cleanup (ls-bridge-graceful-shutdown).
     pub(crate) async fn force_kill_with_escalation(&mut self) {
         #[cfg(unix)]
         {

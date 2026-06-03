@@ -1,12 +1,12 @@
 //! Global shutdown timeout for language server pool.
 //!
 //! This module provides a validated timeout type for graceful shutdown
-//! per ADR-0018 Tier 3 (5-15s range).
+//! per ls-bridge-timeout-hierarchy Tier 3 (5-15s range).
 
 use std::time::Duration;
 
-/// Tier-3 global shutdown ceiling for all connections (ADR-0018, 5–15s,
-/// default 10s). Parallel shutdown under one timeout (ADR-0017); on expiry,
+/// Tier-3 global shutdown ceiling for all connections (ls-bridge-timeout-hierarchy, 5–15s,
+/// default 10s). Parallel shutdown under one timeout (ls-bridge-graceful-shutdown); on expiry,
 /// survivors get `force_kill_all` (SIGTERM→SIGKILL). The 5s floor lets fast
 /// servers finish the LSP handshake; the 15s ceiling caps user wait time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,7 @@ mod tests {
 
     /// Test that GlobalShutdownTimeout type rejects values outside 5-15s range.
     ///
-    /// ADR-0018 specifies the global shutdown timeout should be 5-15s.
+    /// ls-bridge-timeout-hierarchy specifies the global shutdown timeout should be 5-15s.
     /// This test verifies the newtype validation rejects out-of-range values.
     #[test]
     fn global_shutdown_timeout_rejects_out_of_range() {
@@ -155,7 +155,7 @@ mod tests {
 
     /// Test default GlobalShutdownTimeout value.
     ///
-    /// Default should be exactly 10s per ADR-0018 recommendation - a balance between
+    /// Default should be exactly 10s per ls-bridge-timeout-hierarchy recommendation - a balance between
     /// allowing graceful shutdown for fast servers and bounding user wait time.
     ///
     /// This also documents the architectural property: GlobalShutdownTimeout is the
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(
             default_timeout.as_duration(),
             Duration::from_secs(10),
-            "Default should be exactly 10s per ADR-0018"
+            "Default should be exactly 10s per ls-bridge-timeout-hierarchy"
         );
     }
 }

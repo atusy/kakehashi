@@ -593,7 +593,7 @@ async fn run_lsp_server() {
     .finish();
 
     // Wrap service with RequestIdCapture to:
-    // 1. Capture upstream request IDs (for ADR-0016 bridge requests)
+    // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)
     // 2. Forward $/cancelRequest notifications to downstream servers
     let service = RequestIdCapture::with_cancel_forwarder(service, cancel_forwarder);
 

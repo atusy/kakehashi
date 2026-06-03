@@ -1,7 +1,7 @@
 //! Completion request handling for bridge connections.
 //!
 //! Handles the coordinate transformation between host and virtual documents.
-//! Messages are queued via the channel-based writer task (ADR-0015) for FIFO
+//! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
 use std::io;

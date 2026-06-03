@@ -6,9 +6,9 @@
 //! Like document symbol, diagnostic requests operate on the entire document -
 //! they don't take a position parameter.
 //!
-//! Implements ADR-0020 Phase 1: Pull-first diagnostic forwarding.
+//! Implements pull-first-diagnostic-forwarding Phase 1: Pull-first diagnostic forwarding.
 //!
-//! # Single-Writer Loop (ADR-0015)
+//! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
 //! This handler uses `send_request()` to queue requests via the channel-based
 //! writer task, ensuring FIFO ordering with other messages.

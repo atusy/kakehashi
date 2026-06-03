@@ -1,4 +1,4 @@
-//! `textDocument/diagnostic` (pull): ADR-0020 Phase 1 pull-first forwarding
+//! `textDocument/diagnostic` (pull): pull-first-diagnostic-forwarding Phase 1 pull-first forwarding
 //! with multi-region aggregation via parallel fan-out. Push side lives in
 //! `publish_diagnostic.rs`.
 //!
@@ -30,7 +30,7 @@ use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 // Shared diagnostic utilities (used by both pull and push diagnostics)
 // ============================================================================
 
-/// Per-request timeout for diagnostic fan-out (ADR-0020).
+/// Per-request timeout for diagnostic fan-out (pull-first-diagnostic-forwarding).
 ///
 /// Used by both pull diagnostics (textDocument/diagnostic) and
 /// synthetic push diagnostics (didSave/didOpen/didChange triggered).

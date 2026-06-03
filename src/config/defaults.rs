@@ -25,7 +25,7 @@ pub fn default_settings() -> RawWorkspaceSettings {
 
 /// Returns the default languages map containing the wildcard `_` entry.
 ///
-/// The wildcard language is the root of all base chains (ADR-0024).
+/// The wildcard language is the root of all base chains (base-language-inheritance).
 /// It provides default bridge settings: all bridging enabled, with
 /// `Preferred` strategy for most methods and `Concatenated` for diagnostics.
 fn default_languages() -> HashMap<String, LanguageSettings> {

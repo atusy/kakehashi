@@ -56,7 +56,7 @@ pub(super) fn build_notifier<'a>(
     ClientNotifier::new(client.clone(), settings_manager.client_capabilities_lock())
 }
 
-/// Detect the canonical language for a document using the full ADR-0005 chain.
+/// Detect the canonical language for a document using the full language-detection-fallback-chain chain.
 ///
 /// This uses the stored document text and optional language_id so alias resolution
 /// still works even if the document is accessed before didOpen fully completes.
@@ -136,10 +136,10 @@ pub struct Kakehashi {
     auto_install: AutoInstallManager,
     /// Bridge coordinator for downstream LS pool and region ID tracking
     bridge: std::sync::Arc<BridgeCoordinator>,
-    /// Manager for synthetic (background) diagnostic push tasks (ADR-0020 Phase 2).
+    /// Manager for synthetic (background) diagnostic push tasks (pull-first-diagnostic-forwarding Phase 2).
     /// Wrapped in Arc for sharing with debounced diagnostics (Phase 3).
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
-    /// Manager for debounced didChange diagnostic triggers (ADR-0020 Phase 3)
+    /// Manager for debounced didChange diagnostic triggers (pull-first-diagnostic-forwarding Phase 3)
     debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     /// Token for cancelling the upstream forwarding task on shutdown.
     ///

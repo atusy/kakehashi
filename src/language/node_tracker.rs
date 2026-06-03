@@ -1,7 +1,7 @@
-//! Stable node identity tracking (ADR-0019).
+//! Stable node identity tracking (lazy-node-identity-tracking).
 //!
 //! This module provides ULID-based identifiers for tree-sitter nodes (originally
-//! used for injection regions, generalized for [ADR-0025](../../docs/adr/0025-node-reference-protocol.md))
+//! used for injection regions, generalized for [node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md))
 //! that remain stable across document edits using position-based composite keys
 //! with START-priority invalidation.
 
@@ -14,10 +14,10 @@ use url::Url;
 
 /// Tracks stable ULID-based identifiers for tree-sitter nodes.
 ///
-/// Uses position-based composite keys (start_byte, end_byte, kind) per ADR-0019
+/// Uses position-based composite keys (start_byte, end_byte, kind) per lazy-node-identity-tracking
 /// and applies START-priority invalidation rules to maintain stable ULIDs across edits.
 /// Originally introduced for injection regions; generalized for the Node Reference
-/// Protocol ([ADR-0025](../../docs/adr/0025-node-reference-protocol.md)).
+/// Protocol ([node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md)).
 ///
 /// Maintains a bidirectional index per URI:
 /// - forward (`PositionKey -> Ulid`) for assignment / dedup on `get_or_create`
@@ -26,7 +26,7 @@ use url::Url;
 ///
 /// Both directions are kept in sync across `get_or_create`, `adjust_for_edits`,
 /// and `cleanup` so an invalidated ULID becomes indistinguishable from a never-issued
-/// one (per ADR-0019 "no tombstone" rule).
+/// one (per lazy-node-identity-tracking "no tombstone" rule).
 pub(crate) struct NodeTracker {
     entries: DashMap<Url, UriEntries>,
 }
@@ -93,9 +93,9 @@ impl UriEntries {
     }
 }
 
-/// Key for Phase 2 position-based tracking (ADR-0019 composite key).
+/// Key for Phase 2 position-based tracking (lazy-node-identity-tracking composite key).
 ///
-/// Note: Language is NOT part of the key per ADR-0019 specification.
+/// Note: Language is NOT part of the key per lazy-node-identity-tracking specification.
 /// Same position with different language gets different ULID because
 /// kind will differ in the AST (e.g., fenced_code_block vs code_block).
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
@@ -169,7 +169,7 @@ impl EditInfo {
 
     /// Check if this is a zero-length (insertion-only) edit.
     ///
-    /// Zero-length edits get special invalidation handling in ADR-0019.
+    /// Zero-length edits get special invalidation handling in lazy-node-identity-tracking.
     fn is_insertion_only(&self) -> bool {
         self.start_byte == self.old_end_byte
     }
@@ -189,7 +189,7 @@ fn apply_delta(position: usize, delta: i64) -> usize {
     (position as i64).saturating_add(delta).max(0) as usize
 }
 
-/// Adjust a position key based on an edit operation (ADR-0019 position adjustment).
+/// Adjust a position key based on an edit operation (lazy-node-identity-tracking position adjustment).
 ///
 /// Returns the adjusted `PositionKey`, or `None` if the range collapsed
 /// (the node should then be invalidated).
@@ -255,7 +255,7 @@ impl NodeTracker {
 
     /// Get or create a stable ULID for a tree-sitter node.
     ///
-    /// Uses ADR-0019 composite key `(start_byte, end_byte, kind)`: the same
+    /// Uses lazy-node-identity-tracking composite key `(start_byte, end_byte, kind)`: the same
     /// (uri, start, end, kind) always returns the same ULID, while different
     /// nodes at the same position (e.g. nested `document` / `section` / `paragraph`
     /// at byte 0) receive distinct ULIDs.
@@ -279,9 +279,9 @@ impl NodeTracker {
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind)` triple.
     ///
     /// Returns `None` if the ULID was never issued for this URI, if it was
-    /// invalidated by an edit (START fell inside the edit range per ADR-0019),
+    /// invalidated by an edit (START fell inside the edit range per lazy-node-identity-tracking),
     /// or if the URI has been closed. These three cases are deliberately
-    /// indistinguishable — see ADR-0025 "Invalidate vs Not-Found".
+    /// indistinguishable — see node-reference-protocol "Invalidate vs Not-Found".
     pub(crate) fn lookup_position(
         &self,
         uri: &Url,
@@ -356,7 +356,7 @@ impl NodeTracker {
         // This differs from apply_input_edits() which uses FORWARD order because
         // LSP incremental edits use RUNNING coordinates (each edit's position is
         // relative to the document state AFTER all previous edits).
-        // See ADR-0019 for invalidation rules and docs/adr/0019-lazy-node-identity-tracking.md.
+        // See lazy-node-identity-tracking for invalidation rules and docs/architecture-decisions/lazy-node-identity-tracking.md.
         //
         // KNOWN RACE CONDITION (documented, accepted):
         // A concurrent get_or_create() between edit applications may create nodes
@@ -467,7 +467,7 @@ impl NodeTracker {
         all_invalidated
     }
 
-    /// START-priority invalidation (ADR-0019): invalidate when the node's START
+    /// START-priority invalidation (lazy-node-identity-tracking): invalidate when the node's START
     /// lies in the half-open `[edit.start, edit.old_end)`.
     ///
     /// For zero-length inserts the ADR compares old- vs new-tree START, but we
@@ -484,7 +484,7 @@ impl NodeTracker {
         }
     }
 
-    /// Apply a single edit operation with START-priority invalidation (ADR-0019).
+    /// Apply a single edit operation with START-priority invalidation (lazy-node-identity-tracking).
     ///
     /// Returns ULIDs that were invalidated by this edit (for Phase 3 cleanup).
     /// Both the forward and reverse indices for the URI are rebuilt in place,
@@ -749,7 +749,7 @@ mod tests {
     #[test]
     fn test_lookup_position_returns_none_after_invalidation() {
         // After START-priority invalidation, the ULID becomes indistinguishable from
-        // never-issued (ADR-0019 no-tombstone rule, ADR-0025 invalidate-vs-not-found).
+        // never-issued (lazy-node-identity-tracking no-tombstone rule, node-reference-protocol invalidate-vs-not-found).
         let tracker = NodeTracker::new();
         let uri = test_uri("reverse_invalidated");
 
@@ -1019,7 +1019,7 @@ mod tests {
     }
 
     // ============================================================
-    // Phase 2 Tests: ADR-0019 START-Priority Invalidation
+    // Phase 2 Tests: lazy-node-identity-tracking START-Priority Invalidation
     // ============================================================
 
     /// Helper to create test text with unique characters at each position
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[test]
     fn test_node_a_start_before_edit_end_after_keeps_ulid_adjusts_end() {
-        // ADR-0019 Node A: Node START before edit, END after edit → KEEP (adjust end)
+        // lazy-node-identity-tracking Node A: Node START before edit, END after edit → KEEP (adjust end)
         let tracker = NodeTracker::new();
         let uri = test_uri("node_a");
 
@@ -1070,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_node_b_start_before_edit_end_absorbed_keeps_ulid() {
-        // ADR-0019 Node B: Node START before edit, END absorbed/overlaps with edit → KEEP
+        // lazy-node-identity-tracking Node B: Node START before edit, END absorbed/overlaps with edit → KEEP
         //
         // Proper Node B case: Edit partially overlaps node's end region.
         // With end clamping, the end is clamped to edit.new_end_byte.
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn test_node_b_end_exactly_at_edit_end_keeps_ulid() {
-        // ADR-0019 Node B variant: Node END exactly at edit end → KEEP
+        // lazy-node-identity-tracking Node B variant: Node END exactly at edit end → KEEP
         let tracker = NodeTracker::new();
         let uri = test_uri("node_b_exact");
 
@@ -1148,7 +1148,7 @@ mod tests {
 
     #[test]
     fn test_node_c_start_inside_edit_invalidates() {
-        // ADR-0019 Node C: Node START inside edit range → INVALIDATE
+        // lazy-node-identity-tracking Node C: Node START inside edit range → INVALIDATE
         let tracker = NodeTracker::new();
         let uri = test_uri("node_c");
 
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_node_d_fully_inside_edit_invalidates() {
-        // ADR-0019 Node D: Node fully inside edit → INVALIDATE
+        // lazy-node-identity-tracking Node D: Node fully inside edit → INVALIDATE
         let tracker = NodeTracker::new();
         let uri = test_uri("node_d");
 
@@ -1197,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_node_e_after_edit_keeps_ulid_shifts_position() {
-        // ADR-0019 Node E: Node after edit → KEEP (shift position)
+        // lazy-node-identity-tracking Node E: Node after edit → KEEP (shift position)
         let tracker = NodeTracker::new();
         let uri = test_uri("node_e");
 
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_node_f_before_edit_unchanged_keeps_ulid() {
-        // ADR-0019 Node F: Node before edit, no overlap → KEEP (unchanged)
+        // lazy-node-identity-tracking Node F: Node before edit, no overlap → KEEP (unchanged)
         let tracker = NodeTracker::new();
         let uri = test_uri("node_f");
 
@@ -1763,7 +1763,7 @@ mod tests {
 
     #[test]
     fn test_apply_input_edits_inside_node_keeps_with_adjusted_end() {
-        // ADR-0019 Node A case: Edit INSIDE node → KEEP (adjust end)
+        // lazy-node-identity-tracking Node A case: Edit INSIDE node → KEEP (adjust end)
         // Node [10, 20), Edit [15, 18) → [15, 25)
         // START 10 NOT in [15, 18) → KEEP
         let tracker = NodeTracker::new();
@@ -1938,7 +1938,7 @@ mod tests {
 
     #[test]
     fn test_apply_input_edits_zero_length_insert_at_start_invalidates() {
-        // ADR-0019: Zero-length insert AT node START → INVALIDATE
+        // lazy-node-identity-tracking: Zero-length insert AT node START → INVALIDATE
         let tracker = NodeTracker::new();
         let uri = test_uri("zero_at_start");
 
@@ -2065,7 +2065,7 @@ mod tests {
     #[test]
     fn test_apply_input_edits_end_absorbed_keeps_node() {
         // Node's END is inside edit range → clamp end to edit.new_end_byte, KEEP node
-        // This is the "end absorbed" case from ADR-0019
+        // This is the "end absorbed" case from lazy-node-identity-tracking
         //
         // Node [20, 30), Edit: delete [25, 55) → [25, 25)
         // - START 20 NOT in [25, 55) → KEEP (START-priority rule)
@@ -2879,7 +2879,7 @@ mod tests {
         let invalidated = tracker.apply_text_diff(&uri, "AB", "AXB");
 
         // Node's START (1) is at the insert point → invalidated (conservative)
-        // Per ADR-0019: zero-length insert at START → invalidate
+        // Per lazy-node-identity-tracking: zero-length insert at START → invalidate
         assert!(
             invalidated.contains(&n),
             "Node at insert point should be invalidated"

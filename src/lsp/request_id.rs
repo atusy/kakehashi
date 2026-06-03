@@ -1,5 +1,5 @@
 //! Tower middleware that stores each incoming LSP request ID in task-local
-//! storage so downstream bridge requests can reuse the upstream ID (ADR-0016).
+//! storage so downstream bridge requests can reuse the upstream ID (ls-bridge-server-pool-coordination).
 //!
 //! Also intercepts `$/cancelRequest`: forwards it to downstream servers via
 //! `CancelForwarder`, and notifies any handler that subscribed with

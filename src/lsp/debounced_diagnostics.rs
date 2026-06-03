@@ -1,4 +1,4 @@
-//! Debounced synthetic-diagnostic triggers for `didChange` (ADR-0020 Phase 3).
+//! Debounced synthetic-diagnostic triggers for `didChange` (pull-first-diagnostic-forwarding Phase 3).
 //!
 //! Each document has its own timer that resets on every change; firing after the
 //! debounce delay (default 500ms) collects and publishes diagnostics.

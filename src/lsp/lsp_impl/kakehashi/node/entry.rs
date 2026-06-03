@@ -1,8 +1,8 @@
-//! `kakehashi/node` — position → NodeInfo entry point (ADR-0025).
+//! `kakehashi/node` — position → NodeInfo entry point (node-reference-protocol).
 //!
 //! Resolves a `Position` to the smallest tree-sitter node (named or anonymous)
 //! containing that byte at the layer selected by the `injection` parameter
-//! (ADR-0025 PR-4). When `injection` is absent or `false`/`0`, the host tree
+//! (node-reference-protocol PR-4). When `injection` is absent or `false`/`0`, the host tree
 //! is used. When `injection` is `true`, the deepest layer at the cursor is
 //! used (saturating). When `injection` is a non-zero integer, the layer is
 //! resolved via `stack[n]` for positive `n` and `stack[stack.len() + n]` for
@@ -31,7 +31,7 @@ use crate::text::PositionMapper;
 
 /// Request parameters for `kakehashi/node`.
 ///
-/// The `injection` field is a `boolean | number` per ADR-0025 PR-4. We
+/// The `injection` field is a `boolean | number` per node-reference-protocol PR-4. We
 /// deserialize it as a raw `Value` and dispatch on the JSON shape ourselves
 /// because serde-tagged enums would reject the natural `true` / `1` / `-2`
 /// shorthand the spec mandates.
@@ -44,7 +44,7 @@ use crate::text::PositionMapper;
 pub struct NodeParams {
     pub text_document: TextDocumentIdentifier,
     pub position: Position,
-    /// `boolean | number` per ADR-0025 §"The `injection` Parameter". Absent /
+    /// `boolean | number` per node-reference-protocol §"The `injection` Parameter". Absent /
     /// `false` / `0` selects the host layer; `true` saturates to the deepest
     /// layer; a non-zero integer indexes the stack strictly.
     ///
@@ -53,7 +53,7 @@ pub struct NodeParams {
     /// an absent field stays `None` (defaults to host). Plain
     /// `Option<Value>` would collapse the two — serde's default Option
     /// deserialization treats `null` and missing identically — which would
-    /// silently accept an unsupported shape against ADR-0025.
+    /// silently accept an unsupported shape against node-reference-protocol.
     #[serde(default, deserialize_with = "deserialize_present_value")]
     pub injection: Option<Value>,
 }
@@ -76,7 +76,7 @@ where
 /// Keeping this as a small enum (rather than just an `i64`) lets the
 /// handler keep the `true` saturation case and the strict-index case
 /// visibly distinct — they share the result for `-1` but differ in
-/// the bounds-check semantics ADR-0025 spells out.
+/// the bounds-check semantics node-reference-protocol spells out.
 enum InjectionSelector {
     /// Host layer (stack[0]). Triggered by absent, `false`, or `0`.
     Host,
@@ -91,7 +91,7 @@ enum InjectionSelector {
 
 /// Parse the `injection` parameter into an [`InjectionSelector`].
 ///
-/// Per ADR-0025: `false` and `0` are equivalent (host); `true` saturates;
+/// Per node-reference-protocol: `false` and `0` are equivalent (host); `true` saturates;
 /// integer values index strictly. Anything else (string, array, fractional
 /// number, **explicit JSON `null`**) is rejected as `Invalid` so the handler
 /// returns null with a log warning, rather than silently coercing. An absent
@@ -111,7 +111,7 @@ fn parse_injection_selector(value: Option<&Value>) -> InjectionSelector {
 }
 
 /// Resolve a non-zero integer index against a stack of length `stack_len`,
-/// following ADR-0025 §"The `injection` Parameter":
+/// following node-reference-protocol §"The `injection` Parameter":
 ///
 /// - positive `n`: `stack[n]` directly, `null` if `n >= stack_len`
 /// - negative `n`: `stack[stack_len + n]`, `null` if the result is < 0
@@ -157,7 +157,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         }
 
-        // URI conversion failure → null (ADR-0025 universal null semantics).
+        // URI conversion failure → null (node-reference-protocol universal null semantics).
         let Ok(uri) = uri_to_url(&lsp_uri) else {
             log::warn!(target: "kakehashi::node", "invalid URI: {}", lsp_uri.as_str());
             return Ok(Value::Null);
@@ -183,7 +183,7 @@ impl Kakehashi {
 
         // Empty document: end-of-document exception is gated on `L > 0`,
         // and any position is either at byte 0 (no node spans `[0, 0)`) or
-        // out of bounds. ADR-0025 explicitly says empty documents return null.
+        // out of bounds. node-reference-protocol explicitly says empty documents return null.
         let doc_len = text.len();
         if doc_len == 0 {
             return Ok(Value::Null);
@@ -465,7 +465,7 @@ impl Kakehashi {
 }
 
 /// Find the smallest node containing `byte` under the half-open `[start, end)` rule,
-/// with the ADR-0025 end-of-document exception.
+/// with the node-reference-protocol end-of-document exception.
 ///
 /// PR-1 only honours the exception case at the document end; the rest of the
 /// lookup uses tree-sitter's `descendant_for_byte_range(byte, byte)`, which
@@ -477,7 +477,7 @@ fn smallest_containing_node(
 ) -> Option<tree_sitter::Node<'_>> {
     let root = tree.root_node();
 
-    // End-of-document exception (ADR-0025 §"End-of-Document Exception"):
+    // End-of-document exception (node-reference-protocol §"End-of-Document Exception"):
     //   gated on doc_len > 0. The empty-document path returns null earlier.
     if byte == doc_len {
         // Pick the smallest descendant whose end_byte == doc_len.

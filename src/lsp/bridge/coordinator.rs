@@ -20,12 +20,12 @@ use super::LanguageServerPool;
 /// An injection region resolved from a host document.
 ///
 /// Represents a single code block embedded in a host document (e.g., a Lua
-/// code fence in a markdown file) along with its stable region ID (ADR-0019).
+/// code fence in a markdown file) along with its stable region ID (lazy-node-identity-tracking).
 #[derive(Debug, Clone)]
 pub(crate) struct BridgeInjection {
     /// The injection language (e.g., "lua", "python", "rust")
     pub(crate) language: String,
-    /// Stable ULID-based region ID (ADR-0019)
+    /// Stable ULID-based region ID (lazy-node-identity-tracking)
     pub(crate) region_id: String,
     /// The text content of the injection region
     pub(crate) content: String,
@@ -183,7 +183,7 @@ impl BridgeCoordinator {
     /// Resolve `bridge.servers` for `injection_language`, returning the
     /// `ResolvedServerConfig` (server name for pooling + spawn config) or
     /// `None` when no server matches, or the host's bridge filter excludes
-    /// this injection. Host lookup uses wildcard resolution (ADR-0011):
+    /// this injection. Host lookup uses wildcard resolution (wildcard-config-inheritance):
     /// undefined hosts inherit `languages._`, letting one default filter apply
     /// to every host.
     pub(crate) fn get_config_for_language(
@@ -209,7 +209,7 @@ impl BridgeCoordinator {
         }
 
         // Look for a server that handles this language
-        // ADR-0011: Resolve each server with wildcard BEFORE checking languages,
+        // wildcard-config-inheritance: Resolve each server with wildcard BEFORE checking languages,
         // because languages list may be inherited from languageServers._
         let servers = &settings.language_servers;
         for server_name in servers.keys() {
