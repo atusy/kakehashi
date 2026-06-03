@@ -145,7 +145,7 @@ Virtual documents may be **logical** (in-memory only) or **materialized** (writt
 **Why materialization is sometimes required**: Some language servers (notably rust-analyzer) index from the filesystem rather than relying solely on `didOpen` content. They return `null` for queries when files don't exist on disk or lack project context.
 
 For materialized documents:
-- Create temporary project structure (see [language-server-bridge](language-server-bridge.md#server-specific-workspace-provisioning))
+- Create temporary project structure (see [language-server-bridge](language-server-bridge.md#workspace-provisioning))
 - Write injection content to real file
 - Use real file URI in LSP communication
 - Clean up on document close or server shutdown
