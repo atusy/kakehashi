@@ -1,11 +1,5 @@
 # LS Bridge Async Connection
 
-| | |
-|---|---|
-| **Status** | Draft |
-| **Date** | 2026-01-05 |
-| **Decision-makers** | atusy |
-
 ## Scope
 
 This decision defines how to communicate with **a single downstream language server** via stdio. It covers:

@@ -1,11 +1,5 @@
 # Node Reference Protocol
 
-| | |
-|---|---|
-| **Date** | 2026-05-27 |
-| **Status** | Draft |
-| **Type** | Protocol Extension |
-
 **Related Decisions**:
 - [lazy-node-identity-tracking](lazy-node-identity-tracking.md) — Underlying identity tracking algorithm
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model for injection regions

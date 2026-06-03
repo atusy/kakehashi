@@ -1,9 +1,5 @@
 # Base Language Inheritance
 
-## Status
-
-Accepted (Supersedes `aliases` field from [language-detection-fallback-chain](language-detection-fallback-chain.md))
-
 ## Context
 
 The current system uses an `aliases` field to map alternative language names to a canonical language:

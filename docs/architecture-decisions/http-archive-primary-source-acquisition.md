@@ -1,13 +1,5 @@
 # HTTP Archive Primary Source Acquisition
 
-| | |
-|---|---|
-| **Status** | accepted |
-| **Date** | 2026-02-26 |
-| **Decision-makers** | atusy |
-| **Consulted** | Claude Code |
-| **Informed** | kakehashi users |
-
 ## Context and Problem Statement
 
 Parser installation used a 3-step git clone process (`clone --depth 1`, `fetch revision`, `checkout FETCH_HEAD`). This required git to be installed and was slower than necessary — git protocol negotiation, ref advertisement, and packfile creation add overhead for what is essentially "download these source files."

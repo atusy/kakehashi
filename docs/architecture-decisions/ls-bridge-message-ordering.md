@@ -1,10 +1,5 @@
 # LS Bridge Message Ordering
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Date** | 2026-01-06 |
-
 **Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — This decision covers Phase 1; optional coalescing deferred to Phase 2.
 
 ## Scope

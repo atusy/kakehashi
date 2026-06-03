@@ -1,10 +1,5 @@
 # LS Bridge Graceful Shutdown
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Date** | 2026-01-06 |
-
 ## Context
 
 ls-bridge-async-connection (Async Bridge Connection), ls-bridge-message-ordering (Message Ordering), and ls-bridge-server-pool-coordination (Server Pool Coordination) establish the communication architecture but do not specify shutdown behavior.

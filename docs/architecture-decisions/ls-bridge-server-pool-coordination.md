@@ -1,10 +1,5 @@
 # LS Bridge Server Pool Coordination
 
-| | |
-|---|---|
-| **Status** | Draft |
-| **Date** | 2026-01-07 |
-
 **Related**:
 - [ls-bridge-async-connection](ls-bridge-async-connection.md): Single-connection async I/O
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md): Single-server message ordering

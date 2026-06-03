@@ -1,10 +1,5 @@
 # Semantic Token Overlap Resolution
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Date** | 2026-02-14 |
-
 ## Decision–Implementation Gap
 
 Phases 1–2 are implemented, including basic multiline token splitting. Further

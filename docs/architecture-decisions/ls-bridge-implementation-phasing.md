@@ -1,11 +1,5 @@
 # LS Bridge Implementation Phasing
 
-| | |
-|---|---|
-| **Date** | 2026-01-08 |
-| **Status** | Draft |
-| **Type** | Cross-Decision Coordination |
-
 ## Context
 
 The async bridge architecture spans multiple decisions (0014-0018), each defining features at different complexity levels. Without a clear phasing strategy, it's unclear:

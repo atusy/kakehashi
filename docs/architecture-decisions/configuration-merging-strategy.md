@@ -1,9 +1,5 @@
 # Configuration Merging Strategy
 
-## Status
-
-Accepted (Implemented across Sprints 118, 119, 120)
-
 ## Context
 
 kakehashi needs to support multiple configuration sources to accommodate different use cases:

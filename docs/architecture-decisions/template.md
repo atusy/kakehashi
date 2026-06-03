@@ -10,10 +10,6 @@ Keep the alternatives that were genuinely considered: this directory records the
 *decisions*, including the options weighed and why the chosen one won.
 -->
 
-## Status
-
-Proposed | Accepted | Deprecated
-
 ## Context
 
 What is the issue motivating this decision? What constraints and forces apply?

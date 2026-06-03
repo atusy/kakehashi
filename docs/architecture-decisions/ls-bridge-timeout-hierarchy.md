@@ -1,11 +1,5 @@
 # LS Bridge Timeout Hierarchy
 
-| | |
-|---|---|
-| **Date** | 2026-01-06 |
-| **Status** | Draft |
-| **Type** | Cross-Decision Coordination |
-
 **Related Decisions**:
 - [ls-bridge-async-connection](ls-bridge-async-connection.md) § Liveness Timeout & Initialization Timeout
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) § Response Aggregation

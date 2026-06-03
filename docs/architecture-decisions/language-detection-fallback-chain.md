@@ -1,8 +1,6 @@
 # Language Detection Fallback Chain
 
-## Status
-
-Accepted. The `aliases` field (`build_alias_map()`, `resolve_alias()`) is superseded by the `base` field (see [base-language-inheritance](base-language-inheritance.md)); the detection fallback chain (languageId → token → first-line) and syntect normalization remain unchanged.
+> The `aliases` field (`build_alias_map()`, `resolve_alias()`) is superseded by the `base` field (see [base-language-inheritance](base-language-inheritance.md)); the detection fallback chain (languageId → token → first-line) and syntect normalization remain unchanged.
 
 ## Context
 

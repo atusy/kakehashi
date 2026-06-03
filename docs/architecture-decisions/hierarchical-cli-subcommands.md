@@ -1,9 +1,5 @@
 # Hierarchical CLI Subcommands
 
-## Status
-
-Accepted
-
 ## Context
 
 kakehashi started with flat CLI commands:

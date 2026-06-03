@@ -1,13 +1,5 @@
 # Replace tree-sitter-cli with Loader
 
-| | |
-|---|---|
-| **Status** | accepted |
-| **Date** | 2026-02-26 |
-| **Decision-makers** | atusy |
-| **Consulted** | Claude Code |
-| **Informed** | kakehashi users |
-
 ## Context and Problem Statement
 
 kakehashi required users to install `tree-sitter-cli` (via `cargo install tree-sitter-cli`) as a runtime dependency for parser compilation. This in turn required the entire Rust toolchain — a significant barrier for users who only want to use kakehashi as an LSP server.

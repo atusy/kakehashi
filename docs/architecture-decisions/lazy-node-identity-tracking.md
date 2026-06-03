@@ -1,11 +1,5 @@
 # Lazy Node Identity Tracking
 
-| | |
-|---|---|
-| **Date** | 2026-01-12 |
-| **Status** | Draft |
-| **Type** | Core Infrastructure |
-
 **Related Decisions**:
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model for injection regions
 - [node-reference-protocol](node-reference-protocol.md) — Protocol exposing tracked node identities to clients

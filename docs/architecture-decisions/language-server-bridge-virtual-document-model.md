@@ -1,9 +1,5 @@
 # Language Server Bridge Virtual Document Model
 
-## Status
-
-Proposed
-
 ## Decision–Implementation Gap
 
 `isolation=true` (one virtual document per injection region) is implemented.

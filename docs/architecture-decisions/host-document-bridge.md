@@ -1,11 +1,5 @@
 # Host Document Bridge
 
-| | |
-|---|---|
-| **Date** | 2026-05-28 |
-| **Status** | Proposed |
-| **Type** | Configuration Schema Extension |
-
 **Related Decisions**:
 - [language-server-bridge](language-server-bridge.md) — Bridge concept introduction
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)

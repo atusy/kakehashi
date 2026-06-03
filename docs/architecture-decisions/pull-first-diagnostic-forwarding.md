@@ -1,10 +1,5 @@
 # Pull-First Diagnostic Forwarding
 
-| | |
-|---|---|
-| **Status** | Accepted (Phases 1-3 Implemented) |
-| **Date** | 2026-01-29 |
-
 **Related**:
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Request-Specific Bridge Strategies (Strategy 4: Background Collection)
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md): Server Pool Coordination (Notification Forwarding)

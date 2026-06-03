@@ -1,9 +1,5 @@
 # Language Server Bridge
 
-## Status
-
-Proposed
-
 ## Decision–Implementation Gap
 
 As recorded, only Phase 1 (bridge infrastructure with working go-to-definition)

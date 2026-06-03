@@ -1,11 +1,9 @@
 # Language Server Bridge Request Strategies
 
-## Status
-
-Accepted. The single-LS, per-method strategies defined here remain in effect.
-Multi-LS routing, aggregation, and initialization-window handling are covered by
-[ls-bridge-message-ordering](ls-bridge-message-ordering.md) and
-[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md).
+> The single-LS, per-method strategies defined here remain in effect. Multi-LS
+> routing, aggregation, and initialization-window handling are covered by
+> [ls-bridge-message-ordering](ls-bridge-message-ordering.md) and
+> [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md).
 
 ## Decision–Implementation Gap
 

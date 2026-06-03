@@ -1,9 +1,5 @@
 # Wildcard Config Inheritance
 
-## Status
-
-Implemented (Sprints 121-123)
-
 ## Context
 
 configuration-merging-strategy defines how configuration merges across layers (user → project → InitializationOptions). However, there's another dimension of merging: **within a single config**, the `_` (wildcard) key serves as defaults that should be inherited by specific entries.
