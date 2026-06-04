@@ -79,7 +79,7 @@ This matches AST semantics: a `fenced_code_block` remains the "same" block when 
 Multiple nodes can share the same START byte position (e.g., a `document` node, `section` node, and `paragraph` node all starting at byte 0). To ensure unique identification, the `NodeTracker` uses a composite key:
 
 ```
-Key = (start_byte, end_byte, kind)
+Key = (start_byte, end_byte, kind, layer)
 ```
 
 | Field | Purpose |
@@ -87,15 +87,55 @@ Key = (start_byte, end_byte, kind)
 | `start_byte` | Primary identity anchor (per START-priority rule) |
 | `end_byte` | Disambiguates nested nodes at same start position |
 | `kind` | Disambiguates nodes with identical spans but different types |
+| `layer` | Disambiguates host vs injected nodes that share an identical span **and** kind (injection depth; `0` = host) |
 
 **Example**: At position 0-100, three nodes might exist:
-- `(0, 100, "document")` → ULID_A
-- `(0, 100, "section")` → ULID_B
-- `(0, 50, "paragraph")` → ULID_C
+- `(0, 100, "document", 0)` → ULID_A
+- `(0, 100, "section", 0)` → ULID_B
+- `(0, 50, "paragraph", 0)` → ULID_C
 
 All three have distinct keys and receive separate ULIDs.
 
-**Invalidation with composite keys**: The START-priority rule applies to the `start_byte` component. When `start_byte ∈ [edit.start, edit.old_end)`, all entries with that `start_byte` are invalidated regardless of their `end_byte` or `kind`.
+#### Why `layer` is part of the key
+
+`kind` alone was originally assumed sufficient to separate co-located nodes from
+different injection layers — "a Markdown `code_fence_content` vs a Python
+`module` differ by kind". That assumption breaks under **recursive same-language
+injection**: a ` ```markdown ` block injected into a Markdown host produces a
+`paragraph` (or any node kind) at the **same span and kind** in both the host
+tree and the injected tree. Without `layer`, both collapse to one ULID, and
+navigation ([node-reference-protocol](node-reference-protocol.md)) can no longer
+tell which language tree the ID belongs to — violating that protocol's per-layer
+Scope rule. Adding `layer` makes the host and injected nodes distinct ULIDs,
+eliminating the collision at its root.
+
+`layer` is **internal**: it lives only inside `PositionKey`. Clients receive an
+opaque ULID and never see the layer, so its representation can change without any
+protocol-visible effect.
+
+##### Layer discriminator: considered options
+
+The discriminator must (a) separate host from injected nodes including the
+same-language case, and (b) stay stable across edits per the START-priority rule.
+
+1. **Language name** — rejected: cannot separate same-language recursion
+   (markdown-in-markdown share the name "markdown").
+2. **Containing injection region's ULID** (host = sentinel) — viable and the
+   most edit-stable: a region ULID is itself START-anchored, so it survives
+   edits that restructure outer nesting. Rejected **for now** as over-engineered:
+   the injection-stack walk does not currently carry region IDs, and
+   `calculate_region_id` is itself a `get_or_create` caller (a chicken-and-egg to
+   break), so it is materially more invasive than the bug requires.
+3. **Injection depth index** (`0` = host, `1+` = nesting depth) — **chosen**.
+   It is already in scope at every mint site (the stack index) and at resolve
+   time (`stack[layer]`), so it is nearly free to plumb. Its one weakness is
+   that an edit which *restructures* injection nesting (adds/removes an outer
+   layer) shifts a node's depth, so a held ULID stops resolving — but it
+   degrades to a safe `null` ("re-acquire" per node-reference-protocol), never to
+   wrong-tree navigation. If that churn ever proves painful in practice, switch
+   to option 2; because `layer` is internal, the swap is non-breaking.
+
+**Invalidation with composite keys**: The START-priority rule applies to the `start_byte` component. When `start_byte ∈ [edit.start, edit.old_end)`, all entries with that `start_byte` are invalidated regardless of their `end_byte`, `kind`, or `layer`. The `layer` value is edit-invariant (a depth index does not move with byte positions), so position adjustment carries it through unchanged.
 
 ### Bidirectional Indexing
 
@@ -148,7 +188,8 @@ More text
 ### Negative
 
 - **Lookup table rebuild**: After edit, reverse lookup must be rebuilt
-- **Nested nodes**: Multiple nodes at same position require `(start, end, kind)` tuple for uniqueness (see [Node Uniqueness Key](#node-uniqueness-key))
+- **Nested nodes**: Multiple nodes at same position require the `(start, end, kind, layer)` tuple for uniqueness (see [Node Uniqueness Key](#node-uniqueness-key))
+- **Injection restructuring churn**: Because `layer` is an injection depth index, an edit that adds or removes an *outer* injection layer shifts an inner node's depth, invalidating its held ULID (degrades to a safe `null`, never wrong-tree). See the layer-discriminator options above
 - **START edits invalidate**: Editing a code block's opening delimiter invalidates its ID
 - **START shifts outside range**: Nodes whose START shifts due to earlier edits are preserved
 - **Injection region reordering**: When code blocks are inserted or deleted above tracked injection regions, those regions' container nodes are preserved (START unchanged), but their ordinal position changes. Systems relying on positional region IDs (e.g., `region-0`, `region-1`) must handle URI changes via close/reopen cycles
@@ -195,7 +236,7 @@ Invalidate any node whose range overlaps with the edit range.
 |--------|----------|
 | **Assignment** | Lazy (on-demand) |
 | **Identifier** | ULID |
-| **Uniqueness key** | `(start_byte, end_byte, kind)` |
+| **Uniqueness key** | `(start_byte, end_byte, kind, layer)` |
 | **Invalidation** | START-priority boundary-based |
 | **Storage** | Per-document |
 | **Indexing** | Bidirectional (`PositionKey ↔ Ulid`) |
