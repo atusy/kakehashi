@@ -1,4 +1,4 @@
-//! `textDocument/diagnostic` (pull): pull-first-diagnostic-forwarding Phase 1 pull-first forwarding
+//! `textDocument/diagnostic` (pull): Phase 1 of pull-first-diagnostic-forwarding,
 //! with multi-region aggregation via parallel fan-out. Push side lives in
 //! `publish_diagnostic.rs`.
 //!

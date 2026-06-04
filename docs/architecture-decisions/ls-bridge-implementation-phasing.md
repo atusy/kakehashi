@@ -2,7 +2,7 @@
 
 ## Context
 
-The async bridge architecture spans multiple decisions (0014-0018), each defining features at different complexity levels. Without a clear phasing strategy, it's unclear:
+The async bridge architecture spans multiple decisions, each defining features at different complexity levels. Without a clear phasing strategy, it's unclear:
 - What must be implemented first
 - What can be deferred
 - How features depend on each other
@@ -103,13 +103,13 @@ The async bridge architecture spans multiple decisions (0014-0018), each definin
 
 ## Decision Phase Mapping
 
-| decision | Phase 1 Scope | Phase 2 Additions | Phase 3 Additions |
+| Decision | Phase 1 Scope | Phase 2 Additions | Phase 3 Additions |
 |-----|---------------|-------------------|-------------------|
-| **0014** (Connection) | Async I/O, timeouts | — | — |
-| **0015** (Ordering) | Thin bridge, forwarding | Optional coalescing, telemetry | — |
-| **0016** (Coordination) | Simple routing, lifecycle | Rate-limited respawn | Aggregation, fan-out |
-| **0017** (Shutdown) | Graceful shutdown | — | — |
-| **0018** (Timeouts) | Init, Liveness, Global | — | Per-request timeout |
+| **ls-bridge-async-connection** (Connection) | Async I/O, timeouts | — | — |
+| **ls-bridge-message-ordering** (Ordering) | Thin bridge, forwarding | Optional coalescing, telemetry | — |
+| **ls-bridge-server-pool-coordination** (Coordination) | Simple routing, lifecycle | Rate-limited respawn | Aggregation, fan-out |
+| **ls-bridge-graceful-shutdown** (Shutdown) | Graceful shutdown | — | — |
+| **ls-bridge-timeout-hierarchy** (Timeouts) | Init, Liveness, Global | — | Per-request timeout |
 
 ## Consequences
 

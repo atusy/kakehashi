@@ -1,7 +1,7 @@
 //! Stable node identity tracking (lazy-node-identity-tracking).
 //!
-//! This module provides ULID-based identifiers for tree-sitter nodes (originally
-//! used for injection regions, generalized for [node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md))
+//! This module provides ULID-based identifiers for tree-sitter nodes — originally
+//! used for injection regions, now generalized for [node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md) —
 //! that remain stable across document edits using position-based composite keys
 //! with START-priority invalidation.
 

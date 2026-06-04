@@ -252,7 +252,7 @@ fn test_node_text_survives_edit_that_does_not_touch_start() {
 }
 
 /// Invalidation: an edit whose range covers the node's START byte must drop the
-/// ULID per the lazy-node-identity-tracking decision's START-priority rule. node-reference-protocol collapses
+/// ULID per the lazy-node-identity-tracking decision's START-priority rule. The node-reference-protocol decision collapses
 /// invalidated / never-issued / mismatched-URI cases into a single null
 /// response, so `kakehashi/node/text` must return null after the edit.
 #[test]
