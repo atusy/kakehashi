@@ -1,8 +1,4 @@
-# ADR-0010: Configuration Merging Strategy
-
-## Status
-
-Accepted (Implemented across Sprints 118, 119, 120)
+# Configuration Merging Strategy
 
 ## Context
 
@@ -19,7 +15,7 @@ The limitations of the current system are:
 - **Project-specific settings** are only based on `./kakehashi.toml`
 - Complex `captureMappings` overrides must be duplicated in each project's `kakehashi.toml`
 
-The standard pattern in many language servers and CLI tools is layered configuration with clear precedence rules. This ADR proposes adding a **user configuration layer** between programmed defaults and project config.
+The standard pattern in many language servers and CLI tools is layered configuration with clear precedence rules. This decision proposes adding a **user configuration layer** between programmed defaults and project config.
 
 ## Decision
 
@@ -309,8 +305,8 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 ### 6. Merge queries per-kind instead of replacing entire array
 - Pro: Override only highlights while inheriting locals from user config
 - Con: Significantly more complex merge logic
-- Decision: Keep simple array replacement; users can use ADR-0011 wildcard inheritance for shared queries
+- Decision: Keep simple array replacement; users can use wildcard-config-inheritance wildcard inheritance for shared queries
 
 ## Related Decisions
 
-- [ADR-0011](0011-wildcard-config-inheritance.md): Wildcard inheritance within a single config layer
+- [wildcard-config-inheritance](wildcard-config-inheritance.md): Wildcard inheritance within a single config layer

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Resolve a key from a map with wildcard fallback and merging.
 ///
-/// Implements ADR-0011 wildcard config inheritance for HashMap-based settings:
+/// Implements wildcard config inheritance (wildcard-config-inheritance) for HashMap-based settings:
 /// - If both wildcard ("_") and specific key exist: merge them via `merge`
 /// - If only wildcard exists: return wildcard (cloned)
 /// - If only specific key exists: return specific key (cloned)
@@ -55,7 +55,7 @@ pub(crate) fn merge_bridge_language_configs(
 
 /// Field-level merge of two BridgeServerConfig values.
 /// Vec fields: use overlay if non-empty, else base.
-/// JSON Option fields: deep merge (ADR-0010).
+/// JSON Option fields: deep merge (configuration-merging-strategy).
 /// Option fields: overlay wins when present.
 pub(crate) fn merge_bridge_server_configs(
     base: &BridgeServerConfig,
@@ -102,7 +102,7 @@ pub(crate) fn merge_language_settings(
 }
 
 /// Resolve base configs: for each language, walk the `base` chain and merge
-/// configs using most-specific-wins semantics (ADR-0024 Phase 2).
+/// configs using most-specific-wins semantics (base-language-inheritance Phase 2).
 ///
 /// The chain is built from most-specific (leaf) to least-specific (root),
 /// then merged root-to-leaf so that more specific entries override less
@@ -142,7 +142,7 @@ pub(crate) fn resolve_base_configs(
 /// Example: for `rmd` with `base = "markdown"`, and `markdown` with no base,
 /// the chain is `["rmd", "markdown", "_"]`.
 ///
-/// Languages with no explicit `base` implicitly chain to `_` (ADR-0024).
+/// Languages with no explicit `base` implicitly chain to `_` (base-language-inheritance).
 /// `_` itself terminates when its `base` is `None` or self-referential.
 fn build_base_chain(name: &str, languages: &HashMap<String, LanguageSettings>) -> Vec<String> {
     let mut chain = vec![name.to_string()];
@@ -234,7 +234,7 @@ fn merge_bridge_maps(
     }
 }
 
-/// Deep merge two JSON values (ADR-0010).
+/// Deep merge two JSON values (configuration-merging-strategy).
 ///
 /// For objects: recursively merge keys, with `overlay` values taking precedence.
 /// For non-objects: `overlay` completely replaces `base`.
@@ -647,11 +647,11 @@ mod tests {
         assert!(bridge.contains_key("javascript"));
     }
 
-    // Languages wildcard inheritance (ADR-0011)
+    // Languages wildcard inheritance (wildcard-config-inheritance)
 
     #[test]
     fn test_specific_values_override_wildcards_at_both_levels() {
-        // ADR-0011: python.bridge.javascript overrides _.bridge._ settings
+        // wildcard-config-inheritance: python.bridge.javascript overrides _.bridge._ settings
         // Setup:
         // - languages._ has bridge._ with enabled = true (default)
         // - languages.python has bridge.javascript with enabled = false (override)
@@ -722,7 +722,7 @@ mod tests {
         );
 
         // Rust: inherited from _.bridge._ through deep merge
-        // ADR-0011: bridge maps are deep merged, so python gets wildcard's bridge._
+        // wildcard-config-inheritance: bridge maps are deep merged, so python gets wildcard's bridge._
         let rust_resolved = resolve_with_wildcard(bridge, "rust", merge_bridge_language_configs);
         assert!(
             rust_resolved.is_some(),
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_specific_bridge_with_nested_wildcard() {
-        // ADR-0011: Test case where python.bridge includes _ wildcard
+        // wildcard-config-inheritance: Test case where python.bridge includes _ wildcard
         // - languages.python.bridge._ = enabled: true (python-specific default)
         // - languages.python.bridge.javascript = enabled: false (override)
         // - rust should inherit from python.bridge._ (enabled = true)
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_nested_wildcard_resolution_outer_then_inner() {
-        // ADR-0011: Nested wildcard resolution applies outer then inner
+        // wildcard-config-inheritance: Nested wildcard resolution applies outer then inner
         // Resolution order:
         // 1. Resolve outer: languages._ -> languages.python
         // 2. Resolve inner: bridge._ -> bridge.rust
@@ -847,7 +847,7 @@ mod tests {
 
     #[test]
     fn test_resolve_language_with_wildcard_deep_merges_bridge_maps() {
-        // ADR-0011: Bridge maps should be deep merged, not overridden
+        // wildcard-config-inheritance: Bridge maps should be deep merged, not overridden
         //
         // Setup:
         // - languages._.bridge = { rust: enabled=true, go: enabled=true }
@@ -937,9 +937,9 @@ mod tests {
         );
     }
 
-    // languageServers wildcard inheritance (ADR-0011)
+    // languageServers wildcard inheritance (wildcard-config-inheritance)
 
-    /// ADR-0011: resolve_with_wildcard covers all 4 match arms for language servers.
+    /// wildcard-config-inheritance: resolve_with_wildcard covers all 4 match arms for language servers.
     ///
     /// - Neither wildcard nor specific → None
     /// - Wildcard only → cloned wildcard
@@ -1010,9 +1010,9 @@ mod tests {
         );
     }
 
-    // Deep merge for initialization_options (ADR-0010)
+    // Deep merge for initialization_options (configuration-merging-strategy)
 
-    /// ADR-0010: initialization_options deep merge covers three behaviors:
+    /// configuration-merging-strategy: initialization_options deep merge covers three behaviors:
     /// - Disjoint keys: both preserved (feature1 from base, feature2 from overlay)
     /// - Same key: overlay wins (shared_opt = "overlay")
     /// - Nested objects: recursively merged (nested.base_only + nested.overlay_only)
@@ -1209,7 +1209,7 @@ mod tests {
 
     /// Test that server lookup finds servers when languages list is inherited from wildcard.
     ///
-    /// ADR-0011: When languageServers.rust-analyzer has empty languages but
+    /// wildcard-config-inheritance: When languageServers.rust-analyzer has empty languages but
     /// languageServers._ specifies languages = ["rust"], the lookup should still
     /// find rust-analyzer for Rust injections because the languages list is
     /// inherited from the wildcard during resolution.

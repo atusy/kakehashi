@@ -72,7 +72,7 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
 
-    // Layer 1: Programmed defaults (ADR-0010: lowest precedence)
+    // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
@@ -156,7 +156,7 @@ fn load_user_config_with_events(events: &mut Vec<SettingsEvent>) -> Option<RawWo
 /// Load a TOML config file from an explicit path (used with `--config-file`).
 ///
 /// Unlike `load_toml_settings`, non-existent files are treated as errors
-/// because explicit paths represent user intent (ADR-0010).
+/// because explicit paths represent user intent (configuration-merging-strategy).
 fn load_toml_file(path: &Path, events: &mut Vec<SettingsEvent>) -> Option<RawWorkspaceSettings> {
     if !path.exists() {
         events.push(SettingsEvent::error(format!(
@@ -554,7 +554,7 @@ mod tests {
         );
     }
 
-    /// load_toml_file: non-existent path returns None + error event (ADR-0010).
+    /// load_toml_file: non-existent path returns None + error event (configuration-merging-strategy).
     #[test]
     fn test_load_toml_file_missing() {
         let mut events = Vec::new();

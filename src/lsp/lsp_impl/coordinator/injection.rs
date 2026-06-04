@@ -67,7 +67,7 @@ impl InjectionCoordinator {
     }
 
     /// Resolve all injection regions for a document, with stable region IDs from
-    /// `NodeTracker` (ADR-0019). Empty Vec when nothing matches.
+    /// `NodeTracker` (lazy-node-identity-tracking). Empty Vec when nothing matches.
     ///
     /// Lock safety: the document store lock is held only long enough to clone the
     /// tree and text, then released before the tree traversal — no DashMap deadlock risk.

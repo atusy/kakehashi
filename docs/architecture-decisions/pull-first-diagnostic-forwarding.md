@@ -1,14 +1,9 @@
-# ADR-0020: Pull-First Diagnostic Forwarding Strategy
-
-| | |
-|---|---|
-| **Status** | Accepted (Phases 1-3 Implemented) |
-| **Date** | 2026-01-29 |
+# Pull-First Diagnostic Forwarding
 
 **Related**:
-- [ADR-0008](0008-language-server-bridge-request-strategies.md): Request-Specific Bridge Strategies (Strategy 4: Background Collection)
-- [ADR-0016](0016-ls-bridge-server-pool-coordination.md): Server Pool Coordination (Notification Forwarding)
-- [ADR-0015](0015-ls-bridge-message-ordering.md): Message Ordering
+- [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Request-Specific Bridge Strategies (Strategy 4: Background Collection)
+- [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md): Server Pool Coordination (Notification Forwarding)
+- [ls-bridge-message-ordering](ls-bridge-message-ordering.md): Message Ordering
 
 ## Context
 
@@ -22,7 +17,7 @@ Diagnostics must be:
 3. **Fresh**: Diagnostics must reflect the current document state, not stale versions
 4. **Timely**: Users expect feedback within a reasonable latency window
 
-### Original Approach: Push-First (ADR-0008 Strategy 4)
+### Original Approach: Push-First (language-server-bridge-request-strategies Strategy 4)
 
 The original plan followed a push-first model:
 
@@ -338,13 +333,13 @@ kakehashi should advertise pull diagnostic support:
 }
 ```
 
-## Related ADRs
+## Related Decisions
 
-- **[ADR-0007](0007-language-server-bridge-virtual-document-model.md)**: Virtual Document Model
+- **[language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md)**: Virtual Document Model
   - Defines how injection regions become virtual documents
-- **[ADR-0008](0008-language-server-bridge-request-strategies.md)**: Request Strategies
-  - This ADR supersedes Strategy 4 (Background Collection) for diagnostics
-- **[ADR-0015](0015-ls-bridge-message-ordering.md)**: Message Ordering
+- **[language-server-bridge-request-strategies](language-server-bridge-request-strategies.md)**: Request Strategies
+  - This decision supersedes Strategy 4 (Background Collection) for diagnostics
+- **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Message Ordering
   - Request forwarding patterns apply to diagnostic fan-out
-- **[ADR-0016](0016-ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
+- **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
   - Notification Forwarding section updated by this decision

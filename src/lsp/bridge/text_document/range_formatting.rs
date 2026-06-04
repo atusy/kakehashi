@@ -5,7 +5,7 @@
 //! before forwarding, and the response transformer ([`transform_formatting_response_to_host`])
 //! is shared with full formatting since the payload shape is identical.
 //!
-//! # Single-Writer Loop (ADR-0015)
+//! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
 //! This handler uses `send_request()` to queue requests via the channel-based
 //! writer task, ensuring FIFO ordering with other messages.

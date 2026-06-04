@@ -1,6 +1,6 @@
 //! Shared helpers for resolving tracker entries back to tree-sitter nodes.
 //!
-//! Multiple ADR-0025 handlers (`parent`, `children`, …) need to recover a
+//! Multiple node-reference-protocol handlers (`parent`, `children`, …) need to recover a
 //! `tree_sitter::Node` from a tracked `(start_byte, end_byte, kind)` triple in
 //! the current parse tree. Tree-sitter exposes no direct "find by composite
 //! key" API, so this module centralises the upward-walk strategy used by all

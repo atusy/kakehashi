@@ -1,12 +1,8 @@
-# ADR-0011: Wildcard Config Inheritance
-
-## Status
-
-Implemented (Sprints 121-123)
+# Wildcard Config Inheritance
 
 ## Context
 
-ADR-0010 defines how configuration merges across layers (user → project → InitializationOptions). However, there's another dimension of merging: **within a single config**, the `_` (wildcard) key serves as defaults that should be inherited by specific entries.
+configuration-merging-strategy defines how configuration merges across layers (user → project → InitializationOptions). However, there's another dimension of merging: **within a single config**, the `_` (wildcard) key serves as defaults that should be inherited by specific entries.
 
 Currently in `captureMappings`:
 - `captureMappings._` defines default capture-to-token mappings for all languages
@@ -38,7 +34,7 @@ effective_config[rust] = merge(config["_"], config["rust"])
 
 ### Application Order
 
-Wildcard inheritance happens **after** cross-layer merging (ADR-0010):
+Wildcard inheritance happens **after** cross-layer merging (configuration-merging-strategy):
 
 ```
 1. Merge across layers:    final_config = [user, project, InitializationOptions].into_iter().reduce(merge_workspace_settings).flatten()
@@ -234,4 +230,4 @@ The existing `resolve_capture()` in `legend.rs` already implements lazy fallback
 
 ## Related Decisions
 
-- [ADR-0010](0010-configuration-merging-strategy.md): Cross-layer configuration merging strategy
+- [configuration-merging-strategy](configuration-merging-strategy.md): Cross-layer configuration merging strategy

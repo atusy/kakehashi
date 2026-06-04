@@ -1,10 +1,10 @@
-//! Pool of downstream language-server connections (ADR-0016), keyed by
+//! Pool of downstream language-server connections (ls-bridge-server-pool-coordination), keyed by
 //! `server_name` rather than `languageId` so multiple languages can share one
 //! process (e.g. `typescript` + `typescriptreact` → `tsgo`). Routing:
 //! `languageId` → `server_name` (config) → connection.
 //!
 //! [`LanguageServerPool`] manages the connections; [`ConnectionHandle`]
-//! (ADR-0014) and [`ConnectionState`] track each connection's lifecycle.
+//! (ls-bridge-async-connection) and [`ConnectionState`] track each connection's lifecycle.
 
 mod connection_action;
 mod connection_handle;
@@ -48,7 +48,7 @@ use crate::error::LockResultExt;
 use super::protocol::{JsonRpcNotification, VirtualDocumentUri, build_didopen_notification};
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
-/// initializing server (ADR-0018 Tier 0: 30-60s recommended). A downstream
+/// initializing server (ls-bridge-timeout-hierarchy Tier 0: 30-60s recommended). A downstream
 /// server that doesn't respond within this window fails with a timeout error.
 pub(crate) const INIT_TIMEOUT_SECS: u64 = 30;
 
@@ -153,9 +153,9 @@ impl CancelForwardingMetrics {
     }
 }
 
-/// Pool of connections to downstream language servers (ADR-0016), one per
+/// Pool of connections to downstream language servers (ls-bridge-server-pool-coordination), one per
 /// `server_name`, with connections lazily initialized via the LSP handshake and
-/// per-connection state embedded in each `ConnectionHandle` (ADR-0015).
+/// per-connection state embedded in each `ConnectionHandle` (ls-bridge-message-ordering).
 ///
 /// `pub` so a shared pool can be wired into the cancel forwarding middleware;
 /// normal usage should go through `BridgeCoordinator`.
@@ -165,7 +165,7 @@ pub struct LanguageServerPool {
     /// Document tracking for virtual documents (versions, host mappings, opened state)
     document_tracker: DocumentTracker,
     /// Upstream request ID → set of downstream servers, for fan-out cancel
-    /// forwarding (ADR-0015). Multiple servers can share an ID when a single
+    /// forwarding (ls-bridge-message-ordering). Multiple servers can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
     ///
     /// Cleaned per-server via `unregister_upstream_request` on response or
@@ -364,7 +364,7 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Whether a document has been claimed or opened on a downstream server (ADR-0015).
+    /// Whether a document has been claimed or opened on a downstream server (ls-bridge-message-ordering).
     ///
     /// Fast synchronous check used to gate operations on documents not yet known
     /// downstream. True once `try_claim_for_open()` has run — claims happen before
@@ -411,7 +411,7 @@ impl LanguageServerPool {
     /// aborted between register and send; both are rolled back on send failure.
     ///
     /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
-    /// the single-writer-loop architecture (ADR-0015).
+    /// the single-writer-loop architecture (ls-bridge-message-ordering).
     pub(crate) async fn ensure_document_opened<S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
@@ -429,7 +429,7 @@ impl LanguageServerPool {
         }
         // Register host_to_virtual BEFORE send so that close_host_document
         // can find this document even if the task is aborted after send.
-        // The single-writer loop (ADR-0015) guarantees FIFO ordering, so
+        // The single-writer loop (ls-bridge-message-ordering) guarantees FIFO ordering, so
         // any subsequent didClose queued by close_host_document will arrive
         // after didOpen on the wire.
         self.document_tracker
@@ -549,7 +549,7 @@ impl LanguageServerPool {
 }
 
 impl LanguageServerPool {
-    /// Fast-fail get-or-spawn (ADR-0015): on miss, start the process, split
+    /// Fast-fail get-or-spawn (ls-bridge-message-ordering): on miss, start the process, split
     /// reader+writer, store the handle as `Initializing`, and run the LSP
     /// initialize handshake in a background task that transitions Ready or
     /// Failed. Requests against Initializing fail with REQUEST_FAILED; Failed
@@ -572,7 +572,7 @@ impl LanguageServerPool {
         };
 
         // Check if we already have a connection for this server
-        // Use pure decision function for testability (ADR-0015 Operation Gating)
+        // Use pure decision function for testability (ls-bridge-message-ordering Operation Gating)
         let existing_state = connections.get(server_name).map(|h| h.state());
         match decide_connection_action(existing_state, panic_count) {
             ConnectionAction::ReturnExisting => {
@@ -624,7 +624,7 @@ impl LanguageServerPool {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
 
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
-        // Liveness timeout is configured via LivenessTimeout::default() (60s per ADR-0018 Tier 2)
+        // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
         // Server name is passed for structured logging (observability improvement)
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
         let reader_handle = spawn_reader_task_for_language(
@@ -846,7 +846,7 @@ impl LanguageServerPool {
             }
         };
 
-        // Build and send the cancel notification via single-writer loop (ADR-0015)
+        // Build and send the cancel notification via single-writer loop (ls-bridge-message-ordering)
         // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
         let notification = JsonRpcNotification::new(
             "$/cancelRequest",
@@ -1608,7 +1608,7 @@ mod tests {
 
     /// Test that forward_didchange_to_opened_docs completes quickly with channel-based sending.
     ///
-    /// ADR-0015: Channel-based sends via try_send() are non-blocking.
+    /// ls-bridge-message-ordering: Channel-based sends via try_send() are non-blocking.
     /// This verifies forward_didchange_to_opened_docs returns promptly.
     #[tokio::test]
     async fn forward_didchange_is_non_blocking() {
@@ -1630,7 +1630,7 @@ mod tests {
             .await
             .insert("lua".to_string(), Arc::clone(&handle));
 
-        // ADR-0015: No need to hold a writer lock - sends are channel-based and non-blocking
+        // ls-bridge-message-ordering: No need to hold a writer lock - sends are channel-based and non-blocking
         use crate::lsp::bridge::coordinator::BridgeInjection;
         let injections = vec![BridgeInjection {
             language: "lua".to_string(),
@@ -1798,7 +1798,7 @@ mod tests {
 
     /// Test that requests during Closing state receive error immediately.
     ///
-    /// ADR-0015 Operation Gating: When connection is Closing, new requests
+    /// ls-bridge-message-ordering Operation Gating: When connection is Closing, new requests
     /// are rejected with "bridge: connection closing" error. This prevents
     /// new requests from queuing during shutdown.
     #[tokio::test]
@@ -1874,7 +1874,7 @@ mod tests {
 
     /// Test that shutdown sends LSP shutdown request and receives response.
     ///
-    /// ADR-0017: Graceful shutdown requires sending LSP "shutdown" request and
+    /// ls-bridge-graceful-shutdown: Graceful shutdown requires sending LSP "shutdown" request and
     /// waiting for the server's response before sending "exit" notification.
     /// This test verifies the shutdown request is properly formatted and sent.
     #[tokio::test]
@@ -1925,7 +1925,7 @@ mod tests {
         // Verify initial state
         assert_eq!(handle.state(), ConnectionState::Ready);
 
-        // Perform shutdown with timeout (ADR-0018: graceful_shutdown has no internal timeout,
+        // Perform shutdown with timeout (ls-bridge-timeout-hierarchy: graceful_shutdown has no internal timeout,
         // caller must provide one). Sink servers don't respond, so this always times out.
         let result = tokio::time::timeout(Duration::from_secs(2), handle.graceful_shutdown()).await;
 
@@ -1944,7 +1944,7 @@ mod tests {
 
     /// Test that shutdown transitions through Closing state.
     ///
-    /// ADR-0017: Shutdown transitions to Closing state first, which rejects new
+    /// ls-bridge-graceful-shutdown: Shutdown transitions to Closing state first, which rejects new
     /// operations. This test verifies the state transition happens immediately
     /// when begin_shutdown() is called.
     #[tokio::test]
@@ -1977,7 +1977,7 @@ mod tests {
 
     /// Test that shutdown_all handles multiple connections in parallel.
     ///
-    /// ADR-0017: All connections shut down in parallel with a global timeout.
+    /// ls-bridge-graceful-shutdown: All connections shut down in parallel with a global timeout.
     /// This test verifies that multiple connections can be shut down concurrently.
     #[tokio::test]
     async fn shutdown_all_handles_multiple_connections_in_parallel() {
@@ -2036,7 +2036,7 @@ mod tests {
 
     /// Test that pool.shutdown_all_with_timeout force-kills unresponsive processes.
     ///
-    /// ADR-0017/ADR-0018: When graceful shutdown times out, force_kill_all is called
+    /// ls-bridge-graceful-shutdown/ls-bridge-timeout-hierarchy: When graceful shutdown times out, force_kill_all is called
     /// which escalates to SIGKILL for processes that don't respond to SIGTERM.
     #[cfg(unix)]
     #[tokio::test]
@@ -2081,7 +2081,7 @@ mod tests {
         // Start timer
         let start = Instant::now();
 
-        // Call shutdown_all with minimum valid timeout (5 seconds per ADR-0018)
+        // Call shutdown_all with minimum valid timeout (5 seconds per ls-bridge-timeout-hierarchy)
         // This should:
         // 1. Try graceful shutdown (will hang waiting for LSP response)
         // 2. After 5s timeout, call force_kill_all
@@ -2318,7 +2318,7 @@ mod tests {
 
     /// Test that graceful_shutdown waits for writer task to drain and return.
     ///
-    /// ADR-0015: The 3-phase shutdown protocol ensures:
+    /// ls-bridge-message-ordering: The 3-phase shutdown protocol ensures:
     /// 1. Stop signal sent to writer task
     /// 2. Writer task drains queue and confirms idle
     /// 3. Writer is reclaimed for LSP shutdown sequence
@@ -2336,7 +2336,7 @@ mod tests {
             "Should be able to send notification before shutdown"
         );
 
-        // Perform graceful shutdown with timeout (ADR-0018: caller provides timeout).
+        // Perform graceful shutdown with timeout (ls-bridge-timeout-hierarchy: caller provides timeout).
         // Sink server doesn't respond, so handshake always times out. We verify the
         // writer task coordination (stop_and_reclaim) works by checking that the
         // notification was sent and shutdown progresses to Closing state.

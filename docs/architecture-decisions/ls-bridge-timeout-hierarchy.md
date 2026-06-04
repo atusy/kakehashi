@@ -1,21 +1,15 @@
-# ADR-0018: LS Bridge Timeout Hierarchy
+# LS Bridge Timeout Hierarchy
 
-| | |
-|---|---|
-| **Date** | 2026-01-06 |
-| **Status** | Draft |
-| **Type** | Cross-ADR Coordination |
+**Related Decisions**:
+- [ls-bridge-async-connection](ls-bridge-async-connection.md) § Liveness Timeout & Initialization Timeout
+- [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) § Response Aggregation
+- [ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md) § Shutdown Timeout
 
-**Related ADRs**:
-- [ADR-0014](0014-ls-bridge-async-connection.md) § Liveness Timeout & Initialization Timeout
-- [ADR-0016](0016-ls-bridge-server-pool-coordination.md) § Response Aggregation
-- [ADR-0017](0017-ls-bridge-graceful-shutdown.md) § Shutdown Timeout
-
-**Phasing**: See [ADR-0013](0013-ls-bridge-implementation-phasing.md) — Phase 1 (Init, Liveness, Global Shutdown), Phase 3 (Per-Request).
+**Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — Phase 1 (Init, Liveness, Global Shutdown), Phase 3 (Per-Request).
 
 ## Scope
 
-This ADR coordinates timeout mechanisms across the bridge architecture. It defines:
+This decision coordinates timeout mechanisms across the bridge architecture. It defines:
 - Timeout tier hierarchy and precedence rules
 - Interaction semantics when multiple timeouts are active
 - State transitions triggered by each timeout
@@ -26,12 +20,12 @@ This ADR coordinates timeout mechanisms across the bridge architecture. It defin
 
 ## Context
 
-The async bridge architecture defines timeout systems across three ADRs:
+The async bridge architecture defines timeout systems across three decisions:
 
-1. **Initialization Timeout** (ADR-0014): Bounds server initialization time during startup
-2. **Liveness Timeout** (ADR-0014): Detects hung servers (unresponsive to pending requests)
-3. **Global Shutdown Timeout** (ADR-0017): Bounds total shutdown time
-4. **Per-Request Timeout** (ADR-0016): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
+1. **Initialization Timeout** (ls-bridge-async-connection): Bounds server initialization time during startup
+2. **Liveness Timeout** (ls-bridge-async-connection): Detects hung servers (unresponsive to pending requests)
+3. **Global Shutdown Timeout** (ls-bridge-graceful-shutdown): Bounds total shutdown time
+4. **Per-Request Timeout** (ls-bridge-server-pool-coordination): Bounds user-facing latency for multi-server aggregation *[Phase 3 only]*
 
 ### The Problem
 
@@ -106,7 +100,7 @@ Global Shutdown overrides all (highest priority)
 - **Duration**: 2s fixed
 - **Purpose**: Wait for writer loop to finish current operation before taking exclusive stdin access
 - **Scope**: Counts against global shutdown budget (not additional time)
-- **See**: ADR-0017 § Writer Loop Shutdown Synchronization
+- **See**: ls-bridge-graceful-shutdown § Writer Loop Shutdown Synchronization
 
 ## Consequences
 
@@ -145,12 +139,12 @@ Let implementation details determine which timeout wins.
 
 **Rejected**: Non-deterministic, hard to debug, race conditions.
 
-## Related ADRs
+## Related Decisions
 
-- **[ADR-0014](0014-ls-bridge-async-connection.md)**: Defines liveness and initialization timeouts
-- **[ADR-0015](0015-ls-bridge-message-ordering.md)**: Connection state machine (state-based timeout gating)
-- **[ADR-0016](0016-ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
-- **[ADR-0017](0017-ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
+- **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Defines liveness and initialization timeouts
+- **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Connection state machine (state-based timeout gating)
+- **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Per-request timeout *(Phase 3)*
+- **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Global shutdown timeout
 
 ## Summary
 

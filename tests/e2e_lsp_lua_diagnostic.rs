@@ -10,7 +10,7 @@
 //!
 //! **Requirements**: lua-language-server must be installed and in PATH.
 //!
-//! Implements ADR-0020 Phase 1: Pull-first diagnostic forwarding.
+//! Implements Pull-first diagnostic forwarding (pull-first-diagnostic-forwarding Phase 1).
 
 #![cfg(feature = "e2e")]
 
@@ -48,17 +48,17 @@ fn e2e_diagnostic_capability_advertised() {
         "diagnosticProvider should be advertised in server capabilities"
     );
 
-    // Verify specific options per ADR-0020
+    // Verify specific options per pull-first-diagnostic-forwarding
     let provider = diagnostic_provider.unwrap();
     assert_eq!(
         provider.get("interFileDependencies"),
         Some(&json!(false)),
-        "interFileDependencies should be false per ADR-0020"
+        "interFileDependencies should be false per pull-first-diagnostic-forwarding"
     );
     assert_eq!(
         provider.get("workspaceDiagnostics"),
         Some(&json!(false)),
-        "workspaceDiagnostics should be false per ADR-0020"
+        "workspaceDiagnostics should be false per pull-first-diagnostic-forwarding"
     );
 
     println!("E2E: diagnosticProvider capability advertised correctly");

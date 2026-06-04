@@ -4,7 +4,7 @@
 //! Unlike position-based requests (hover, definition, etc.), document color
 //! operates on the whole document and takes no position parameter.
 //!
-//! Requests go through `send_request()` so the single-writer task (ADR-0015)
+//! Requests go through `send_request()` so the single-writer task (ls-bridge-message-ordering)
 //! preserves FIFO ordering with other messages.
 
 use std::io;

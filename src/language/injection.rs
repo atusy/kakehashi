@@ -913,7 +913,7 @@ impl InjectionResolver {
 
     /// Calculate a stable ULID-based region_id for an injection.
     ///
-    /// Phase 2 (ADR-0019): keyed on position (start_byte, end_byte, kind), so the
+    /// Phase 2 (lazy-node-identity-tracking): keyed on position (start_byte, end_byte, kind), so the
     /// ULID stays constant for the same position key.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
@@ -928,7 +928,7 @@ impl InjectionResolver {
         )
     }
 
-    /// Resolve injection language using the unified detection chain (ADR-0005).
+    /// Resolve injection language using the unified detection chain (language-detection-fallback-chain).
     ///
     /// This normalizes raw fence identifiers (e.g., "py") to canonical language names
     /// (e.g., "python") that match bridge server configurations.

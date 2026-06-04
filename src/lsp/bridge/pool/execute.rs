@@ -105,7 +105,7 @@ impl LanguageServerPool {
             return Err(e);
         }
 
-        // Queue the request via single-writer loop (ADR-0015)
+        // Queue the request via single-writer loop (ls-bridge-message-ordering)
         if let Err(e) = handle.send_request(request, request_id) {
             // router_guard drops here, cleaning up the router entry
             if let Some(ref id) = upstream_request_id {

@@ -4,7 +4,7 @@
 //! for downstream language servers. It tracks:
 //! - Document versions (for didChange notifications)
 //! - Host-to-virtual mappings (for didClose propagation)
-//! - Opened state (for LSP spec compliance - ADR-0015)
+//! - Opened state (for LSP spec compliance - ls-bridge-message-ordering)
 
 use std::collections::HashMap;
 
@@ -33,7 +33,7 @@ pub(crate) struct OpenedVirtualDoc {
 
 /// Per-server virtual document state: versions (for `didChange`),
 /// host→virtual mappings (for `didClose` propagation), and opened state
-/// (for LSP spec compliance, ADR-0015).
+/// (for LSP spec compliance, ls-bridge-message-ordering).
 ///
 /// Keyed by `server_name` (not language) so related languages can share one
 /// process (e.g. ts/tsx → tsgo); the URI itself still uses `injection_language`
@@ -54,7 +54,7 @@ pub(crate) struct DocumentTracker {
     /// Incremented at claim time (`try_claim_for_open`), before the actual didOpen send.
     /// Rolled back via `unclaim_document` if the send fails.
     /// Reference-counted: multiple servers may open the same virtual URI.
-    /// Uses DashMap for concurrent reads via internal sharded locking (ADR-0015).
+    /// Uses DashMap for concurrent reads via internal sharded locking (ls-bridge-message-ordering).
     opened_documents: DashMap<String, usize>,
     /// Reverse index: virtual URI string → server names that have this doc open.
     ///

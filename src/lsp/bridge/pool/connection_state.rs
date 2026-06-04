@@ -1,6 +1,6 @@
-//! Connection state machine for downstream LSP connections (ADR-0015).
+//! Connection state machine for downstream LSP connections (ls-bridge-message-ordering).
 
-/// LSP-handshake lifecycle. Closed is terminal. Transitions (ADR-0015 Operation Gating):
+/// LSP-handshake lifecycle. Closed is terminal. Transitions (ls-bridge-message-ordering Operation Gating):
 /// Initializing → Ready (init ok) | Failed (timeout/err) | Closing (shutdown mid-init);
 /// Ready → Closing (shutdown); Closing → Closed (complete/timeout); Failed → Closed
 /// directly (stdin gone, no LSP handshake). Failed connections are evicted from the
@@ -26,7 +26,7 @@ mod tests {
 
     /// Test that Ready state transitions to Closing on shutdown signal.
     ///
-    /// ADR-0015: Ready → Closing transition occurs when shutdown is initiated.
+    /// ls-bridge-message-ordering: Ready → Closing transition occurs when shutdown is initiated.
     /// This is the graceful shutdown path for active connections.
     #[tokio::test]
     async fn ready_to_closing_transition() {
@@ -52,7 +52,7 @@ mod tests {
 
     /// Test that Initializing state transitions to Closing on shutdown signal.
     ///
-    /// ADR-0017: When shutdown is initiated during initialization, abort init
+    /// ls-bridge-graceful-shutdown: When shutdown is initiated during initialization, abort init
     /// and proceed directly to shutdown. This handles cases where editor closes
     /// during slow server startup.
     #[tokio::test]
@@ -79,7 +79,7 @@ mod tests {
 
     /// Test that Closing state transitions to Closed on completion.
     ///
-    /// ADR-0015: Closing → Closed transition occurs when LSP shutdown/exit
+    /// ls-bridge-message-ordering: Closing → Closed transition occurs when LSP shutdown/exit
     /// handshake completes or times out. This is the terminal state for
     /// graceful shutdown.
     #[tokio::test]
@@ -106,7 +106,7 @@ mod tests {
 
     /// Test that Failed state transitions directly to Closed (bypassing Closing).
     ///
-    /// ADR-0017: Failed connections cannot perform LSP shutdown/exit handshake
+    /// ls-bridge-graceful-shutdown: Failed connections cannot perform LSP shutdown/exit handshake
     /// because stdin is unavailable. They go directly to Closed state.
     #[tokio::test]
     async fn failed_to_closed_direct_transition() {

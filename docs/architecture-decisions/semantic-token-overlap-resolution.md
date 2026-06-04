@@ -1,9 +1,9 @@
-# ADR-0021: Semantic Token Overlap Resolution Strategy
+# Semantic Token Overlap Resolution
 
-| | |
-|---|---|
-| **Status** | Accepted (Phases 1-2 Implemented, basic multiline splitting added) |
-| **Date** | 2026-02-14 |
+## Decision–Implementation Gap
+
+Phases 1–2 are implemented, including basic multiline token splitting. Further
+overlap-resolution phases described below are not yet implemented.
 
 ## Context
 
@@ -262,7 +262,7 @@ Basic multiline splitting (`split_multiline_tokens`) is implemented: multiline t
 - Smarter handling of tokens spanning empty lines
 - Low priority: the current per-line approach handles all known use cases
 
-### Phase 4: `overlappingTokenSupport` Pass-Through (Future ADR)
+### Phase 4: `overlappingTokenSupport` Pass-Through (Future decision)
 
 The LSP `SemanticTokensClientCapabilities` includes an `overlappingTokenSupport?: boolean` field ([LSP 3.16.0](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/)). When a client declares `overlappingTokenSupport: true`, the server is permitted to return overlapping tokens — the client is responsible for layering them correctly.
 
@@ -274,7 +274,7 @@ However, when a client supports overlapping tokens, the sweep line may be **coun
 - **Unnecessary computation**: The sweep line's breakpoint collection, interval scanning, and fragment merging are wasted work when the client can handle raw overlapping tokens natively.
 - **Injection region exclusion still needed**: Even with `overlappingTokenSupport: true`, Stage 1 (injection region exclusion) remains necessary. Host tokens inside active injection regions are semantically wrong (they represent the host language's interpretation of injected content), not just visually overlapping.
 
-A future ADR should evaluate:
+A future decision should evaluate:
 
 1. **Whether to skip Stage 2** when `overlappingTokenSupport: true` — return unsplit overlapping tokens, letting the client layer them
 2. **Whether Stage 1 should change** — should injection region exclusion become optional, or is it always semantically correct?

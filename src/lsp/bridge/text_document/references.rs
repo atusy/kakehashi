@@ -3,7 +3,7 @@
 //! This module provides references request functionality for downstream language servers,
 //! handling the coordinate transformation between host and virtual documents.
 //!
-//! # Single-Writer Loop (ADR-0015)
+//! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
 //! This handler uses `send_request()` to queue requests via the channel-based
 //! writer task, ensuring FIFO ordering with other messages.

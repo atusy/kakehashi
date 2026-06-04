@@ -1,7 +1,7 @@
 //! Message sender abstraction for downstream language server communication.
 //!
 //! This module provides the `MessageSender` trait for channel-based sending
-//! per ADR-0015 (single-writer loop pattern).
+//! per ls-bridge-message-ordering (single-writer loop pattern).
 //!
 //! Implementations:
 //! - `mpsc::Sender<OutboundMessage>`: Channel-based sends
@@ -21,7 +21,7 @@ use crate::lsp::bridge::protocol::JsonRpcNotification;
 
 /// Abstraction for sending messages to a downstream language server.
 ///
-/// Unified channel-based sending per ADR-0015 (single-writer loop). Errors map
+/// Unified channel-based sending per ls-bridge-message-ordering (single-writer loop). Errors map
 /// to `ErrorKind::BrokenPipe` (channel closed) and `ErrorKind::WouldBlock`
 /// (channel full — non-blocking backpressure).
 pub(crate) trait MessageSender: Send {
@@ -48,7 +48,7 @@ impl MessageSender for mpsc::Sender<OutboundMessage> {
     ) -> io::Result<()> {
         let payload = serde_json::to_value(notification)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Use try_send for non-blocking backpressure per ADR-0015
+        // Use try_send for non-blocking backpressure per ls-bridge-message-ordering
         self.try_send(OutboundMessage::Untracked(payload))
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => {

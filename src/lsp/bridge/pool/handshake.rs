@@ -6,7 +6,7 @@
 //! 2. Wait for `initialize` response
 //! 3. Send `initialized` notification
 //!
-//! # Single-Writer Loop (ADR-0015)
+//! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
 //! The handshake uses `send_request()` and `send_notification()` to queue messages
 //! via the channel-based writer task. This ensures all messages go through the
@@ -26,7 +26,7 @@ use crate::lsp::bridge::protocol::{
 /// Send `initialize`, await the response, send `initialized`, return the typed
 /// `ServerCapabilities`. Invoked by `get_or_create_connection_with_timeout`
 /// once the connection has spawned and the reader task is up; goes through
-/// the single-writer channel (ADR-0015) for FIFO ordering.
+/// the single-writer channel (ls-bridge-message-ordering) for FIFO ordering.
 pub(super) async fn perform_lsp_handshake(
     handle: &ConnectionHandle,
     init_request_id: RequestId,

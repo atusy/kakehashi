@@ -5,7 +5,7 @@
 //! requests operate on the entire document — they take no position parameter.
 //!
 //! Requests are queued via the channel-based writer task (`send_request()`) for
-//! FIFO ordering with other messages (ADR-0015 single-writer loop).
+//! FIFO ordering with other messages (ls-bridge-message-ordering single-writer loop).
 
 use std::io;
 

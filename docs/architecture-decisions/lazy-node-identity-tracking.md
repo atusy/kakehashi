@@ -1,14 +1,8 @@
-# ADR-0019: Lazy Node Identity Tracking
+# Lazy Node Identity Tracking
 
-| | |
-|---|---|
-| **Date** | 2026-01-12 |
-| **Status** | Draft |
-| **Type** | Core Infrastructure |
-
-**Related ADRs**:
-- [ADR-0007](0007-language-server-bridge-virtual-document-model.md) — Virtual document model for injection regions
-- [ADR-0025](0025-node-reference-protocol.md) — Protocol exposing tracked node identities to clients
+**Related Decisions**:
+- [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model for injection regions
+- [node-reference-protocol](node-reference-protocol.md) — Protocol exposing tracked node identities to clients
 
 ## Context and Problem Statement
 

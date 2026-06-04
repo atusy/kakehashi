@@ -1,5 +1,5 @@
 //! `textDocument/documentSymbol` for downstream servers (whole-document, no position).
-//! Uses `send_request()` for FIFO ordering with the single writer task (ADR-0015).
+//! Uses `send_request()` for FIFO ordering with the single writer task (ls-bridge-message-ordering).
 //!
 //! Both `DocumentSymbol[]` and `SymbolInformation[]` responses are normalized to
 //! `Vec<DocumentSymbol>` here so the lsp_impl handler works with one type and only

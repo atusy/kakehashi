@@ -1,19 +1,10 @@
-# ADR-0022: Replace tree-sitter-cli with tree-sitter-loader
-
-| | |
-|---|---|
-| **Status** | accepted |
-| **Date** | 2026-02-26 |
-| **Decision-makers** | atusy |
-| **Consulted** | Claude Code |
-| **Informed** | kakehashi users |
-| **Supersedes** | [ADR-0004](0004-keep-tree-sitter-cli-dependency.md) |
+# Replace tree-sitter-cli with Loader
 
 ## Context and Problem Statement
 
 kakehashi required users to install `tree-sitter-cli` (via `cargo install tree-sitter-cli`) as a runtime dependency for parser compilation. This in turn required the entire Rust toolchain — a significant barrier for users who only want to use kakehashi as an LSP server.
 
-ADR-0004 evaluated "direct C compilation with manual header management" as an alternative and rejected it due to header management complexity. However, `tree-sitter-loader` is a different proposition: it's the official library crate from the tree-sitter team that handles headers, scanner detection, platform flags, and file locking automatically via the `cc` crate.
+An earlier decision to keep `tree-sitter-cli` evaluated "direct C compilation with manual header management" as an alternative and rejected it due to header management complexity. However, `tree-sitter-loader` is a different proposition: it's the official library crate from the tree-sitter team that handles headers, scanner detection, platform flags, and file locking automatically via the `cc` crate.
 
 ## Decision Drivers
 
@@ -24,7 +15,7 @@ ADR-0004 evaluated "direct C compilation with manual header management" as an al
 
 ## Considered Options
 
-1. **Keep tree-sitter-cli** (status quo from ADR-0004)
+1. **Keep tree-sitter-cli** (the previous status quo)
 2. **Use tree-sitter-loader library**
 
 ## Decision Outcome
@@ -58,4 +49,3 @@ ADR-0004 evaluated "direct C compilation with manual header management" as an al
 ## More Information
 
 * [tree-sitter-loader crate](https://crates.io/crates/tree-sitter-loader)
-* [ADR-0004](0004-keep-tree-sitter-cli-dependency.md) — Superseded decision

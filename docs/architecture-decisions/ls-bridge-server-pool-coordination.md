@@ -1,19 +1,14 @@
-# ADR-0016: LS Bridge Server Pool Coordination
-
-| | |
-|---|---|
-| **Status** | Draft |
-| **Date** | 2026-01-07 |
+# LS Bridge Server Pool Coordination
 
 **Related**:
-- [ADR-0014](0014-ls-bridge-async-connection.md): Single-connection async I/O
-- [ADR-0015](0015-ls-bridge-message-ordering.md): Single-server message ordering
+- [ls-bridge-async-connection](ls-bridge-async-connection.md): Single-connection async I/O
+- [ls-bridge-message-ordering](ls-bridge-message-ordering.md): Single-server message ordering
 
-**Phasing**: See [ADR-0013](0013-ls-bridge-implementation-phasing.md) — Phase 1 (routing), Phase 2 (rate-limited respawn), Phase 3 (aggregation).
+**Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — Phase 1 (routing), Phase 2 (rate-limited respawn), Phase 3 (aggregation).
 
 ## Scope
 
-This ADR defines how to coordinate **multiple downstream language server connections** from a single bridge. It covers:
+This decision defines how to coordinate **multiple downstream language server connections** from a single bridge. It covers:
 - Server pool lifecycle (spawn, initialize, shutdown)
 - Request routing to appropriate server(s)
 - Document lifecycle per downstream server
@@ -21,7 +16,7 @@ This ADR defines how to coordinate **multiple downstream language server connect
 
 ## Context
 
-The bridge manages connections to multiple downstream language servers. Even in Phase 1, multiple servers exist (e.g., pyright for Python, lua-ls for Lua). Each connection follows ADR-0014 (async I/O) and ADR-0015 (message ordering).
+The bridge manages connections to multiple downstream language servers. Even in Phase 1, multiple servers exist (e.g., pyright for Python, lua-ls for Lua). Each connection follows ls-bridge-async-connection (async I/O) and ls-bridge-message-ordering (message ordering).
 
 ### Key Challenges
 
@@ -66,14 +61,14 @@ Routing: `language` → `server_name` (via config) → connection.
 │  │ └───────────┘  └───────────┘  └───────────┘        │ │
 │  │      ↑              ↑              ↑               │ │
 │  │      └──────────────┴──────────────┘               │ │
-│  │           Each: ADR-0014 + ADR-0015                │ │
+│  │           Each: ls-bridge-async-connection + ls-bridge-message-ordering                │ │
 │  └────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
 ```
 
 **Phase 1 Design:**
 - **RequestRouter**: Routes by `languageId` to single server
-- **Per-Connection Isolation**: Each downstream connection maintains its own actor (ADR-0015)
+- **Per-Connection Isolation**: Each downstream connection maintains its own actor (ls-bridge-message-ordering)
 - **No Aggregation**: Single server per language, no fan-out
 
 **Phase 3 Extension**: ResponseAggregator for multi-LS fan-out (see Future Extensions).
@@ -196,7 +191,7 @@ downstream ──notification──►  bridge  ──notification──►  ups
 
 ### Cancellation Propagation
 
-See [ADR-0015 § Cancellation Forwarding](0015-ls-bridge-message-ordering.md#5-cancellation-forwarding) for single-connection cancellation semantics.
+See [ls-bridge-message-ordering § Cancellation Forwarding](ls-bridge-message-ordering.md#5-cancellation-forwarding) for single-connection cancellation semantics.
 
 **Multi-Connection Coordination (Phase 3)**: Router forwards `$/cancelRequest` to all connections that received the original fan-out request.
 
@@ -210,7 +205,7 @@ When routing notifications to multiple servers for the same language (Phase 3), 
 
 ```
 Router sends didSave to pyright + ruff (both handle Python):
-├─ pyright: queue full → DROP (per ADR-0015)
+├─ pyright: queue full → DROP (per ls-bridge-message-ordering)
 └─ ruff: queue OK → FORWARD
 
 Result: State divergence (recoverable via next didChange)
@@ -417,24 +412,22 @@ languageServers:
 
 **Phase 3 Configuration Example** (future): See Future Extensions for multi-LS aggregation config.
 
-## Related ADRs
+## Related Decisions
 
-- **[ADR-0006](0006-language-server-bridge.md)**: Core LSP bridge architecture (1:1 pattern)
-  - ADR-0016 extends to 1:N (one client → multiple servers per language)
-- **[ADR-0008](0008-language-server-bridge-request-strategies.md)**: Per-method bridge strategies
+- **[language-server-bridge](language-server-bridge.md)**: Core LSP bridge architecture (1:1 pattern)
+  - ls-bridge-server-pool-coordination extends to 1:N (one client → multiple servers per language)
+- **[language-server-bridge-request-strategies](language-server-bridge-request-strategies.md)**: Per-method bridge strategies
   - Per-method strategies remain valid for single-server routing
-- **[ADR-0012](0012-multi-ls-async-bridge-architecture.md)**: Multi-LS async bridge **(Parent ADR)**
-  - This ADR extracts multi-server coordination from ADR-0012
-- **[ADR-0014](0014-ls-bridge-async-connection.md)**: Async Bridge Connection (single-server I/O)
+- **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Async Bridge Connection (single-server I/O)
   - Provides async I/O patterns enabling parallel server management
-- **[ADR-0015](0015-ls-bridge-message-ordering.md)**: Message Ordering
-  - Handles single-server ordering; ADR-0016 coordinates multiple servers
-- **[ADR-0017](0017-ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
+- **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Message Ordering
+  - Handles single-server ordering; ls-bridge-server-pool-coordination coordinates multiple servers
+- **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
   - Defines shutdown coordination for multiple concurrent connections
-  - Router broadcasts shutdown; ADR-0017 specifies per-connection sequence
+  - Router broadcasts shutdown; ls-bridge-graceful-shutdown specifies per-connection sequence
 
 ## Amendment History
 
 - **2026-01-24**: Changed from language-based to server-name-based pool keying to enable process sharing for related languages (e.g., ts/tsx sharing tsgo). Connection pool is now keyed by `server_name` instead of `languageId`, with configuration resolving `language` → `server_name`.
-- **2026-01-07**: Merged [Amendment 002](0015-multi-server-coordination-amendment-002.md) - Simplified ID namespace by using upstream request IDs directly (no transformation), replaced `pending_correlations` with `pending_responses`
-- **2026-01-06**: Merged [Amendment 001](0015-multi-server-coordination-amendment-001.md) - Updated partial results to use LSP-native fields (isIncomplete), clarified $/cancelRequest semantics, added response guarantees for cancelled requests
+- **2026-01-07**: Merged Amendment 002 - Simplified ID namespace by using upstream request IDs directly (no transformation), replaced `pending_correlations` with `pending_responses`
+- **2026-01-06**: Merged Amendment 001 - Updated partial results to use LSP-native fields (isIncomplete), clarified $/cancelRequest semantics, added response guarantees for cancelled requests

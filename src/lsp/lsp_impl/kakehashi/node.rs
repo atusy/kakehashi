@@ -1,6 +1,6 @@
-//! Handlers for the ADR-0025 Node Reference Protocol.
+//! Handlers for the Node Reference Protocol (node-reference-protocol).
 //!
-//! See [ADR-0025](../../../../../docs/adr/0025-node-reference-protocol.md) for the
+//! See [node-reference-protocol](../../../../docs/architecture-decisions/node-reference-protocol.md) for the
 //! protocol specification. Each method has its own file under `node/`:
 //!
 //! - [`entry`]: `kakehashi/node` — position → NodeInfo entry point

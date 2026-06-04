@@ -1,31 +1,22 @@
-# ADR-0015: LS Bridge Message Ordering
+# LS Bridge Message Ordering
 
-| | |
-|---|---|
-| **Status** | Accepted |
-| **Date** | 2026-01-06 |
-
-**Supersedes**:
-- [ADR-0012](0012-multi-ls-async-bridge-architecture.md) § Timeout-based control
-- [ADR-0009](0009-async-bridge-architecture.md): Original async architecture
-
-**Phasing**: See [ADR-0013](0013-ls-bridge-implementation-phasing.md) — This ADR covers Phase 1; optional coalescing deferred to Phase 2.
+**Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — This decision covers Phase 1; optional coalescing deferred to Phase 2.
 
 ## Scope
 
-This ADR defines message ordering guarantees for **a single connection** to a downstream language server. It covers:
+This decision defines message ordering guarantees for **a single connection** to a downstream language server. It covers:
 - Single-writer actor loop for protocol correctness
 - Connection state machine (Initializing → Ready → Failed/Closing → Closed)
 - Operation gating based on connection state
 - Cancellation forwarding to downstream servers
 
-**Out of Scope**: Coordination of multiple connections (routing, aggregation) is covered by ADR-0016.
+**Out of Scope**: Coordination of multiple connections (routing, aggregation) is covered by ls-bridge-server-pool-coordination.
 
 ## Context
 
 ### Problems with Previous Approach
 
-ADR-0012 established timeout-based control for initialization and request superseding. This approach had three fundamental problems:
+An earlier design established timeout-based control for initialization and request superseding. This approach had three fundamental problems:
 
 **1. Time-Based Control Doesn't Reflect System State**
 
@@ -177,7 +168,7 @@ enum ConnectionState {
     Initializing,  // Writer loop started, initialization in progress
     Ready,         // Initialization completed successfully
     Failed,        // Initialization failed or writer loop panicked
-    Closing,       // Shutdown initiated, draining operations (ADR-0017)
+    Closing,       // Shutdown initiated, draining operations (ls-bridge-graceful-shutdown)
     Closed,        // Connection fully terminated
 }
 ```
@@ -237,7 +228,7 @@ enum ConnectionState {
 `Failed` transitions directly to `Closed`, bypassing `Closing`. This is because:
 - `Failed` state means the connection is already broken (panic, crash, timeout)
 - LSP shutdown handshake is impossible (stdin may be unavailable)
-- ADR-0017 specifies: `Failed → Closed` with process cleanup only (SIGTERM → SIGKILL)
+- ls-bridge-graceful-shutdown specifies: `Failed → Closed` with process cleanup only (SIGTERM → SIGKILL)
 
 **Operation Gating:**
 
@@ -248,10 +239,10 @@ Operations are gated at two levels: **server lifecycle** and **document lifecycl
 - **Requests**: Gated on `Ready` state:
   - `Initializing` → `REQUEST_FAILED` ("bridge: downstream server initializing")
   - `Failed` → `REQUEST_FAILED` ("bridge: downstream server failed")
-  - `Closing` → `REQUEST_FAILED` ("bridge: connection closing") [See ADR-0017]
+  - `Closing` → `REQUEST_FAILED` ("bridge: connection closing") [See ls-bridge-graceful-shutdown]
   - `Closed` → `REQUEST_FAILED` ("bridge: connection closed")
 - **Notifications**: Accepted by writer loop in `Initializing` or `Ready` state only
-  - `Closing`/`Closed` → DROP (writer loop stopped, see ADR-0017)
+  - `Closing`/`Closed` → DROP (writer loop stopped, see ls-bridge-graceful-shutdown)
   - Subject to document lifecycle gating below
 
 **Why `REQUEST_FAILED` instead of `SERVER_NOT_INITIALIZED`**: The upstream client communicates with kakehashi, which IS initialized. The client has no knowledge of downstream servers—that's an internal implementation detail. Using `SERVER_NOT_INITIALIZED` would confuse clients that just received an `initialized` response from kakehashi.
@@ -295,7 +286,7 @@ Client                    Bridge                      Downstream
 - Complete the request (too late to cancel) → forward result
 - Cancel successfully → forward REQUEST_CANCELLED error
 
-**Coordination with ADR-0016:** Router forwards `$/cancelRequest` to all connections that received the original request.
+**Coordination with ls-bridge-server-pool-coordination:** Router forwards `$/cancelRequest` to all connections that received the original request.
 
 ### 6. Fail-Fast Error Handling
 
@@ -312,7 +303,7 @@ Writer loop panics use fail-fast pattern (not restart) because `ChildStdin` cann
 **Failed State Semantics:**
 - `Failed` is a terminal state for the *connection* (no self-recovery)
 - The *pool* decides the response: respawn new connection (normal) or cleanup (shutdown)
-- During shutdown: `Failed → Closed` (see ADR-0017), no respawn
+- During shutdown: `Failed → Closed` (see ls-bridge-graceful-shutdown), no respawn
 
 **Panic Handler Order:**
 1. **First**: Fail all pending operations (LSP response guarantee)
@@ -441,17 +432,15 @@ Attempt to restart the writer loop after panic instead of failing the connection
 3. **Debugging nightmare**: Appears to work but silently fails
 4. **Better alternative exists**: Respawn entire connection with fresh stdin (~100-500ms)
 
-## Related ADRs
+## Related Decisions
 
-- **[ADR-0012](0012-multi-ls-async-bridge-architecture.md)**: Multi-LS async bridge architecture
-  - ADR-0015 supersedes timeout-based control while maintaining LSP compliance
-- **[ADR-0016](0016-ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
-  - Relies on ADR-0015's ConnectionState for router integration
-- **[ADR-0014](0014-ls-bridge-async-connection.md)**: Async Bridge Connection
-  - ADR-0015 builds on tokio runtime, uses ChildStdin from process spawning
-- **[ADR-0017](0017-ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
+- **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
+  - Relies on ls-bridge-message-ordering's ConnectionState for router integration
+- **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Async Bridge Connection
+  - ls-bridge-message-ordering builds on tokio runtime, uses ChildStdin from process spawning
+- **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
   - Defines behavior for Closing/Closed states in the ConnectionState enum
-- **[ADR-0007](0007-language-server-bridge-virtual-document-model.md)**: Virtual document model
+- **[language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md)**: Virtual document model
   - Stable URIs (PBI-200) enable consistent request tracking
 
 ## References
@@ -503,5 +492,5 @@ The current design rejects requests with `REQUEST_FAILED` during initialization.
 
 ## Amendment History
 
-- **2026-01-06**: Merged [Amendment 001](0014-actor-based-message-ordering-amendment-001.md) - Completed state machine with all transitions, panic handler implementation requirements, and error code corrections
-- **2026-01-06**: Merged [Amendment 002](0014-actor-based-message-ordering-amendment-002.md) - Added comprehensive notification drop telemetry and state re-synchronization metadata to prevent silent data loss
+- **2026-01-06**: Merged Amendment 001 - Completed state machine with all transitions, panic handler implementation requirements, and error code corrections
+- **2026-01-06**: Merged Amendment 002 - Added comprehensive notification drop telemetry and state re-synchronization metadata to prevent silent data loss

@@ -1,8 +1,8 @@
-//! Compute the injection layer stack at a byte offset (ADR-0025 PR-4 helper).
+//! Compute the injection layer stack at a byte offset (node-reference-protocol PR-4 helper).
 //!
 //! The host language tree is layer 0; each enclosing `@injection.content`
 //! that contains the cursor adds a deeper layer. Layers are returned in
-//! outermost-to-innermost order so callers can index by ADR-0025's formulas:
+//! outermost-to-innermost order so callers can index by the node-reference-protocol decision's formulas:
 //! `stack[n]` for positive `n` and `stack[stack.len() + n]` for negative `n`.
 //!
 //! Trees within each layer are parsed against the **full host text** with
@@ -61,7 +61,7 @@ fn whole_document_range(host_text: &str) -> tree_sitter::Range {
 /// Returns `[host, layer₁, ..., deepest]`. Always contains at least the host
 /// layer when `host_tree` parses successfully; deeper layers are only added
 /// when the byte lies strictly inside an injection's content range
-/// (half-open `[start, end)` per ADR-0025).
+/// (half-open `[start, end)` per node-reference-protocol).
 ///
 /// `host_language` selects the injection query for layer 0 only. Each deeper
 /// level uses the **language resolved for the layer above it** (the previous
@@ -119,7 +119,7 @@ pub(super) fn injection_stack_at(
         //   - intersect with `compute_included_ranges` so blockquote `> `
         //     prefixes (`block_continuation` children) are out.
         // A cursor on an excluded byte must NOT push a new injection layer —
-        // ADR-0025 §"Half-Open Intervals" works against the effective ranges.
+        // node-reference-protocol §"Half-Open Intervals" works against the effective ranges.
         let host_len = host_text.len();
         let mut candidates: Vec<(_, Vec<tree_sitter::Range>)> = Vec::new();
         for region in injections {
@@ -169,7 +169,7 @@ pub(super) fn injection_stack_at(
         };
 
         // Pass the actual injection content to the language resolver so its
-        // shebang / first-line heuristics (ADR-0005) can fire for nested
+        // shebang / first-line heuristics (language-detection-fallback-chain) can fire for nested
         // injections — passing "" would silently disable detection.
         let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
         let Some((resolved_lang, _)) =
@@ -494,7 +494,7 @@ fn build_effective_ranges(
     absolute_ranges
 }
 
-/// Half-open containment over a list of disjoint ranges, with ADR-0025's
+/// Half-open containment over a list of disjoint ranges, with the node-reference-protocol decision's
 /// end-of-document exception (`byte == host_len` includes nodes whose
 /// `end_byte == host_len`).
 fn ranges_contain_byte(ranges: &[tree_sitter::Range], byte: usize, host_len: usize) -> bool {

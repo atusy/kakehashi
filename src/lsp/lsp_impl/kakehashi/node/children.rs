@@ -1,11 +1,11 @@
-//! `kakehashi/node/children` — id → immediate-children NodeInfo array (ADR-0025).
+//! `kakehashi/node/children` — id → immediate-children NodeInfo array (node-reference-protocol).
 //!
 //! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind)`
 //! triple, locates the matching tree-sitter node in the current parse tree, and
-//! returns one [`NodeInfo`](../../../../../docs/adr/0025-node-reference-protocol.md#nodeinfo-type)
+//! returns one [`NodeInfo`](../../../../../docs/architecture-decisions/node-reference-protocol.md#nodeinfo-type)
 //! per immediate child in **document order** (ascending `start_byte`).
 //!
-//! Per ADR-0025 §"Navigation Methods":
+//! Per node-reference-protocol §"Navigation Methods":
 //! - Children include **both named and anonymous** nodes. A future `namedOnly`
 //!   parameter may filter, but PR-3 returns the full child list.
 //! - The order is tree-sitter's native child iteration, which equals ascending
@@ -15,7 +15,7 @@
 //!   injection-host node return ONLY the host-tree children, NOT the root of
 //!   the injected tree. Crossing injection boundaries is PR-4 scope.
 //!
-//! Return-value distinction (ADR-0025 §"Empty children"):
+//! Return-value distinction (node-reference-protocol §"Empty children"):
 //! - `[]` — id resolves to an existing node that has no children
 //! - `null` — id is not currently resolvable (never issued / invalidated /
 //!   mismatched URI / unparsed document / drift)
@@ -52,7 +52,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Malformed ULID collapses to null per ADR-0025 §"Invalidate vs Not-Found".
+        // Malformed ULID collapses to null per node-reference-protocol §"Invalidate vs Not-Found".
         let Ok(ulid) = params.id.parse::<Ulid>() else {
             return Ok(Value::Null);
         };
@@ -85,7 +85,7 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Search the host tree first, then injected layers at `start`. ADR-0025
+        // Search the host tree first, then injected layers at `start`. node-reference-protocol
         // "Navigation Methods": children stay within a single language tree, so
         // an injected node's children come from the injected tree — not from
         // the host node that contains the injection.

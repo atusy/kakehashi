@@ -37,7 +37,7 @@ impl Kakehashi {
         // Apply content changes and build tree-sitter edits
         let (text, edits) = apply_content_changes_with_edits(&old_text, params.content_changes);
 
-        // ADR-0019: Apply START-priority invalidation to region ID tracker.
+        // lazy-node-identity-tracking: Apply START-priority invalidation to region ID tracker.
         // Use InputEdits directly for precise invalidation when available,
         // fall back to diff-based approach for full document sync.
         //
@@ -70,7 +70,7 @@ impl Kakehashi {
         // The cache is validated at lookup time via result_id matching, so stale
         // tokens won't be returned for mismatched result_ids.
 
-        // ADR-0019: Close invalidated virtual documents.
+        // lazy-node-identity-tracking: Close invalidated virtual documents.
         // Send didClose notifications to downstream LSs for orphaned docs.
         self.injection_coordinator()
             .close_invalidated_virtual_docs(&uri, &invalidated_ulids)
@@ -86,7 +86,7 @@ impl Kakehashi {
             .process_injections(&uri, true)
             .await;
 
-        // ADR-0020 Phase 3: Schedule debounced diagnostic push on didChange.
+        // pull-first-diagnostic-forwarding Phase 3: Schedule debounced diagnostic push on didChange.
         // After 500ms of no changes, diagnostics will be collected and published.
         // This provides near-real-time feedback while avoiding excessive requests during typing.
         self.diagnostic_scheduler()

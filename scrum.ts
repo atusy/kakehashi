@@ -10,7 +10,7 @@ const userStoryRoles = [
 const scrum: ScrumDashboard = {
   product_goal: {
     statement:
-      "Pull-first diagnostic forwarding for embedded language regions (ADR-0020 Phase 1)",
+      "Pull-first diagnostic forwarding for embedded language regions (pull-first-diagnostic-forwarding Phase 1)",
     success_metrics: [
       {
         metric: "textDocument/diagnostic handler exists",

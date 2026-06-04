@@ -1,14 +1,8 @@
-# ADR-0013: LS Bridge Implementation Phasing
-
-| | |
-|---|---|
-| **Date** | 2026-01-08 |
-| **Status** | Draft |
-| **Type** | Cross-ADR Coordination |
+# LS Bridge Implementation Phasing
 
 ## Context
 
-The async bridge architecture spans multiple ADRs (0014-0018), each defining features at different complexity levels. Without a clear phasing strategy, it's unclear:
+The async bridge architecture spans multiple decisions, each defining features at different complexity levels. Without a clear phasing strategy, it's unclear:
 - What must be implemented first
 - What can be deferred
 - How features depend on each other
@@ -29,11 +23,11 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 
 | Component | Phase 1 Behavior |
 |-----------|------------------|
-| **Routing** | `languageId` → single server (ADR-0016) |
-| **Requests during init** | `REQUEST_FAILED` immediately (ADR-0015) |
-| **Cancellation** | Forward `$/cancelRequest` to downstream (ADR-0015) |
-| **Timeouts** | Init, Liveness, Global Shutdown (ADR-0018) |
-| **Coalescing** | None — trust client/server (ADR-0015) |
+| **Routing** | `languageId` → single server (ls-bridge-server-pool-coordination) |
+| **Requests during init** | `REQUEST_FAILED` immediately (ls-bridge-message-ordering) |
+| **Cancellation** | Forward `$/cancelRequest` to downstream (ls-bridge-message-ordering) |
+| **Timeouts** | Init, Liveness, Global Shutdown (ls-bridge-timeout-hierarchy) |
+| **Coalescing** | None — trust client/server (ls-bridge-message-ordering) |
 
 **What Works:**
 - Multiple embedded languages (Python + Lua + TOML in markdown)
@@ -54,7 +48,7 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 |-----------|------------------|
 | **Rate-limited respawn** | Max N respawns per time window, backoff on limit |
 | **Telemetry** | `$/telemetry` events for crashes/backoff |
-| **Coalescing** | Optional, profile-driven (ADR-0015 Future) |
+| **Coalescing** | Optional, profile-driven (ls-bridge-message-ordering Future) |
 
 **Why Rate-limited Respawn**: Language servers fail by crashing, not by returning errors while alive. Rate-limited respawn prevents respawn storms when a server keeps crashing (e.g., bad config, missing dependency).
 
@@ -69,7 +63,7 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 - Requests during backoff receive `REQUEST_FAILED` ("server recovering")
 - Telemetry: fire-and-forget, never blocks respawn decisions
 
-*Shutdown*: Respawn suppressed when pool is shutting down (per ADR-0015 § 6).
+*Shutdown*: Respawn suppressed when pool is shutting down (per ls-bridge-message-ordering § 6).
 
 *Parameters (max respawns, window size, backoff intervals) are implementation-defined.*
 
@@ -81,10 +75,10 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 
 | Component | Phase 3 Addition |
 |-----------|------------------|
-| **Routing** | Fan-out to multiple servers (ADR-0016) |
+| **Routing** | Fan-out to multiple servers (ls-bridge-server-pool-coordination) |
 | **Aggregation** | preferred, concatenated, deduplicated, … strategies |
-| **Per-Request Timeout** | Bounds aggregation latency (ADR-0018) |
-| **Backpressure** | Multi-server coordination (ADR-0016) |
+| **Per-Request Timeout** | Bounds aggregation latency (ls-bridge-timeout-hierarchy) |
+| **Backpressure** | Multi-server coordination (ls-bridge-server-pool-coordination) |
 
 **Use Case**: pyright (types) + ruff (linting) for Python simultaneously.
 
@@ -107,22 +101,22 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 | Response aggregation | ❌ | ❌ | ✅ |
 | Per-request timeout | ❌ | ❌ | ✅ |
 
-## ADR Phase Mapping
+## Decision Phase Mapping
 
-| ADR | Phase 1 Scope | Phase 2 Additions | Phase 3 Additions |
+| Decision | Phase 1 Scope | Phase 2 Additions | Phase 3 Additions |
 |-----|---------------|-------------------|-------------------|
-| **0014** (Connection) | Async I/O, timeouts | — | — |
-| **0015** (Ordering) | Thin bridge, forwarding | Optional coalescing, telemetry | — |
-| **0016** (Coordination) | Simple routing, lifecycle | Rate-limited respawn | Aggregation, fan-out |
-| **0017** (Shutdown) | Graceful shutdown | — | — |
-| **0018** (Timeouts) | Init, Liveness, Global | — | Per-request timeout |
+| **ls-bridge-async-connection** (Connection) | Async I/O, timeouts | — | — |
+| **ls-bridge-message-ordering** (Ordering) | Thin bridge, forwarding | Optional coalescing, telemetry | — |
+| **ls-bridge-server-pool-coordination** (Coordination) | Simple routing, lifecycle | Rate-limited respawn | Aggregation, fan-out |
+| **ls-bridge-graceful-shutdown** (Shutdown) | Graceful shutdown | — | — |
+| **ls-bridge-timeout-hierarchy** (Timeouts) | Init, Liveness, Global | — | Per-request timeout |
 
 ## Consequences
 
 ### Positive
 
 - **Clear implementation order**: Know what to build first
-- **Reduced complexity**: Each ADR can focus on current phase
+- **Reduced complexity**: Each decision can focus on current phase
 - **Testable milestones**: Phase 1 is a complete, working system
 
 ### Negative
@@ -134,10 +128,10 @@ The async bridge architecture spans multiple ADRs (0014-0018), each defining fea
 
 - **Extensibility preserved**: Phase 2/3 features documented but not blocking
 
-## Related ADRs
+## Related Decisions
 
-- **[ADR-0014](0014-ls-bridge-async-connection.md)**: Async Bridge Connection
-- **[ADR-0015](0015-ls-bridge-message-ordering.md)**: Message Ordering
-- **[ADR-0016](0016-ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
-- **[ADR-0017](0017-ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
-- **[ADR-0018](0018-ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy
+- **[ls-bridge-async-connection](ls-bridge-async-connection.md)**: Async Bridge Connection
+- **[ls-bridge-message-ordering](ls-bridge-message-ordering.md)**: Message Ordering
+- **[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md)**: Server Pool Coordination
+- **[ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)**: Graceful Shutdown
+- **[ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md)**: Timeout Hierarchy

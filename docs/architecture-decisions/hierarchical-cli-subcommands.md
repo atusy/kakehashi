@@ -1,8 +1,4 @@
-# ADR-0001: Hierarchical CLI Subcommands
-
-## Status
-
-Accepted
+# Hierarchical CLI Subcommands
 
 ## Context
 

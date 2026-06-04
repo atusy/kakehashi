@@ -15,7 +15,7 @@ use crate::lsp::bridge::connection::SplitConnectionWriter;
 
 use super::ResponseRouter;
 
-/// Queue capacity for outbound messages per ADR-0015.
+/// Queue capacity for outbound messages per ls-bridge-message-ordering.
 ///
 /// This bounds memory usage and provides backpressure. With 256 slots and
 /// typical message sizes, this uses approximately 32KB per connection.

@@ -21,13 +21,13 @@ impl Kakehashi {
         // Clean up all caches for this document (semantic tokens, injections, requests)
         self.cache.remove_document(&uri);
 
-        // Clean up region ID mappings for this document (ADR-0019)
+        // Clean up region ID mappings for this document (lazy-node-identity-tracking)
         self.bridge.cleanup(&uri);
 
-        // Abort any in-progress synthetic diagnostic task for this document (ADR-0020 Phase 2)
+        // Abort any in-progress synthetic diagnostic task for this document (pull-first-diagnostic-forwarding Phase 2)
         self.synthetic_diagnostics.remove_document(&uri);
 
-        // Cancel any pending debounced diagnostic for this document (ADR-0020 Phase 3)
+        // Cancel any pending debounced diagnostic for this document (pull-first-diagnostic-forwarding Phase 3)
         self.debounced_diagnostics.cancel(&uri);
 
         // Cancel any eager-open tasks for this document (prevents orphaned didOpen)

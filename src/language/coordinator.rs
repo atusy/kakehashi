@@ -461,7 +461,7 @@ impl LanguageCoordinator {
             .collect()
     }
 
-    /// ADR-0005: Try candidate directly, then with config-based base fallback.
+    /// language-detection-fallback-chain: Try candidate directly, then with config-based base fallback.
     ///
     /// Returns the language name if a parser is available (either directly or via base).
     /// This is applied as a sub-step after each detection method.
@@ -754,7 +754,7 @@ impl LanguageCoordinator {
 
     /// Check if a parser is available for a given language name.
     ///
-    /// Used by the detection fallback chain (ADR-0005) to determine whether
+    /// Used by the detection fallback chain (language-detection-fallback-chain) to determine whether
     /// to accept a detection result or continue to the next method.
     ///
     /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to check parser
@@ -763,7 +763,7 @@ impl LanguageCoordinator {
         self.language_registry.contains(language_name)
     }
 
-    /// ADR-0005 unified detection chain for host docs and injections; returns
+    /// language-detection-fallback-chain unified detection chain for host docs and injections; returns
     /// the first language with an available parser. Each stage is
     /// detect → base resolution → availability:
     /// (1) LSP `languageId` (if not `"plaintext"`); (2) heuristics — explicit
@@ -840,7 +840,7 @@ impl LanguageCoordinator {
         // 2. Try heuristic detection: token, path-derived token, first line (shebang)
         //    Short-circuits on first successful match.
         //
-        // Token priority (ADR-0005):
+        // Token priority (language-detection-fallback-chain):
         // - Explicit token (e.g., code fence identifier) takes precedence
         // - Path-derived token (extension or basename) is used as fallback
         // - First line (shebang/mode line) for extensionless files
@@ -885,7 +885,7 @@ impl LanguageCoordinator {
         (None, "none", last_candidate)
     }
 
-    /// ADR-0005 injection-language detection. Same chain as `detect_language`
+    /// language-detection-fallback-chain injection-language detection. Same chain as `detect_language`
     /// (1: direct id, 2: syntect normalisation `py→python`, `js→javascript`,
     /// 3: first-line shebang/mode-line) but *loads* the parser instead of
     /// only checking availability — injection discovery runs before we know
@@ -2087,7 +2087,7 @@ mod tests {
         );
     }
 
-    // ADR-0005: Base resolution as sub-step for extension detection
+    // language-detection-fallback-chain: Base resolution as sub-step for extension detection
 
     #[test]
     fn test_extension_detection_with_base_fallback() {

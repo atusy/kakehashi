@@ -1,12 +1,10 @@
-# ADR-0005: Language Detection Fallback Chain
+# Language Detection Fallback Chain
 
-## Status
-
-Accepted (Supersedes [ADR-0002](0002-filetype-detection-via-extension-mapping.md)). Alias resolution (`aliases` field, `build_alias_map()`, `resolve_alias()`) is superseded by [ADR-0024](0024-base-language-inheritance.md)'s `base` field. The detection fallback chain (languageId → token → first-line) and syntect normalization remain unchanged.
+> The `aliases` field (`build_alias_map()`, `resolve_alias()`) is superseded by the `base` field (see [base-language-inheritance](base-language-inheritance.md)); the detection fallback chain (languageId → token → first-line) and syntect normalization remain unchanged.
 
 ## Context
 
-ADR-0002 established extension-based document-level language detection as the primary method with LSP languageId as fallback. However, this approach has limitations:
+An earlier decision established extension-based document-level language detection as the primary method with LSP languageId as fallback. However, this approach has limitations:
 
 1. **LSP clients are authoritative**: Modern LSP clients (VS Code, Neovim, etc.) already perform sophisticated language detection and send accurate `languageId` values
 2. **Extension mapping is redundant**: Duplicating what clients already do creates maintenance burden and potential conflicts
@@ -173,7 +171,7 @@ This means:
 - **Caching**: Detection result is stored per-document; cache invalidates on content change or `languageId` change from client
 - **syntect dependency**: Uses syntect's Sublime Text syntax definitions for token normalization and first-line detection
 
-## Migration from ADR-0002
+## Migration from Extension-Based Detection
 
 The `filetypes` configuration field has been removed (PBI-061). Users who relied on custom extension mappings should:
 

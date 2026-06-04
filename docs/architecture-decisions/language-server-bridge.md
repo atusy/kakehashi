@@ -1,8 +1,10 @@
-# ADR-0006: LSP Bridge Architecture for Injection Regions
+# Language Server Bridge
 
-## Status
+## Decision–Implementation Gap
 
-Proposed (Phase 1 complete: infrastructure with go-to-definition working)
+As recorded, only Phase 1 (bridge infrastructure with working go-to-definition)
+was complete. Per-method coverage has since expanded well beyond this; see
+[docs/README.md](../README.md) for the current list of bridge-backed requests.
 
 ## Context
 
@@ -436,9 +438,9 @@ For a single injection region starting at host line `H` and column `C`:
 | Host → Virtual | `virtual_line = host_line - H`, `virtual_col = host_col - C` (first line only) |
 | Virtual → Host | `host_line = virtual_line + H`, `host_col = virtual_col + C` (first line only) |
 
-For multiple injections of the same language in one document, see [ADR-0007](0007-language-server-bridge-virtual-document-model.md) for virtual document strategies.
+For multiple injections of the same language in one document, see [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) for virtual document strategies.
 
-Translation is straightforward for positions within a single injection. See [ADR-0008](0008-language-server-bridge-request-strategies.md) for complex cases involving cross-file references.
+Translation is straightforward for positions within a single injection. See [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) for complex cases involving cross-file references.
 
 ## Consequences
 
@@ -462,7 +464,7 @@ Translation is straightforward for positions within a single injection. See [ADR
 ### Neutral
 
 - **Configuration optional**: Some servers (pyright) work out-of-the-box; others (rust-analyzer) benefit from `initializationOptions` for full functionality
-- **Partial feature support**: Not all LSP methods will be bridged (see [ADR-0008](0008-language-server-bridge-request-strategies.md))
+- **Partial feature support**: Not all LSP methods will be bridged (see [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md))
 - **Server availability**: Graceful degradation when servers not installed
 
 ## Implementation Phases
@@ -495,10 +497,10 @@ Translation is straightforward for positions within a single injection. See [ADR
 
 ### Phase 5+: Feature Expansion
 
-See [ADR-0008](0008-language-server-bridge-request-strategies.md) for per-method implementation details.
+See [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) for per-method implementation details.
 
 ## Related Decisions
 
-- [ADR-0005](0005-language-detection-fallback-chain.md): Language detection applies to both host documents and injection regions
-- [ADR-0007](0007-language-server-bridge-virtual-document-model.md): How multiple injections are represented as virtual documents
-- [ADR-0008](0008-language-server-bridge-request-strategies.md): Per-method bridge strategies
+- [language-detection-fallback-chain](language-detection-fallback-chain.md): Language detection applies to both host documents and injection regions
+- [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How multiple injections are represented as virtual documents
+- [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Per-method bridge strategies

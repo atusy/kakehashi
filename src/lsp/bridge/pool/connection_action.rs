@@ -26,10 +26,10 @@ pub(crate) enum BridgeError {
     Closing,
     /// Server disabled after repeated handshake failures.
     Disabled,
-    // === ADR-0015 Single-Writer Loop variants ===
+    // === ls-bridge-message-ordering Single-Writer Loop variants ===
     /// Request queue is full; request rejected with REQUEST_FAILED.
     ///
-    /// Per ADR-0015 Section 3, when the bounded order queue (capacity 256)
+    /// Per ls-bridge-message-ordering Section 3, when the bounded order queue (capacity 256)
     /// is full, requests are rejected with this error. Notifications are
     /// dropped instead (with WARN logging).
     QueueFull,
@@ -113,7 +113,7 @@ pub(super) enum ConnectionAction {
 
 /// Decide what action to take based on existing connection state and panic history.
 ///
-/// State gating follows ADR-0015: `Initializing`/`Closing` reject concurrent/new
+/// State gating follows ls-bridge-message-ordering: `Initializing`/`Closing` reject concurrent/new
 /// requests via `FailFast`. The `consecutive_panic_count >= MAX_CONSECUTIVE_PANICS`
 /// check runs first to break infinite retry loops when a handshake consistently panics.
 pub(super) fn decide_connection_action(
@@ -161,7 +161,7 @@ mod tests {
 
     /// Test that Initializing state fails fast.
     ///
-    /// ADR-0015: Concurrent requests during initialization should fail immediately
+    /// ls-bridge-message-ordering: Concurrent requests during initialization should fail immediately
     /// rather than block or queue.
     #[test]
     fn initializing_state_fails_fast() {
@@ -174,7 +174,7 @@ mod tests {
 
     /// Test that Failed state triggers respawn.
     ///
-    /// ADR-0015: Failed connections are removed from pool, next request spawns fresh.
+    /// ls-bridge-message-ordering: Failed connections are removed from pool, next request spawns fresh.
     #[test]
     fn failed_state_spawns_new() {
         assert_eq!(
@@ -185,7 +185,7 @@ mod tests {
 
     /// Test that Closing state fails fast.
     ///
-    /// ADR-0017: Connections in graceful shutdown reject new requests.
+    /// ls-bridge-graceful-shutdown: Connections in graceful shutdown reject new requests.
     #[test]
     fn closing_state_fails_fast() {
         let action = decide_connection_action(Some(ConnectionState::Closing), 0);
@@ -228,7 +228,7 @@ mod tests {
     }
 
     // ========================================
-    // ADR-0015 Single-Writer Loop error tests
+    // ls-bridge-message-ordering Single-Writer Loop error tests
     // ========================================
 
     /// Test QueueFull error has correct LSP error code.

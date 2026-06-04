@@ -1,7 +1,7 @@
 //! Signature help request handling for bridge connections, translating
 //! coordinates between host and virtual documents.
 //!
-//! Requests go through `send_request()` so the single-writer task (ADR-0015)
+//! Requests go through `send_request()` so the single-writer task (ls-bridge-message-ordering)
 //! preserves FIFO ordering with other messages.
 
 use std::io;

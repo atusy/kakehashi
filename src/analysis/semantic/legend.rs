@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn resolve_capture_uses_wildcard_merge() {
-        // ADR-0011: When both wildcard and specific key exist, merge them
+        // wildcard-config-inheritance: When both wildcard and specific key exist, merge them
         // This test verifies that resolve_capture correctly inherits
         // mappings from wildcard when the specific key doesn't have them
         let mut mappings = CaptureMappings::new();
