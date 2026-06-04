@@ -10,7 +10,7 @@
 //!
 //! **Requirements**: lua-language-server must be installed and in PATH.
 //!
-//! Implements pull-first-diagnostic-forwarding Phase 1: Pull-first diagnostic forwarding.
+//! Implements Pull-first diagnostic forwarding (pull-first-diagnostic-forwarding Phase 1).
 
 #![cfg(feature = "e2e")]
 

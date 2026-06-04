@@ -1,4 +1,4 @@
-//! Handlers for the node-reference-protocol Node Reference Protocol.
+//! Handlers for the Node Reference Protocol (node-reference-protocol).
 //!
 //! See [node-reference-protocol](../../../../docs/architecture-decisions/node-reference-protocol.md) for the
 //! protocol specification. Each method has its own file under `node/`:

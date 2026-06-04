@@ -6,7 +6,7 @@
 //! Like document symbol, diagnostic requests operate on the entire document -
 //! they don't take a position parameter.
 //!
-//! Implements pull-first-diagnostic-forwarding Phase 1: Pull-first diagnostic forwarding.
+//! Implements Pull-first diagnostic forwarding (pull-first-diagnostic-forwarding Phase 1).
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!

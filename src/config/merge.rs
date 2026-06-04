@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Resolve a key from a map with wildcard fallback and merging.
 ///
-/// Implements wildcard-config-inheritance wildcard config inheritance for HashMap-based settings:
+/// Implements wildcard config inheritance (wildcard-config-inheritance) for HashMap-based settings:
 /// - If both wildcard ("_") and specific key exist: merge them via `merge`
 /// - If only wildcard exists: return wildcard (cloned)
 /// - If only specific key exists: return specific key (cloned)
