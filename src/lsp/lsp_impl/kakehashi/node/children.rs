@@ -57,9 +57,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Look up the tracked node's byte range and kind. None means: never
-        // issued, invalidated by a prior edit, or this URI has no entries.
-        let Some((start, end, kind)) = self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        // Look up the tracked node's byte range, kind, and injection layer.
+        // None means: never issued, invalidated by a prior edit, or this URI
+        // has no entries. `layer` pins resolution and child minting to the
+        // language tree that minted the node (node-reference-protocol Scope rule).
+        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -101,6 +103,7 @@ impl Kakehashi {
             start,
             end,
             kind,
+            layer,
             |node| {
                 let mut cursor = node.walk();
                 node.children(&mut cursor)
@@ -121,7 +124,10 @@ impl Kakehashi {
         let infos: Vec<Value> = child_infos
             .into_iter()
             .map(|(c_start, c_end, c_kind)| {
-                let child_ulid = tracker.get_or_create(&uri, c_start, c_end, c_kind);
+                // Children live in the same tree as their parent, so they are
+                // minted in the same `layer`.
+                let child_ulid =
+                    tracker.get_or_create_in_layer(&uri, c_start, c_end, c_kind, layer);
                 json!({
                     "id": child_ulid.to_string(),
                     "type": c_kind,

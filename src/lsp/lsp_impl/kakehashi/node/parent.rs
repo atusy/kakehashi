@@ -57,9 +57,12 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Look up the tracked node's byte range and kind. None means: never
-        // issued, invalidated by a prior edit, or this URI has no entries.
-        let Some((start, end, kind)) = self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        // Look up the tracked node's byte range, kind, and injection layer.
+        // None means: never issued, invalidated by a prior edit, or this URI
+        // has no entries. `layer` pins resolution to the language tree that
+        // minted the node so navigation stays in-layer (node-reference-protocol
+        // Scope rule).
+        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -95,6 +98,7 @@ impl Kakehashi {
             start,
             end,
             kind,
+            layer,
             |node| {
                 node.parent()
                     .map(|p| (p.start_byte(), p.end_byte(), p.kind()))
@@ -111,11 +115,13 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Issue / reuse a stable ULID for the parent (lazy-node-identity-tracking lazy assignment).
+        // Issue / reuse a stable ULID for the parent (lazy-node-identity-tracking
+        // lazy assignment). The parent lives in the same tree as the child, so
+        // it is minted in the same `layer`.
         let parent_ulid = self
             .bridge
             .node_tracker()
-            .get_or_create(&uri, p_start, p_end, p_kind);
+            .get_or_create_in_layer(&uri, p_start, p_end, p_kind, layer);
 
         Ok(json!({
             "id": parent_ulid.to_string(),

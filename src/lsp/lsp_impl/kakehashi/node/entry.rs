@@ -278,11 +278,15 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        let ulid = self.bridge.node_tracker().get_or_create(
+        // Mint with the resolved layer index so a host and injected node sharing
+        // (start, end, kind) get distinct ULIDs and stay navigable in their own
+        // tree (lazy-node-identity-tracking §"Node Uniqueness Key", issue #313).
+        let ulid = self.bridge.node_tracker().get_or_create_in_layer(
             &uri,
             node.start_byte(),
             node.end_byte(),
             node.kind(),
+            layer_index,
         );
 
         Ok(json!({
