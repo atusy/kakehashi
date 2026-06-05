@@ -1459,3 +1459,67 @@ fn test_node_layer_collision_navigation_stays_in_layer() {
         injected_parent
     );
 }
+
+/// Regression for the layer discriminator's edit behavior (lazy-node-identity-tracking
+/// §"Injection restructuring churn"). An edit that does NOT touch the injected
+/// node's START byte must preserve its ULID *and* its stored `layer`, so a later
+/// `parent` call still resolves in the injected tree (→ `null` at its root)
+/// rather than re-matching the same `(start, end, kind)` against the host tree
+/// and leaking the host `paragraph`. This locks in "navigation stays in-layer
+/// across surviving edits", the safe half of the depth-index contract — the half
+/// the implementation *can* guarantee (the unguaranteed half, nesting
+/// restructuring, degrades to a safe `null` and is covered by the protocol's
+/// re-acquire contract, not asserted here).
+#[test]
+fn test_node_layer_collision_survives_edit_and_stays_in_layer() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_inline_collision_edit.md";
+    open_markdown(&mut client, uri, MARKDOWN_PARAGRAPH);
+
+    // Acquire the injected-layer `inline` (root of the markdown_inline tree).
+    let injected = request_node_with_injection(&mut client, uri, 0, 2, json!(true));
+    assert!(!injected.is_null(), "injected layer must resolve a node");
+    assert_eq!(
+        node_type(&injected),
+        "inline",
+        "expected the injected root to be `inline` (the collision fixture)"
+    );
+    let injected_id = node_id(&injected).to_string();
+
+    // Baseline: before any edit, the injected root has a null parent.
+    assert!(
+        request_node_parent(&mut client, uri, &injected_id).is_null(),
+        "baseline: injected inline is its tree root; parent must be null"
+    );
+
+    // Append a second paragraph BELOW. The first paragraph's inline starts at
+    // byte 0 and is untouched, so START-priority keeps the injected ULID alive
+    // and carries its stored `layer` through unchanged.
+    let edited = "hello world\n\nsecond paragraph\n";
+    full_text_change(&mut client, uri, 2, edited);
+
+    // The ULID survived: text still resolves to the (unchanged) inline content.
+    let text = request_node_text(&mut client, uri, &injected_id);
+    assert!(
+        !text.is_null(),
+        "injected id must survive an edit that does not touch its START byte"
+    );
+    assert_eq!(
+        text.get("text").and_then(Value::as_str),
+        Some("hello world"),
+        "surviving injected id must still slice its original inline text"
+    );
+
+    // The crux: navigation still resolves in the injected tree. If the stored
+    // layer were lost (or navigation fell back across layers), this would
+    // re-match `(start, end, kind)` in the host tree and surface the host
+    // `paragraph`. It must stay null.
+    let injected_parent = request_node_parent(&mut client, uri, &injected_id);
+    assert!(
+        injected_parent.is_null(),
+        "after a surviving edit, injected inline must still be its tree root (null parent), not the host paragraph (got {:?})",
+        injected_parent
+    );
+}
