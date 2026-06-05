@@ -214,11 +214,21 @@ pub(super) fn injection_stack_at(
 /// searches `stack[layer]` only. We deliberately do **not** fall back to other
 /// layers: a node carries the layer it was created in, and resolving it in a
 /// different layer would violate node-reference-protocol's per-layer Scope rule.
-/// This is exactly the host-vs-injected collision the `layer` key prevents — a
-/// host and injected node sharing `(start, end, kind)` would otherwise be
-/// indistinguishable here (issue #313). If the stack is now shallower than
-/// `layer` (an edit restructured the nesting), `stack.get(layer)` is `None` and
-/// we return `None` — a safe "re-acquire" signal, never a wrong-tree match.
+/// Within a single parse this is exactly the host-vs-injected collision the
+/// `layer` key prevents — a host and injected node sharing `(start, end, kind)`
+/// would otherwise be indistinguishable here (issue #313).
+///
+/// Across edits the depth index is a weaker guarantee. If an edit makes the
+/// stack shallower than `layer`, `stack.get(layer)` is `None` and we return
+/// `None` — a safe "re-acquire" signal. But `layer` is only a depth, not a tree
+/// identity: an edit that restructures the nesting while keeping
+/// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
+/// then succeeds only if that tree happens to hold a node at the identical
+/// `(start, end, kind)`, and otherwise returns `None`. We do not (and with a
+/// depth index cannot) detect that case, so the "re-acquire on `null`" contract
+/// — not a wrong-tree guarantee — is what protects clients. See the
+/// layer-discriminator options in lazy-node-identity-tracking for the
+/// region-ULID alternative that would close this gap.
 ///
 /// `f` is invoked at most once, with the matching `Node`. Returning `None`
 /// from `f` is distinguishable from the "no match" outcome only by

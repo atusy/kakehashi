@@ -915,6 +915,14 @@ impl InjectionResolver {
     ///
     /// Phase 2 (lazy-node-identity-tracking): keyed on position (start_byte, end_byte, kind), so the
     /// ULID stays constant for the same position key.
+    ///
+    /// Minted via the host-layer `get_or_create` (`layer = 0`) **by design**:
+    /// `content_node` comes from the host document's injection query, so it is a
+    /// host-tree node. The `layer` discriminator (lazy-node-identity-tracking
+    /// §"Node Uniqueness Key") only needs to separate host from injected nodes,
+    /// and a region's content node is always the host side. If a navigation
+    /// `kakehashi/node` call resolves that same host node it dedups to this same
+    /// ULID, which is correct.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
         uri: &Url,

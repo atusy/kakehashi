@@ -1,7 +1,7 @@
 //! `kakehashi/node/children` — id → immediate-children NodeInfo array (node-reference-protocol).
 //!
-//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind)`
-//! triple, locates the matching tree-sitter node in the current parse tree, and
+//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind, layer)`
+//! key, locates the matching tree-sitter node in the current parse tree, and
 //! returns one [`NodeInfo`](../../../../../docs/architecture-decisions/node-reference-protocol.md#nodeinfo-type)
 //! per immediate child in **document order** (ascending `start_byte`).
 //!

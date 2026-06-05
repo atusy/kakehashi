@@ -1,25 +1,25 @@
 //! `kakehashi/node/parent` — id → immediate-parent NodeInfo (node-reference-protocol).
 //!
-//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind)`
-//! triple, locates the matching tree-sitter node in the current parse tree, and
+//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind, layer)`
+//! key, locates the matching tree-sitter node in the current parse tree, and
 //! returns a [`NodeInfo`](../../../../../docs/architecture-decisions/node-reference-protocol.md#nodeinfo-type)
 //! for its tree-sitter parent.
 //!
 //! Per node-reference-protocol §"Navigation Methods", navigation stays within a single
 //! language tree: calling `parent` on the root of an injected tree must **not**
 //! cross into the host node that contains the injection. To find the node in
-//! the correct tree we search the host tree first and then each injected layer
-//! at the tracked `start_byte` (see
-//! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — that
-//! way a node minted by `kakehashi/node` against an injected layer remains
-//! navigable from the same layer that produced it.
+//! the correct tree we resolve it **only** in the layer that minted it —
+//! `stack[layer]` for the tracked `layer` (see
+//! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — so a
+//! node minted by `kakehashi/node` against an injected layer is never re-matched
+//! against a different layer's tree.
 //!
 //! Returns `null` (serialized as JSON `null`) when:
 //! - the URI is unknown or invalid,
 //! - the ULID is malformed or was never issued / has been invalidated,
 //! - the document has not yet been parsed,
-//! - the tracked range cannot be matched against a node in the host tree or
-//!   any injected layer, or
+//! - the tracked range cannot be matched against a node in the minting layer's
+//!   tree (e.g. an edit restructured the injection nesting), or
 //! - the matched node is the root of its tree (no parent — applies to host
 //!   root AND to the root of any injected tree, per the Scope rule).
 

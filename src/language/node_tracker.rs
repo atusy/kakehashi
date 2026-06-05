@@ -14,7 +14,7 @@ use url::Url;
 
 /// Tracks stable ULID-based identifiers for tree-sitter nodes.
 ///
-/// Uses position-based composite keys (start_byte, end_byte, kind) per lazy-node-identity-tracking
+/// Uses position-based composite keys (start_byte, end_byte, kind, layer) per lazy-node-identity-tracking
 /// and applies START-priority invalidation rules to maintain stable ULIDs across edits.
 /// Originally introduced for injection regions; generalized for the Node Reference
 /// Protocol ([node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md)).
@@ -98,8 +98,8 @@ impl UriEntries {
 /// `kind` was originally assumed to separate co-located nodes from different
 /// injection layers ("a Markdown `fenced_code_block` vs a Python `module`
 /// differ by kind"). Recursive same-language injection breaks that: a
-/// ` ```markdown ` block injected into Markdown yields the same kind at the same
-/// span in both the host and injected tree. `layer` (injection depth, `0` =
+/// ```` ```markdown ```` block injected into Markdown yields the same kind at the
+/// same span in both the host and injected tree. `layer` (injection depth, `0` =
 /// host) restores uniqueness so the two get distinct ULIDs — see
 /// lazy-node-identity-tracking §"Node Uniqueness Key". `layer` is internal:
 /// clients only ever see the opaque ULID.
@@ -112,9 +112,13 @@ struct PositionKey {
     /// `&'static str`. Storing the static slice avoids an allocation per
     /// tracker entry without losing any genuinely owned data.
     kind: &'static str,
-    /// Injection depth that minted the node (`0` = host). Edit-invariant: a
-    /// depth index does not move with byte positions, so position adjustment
-    /// carries it through unchanged.
+    /// Injection depth that minted the node (`0` = host). Preserved by position
+    /// adjustment: a depth index does not move with byte positions, so it is
+    /// carried through edits unchanged. It is *not* an absolute identity — an
+    /// edit that restructures injection nesting (adds/removes an outer layer)
+    /// shifts a node's true depth, leaving the stored `layer` stale. The held
+    /// ULID then degrades to "re-acquire" (see `with_resolved_node`), rather
+    /// than guaranteeing the node still lives at this depth.
     layer: usize,
 }
 
@@ -131,14 +135,13 @@ impl PositionKey {
 
     /// Create a position key with adjusted positions (for edit operations).
     ///
-    /// `layer` is preserved verbatim from the pre-edit key — depth does not
-    /// shift with byte positions.
-    fn with_positions(start: usize, end: usize, kind: &'static str, layer: usize) -> Self {
+    /// `kind` and `layer` are carried over verbatim via struct-update syntax —
+    /// neither shifts with byte positions (`PositionKey` is `Copy`).
+    fn with_positions(self, start: usize, end: usize) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
-            kind,
-            layer,
+            ..self
         }
     }
 }
@@ -210,11 +213,9 @@ fn apply_delta(position: usize, delta: i64) -> usize {
 fn adjust_position_for_edit(key: PositionKey, edit: &EditInfo, delta: i64) -> Option<PositionKey> {
     if key.start_byte >= edit.old_end_byte {
         // Node E: AFTER edit → shift both start and end
-        Some(PositionKey::with_positions(
+        Some(key.with_positions(
             apply_delta(key.start_byte, delta),
             apply_delta(key.end_byte, delta),
-            key.kind,
-            key.layer,
         ))
     } else if key.end_byte > edit.start_byte {
         // Node A/B: CONTAINS or OVERLAPS edit
@@ -248,12 +249,7 @@ fn adjust_position_for_edit(key: PositionKey, edit: &EditInfo, delta: i64) -> Op
         if new_end <= key.start_byte {
             None // Range collapsed to zero or negative
         } else {
-            Some(PositionKey::with_positions(
-                key.start_byte,
-                new_end,
-                key.kind,
-                key.layer,
-            ))
+            Some(key.with_positions(key.start_byte, new_end))
         }
     } else {
         // Node F: BEFORE edit → unchanged
