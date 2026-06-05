@@ -1349,3 +1349,113 @@ fn test_node_children_on_injected_id_stays_in_injected_tree() {
         );
     }
 }
+
+// ============================================================
+// Issue #313: layer-aware node identity — host vs injected
+// nodes that share an identical (start, end, kind).
+//
+// Markdown injects `markdown_inline` over every `(inline)` node, and
+// tree-sitter-markdown-inline's root node is itself an `inline`. So a host
+// `inline` and the injected layer's root `inline` occupy the SAME span AND
+// kind — a real (start, end, kind) collision. Before the layer discriminator
+// they collapsed to one ULID and navigation could cross language trees.
+// ============================================================
+
+/// A single markdown paragraph. The inline text spans line 0, so a cursor at
+/// (0, 2) lands inside the host `inline` node and, one layer deeper, inside
+/// the injected `markdown_inline` tree whose root is also an `inline`.
+const MARKDOWN_PARAGRAPH: &str = "hello world\n";
+
+/// Read the `type` field as a string, asserting it is present.
+fn node_type(node: &Value) -> &str {
+    node.get("type")
+        .and_then(Value::as_str)
+        .expect("type field must be a string")
+}
+
+/// Read the `id` field as a string, asserting it is present.
+fn node_id(node: &Value) -> &str {
+    node.get("id")
+        .and_then(Value::as_str)
+        .expect("id field must be a string")
+}
+
+/// The collapsed-identity case (#313): a host `inline` and the injected
+/// `markdown_inline` root `inline` share the SAME `(start, end, kind)`. The
+/// layer discriminator must give them DISTINCT ULIDs. Before the fix they
+/// collapsed to a single ULID.
+#[test]
+fn test_node_layer_collision_host_and_injected_inline_get_distinct_ids() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_inline_collision.md";
+    open_markdown(&mut client, uri, MARKDOWN_PARAGRAPH);
+
+    // Cursor inside the inline text "hello world" (line 0, char 2 is "l").
+    let host = request_node_with_injection(&mut client, uri, 0, 2, json!(false));
+    let injected = request_node_with_injection(&mut client, uri, 0, 2, json!(true));
+    assert!(!host.is_null(), "host layer must resolve a node");
+    assert!(!injected.is_null(), "injected layer must resolve a node");
+
+    // The fixture is chosen so the collision genuinely occurs: both layers
+    // resolve an `inline` node at the same span. If this regresses (e.g. an
+    // upstream grammar change), the test below is no longer exercising #313.
+    assert_eq!(
+        node_type(&host),
+        "inline",
+        "expected the host node to be `inline` (the collision fixture)"
+    );
+    assert_eq!(
+        node_type(&injected),
+        "inline",
+        "expected the injected root to be `inline` (the collision fixture)"
+    );
+
+    assert_ne!(
+        node_id(&host),
+        node_id(&injected),
+        "host and injected nodes sharing (start, end, kind) must have distinct ULIDs (#313)"
+    );
+}
+
+/// With the collapsed identity disambiguated, navigation from each ULID must
+/// stay in its own language tree: the host `inline` walks up to the host
+/// `paragraph`, while the injected `inline` is its tree's root and so returns
+/// `null` (node-reference-protocol Scope rule) — it must NOT surface the host
+/// `paragraph`.
+#[test]
+fn test_node_layer_collision_navigation_stays_in_layer() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_node_inline_collision_nav.md";
+    open_markdown(&mut client, uri, MARKDOWN_PARAGRAPH);
+
+    let host = request_node_with_injection(&mut client, uri, 0, 2, json!(false));
+    let injected = request_node_with_injection(&mut client, uri, 0, 2, json!(true));
+    assert!(!host.is_null() && !injected.is_null());
+
+    // Host inline → host parent (a block-level markdown node).
+    let host_parent = request_node_parent(&mut client, uri, node_id(&host));
+    assert!(
+        !host_parent.is_null(),
+        "host inline must have a parent in the host tree"
+    );
+    assert_eq!(
+        node_type(&host_parent),
+        "paragraph",
+        "host inline's parent must be the host `paragraph`, got {:?}",
+        node_type(&host_parent)
+    );
+
+    // Injected inline is the root of the markdown_inline tree → null parent.
+    // The pre-fix collapse would have made this resolve through the shared
+    // ULID into the host `paragraph`, leaking across the injection boundary.
+    let injected_parent = request_node_parent(&mut client, uri, node_id(&injected));
+    assert!(
+        injected_parent.is_null(),
+        "injected inline is its tree root; parent must be null, not the host paragraph (got {:?})",
+        injected_parent
+    );
+}
