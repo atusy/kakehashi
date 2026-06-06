@@ -104,7 +104,7 @@ different injection layers — "a Markdown `code_fence_content` vs a Python
 injection**: a ```` ```markdown ```` block injected into a Markdown host produces
 a `paragraph` (or any node kind) at the **same span and kind** in both the host
 tree and the injected tree. Without `layer`, both collapse to one ULID, and
-navigation ([node-reference-protocol](node-reference-protocol.md)) can no longer
+navigation (node-reference-protocol) can no longer
 tell which language tree the ID belongs to — violating that protocol's per-layer
 Scope rule. Adding `layer` makes the host and injected nodes distinct ULIDs,
 eliminating this collision **within a single parse**. (It does not by itself make

@@ -163,7 +163,7 @@ Edge cases:
 
 **Scope rule**: Navigation stays within a single language tree. Calling `parent` on the root of an injected tree returns `null`, **not** the host node that contains the injection. Crossing injection boundaries requires a fresh `kakehashi/node` call.
 
-This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator ([lazy-node-identity-tracking](lazy-node-identity-tracking.md) §"Node Uniqueness Key"), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
+This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator (lazy-node-identity-tracking §"Node Uniqueness Key"), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
 
 **`null` cases**:
 - `parent`: id not in tracker, **or** id refers to a root node
@@ -282,7 +282,7 @@ Include `range` in every `NodeInfo` returned.
 
 - Methods are registered via `LspService::build().custom_method(...)` in `src/bin/main.rs`, following the existing `kakehashi/internal/effectiveConfiguration` pattern
 - Handlers live under `src/lsp/lsp_impl/kakehashi/node/` (one file per method) for symmetry with `kakehashi/internal/`
-- `RegionIdTracker` is renamed to `NodeTracker` and extended with a reverse index (`Ulid → PositionKey`); see [lazy-node-identity-tracking](lazy-node-identity-tracking.md)
+- `RegionIdTracker` is renamed to `NodeTracker` and extended with a reverse index (`Ulid → PositionKey`); see lazy-node-identity-tracking
 - Injection layer enumeration reuses the existing injection processing in `src/lsp/lsp_impl/coordinator/injection.rs`
 
 ## Summary
