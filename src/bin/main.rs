@@ -114,6 +114,29 @@ enum ConfigAction {
     },
 }
 
+/// Restore the default `SIGPIPE` disposition (Unix only).
+///
+/// Rust ignores `SIGPIPE` at startup, which turns a broken pipe into a panic on
+/// the next `print!`/`println!` (e.g. `kakehashi config schema | head`). CLI
+/// subcommands write to stdout and are routinely piped, so for those we restore
+/// the conventional Unix behavior: the process terminates quietly with `SIGPIPE`
+/// when the reader goes away.
+///
+/// LSP server mode intentionally keeps the Rust default (ignored) so the bridge
+/// can observe `BrokenPipe` as a recoverable I/O error when a downstream
+/// language server dies, rather than being killed by the signal.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    // SAFETY: `SigDfl` is async-signal-safe and installed once, before any output.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -125,6 +148,11 @@ fn main() -> ExitCode {
 
     if !cli.config_file.is_empty() {
         kakehashi::config::set_config_file_override(cli.config_file);
+    }
+
+    // Subcommands (not the LSP server) print to stdout and are commonly piped.
+    if cli.command.is_some() {
+        reset_sigpipe();
     }
 
     let result = match cli.command {

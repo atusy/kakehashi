@@ -998,3 +998,43 @@ fn test_language_uninstall_cancel() {
         "Parser should still exist after cancellation"
     );
 }
+
+/// A CLI subcommand whose stdout reader closes early (e.g. `kakehashi config
+/// schema | head`) must not panic. Rust ignores SIGPIPE by default, which turns
+/// a broken pipe into a panic on the next `print!`; the fix restores the default
+/// SIGPIPE disposition for subcommands so the process terminates quietly instead.
+///
+/// The read end of the pipe is closed *before* the child writes, so the first
+/// write hits a pipe with no readers and fails with EPIPE regardless of the
+/// kernel pipe-buffer size — making the reproduction deterministic.
+#[test]
+fn config_schema_does_not_panic_on_broken_pipe() {
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "schema"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn command");
+
+    // Close the stdout read end immediately, before the child gets to write.
+    drop(child.stdout.take());
+
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for command");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "Broken pipe must not cause a panic. stderr: {stderr}"
+    );
+    // Rust's default panic handler exits with code 101; the fix must avoid that.
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "Subcommand should not exit via panic (101) on broken pipe; status: {:?}",
+        output.status
+    );
+}
