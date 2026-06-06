@@ -2,8 +2,8 @@
 
 > The single-LS, per-method strategies defined here remain in effect. Multi-LS
 > routing, aggregation, and initialization-window handling are covered by
-> [ls-bridge-message-ordering](ls-bridge-message-ordering.md) and
-> [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md).
+> ls-bridge-message-ordering and
+> ls-bridge-server-pool-coordination.
 
 ## Decision–Implementation Gap
 
@@ -13,7 +13,7 @@ The remaining three are not yet implemented.
 
 ## Context
 
-When bridging LSP requests for injection regions (see [language-server-bridge](language-server-bridge.md)), different LSP methods have different characteristics:
+When bridging LSP requests for injection regions (see language-server-bridge), different LSP methods have different characteristics:
 
 | Method | Latency Sensitivity | kakehashi Capability | Language Server Value |
 |--------|---------------------|--------------------------|----------------------|

@@ -25,7 +25,7 @@ ls-bridge-async-connection (Async Bridge Connection), ls-bridge-message-ordering
 
 ### Connection State for Shutdown
 
-This decision defines behavior for `Closing` and `Closed` states. See [ls-bridge-message-ordering § Connection State Tracking](ls-bridge-message-ordering.md#4-connection-state-tracking) for the complete ConnectionState enum.
+This decision defines behavior for `Closing` and `Closed` states. See ls-bridge-message-ordering § Connection State Tracking for the complete ConnectionState enum.
 
 **Shutdown-Specific Transitions:**
 ```

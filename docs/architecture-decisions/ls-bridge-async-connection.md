@@ -158,7 +158,7 @@ The system uses two distinct timeout mechanisms with different purposes:
 
 **Independence**: The two timeouts serve different purposes and never overlap (liveness disabled during Initializing; initialization timeout disabled once Ready).
 
-**Coordination with Other Timeouts**: See [ls-bridge-timeout-hierarchy](ls-bridge-timeout-hierarchy.md) for precedence rules when shutdown timeout is active.
+**Coordination with Other Timeouts**: See ls-bridge-timeout-hierarchy for precedence rules when shutdown timeout is active.
 
 ## Consequences
 

@@ -4,7 +4,7 @@
 - [ls-bridge-async-connection](ls-bridge-async-connection.md): Single-connection async I/O
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md): Single-server message ordering
 
-**Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — Phase 1 (routing), Phase 2 (rate-limited respawn), Phase 3 (aggregation).
+**Phasing**: See ls-bridge-implementation-phasing — Phase 1 (routing), Phase 2 (rate-limited respawn), Phase 3 (aggregation).
 
 ## Scope
 
@@ -191,7 +191,7 @@ downstream ──notification──►  bridge  ──notification──►  ups
 
 ### Cancellation Propagation
 
-See [ls-bridge-message-ordering § Cancellation Forwarding](ls-bridge-message-ordering.md#5-cancellation-forwarding) for single-connection cancellation semantics.
+See ls-bridge-message-ordering § Cancellation Forwarding for single-connection cancellation semantics.
 
 **Multi-Connection Coordination (Phase 3)**: Router forwards `$/cancelRequest` to all connections that received the original fan-out request.
 

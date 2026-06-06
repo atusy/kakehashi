@@ -438,9 +438,9 @@ For a single injection region starting at host line `H` and column `C`:
 | Host → Virtual | `virtual_line = host_line - H`, `virtual_col = host_col - C` (first line only) |
 | Virtual → Host | `host_line = virtual_line + H`, `host_col = virtual_col + C` (first line only) |
 
-For multiple injections of the same language in one document, see [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) for virtual document strategies.
+For multiple injections of the same language in one document, see language-server-bridge-virtual-document-model for virtual document strategies.
 
-Translation is straightforward for positions within a single injection. See [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) for complex cases involving cross-file references.
+Translation is straightforward for positions within a single injection. See language-server-bridge-request-strategies for complex cases involving cross-file references.
 
 ## Consequences
 
@@ -464,7 +464,7 @@ Translation is straightforward for positions within a single injection. See [lan
 ### Neutral
 
 - **Configuration optional**: Some servers (pyright) work out-of-the-box; others (rust-analyzer) benefit from `initializationOptions` for full functionality
-- **Partial feature support**: Not all LSP methods will be bridged (see [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md))
+- **Partial feature support**: Not all LSP methods will be bridged (see language-server-bridge-request-strategies)
 - **Server availability**: Graceful degradation when servers not installed
 
 ## Implementation Phases
@@ -497,7 +497,7 @@ Translation is straightforward for positions within a single injection. See [lan
 
 ### Phase 5+: Feature Expansion
 
-See [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) for per-method implementation details.
+See language-server-bridge-request-strategies for per-method implementation details.
 
 ## Related Decisions
 
