@@ -8,6 +8,19 @@ Supersession is NOT recorded here. When a decision replaces another, delete the
 old record — its history stays in `git log` (use `git log --follow <file>`).
 Keep the alternatives that were genuinely considered: this directory records the
 *decisions*, including the options weighed and why the chosen one won.
+
+Cross-references between ADRs:
+- In body prose, refer to another ADR by its **bare slug in plain text**
+  (e.g. `see node-reference-protocol`), NOT as a markdown link. Add a section
+  reference inline when useful (e.g. `ls-bridge-message-ordering § Cancellation
+  Forwarding`).
+- Reserve markdown links (`[slug](slug.md)`) for the curated **Related
+  Decisions** block and footer link lists (e.g. `## Related Decisions`,
+  `## More Information`).
+- Rationale: ADRs are deleted when superseded (delete-on-supersede), so inline
+  links rot into clickable 404s. Plain-text mentions degrade gracefully to a
+  stale-but-harmless proper noun, keeping the curated link block the single
+  place a link can rot.
 -->
 
 ## Context

@@ -6,7 +6,7 @@
 
 ## Context and Problem Statement
 
-Kakehashi already parses every open document with tree-sitter and maintains stable node identities across edits via [lazy-node-identity-tracking](lazy-node-identity-tracking.md). The syntax tree carries information that editor users and plugin authors routinely want to act on — node boundaries, types, parent-child relations, injection structure — but **none of it is currently reachable from the client side**.
+Kakehashi already parses every open document with tree-sitter and maintains stable node identities across edits via lazy-node-identity-tracking. The syntax tree carries information that editor users and plugin authors routinely want to act on — node boundaries, types, parent-child relations, injection structure — but **none of it is currently reachable from the client side**.
 
 The goal of this protocol is to **open kakehashi as a platform for syntax-aware extensions**: any LSP client (editor command, plugin, REPL, scripting layer) should be able to ask kakehashi about nodes and build features on top, **without bundling tree-sitter on the client side** and without re-implementing the parser, queries, or injection logic that kakehashi already maintains.
 
@@ -22,7 +22,7 @@ These all reduce to four primitives: **identify a node at a position**, **naviga
 ## Decision Drivers
 
 * **Minimal API surface**: Each method returns exactly one kind of information, composing well
-* **Edit-resilient**: A held ID must continue to resolve after `didChange`, as long as the underlying node survives invalidation rules ([lazy-node-identity-tracking](lazy-node-identity-tracking.md))
+* **Edit-resilient**: A held ID must continue to resolve after `didChange`, as long as the underlying node survives invalidation rules (lazy-node-identity-tracking)
 * **LSP-spec aligned**: Custom methods, but parameter shapes follow LSP conventions (`TextDocumentIdentifier`, `Position`, `Range`)
 * **Predictable null semantics**: A single null response means "not currently valid", whether due to invalidation, prior unknown ID, or out-of-range position
 * **Injection-aware**: Multi-layer language nesting (e.g., Markdown → Python → regex) must be addressable explicitly
@@ -163,7 +163,7 @@ Edge cases:
 
 **Scope rule**: Navigation stays within a single language tree. Calling `parent` on the root of an injected tree returns `null`, **not** the host node that contains the injection. Crossing injection boundaries requires a fresh `kakehashi/node` call.
 
-This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator ([lazy-node-identity-tracking](lazy-node-identity-tracking.md) §"Node Uniqueness Key"), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
+This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator (lazy-node-identity-tracking §"Node Uniqueness Key"), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
 
 **`null` cases**:
 - `parent`: id not in tracker, **or** id refers to a root node
@@ -186,7 +186,7 @@ This holds even when a host node and an injected node share an identical span **
 null                                    // id is not currently valid for this document
 ```
 
-The returned text is sliced from the **current** document content using the node's adjusted byte range. Because [lazy-node-identity-tracking](lazy-node-identity-tracking.md)'s position adjustment runs synchronously inside `didChange`, the slice is always consistent with the document the client has observed.
+The returned text is sliced from the **current** document content using the node's adjusted byte range. Because lazy-node-identity-tracking's position adjustment runs synchronously inside `didChange`, the slice is always consistent with the document the client has observed.
 
 ### Invalidate vs Not-Found
 
@@ -196,12 +196,12 @@ Clients **cannot distinguish** between:
 - An ID that was never issued by this server for the supplied `textDocument`
 - A `textDocument` that has no tracker entries (e.g., never opened, already closed)
 
-All three collapse to `null`. This is a deliberate consequence of the no-tombstone, no-LRU design ([lazy-node-identity-tracking](lazy-node-identity-tracking.md)). Clients that need to refresh a node should treat `null` as "re-acquire via `kakehashi/node`".
+All three collapse to `null`. This is a deliberate consequence of the no-tombstone, no-LRU design (lazy-node-identity-tracking). Clients that need to refresh a node should treat `null` as "re-acquire via `kakehashi/node`".
 
 ### Lifecycle
 
 - `didOpen`: no eager work — IDs are issued lazily on first `kakehashi/node*` request
-- `didChange`: existing IDs are repositioned or invalidated per [lazy-node-identity-tracking](lazy-node-identity-tracking.md)
+- `didChange`: existing IDs are repositioned or invalidated per lazy-node-identity-tracking
 - `didClose`: all IDs for the URI are dropped
 
 ## Example Flow
@@ -239,7 +239,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 - **No invalidate diagnostics**: Clients cannot tell why an ID failed; they must re-acquire blindly
 - **Cross-injection navigation is two-step**: `parent` does not transparently cross into a host tree
 - **`injection` mixed mode**: `true` saturates while integer indices are strict (resolve via a single formula, return `null` when out of bounds) — clients must remember which mode they want
-- **Unbounded tracker growth per URI**: Long editing sessions on large files accumulate IDs until `didClose` (no LRU per [lazy-node-identity-tracking](lazy-node-identity-tracking.md))
+- **Unbounded tracker growth per URI**: Long editing sessions on large files accumulate IDs until `didClose` (no LRU per lazy-node-identity-tracking)
 
 ### Neutral
 
@@ -282,7 +282,7 @@ Include `range` in every `NodeInfo` returned.
 
 - Methods are registered via `LspService::build().custom_method(...)` in `src/bin/main.rs`, following the existing `kakehashi/internal/effectiveConfiguration` pattern
 - Handlers live under `src/lsp/lsp_impl/kakehashi/node/` (one file per method) for symmetry with `kakehashi/internal/`
-- `RegionIdTracker` is renamed to `NodeTracker` and extended with a reverse index (`Ulid → PositionKey`); see [lazy-node-identity-tracking](lazy-node-identity-tracking.md)
+- `RegionIdTracker` is renamed to `NodeTracker` and extended with a reverse index (`Ulid → PositionKey`); see lazy-node-identity-tracking
 - Injection layer enumeration reuses the existing injection processing in `src/lsp/lsp_impl/coordinator/injection.rs`
 
 ## Summary

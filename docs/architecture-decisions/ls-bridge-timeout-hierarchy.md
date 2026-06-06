@@ -5,7 +5,7 @@
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) § Response Aggregation
 - [ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md) § Shutdown Timeout
 
-**Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — Phase 1 (Init, Liveness, Global Shutdown), Phase 3 (Per-Request).
+**Phasing**: See ls-bridge-implementation-phasing — Phase 1 (Init, Liveness, Global Shutdown), Phase 3 (Per-Request).
 
 ## Scope
 

@@ -8,7 +8,7 @@ document) is deferred and not implemented.
 
 ## Context
 
-When bridging LSP requests for injection regions (see [language-server-bridge](language-server-bridge.md)), we need to represent injection content to language servers. A host document may contain multiple injection regions of the same language (e.g., multiple Rust code blocks in Markdown).
+When bridging LSP requests for injection regions (see language-server-bridge), we need to represent injection content to language servers. A host document may contain multiple injection regions of the same language (e.g., multiple Rust code blocks in Markdown).
 
 The key question: **Should multiple injections of the same language be isolated (each in its own virtual document), or combined into a single virtual document?**
 
@@ -78,7 +78,7 @@ isolation = true
 isolation = false
 ```
 
-The `_` wildcard matches any host or injection language, enabling layered defaults (see [wildcard-config-inheritance](wildcard-config-inheritance.md)):
+The `_` wildcard matches any host or injection language, enabling layered defaults (see wildcard-config-inheritance):
 
 | Host | Bridge Config | Meaning |
 |------|---------------|---------|
@@ -145,7 +145,7 @@ Virtual documents may be **logical** (in-memory only) or **materialized** (writt
 **Why materialization is sometimes required**: Some language servers (notably rust-analyzer) index from the filesystem rather than relying solely on `didOpen` content. They return `null` for queries when files don't exist on disk or lack project context.
 
 For materialized documents:
-- Create temporary project structure (see [language-server-bridge](language-server-bridge.md#workspace-provisioning))
+- Create temporary project structure (see language-server-bridge § Workspace Provisioning)
 - Write injection content to real file
 - Use real file URI in LSP communication
 - Clean up on document close or server shutdown

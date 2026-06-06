@@ -25,7 +25,7 @@ Design challenges:
 ## Decision Drivers
 
 - **Minimal schema disruption**: no new types in `BridgeServerConfig`, `BridgeLanguageConfig`, or `AggregationConfig`.
-- **Reuse wildcard machinery**: [wildcard-config-inheritance](wildcard-config-inheritance.md)'s `resolve_with_wildcard` should apply uniformly across host and virt entries.
+- **Reuse wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` should apply uniformly across host and virt entries.
 - **Capability vs. policy separation**: `languageServers.*` declares *what* an LS can do; `languages.*.bridge.*` decides *whether and how* it is used.
 - **Opt-in for new behavior**: host bridging defaults *off* so existing configs are unchanged.
 - **Symmetric mental model**: host and virt are both "bridges" — only the LS-matching rule differs.
@@ -91,7 +91,7 @@ No new fields on `BridgeServerConfig`. An LS that should not act as host for a g
 
 ### Wildcard Merge Safety
 
-Concern: under [wildcard-config-inheritance](wildcard-config-inheritance.md), `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. If `_.enabled = true` and `_self.enabled` were absent, the wildcard would silently turn host bridging on.
+Concern: under wildcard-config-inheritance, `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. If `_.enabled = true` and `_self.enabled` were absent, the wildcard would silently turn host bridging on.
 
 Resolution: built-in defaults at `languages._.bridge._self.enabled = false` and `languages._.bridge._.enabled = true` mean that after the *outer* wildcard merge (language layer), every `bridge` map sees `_self` populated with `Some(false)`. During the *inner* wildcard merge (`_self ⊕ _`), key-specific fields win — `_self.enabled = Some(false)` beats `_.enabled = Some(true)`. No special case is needed.
 
@@ -122,7 +122,7 @@ The same reasoning extends to any future `_self`-meaningful field: as long as th
 
 ### URI and Coordinate Handling
 
-Host bridges use the **real URI** as sent by the client. This is the key distinction from virt bridges ([language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md)):
+Host bridges use the **real URI** as sent by the client. This is the key distinction from virt bridges (language-server-bridge-virtual-document-model):
 
 | Aspect | Virt bridge | Host bridge |
 |---|---|---|

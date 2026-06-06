@@ -1,6 +1,6 @@
 # LS Bridge Message Ordering
 
-**Phasing**: See [ls-bridge-implementation-phasing](ls-bridge-implementation-phasing.md) — This decision covers Phase 1; optional coalescing deferred to Phase 2.
+**Phasing**: See ls-bridge-implementation-phasing — This decision covers Phase 1; optional coalescing deferred to Phase 2.
 
 ## Scope
 
