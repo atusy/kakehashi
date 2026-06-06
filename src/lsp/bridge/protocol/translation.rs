@@ -90,6 +90,19 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 // Host -> Virtual (request direction)
 // =============================================================================
 
+/// Whether `host_position` lies on or after the region's start line, i.e. it can
+/// be translated into virtual coordinates without line underflow.
+///
+/// A position *above* the region (`line < region start line`) signals stale
+/// region data — typically an in-flight request whose region was shifted by a
+/// concurrent host edit. Forwarding it would clamp the line to 0 via
+/// `saturating_sub` and send wrong coordinates downstream, so callers should
+/// abort instead. Only the line is checked: once the line is in range, column
+/// underflow is handled by saturation and does not warrant aborting.
+pub(crate) fn host_position_within_region(host_position: Position, offset: &RegionOffset) -> bool {
+    host_position.line >= offset.line()
+}
+
 /// Translate a single host position to virtual coordinates.
 ///
 /// Subtracts the line offset, then applies the per-line column offset for the
@@ -413,5 +426,37 @@ mod tests {
         assert_eq!(range.start.character, 5); // 3 + 2
         assert_eq!(range.end.line, 11);
         assert_eq!(range.end.character, 9); // 7 + 2
+    }
+
+    // ======================================================================
+    // host_position_within_region
+    // ======================================================================
+
+    #[test]
+    fn position_within_region_when_on_start_line() {
+        let pos = Position {
+            line: 10,
+            character: 0,
+        };
+        assert!(host_position_within_region(pos, &RegionOffset::new(10, 4)));
+    }
+
+    #[test]
+    fn position_within_region_when_below_start_line() {
+        let pos = Position {
+            line: 15,
+            character: 0,
+        };
+        assert!(host_position_within_region(pos, &RegionOffset::new(10, 4)));
+    }
+
+    #[test]
+    fn position_outside_region_when_above_start_line() {
+        // Stale region data: host position is above where the region starts.
+        let pos = Position {
+            line: 9,
+            character: 0,
+        };
+        assert!(!host_position_within_region(pos, &RegionOffset::new(10, 4)));
     }
 }
