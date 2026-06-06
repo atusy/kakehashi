@@ -13,9 +13,10 @@ Cross-references between ADRs:
 - In body prose, refer to another ADR by its **bare slug in plain text**
   (e.g. `see node-reference-protocol`), NOT as a markdown link. Add a section
   reference inline when useful (e.g. `ls-bridge-message-ordering § Cancellation Forwarding`).
-- Reserve markdown links (`[slug](slug.md)`) for the curated **Related
-  Decisions** block and footer link lists (e.g. `## Related Decisions`,
-  `## More Information`).
+- Reserve markdown links (`[slug](slug.md)`) for the curated related-decisions
+  block — written as a top-of-file `**Related Decisions**:` / `**Related**:`
+  list or a footer `## Related Decisions` section — and for footer link lists
+  (e.g. `## More Information`).
 - Rationale: ADRs are deleted when superseded (delete-on-supersede), so inline
   links rot into clickable 404s. Plain-text mentions degrade gracefully to a
   stale-but-harmless proper noun, keeping the curated link block the single
