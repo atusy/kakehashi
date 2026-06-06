@@ -12,8 +12,7 @@ Keep the alternatives that were genuinely considered: this directory records the
 Cross-references between ADRs:
 - In body prose, refer to another ADR by its **bare slug in plain text**
   (e.g. `see node-reference-protocol`), NOT as a markdown link. Add a section
-  reference inline when useful (e.g. `ls-bridge-message-ordering § Cancellation
-  Forwarding`).
+  reference inline when useful (e.g. `ls-bridge-message-ordering § Cancellation Forwarding`).
 - Reserve markdown links (`[slug](slug.md)`) for the curated **Related
   Decisions** block and footer link lists (e.g. `## Related Decisions`,
   `## More Information`).
