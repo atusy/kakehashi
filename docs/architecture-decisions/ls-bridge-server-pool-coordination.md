@@ -278,7 +278,9 @@ languages:
           textDocument/codeAction:
             strategy: concatenated   # Safe: proposals, user executes one
           # hover, definition: use default (single_by_capability)
-          # formatting, rename: MUST use single_by_capability
+          # rename: MUST use single_by_capability (overlapping WorkspaceEdits)
+          # formatting: concatenated runs a sequential pipeline, NOT list
+          #   concatenation — see concatenated-formatting-pipeline
 
 languageServers:
   pyright:

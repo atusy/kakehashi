@@ -61,7 +61,7 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 ```
                     ┌─────────────────────────────┐
- Request ──────────▶│      kakehashi          │
+ Request ──────────▶│      kakehashi              │
                     │  ┌─────────────────────┐    │
                     │  │ Tree-sitter tokens  │────│───▶ Immediate response
                     │  │ (local, fast)       │    │     (use if bridge slow)
@@ -221,8 +221,12 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Output | TextEdit[] |
 | Cross-file | N/A (single document) |
 | Position mapping | All edit ranges |
+| Multi-server | `preferred` by default; `concatenated` opts into a sequential pipeline |
 
-Relatively simple—all edits are within the virtual document.
+Single-server formatting is simple—all edits are within the virtual document.
+For multiple servers, `concatenated` does **not** concatenate edit lists (that
+would overlap); it runs a sequential formatter pipeline ordered by `priorities`.
+See concatenated-formatting-pipeline.
 
 ### Strategy 4: Background Collection
 
@@ -281,6 +285,7 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
+| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (concatenated-formatting-pipeline) |
 
 ## Consequences
 
@@ -342,3 +347,4 @@ The original priority order (for reference):
 
 - [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How injections are represented as virtual documents
+- [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md): Multi-server formatting via a sequential pipeline (`strategy: "concatenated"`)
