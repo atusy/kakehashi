@@ -1,7 +1,7 @@
 //! `kakehashi/node/children` — id → immediate-children NodeInfo array (node-reference-protocol).
 //!
-//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind)`
-//! triple, locates the matching tree-sitter node in the current parse tree, and
+//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind, layer)`
+//! key, locates the matching tree-sitter node in the current parse tree, and
 //! returns one [`NodeInfo`](../../../../../docs/architecture-decisions/node-reference-protocol.md#nodeinfo-type)
 //! per immediate child in **document order** (ascending `start_byte`).
 //!
@@ -57,9 +57,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Look up the tracked node's byte range and kind. None means: never
-        // issued, invalidated by a prior edit, or this URI has no entries.
-        let Some((start, end, kind)) = self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        // Look up the tracked node's byte range, kind, and injection layer.
+        // None means: never issued, invalidated by a prior edit, or this URI
+        // has no entries. `layer` pins resolution and child minting to the
+        // language tree that minted the node (node-reference-protocol Scope rule).
+        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -85,10 +87,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Search the host tree first, then injected layers at `start`. node-reference-protocol
-        // "Navigation Methods": children stay within a single language tree, so
-        // an injected node's children come from the injected tree — not from
-        // the host node that contains the injection.
+        // Resolve in the minting layer only (`stack[layer]`), never falling back
+        // to other layers. node-reference-protocol "Navigation Methods":
+        // children stay within a single language tree, so an injected node's
+        // children come from the injected tree — not from the host node that
+        // contains the injection.
         //
         // tree-sitter's `Node::children(&mut cursor)` iterates BOTH named and
         // anonymous children in document order. A leaf node yields an empty
@@ -101,6 +104,7 @@ impl Kakehashi {
             start,
             end,
             kind,
+            layer,
             |node| {
                 let mut cursor = node.walk();
                 node.children(&mut cursor)
@@ -111,8 +115,8 @@ impl Kakehashi {
         let Some(child_infos) = child_infos else {
             log::warn!(
                 target: "kakehashi::node::children",
-                "tracker hit but no matching node in any layer for ulid={} uri={} range=[{},{}) kind={}",
-                ulid, uri, start, end, kind
+                "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                layer, ulid, uri, start, end, kind
             );
             return Ok(Value::Null);
         };
@@ -121,7 +125,10 @@ impl Kakehashi {
         let infos: Vec<Value> = child_infos
             .into_iter()
             .map(|(c_start, c_end, c_kind)| {
-                let child_ulid = tracker.get_or_create(&uri, c_start, c_end, c_kind);
+                // Children live in the same tree as their parent, so they are
+                // minted in the same `layer`.
+                let child_ulid =
+                    tracker.get_or_create_in_layer(&uri, c_start, c_end, c_kind, layer);
                 json!({
                     "id": child_ulid.to_string(),
                     "type": c_kind,

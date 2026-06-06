@@ -9,10 +9,11 @@
 //! tree-sitter's `set_included_ranges`, which means every node's
 //! `start_byte` / `end_byte` is already in original-document coordinates.
 //! That property is load-bearing: the entry-point handler issues ULIDs via
-//! `NodeTracker::get_or_create(uri, start_byte, end_byte, kind)`, and the
-//! tracker keys must stay in the host's byte space so subsequent
+//! `NodeTracker::get_or_create_in_layer(uri, start_byte, end_byte, kind, layer)`,
+//! and the tracker keys must stay in the host's byte space so subsequent
 //! `parent` / `children` / `text` calls and `didChange` adjustments line
-//! up across layers.
+//! up across layers. The `layer` index distinguishes a host node from an
+//! injected node sharing the same span and kind (lazy-node-identity-tracking).
 
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
@@ -204,21 +205,35 @@ pub(super) fn injection_stack_at(
     stack
 }
 
-/// Resolve a tracked `(start, end, kind)` triple to a tree-sitter node by
-/// searching the host tree first, then each injected layer at `start`.
+/// Resolve a tracked node to a tree-sitter node **in the exact layer that
+/// minted it**, identified by the `layer` discriminator recorded in its
+/// identity key (lazy-node-identity-tracking §"Node Uniqueness Key").
 ///
-/// Tracker entries store only `(uri, start_byte, end_byte, kind)` — they do
-/// not record which language tree the node originated from. A node minted
-/// by `kakehashi/node` against an injected layer (e.g. a Python `assignment`
-/// inside a markdown code block) would otherwise be unreachable from
-/// navigation handlers that only look at the host tree. Walking the stack
-/// here lets `parent` and `children` follow injected nodes in the same
-/// layer that produced them.
+/// `layer == 0` resolves against the host tree directly (the common case, no
+/// stack walk). A deeper `layer` rebuilds the injection stack at `start` and
+/// searches `stack[layer]` only. We deliberately do **not** fall back to other
+/// layers: a node carries the layer it was created in, and resolving it in a
+/// different layer would violate node-reference-protocol's per-layer Scope rule.
+/// Within a single parse this is exactly the host-vs-injected collision the
+/// `layer` key prevents — a host and injected node sharing `(start, end, kind)`
+/// would otherwise be indistinguishable here (issue #313).
+///
+/// Across edits the depth index is a weaker guarantee. If an edit makes the
+/// stack shallower than `layer`, `stack.get(layer)` is `None` and we return
+/// `None` — a safe "re-acquire" signal. But `layer` is only a depth, not a tree
+/// identity: an edit that restructures the nesting while keeping
+/// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
+/// then succeeds only if that tree happens to hold a node at the identical
+/// `(start, end, kind)`, and otherwise returns `None`. We do not (and with a
+/// depth index cannot) detect that case, so the "re-acquire on `null`" contract
+/// — not a wrong-tree guarantee — is what protects clients. See the
+/// layer-discriminator options in lazy-node-identity-tracking for the
+/// region-ULID alternative that would close this gap.
 ///
 /// `f` is invoked at most once, with the matching `Node`. Returning `None`
-/// from `f` is distinguishable from the "no layer matched" outcome only by
+/// from `f` is distinguishable from the "no match" outcome only by
 /// the caller's outer `Option` — both surface as `Option<R>` because the
-/// outer call returns `None` when no layer matched. Callers that need to
+/// outer call returns `None` when nothing matched. Callers that need to
 /// distinguish "found node but operation returned nothing" (e.g. parent of
 /// a root) from "no match" should use a richer `R` like `Option<T>`.
 #[allow(clippy::too_many_arguments)]
@@ -230,6 +245,7 @@ pub(super) fn with_resolved_node<R>(
     start: usize,
     end: usize,
     kind: &'static str,
+    layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
 ) -> Option<R> {
     // Reject obviously-invalid ranges up front — same guard `find_node_at`
@@ -240,21 +256,18 @@ pub(super) fn with_resolved_node<R>(
         return None;
     }
 
-    // Fast path: the most common case is a node living in the host tree.
-    if let Some(node) = find_node_at(host_tree, start, end, kind) {
+    // Host layer: resolve against the host tree without the stack walk.
+    if layer == 0 {
+        let node = find_node_at(host_tree, start, end, kind)?;
         return Some(f(node));
     }
 
-    // Walk injected layers. `stack[0]` is the host (already tried above), so
-    // skip it.
+    // Deeper layer: rebuild the stack at `start` and search the minting layer
+    // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
-    for layer in stack.iter().skip(1) {
-        if let Some(node) = find_node_at(&layer.tree, start, end, kind) {
-            return Some(f(node));
-        }
-    }
-
-    None
+    let layer_tree = &stack.get(layer)?.tree;
+    let node = find_node_at(layer_tree, start, end, kind)?;
+    Some(f(node))
 }
 
 /// Collect the injection languages along the cursor's injection path at

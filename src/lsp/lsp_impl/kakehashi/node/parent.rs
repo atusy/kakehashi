@@ -1,25 +1,25 @@
 //! `kakehashi/node/parent` — id → immediate-parent NodeInfo (node-reference-protocol).
 //!
-//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind)`
-//! triple, locates the matching tree-sitter node in the current parse tree, and
+//! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind, layer)`
+//! key, locates the matching tree-sitter node in the current parse tree, and
 //! returns a [`NodeInfo`](../../../../../docs/architecture-decisions/node-reference-protocol.md#nodeinfo-type)
 //! for its tree-sitter parent.
 //!
 //! Per node-reference-protocol §"Navigation Methods", navigation stays within a single
 //! language tree: calling `parent` on the root of an injected tree must **not**
 //! cross into the host node that contains the injection. To find the node in
-//! the correct tree we search the host tree first and then each injected layer
-//! at the tracked `start_byte` (see
-//! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — that
-//! way a node minted by `kakehashi/node` against an injected layer remains
-//! navigable from the same layer that produced it.
+//! the correct tree we resolve it **only** in the layer that minted it —
+//! `stack[layer]` for the tracked `layer` (see
+//! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — so a
+//! node minted by `kakehashi/node` against an injected layer is never re-matched
+//! against a different layer's tree.
 //!
 //! Returns `null` (serialized as JSON `null`) when:
 //! - the URI is unknown or invalid,
 //! - the ULID is malformed or was never issued / has been invalidated,
 //! - the document has not yet been parsed,
-//! - the tracked range cannot be matched against a node in the host tree or
-//!   any injected layer, or
+//! - the tracked range cannot be matched against a node in the minting layer's
+//!   tree (e.g. an edit restructured the injection nesting), or
 //! - the matched node is the root of its tree (no parent — applies to host
 //!   root AND to the root of any injected tree, per the Scope rule).
 
@@ -57,9 +57,12 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Look up the tracked node's byte range and kind. None means: never
-        // issued, invalidated by a prior edit, or this URI has no entries.
-        let Some((start, end, kind)) = self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        // Look up the tracked node's byte range, kind, and injection layer.
+        // None means: never issued, invalidated by a prior edit, or this URI
+        // has no entries. `layer` pins resolution to the language tree that
+        // minted the node so navigation stays in-layer (node-reference-protocol
+        // Scope rule).
+        let Some((start, end, kind, layer)) = self.bridge.node_tracker().lookup_node(&uri, &ulid)
         else {
             return Ok(Value::Null);
         };
@@ -82,11 +85,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Search the host tree first, then injected layers at `start`. node-reference-protocol
-        // "Scope rule" applies per layer: tree-sitter's `node.parent()` returns
-        // None for any tree root (host root AND injected root), which is the
-        // intended semantics — do NOT chase into the host node that contains
-        // the injection.
+        // Resolve in the minting layer only (`stack[layer]`), never falling back
+        // to other layers. node-reference-protocol "Scope rule" applies per
+        // layer: tree-sitter's `node.parent()` returns None for any tree root
+        // (host root AND injected root), which is the intended semantics — do
+        // NOT chase into the host node that contains the injection.
         let parent_info = with_resolved_node(
             &self.language,
             &host_language,
@@ -95,6 +98,7 @@ impl Kakehashi {
             start,
             end,
             kind,
+            layer,
             |node| {
                 node.parent()
                     .map(|p| (p.start_byte(), p.end_byte(), p.kind()))
@@ -104,18 +108,20 @@ impl Kakehashi {
             if parent_info.is_none() {
                 log::warn!(
                     target: "kakehashi::node::parent",
-                    "tracker hit but no matching node in any layer for ulid={} uri={} range=[{},{}) kind={}",
-                    ulid, uri, start, end, kind
+                    "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                    layer, ulid, uri, start, end, kind
                 );
             }
             return Ok(Value::Null);
         };
 
-        // Issue / reuse a stable ULID for the parent (lazy-node-identity-tracking lazy assignment).
+        // Issue / reuse a stable ULID for the parent (lazy-node-identity-tracking
+        // lazy assignment). The parent lives in the same tree as the child, so
+        // it is minted in the same `layer`.
         let parent_ulid = self
             .bridge
             .node_tracker()
-            .get_or_create(&uri, p_start, p_end, p_kind);
+            .get_or_create_in_layer(&uri, p_start, p_end, p_kind, layer);
 
         Ok(json!({
             "id": parent_ulid.to_string(),

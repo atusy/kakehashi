@@ -14,7 +14,7 @@ use url::Url;
 
 /// Tracks stable ULID-based identifiers for tree-sitter nodes.
 ///
-/// Uses position-based composite keys (start_byte, end_byte, kind) per lazy-node-identity-tracking
+/// Uses position-based composite keys (start_byte, end_byte, kind, layer) per lazy-node-identity-tracking
 /// and applies START-priority invalidation rules to maintain stable ULIDs across edits.
 /// Originally introduced for injection regions; generalized for the Node Reference
 /// Protocol ([node-reference-protocol](../../docs/architecture-decisions/node-reference-protocol.md)).
@@ -93,11 +93,16 @@ impl UriEntries {
     }
 }
 
-/// Key for Phase 2 position-based tracking (lazy-node-identity-tracking composite key).
+/// Composite key for position-based tracking (lazy-node-identity-tracking).
 ///
-/// Note: Language is NOT part of the key per lazy-node-identity-tracking specification.
-/// Same position with different language gets different ULID because
-/// kind will differ in the AST (e.g., fenced_code_block vs code_block).
+/// `kind` was originally assumed to separate co-located nodes from different
+/// injection layers ("a Markdown `fenced_code_block` vs a Python `module`
+/// differ by kind"). Recursive same-language injection breaks that: a
+/// ```` ```markdown ```` block injected into Markdown yields the same kind at the
+/// same span in both the host and injected tree. `layer` (injection depth, `0` =
+/// host) restores uniqueness so the two get distinct ULIDs — see
+/// lazy-node-identity-tracking §"Node Uniqueness Key". `layer` is internal:
+/// clients only ever see the opaque ULID.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 struct PositionKey {
     start_byte: usize,
@@ -107,24 +112,36 @@ struct PositionKey {
     /// `&'static str`. Storing the static slice avoids an allocation per
     /// tracker entry without losing any genuinely owned data.
     kind: &'static str,
+    /// Injection depth that minted the node (`0` = host). Preserved by position
+    /// adjustment: a depth index does not move with byte positions, so it is
+    /// carried through edits unchanged. It is *not* an absolute identity — an
+    /// edit that restructures injection nesting (adds/removes an outer layer)
+    /// shifts a node's true depth, leaving the stored `layer` stale. The held
+    /// ULID then degrades to "re-acquire" (see `with_resolved_node`), rather
+    /// than guaranteeing the node still lives at this depth.
+    layer: usize,
 }
 
 impl PositionKey {
-    /// Create a new position key from byte range and node kind.
-    fn new(start: usize, end: usize, kind: &'static str) -> Self {
+    /// Create a new position key from byte range, node kind, and injection layer.
+    fn new(start: usize, end: usize, kind: &'static str, layer: usize) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
             kind,
+            layer,
         }
     }
 
     /// Create a position key with adjusted positions (for edit operations).
-    fn with_positions(start: usize, end: usize, kind: &'static str) -> Self {
+    ///
+    /// `kind` and `layer` are carried over verbatim via struct-update syntax —
+    /// neither shifts with byte positions (`PositionKey` is `Copy`).
+    fn with_positions(self, start: usize, end: usize) -> Self {
         Self {
             start_byte: start,
             end_byte: end,
-            kind,
+            ..self
         }
     }
 }
@@ -196,10 +213,9 @@ fn apply_delta(position: usize, delta: i64) -> usize {
 fn adjust_position_for_edit(key: PositionKey, edit: &EditInfo, delta: i64) -> Option<PositionKey> {
     if key.start_byte >= edit.old_end_byte {
         // Node E: AFTER edit → shift both start and end
-        Some(PositionKey::with_positions(
+        Some(key.with_positions(
             apply_delta(key.start_byte, delta),
             apply_delta(key.end_byte, delta),
-            key.kind,
         ))
     } else if key.end_byte > edit.start_byte {
         // Node A/B: CONTAINS or OVERLAPS edit
@@ -233,11 +249,7 @@ fn adjust_position_for_edit(key: PositionKey, edit: &EditInfo, delta: i64) -> Op
         if new_end <= key.start_byte {
             None // Range collapsed to zero or negative
         } else {
-            Some(PositionKey::with_positions(
-                key.start_byte,
-                new_end,
-                key.kind,
-            ))
+            Some(key.with_positions(key.start_byte, new_end))
         }
     } else {
         // Node F: BEFORE edit → unchanged
@@ -253,15 +265,13 @@ impl NodeTracker {
         }
     }
 
-    /// Get or create a stable ULID for a tree-sitter node.
+    /// Get or create a stable ULID for a **host-layer** tree-sitter node.
     ///
-    /// Uses lazy-node-identity-tracking composite key `(start_byte, end_byte, kind)`: the same
-    /// (uri, start, end, kind) always returns the same ULID, while different
-    /// nodes at the same position (e.g. nested `document` / `section` / `paragraph`
-    /// at byte 0) receive distinct ULIDs.
-    ///
-    /// Updates both the forward and reverse index so the returned ULID can be
-    /// resolved back to its position via [`lookup_position`](Self::lookup_position).
+    /// Convenience for the common case (host tree, region content nodes): it
+    /// delegates to [`get_or_create_in_layer`](Self::get_or_create_in_layer)
+    /// with `layer = 0`. Injection-aware call sites that mint nodes from a
+    /// deeper layer MUST use `get_or_create_in_layer` so host and injected
+    /// nodes sharing `(start, end, kind)` receive distinct ULIDs.
     pub(crate) fn get_or_create(
         &self,
         uri: &Url,
@@ -269,7 +279,27 @@ impl NodeTracker {
         end: usize,
         kind: &'static str,
     ) -> Ulid {
-        let key = PositionKey::new(start, end, kind);
+        self.get_or_create_in_layer(uri, start, end, kind, 0)
+    }
+
+    /// Get or create a stable ULID for a tree-sitter node at injection `layer`.
+    ///
+    /// Uses lazy-node-identity-tracking composite key `(start_byte, end_byte,
+    /// kind, layer)`: the same key always returns the same ULID, while
+    /// different nodes — including a host vs injected node that share an
+    /// identical span and kind (`layer` differs) — receive distinct ULIDs.
+    ///
+    /// Updates both the forward and reverse index so the returned ULID can be
+    /// resolved back to its position via [`lookup_node`](Self::lookup_node).
+    pub(crate) fn get_or_create_in_layer(
+        &self,
+        uri: &Url,
+        start: usize,
+        end: usize,
+        kind: &'static str,
+        layer: usize,
+    ) -> Ulid {
+        let key = PositionKey::new(start, end, kind, layer);
 
         // NOTE: Explicit two-step pattern to avoid DashMap lifetime ambiguity.
         let mut entry = self.entries.entry(uri.clone()).or_default();
@@ -277,6 +307,10 @@ impl NodeTracker {
     }
 
     /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind)` triple.
+    ///
+    /// Drops the layer discriminator — callers that need it (the navigation
+    /// handlers, to re-mint in the same layer) use
+    /// [`lookup_node`](Self::lookup_node) instead.
     ///
     /// Returns `None` if the ULID was never issued for this URI, if it was
     /// invalidated by an edit (START fell inside the edit range per lazy-node-identity-tracking),
@@ -287,9 +321,24 @@ impl NodeTracker {
         uri: &Url,
         ulid: &Ulid,
     ) -> Option<(usize, usize, &'static str)> {
+        let (start, end, kind, _layer) = self.lookup_node(uri, ulid)?;
+        Some((start, end, kind))
+    }
+
+    /// Resolve a ULID back to its tracked `(start_byte, end_byte, kind, layer)`.
+    ///
+    /// Like [`lookup_position`](Self::lookup_position) but also returns the
+    /// injection `layer` that minted the node, so navigation handlers can
+    /// resolve it in the correct language tree and re-mint parent/children in
+    /// the same layer.
+    pub(crate) fn lookup_node(
+        &self,
+        uri: &Url,
+        ulid: &Ulid,
+    ) -> Option<(usize, usize, &'static str, usize)> {
         let entries = self.entries.get(uri)?;
         let key = entries.lookup(ulid)?;
-        Some((key.start_byte, key.end_byte, key.kind))
+        Some((key.start_byte, key.end_byte, key.kind, key.layer))
     }
 
     /// Get the ULID for a position if it exists, without creating it.
@@ -298,7 +347,7 @@ impl NodeTracker {
     /// Used in tests to verify position adjustment without side effects.
     #[cfg(test)]
     fn get(&self, uri: &Url, start: usize, end: usize, kind: &'static str) -> Option<Ulid> {
-        let key = PositionKey::new(start, end, kind);
+        let key = PositionKey::new(start, end, kind, 0);
         self.entries.get(uri)?.forward.get(&key).copied()
     }
 
@@ -533,8 +582,8 @@ impl NodeTracker {
             if let Err(_existing) = new_entries.insert(new_key, ulid) {
                 warn!(
                     target: "kakehashi::node_tracker",
-                    "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}",
-                    ulid, new_key.start_byte, new_key.end_byte, new_key.kind
+                    "Position collision after edit - ULID mapping dropped: ulid={}, start={}, end={}, kind={}, layer={}",
+                    ulid, new_key.start_byte, new_key.end_byte, new_key.kind, new_key.layer
                 );
                 // Note: Collided ULID is also invalidated (both nodes can't coexist)
                 invalidated.push(ulid);
@@ -620,6 +669,70 @@ mod tests {
         assert_ne!(
             block_ulid, fence_ulid,
             "Different kinds should return different ULIDs"
+        );
+    }
+
+    #[test]
+    fn test_different_layer_returns_different_ulid() {
+        // Issue #313: recursive same-language injection can place a node with an
+        // identical (start, end, kind) in both the host and an injected layer.
+        // The `layer` discriminator must keep their ULIDs distinct so navigation
+        // can resolve each in the correct language tree.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("layer");
+
+        let host_ulid = tracker.get_or_create_in_layer(&uri, 0, 10, "paragraph", 0);
+        let injected_ulid = tracker.get_or_create_in_layer(&uri, 0, 10, "paragraph", 1);
+
+        assert_ne!(
+            host_ulid, injected_ulid,
+            "Same (start, end, kind) at different layers should return different ULIDs"
+        );
+    }
+
+    #[test]
+    fn test_same_layer_returns_same_ulid() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("layer-stable");
+
+        let a = tracker.get_or_create_in_layer(&uri, 0, 10, "paragraph", 2);
+        let b = tracker.get_or_create_in_layer(&uri, 0, 10, "paragraph", 2);
+
+        assert_eq!(a, b, "Same key including layer should return the same ULID");
+    }
+
+    #[test]
+    fn test_get_or_create_defaults_to_host_layer() {
+        // The plain `get_or_create` convenience must mint at layer 0, matching a
+        // node explicitly created in the host layer.
+        let tracker = NodeTracker::new();
+        let uri = test_uri("layer-default");
+
+        let default_ulid = tracker.get_or_create(&uri, 0, 10, "paragraph");
+        let host_ulid = tracker.get_or_create_in_layer(&uri, 0, 10, "paragraph", 0);
+
+        assert_eq!(
+            default_ulid, host_ulid,
+            "get_or_create should be equivalent to layer 0"
+        );
+    }
+
+    #[test]
+    fn test_lookup_node_returns_layer() {
+        let tracker = NodeTracker::new();
+        let uri = test_uri("lookup-layer");
+
+        let ulid = tracker.get_or_create_in_layer(&uri, 5, 15, "block", 3);
+
+        assert_eq!(
+            tracker.lookup_node(&uri, &ulid),
+            Some((5, 15, "block", 3)),
+            "lookup_node should round-trip the layer discriminator"
+        );
+        assert_eq!(
+            tracker.lookup_position(&uri, &ulid),
+            Some((5, 15, "block")),
+            "lookup_position should drop the layer"
         );
     }
 
