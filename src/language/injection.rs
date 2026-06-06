@@ -913,8 +913,9 @@ impl InjectionResolver {
 
     /// Calculate a stable ULID-based region_id for an injection.
     ///
-    /// Phase 2 (lazy-node-identity-tracking): keyed on position (start_byte, end_byte, kind), so the
-    /// ULID stays constant for the same position key.
+    /// Phase 2 (lazy-node-identity-tracking): keyed on position (start_byte,
+    /// end_byte, kind, layer), so the ULID stays constant for the same position
+    /// key. Region IDs always use `layer = 0` (see below).
     ///
     /// Minted via the host-layer `get_or_create` (`layer = 0`) **by design**:
     /// `content_node` comes from the host document's injection query, so it is a

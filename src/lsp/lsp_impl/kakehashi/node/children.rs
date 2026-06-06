@@ -87,10 +87,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Search the host tree first, then injected layers at `start`. node-reference-protocol
-        // "Navigation Methods": children stay within a single language tree, so
-        // an injected node's children come from the injected tree — not from
-        // the host node that contains the injection.
+        // Resolve in the minting layer only (`stack[layer]`), never falling back
+        // to other layers. node-reference-protocol "Navigation Methods":
+        // children stay within a single language tree, so an injected node's
+        // children come from the injected tree — not from the host node that
+        // contains the injection.
         //
         // tree-sitter's `Node::children(&mut cursor)` iterates BOTH named and
         // anonymous children in document order. A leaf node yields an empty
@@ -114,8 +115,8 @@ impl Kakehashi {
         let Some(child_infos) = child_infos else {
             log::warn!(
                 target: "kakehashi::node::children",
-                "tracker hit but no matching node in any layer for ulid={} uri={} range=[{},{}) kind={}",
-                ulid, uri, start, end, kind
+                "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                layer, ulid, uri, start, end, kind
             );
             return Ok(Value::Null);
         };

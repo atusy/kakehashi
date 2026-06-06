@@ -85,11 +85,11 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        // Search the host tree first, then injected layers at `start`. node-reference-protocol
-        // "Scope rule" applies per layer: tree-sitter's `node.parent()` returns
-        // None for any tree root (host root AND injected root), which is the
-        // intended semantics — do NOT chase into the host node that contains
-        // the injection.
+        // Resolve in the minting layer only (`stack[layer]`), never falling back
+        // to other layers. node-reference-protocol "Scope rule" applies per
+        // layer: tree-sitter's `node.parent()` returns None for any tree root
+        // (host root AND injected root), which is the intended semantics — do
+        // NOT chase into the host node that contains the injection.
         let parent_info = with_resolved_node(
             &self.language,
             &host_language,
@@ -108,8 +108,8 @@ impl Kakehashi {
             if parent_info.is_none() {
                 log::warn!(
                     target: "kakehashi::node::parent",
-                    "tracker hit but no matching node in any layer for ulid={} uri={} range=[{},{}) kind={}",
-                    ulid, uri, start, end, kind
+                    "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                    layer, ulid, uri, start, end, kind
                 );
             }
             return Ok(Value::Null);
