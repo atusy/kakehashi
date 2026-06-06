@@ -16,8 +16,6 @@
 use std::io;
 use std::time::Duration;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
@@ -27,7 +25,8 @@ use tower_lsp_server::ls_types::{DocumentDiagnosticParams, TextDocumentIdentifie
 
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
+    virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -126,8 +125,8 @@ fn transform_diagnostic_response_to_host(
     offset: &RegionOffset,
     host_uri: &str,
 ) -> Vec<Diagnostic> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/diagnostic: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/diagnostic") {
+        return Vec::new();
     }
     let Some(mut result) = response.get_mut("result").map(serde_json::Value::take) else {
         return Vec::new();

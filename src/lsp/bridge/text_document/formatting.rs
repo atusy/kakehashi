@@ -29,7 +29,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
-use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri};
+use super::super::protocol::{
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
+};
 
 impl LanguageServerPool {
     /// Send a formatting request and wait for the response.
@@ -148,8 +150,8 @@ pub(super) fn transform_formatting_response_to_host(
     offset: &RegionOffset,
     virtual_line_count: u32,
 ) -> Option<Vec<TextEdit>> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for formatting-style request: {}", error);
+    if response_has_jsonrpc_error(&response, "formatting-style request") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 

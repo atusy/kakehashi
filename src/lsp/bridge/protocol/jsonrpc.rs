@@ -3,7 +3,28 @@
 //! These structs replace raw `serde_json::Value` construction in protocol
 //! builders, enabling compile-time validation of message structure.
 
+use log::warn;
 use serde::Serialize;
+
+/// Detect a JSON-RPC error response so transformers can short-circuit.
+///
+/// Per JSON-RPC 2.0 a response object MUST NOT contain both `result` and
+/// `error`; when `error` is present the `result` is meaningless. Returns `true`
+/// (after logging a warning tagged with `method`) when the response carries a
+/// non-null `error`, signalling the caller to abandon `result` parsing and
+/// return its own "no result" value.
+///
+/// A literal `"error": null` is treated as *no error*: some servers include the
+/// null field alongside a valid `result`, and short-circuiting on it would drop
+/// good results.
+pub(crate) fn response_has_jsonrpc_error(response: &serde_json::Value, method: &str) -> bool {
+    if let Some(error) = response.get("error").filter(|e| !e.is_null()) {
+        warn!(target: "kakehashi::bridge", "Downstream server returned error for {method}: {error}");
+        true
+    } else {
+        false
+    }
+}
 
 /// A JSON-RPC 2.0 request message (expects a response).
 #[derive(Debug, Serialize)]
@@ -75,5 +96,38 @@ mod tests {
         let req = JsonRpcRequest::new(1, "shutdown", ());
         let json = serde_json::to_value(&req).unwrap();
         assert!(json["params"].is_null());
+    }
+
+    #[test]
+    fn response_with_error_is_detected() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32601, "message": "Method not found"},
+        });
+        assert!(response_has_jsonrpc_error(&response, "textDocument/hover"));
+    }
+
+    #[test]
+    fn response_without_error_is_not_flagged() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"contents": "value"},
+        });
+        assert!(!response_has_jsonrpc_error(&response, "textDocument/hover"));
+    }
+
+    #[test]
+    fn response_with_null_error_alongside_result_is_not_flagged() {
+        // Some servers send `"error": null` next to a valid result; this MUST NOT
+        // be treated as an error, otherwise good results get dropped.
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"contents": "value"},
+            "error": null,
+        });
+        assert!(!response_has_jsonrpc_error(&response, "textDocument/hover"));
     }
 }

@@ -10,15 +10,14 @@
 
 use std::io;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{Location, Position, Uri};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, build_text_document_position_params, transform_location_for_goto,
+    JsonRpcRequest, RegionOffset, build_text_document_position_params, response_has_jsonrpc_error,
+    transform_location_for_goto,
 };
 use tower_lsp_server::ls_types::{ReferenceContext, ReferenceParams};
 
@@ -96,8 +95,8 @@ fn transform_references_response_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> Option<Vec<Location>> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/references: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/references") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
     if result.is_null() {

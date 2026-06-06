@@ -14,8 +14,6 @@
 
 use std::io;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Range, Uri};
 use url::Url;
@@ -24,8 +22,9 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use tower_lsp_server::ls_types::{InlayHintParams, TextDocumentIdentifier};
 
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
-    translate_virtual_position_to_host, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
+    translate_host_range_to_virtual, translate_virtual_position_to_host,
+    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -115,8 +114,8 @@ fn transform_inlay_hint_response_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> Option<Vec<InlayHint>> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/inlayHint: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/inlayHint") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 

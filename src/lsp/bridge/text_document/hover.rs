@@ -10,8 +10,6 @@
 
 use std::io;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{Hover, Position};
 use url::Url;
@@ -20,6 +18,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    response_has_jsonrpc_error,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -91,8 +90,8 @@ fn transform_hover_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
 ) -> Option<Hover> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/hover: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/hover") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
     if result.is_null() {
@@ -251,6 +250,24 @@ mod tests {
     #[case::no_result_key(serde_json::json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     #[case::malformed_result(serde_json::json!({"jsonrpc": "2.0", "id": 42, "result": "not_a_hover_object"}))]
     fn hover_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
+        let transformed = transform_hover_response_to_host(response, &RegionOffset::new(5, 0));
+        assert!(transformed.is_none());
+    }
+
+    #[test]
+    fn hover_response_short_circuits_when_error_present_alongside_result() {
+        // JSON-RPC 2.0: a response MUST NOT carry both `result` and `error`.
+        // A misbehaving server that sends both must not have its (meaningless)
+        // `result` parsed — the error takes precedence and we return None.
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": {"code": -32603, "message": "Internal error"},
+            "result": {
+                "contents": "this result must be ignored"
+            }
+        });
+
         let transformed = transform_hover_response_to_host(response, &RegionOffset::new(5, 0));
         assert!(transformed.is_none());
     }

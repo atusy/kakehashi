@@ -10,8 +10,6 @@
 
 use std::io;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{Moniker, Position};
 use url::Url;
@@ -19,6 +17,7 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    response_has_jsonrpc_error,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -86,8 +85,8 @@ fn build_moniker_request(
 /// Moniker fields (scheme, identifier, unique, kind) are non-coordinate data,
 /// so no line/range transformation is needed.
 fn transform_moniker_response_to_host(mut response: serde_json::Value) -> Option<Vec<Moniker>> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/moniker: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/moniker") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 

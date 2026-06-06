@@ -9,8 +9,6 @@
 
 use std::io;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::ColorInformation;
 use url::Url;
@@ -19,7 +17,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_whole_document_request,
+    build_whole_document_request, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -81,8 +79,8 @@ fn transform_document_color_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
 ) -> Vec<ColorInformation> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentColor: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/documentColor") {
+        return vec![];
     }
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
         return vec![];
