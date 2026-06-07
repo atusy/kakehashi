@@ -1,11 +1,14 @@
 # Concatenated Formatting Pipeline
 
-> Scoped to `textDocument/formatting` within a single injection region (see
-> [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md)).
-> Per-method strategy selection and the cross-file/edit-filtering rules live in
-> [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md);
-> the `AggregationStrategy` enum and fan-in mechanics live in
-> [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md).
+> Scoped to formatting within a single injection region (see the virtual
+> document model in language-server-bridge-virtual-document-model). Applies to
+> both `textDocument/formatting` and `textDocument/rangeFormatting`: range
+> formatting resolves aggregation under the `textDocument/formatting` key, so it
+> shares the same `strategy`/`priorities` and inherits this pipeline once
+> implemented (it runs the same servers over the requested sub-range). Per-method
+> strategy selection and the cross-file/edit-filtering rules live in
+> language-server-bridge-request-strategies; the `AggregationStrategy` enum and
+> fan-in mechanics live in ls-bridge-server-pool-coordination.
 
 ## Context
 
@@ -199,11 +202,12 @@ change without affecting the config surface.
 
 ## Decision–Implementation Gap
 
-Not yet implemented as of this decision. `textDocument/formatting` currently runs
-the `preferred` strategy per region regardless of config, and a misconfigured
-`concatenated` formatting pair only emits a warning rather than running a
-pipeline. This record defines the target behavior; the warning path is the
-placeholder to be replaced.
+Not yet implemented as of this decision. `textDocument/formatting` (and
+`textDocument/rangeFormatting`, which resolves aggregation under the same
+`textDocument/formatting` key) currently runs the `preferred` strategy per region
+regardless of config, and a misconfigured `concatenated` formatting pair only
+emits a warning rather than running a pipeline. This record defines the target
+behavior; the warning path is the placeholder to be replaced.
 
 ## Related Decisions
 
