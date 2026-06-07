@@ -142,26 +142,32 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    timeout budget, and a failing step is logged so the misbehaving server is
    diagnosable.
 
-7. **Speculative `didChange` must be reconciled (state-consistency invariant).**
-   The intermediate `didChange` notifications (step 3.1) push *speculative*
-   formatted text into each downstream server's document — text the editor has
-   **not** applied. The editor's truth only changes when it applies the final
-   emitted edit (or stays at the original on a no-op / complete failure /
-   cancellation). So when the pipeline ends — on success, total failure, **or
-   cancellation** — the bridge **must restore every participating downstream
-   server's document to the canonical region content** (the host-derived virtual
-   text), otherwise those servers diverge from the editor and corrupt later
-   edits, diagnostics, and completions. The reconciliation mechanism (a corrective
-   `didChange` back to the canonical text, or running the pipeline against a
-   throwaway scratch document so the shared one is never speculatively mutated) is
-   an implementation choice; the **invariant** — no downstream document is left
-   holding speculative text after the pipeline returns — is the decision.
+7. **Isolate speculative state in a scratch document (state-consistency
+   invariant).** The intermediate `didChange` notifications (step 3.1) push
+   *speculative* formatted text — text the editor has **not** applied. The
+   editor's truth only changes when it applies the final emitted edit (or stays at
+   the original on a no-op / complete failure / cancellation). The **invariant**
+   is that no downstream document the rest of the bridge relies on is ever left
+   holding speculative text. The **recommended** mechanism is to run the pipeline
+   against a **throwaway scratch document** (a unique virtual URI, `didOpen`/
+   `didClose` per run) so the canonical virtual document is never speculatively
+   mutated at all. This is preferred over mutating the shared document and
+   reconciling afterward with a corrective `didChange`, because the shared-mutation
+   approach has two hazards (per tower-lsp concurrency, see CLAUDE.md):
+   - **Concurrent reads see speculative state**: a `hover`/`completion`/diagnostic
+     request the downstream server handles *during* the pipeline would evaluate
+     against unapplied text — flashes and wrong results.
+   - **Reconciliation can fail when it matters most**: if a step times out or the
+     server is stuck (point 6), the corrective `didChange` may itself queue behind
+     the stuck request or time out, leaving the shared document **permanently**
+     desynced. A scratch document needs no corrective step — it is simply
+     discarded — so failure can never desync the canonical document.
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
 intermediate `didChange` that feeds each server's output into the next,
 (c) collapsing the final text into one region-replacement edit, and (d) the
-end-of-pipeline reconciliation that restores downstream document state.
+scratch-document lifecycle that isolates the pipeline's speculative state.
 
 ### Keyword overload, made explicit
 
@@ -241,9 +247,10 @@ change without affecting the config surface.
 - **Coarse output**: full-region replacement enlarges the edit payload, can
   coarsen editor undo granularity, and may disrupt the user's cursor position,
   active code folds, or bookmarks within the region until option D is taken.
-- **Reconciliation overhead**: keeping downstream state consistent (Decision
-  point 7) costs an extra corrective `didChange` (or a scratch-document setup)
-  per participating server at the end of each pipeline run.
+- **Scratch-document overhead**: isolating speculative state (Decision point 7)
+  costs a `didOpen`/`didClose` of a throwaway document per pipeline run, plus the
+  per-step `didChange`s — extra protocol traffic to keep the canonical document
+  untouched.
 - **`priorities` semantics overload**: for formatting, `priorities` becomes an
   allowlist+order (servers not listed do not run), unlike `preferred` where it is
   only a tie-break ordering. Documented, but a behavioral nuance.
