@@ -97,15 +97,17 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
       a single scratch document is reused across steps rather than opened fresh per
       server;
    2. ask that server to format the whole region. The **pipeline** prefers
-      `textDocument/formatting`; if the server has no `documentFormattingProvider`
-      (full formatting yields no result), the pipeline
-      **falls back to `textDocument/rangeFormatting` over the entire region** so range-only
-      servers still participate — the same whole-region equivalence the existing
-      `textDocument/rangeFormatting` handler relies on for covering requests. (The current
-      full-formatting path does not itself fall back; this is target pipeline
-      behavior.) A genuine error is treated as a **failed step** — handled by
-      point 6 (skip-and-continue), not surfaced to the editor; an empty edit list
-      is **authoritative** ("already formatted"), not a fallback trigger;
+      `textDocument/formatting`; if the server lacks full-formatting support —
+      either not advertising `documentFormattingProvider` or returning `null`
+      (`Ok(None)`) — the pipeline
+      **falls back to `textDocument/rangeFormatting` over the entire region** so
+      range-only servers still participate — the same whole-region equivalence the
+      existing `textDocument/rangeFormatting` handler relies on for covering
+      requests. (The current full-formatting path does not itself fall back; this
+      is target pipeline behavior.) A genuine error is treated as a
+      **failed step** — handled by point 6 (skip-and-continue), not surfaced to
+      the editor; an empty edit list (`[]` / `Ok(Some([]))`) is
+      **authoritative** ("already formatted"), not a fallback trigger;
    3. apply the returned edits to the region text (empty edits = already
       formatted = no-op);
    4. proceed to the next server with the updated text.
@@ -185,7 +187,8 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    the URI's directory and extension. So the scratch URI must keep the canonical
    virtual document's directory and file extension (not a random or
    different-scheme URI), or config discovery and language detection break. The
-   concrete naming is given below. The flip side: a real-looking scratch
+   naming requirements and examples are described below. The flip side: a
+   real-looking scratch
    URI risks the downstream server indexing it as a workspace file (duplicate
    symbols, namespace collisions, stray diagnostics). The bridge therefore
    **must keep the scratch document ephemeral** (`didOpen`/`didClose` bracketing
