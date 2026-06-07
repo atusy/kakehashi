@@ -126,18 +126,18 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    offset). It does **not** attempt to compute a minimal diff. This keeps the LSP
    output trivially non-overlapping and avoids needing a text-edit-composition or
    diff utility. Because the replacement spans multiple lines, the host
-   translation **must re-apply each line's host prefix/indentation** (the
-   `RegionOffset` per-line columns — e.g. a Markdown blockquote `> ` on every
-   continuation line), not just the first line's offset. The virtual `newText`
-   starts at column 0 of the embedded language, so emitting it verbatim would
-   strip those prefixes and corrupt blockquoted/indented injections — the existing
-   single-edit limitation noted in `src/lsp/bridge/text_document/formatting.rs`
-   ("multi-line edits drop host indentation"), which the pipeline's full-region
-   output must resolve. Because a formatter may add or remove lines, the per-line
-   `RegionOffset` columns no longer map 1:1 to the output; for lines without a
-   prior-line counterpart the pipeline applies the region's **uniform prefix** —
-   the common host prefix/indentation shared by the region's lines (e.g. the
-   blockquote `> `), captured once for the region — to those new output lines.
+   translation **must re-apply the region's host prefix/indentation to every
+   output line** — not just the first line's offset. The virtual `newText` starts
+   at column 0 of the embedded language, so emitting it verbatim would strip those
+   prefixes and corrupt blockquoted/indented injections — the single-edit
+   limitation noted in `src/lsp/bridge/text_document/formatting.rs` ("multi-line
+   edits drop host indentation"), which the pipeline's full-region output must
+   resolve. An injection region's host prefix is **uniform** — the same `> ` or
+   indentation on each line — so the pipeline applies that one prefix, captured
+   once for the region, to all lines of the formatted output. This needs no
+   line-by-line diff or alignment (consistent with emitting one full-region
+   replacement rather than a minimal diff), and a formatter freely adding or
+   removing lines is fine because every output line receives the same prefix.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
