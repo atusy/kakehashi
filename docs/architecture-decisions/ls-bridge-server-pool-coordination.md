@@ -261,43 +261,35 @@ enum AggregationStrategy {
 
 ### Phase 3: Configuration Example
 
-Multi-server aggregation is configured per host-language → injection-language →
-method, under `languages.<host>.bridge.<inj>.aggregation."<method>"` (with `_` as
-the wildcard/default); each entry carries `priorities`, `strategy`, and
-`maxFanOut`. Servers are declared under top-level `languageServers`. The
-authoritative schema and worked examples live in `docs/README.md` and
-host-document-bridge; a minimal shape:
+```yaml
+# Phase 3: Multiple servers per language with aggregation
+languages:
+  markdown:
+    bridges:
+      python:
+        # Multiple servers for Python
+        priority: ["ruff", "pyright"]  # Prioritize ruff when capability overlaps
 
-```json
-{
-  "languages": {
-    "markdown": {
-      "bridge": {
-        "python": {
-          "aggregation": {
-            "_": { "priorities": ["ruff", "pyright"] },
-            "textDocument/completion": { "strategy": "concatenated" }
-          }
-        }
-      }
-    }
-  },
-  "languageServers": {
-    "pyright": { "cmd": ["pyright-langserver", "--stdio"], "languages": ["python"] },
-    "ruff": { "cmd": ["ruff", "server"], "languages": ["python"] }
-  }
-}
+        # Per-method aggregation config:
+        aggregations:
+          textDocument/completion:
+            strategy: concatenated   # Safe: candidates, user selects one
+            dedup_key: label
+          textDocument/codeAction:
+            strategy: concatenated   # Safe: proposals, user executes one
+          # hover, definition: use default (single_by_capability)
+          # rename: MUST use single_by_capability (overlapping WorkspaceEdits)
+          # formatting: see concatenated-formatting-pipeline (planned sequential
+          #   pipeline; textDocument/rangeFormatting stays preferred)
+
+languageServers:
+  pyright:
+    cmd: [pyright-langserver, --stdio]
+    languages: [python]
+  ruff:
+    cmd: [ruff, server]
+    languages: [python]  # Same language as pyright
 ```
-
-Per-method intent for that Python injection:
-
-- **completion** — `concatenated` (merge candidate lists; the user picks one).
-- **hover / definition** — default `preferred` (first non-empty response).
-- **rename** — single server only (overlapping `WorkspaceEdit`s cannot merge).
-- **formatting** — `concatenated` is PLANNED to run a sequential pipeline (not
-  list concatenation; not yet implemented) — see concatenated-formatting-pipeline.
-- **`textDocument/rangeFormatting`** — `preferred` only (shares the formatting
-  config key but ignores `concatenated`; the range pipeline is out of scope).
 
 ## Consequences
 
@@ -385,10 +377,10 @@ Silently discard notifications instead of explicit DROP with state tracking.
 ## Configuration Example (Phase 1)
 
 ```yaml
-# Phase 1: Server-name-based routing with process sharing (illustrative)
+# Phase 1: Server-name-based routing with process sharing
 languages:
   markdown:
-    bridge:
+    bridges:
       python:
         server: pyright          # Single server for Python
       lua:

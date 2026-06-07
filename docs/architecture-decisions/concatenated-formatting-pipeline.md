@@ -329,6 +329,12 @@ the `preferred` strategy per region regardless of config, and a misconfigured
 a pipeline. This record defines the target behavior for full formatting; the
 warning path is the placeholder to be replaced.
 
+The current code also collapses a `null` formatting result to "no result", so a
+capable server's `null` ("already formatted") is today indistinguishable from a
+missing provider and falls through to lower-priority servers. The pipeline's
+capability-based fallback (Decision point 3.2) depends on telling these apart, so
+that collapse is part of the gap to close.
+
 `textDocument/rangeFormatting` keeps the `preferred` behavior **by design**, not
 just pending implementation — it is out of scope for the pipeline (see *Decision*
 point 5), so this decision leaves it unchanged.
