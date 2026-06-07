@@ -143,7 +143,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    preserves the line count, each output line takes its original per-line offset
    (a 1:1 mapping). When the formatter changes the line count, new lines have no
    original counterpart and — since the pipeline computes no diff/alignment — the
-   **region's common prefix** is applied to them: this is exact for the usual
+   **region's common prefix** is applied to them — the longest leading host
+   prefix shared by every line of the region (its lines' LCP, equivalently the
+   narrowest per-line `RegionOffset` column). This is exact for the usual
    uniform-prefix injection (single-level indentation, or a uniform `> `) and is a
    documented limitation for the rare region whose per-line prefixes genuinely
    differ across a line-count change. On **empty** output lines the prefix's
@@ -299,7 +301,10 @@ change without affecting the config surface.
 ### Negative
 
 - **Serial latency**: total time is the sum of per-server round-trips plus the
-  intermediate `didChange` processing; a per-pipeline timeout budget is required.
+  intermediate `didChange` processing; a per-pipeline timeout budget is required —
+  reusing the existing per-request aggregation timeout (ls-bridge-timeout-hierarchy,
+  ls-bridge-server-pool-coordination) as the whole-pipeline bound rather than
+  introducing a formatting-specific timeout config.
   Cancellation must be polled **concurrently during** each in-flight step (e.g.
   `tokio::select!` on the request future and the cancel signal), not only between
   steps, so a hung formatter can be aborted immediately rather than blocking the
