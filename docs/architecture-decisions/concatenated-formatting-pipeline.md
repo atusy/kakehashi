@@ -93,7 +93,12 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
 3. **Sequential application (single pass).** For each server in `priorities`
    order, against the **current** region text:
    1. push the current region text to the downstream server via `didChange`;
-   2. send `textDocument/formatting`;
+   2. ask that server to format the whole region via `textDocument/formatting`,
+      reusing the existing formatting path — which **falls back to
+      `textDocument/rangeFormatting` over the entire region when the server lacks
+      full-formatting support** (returns `Ok(None)`). A genuine error propagates
+      (handled by point 6); an empty edit list is **authoritative** ("already
+      formatted"), not a fallback trigger;
    3. apply the returned edits to the region text (empty edits = already
       formatted = no-op);
    4. proceed to the next server with the updated text.
@@ -112,7 +117,10 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    shares this aggregation config (it resolves `strategy`/`priorities` under the
    `textDocument/formatting` key), the pipeline applies to **full formatting
    only**. Range formatting always uses `preferred`, even when
-   `strategy: "concatenated"` is configured. A sequential pipeline over a
+   `strategy: "concatenated"` is configured. (Note this is distinct from the
+   whole-region range *fallback* inside step 2: that shim lets a server lacking
+   `textDocument/formatting` still participate in **full** formatting; it is not a
+   user-issued `rangeFormatting` request, which is what stays on `preferred`.) A sequential pipeline over a
    sub-range would reintroduce the offset drift full formatting avoids — each
    server's edits shift the requested range, forcing per-step range re-mapping
    and clipping the output back to the selection — and that cost is not worth it
@@ -158,7 +166,7 @@ end-of-pipeline reconciliation that restores downstream document state.
 
 | Method family | `concatenated` mechanics | Direction |
 |---------------|--------------------------|-----------|
-| diagnostics, references, code actions | concatenate **result lists** from all servers | parallel fan-in |
+| diagnostics, references | concatenate **result lists** from all servers | parallel fan-in |
 | formatting (this decision) | **sequential text pipeline**, each server's output feeds the next | serial |
 
 Same config keyword, deliberately, so users reach for one familiar switch; the
