@@ -131,9 +131,15 @@ fn reset_sigpipe() {
     let result = unsafe { sigaction(Signal::SIGPIPE, &action) };
     // Restoring the default disposition for a valid signal cannot realistically
     // fail, but surface it on stderr rather than swallowing it: otherwise a
-    // silent failure would regress to panicking on a broken pipe.
+    // silent failure would regress to panicking on a broken pipe. Use `writeln!`
+    // (ignoring its result) instead of `eprintln!`, which would itself panic if
+    // stderr is a broken pipe.
     if let Err(e) = result {
-        eprintln!("warning: failed to restore default SIGPIPE handler: {e}");
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: failed to restore default SIGPIPE handler: {e}"
+        );
     }
 }
 
@@ -151,9 +157,11 @@ fn ignore_sigpipe() {
     let result = unsafe { sigaction(Signal::SIGPIPE, &action) };
     // LSP server mode relies on the ignored disposition so the bridge sees a
     // closed downstream peer as a recoverable BrokenPipe; surface a failure
-    // rather than silently risking a SIGPIPE kill.
+    // rather than silently risking a SIGPIPE kill. Use `writeln!` (ignoring its
+    // result) instead of `eprintln!`, which would panic on a broken stderr.
     if let Err(e) = result {
-        eprintln!("warning: failed to ignore SIGPIPE: {e}");
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "warning: failed to ignore SIGPIPE: {e}");
     }
 }
 
