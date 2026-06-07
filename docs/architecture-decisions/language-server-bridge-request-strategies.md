@@ -61,7 +61,7 @@ A single bridge strategy doesn't fit all methods. We need per-method strategies 
 
 ```
                     ┌─────────────────────────────┐
- Request ──────────▶│      kakehashi              │
+ Request ──────────▶│      kakehashi          │
                     │  ┌─────────────────────┐    │
                     │  │ Tree-sitter tokens  │────│───▶ Immediate response
                     │  │ (local, fast)       │    │     (use if bridge slow)
