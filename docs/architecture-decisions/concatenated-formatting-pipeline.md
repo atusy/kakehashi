@@ -74,8 +74,7 @@ serialize only the conflicting ones. This was rejected because:
 
 ## Decision
 
-**Treat `strategy: "concatenated"` on `textDocument/formatting` as an explicit
-opt-in to a sequential formatter pipeline driven by `priorities`.**
+**Treat `strategy: "concatenated"` on `textDocument/formatting` as an explicit opt-in to a sequential formatter pipeline driven by `priorities`.**
 
 1. **Explicit switch.** The pipeline activates only when the resolved
    aggregation config for the method sets `strategy = "concatenated"`. With the
@@ -95,8 +94,8 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    1. push the current region text to the downstream server via `didChange`;
    2. ask that server to format the whole region. The **pipeline** prefers
       `textDocument/formatting`; if the server has no `documentFormattingProvider`
-      (full formatting yields no result), the pipeline **falls back to
-      `textDocument/rangeFormatting` over the entire region** so range-only
+      (full formatting yields no result), the pipeline
+      **falls back to `textDocument/rangeFormatting` over the entire region** so range-only
       servers still participate — the same whole-region equivalence the existing
       `rangeFormatting` handler relies on for covering requests. (The current
       full-formatting path does not itself fall back; this is target pipeline
@@ -112,15 +111,23 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
 
 4. **Region full-replacement output.** After the last server, the pipeline emits
    a **single `TextEdit` that replaces the entire region** with the final text
-   (range = whole virtual document, translated to host coordinates via the
-   region offset). It does **not** attempt to compute a minimal diff. This keeps
-   the LSP output trivially non-overlapping and avoids needing a
-   text-edit-composition or diff utility.
+   (range = whole virtual document, translated to host coordinates via the region
+   offset). It does **not** attempt to compute a minimal diff. This keeps the LSP
+   output trivially non-overlapping and avoids needing a text-edit-composition or
+   diff utility. Because the replacement spans multiple lines, the host
+   translation **must re-apply each line's host prefix/indentation** (the
+   `RegionOffset` per-line columns — e.g. a Markdown blockquote `> ` on every
+   continuation line), not just the first line's offset. The virtual `newText`
+   starts at column 0 of the embedded language, so emitting it verbatim would
+   strip those prefixes and corrupt blockquoted/indented injections — the existing
+   single-edit limitation noted in `src/lsp/bridge/text_document/formatting.rs`
+   ("multi-line edits drop host indentation"), which the pipeline's full-region
+   output must resolve.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
-   `textDocument/formatting` key), the pipeline applies to **full formatting
-   only**. Range formatting always uses `preferred`, even when
+   `textDocument/formatting` key), the pipeline applies to
+   **full formatting only**. Range formatting always uses `preferred`, even when
    `strategy: "concatenated"` is configured. (Note this is distinct from the
    whole-region range *fallback* inside step 3.2: that shim lets a server lacking
    `textDocument/formatting` still participate in **full** formatting; it is not a
@@ -132,8 +139,8 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    want multi-formatter chaining trigger full-document formatting instead.
 
 6. **Best-effort on failure (skip-and-continue).** If a server in the pipeline
-   fails — LSP error, crash, or per-step timeout — the pipeline **skips it and
-   proceeds to the next server with the current accumulated text**. It never
+   fails — LSP error, crash, or per-step timeout — the pipeline
+   **skips it and proceeds to the next server with the current accumulated text**. It never
    aborts the pipeline or discards earlier successful steps. The emitted edit
    therefore reflects whatever steps succeeded, degrading to a no-op edit only
    when every server failed or the text is unchanged; it never falls back to
@@ -145,8 +152,8 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    client's request timeout — it just exhausts the budget and the rest are
    skipped. A failing step is logged so the misbehaving server is diagnosable.
 
-7. **Isolate speculative state in a scratch document (state-consistency
-   invariant).** The intermediate `didChange` notifications (step 3.1) push
+7. **Isolate speculative state in a scratch document (state-consistency invariant).**
+   The intermediate `didChange` notifications (step 3.1) push
    *speculative* formatted text — text the editor has **not** applied. The
    editor's truth only changes when it applies the final emitted edit (or stays at
    the original on a no-op / complete failure / cancellation). The **invariant**
@@ -175,10 +182,11 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    URI risks the downstream server indexing it as a workspace file (duplicate
    symbols, namespace collisions, stray diagnostics). The bridge therefore
    **must keep the scratch document ephemeral** (`didOpen`/`didClose` bracketing
-   the single pipeline run) and **discard any server-initiated notifications
-   targeting scratch URIs** (notably `textDocument/publishDiagnostics`) so they
-   never reach the editor. The scratch URI should also carry a **standardized,
-   ignorable marker** in its name (e.g. a `.kakehashi-scratch` infix as in
+   the single pipeline run) and
+   **discard any server-initiated notifications targeting scratch URIs**
+   (notably `textDocument/publishDiagnostics`) so they never reach the editor. The
+   scratch URI should also carry a
+   **standardized, ignorable marker** in its name (e.g. a `.kakehashi-scratch` infix as in
    `…/file.kakehashi-scratch.py`) while keeping the directory and extension, so
    that anything which does observe paths — file watchers, build tools, test
    runners, hot-reloaders — can recognize and ignore it. (Scratch documents are
