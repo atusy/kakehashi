@@ -296,7 +296,9 @@ change without affecting the config surface.
   Cancellation must be polled **concurrently during** each in-flight step (e.g.
   `tokio::select!` on the request future and the cancel signal), not only between
   steps, so a hung formatter can be aborted immediately rather than blocking the
-  pipeline until it returns.
+  pipeline until it returns. On abort the bridge should also send
+  `$/cancelRequest` to the active downstream server so it stops the discarded
+  formatting task and frees its resources.
 - **Downstream statefulness**: feeding each server requires a `didChange` and
   waiting for it to take effect before re-requesting — more protocol
   choreography than a stateless forward.
