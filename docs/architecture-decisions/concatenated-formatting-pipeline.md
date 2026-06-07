@@ -1,14 +1,11 @@
 # Concatenated Formatting Pipeline
 
-> Scoped to formatting within a single injection region (see the virtual
-> document model in language-server-bridge-virtual-document-model). Applies to
-> both `textDocument/formatting` and `textDocument/rangeFormatting`: range
-> formatting resolves aggregation under the `textDocument/formatting` key, so it
-> shares the same `strategy`/`priorities` and inherits this pipeline once
-> implemented — it runs the same servers in the same order, but sends the
-> `rangeFormatting` method and confines its output to the requested range (see
-> the per-method differences under *Decision*). Per-method
-> strategy selection and the cross-file/edit-filtering rules live in
+> Scoped to `textDocument/formatting` within a single injection region (see the
+> virtual document model in language-server-bridge-virtual-document-model).
+> `textDocument/rangeFormatting` is **out of scope**: although it resolves
+> aggregation under the same `textDocument/formatting` key, it always uses the
+> `preferred` strategy and ignores `concatenated` (rationale under *Decision*).
+> Per-method strategy selection and the cross-file/edit-filtering rules live in
 > language-server-bridge-request-strategies; the `AggregationStrategy` enum and
 > fan-in mechanics live in ls-bridge-server-pool-coordination.
 
@@ -95,11 +92,7 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
 3. **Sequential application (single pass).** For each server in `priorities`
    order, against the **current** region text:
    1. push the current region text to the downstream server via `didChange`;
-   2. send the **originating method** to that server — `textDocument/formatting`
-      for full formatting, or `textDocument/rangeFormatting` for range
-      formatting. For the range case the requested range must be **re-mapped onto
-      the current text** before each step, since earlier servers' edits shift its
-      coordinates (an implementation concern, not a config one);
+   2. send `textDocument/formatting`;
    3. apply the returned edits to the region text (empty edits = already
       formatted = no-op);
    4. proceed to the next server with the updated text.
@@ -107,23 +100,28 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    across servers — there is nothing to merge. The pipeline runs **one pass**;
    recursion / fixpoint re-formatting is explicitly out of scope.
 
-4. **Replacement output, bounded by request type.** After the last server the
-   pipeline emits a replacement rather than a computed minimal diff — keeping the
-   LSP output trivially non-overlapping and avoiding any text-edit-composition or
-   diff utility. The replacement span depends on the method:
-   - **full formatting** → a **single `TextEdit` replacing the entire region**
-     with the final text (range = whole virtual document, translated to host
-     coordinates via the region offset);
-   - **range formatting** → the replacement is **confined to the originally
-     requested range**; text outside the user's selection must stay untouched, as
-     `rangeFormatting` semantics require. Replacing the whole region here would
-     over-reach. The exact range-bounded output (and the range re-mapping above)
-     is an implementation detail this decision flags rather than fully specifies.
+4. **Region full-replacement output.** After the last server, the pipeline emits
+   a **single `TextEdit` that replaces the entire region** with the final text
+   (range = whole virtual document, translated to host coordinates via the
+   region offset). It does **not** attempt to compute a minimal diff. This keeps
+   the LSP output trivially non-overlapping and avoids needing a
+   text-edit-composition or diff utility.
+
+5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
+   shares this aggregation config (it resolves `strategy`/`priorities` under the
+   `textDocument/formatting` key), the pipeline applies to **full formatting
+   only**. Range formatting always uses `preferred`, even when
+   `strategy: "concatenated"` is configured. A sequential pipeline over a
+   sub-range would reintroduce the offset drift full formatting avoids — each
+   server's edits shift the requested range, forcing per-step range re-mapping
+   and clipping the output back to the selection — and that cost is not worth it
+   for partial, interactive formatting where chaining is a rare need. Users who
+   want multi-formatter chaining trigger full-document formatting instead.
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
 intermediate `didChange` that feeds each server's output into the next, and
-(c) collapsing the final text into the bounded replacement edit.
+(c) collapsing the final text into one region-replacement edit.
 
 ### Keyword overload, made explicit
 
@@ -211,15 +209,23 @@ change without affecting the config surface.
   reverts a previous tool) produces a bad-but-deterministic result, not an error.
 - Recursion/fixpoint re-formatting and minimal-diff output are left as future
   options without committing to them.
+- **Shared config, asymmetric effect**: `strategy: "concatenated"` set under the
+  `textDocument/formatting` key affects full formatting but is silently ignored
+  by `rangeFormatting` (which stays on `preferred`). This is a deliberate scope
+  cut, not an oversight — keeping range formatting simple — but it means one
+  config key drives two methods differently.
 
 ## Decision–Implementation Gap
 
-Not yet implemented as of this decision. `textDocument/formatting` (and
-`textDocument/rangeFormatting`, which resolves aggregation under the same
-`textDocument/formatting` key) currently runs the `preferred` strategy per region
-regardless of config, and a misconfigured `concatenated` formatting pair only
-emits a warning rather than running a pipeline. This record defines the target
-behavior; the warning path is the placeholder to be replaced.
+Not yet implemented as of this decision. `textDocument/formatting` currently runs
+the `preferred` strategy per region regardless of config, and a misconfigured
+`concatenated` formatting pair only emits a warning rather than running a
+pipeline. This record defines the target behavior for full formatting; the
+warning path is the placeholder to be replaced.
+
+`textDocument/rangeFormatting` keeps the `preferred` behavior **by design**, not
+just pending implementation — it is out of scope for the pipeline (see *Decision*
+point 5), so this decision leaves it unchanged.
 
 ## Related Decisions
 

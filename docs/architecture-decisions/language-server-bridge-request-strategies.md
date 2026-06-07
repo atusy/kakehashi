@@ -221,12 +221,14 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Output | TextEdit[] |
 | Cross-file | N/A (single document) |
 | Position mapping | All edit ranges |
-| Multi-server | `preferred` by default; `concatenated` opts into a sequential pipeline |
+| Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline. rangeFormatting: `preferred` only |
 
 Single-server formatting is simple—all edits are within the virtual document.
 For multiple servers, the **planned** (not yet implemented) `concatenated`
 behavior does **not** concatenate edit lists (that would overlap); it runs a
-sequential formatter pipeline ordered by `priorities`. See
+sequential formatter pipeline ordered by `priorities`. This applies to **full
+formatting only** — `rangeFormatting` always uses `preferred`, even though it
+shares the `textDocument/formatting` config key. See
 concatenated-formatting-pipeline.
 
 ### Strategy 4: Background Collection
@@ -286,7 +288,7 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
-| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` — planned, not yet implemented (concatenated-formatting-pipeline) |
+| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` — planned, full formatting only, not yet implemented. rangeFormatting stays on `preferred` (concatenated-formatting-pipeline) |
 
 ## Consequences
 
