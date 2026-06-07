@@ -1044,3 +1044,39 @@ fn config_schema_does_not_panic_on_broken_pipe() {
         output.status
     );
 }
+
+/// `--help` output is written by clap during argument parsing, before any
+/// subcommand dispatch. `reset_sigpipe` runs as the first line of `main`, so a
+/// closed reader (e.g. `kakehashi --help | head`) must not panic either.
+///
+/// Unix-only for the same reason as `config_schema_does_not_panic_on_broken_pipe`.
+#[cfg(unix)]
+#[test]
+fn help_does_not_panic_on_broken_pipe() {
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn command");
+
+    drop(child.stdout.take());
+
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for command");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "Broken pipe on --help must not cause a panic. stderr: {stderr}"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(101),
+        "--help should not exit via panic (101) on broken pipe; status: {:?}",
+        output.status
+    );
+}
