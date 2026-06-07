@@ -97,17 +97,22 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
       a single scratch document is reused across steps rather than opened fresh per
       server;
    2. ask that server to format the whole region. The **pipeline** prefers
-      `textDocument/formatting`; if the server lacks full-formatting support —
-      either not advertising `documentFormattingProvider` or returning `null`
-      (`Ok(None)`) — the pipeline
-      **falls back to `textDocument/rangeFormatting` over the entire region** so
+      `textDocument/formatting`; the fallback keys on **capability**, not on the
+      response: only when the server does not advertise `documentFormattingProvider`
+      does the pipeline
+      **fall back to `textDocument/rangeFormatting` over the entire region** so
       range-only servers still participate — the same whole-region equivalence the
       existing `textDocument/rangeFormatting` handler relies on for covering
       requests. (The current full-formatting path does not itself fall back; this
-      is target pipeline behavior.) A genuine error is treated as a
+      is target pipeline behavior.) Crucially, a `null` response from a *capable*
+      server is the LSP "no changes / already formatted" signal and is
+      **authoritative** — it must **not** trigger the fallback. The implementation
+      must therefore distinguish "no capability" from "no changes" rather than
+      collapsing both to one no-result value: reserve the no-result path for a
+      missing provider, and treat a successful `null` as an empty edit list
+      (`[]` / `Ok(Some([]))`). A genuine error is treated as a
       **failed step** — handled by point 6 (skip-and-continue), not surfaced to
-      the editor; an empty edit list (`[]` / `Ok(Some([]))`) is
-      **authoritative** ("already formatted"), not a fallback trigger;
+      the editor;
    3. apply the returned edits to the region text (empty edits = already
       formatted = no-op);
    4. proceed to the next server with the updated text.

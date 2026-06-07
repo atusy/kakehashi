@@ -261,8 +261,17 @@ enum AggregationStrategy {
 
 ### Phase 3: Configuration Example
 
+> **Illustrative pseudo-config, not the literal schema.** The keys below
+> (`bridges`, `aggregations`, top-level `priorities`, `dedup_key`,
+> `single_by_capability`) sketch the *intent* of Phase-3 aggregation and predate
+> the implemented format. The real schema uses a singular `bridge` map with
+> per-method `aggregation` entries holding `priorities`/`strategy` — see
+> language-server-bridge-virtual-document-model and `src/config/settings.rs`.
+> Do not copy this block verbatim. (Aligning it with the current schema is
+> tracked as follow-up, out of scope for this ADR.)
+
 ```yaml
-# Phase 3: Multiple servers per language with aggregation
+# Phase 3: Multiple servers per language with aggregation (ILLUSTRATIVE — see note above)
 languages:
   markdown:
     bridges:
