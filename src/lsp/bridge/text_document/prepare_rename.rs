@@ -53,7 +53,7 @@ impl LanguageServerPool {
             }
             return Ok(None);
         }
-        self.execute_bridge_request_with_handle(
+        self.execute_position_bridge_request_with_handle(
             handle,
             server_name,
             host_uri,
@@ -62,6 +62,8 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            host_position,
+            "textDocument/prepareRename",
             |virtual_uri, request_id| {
                 build_prepare_rename_request(virtual_uri, host_position, &offset, request_id)
             },

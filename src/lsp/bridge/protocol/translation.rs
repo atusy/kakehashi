@@ -90,6 +90,31 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 // Host -> Virtual (request direction)
 // =============================================================================
 
+/// Whether `host_position` can be translated into virtual coordinates without
+/// underflow, i.e. it lies within the injection region's boundary.
+///
+/// A position *above* the region (`line < region start line`) signals stale
+/// region data — typically an in-flight request whose region was shifted by a
+/// concurrent host edit. A position *on* the start line but *before* the region's
+/// start column (e.g. the cursor is on the markdown fence backticks or inside a
+/// blockquote `> ` prefix rather than the injected content) is likewise outside.
+///
+/// Either case would otherwise be silently mistranslated by the `saturating_sub`
+/// in [`translate_host_position_to_virtual`] and forwarded as wrong coordinates:
+/// a line above the region clamps the line to 0 (the column is deliberately left
+/// unadjusted there, so the character is preserved → `(0, character)`), while a
+/// position before the start column on an in-range line clamps the character to 0
+/// (→ `(virtual_line, 0)`). The column boundary is checked against the same
+/// per-virtual-line offset used by translation, so non-blockquote lines past the
+/// first (offset 0) never trigger a false abort.
+pub(crate) fn host_position_within_region(host_position: Position, offset: &RegionOffset) -> bool {
+    if host_position.line < offset.line() {
+        return false;
+    }
+    let virtual_line = host_position.line - offset.line();
+    host_position.character >= offset.column_for_line(virtual_line)
+}
+
 /// Translate a single host position to virtual coordinates.
 ///
 /// Subtracts the line offset, then applies the per-line column offset for the
@@ -413,5 +438,69 @@ mod tests {
         assert_eq!(range.start.character, 5); // 3 + 2
         assert_eq!(range.end.line, 11);
         assert_eq!(range.end.character, 9); // 7 + 2
+    }
+
+    // ======================================================================
+    // host_position_within_region
+    // ======================================================================
+
+    #[test]
+    fn position_within_region_when_on_start_line_at_or_after_start_column() {
+        // On the start line, at the start column → inside.
+        let pos = Position {
+            line: 10,
+            character: 4,
+        };
+        assert!(host_position_within_region(pos, &RegionOffset::new(10, 4)));
+    }
+
+    #[test]
+    fn position_within_region_when_below_start_line() {
+        // Non-blockquote: lines past the first have column offset 0, so any
+        // character is inside — no false abort.
+        let pos = Position {
+            line: 15,
+            character: 0,
+        };
+        assert!(host_position_within_region(pos, &RegionOffset::new(10, 4)));
+    }
+
+    #[test]
+    fn position_outside_region_when_above_start_line() {
+        // Stale region data: host position is above where the region starts.
+        let pos = Position {
+            line: 9,
+            character: 0,
+        };
+        assert!(!host_position_within_region(pos, &RegionOffset::new(10, 4)));
+    }
+
+    #[test]
+    fn position_outside_region_when_before_start_column_on_start_line() {
+        // On the start line but left of the start column (e.g. cursor on the
+        // fence backticks) → outside; translation would clamp to (0, 0).
+        let pos = Position {
+            line: 10,
+            character: 2,
+        };
+        assert!(!host_position_within_region(pos, &RegionOffset::new(10, 4)));
+    }
+
+    #[test]
+    fn position_outside_region_within_blockquote_prefix() {
+        // Blockquote: every virtual line carries a `> ` prefix width of 2.
+        // A cursor inside that prefix on line 1 (char 1) is outside the content.
+        let offset = RegionOffset::with_per_line_offsets(10, vec![2, 2]);
+        let inside_prefix = Position {
+            line: 11,
+            character: 1,
+        };
+        assert!(!host_position_within_region(inside_prefix, &offset));
+
+        let at_content = Position {
+            line: 11,
+            character: 2,
+        };
+        assert!(host_position_within_region(at_content, &offset));
     }
 }

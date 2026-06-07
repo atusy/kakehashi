@@ -47,7 +47,7 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/references") {
             return Ok(None);
         }
-        self.execute_bridge_request_with_handle(
+        self.execute_position_bridge_request_with_handle(
             handle,
             server_name,
             host_uri,
@@ -56,6 +56,8 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
+            host_position,
+            "textDocument/references",
             |virtual_uri, request_id| {
                 let params = ReferenceParams {
                     text_document_position: build_text_document_position_params(
