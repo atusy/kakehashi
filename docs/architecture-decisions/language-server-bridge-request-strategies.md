@@ -221,7 +221,7 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Output | TextEdit[] |
 | Cross-file | N/A (single document) |
 | Position mapping | All edit ranges |
-| Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline (planned, not yet implemented). `textDocument/rangeFormatting`: `preferred` only |
+| Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run; planned, not yet implemented). `textDocument/rangeFormatting`: `preferred` only |
 
 Single-server formatting is simple—all edits are within the virtual document.
 For multiple servers, the **planned** (not yet implemented) `concatenated`

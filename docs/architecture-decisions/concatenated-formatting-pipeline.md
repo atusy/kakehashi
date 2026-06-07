@@ -100,8 +100,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
       servers still participate — the same whole-region equivalence the existing
       `rangeFormatting` handler relies on for covering requests. (The current
       full-formatting path does not itself fall back; this is target pipeline
-      behavior.) A genuine error propagates (handled by point 6); an empty edit
-      list is **authoritative** ("already formatted"), not a fallback trigger;
+      behavior.) A genuine error is treated as a **failed step** — handled by
+      point 6 (skip-and-continue), not surfaced to the editor; an empty edit list
+      is **authoritative** ("already formatted"), not a fallback trigger;
    3. apply the returned edits to the region text (empty edits = already
       formatted = no-op);
    4. proceed to the next server with the updated text.
@@ -153,7 +154,7 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    `didClose` per run) so the canonical virtual document is never speculatively
    mutated at all. This is preferred over mutating the shared document and
    reconciling afterward with a corrective `didChange`, because the shared-mutation
-   approach has two hazards (per tower-lsp concurrency, see CLAUDE.md):
+   approach has two hazards under tower-lsp's concurrent request processing:
    - **Concurrent reads see speculative state**: a `hover`/`completion`/diagnostic
      request the downstream server handles *during* the pipeline would evaluate
      against unapplied text — flashes and wrong results.
@@ -168,7 +169,13 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    the URI's directory and extension. So the scratch URI must keep the canonical
    virtual document's directory and file extension — e.g. a `…/file.scratch.py`
    suffix beside the real path, not a random or different-scheme URI — or config
-   discovery and language detection break.
+   discovery and language detection break. The flip side: a real-looking scratch
+   URI risks the downstream server indexing it as a workspace file (duplicate
+   symbols, namespace collisions, stray diagnostics). The bridge therefore
+   **must keep the scratch document ephemeral** (`didOpen`/`didClose` bracketing
+   the single pipeline run) and **discard any server-initiated notifications
+   targeting scratch URIs** (notably `textDocument/publishDiagnostics`) so they
+   never reach the editor.
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the

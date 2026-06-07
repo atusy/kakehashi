@@ -282,8 +282,8 @@ languages:
           # formatting: concatenated is PLANNED to run a sequential pipeline,
           #   NOT list concatenation (not yet implemented) — see
           #   concatenated-formatting-pipeline
-          # rangeFormatting: preferred only — shares the formatting config key
-          #   but ignores concatenated (range pipeline is out of scope)
+          # textDocument/rangeFormatting: preferred only — shares the formatting
+          #   config key but ignores concatenated (range pipeline is out of scope)
 
 languageServers:
   pyright:
