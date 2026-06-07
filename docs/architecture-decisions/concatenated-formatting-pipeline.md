@@ -26,8 +26,8 @@ tools over one document:
   edit that replaces (nearly) the entire region.
 
 Users want to combine **both kinds** in one region (e.g. `black` then `isort`).
-The previously documented rule (server-pool-coordination) said formatting *must*
-use a single server, precisely because naively merging `TextEdit[]` from several
+The previously documented rule (ls-bridge-server-pool-coordination) said
+formatting *must* use a single server, precisely because naively merging `TextEdit[]` from several
 formatters violates the LSP "edits must not overlap" rule — two whole-document
 formatters always overlap.
 
@@ -118,6 +118,18 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    for partial, interactive formatting where chaining is a rare need. Users who
    want multi-formatter chaining trigger full-document formatting instead.
 
+6. **Best-effort on failure (skip-and-continue).** If a server in the pipeline
+   fails — LSP error, crash, or per-step timeout — the pipeline **skips it and
+   proceeds to the next server with the current accumulated text**. It never
+   aborts the pipeline or discards earlier successful steps. The emitted edit
+   therefore reflects whatever steps succeeded, degrading to a no-op edit only
+   when every server failed or the text is unchanged; it never falls back to
+   throwing away formatting already produced. This mirrors the partial-results
+   philosophy of ls-bridge-server-pool-coordination (return what succeeded rather
+   than fail the whole request). Each step runs under the overall pipeline
+   timeout budget, and a failing step is logged so the misbehaving server is
+   diagnosable.
+
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
 intermediate `didChange` that feeds each server's output into the next, and
@@ -129,7 +141,7 @@ intermediate `didChange` that feeds each server's output into the next, and
 
 | Method family | `concatenated` mechanics | Direction |
 |---------------|--------------------------|-----------|
-| diagnostics, references | concatenate **result lists** from all servers | parallel fan-in |
+| diagnostics, references, code actions | concatenate **result lists** from all servers | parallel fan-in |
 | formatting (this decision) | **sequential text pipeline**, each server's output feeds the next | serial |
 
 Same config keyword, deliberately, so users reach for one familiar switch; the
@@ -214,13 +226,17 @@ change without affecting the config surface.
   by `rangeFormatting` (which stays on `preferred`). This is a deliberate scope
   cut, not an oversight — keeping range formatting simple — but it means one
   config key drives two methods differently.
+- **Silently skipped formatters**: a failing pipeline step is skipped (and
+  logged) rather than surfaced to the editor, so a user may not notice that a
+  configured formatter did not run. Best-effort robustness is the deliberate
+  trade for not failing the whole format request.
 
 ## Decision–Implementation Gap
 
 Not yet implemented as of this decision. `textDocument/formatting` currently runs
 the `preferred` strategy per region regardless of config, and a misconfigured
-`concatenated` formatting pair only emits a warning rather than running a
-pipeline. This record defines the target behavior for full formatting; the
+`concatenated` formatting configuration only emits a warning rather than running
+a pipeline. This record defines the target behavior for full formatting; the
 warning path is the placeholder to be replaced.
 
 `textDocument/rangeFormatting` keeps the `preferred` behavior **by design**, not
