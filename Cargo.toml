@@ -56,9 +56,10 @@ nix = { version = "0.31", features = ["signal", "process"] }
 e2e = []
 experimental = []
 
-# Unix-only dev dependencies (e.g. pipe() for deterministic broken-pipe tests)
+# Unix-only dev dependencies: pipe() for deterministic broken-pipe tests,
+# Signal::SIGPIPE for asserting the termination signal.
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.31", features = ["fs"] }
+nix = { version = "0.31", features = ["fs", "signal"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

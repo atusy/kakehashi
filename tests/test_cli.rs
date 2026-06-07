@@ -1029,9 +1029,10 @@ fn run_with_broken_stdout_pipe(args: &[&str]) -> std::process::Output {
         .expect("Failed to wait for command")
 }
 
-/// SIGPIPE is signal 13 on Linux and macOS.
+/// The platform's `SIGPIPE` signal number (13 on Linux/macOS), taken from `nix`
+/// rather than hardcoded so it stays correct across architectures.
 #[cfg(unix)]
-const SIGPIPE: i32 = 13;
+const SIGPIPE: i32 = nix::sys::signal::Signal::SIGPIPE as i32;
 
 /// A CLI subcommand whose stdout reader is gone (e.g. `kakehashi config schema |
 /// head`) must not panic. Rust ignores SIGPIPE by default, turning a broken pipe
