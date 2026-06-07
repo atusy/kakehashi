@@ -385,10 +385,10 @@ Silently discard notifications instead of explicit DROP with state tracking.
 ## Configuration Example (Phase 1)
 
 ```yaml
-# Phase 1: Server-name-based routing with process sharing
+# Phase 1: Server-name-based routing with process sharing (illustrative)
 languages:
   markdown:
-    bridges:
+    bridge:
       python:
         server: pyright          # Single server for Python
       lua:

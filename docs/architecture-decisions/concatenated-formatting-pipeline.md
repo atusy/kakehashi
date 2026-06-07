@@ -137,7 +137,7 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    `RegionOffset` columns no longer map 1:1 to the output; for lines without a
    prior-line counterpart the pipeline applies the region's **uniform prefix** —
    the common host prefix/indentation shared by the region's lines (e.g. the
-   blockquote `> `), captured once for the region — to every output line.
+   blockquote `> `), captured once for the region — to those new output lines.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
