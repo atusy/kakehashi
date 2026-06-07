@@ -140,17 +140,23 @@ impl LanguageServerPool {
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
     /// but for position-based requests (hover, completion, definition, …): aborts
-    /// before contacting the downstream server when `host_position` falls *above*
-    /// the injection region.
+    /// before contacting the downstream server when `host_position` falls outside
+    /// the injection region — either *above* its start line, or on the start line
+    /// but *before* its start column (e.g. the cursor is on the markdown fence
+    /// backticks or inside a blockquote `> ` prefix). See
+    /// [`host_position_within_region`].
     ///
-    /// That condition means the captured region data is stale (e.g. a concurrent
-    /// host edit moved the region). Translating anyway would clamp the line to 0
-    /// via `saturating_sub` and forward wrong coordinates, yielding
-    /// plausible-but-wrong results. Per the LSP spec every position request may
-    /// return an empty/null result, so on abort we feed a synthetic
+    /// Translating an out-of-region position would silently mistranslate it
+    /// (clamping line and/or character via `saturating_sub`) and forward
+    /// plausible-but-wrong coordinates. Per the LSP spec every position request
+    /// may return an empty/null result, so on abort we feed a synthetic
     /// `{"result": null}` to `transform_response`, which produces the handler's
-    /// natural "no result" value (`None` / empty `Vec`) — and we log a warning,
-    /// since this state should be unreachable and signals a bug if it fires.
+    /// natural "no result" value (`None` / empty `Vec`).
+    ///
+    /// A line *above* the region almost certainly means stale region data (a
+    /// concurrent host edit) and is logged at `warn`; a position merely before
+    /// the start column is a normal cursor location outside the content and is
+    /// logged at `debug` to avoid flooding logs during ordinary editing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_position_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,
@@ -168,13 +174,30 @@ impl LanguageServerPool {
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
         if !host_position_within_region(host_position, offset) {
-            warn!(
-                target: "kakehashi::bridge",
-                "{method}: host position (line {}) is above injection region (start line {}); \
-                 aborting request — stale region data",
-                host_position.line,
-                offset.line(),
-            );
+            if host_position.line < offset.line() {
+                // Line above the region → almost certainly stale region data
+                // (a concurrent host edit shifted the region). Unexpected.
+                warn!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}) is above injection region (start line {}); \
+                     aborting request — stale region data",
+                    host_position.line,
+                    offset.line(),
+                );
+            } else {
+                // On the start line but left of the start column (fence backticks,
+                // blockquote prefix). A normal cursor location just outside the
+                // injected content — debug, not warn.
+                let virtual_line = host_position.line - offset.line();
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{method}: host position (line {}, char {}) is before injection start column {}; \
+                     aborting request",
+                    host_position.line,
+                    host_position.character,
+                    offset.column_for_line(virtual_line),
+                );
+            }
 
             let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -309,6 +332,56 @@ mod tests {
         assert!(
             result.unwrap().is_none(),
             "out-of-region host position must abort to None"
+        );
+    }
+
+    /// Test that a position-based request also aborts when the host position is on
+    /// the region's start line but *before* its start column (e.g. cursor on the
+    /// markdown fence backticks). Same sink-server reasoning as the line-above
+    /// case: a fast `Ok(None)` proves the abort fired before any request was sent.
+    #[tokio::test]
+    async fn position_request_aborts_when_host_position_before_start_column() {
+        use tower_lsp_server::ls_types::{HoverProviderCapability, Position, ServerCapabilities};
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let config = devnull_config();
+
+        {
+            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            handle.set_server_capabilities(ServerCapabilities {
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                ..Default::default()
+            });
+            pool.connections
+                .lock()
+                .await
+                .insert("test-server".to_string(), handle);
+        }
+
+        let host_uri = test_host_uri("doc");
+        // Region starts at line 10, column 4. Cursor is on line 10 but at column 1
+        // — left of the start column, i.e. outside the injected content.
+        let result = pool
+            .send_hover_request(
+                "test-server",
+                &config,
+                &host_uri,
+                Position {
+                    line: 10,
+                    character: 1,
+                },
+                "lua",
+                TEST_ULID_LUA_0,
+                RegionOffset::new(10, 4),
+                "print('hello')",
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "abort should yield Ok, got {result:?}");
+        assert!(
+            result.unwrap().is_none(),
+            "position before start column must abort to None"
         );
     }
 

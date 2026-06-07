@@ -99,12 +99,14 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 /// start column (e.g. the cursor is on the markdown fence backticks or inside a
 /// blockquote `> ` prefix rather than the injected content) is likewise outside.
 ///
-/// Both cases would otherwise be clamped to `0` by the `saturating_sub` in
-/// [`translate_host_position_to_virtual`] and forwarded as virtual coordinate
-/// `(0, 0)` — a plausible-but-wrong location at the very start of the injection.
-/// The column boundary is checked against the same per-virtual-line offset used
-/// by translation, so non-blockquote lines past the first (offset 0) never
-/// trigger a false abort.
+/// Either case would otherwise be silently mistranslated by the `saturating_sub`
+/// in [`translate_host_position_to_virtual`] and forwarded as wrong coordinates:
+/// a line above the region clamps the line to 0 (the column is deliberately left
+/// unadjusted there, so the character is preserved → `(0, character)`), while a
+/// position before the start column on an in-range line clamps the character to 0
+/// (→ `(virtual_line, 0)`). The column boundary is checked against the same
+/// per-virtual-line offset used by translation, so non-blockquote lines past the
+/// first (offset 0) never trigger a false abort.
 pub(crate) fn host_position_within_region(host_position: Position, offset: &RegionOffset) -> bool {
     if host_position.line < offset.line() {
         return false;
