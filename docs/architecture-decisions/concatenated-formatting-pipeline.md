@@ -94,10 +94,10 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    text from the host document **after parse completion** — never a half-parsed
    snapshot, since stale injection boundaries would corrupt the region — then, for
    each server in `priorities` order, against the **current** region text:
-   1. make the current accumulated text available to the server — the scratch
-      document's `didOpen` (point 7) carries it; a `didChange` is only needed when
-      a single scratch document is reused across steps rather than opened fresh per
-      server;
+   1. make the current accumulated text available to the server — since each
+      downstream server is an independent process, it receives a
+      **fresh `didOpen`** on its scratch document (point 7) carrying the latest
+      accumulated text, so intermediate `didChange` notifications are unnecessary;
    2. ask that server to format the whole region. The **pipeline** prefers
       `textDocument/formatting`; the fallback keys on **capability**, not on the
       response: only when the server does not advertise `documentFormattingProvider`
@@ -184,7 +184,7 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    failing step is logged so the misbehaving server is diagnosable.
 
 7. **Isolate speculative state in a scratch document (state-consistency invariant).**
-   The intermediate `didChange` notifications (step 3.1) push
+   The scratch `didOpen` notifications (step 3.1) push
    *speculative* formatted text — text the editor has **not** applied. The
    editor's truth only changes when it applies the final emitted edit (or stays at
    the original on a no-op / complete failure / cancellation). The **invariant**
@@ -217,17 +217,20 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    the single pipeline run) and
    **discard any server-initiated notifications targeting scratch URIs**
    (notably `textDocument/publishDiagnostics`) so they never reach the editor. The
-   scratch URI should also carry a
-   **standardized, ignorable marker** in its name (e.g. a `.kakehashi-scratch` infix as in
-   `…/file.kakehashi-scratch.py`) while keeping the directory and extension, so
-   that anything which does observe paths — file watchers, build tools, test
-   runners, hot-reloaders — can recognize and ignore it. (Scratch documents are
+   scratch URI should also follow the existing virtual-document scheme
+   (`{scheme}:///{host_dir}/kakehashi-virtual-uri-{id}.{ext}`,
+   `src/lsp/bridge/protocol/virtual_uri.rs`) with a scratch-specific id — e.g.
+   `…/{host_dir}/kakehashi-virtual-uri-{id}-scratch.py` — so it keeps the host
+   directory and extension (config discovery, parser selection), stays unique per
+   region (no host-file collision), and carries the distinctive `kakehashi-virtual-uri-`
+   marker that anything observing paths — file watchers, build tools, test
+   runners, hot-reloaders — can recognize and ignore. (Scratch documents are
    virtual LSP documents whose content is delivered via `didOpen`; a recognizable
    name bounds the blast radius if a server resolves the path on disk.)
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
-intermediate `didChange` that feeds each server's output into the next,
+fresh scratch `didOpen` that feeds each server's output into the next,
 (c) collapsing the final text into one region-replacement edit, and (d) the
 scratch-document lifecycle that isolates the pipeline's speculative state.
 
@@ -260,8 +263,8 @@ priorities = ["black", "isort"]
 Deterministic (config order), trivially non-overlapping (one pass, one output
 edit), handles the mixed whole-document + complementary case, and matches how
 formatter chains (`black` then `isort`) actually work. Cost: fully serial
-(latency = sum of round-trips) and requires `didChange` choreography to feed each
-server.
+(latency = sum of round-trips) and requires scratch-document lifecycle
+choreography (a `didOpen`/`didClose` per step) to feed each server.
 
 ### B. Parallel diff-stacking with conflict re-request (rejected)
 
@@ -301,7 +304,7 @@ change without affecting the config surface.
 ### Negative
 
 - **Serial latency**: total time is the sum of per-server round-trips plus the
-  intermediate `didChange` processing; a per-pipeline timeout budget is required —
+  scratch `didOpen`/`didClose` handling; a per-pipeline timeout budget is required —
   reusing the existing per-request aggregation timeout (ls-bridge-timeout-hierarchy,
   ls-bridge-server-pool-coordination) as the whole-pipeline bound rather than
   introducing a formatting-specific timeout config.
@@ -311,16 +314,15 @@ change without affecting the config surface.
   pipeline until it returns. On abort the bridge should also send
   `$/cancelRequest` to the active downstream server so it stops the discarded
   formatting task and frees its resources.
-- **Downstream statefulness**: feeding each server requires a `didChange` and
-  waiting for it to take effect before re-requesting — more protocol
-  choreography than a stateless forward.
+- **Downstream statefulness**: feeding each server requires a `didOpen` carrying
+  the accumulated text and a matching `didClose` — more protocol choreography than
+  a stateless forward.
 - **Coarse output**: full-region replacement enlarges the edit payload, can
   coarsen editor undo granularity, and may disrupt the user's cursor position,
   active code folds, or bookmarks within the region until option D is taken.
 - **Scratch-document overhead**: isolating speculative state (Decision point 7)
-  costs a `didOpen`/`didClose` of a throwaway document per pipeline run, plus the
-  per-step `didChange`s — extra protocol traffic to keep the canonical document
-  untouched.
+  costs a `didOpen`/`didClose` of a throwaway document per pipeline step — extra
+  protocol traffic to keep the canonical document untouched.
 - **`priorities` semantics overload**: for formatting, `priorities` becomes an
   allowlist+order (servers not listed do not run), unlike `preferred` where it is
   only a tie-break ordering. Documented, but a behavioral nuance.
