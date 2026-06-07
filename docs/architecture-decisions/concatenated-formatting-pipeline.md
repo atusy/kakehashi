@@ -139,9 +139,11 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    when every server failed or the text is unchanged; it never falls back to
    throwing away formatting already produced. This mirrors the partial-results
    philosophy of ls-bridge-server-pool-coordination (return what succeeded rather
-   than fail the whole request). Each step runs under the overall pipeline
-   timeout budget, and a failing step is logged so the misbehaving server is
-   diagnosable.
+   than fail the whole request). Each step's deadline is the **remaining** share
+   of the overall pipeline budget (`overall − elapsed`), not a fixed per-step
+   timeout, so a slow early step cannot let the cumulative latency overrun the
+   client's request timeout — it just exhausts the budget and the rest are
+   skipped. A failing step is logged so the misbehaving server is diagnosable.
 
 7. **Isolate speculative state in a scratch document (state-consistency
    invariant).** The intermediate `didChange` notifications (step 3.1) push
@@ -175,7 +177,13 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    **must keep the scratch document ephemeral** (`didOpen`/`didClose` bracketing
    the single pipeline run) and **discard any server-initiated notifications
    targeting scratch URIs** (notably `textDocument/publishDiagnostics`) so they
-   never reach the editor.
+   never reach the editor. The scratch URI should also carry a **standardized,
+   ignorable marker** in its name (e.g. a `.kakehashi-scratch` infix as in
+   `…/file.kakehashi-scratch.py`) while keeping the directory and extension, so
+   that anything which does observe paths — file watchers, build tools, test
+   runners, hot-reloaders — can recognize and ignore it. (Scratch documents are
+   virtual LSP documents whose content is delivered via `didOpen`; a recognizable
+   name bounds the blast radius if a server resolves the path on disk.)
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
