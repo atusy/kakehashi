@@ -213,11 +213,11 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Cross-file | Filter out actions with cross-file edits |
 | Position mapping | All ranges in remaining actions |
 
-#### textDocument/formatting / rangeFormatting
+#### textDocument/formatting / textDocument/rangeFormatting
 
 | Aspect | Handling |
 |--------|----------|
-| Input | Options (or range for rangeFormatting) |
+| Input | Options (or range for `textDocument/rangeFormatting`) |
 | Output | TextEdit[] |
 | Cross-file | N/A (single document) |
 | Position mapping | All edit ranges |

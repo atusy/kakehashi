@@ -14,7 +14,7 @@
 A single injection region may have **multiple downstream language servers**
 configured for the same language. For most methods, the `preferred` strategy
 (first non-empty response wins) is the right default, and for list-producing
-methods (`textDocument/diagnostic`, `references`) the `concatenated` strategy
+methods (`textDocument/diagnostic`, `textDocument/references`) the `concatenated` strategy
 concatenates the **result lists** from all servers.
 
 Formatting is different. Real-world formatting setups routinely chain several
@@ -91,13 +91,16 @@ serialize only the conflicting ones. This was rejected because:
 
 3. **Sequential application (single pass).** For each server in `priorities`
    order, against the **current** region text:
-   1. push the current region text to the downstream server via `didChange`;
+   1. make the current accumulated text available to the server — the scratch
+      document's `didOpen` (point 7) carries it; a `didChange` is only needed when
+      a single scratch document is reused across steps rather than opened fresh per
+      server;
    2. ask that server to format the whole region. The **pipeline** prefers
       `textDocument/formatting`; if the server has no `documentFormattingProvider`
       (full formatting yields no result), the pipeline
       **falls back to `textDocument/rangeFormatting` over the entire region** so range-only
       servers still participate — the same whole-region equivalence the existing
-      `rangeFormatting` handler relies on for covering requests. (The current
+      `textDocument/rangeFormatting` handler relies on for covering requests. (The current
       full-formatting path does not itself fall back; this is target pipeline
       behavior.) A genuine error is treated as a **failed step** — handled by
       point 6 (skip-and-continue), not surfaced to the editor; an empty edit list
@@ -131,7 +134,7 @@ serialize only the conflicting ones. This was rejected because:
    `strategy: "concatenated"` is configured. (Note this is distinct from the
    whole-region range *fallback* inside step 3.2: that shim lets a server lacking
    `textDocument/formatting` still participate in **full** formatting; it is not a
-   user-issued `rangeFormatting` request, which is what stays on `preferred`.) A sequential pipeline over a
+   user-issued `textDocument/rangeFormatting` request, which is what stays on `preferred`.) A sequential pipeline over a
    sub-range would reintroduce the offset drift full formatting avoids — each
    server's edits shift the requested range, forcing per-step range re-mapping
    and clipping the output back to the selection — and that cost is not worth it
@@ -150,7 +153,9 @@ serialize only the conflicting ones. This was rejected because:
    of the overall pipeline budget (`overall − elapsed`), not a fixed per-step
    timeout, so a slow early step cannot let the cumulative latency overrun the
    client's request timeout — it just exhausts the budget and the rest are
-   skipped. A failing step is logged so the misbehaving server is diagnosable.
+   skipped. Below a small floor (e.g. < 50 ms remaining) the pipeline skips the
+   rest outright rather than issuing requests almost certain to time out. A
+   failing step is logged so the misbehaving server is diagnosable.
 
 7. **Isolate speculative state in a scratch document (state-consistency invariant).**
    The intermediate `didChange` notifications (step 3.1) push
@@ -176,9 +181,9 @@ serialize only the conflicting ones. This was rejected because:
    The scratch URI is **not** an arbitrary path: downstream servers resolve
    project config (`.prettierrc`, `pyproject.toml`, …) and select a parser from
    the URI's directory and extension. So the scratch URI must keep the canonical
-   virtual document's directory and file extension — e.g. a `…/file.scratch.py`
-   suffix beside the real path, not a random or different-scheme URI — or config
-   discovery and language detection break. The flip side: a real-looking scratch
+   virtual document's directory and file extension (not a random or
+   different-scheme URI), or config discovery and language detection break. The
+   concrete naming is given below. The flip side: a real-looking scratch
    URI risks the downstream server indexing it as a workspace file (duplicate
    symbols, namespace collisions, stray diagnostics). The bridge therefore
    **must keep the scratch document ephemeral** (`didOpen`/`didClose` bracketing
@@ -293,7 +298,7 @@ change without affecting the config surface.
   options without committing to them.
 - **Shared config, asymmetric effect**: `strategy: "concatenated"` set under the
   `textDocument/formatting` key affects full formatting but is silently ignored
-  by `rangeFormatting` (which stays on `preferred`). This is a deliberate scope
+  by `textDocument/rangeFormatting` (which stays on `preferred`). This is a deliberate scope
   cut, not an oversight — keeping range formatting simple — but it means one
   config key drives two methods differently.
 - **Silently skipped formatters**: a failing pipeline step is skipped (and

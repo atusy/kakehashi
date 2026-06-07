@@ -268,7 +268,7 @@ languages:
     bridges:
       python:
         # Multiple servers for Python
-        priority: ["ruff", "pyright"]  # Prioritize ruff when capability overlaps
+        priorities: ["ruff", "pyright"]  # Prioritize ruff when capability overlaps
 
         # Per-method aggregation config:
         aggregations:
