@@ -90,8 +90,10 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    falls back to `preferred` (with a warning), since order would otherwise be
    undefined.
 
-3. **Sequential application (single pass).** For each server in `priorities`
-   order, against the **current** region text:
+3. **Sequential application (single pass).** The pipeline seeds its initial region
+   text from the host document **after parse completion** — never a half-parsed
+   snapshot, since stale injection boundaries would corrupt the region — then, for
+   each server in `priorities` order, against the **current** region text:
    1. make the current accumulated text available to the server — the scratch
       document's `didOpen` (point 7) carries it; a `didChange` is only needed when
       a single scratch document is reused across steps rather than opened fresh per
@@ -103,7 +105,10 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
       **fall back to `textDocument/rangeFormatting` over the entire region** so
       range-only servers still participate — the same whole-region equivalence the
       existing `textDocument/rangeFormatting` handler relies on for covering
-      requests. (The current full-formatting path does not itself fall back; this
+      requests. The fallback is itself gated on `documentRangeFormattingProvider`;
+      a server advertising **neither** provider contributes nothing and is simply
+      skipped (no unsupported request is sent). (The current full-formatting path
+      does not itself fall back; this
       is target pipeline behavior.) Crucially, a `null` response from a *capable*
       server is the LSP "no changes / already formatted" signal and is
       **authoritative** — it must **not** trigger the fallback. The implementation
@@ -133,15 +138,17 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    prefixes and corrupt blockquoted/indented injections — the single-edit
    limitation noted in `src/lsp/bridge/text_document/formatting.rs` ("multi-line
    edits drop host indentation"), which the pipeline's full-region output must
-   resolve. An injection region's host prefix is **uniform** — the same `> ` or
-   indentation on each line — so the pipeline applies that one prefix, captured
-   once for the region, to all lines of the formatted output. This needs no
-   line-by-line diff or alignment (consistent with emitting one full-region
-   replacement rather than a minimal diff), and a formatter freely adding or
-   removing lines is fine because every output line receives the same prefix.
-   On **empty** output lines the prefix's trailing whitespace is trimmed (emit
-   `>` not `> `, and leave a space-only prefix off entirely) so the pipeline
-   does not introduce trailing-whitespace violations.
+   resolve. The host prefix is tracked **per line** (`RegionOffset::columns`) and
+   can differ line to line (e.g. nested blockquote levels). When the formatter
+   preserves the line count, each output line takes its original per-line offset
+   (a 1:1 mapping). When the formatter changes the line count, new lines have no
+   original counterpart and — since the pipeline computes no diff/alignment — the
+   **region's common prefix** is applied to them: this is exact for the usual
+   uniform-prefix injection (single-level indentation, or a uniform `> `) and is a
+   documented limitation for the rare region whose per-line prefixes genuinely
+   differ across a line-count change. On **empty** output lines the prefix's
+   trailing whitespace is trimmed (emit `>` not `> `, and leave a space-only prefix
+   off entirely) so the pipeline does not introduce trailing-whitespace violations.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
