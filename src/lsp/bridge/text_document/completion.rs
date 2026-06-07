@@ -6,7 +6,6 @@
 
 use std::io;
 
-use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,6 +17,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    response_has_jsonrpc_error,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -104,8 +104,8 @@ fn transform_completion_response_to_host(
     offset: &RegionOffset,
     envelope_ctx: Option<EnvelopeContext<'_>>,
 ) -> Option<CompletionList> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/completion: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/completion") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
     if result.is_null() {

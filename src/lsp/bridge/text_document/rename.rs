@@ -10,7 +10,6 @@
 
 use std::io;
 
-use log::warn;
 use std::collections::HashMap;
 
 use crate::config::settings::BridgeServerConfig;
@@ -26,7 +25,7 @@ use tower_lsp_server::ls_types::RenameParams;
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_text_document_position_params,
+    build_text_document_position_params, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -114,8 +113,8 @@ fn transform_workspace_edit_response_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> Option<WorkspaceEdit> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/rename: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/rename") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 

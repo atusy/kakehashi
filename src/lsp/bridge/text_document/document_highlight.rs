@@ -10,8 +10,6 @@
 
 use std::io;
 
-use log::warn;
-
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{DocumentHighlight, Position};
 use url::Url;
@@ -20,6 +18,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    response_has_jsonrpc_error,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -93,8 +92,8 @@ fn transform_document_highlight_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
 ) -> Option<Vec<DocumentHighlight>> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for textDocument/documentHighlight: {}", error);
+    if response_has_jsonrpc_error(&response, "textDocument/documentHighlight") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 

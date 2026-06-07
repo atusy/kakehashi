@@ -20,7 +20,7 @@ mod translation;
 mod virtual_uri;
 
 // Re-export all public items for external use
-pub(crate) use jsonrpc::{JsonRpcNotification, JsonRpcRequest};
+pub(crate) use jsonrpc::{JsonRpcNotification, JsonRpcRequest, response_has_jsonrpc_error};
 pub(crate) use lifecycle::*;
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;

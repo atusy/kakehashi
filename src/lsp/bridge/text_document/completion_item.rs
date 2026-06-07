@@ -14,7 +14,7 @@ use log::warn;
 use tower_lsp_server::ls_types::CompletionItem;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId};
+use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error};
 use super::completion::{
     EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
     transform_completion_item,
@@ -185,12 +185,8 @@ fn build_completion_resolve_request(
 ///
 /// Returns `None` for null results, missing results, and deserialization failures.
 fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<CompletionItem> {
-    if let Some(error) = response.get("error") {
-        warn!(
-            target: "kakehashi::bridge",
-            "Downstream server returned error for completionItem/resolve: {}",
-            error
-        );
+    if response_has_jsonrpc_error(&response, "completionItem/resolve") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
     if result.is_null() {

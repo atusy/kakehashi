@@ -6,8 +6,7 @@
 //! request-virtual-URI matches, drop other virtual URIs (cross-region offsets
 //! are unsafe). Used by goto definition/type_definition/implementation/declaration.
 
-use log::warn;
-
+use super::jsonrpc::response_has_jsonrpc_error;
 use super::translation::{RegionOffset, translate_virtual_range_to_host};
 use super::virtual_uri::VirtualDocumentUri;
 use tower_lsp_server::ls_types::{Location, LocationLink, Uri};
@@ -30,8 +29,8 @@ pub(crate) fn transform_goto_response_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> Option<Vec<LocationLink>> {
-    if let Some(error) = response.get("error") {
-        warn!(target: "kakehashi::bridge", "Downstream server returned error for goto request: {}", error);
+    if response_has_jsonrpc_error(&response, "goto request") {
+        return None;
     }
     let result = response.get_mut("result").map(serde_json::Value::take)?;
     if result.is_null() {
