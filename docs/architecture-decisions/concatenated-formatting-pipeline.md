@@ -133,7 +133,11 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    strip those prefixes and corrupt blockquoted/indented injections — the existing
    single-edit limitation noted in `src/lsp/bridge/text_document/formatting.rs`
    ("multi-line edits drop host indentation"), which the pipeline's full-region
-   output must resolve.
+   output must resolve. Because a formatter may add or remove lines, the per-line
+   `RegionOffset` columns no longer map 1:1 to the output; for lines without a
+   prior-line counterpart the pipeline applies the region's **uniform prefix** —
+   the common host prefix/indentation shared by the region's lines (e.g. the
+   blockquote `> `), captured once for the region — to every output line.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
@@ -191,9 +195,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    project config (`.prettierrc`, `pyproject.toml`, …) and select a parser from
    the URI's directory and extension. So the scratch URI must keep the canonical
    virtual document's directory and file extension (not a random or
-   different-scheme URI), or config discovery and language detection break. The
-   naming requirements and examples are described below. The flip side: a
-   real-looking scratch
+   different-scheme URI), or config discovery and language detection break (naming
+   requirements and an example follow inline). The flip side: a real-looking
+   scratch
    URI risks the downstream server indexing it as a workspace file (duplicate
    symbols, namespace collisions, stray diagnostics). The bridge therefore
    **must keep the scratch document ephemeral** (`didOpen`/`didClose` bracketing

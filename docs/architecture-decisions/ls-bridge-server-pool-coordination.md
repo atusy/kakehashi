@@ -261,47 +261,43 @@ enum AggregationStrategy {
 
 ### Phase 3: Configuration Example
 
-> **Illustrative pseudo-config, not the literal schema.** The keys below
-> (`bridges`, `aggregations`, top-level `priorities`, `dedup_key`,
-> `single_by_capability`) sketch the *intent* of Phase-3 aggregation and predate
-> the implemented format. The real schema uses a singular `bridge` map with
-> per-method `aggregation` entries holding `priorities`/`strategy` — see
-> language-server-bridge-virtual-document-model and `src/config/settings.rs`.
-> Do not copy this block verbatim. (Aligning it with the current schema is
-> tracked as follow-up, out of scope for this ADR.)
+Multi-server aggregation is configured per host-language → injection-language →
+method, under `languages.<host>.bridge.<inj>.aggregation."<method>"` (with `_` as
+the wildcard/default); each entry carries `priorities`, `strategy`, and
+`maxFanOut`. Servers are declared under top-level `languageServers`. The
+authoritative schema and worked examples live in `docs/README.md` and
+host-document-bridge; a minimal shape:
 
-```yaml
-# Phase 3: Multiple servers per language with aggregation (ILLUSTRATIVE — see note above)
-languages:
-  markdown:
-    bridges:
-      python:
-        # Multiple servers for Python
-        priorities: ["ruff", "pyright"]  # Prioritize ruff when capability overlaps
-
-        # Per-method aggregation config:
-        aggregations:
-          textDocument/completion:
-            strategy: concatenated   # Safe: candidates, user selects one
-            dedup_key: label
-          textDocument/codeAction:
-            strategy: concatenated   # Safe: proposals, user executes one
-          # hover, definition: use default (single_by_capability)
-          # rename: MUST use single_by_capability (overlapping WorkspaceEdits)
-          # formatting: concatenated is PLANNED to run a sequential pipeline,
-          #   NOT list concatenation (not yet implemented) — see
-          #   concatenated-formatting-pipeline
-          # textDocument/rangeFormatting: preferred only — shares the formatting
-          #   config key but ignores concatenated (range pipeline is out of scope)
-
-languageServers:
-  pyright:
-    cmd: [pyright-langserver, --stdio]
-    languages: [python]
-  ruff:
-    cmd: [ruff, server]
-    languages: [python]  # Same language as pyright
+```json
+{
+  "languages": {
+    "markdown": {
+      "bridge": {
+        "python": {
+          "aggregation": {
+            "_": { "priorities": ["ruff", "pyright"] },
+            "textDocument/completion": { "strategy": "concatenated" }
+          }
+        }
+      }
+    }
+  },
+  "languageServers": {
+    "pyright": { "cmd": ["pyright-langserver", "--stdio"], "languages": ["python"] },
+    "ruff": { "cmd": ["ruff", "server"], "languages": ["python"] }
+  }
+}
 ```
+
+Per-method intent for that Python injection:
+
+- **completion** — `concatenated` (merge candidate lists; the user picks one).
+- **hover / definition** — default `preferred` (first non-empty response).
+- **rename** — single server only (overlapping `WorkspaceEdit`s cannot merge).
+- **formatting** — `concatenated` is PLANNED to run a sequential pipeline (not
+  list concatenation; not yet implemented) — see concatenated-formatting-pipeline.
+- **`textDocument/rangeFormatting`** — `preferred` only (shares the formatting
+  config key but ignores `concatenated`; the range pipeline is out of scope).
 
 ## Consequences
 
