@@ -45,7 +45,8 @@ at each level for a **different** reason:
   injection regions, each a disjoint span of the host. They are formatted
   concurrently (one task per region) and their resulting edits are concatenated;
   disjointness means the concatenation can never overlap. This is existing
-  behavior, owned by request-strategies, and is unchanged by this decision.
+  behavior, owned by language-server-bridge-request-strategies, and is unchanged
+  by this decision.
 - **Within one region — sequential.** When a single region has multiple servers,
   this decision runs them serially over the same text. Here overlap-freedom comes
   from seriality (each server sees the prior server's output), not disjointness.
@@ -130,10 +131,26 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    timeout budget, and a failing step is logged so the misbehaving server is
    diagnosable.
 
+7. **Speculative `didChange` must be reconciled (state-consistency invariant).**
+   The intermediate `didChange` notifications (step 3.1) push *speculative*
+   formatted text into each downstream server's document — text the editor has
+   **not** applied. The editor's truth only changes when it applies the final
+   emitted edit (or stays at the original on a no-op / complete failure /
+   cancellation). So when the pipeline ends — on success, total failure, **or
+   cancellation** — the bridge **must restore every participating downstream
+   server's document to the canonical region content** (the host-derived virtual
+   text), otherwise those servers diverge from the editor and corrupt later
+   edits, diagnostics, and completions. The reconciliation mechanism (a corrective
+   `didChange` back to the canonical text, or running the pipeline against a
+   throwaway scratch document so the shared one is never speculatively mutated) is
+   an implementation choice; the **invariant** — no downstream document is left
+   holding speculative text after the pipeline returns — is the decision.
+
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
-intermediate `didChange` that feeds each server's output into the next, and
-(c) collapsing the final text into one region-replacement edit.
+intermediate `didChange` that feeds each server's output into the next,
+(c) collapsing the final text into one region-replacement edit, and (d) the
+end-of-pipeline reconciliation that restores downstream document state.
 
 ### Keyword overload, made explicit
 
@@ -145,7 +162,8 @@ intermediate `didChange` that feeds each server's output into the next, and
 | formatting (this decision) | **sequential text pipeline**, each server's output feeds the next | serial |
 
 Same config keyword, deliberately, so users reach for one familiar switch; the
-per-method behavior is documented here and in request-strategies.
+per-method behavior is documented here and in
+language-server-bridge-request-strategies.
 
 ### Example
 
@@ -209,8 +227,12 @@ change without affecting the config surface.
 - **Downstream statefulness**: feeding each server requires a `didChange` and
   waiting for it to take effect before re-requesting — more protocol
   choreography than a stateless forward.
-- **Coarse output**: full-region replacement enlarges the edit payload and can
-  coarsen editor undo granularity until option D is taken.
+- **Coarse output**: full-region replacement enlarges the edit payload, can
+  coarsen editor undo granularity, and may disrupt the user's cursor position,
+  active code folds, or bookmarks within the region until option D is taken.
+- **Reconciliation overhead**: keeping downstream state consistent (Decision
+  point 7) costs an extra corrective `didChange` (or a scratch-document setup)
+  per participating server at the end of each pipeline run.
 - **`priorities` semantics overload**: for formatting, `priorities` becomes an
   allowlist+order (servers not listed do not run), unlike `preferred` where it is
   only a tie-break ordering. Documented, but a behavioral nuance.
