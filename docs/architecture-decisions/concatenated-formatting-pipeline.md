@@ -74,7 +74,8 @@ serialize only the conflicting ones. This was rejected because:
 
 ## Decision
 
-**Treat `strategy: "concatenated"` on `textDocument/formatting` as an explicit opt-in to a sequential formatter pipeline driven by `priorities`.**
+Treat `strategy: "concatenated"` on `textDocument/formatting` as an explicit
+opt-in to a sequential formatter pipeline driven by `priorities`.
 
 1. **Explicit switch.** The pipeline activates only when the resolved
    aggregation config for the method sets `strategy = "concatenated"`. With the
@@ -134,8 +135,9 @@ serialize only the conflicting ones. This was rejected because:
    `strategy: "concatenated"` is configured. (Note this is distinct from the
    whole-region range *fallback* inside step 3.2: that shim lets a server lacking
    `textDocument/formatting` still participate in **full** formatting; it is not a
-   user-issued `textDocument/rangeFormatting` request, which is what stays on `preferred`.) A sequential pipeline over a
-   sub-range would reintroduce the offset drift full formatting avoids — each
+   user-issued `textDocument/rangeFormatting` request, which is what stays on
+   `preferred`.) A sequential pipeline over a sub-range would reintroduce the
+   offset drift full formatting avoids — each
    server's edits shift the requested range, forcing per-step range re-mapping
    and clipping the output back to the selection — and that cost is not worth it
    for partial, interactive formatting where chaining is a rare need. Users who
