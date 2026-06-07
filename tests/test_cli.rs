@@ -1004,9 +1004,15 @@ fn test_language_uninstall_cancel() {
 /// a broken pipe into a panic on the next `print!`; the fix restores the default
 /// SIGPIPE disposition for subcommands so the process terminates quietly instead.
 ///
-/// The read end of the pipe is closed *before* the child writes, so the first
-/// write hits a pipe with no readers and fails with EPIPE regardless of the
-/// kernel pipe-buffer size — making the reproduction deterministic.
+/// Unix-only: `reset_sigpipe` is a no-op on Windows (no SIGPIPE), where this
+/// scenario would still panic, so the test would not hold there.
+///
+/// The parent closes the stdout read end immediately after `spawn` returns —
+/// before the child, which must initialize, parse args, and serialize the schema,
+/// reaches its first write. The child's first write therefore hits a pipe with no
+/// readers and fails with EPIPE regardless of the kernel pipe-buffer size. (This
+/// was confirmed by running the pre-fix binary, which panics here every time.)
+#[cfg(unix)]
 #[test]
 fn config_schema_does_not_panic_on_broken_pipe() {
     use std::process::Stdio;

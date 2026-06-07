@@ -129,8 +129,12 @@ enum ConfigAction {
 fn reset_sigpipe() {
     use nix::sys::signal::{SigHandler, Signal, signal};
     // SAFETY: `SigDfl` is async-signal-safe and installed once, before any output.
-    unsafe {
-        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    let result = unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) };
+    // Restoring the default disposition for a valid signal cannot realistically
+    // fail, but surface it on stderr rather than swallowing it: otherwise a
+    // silent failure would regress to panicking on a broken pipe.
+    if let Err(e) = result {
+        eprintln!("warning: failed to restore default SIGPIPE handler: {e}");
     }
 }
 
