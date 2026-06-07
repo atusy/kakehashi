@@ -148,7 +148,13 @@ fn ignore_sigpipe() {
     use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
     let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
     // SAFETY: `SigIgn` is async-signal-safe and installed before bridge I/O.
-    let _ = unsafe { sigaction(Signal::SIGPIPE, &action) };
+    let result = unsafe { sigaction(Signal::SIGPIPE, &action) };
+    // LSP server mode relies on the ignored disposition so the bridge sees a
+    // closed downstream peer as a recoverable BrokenPipe; surface a failure
+    // rather than silently risking a SIGPIPE kill.
+    if let Err(e) = result {
+        eprintln!("warning: failed to ignore SIGPIPE: {e}");
+    }
 }
 
 #[cfg(not(unix))]
