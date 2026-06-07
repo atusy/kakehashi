@@ -126,8 +126,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    offset). It does **not** attempt to compute a minimal diff. This keeps the LSP
    output trivially non-overlapping and avoids needing a text-edit-composition or
    diff utility. Because the replacement spans multiple lines, the host
-   translation **must re-apply the region's host prefix/indentation to every
-   output line** — not just the first line's offset. The virtual `newText` starts
+   translation
+   **must re-apply the region's host prefix/indentation to every output line** —
+   not just the first line's offset. The virtual `newText` starts
    at column 0 of the embedded language, so emitting it verbatim would strip those
    prefixes and corrupt blockquoted/indented injections — the single-edit
    limitation noted in `src/lsp/bridge/text_document/formatting.rs` ("multi-line
