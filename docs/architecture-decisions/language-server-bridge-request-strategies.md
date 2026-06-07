@@ -226,8 +226,9 @@ Rename can affect multiple files. For injections, only same-document renames are
 Single-server formatting is simple—all edits are within the virtual document.
 For multiple servers, the **planned** (not yet implemented) `concatenated`
 behavior does **not** concatenate edit lists (that would overlap); it runs a
-sequential formatter pipeline ordered by `priorities`. This applies to **full
-formatting only** — `textDocument/rangeFormatting` always uses `preferred`, even though it
+sequential formatter pipeline over `priorities`, which is both the **membership
+allowlist** (servers not listed do not run) and the application order. This
+applies to **full formatting only** — `textDocument/rangeFormatting` always uses `preferred`, even though it
 shares the `textDocument/formatting` config key. See
 concatenated-formatting-pipeline.
 
@@ -288,7 +289,7 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
-| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` — planned, full formatting only, not yet implemented. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
+| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — planned, full formatting only, not yet implemented. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
 
 ## Consequences
 

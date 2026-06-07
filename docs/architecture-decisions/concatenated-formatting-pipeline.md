@@ -163,6 +163,13 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
      desynced. A scratch document needs no corrective step — it is simply
      discarded — so failure can never desync the canonical document.
 
+   The scratch URI is **not** an arbitrary path: downstream servers resolve
+   project config (`.prettierrc`, `pyproject.toml`, …) and select a parser from
+   the URI's directory and extension. So the scratch URI must keep the canonical
+   virtual document's directory and file extension — e.g. a `…/file.scratch.py`
+   suffix beside the real path, not a random or different-scheme URI — or config
+   discovery and language detection break.
+
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
 intermediate `didChange` that feeds each server's output into the next,
