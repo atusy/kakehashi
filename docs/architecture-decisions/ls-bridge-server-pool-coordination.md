@@ -280,7 +280,7 @@ languages:
           # hover, definition: use default (single_by_capability)
           # rename: MUST use single_by_capability (overlapping WorkspaceEdits)
           # formatting: see concatenated-formatting-pipeline (planned sequential
-          #   pipeline; textDocument/rangeFormatting unaffected)
+          #   pipeline; user-issued textDocument/rangeFormatting requests unaffected)
 
 languageServers:
   pyright:
