@@ -139,6 +139,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    line-by-line diff or alignment (consistent with emitting one full-region
    replacement rather than a minimal diff), and a formatter freely adding or
    removing lines is fine because every output line receives the same prefix.
+   On **empty** output lines the prefix's trailing whitespace is trimmed (emit
+   `>` not `> `, and leave a space-only prefix off entirely) so the pipeline
+   does not introduce trailing-whitespace violations.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
@@ -289,8 +292,11 @@ change without affecting the config surface.
 ### Negative
 
 - **Serial latency**: total time is the sum of per-server round-trips plus the
-  intermediate `didChange` processing; a per-pipeline timeout budget and
-  per-step cancellation checks are required.
+  intermediate `didChange` processing; a per-pipeline timeout budget is required.
+  Cancellation must be polled **concurrently during** each in-flight step (e.g.
+  `tokio::select!` on the request future and the cancel signal), not only between
+  steps, so a hung formatter can be aborted immediately rather than blocking the
+  pipeline until it returns.
 - **Downstream statefulness**: feeding each server requires a `didChange` and
   waiting for it to take effect before re-requesting — more protocol
   choreography than a stateless forward.
