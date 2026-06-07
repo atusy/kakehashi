@@ -5,7 +5,9 @@
 > both `textDocument/formatting` and `textDocument/rangeFormatting`: range
 > formatting resolves aggregation under the `textDocument/formatting` key, so it
 > shares the same `strategy`/`priorities` and inherits this pipeline once
-> implemented (it runs the same servers over the requested sub-range). Per-method
+> implemented — it runs the same servers in the same order, but sends the
+> `rangeFormatting` method and confines its output to the requested range (see
+> the per-method differences under *Decision*). Per-method
 > strategy selection and the cross-file/edit-filtering rules live in
 > language-server-bridge-request-strategies; the `AggregationStrategy` enum and
 > fan-in mechanics live in ls-bridge-server-pool-coordination.
@@ -93,7 +95,11 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
 3. **Sequential application (single pass).** For each server in `priorities`
    order, against the **current** region text:
    1. push the current region text to the downstream server via `didChange`;
-   2. send `textDocument/formatting`;
+   2. send the **originating method** to that server — `textDocument/formatting`
+      for full formatting, or `textDocument/rangeFormatting` for range
+      formatting. For the range case the requested range must be **re-mapped onto
+      the current text** before each step, since earlier servers' edits shift its
+      coordinates (an implementation concern, not a config one);
    3. apply the returned edits to the region text (empty edits = already
       formatted = no-op);
    4. proceed to the next server with the updated text.
@@ -101,17 +107,23 @@ opt-in to a sequential formatter pipeline driven by `priorities`.**
    across servers — there is nothing to merge. The pipeline runs **one pass**;
    recursion / fixpoint re-formatting is explicitly out of scope.
 
-4. **Region full-replacement output.** After the last server, the pipeline emits
-   a **single `TextEdit` that replaces the entire region** with the final text
-   (range = whole virtual document, translated to host coordinates via the
-   region offset). It does **not** attempt to compute a minimal diff. This keeps
-   the LSP output trivially non-overlapping and avoids needing a
-   text-edit-composition or diff utility.
+4. **Replacement output, bounded by request type.** After the last server the
+   pipeline emits a replacement rather than a computed minimal diff — keeping the
+   LSP output trivially non-overlapping and avoiding any text-edit-composition or
+   diff utility. The replacement span depends on the method:
+   - **full formatting** → a **single `TextEdit` replacing the entire region**
+     with the final text (range = whole virtual document, translated to host
+     coordinates via the region offset);
+   - **range formatting** → the replacement is **confined to the originally
+     requested range**; text outside the user's selection must stay untouched, as
+     `rangeFormatting` semantics require. Replacing the whole region here would
+     over-reach. The exact range-bounded output (and the range re-mapping above)
+     is an implementation detail this decision flags rather than fully specifies.
 
 The pipeline reuses the existing per-server virtual-document and
 position-translation machinery; the new parts are (a) strategy dispatch, (b) the
 intermediate `didChange` that feeds each server's output into the next, and
-(c) collapsing the final text into one region-replacement edit.
+(c) collapsing the final text into the bounded replacement edit.
 
 ### Keyword overload, made explicit
 

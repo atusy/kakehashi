@@ -224,9 +224,10 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Multi-server | `preferred` by default; `concatenated` opts into a sequential pipeline |
 
 Single-server formatting is simple—all edits are within the virtual document.
-For multiple servers, `concatenated` does **not** concatenate edit lists (that
-would overlap); it runs a sequential formatter pipeline ordered by `priorities`.
-See concatenated-formatting-pipeline.
+For multiple servers, the **planned** (not yet implemented) `concatenated`
+behavior does **not** concatenate edit lists (that would overlap); it runs a
+sequential formatter pipeline ordered by `priorities`. See
+concatenated-formatting-pipeline.
 
 ### Strategy 4: Background Collection
 
@@ -285,7 +286,7 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
-| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (concatenated-formatting-pipeline) |
+| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` — planned, not yet implemented (concatenated-formatting-pipeline) |
 
 ## Consequences
 
