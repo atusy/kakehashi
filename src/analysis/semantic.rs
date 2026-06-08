@@ -36,7 +36,7 @@ pub(crate) async fn handle_semantic_tokens_full(
     tree: Tree,
     query: std::sync::Arc<Query>,
     filetype: Option<String>,
-    capture_mappings: Option<CaptureMappings>,
+    capture_mappings: Option<std::sync::Arc<CaptureMappings>>,
     coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
     supports_multiline: bool,
 ) -> Option<SemanticTokensResult> {
@@ -50,7 +50,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             &tree,
             &query,
             filetype.as_deref(),
-            capture_mappings.as_ref(),
+            capture_mappings.as_deref(),
             &text,
             &lines,
             0,
@@ -69,7 +69,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             &tree,
             filetype.as_deref(),
             &coordinator,
-            capture_mappings.as_ref(),
+            capture_mappings.as_deref(),
             supports_multiline,
         );
 
@@ -685,7 +685,7 @@ local x = 42
 
         // Use default capture mappings so markdown captures like @markup.raw.block
         // are translated to `string` (token_type 2).
-        let capture_mappings = default_capture_mappings();
+        let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         // Use the full pipeline — exclusion now happens in finalize_tokens
         let result = handle_semantic_tokens_full(
@@ -798,7 +798,7 @@ local x = 42
         parser_pool.release("markdown".to_string(), parser);
 
         // Use default capture mappings so @markup.raw.block → `string`
-        let capture_mappings = default_capture_mappings();
+        let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         let result = handle_semantic_tokens_full(
             text,
@@ -910,7 +910,7 @@ local x = 42
         };
         parser_pool.release("markdown".to_string(), parser);
 
-        let capture_mappings = default_capture_mappings();
+        let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
             text,
             tree,
@@ -1019,7 +1019,7 @@ local x = 42
         };
         parser_pool.release("markdown".to_string(), parser);
 
-        let capture_mappings = default_capture_mappings();
+        let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         // KEY: supports_multiline = true
         let result = handle_semantic_tokens_full(
@@ -1151,7 +1151,7 @@ foo
         };
         parser_pool.release("markdown".to_string(), parser);
 
-        let capture_mappings = default_capture_mappings();
+        let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
             text,
             tree,
@@ -1259,7 +1259,7 @@ foo
         };
         parser_pool.release("markdown".to_string(), parser);
 
-        let capture_mappings = default_capture_mappings();
+        let capture_mappings = std::sync::Arc::new(default_capture_mappings());
 
         let result = handle_semantic_tokens_full(
             text,

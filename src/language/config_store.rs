@@ -2,20 +2,20 @@ use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use path_clean::PathClean;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Thread-safe cache of workspace settings for the language subsystem.
 ///
 /// Search paths are cleaned/normalized (e.g. `..` resolved) on write.
 pub(crate) struct ConfigStore {
-    capture_mappings: RwLock<CaptureMappings>,
+    capture_mappings: RwLock<Arc<CaptureMappings>>,
     search_paths: RwLock<Vec<PathBuf>>,
 }
 
 impl ConfigStore {
     pub(crate) fn new() -> Self {
         Self {
-            capture_mappings: RwLock::new(CaptureMappings::default()),
+            capture_mappings: RwLock::new(Arc::new(CaptureMappings::default())),
             search_paths: RwLock::new(Vec::new()),
         }
     }
@@ -29,14 +29,20 @@ impl ConfigStore {
         *self
             .capture_mappings
             .write()
-            .recover_poison("ConfigStore::set_capture_mappings") = mappings;
+            .recover_poison("ConfigStore::set_capture_mappings") = Arc::new(mappings);
     }
 
-    pub(crate) fn capture_mappings(&self) -> CaptureMappings {
-        self.capture_mappings
-            .read()
-            .recover_poison("ConfigStore::capture_mappings")
-            .clone()
+    /// Returns a cheap `Arc` handle to the shared capture mappings.
+    ///
+    /// Cloning the `Arc` is a refcount bump, not a deep copy of the nested
+    /// maps — this is called once per semantic-tokens request on the hot path.
+    pub(crate) fn capture_mappings(&self) -> Arc<CaptureMappings> {
+        Arc::clone(
+            &self
+                .capture_mappings
+                .read()
+                .recover_poison("ConfigStore::capture_mappings"),
+        )
     }
 
     fn set_search_paths(&self, paths: Vec<String>) {
@@ -77,7 +83,7 @@ mod tests {
         store.update_from_settings(&settings);
 
         assert_eq!(store.search_paths(), vec![PathBuf::from("/search/path")]);
-        assert_eq!(store.capture_mappings(), settings.capture_mappings);
+        assert_eq!(*store.capture_mappings(), settings.capture_mappings);
     }
 
     #[test]
