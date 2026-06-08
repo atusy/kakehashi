@@ -498,6 +498,12 @@ pub(crate) fn collect_injection_tokens_parallel(
 
 /// Convert byte-based exclusion ranges to line/column `ActiveInjectionBounds`s,
 /// keeping only those regions that contain at least one injection token.
+///
+/// `tokens` MUST be sorted ascending by `(line, column)` (the caller sorts
+/// before invoking). That ordering lets each region binary-search its start
+/// position and scan only the tokens inside the region, rather than the whole
+/// token list — turning the cost from O(regions × tokens) into
+/// O(regions × log n + tokens-in-regions).
 fn compute_active_injection_regions(
     host_text: &str,
     host_lines: &[&str],
@@ -511,12 +517,15 @@ fn compute_active_injection_regions(
             let (start_line, start_col) = byte_to_line_col(host_text, host_lines, start_byte);
             let (end_line, end_col) = byte_to_line_col(host_text, host_lines, end_byte);
 
-            // Check if any token (depth ≥ 1) falls within this region
-            let has_injection_tokens = tokens.iter().any(|t| {
-                t.depth >= 1
-                    && ((t.line > start_line || (t.line == start_line && t.column >= start_col))
-                        && (t.line < end_line || (t.line == end_line && t.column < end_col)))
+            // Binary-search the first token at or after the region start, then
+            // scan forward only while tokens remain inside the region.
+            let start_idx = tokens.partition_point(|t| {
+                t.line < start_line || (t.line == start_line && t.column < start_col)
             });
+            let has_injection_tokens = tokens[start_idx..]
+                .iter()
+                .take_while(|t| t.line < end_line || (t.line == end_line && t.column < end_col))
+                .any(|t| t.depth >= 1);
 
             if has_injection_tokens {
                 Some(ActiveInjectionBounds {
