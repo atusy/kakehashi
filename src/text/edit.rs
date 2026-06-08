@@ -12,11 +12,15 @@ use super::position::PositionMapper;
 
 /// Apply `edits` to `text`, returning the resulting string.
 ///
-/// All edit ranges are interpreted against the original `text` (LSP semantics),
-/// so edits are applied highest-position-first; that way an earlier edit never
-/// shifts the byte offsets a later edit still refers to. Out-of-bounds
-/// positions are clamped, and an inverted range (`start` after `end`) is
-/// normalized rather than panicking.
+/// All edit ranges are interpreted against the original `text` (LSP semantics).
+/// Edits are sorted by `(start, end)` and applied in a single **forward copy**
+/// (O(n + total edit length)) rather than repeated `String::replace_range`
+/// (which is O(n²)): the result is built by copying the gap before each edit,
+/// then its `new_text`. Out-of-bounds positions are clamped, an inverted range
+/// (`start` after `end`) is normalized, byte offsets are floored to UTF-8 char
+/// boundaries, and an edit overlapping one already applied is dropped (LSP
+/// forbids overlap, but a buggy server must never make us panic or corrupt) —
+/// the earlier, higher-priority edit wins.
 pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     if edits.is_empty() {
         return text.to_string();
@@ -26,43 +30,40 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     let mut byte_edits: Vec<(usize, usize, &str)> = edits
         .iter()
         .map(|e| {
-            let a = mapper.position_to_byte_clamped(e.range.start);
-            let b = mapper.position_to_byte_clamped(e.range.end);
+            let a = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.start));
+            let b = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.end));
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             (start, end, e.new_text.as_str())
         })
         .collect();
 
-    // Apply from the end of the document backwards so that replacing an earlier
-    // span never invalidates the byte offsets of a later (non-overlapping) edit.
-    // Sort by `(start, end)`: when several edits share a start (e.g. a zero-width
-    // insertion and a replacement), the wider span must be applied first under
-    // the reversed iteration, so the insertion is not swallowed by the
-    // replacement's range.
     byte_edits.sort_by_key(|&(start, end, _)| (start, end));
 
-    let mut result = text.to_string();
-    // Defensive against buggy downstream servers: clamp offsets to UTF-8 char
-    // boundaries (`replace_range` panics otherwise) and skip an edit that
-    // overlaps one already applied (LSP forbids overlap, but we never trust the
-    // server enough to panic). `last_start` is the start of the most recently
-    // applied edit; since we go highest-first, a later edit whose `end` reaches
-    // past it overlaps and is dropped.
-    let mut last_start = result.len();
-    for (mut start, mut end, new_text) in byte_edits.into_iter().rev() {
-        while start > 0 && !result.is_char_boundary(start) {
-            start -= 1;
-        }
-        while end > start && !result.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end > last_start {
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end, new_text) in byte_edits {
+        // Drop an edit that starts before the cursor — it overlaps one already
+        // applied; keep the earlier (lower-start) edit.
+        if start < cursor {
             continue;
         }
-        result.replace_range(start..end, new_text);
-        last_start = start;
+        result.push_str(&text[cursor..start]);
+        result.push_str(new_text);
+        cursor = end;
     }
+    result.push_str(&text[cursor..]);
     result
+}
+
+/// Floor `offset` down to the nearest UTF-8 char boundary of `text` (or its
+/// length), so slicing never panics on a mid-codepoint offset from a buggy
+/// downstream server.
+fn floor_char_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 #[cfg(test)]
@@ -143,14 +144,14 @@ mod tests {
     #[test]
     fn overlapping_edits_are_dropped_rather_than_panicking() {
         // Two edits whose original ranges overlap (0..3 and 2..5). Applying both
-        // verbatim would corrupt or panic; the second (lower-priority by
-        // position) overlapping edit is skipped defensively.
+        // verbatim would corrupt or panic; the forward copy keeps the earlier
+        // (lower-start) edit and drops the later overlapping one.
         let text = "abcdef";
         let edits = vec![edit(0, 0, 0, 3, "A"), edit(0, 2, 0, 5, "B")];
-        // Highest-start first: (2..5)->"B" applied, then (0..3) overlaps and is
-        // dropped, leaving the tail intact.
+        // (0..3)->"A" applied (cursor=3), then (2..5) starts before the cursor
+        // and is dropped, leaving the tail "def".
         let out = apply_text_edits(text, &edits);
-        assert_eq!(out, "abBf");
+        assert_eq!(out, "Adef");
     }
 
     #[test]
