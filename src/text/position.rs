@@ -117,6 +117,15 @@ pub(crate) fn byte_to_utf16_col(line: &str, byte_col: usize) -> usize {
 /// Returns None if the byte position is invalid (e.g., in the middle of a multi-byte character)
 #[inline(always)]
 pub fn convert_byte_to_utf16_in_line(line_text: &str, byte_pos: usize) -> Option<usize> {
+    // Fast path: when the prefix up to `byte_pos` is pure ASCII, every byte is a
+    // single-byte UTF-8 char and a single UTF-16 code unit, so the UTF-16 column
+    // equals `byte_pos`. `<[u8]>::is_ascii` is vectorized by the standard library,
+    // which beats the per-`char` decode loop on the common all-ASCII source line.
+    // Multi-byte prefixes fall through to the exact loop below.
+    if byte_pos <= line_text.len() && line_text.as_bytes()[..byte_pos].is_ascii() {
+        return Some(byte_pos);
+    }
+
     let mut utf16_offset = 0;
     let mut byte_count = 0;
 
