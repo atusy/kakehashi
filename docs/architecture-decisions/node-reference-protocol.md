@@ -17,7 +17,7 @@ Concrete extension scenarios this protocol enables:
 3. **Long-lived references** — hold a handle to a node across `didChange` events (e.g., for bookmarks, breakpoints, AI agent reasoning)
 4. **Injection-aware tooling** — explicitly target a host-language node vs. an injected-language node at the same position
 
-These all reduce to four primitives: **identify a node at a position**, **navigate to its parent or children**, and **read its current text**. We expose them as custom methods under the `kakehashi/` namespace so that clients can compose richer features on top.
+These reduce to a small set of primitives: **identify a node at a position**, **navigate to its parent or children** (with a named-only variant), and **read its current text**. We expose them as custom methods under the `kakehashi/` namespace so that clients can compose richer features on top.
 
 ## Decision Drivers
 
@@ -29,15 +29,16 @@ These all reduce to four primitives: **identify a node at a position**, **naviga
 
 ## Decision Outcome
 
-**Chosen approach**: Introduce four custom LSP methods (`kakehashi/node`, `kakehashi/node/parent`, `kakehashi/node/children`, `kakehashi/node/text`) returning a minimal `NodeInfo` type and propagating `null` for any unresolvable reference. Injection layer selection is controlled by an explicit `injection` parameter on the entry-point method.
+**Chosen approach**: Introduce five custom LSP methods (`kakehashi/node`, `kakehashi/node/parent`, `kakehashi/node/children`, `kakehashi/node/namedChildren`, `kakehashi/node/text`) returning a minimal `NodeInfo` type and propagating `null` for any unresolvable reference. Injection layer selection is controlled by an explicit `injection` parameter on the entry-point method. Named-vs-anonymous selection follows tree-sitter's own API surface: a `namedOnly` parameter on the entry point (mirroring `named_descendant_for_byte_range`) and a dedicated `namedChildren` navigation method (mirroring `named_children()`).
 
 ### Method Catalog
 
 | Method | Input | Output | Purpose |
 |---|---|---|---|
-| `kakehashi/node` | `{ textDocument, position, injection? }` | `NodeInfo \| null` | Entry point: position → node identity |
+| `kakehashi/node` | `{ textDocument, position, injection?, namedOnly? }` | `NodeInfo \| null` | Entry point: position → node identity |
 | `kakehashi/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | Walk one step toward the root |
-| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate children |
+| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate children (named + anonymous) |
+| `kakehashi/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate **named** children only |
 | `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | Resolve current text content |
 
 All methods carry a `TextDocumentIdentifier` even when an `id` (ULID) is provided. While ULIDs are globally unique by construction, the `textDocument` field keeps the protocol aligned with LSP conventions, allows the server to route directly to the correct per-URI tracker, and lets the server reject mismatched (`uri`, `id`) pairs as `null` instead of silently querying another document.
@@ -60,6 +61,8 @@ Positional information (`range`) is **intentionally omitted** for two reasons:
 
 The cost is N+1 round trips for clients that need ranges of every child, accepted as an explicit trade-off. A bulk endpoint (e.g., `childrenWithRange`) may be added later if profiling shows it is needed.
 
+Namedness (`is_named()`) is likewise **not** a field on `NodeInfo`. Named-vs-anonymous is expressed through *selection* — the `namedOnly` parameter and the `namedChildren` method below — rather than reported per node, because the round-trip-sensitive use cases all want to *select* named nodes, not to *introspect* one already in hand. A `named: boolean` field remains available as a future addition: unlike `range` it is intrinsic, immutable, and one byte, so it would belong inline alongside `type` rather than behind its own endpoint. It is deferred until a concrete consumer needs to label nodes it already holds (e.g. a nearest-named-ancestor `parent` walk) — see Alternatives.
+
 ### Entry-Point Method: `kakehashi/node`
 
 ```jsonc
@@ -67,14 +70,15 @@ The cost is N+1 round trips for clients that need ranges of every child, accepte
 {
   "textDocument": { "uri": "file:///foo.md" },
   "position":     { "line": 3, "character": 5 },
-  "injection":    true     // optional, default: false
+  "injection":    true,    // optional, default: false
+  "namedOnly":    false    // optional, default: false
 }
 
 // Response: NodeInfo | null
 { "id": "01HX...", "type": "fenced_code_block" }
 ```
 
-**Resolution rule**: Returns the **smallest (deepest) named or anonymous node** containing `position` at the selected injection layer. Returns `null` when the position is outside the document or the requested injection layer does not exist at that position.
+**Resolution rule**: Returns the **smallest (deepest) node** containing `position` at the selected injection layer. With `namedOnly` absent or `false`, this is the smallest named *or anonymous* node (`descendant_for_byte_range`); with `namedOnly: true`, it is the smallest *named* node (`named_descendant_for_byte_range`) — see The `namedOnly` Parameter below. Returns `null` when the position is outside the document or the requested injection layer does not exist at that position.
 
 ### The `injection` Parameter
 
@@ -104,6 +108,25 @@ Semantics, given an injection stack `[host, layer₁, layer₂, ..., deepest]` a
 | inside Python regex literal | `2` / `true` / `-1` | regex node |
 | inside Python regex literal | `3` | `null` (stack only 3 layers: 0/1/2) |
 | inside Python regex literal | `-2` | Python node |
+
+### The `namedOnly` Parameter
+
+```typescript
+type NamedOnly = boolean; // default: false
+```
+
+Controls whether the entry point resolves through tree-sitter's anonymous-inclusive or named-only descendant lookup, **at the injection layer already selected by `injection`** (the two parameters compose):
+
+| Value | Resolved node | tree-sitter primitive |
+|---|---|---|
+| `false` (default) | smallest named **or anonymous** node containing the byte | `descendant_for_byte_range(b, b)` |
+| `true` | smallest **named** node containing the byte | `named_descendant_for_byte_range(b, b)` |
+
+**Why a parameter here (but a method for children)**: the entry point already carries the `injection` policy, and named-vs-anonymous is a second, *composing* axis (`named_descendant` within injection layer `n`). Splitting it into a separate method would duplicate the protocol's most complex handler once per `injection × namedOnly` combination. Navigation methods have no such second axis, so they follow tree-sitter's own surface instead — a dedicated `namedChildren` method rather than a flag (see Navigation Methods).
+
+**Equivalence to a parent-walk**: `namedOnly: true` returns exactly the node a client would reach by resolving the anonymous-inclusive node and walking `parent` until the first named ancestor. The nodes containing a given byte form a single ancestor chain (tree-sitter siblings are non-overlapping), so "smallest named node containing `b`" *is* the first named node on the way up. The parameter collapses that N-round-trip walk — which would also mint a ULID for every anonymous node passed through, against lazy-node-identity-tracking's bounded-memory goal — into one native lookup that mints exactly one ID.
+
+**Primary use case**: parity with editor defaults such as Neovim's `vim.treesitter.get_node{ include_anonymous = false }`, which resolves the smallest *named* node. Such clients pass `namedOnly: true`. The protocol default stays `false` so the entry point exposes the full tree (consistent with `children` returning anonymous nodes too) and lets clients narrow explicitly, rather than baking one editor's default into the protocol.
 
 ### Boundary Semantics
 
@@ -157,7 +180,10 @@ Edge cases:
 // kakehashi/node/parent
 { "textDocument": { "uri": "..." }, "id": "01HX..." }    →    NodeInfo | null
 
-// kakehashi/node/children
+// kakehashi/node/children        — named + anonymous
+{ "textDocument": { "uri": "..." }, "id": "01HX..." }    →    NodeInfo[] | null
+
+// kakehashi/node/namedChildren   — named only
 { "textDocument": { "uri": "..." }, "id": "01HX..." }    →    NodeInfo[] | null
 ```
 
@@ -167,13 +193,15 @@ This holds even when a host node and an injected node share an identical span **
 
 **`null` cases**:
 - `parent`: id not in tracker, **or** id refers to a root node
-- `children`: id not in tracker
+- `children` / `namedChildren`: id not in tracker
 
-**Empty children**: A node that exists but has no children returns `[]` (not `null`).
+**Empty children**: A node that exists but has no children (or no *named* children, for `namedChildren`) returns `[]` (not `null`).
 
-**Ordering**: Children are returned in **document order** — equivalent to ascending `start_byte` because direct siblings in a tree-sitter tree are non-overlapping by construction. This matches tree-sitter's native child iteration and gives clients a deterministic walk order for structural navigation, AST walks, fold computation, and "go to next/previous sibling" gestures. The ordering invariant is preserved across any future filtering (e.g., a `namedOnly` parameter): filters narrow the sequence, they do not reorder it.
+**Ordering**: Children are returned in **document order** — equivalent to ascending `start_byte` because direct siblings in a tree-sitter tree are non-overlapping by construction. This matches tree-sitter's native child iteration and gives clients a deterministic walk order for structural navigation, AST walks, fold computation, and "go to next/previous sibling" gestures. The ordering invariant is preserved across the named-only variant (`namedChildren`) and any future filtering: narrowing the sequence never reorders it.
 
-**Named vs anonymous**: `children` returns both named and anonymous children. A future request parameter (e.g., `namedOnly`) may restrict this if needed.
+**Named vs anonymous**: `children` returns both named and anonymous children; `namedChildren` returns only the named ones, mirroring tree-sitter's `children()` vs `named_children()`. It is a **separate method, not a `namedOnly` flag on `children`**, for two reasons: (1) it matches tree-sitter's own API surface, which blesses exactly the named distinction (there is no `extra_children()` etc.), so there is no flag combinatorics to absorb; (2) filtering server-side returns only the named nodes, so the tracker mints ULIDs **only** for children the client keeps — filtering a full `children` result client-side would instead mint and retain IDs for anonymous children the client immediately discards, against lazy-node-identity-tracking's bounded-memory goal.
+
+**No `namedParent`**: `parent` has no named-only variant, because tree-sitter's `Node` has no `named_parent` — `parent()` is singular. A client wanting the nearest *named* ancestor walks `parent` and stops at the first named node. Knowing which nodes are named for that walk is the one case that would motivate a `named` field on `NodeInfo` (mirroring `is_named()`); it is deferred until such a consumer exists (see Alternatives).
 
 ### Text Resolution: `kakehashi/node/text`
 
@@ -227,10 +255,11 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 ### Positive
 
 - **Stable references across edits**: Clients can hold a node ID through editing sessions
-- **Composable API**: Four orthogonal methods cover position lookup, navigation, and content retrieval
+- **Composable API**: Five orthogonal methods cover position lookup, navigation (named + anonymous, or named-only), and content retrieval
 - **No tree-sitter on client**: Editors can implement syntax-aware features without bundling tree-sitter
-- **Lazy memory growth**: Only nodes touched via the protocol consume tracker memory
+- **Lazy memory growth**: Only nodes touched via the protocol consume tracker memory; `namedChildren` further avoids minting IDs for anonymous children a client would discard
 - **Injection-explicit**: Multi-layer language stacks are addressable without ambiguity
+- **tree-sitter-faithful named selection**: `namedOnly` and `namedChildren` map 1:1 to `named_descendant_for_byte_range` / `named_children()`, giving editor-default parity (e.g. Neovim `get_node`) in one round trip with no extra ID churn
 - **Predictable error model**: `null` is the universal "not currently resolvable" signal
 
 ### Negative
@@ -244,7 +273,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 ### Neutral
 
 - **Custom methods under `kakehashi/`**: Consistent with existing extensions (`kakehashi/internal/effectiveConfiguration`)
-- **Named + anonymous children**: Returning both is a default; can be parameterized later
+- **Named-vs-anonymous surface mirrors tree-sitter**: parameter on the entry point (`named_descendant_for_byte_range`), dedicated method for children (`named_children()`), no variant for `parent` (the `is_named()` field is deferred)
 - **Half-open intervals**: Standard convention for ranges in most text APIs
 
 ## Alternatives Considered
@@ -278,22 +307,48 @@ Include `range` in every `NodeInfo` returned.
 * Bad, because **opaque layer crossing surprises clients** — they cannot tell whether they're still in the same language tree
 * Bad, because **breaks tree-sitter's logical separation** between host and injected trees
 
+### Alternative E: Uniform `namedOnly` Parameter on Every Navigation Method
+
+Add `namedOnly` to `parent` and `children` (and entry) instead of a dedicated `namedChildren` method.
+
+* Bad, because **does not match tree-sitter's surface** — tree-sitter exposes `named_children()` as a method and has **no** `named_parent`, so a uniform flag invents a `parent` variant with no tree-sitter counterpart
+* Bad, because **invites flag combinatorics** on navigation methods (a later `extra` / `error` / `missing` filter would each add another boolean), whereas tree-sitter blesses only the named distinction
+* The entry point is the deliberate exception: it already carries `injection`, and named-vs-anonymous *composes* with it, so a parameter there avoids a method-per-combination explosion
+
+### Alternative F: `children` + `named` Field + Client-Side Filter
+
+Return both children always, add `named: boolean` to `NodeInfo`, and let clients filter for named.
+
+* Bad, because **mints ULIDs for discarded nodes** — resolving every child to filter client-side tracks anonymous children the client throws away, fighting lazy-node-identity-tracking's bounded-memory design
+* Bad, because **larger payloads** and per-client filtering logic for a distinction the server can make natively via `named_children()`
+* The `named` field itself is not rejected outright — it is deferred until a *holding-a-node* consumer (e.g. a nearest-named-ancestor `parent` walk) needs it, at which point it would live inline on `NodeInfo`
+
+### Alternative G: Separate `kakehashi/node/named` Entry Method
+
+Split the entry point into anonymous-inclusive and named-only methods instead of a `namedOnly` parameter.
+
+* Bad, because **duplicates the most complex handler** — both would carry the full `injection` resolution, parser auto-install, and re-snapshot machinery
+* Bad, because **injection × named is a 2-D space** better expressed as two composing parameters than four method names
+
 ## Implementation Notes
 
 - Methods are registered via `LspService::build().custom_method(...)` in `src/bin/main.rs`, following the existing `kakehashi/internal/effectiveConfiguration` pattern
 - Handlers live under `src/lsp/lsp_impl/kakehashi/node/` (one file per method) for symmetry with `kakehashi/internal/`
-- `RegionIdTracker` is renamed to `NodeTracker` and extended with a reverse index (`Ulid → PositionKey`); see lazy-node-identity-tracking
+- The entry point resolves `namedOnly` by switching `descendant_for_byte_range` → `named_descendant_for_byte_range` at the selected layer's tree; the end-of-document exception walks the right spine to the deepest node ending at `L`, restricted to named nodes when `namedOnly` is set
+- `namedChildren` reuses the `children` handler's tracker-minting path over `Node::named_children` instead of `Node::children`
+- `NodeTracker` (`src/language/node_tracker.rs`) backs all four id-based methods via a per-URI bidirectional index — forward (`PositionKey → Ulid`) for minting/dedup, reverse (`Ulid → PositionKey`) for resolving a held ULID back to a node range; see lazy-node-identity-tracking
 - Injection layer enumeration reuses the existing injection processing in `src/lsp/lsp_impl/coordinator/injection.rs`
 
 ## Summary
 
 | Aspect | Decision |
 |--------|----------|
-| **Methods** | `kakehashi/node`, `/parent`, `/children`, `/text` |
+| **Methods** | `kakehashi/node`, `/parent`, `/children`, `/namedChildren`, `/text` |
 | **Common params** | All methods carry `TextDocumentIdentifier` |
-| **`NodeInfo` shape** | `{ id, type }` (no range) |
+| **`NodeInfo` shape** | `{ id, type }` (no range, no `named` — both deferred) |
 | **Entry resolution** | Smallest containing node at selected injection layer |
 | **Injection selector** | `boolean \| number`, default `false` |
+| **Named selection** | `namedOnly` param on entry (`named_descendant_for_byte_range`); `namedChildren` method (`named_children()`); no `parent` variant (tree-sitter has no `named_parent`) |
 | **Boundary** | Half-open `[start, end)`; end-of-document (`b == L`) is contained by nodes with `e == L` |
 | **Navigation scope** | Single language tree per call |
 | **Null semantics** | Universal "not currently resolvable" |
