@@ -38,12 +38,12 @@ use crate::text::edit::apply_text_edits;
 ///   text the step handed back, never aborting the pipeline or discarding
 ///   earlier successful steps.
 ///
-/// Returns `Some(final_text)` when at least one server applied a non-empty
-/// edit, or `None` when nothing changed (every server was a no-op via empty
-/// edits, was skipped, or all failed) so the caller can emit no edit. An empty
-/// edit list — not byte-equality with `initial_text` — is the "no change"
-/// signal, which lets the pipeline avoid cloning `initial_text` up front and
-/// re-scanning the whole accumulated text at the end.
+/// Returns `Some(final_text)` only when at least one server applied a non-empty
+/// edit **and** the resulting text is not byte-identical to `initial_text`;
+/// otherwise `None`, so the caller emits no edit. Byte-equality with the
+/// original — not merely "some step returned edits" — is the "no change" signal,
+/// so a formatter that returns edits which round-trip to identical content does
+/// not produce a pointless whole-region replacement.
 pub(crate) async fn run_sequential_format_pipeline<F, Fut>(
     initial_text: String,
     server_names: &[String],
