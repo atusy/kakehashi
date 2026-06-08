@@ -318,7 +318,11 @@ async fn dispatch_concatenated_formatting(
             let host_uri_lsp = host_uri_lsp.clone();
             let open_scratch = Arc::clone(&open_scratch);
             async move {
-                let server_config = server_config?;
+                // No config for this server name: skip-and-continue, handing the
+                // unchanged text back to the pipeline (ADR Decision point 6).
+                let Some(server_config) = server_config else {
+                    return (current_text, None);
+                };
                 let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let scratch_id = scratch_region_id(&region_id, step);
 
@@ -346,7 +350,21 @@ async fn dispatch_concatenated_formatting(
                 // result by passing the zero offset for the response transform.
                 // The region offset is only re-applied once, when the final
                 // text is collapsed into the host replacement edit below.
-                let result = pool
+                //
+                // Per-step host-transform interaction: `send_formatting_request`
+                // runs `transform_formatting_response_to_host`, which clamps
+                // edits to a synthetic EOF and drops any past `virtual_line_count`
+                // for *this step's* `current_text`. Because we pass
+                // `RegionOffset::new(0, 0)` (an identity translation) and the
+                // step's own current text, those edits come back already
+                // EOF-clamped and host-translated by a zero offset — i.e. still
+                // in virtual coordinates relative to `current_text` — so applying
+                // them to the virtual accumulated text is correct. The single
+                // real region-offset translation happens once at the final
+                // collapse in `build_region_replacement_edit`.
+                // (`apply_text_edits` does its own clamping as a general safety
+                // net, independent of this transform.)
+                let send_result = pool
                     .send_formatting_request(
                         &server_name,
                         &server_config,
@@ -358,9 +376,25 @@ async fn dispatch_concatenated_formatting(
                         options,
                         upstream_id,
                     )
-                    .await
-                    .ok()
-                    .flatten();
+                    .await;
+
+                // ADR Decision point 6 (best-effort, skip-and-continue): a
+                // failed step is skipped — never surfaced to the editor — but is
+                // logged so the misbehaving server stays diagnosable. We log the
+                // downstream error here (before mapping to `None`) instead of
+                // silently dropping it with `.ok().flatten()`.
+                let result = match send_result {
+                    Ok(edits) => edits,
+                    Err(e) => {
+                        log::warn!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting step for server {} failed; skipping (ADR point 6): {}",
+                            server_name,
+                            e
+                        );
+                        None
+                    }
+                };
 
                 // Close the scratch document promptly on the happy path so it
                 // does not orphan tracking state or leak downstream diagnostics
@@ -374,7 +408,10 @@ async fn dispatch_concatenated_formatting(
                         .await;
                 }
 
-                result
+                // Hand the (unchanged) virtual text back to the pipeline along
+                // with the result so the pipeline can move it forward without a
+                // per-step clone.
+                (current_text, result)
             }
         }
     });

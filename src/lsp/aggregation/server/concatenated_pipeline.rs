@@ -22,16 +22,21 @@ use crate::text::edit::apply_text_edits;
 /// Run the priority-ordered servers serially over `initial_text`.
 ///
 /// For each `server_name` in order, `format_step` is invoked with that server's
-/// name and the **current** accumulated text. Its result is interpreted per
+/// name and the **current** accumulated text *by value* and must hand the text
+/// back (possibly unchanged) alongside its result. Handing the text in and out
+/// by move — rather than passing a borrowed `&str` plus a per-step
+/// `accumulated.clone()` — keeps the pipeline O(text_size) total instead of
+/// O(steps × text_size): no-op and failed steps no longer clone the whole
+/// accumulated text. The result is interpreted per
 /// concatenated-formatting-pipeline Decision points 3 and 6:
 ///
-/// - `Some(edits)` — apply `edits` (relative to the current text) to produce the
-///   next accumulated text. An empty list is the authoritative "already
+/// - `Some(edits)` — apply `edits` (relative to the returned text) to produce
+///   the next accumulated text. An empty list is the authoritative "already
 ///   formatted / no changes" signal and is a no-op that still advances the
 ///   pipeline.
 /// - `None` — a failed or unsupported step: **skip and continue** with the
-///   current accumulated text, never aborting the pipeline or discarding earlier
-///   successful steps.
+///   text the step handed back, never aborting the pipeline or discarding
+///   earlier successful steps.
 ///
 /// Returns `Some(final_text)` when at least one server applied a non-empty
 /// edit, or `None` when nothing changed (every server was a no-op via empty
@@ -46,7 +51,7 @@ pub(crate) async fn run_sequential_format_pipeline<F, Fut>(
 ) -> Option<String>
 where
     F: Fn(String, String) -> Fut,
-    Fut: Future<Output = Option<Vec<TextEdit>>>,
+    Fut: Future<Output = (String, Option<Vec<TextEdit>>)>,
 {
     // Start from the moved-in `initial_text` and only ever allocate a new
     // string when a step actually changes the text. `changed` tracks whether
@@ -58,19 +63,19 @@ where
     let mut changed = false;
 
     for server_name in server_names {
-        match format_step(server_name.clone(), accumulated.clone()).await {
-            // Skip-and-continue: a failed or unsupported server contributes
-            // nothing but must not discard the text produced so far.
-            None => continue,
-            Some(edits) => {
-                // Empty edits = authoritative "already formatted" = no-op.
-                if edits.is_empty() {
-                    continue;
-                }
-                accumulated = apply_text_edits(&accumulated, &edits);
+        // Move the accumulated text into the step and take it back out — no
+        // per-step clone, even when the step is a no-op or fails.
+        let (text, result) = format_step(server_name.clone(), accumulated).await;
+        accumulated = match result {
+            // A non-empty edit list is the only signal that the text changed.
+            Some(edits) if !edits.is_empty() => {
                 changed = true;
+                apply_text_edits(&text, &edits)
             }
-        }
+            // Empty edits ("already formatted") or `None` (failed/unsupported
+            // step): skip-and-continue carrying the text the step handed back.
+            _ => text,
+        };
     }
 
     if changed { Some(accumulated) } else { None }
@@ -117,7 +122,7 @@ mod tests {
                 }
                 other => panic!("unexpected server {other}"),
             };
-            async move { value }
+            async move { (text, value) }
         })
         .await;
 
@@ -138,7 +143,7 @@ mod tests {
                 }
                 other => panic!("unexpected server {other}"),
             };
-            async move { value }
+            async move { (text, value) }
         })
         .await;
 
@@ -159,7 +164,7 @@ mod tests {
                 }
                 other => panic!("unexpected server {other}"),
             };
-            async move { value }
+            async move { (text, value) }
         })
         .await;
 
@@ -171,13 +176,13 @@ mod tests {
         // Every server is a no-op (empty edits or skip) → final text equals the
         // original → no edit to emit.
         let servers = vec!["noop".to_string(), "broken".to_string()];
-        let result = run_sequential_format_pipeline("abc".to_string(), &servers, |name, _text| {
+        let result = run_sequential_format_pipeline("abc".to_string(), &servers, |name, text| {
             let value = match name.as_str() {
                 "noop" => Some(vec![]),
                 "broken" => None,
                 other => panic!("unexpected server {other}"),
             };
-            async move { value }
+            async move { (text, value) }
         })
         .await;
 
@@ -196,7 +201,7 @@ mod tests {
         let result = run_sequential_format_pipeline("abc".to_string(), &servers, |_name, text| {
             // Replace the whole text with identical content via a real edit.
             let value = Some(vec![replace_all(&text)]);
-            async move { value }
+            async move { (text, value) }
         })
         .await;
 
@@ -205,12 +210,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_server_list_returns_none() {
-        let result = run_sequential_format_pipeline(
-            "abc".to_string(),
-            &[],
-            |_name, _text| async move { None },
-        )
-        .await;
+        let result =
+            run_sequential_format_pipeline("abc".to_string(), &[], |_name, text| async move {
+                (text, None)
+            })
+            .await;
         assert_eq!(result, None);
     }
 }
