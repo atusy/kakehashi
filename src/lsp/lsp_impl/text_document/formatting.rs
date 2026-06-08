@@ -627,9 +627,11 @@ async fn close_remaining_scratch_docs(
 /// time (concurrent LSP requests, or a cancel+restart race) would otherwise both
 /// start at step 0 and collide on the same scratch virtual URI. Mixing in this
 /// run sequence makes scratch ids unique across concurrent runs in the process.
-static SCRATCH_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// `AtomicUsize` (not `AtomicU64`) so the build stays portable to targets without
+// native 64-bit atomics; a pointer-width counter is more than enough for run ids.
+static SCRATCH_RUN_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn scratch_region_id(region_id: &str, run: u64, step: usize) -> String {
+fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
     format!("{region_id}-kakehashi-scratch-{run}-{step}")
 }
 
