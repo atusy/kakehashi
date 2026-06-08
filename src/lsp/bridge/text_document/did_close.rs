@@ -99,6 +99,13 @@ impl LanguageServerPool {
         if !self.is_document_opened(scratch_uri) {
             return;
         }
+        // Remove from ALL tracking BEFORE awaiting the didClose send. Otherwise a
+        // concurrent `close_host_document` could still find this scratch URI in
+        // `host_to_virtual` while our didClose is in flight and issue a redundant
+        // double-close. `untrack_document` does not touch `host_to_virtual`, so we
+        // remove that registration (added by `ensure_document_opened`) explicitly.
+        self.unregister_virtual_doc(host_uri, scratch_uri).await;
+        self.untrack_document(scratch_uri, server_name).await;
         if let Err(e) = self
             .send_didclose_notification(scratch_uri, server_name)
             .await
@@ -109,10 +116,6 @@ impl LanguageServerPool {
                 scratch_uri.to_uri_string(), e
             );
         }
-        self.untrack_document(scratch_uri, server_name).await;
-        // Remove the host_to_virtual registration that ensure_document_opened
-        // added; untrack_document does not touch it.
-        self.unregister_virtual_doc(host_uri, scratch_uri).await;
     }
 
     /// Close a single virtual document: send didClose and remove from tracking.
