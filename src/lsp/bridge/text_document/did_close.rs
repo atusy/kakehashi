@@ -66,7 +66,10 @@ impl LanguageServerPool {
     }
 
     /// Close a single scratch virtual document by URI: send didClose and remove
-    /// it from ALL tracking state.
+    /// it from all tracking state for `server_name` (the `host_to_virtual`
+    /// registration, plus the version/opened/reverse-index entries that
+    /// `untrack_document` clears). A scratch URI is only ever opened against the
+    /// one server formatting that step, so per-server untracking is complete.
     ///
     /// Used by the concatenated formatting pipeline, which opens a throwaway
     /// scratch virtual document per step (a unique URI carrying the accumulated

@@ -13,14 +13,15 @@ use super::position::PositionMapper;
 /// Apply `edits` to `text`, returning the resulting string.
 ///
 /// All edit ranges are interpreted against the original `text` (LSP semantics).
-/// Edits are sorted by `(start, end)` and applied in a single **forward copy**
-/// (O(n + total edit length)) rather than repeated `String::replace_range`
-/// (which is O(n²)): the result is built by copying the gap before each edit,
-/// then its `new_text`. Out-of-bounds positions are clamped, an inverted range
-/// (`start` after `end`) is normalized, byte offsets are floored to UTF-8 char
-/// boundaries, and an edit overlapping one already applied is dropped (LSP
-/// forbids overlap, but a buggy server must never make us panic or corrupt) —
-/// resolved purely by sort order, so the lower-start edit wins.
+/// For `m` edits over a `text` of length `n`, the cost is `O(m log m)` to sort by
+/// `(start, end)` plus `O(n + total new_text length)` for a single **forward
+/// copy** — the result is built by copying the gap before each edit, then its
+/// `new_text`, rather than repeated `String::replace_range` (which is O(n²)).
+/// Out-of-bounds positions are clamped, an inverted range (`start` after `end`)
+/// is normalized, byte offsets are floored to UTF-8 char boundaries, and an edit
+/// overlapping one already applied is dropped (LSP forbids overlap, but a buggy
+/// server must never make us panic or corrupt) — resolved purely by sort order,
+/// so the lower-start edit wins.
 pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     if edits.is_empty() {
         return text.to_string();
@@ -30,8 +31,11 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     let mut byte_edits: Vec<(usize, usize, &str)> = edits
         .iter()
         .map(|e| {
-            let a = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.start));
-            let b = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.end));
+            // `floor_char_boundary` (stable since Rust 1.95) also clamps an
+            // index past the end down to `text.len()`, so a buggy mid-codepoint
+            // or out-of-range offset can never make the slices below panic.
+            let a = text.floor_char_boundary(mapper.position_to_byte_clamped(e.range.start));
+            let b = text.floor_char_boundary(mapper.position_to_byte_clamped(e.range.end));
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             (start, end, e.new_text.as_str())
         })
@@ -39,7 +43,10 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
 
     byte_edits.sort_by_key(|&(start, end, _)| (start, end));
 
-    let mut result = String::with_capacity(text.len());
+    // Upper-bound the result capacity (original text + all inserted text) so the
+    // forward copy never reallocates, even with many insertions.
+    let extra: usize = byte_edits.iter().map(|&(_, _, t)| t.len()).sum();
+    let mut result = String::with_capacity(text.len() + extra);
     let mut cursor = 0usize;
     for (start, end, new_text) in byte_edits {
         // Drop an edit that starts before the cursor — it overlaps one already
@@ -53,17 +60,6 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     }
     result.push_str(&text[cursor..]);
     result
-}
-
-/// Floor `offset` down to the nearest UTF-8 char boundary of `text` (or its
-/// length), so slicing never panics on a mid-codepoint offset from a buggy
-/// downstream server.
-fn floor_char_boundary(text: &str, offset: usize) -> usize {
-    let mut offset = offset.min(text.len());
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }
 
 #[cfg(test)]
