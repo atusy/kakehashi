@@ -53,23 +53,25 @@ where
     F: Fn(String, String) -> Fut,
     Fut: Future<Output = (String, Option<Vec<TextEdit>>)>,
 {
-    // Start from the moved-in `initial_text` and only ever allocate a new
-    // string when a step actually changes the text. `changed` tracks whether
-    // any step produced a real edit, so we avoid both the up-front clone of
-    // `initial_text` and the final whole-string `accumulated == initial_text`
-    // comparison (which would re-scan potentially large region text on every
-    // call). When nothing changed we return `None` so the caller emits no edit.
+    // Keep one copy of the original text for the final equality check. The
+    // working copy is moved through each step (no per-step clone); `applied`
+    // skips the comparison entirely in the common case where no step produced a
+    // non-empty edit. The comparison matters because a step can return non-empty
+    // edits that nonetheless round-trip to byte-identical text (a formatter
+    // reformatting already-conformant code); without it the caller would emit a
+    // pointless whole-region replacement with identical content.
+    let original = initial_text.clone();
     let mut accumulated = initial_text;
-    let mut changed = false;
+    let mut applied = false;
 
     for server_name in server_names {
         // Move the accumulated text into the step and take it back out — no
         // per-step clone, even when the step is a no-op or fails.
         let (text, result) = format_step(server_name.clone(), accumulated).await;
         accumulated = match result {
-            // A non-empty edit list is the only signal that the text changed.
+            // A non-empty edit list is the only thing that can change the text.
             Some(edits) if !edits.is_empty() => {
-                changed = true;
+                applied = true;
                 apply_text_edits(&text, &edits)
             }
             // Empty edits ("already formatted") or `None` (failed/unsupported
@@ -78,7 +80,12 @@ where
         };
     }
 
-    if changed { Some(accumulated) } else { None }
+    // Emit `Some` only when an edit was applied AND the bytes actually differ.
+    if applied && accumulated != original {
+        Some(accumulated)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -190,22 +197,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_some_when_a_step_applies_a_real_edit() {
-        // A non-empty edit list means the step changed the text. Even if the
-        // edit happens to reproduce the original bytes, the pipeline reports a
-        // change: emptiness — not byte-equality — is the "no-op" signal, and
-        // skipping the whole-string comparison is the point of the `changed`
-        // flag. The previous byte-equality check would have returned `None`
-        // here; this test pins the new contract.
-        let servers = vec!["echo".to_string()];
+    async fn returns_some_when_a_step_changes_the_bytes() {
+        // A non-empty edit that actually changes the text yields Some(new_text).
+        let servers = vec!["upper".to_string()];
         let result = run_sequential_format_pipeline("abc".to_string(), &servers, |_name, text| {
-            // Replace the whole text with identical content via a real edit.
-            let value = Some(vec![replace_all(&text)]);
+            let value = Some(vec![replace_all(&text.to_uppercase())]);
             async move { (text, value) }
         })
         .await;
 
-        assert_eq!(result, Some("abc".to_string()));
+        assert_eq!(result, Some("ABC".to_string()));
+    }
+
+    #[tokio::test]
+    async fn non_empty_edits_that_round_trip_to_identical_text_emit_nothing() {
+        // A formatter may return a (non-empty) whole-document replacement whose
+        // content is byte-identical to the input — e.g. re-formatting code that
+        // already conforms. The pipeline must NOT report a change, so the caller
+        // never emits a pointless whole-region replacement with identical text.
+        let servers = vec!["noop_reformat".to_string()];
+        let result = run_sequential_format_pipeline("abc".to_string(), &servers, |_name, text| {
+            let value = Some(vec![replace_all(&text)]); // same bytes back
+            async move { (text, value) }
+        })
+        .await;
+
+        assert_eq!(result, None);
     }
 
     #[tokio::test]

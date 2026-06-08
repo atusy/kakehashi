@@ -287,6 +287,10 @@ async fn dispatch_concatenated_formatting(
     // scratch id unique; the scratch document is `didClose`d after the step so
     // it never orphans tracking state or leaks diagnostics.
     let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Per-run sequence so scratch ids don't collide with a concurrent
+    // concatenated-formatting request for the same region (which would also start
+    // at step 0).
+    let run_seq = SCRATCH_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Convert the host URL to the bridge protocol's `Uri` once, for the per-step
     // didClose. This conversion is effectively infallible for a valid host URL;
     // if it ever failed, `send_formatting_request` (which performs the same
@@ -330,7 +334,7 @@ async fn dispatch_concatenated_formatting(
                     return (current_text, None);
                 };
                 let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let scratch_id = scratch_region_id(&region_id, step);
+                let scratch_id = scratch_region_id(&region_id, run_seq, step);
 
                 // Build the scratch URI up front and register it as "open" in the
                 // shared tracker BEFORE the request, so that if this future is
@@ -539,8 +543,16 @@ async fn close_remaining_scratch_docs(
 /// wraps it in the `kakehashi-virtual-uri-` filename marker and preserves the
 /// host directory and language extension required for downstream config and
 /// parser discovery.
-fn scratch_region_id(region_id: &str, step: usize) -> String {
-    format!("{region_id}-kakehashi-scratch-{step}")
+/// Process-global, monotonically increasing pipeline-run sequence. The per-step
+/// counter alone only makes scratch ids unique *within* a single pipeline run;
+/// two concatenated-formatting requests for the same host region overlapping in
+/// time (concurrent LSP requests, or a cancel+restart race) would otherwise both
+/// start at step 0 and collide on the same scratch virtual URI. Mixing in this
+/// run sequence makes scratch ids unique across concurrent runs in the process.
+static SCRATCH_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn scratch_region_id(region_id: &str, run: u64, step: usize) -> String {
+    format!("{region_id}-kakehashi-scratch-{run}-{step}")
 }
 
 /// Compute the host-coordinate `Range` that the concatenated pipeline's single
@@ -752,12 +764,22 @@ mod tests {
         // Each pipeline step must get a distinct scratch id so the bridge builds
         // a distinct virtual URI and re-sends a fresh didOpen with the current
         // accumulated text (rather than reusing the prior step's stale document).
-        let a = scratch_region_id("REGION", 0);
-        let b = scratch_region_id("REGION", 1);
-        let c = scratch_region_id("REGION", 2);
+        let a = scratch_region_id("REGION", 0, 0);
+        let b = scratch_region_id("REGION", 0, 1);
+        let c = scratch_region_id("REGION", 0, 2);
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn scratch_region_id_is_unique_across_runs_for_the_same_step() {
+        // Two concurrent format requests for the same region both start at step 0;
+        // the per-run sequence must still make their scratch ids distinct.
+        assert_ne!(
+            scratch_region_id("REGION", 7, 0),
+            scratch_region_id("REGION", 8, 0)
+        );
     }
 
     #[test]
@@ -765,14 +787,14 @@ mod tests {
         // The scratch document must never collide with the region's canonical
         // virtual document (which other requests like hover keep open).
         let region_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        assert_ne!(scratch_region_id(region_id, 0), region_id);
+        assert_ne!(scratch_region_id(region_id, 0, 0), region_id);
     }
 
     #[test]
     fn scratch_region_id_keeps_region_id_as_prefix() {
         // Preserving the region_id prefix keeps the scratch id unique per region
         // (no host-file collision across regions).
-        let id = scratch_region_id("REGION", 3);
+        let id = scratch_region_id("REGION", 0, 3);
         assert!(
             id.starts_with("REGION"),
             "scratch id should keep the region_id prefix: {id}"
@@ -786,7 +808,7 @@ mod tests {
         // distinctive kakehashi-virtual-uri- marker (Decision point 7).
         use crate::lsp::bridge::VirtualDocumentUri;
         let host_uri: tower_lsp_server::ls_types::Uri = "file:///project/doc.md".parse().unwrap();
-        let id = scratch_region_id("REGION", 1);
+        let id = scratch_region_id("REGION", 0, 1);
         let virtual_uri = VirtualDocumentUri::new(&host_uri, "python", &id);
         let uri_string = virtual_uri.to_uri_string();
         assert!(
