@@ -73,9 +73,11 @@ impl LanguageServerPool {
     ///
     /// Used by the concatenated formatting pipeline, which opens a throwaway
     /// scratch virtual document per step (a unique URI carrying the accumulated
-    /// text) and must close it immediately afterward so it never orphans
-    /// tracking state, accumulates downstream documents, or leaks diagnostics
-    /// for the throwaway URI (concatenated-formatting-pipeline Decision point 7).
+    /// text). The handler closes these via an end-of-run sweep (and an abort-time
+    /// Drop guard) rather than per step — deferring keeps cancellation leak-free —
+    /// so they never orphan tracking state, accumulate downstream documents, or
+    /// leak diagnostics for the throwaway URI (concatenated-formatting-pipeline
+    /// Decision point 7).
     ///
     /// The scratch URI is addressed directly (by URI + host) rather than looked
     /// up via the `host_to_virtual` ULID scan that
