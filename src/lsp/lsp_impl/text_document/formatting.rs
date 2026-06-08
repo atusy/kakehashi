@@ -28,13 +28,15 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentFormattingParams, TextEdit};
+use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
 
+use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::bridge::UpstreamId;
+use crate::lsp::aggregation::server::run_sequential_format_pipeline;
+use crate::lsp::bridge::{RegionOffset, UpstreamId, translate_virtual_range_to_host};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 
@@ -125,40 +127,27 @@ impl Kakehashi {
             let options = options.clone();
             let region_cancel_rx = cancel_state.derive_receiver();
 
+            // `strategy: "concatenated"` with a non-empty priorities list opts
+            // this region into the sequential formatter pipeline
+            // (concatenated-formatting-pipeline): run the priority-listed
+            // servers serially, each formatting the prior server's output, then
+            // emit one region-replacement edit. Everything else (default
+            // `preferred`, or `concatenated` with no priorities — a
+            // misconfiguration) keeps the existing first-non-empty-wins path.
+            let use_concatenated = region_ctx.strategy == AggregationStrategy::Concatenated
+                && !region_ctx.priorities.is_empty();
+
             outer_join_set.spawn(async move {
-                let result = dispatch_preferred(
-                    &region_ctx,
-                    pool.clone(),
-                    move |t| {
-                        let options = options.clone();
-                        async move {
-                            t.pool
-                                .send_formatting_request(
-                                    &t.server_name,
-                                    &t.server_config,
-                                    &t.uri,
-                                    &t.injection_language,
-                                    &t.region_id,
-                                    t.offset,
-                                    &t.virtual_content,
-                                    options,
-                                    t.upstream_id,
-                                )
-                                .await
-                        }
-                    },
-                    // `Some(vec![])` is an authoritative "no edits needed" from
-                    // the formatter (e.g., ruff signaling the code is already
-                    // formatted) — accept it instead of falling through to a
-                    // lower-priority server that might re-format the same code.
-                    // `None` still means "no response" and triggers fallback.
-                    |opt| opt.is_some(),
-                    region_cancel_rx,
-                )
-                .await;
-                match result {
-                    FanInResult::Done(edits) => edits,
-                    FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+                if use_concatenated {
+                    dispatch_concatenated_formatting(&region_ctx, pool.clone(), options).await
+                } else {
+                    dispatch_preferred_formatting(
+                        &region_ctx,
+                        pool.clone(),
+                        options,
+                        region_cancel_rx,
+                    )
+                    .await
                 }
             });
         }
@@ -166,6 +155,192 @@ impl Kakehashi {
         let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
         response
+    }
+}
+
+/// `preferred`-strategy formatting for one region: the existing
+/// first-non-empty-wins fan-out, factored out of the per-region task body.
+async fn dispatch_preferred_formatting(
+    region_ctx: &DocumentRequestContext,
+    pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+    options: tower_lsp_server::ls_types::FormattingOptions,
+    region_cancel_rx: Option<CancelReceiver>,
+) -> Option<Vec<TextEdit>> {
+    let result = dispatch_preferred(
+        region_ctx,
+        pool,
+        move |t| {
+            let options = options.clone();
+            async move {
+                t.pool
+                    .send_formatting_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.offset,
+                        &t.virtual_content,
+                        options,
+                        t.upstream_id,
+                    )
+                    .await
+            }
+        },
+        // `Some(vec![])` is an authoritative "no edits needed" from the
+        // formatter (e.g., ruff signaling the code is already formatted) —
+        // accept it instead of falling through to a lower-priority server that
+        // might re-format the same code. `None` still means "no response" and
+        // triggers fallback.
+        |opt| opt.is_some(),
+        region_cancel_rx,
+    )
+    .await;
+    match result {
+        FanInResult::Done(edits) => edits,
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+    }
+}
+
+/// `concatenated`-strategy formatting for one region: the sequential formatter
+/// pipeline (concatenated-formatting-pipeline).
+///
+/// Runs the region's priority-listed servers serially over the region's virtual
+/// content — each server formats the previous server's output — then collapses
+/// the final text into a single host-coordinate region-replacement edit. When
+/// nothing changed, contributes no edit.
+///
+/// TODO(concatenated-formatting-pipeline): this first slice reuses the existing
+/// `send_formatting_request` path for each step. Still to build (see the ADR):
+///   - scratch-document isolation (per-step didOpen/didClose with a unique
+///     scratch URI) so the canonical virtual document is never mutated;
+///   - capability-based full -> rangeFormatting fallback for range-only servers,
+///     distinguishing "no capability" from a `null` "already formatted";
+///   - per-step remaining-budget timeout and concurrent $/cancelRequest
+///     propagation (Decision points 6 and the Consequences cancellation note).
+async fn dispatch_concatenated_formatting(
+    region_ctx: &DocumentRequestContext,
+    pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+    options: tower_lsp_server::ls_types::FormattingOptions,
+) -> Option<Vec<TextEdit>> {
+    let offset = RegionOffset::with_per_line_offsets(
+        region_ctx.resolved.region.line_range.start,
+        region_ctx.resolved.line_column_offsets.clone(),
+    );
+    let original_virtual = region_ctx.resolved.virtual_content.clone();
+    let injection_language = region_ctx.resolved.injection_language.clone();
+    let region_id = region_ctx.resolved.region.region_id.clone();
+    let uri = region_ctx.uri.clone();
+    let upstream_id = region_ctx.upstream_request_id.clone();
+
+    // `priorities` is both the membership allowlist and the application order;
+    // keep only entries that are actually configured for this region.
+    let configured: std::collections::HashSet<&str> = region_ctx
+        .configs
+        .iter()
+        .map(|c| c.server_name.as_str())
+        .collect();
+    let server_names: Vec<String> = region_ctx
+        .priorities
+        .iter()
+        .filter(|name| configured.contains(name.as_str()))
+        .cloned()
+        .collect();
+
+    let server_config_for = |name: &str| {
+        region_ctx
+            .configs
+            .iter()
+            .find(|c| c.server_name == name)
+            .map(|c| Arc::clone(&c.config))
+    };
+
+    let final_text = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
+        let pool = Arc::clone(&pool);
+        move |server_name, current_text| {
+            let pool = Arc::clone(&pool);
+            let options = options.clone();
+            let injection_language = injection_language.clone();
+            let region_id = region_id.clone();
+            let uri = uri.clone();
+            let upstream_id = upstream_id.clone();
+            let server_config = server_config_for(&server_name);
+            async move {
+                let server_config = server_config?;
+                // The bridge translates the returned edits back to host
+                // coordinates, but the pipeline applies them to the *virtual*
+                // accumulated text, so request a fresh virtual-coordinate
+                // result by passing the zero offset for the response transform.
+                // The region offset is only re-applied once, when the final
+                // text is collapsed into the host replacement edit below.
+                pool.send_formatting_request(
+                    &server_name,
+                    &server_config,
+                    &uri,
+                    &injection_language,
+                    &region_id,
+                    RegionOffset::new(0, 0),
+                    &current_text,
+                    options,
+                    upstream_id,
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+        }
+    })
+    .await?;
+
+    Some(vec![build_region_replacement_edit(
+        &original_virtual,
+        final_text,
+        &offset,
+    )])
+}
+
+/// Build a single host-coordinate `TextEdit` that replaces the entire injection
+/// region with `final_text`.
+///
+/// The replacement range spans the whole *original* virtual document (`(0,0)`
+/// through the end of `original_virtual`), translated to host coordinates via
+/// the region [`RegionOffset`]. Emitting one whole-region edit keeps the LSP
+/// output trivially non-overlapping (concatenated-formatting-pipeline Decision
+/// point 4).
+///
+/// TODO(concatenated-formatting-pipeline): Decision point 4 also requires
+/// re-applying the region's per-line host prefix/indentation to every line of
+/// `final_text` (and the region LCP for new lines on a line-count change), plus
+/// trimming trailing whitespace on empty lines. This slice emits `final_text`
+/// verbatim and relies on the existing range translation only, so multi-line /
+/// blockquoted regions still drop host indentation on replacement lines — the
+/// same limitation documented in `src/lsp/bridge/text_document/formatting.rs`.
+fn build_region_replacement_edit(
+    original_virtual: &str,
+    final_text: String,
+    offset: &RegionOffset,
+) -> TextEdit {
+    // Virtual end position = last line index + its length, in the LSP line
+    // model (a trailing newline adds a final empty line).
+    let last_line = original_virtual.split('\n').next_back().unwrap_or("");
+    let end_line = u32::try_from(original_virtual.matches('\n').count()).unwrap_or(u32::MAX);
+    let end_char = u32::try_from(last_line.encode_utf16().count()).unwrap_or(u32::MAX);
+
+    let mut range = Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: end_line,
+            character: end_char,
+        },
+    };
+    translate_virtual_range_to_host(&mut range, offset);
+
+    TextEdit {
+        range,
+        new_text: final_text,
     }
 }
 

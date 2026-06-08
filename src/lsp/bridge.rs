@@ -28,6 +28,7 @@ pub(crate) use protocol::RegionOffset;
 #[cfg(test)]
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::location_link_to_location;
+pub(crate) use protocol::translate_virtual_range_to_host;
 
 /// Integration tests for the bridge module.
 ///
