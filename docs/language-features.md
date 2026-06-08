@@ -1,317 +1,199 @@
 # Language Features
 
-This document describes the LSP methods kakehashi implements, organized like the
-[LSP specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/)
-(this project follows **LSP 3.18**). For each method it records the parts that the
-specification deliberately leaves to the server: how a request behaves on the
-**host document** versus an **injection (virtual) document**, how results from
-multiple downstream servers are aggregated (`preferred` vs `concatenated`), and how
-positions/URIs are translated. Custom `kakehashi/*` methods are documented at the
-end.
+This document describes the editor features kakehashi provides, method by method,
+following the [LSP 3.18
+specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/).
+For each feature it explains what you can expect in practice — where it works, and
+how kakehashi combines results when several language servers are involved — beyond
+what the specification itself prescribes.
 
-For configuration of bridge servers, aggregation `priorities`, `strategy`, and
-`maxFanOut`, see [README.md](README.md#bridge-configuration). This document
-describes *behavior*; the README describes *setup*.
+For how to install language servers and configure bridging, see
+[README.md](README.md#bridge-configuration). This document describes **what the
+features do**; the README describes **how to set them up**.
 
 ---
 
-## Core model: host documents, native answers, and virtual documents
+## How features are provided
 
-Three concepts recur throughout this document.
+kakehashi provides features in two ways.
 
-**Host document.** The real file the editor opened (the URI the client sent).
-kakehashi parses it with Tree-sitter.
+**Built-in features** work for any language that has a Tree-sitter grammar, with no
+extra setup:
 
-**Native vs. bridged.** kakehashi answers a request in one of two ways:
+- **Syntax highlighting** (semantic tokens)
+- **Selection range** (expand/shrink selection by syntax structure)
 
-- **Native** — computed directly from the Tree-sitter syntax tree, with no
-  downstream language server involved. Only **semantic tokens** and **selection
-  range** are native. They are always available, fast, and require no
-  configuration.
-- **Bridged** — forwarded to a downstream language server (configured under
-  `languageServers`). Every other feature in this document is bridged.
+**Bridged features** are everything else (hover, completion, go-to-definition,
+diagnostics, …). kakehashi cannot compute these itself; instead it forwards your
+request to a real language server that you configure for the embedded language. If
+no server is configured, these features simply return nothing.
 
-**Virtual document (injection region).** An injection region — e.g. a `python`
-fenced code block inside Markdown, or SQL inside a Rust string — is presented to a
-downstream server as its own synthesized *virtual document*
-(`kakehashi:///…#injection-N.py`). Each injection region of the same language gets
-its **own** virtual document (isolated mode), so duplicate symbols across blocks do
-not collide. One downstream server process serves all virtual documents of its
-language.
+### Embedded code blocks
 
-Because bridged features operate on virtual documents, kakehashi must translate
-coordinates: a request `Position`/`Range` is mapped **host → virtual** before
-forwarding, and every `Range`/`uri` in the response is mapped **virtual → host**
-before returning to the editor.
+Bridged features work **inside embedded code blocks** — for example a `python`
+fenced code block in Markdown, or SQL inside a string. kakehashi treats each
+embedded block as a **standalone snippet** and hands it to the matching language
+server. Two consequences follow from this, and they shape what you can expect:
 
-> **Host-language bridging (`_self`) is not active.** The configuration schema
-> reserves a `_self` key for bridging the host language itself to a whole-document
-> server (e.g. marksman for Markdown), but this is **not wired into request
-> dispatch** today. In practice, **content outside injection regions receives only
-> the native features** (semantic tokens, selection range). All bridged features
-> below act *only* on injection regions.
+- **Each block is analyzed on its own.** Two Python blocks can each define
+  `main()` without conflicting. But features that need to see across blocks do not
+  work between them — for example, you cannot go to a definition that lives in a
+  *different* block.
+- **Only embedded content is bridged.** The surrounding document itself (the
+  Markdown prose, the host file as a whole) currently receives only the built-in
+  features. Wiring a whole-document language server to the host file is not yet
+  available.
 
-### How a position-based bridged request flows
+When you trigger a bridged feature, kakehashi uses the embedded block under your
+cursor (for position-based features like hover) or gathers results from **all**
+embedded blocks (for whole-document features like document symbols and
+diagnostics).
 
-```
-Editor request (host position)
-        │
-        ▼
-Is the position inside an injection region?
-        │ no ──────────────▶ return null  (no host bridge today)
-        │ yes
-        ▼
-Pick the single region under the cursor
-        │
-        ▼
-Translate host position → virtual position
-        │
-        ▼
-Fan out to configured server(s) for that injection language
-        │
-        ▼
-Aggregate responses (preferred / concatenated)
-        │
-        ▼
-Translate response ranges/URIs virtual → host; filter cross-region/cross-file
-        │
-        ▼
-Return to editor
-```
+### When several servers handle one language
 
-Whole-document bridged requests (e.g. `documentSymbol`, `formatting`,
-`diagnostic`) instead enumerate **all** injection regions, fan out one task per
-region in parallel, translate each region's results, and concatenate them.
-
-### Aggregation strategies
-
-When more than one downstream server can serve an injection language, responses
-are combined per method:
+If you configure more than one language server for the same embedded language,
+kakehashi combines their responses using one of two strategies, configurable per
+method (`strategy` in the bridge configuration):
 
 | Strategy | Behavior |
 |----------|----------|
-| `preferred` (default for everything except diagnostics) | Use the first **non-empty** response in `priorities` order; falls back to arrival order when no priorities configured. |
-| `concatenated` (default for `textDocument/diagnostic` and `textDocument/publishDiagnostics`) | Collect responses from all servers and merge them. |
+| `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics.** |
+| `concatenated` | Merges the responses from all servers. **Default for diagnostics.** |
 
-`maxFanOut` caps how many servers are queried. The per-method default is resolved
-in `default_aggregation_strategy_for_method` (`src/config/settings.rs`). Note that
-**formatting forcibly ignores `concatenated`** (see [Formatting](#formatting)) to
-avoid producing overlapping edits.
-
----
-
-## Server capabilities (advertised at `initialize`)
-
-The capabilities below are declared in `src/lsp/lsp_impl/lifecycle.rs`. Anything
-not listed here is **not** advertised (see [Not currently
-provided](#not-currently-provided)).
-
-| Capability | Value |
-|------------|-------|
-| `textDocumentSync` | Incremental; `openClose: true`; `save.includeText: false`; no `willSave` |
-| `semanticTokensProvider` | `full` + `full/delta` (`delta: true`), `range: true`, with legend |
-| `selectionRangeProvider` | `true` |
-| `hoverProvider` | `true` |
-| `completionProvider` | `resolveProvider: true`; trigger chars `.` `:` |
-| `signatureHelpProvider` | trigger chars `(` `,`; retrigger `,` |
-| `declarationProvider` / `definitionProvider` / `typeDefinitionProvider` / `implementationProvider` | `true` |
-| `referencesProvider` | `true` |
-| `documentHighlightProvider` | `true` |
-| `documentSymbolProvider` | `true` |
-| `documentLinkProvider` | `true` (no `resolveProvider`) |
-| `renameProvider` | `true` with `prepareProvider: true` |
-| `documentFormattingProvider` / `documentRangeFormattingProvider` | `true` |
-| `inlayHintProvider` | `true` |
-| `monikerProvider` | `true` |
-| `diagnosticProvider` | pull diagnostics; `interFileDependencies: false`, `workspaceDiagnostics: false` |
-| `colorProvider` | **only** under the `experimental` build feature |
-
-**Position encoding.** kakehashi does **not** advertise a `positionEncoding`, so
-per the spec the client must treat `Position.character` as **UTF-16 code units**.
-The server converts to UTF-8 byte offsets internally. To use UTF-8/UTF-32, the
-client must negotiate `general.positionEncodings` (not yet supported server-side).
+`maxFanOut` limits how many servers are queried. Formatting always uses `preferred`
+regardless of configuration (merging independent formatting results would produce
+conflicting edits).
 
 ---
 
-## Native features (Tree-sitter, no bridge)
+## Built-in features
 
-### Semantic Tokens
+### Syntax highlighting
 
-[`textDocument/semanticTokens/full`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_semanticTokens),
-`textDocument/semanticTokens/full/delta`, `textDocument/semanticTokens/range`
+[`textDocument/semanticTokens`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_semanticTokens)
+(full, delta, and range)
 
-- **Native.** Computed from `highlights.scm` Tree-sitter queries over the whole
-  host document. No downstream server is involved.
-- **Host + injections together.** Injection regions are highlighted natively via
-  the injection-aware tokenizer — highlighting inside a fenced code block does
-  **not** require a bridge server. This is the one feature where injected content
-  is served without bridging.
-- **Delta** (`full/delta`) is supported for incremental token updates.
-- Token types/modifiers come from kakehashi's fixed `LEGEND_TYPES` /
-  `LEGEND_MODIFIERS`; capture names are remapped via `captureMappings`
-  configuration.
+Highlights the whole document from Tree-sitter queries, **including embedded code
+blocks** — you get highlighting inside fenced code blocks even without a language
+server configured for that language. Delta updates and range requests are
+supported. Highlight colors are driven by the token types/modifiers kakehashi
+exposes; capture names can be remapped via `captureMappings` (see README).
 
-### Selection Range
+### Selection range
 
 [`textDocument/selectionRange`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_selectionRange)
 
-- **Native.** Builds the expand/shrink hierarchy from the Tree-sitter AST,
-  including nested injection structure, over the whole host document. No bridge.
+Expands or shrinks the selection along the syntax tree, including the structure of
+embedded blocks. Works for any grammar, no setup required.
 
 ---
 
-## Bridged language features (injection regions only)
+## Bridged features
 
-All methods in this section forward to downstream language servers running over
-per-injection virtual documents. If the request is not inside an injection region
-(or no server is configured for that injection language), the handler returns
-`null`/empty — there is **no native fallback** (kakehashi does not answer
-navigation from `locals.scm`).
+All features below require a language server configured for the embedded language.
+Where the request must be inside an embedded code block, placing the cursor outside
+one yields no result.
 
 ### Hover
 
 [`textDocument/hover`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_hover)
 
-- Resolves the single injection region under the cursor; returns `null` if the
-  position is not inside one.
-- Position translated host → virtual; the response `range` (if any) translated
-  virtual → host.
-- Strategy: **preferred** (first non-empty).
+Shows hover information for the symbol under the cursor, when the cursor is inside
+an embedded block. Combine strategy: `preferred`.
 
 ### Completion
 
 [`textDocument/completion`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_completion)
 and [`completionItem/resolve`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#completionItem_resolve)
 
-- Resolves the region under the cursor; trigger characters `.` and `:`.
-- Each returned item is tagged with an internal envelope in `CompletionItem.data`
-  identifying its origin server, so that `completionItem/resolve` is routed back to
-  **that specific server** (no fan-out on resolve). If resolution fails, the
-  original item is returned unchanged.
-- `textEdit`/`additionalTextEdits` ranges are translated virtual → host. Auto-import
-  edits that fall outside the injection region are unsafe (the top of a virtual
-  document maps to inside the code fence, not the file top) — see the limitations in
-  [request-strategies ADR](architecture-decisions/language-server-bridge-request-strategies.md).
-- Strategy: **preferred** (first server with non-empty items).
+Offers completions inside an embedded block (auto-triggered after `.` or `:`).
+Additional details for a highlighted item (documentation, extra edits) are resolved
+on demand from the server that produced it. Auto-import edits that would land
+outside the embedded block are not applied, because the surrounding document is not
+part of the snippet. Combine strategy: `preferred`.
 
-### Signature Help
+### Signature help
 
 [`textDocument/signatureHelp`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_signatureHelp)
 
-- Region under the cursor; trigger chars `(` `,`, retrigger `,`.
-- Pass-through (no positions in the response to translate).
-- Strategy: **preferred**.
+Shows parameter hints while typing a call inside an embedded block (auto-triggered
+after `(` or `,`). Combine strategy: `preferred`.
 
 ### Go to Definition / Declaration / Type Definition / Implementation
 
-[`textDocument/definition`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_definition),
+[`definition`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_definition),
 [`declaration`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_declaration),
 [`typeDefinition`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_typeDefinition),
 [`implementation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_implementation)
 
-These four behave identically:
+Jumps from a symbol in an embedded block to its definition. The target can be
+**within the same block** or a **real file on disk** (e.g. a library dependency).
+Targets that live in a *different* embedded block of the same document are not
+offered, since blocks are independent snippets. Combine strategy: `preferred`.
 
-- Region under the cursor.
-- **Result filtering** (`transform_goto_response_to_host`):
-  - Locations pointing into the **same** virtual document are translated virtual →
-    host (including `originSelectionRange` for `LocationLink`).
-  - Locations pointing to **real files** on disk are passed through unchanged
-    (jumping out of the injection into a real dependency is allowed).
-  - Locations pointing into **other** injection regions' virtual documents are
-    **dropped** (cross-region offsets are not safe to translate).
-- `LocationLink` vs `Location` is chosen based on client capability.
-- Strategy: **preferred**.
-
-### Find References
+### Find references
 
 [`textDocument/references`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_references)
 
-- Region under the cursor; honors `includeDeclaration`.
-- Same URI filtering as goto: own-region locations translated, real-file locations
-  kept, other-region virtual locations dropped. An empty array is preserved (means
-  "found nothing", distinct from a failure).
-- Strategy: **preferred**.
+Lists references to the symbol under the cursor. Like go-to-definition, results are
+limited to the same block and real files on disk; references in other embedded
+blocks are not included. Combine strategy: `preferred`.
 
-### Document Highlight
+### Document highlight
 
 [`textDocument/documentHighlight`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentHighlight)
 
-- Region under the cursor; results are host-document-local, translated virtual →
-  host.
-- Strategy: **preferred**.
+Highlights other occurrences of the symbol under the cursor within its block.
+Combine strategy: `preferred`.
 
-### Document Symbol
+### Document symbols
 
 [`textDocument/documentSymbol`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentSymbol)
 
-- **Whole-document**: enumerates **all** injection regions, fans out one task per
-  region in parallel, and **concatenates** symbols across regions (each region's
-  ranges translated virtual → host).
-- Returns hierarchical `DocumentSymbol[]` or flat `SymbolInformation[]` based on
-  the client's `hierarchicalDocumentSymbolSupport`.
-- Strategy: **preferred** *per region*, then cross-region concatenation.
+Lists symbols from **all** embedded blocks in the document, merged into one outline.
+Returns a hierarchical or flat outline depending on what your editor supports.
 
-### Document Link
+### Document links
 
 [`textDocument/documentLink`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentLink)
 
-- **Whole-document**: all regions in parallel, links concatenated and translated
-  virtual → host. No `documentLink/resolve` is advertised.
-- Strategy: **preferred** per region, then concatenation.
+Collects clickable links from all embedded blocks.
 
-### Rename / Prepare Rename
+### Rename / Prepare rename
 
-[`textDocument/rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
-and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
+[`rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
+and [`prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
-- Region under the cursor.
-- `rename` returns a `WorkspaceEdit`; edit ranges are translated virtual → host.
-  Because injections are isolated single-document regions, only same-region edits
-  are valid.
-- `prepareRename` is a pass-through for the region under the cursor.
-- Strategy: **preferred**.
+Renames a symbol within its embedded block. Because each block is a standalone
+snippet, renames are confined to that block. Combine strategy: `preferred`.
 
 ### Formatting
 
 [`textDocument/formatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_formatting)
 
-- **Whole-document**: all regions in parallel; the resulting `TextEdit`s (each over
-  a disjoint region span) are translated virtual → host and **sorted by start
-  position** before returning.
-- An empty edit list from a server (`Some([])`) is treated as authoritative
-  ("already formatted").
-- **`concatenated` is forcibly ignored for formatting.** Concatenating independent
-  edit lists across servers would produce overlapping/conflicting edits, so
-  formatting always uses **preferred** per region. A warning is emitted at
-  config-apply time if `concatenated` is configured for a formatting method. (The
-  planned multi-server sequential formatting *pipeline* described in the
-  [concatenated-formatting-pipeline ADR](architecture-decisions/concatenated-formatting-pipeline.md)
-  is not yet implemented.)
+Formats every embedded block in the document. When multiple servers are configured,
+the first one in `priorities` is used (formatting always uses `preferred`; merging
+multiple formatters would conflict).
 
-### Range Formatting
+### Range formatting
 
 [`textDocument/rangeFormatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rangeFormatting)
 
-- Like formatting, but each region's request is clipped to the region's byte range;
-  regions disjoint from the requested range are skipped. Endpoints are clamped to
-  content columns. Edits concatenated and sorted.
-- Shares the `textDocument/formatting` aggregation config key but always uses
-  **preferred**.
+Formats the embedded content overlapping the selected range. Behaves like
+formatting, scoped to the selection.
 
-### Inlay Hint
+### Inlay hints
 
 [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlayHint)
 
-- Range-based: resolves the region containing `range.start` and forwards the range;
-  hints translated virtual → host.
-- Strategy: **preferred**.
+Shows inline hints (types, parameter names) for the embedded block overlapping the
+requested range. Combine strategy: `preferred`.
 
 ### Moniker
 
 [`textDocument/moniker`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_moniker)
 
-- Region under the cursor; pass-through.
-- Strategy: **preferred**.
+Returns monikers for the symbol under the cursor. Combine strategy: `preferred`.
 
 ### Diagnostics
 
@@ -320,144 +202,110 @@ and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-p
 [`textDocument/publishDiagnostics`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_publishDiagnostics)
 (push)
 
-- **Whole-document**, **concatenated by default** — this is the one family whose
-  default strategy is `concatenated` rather than `preferred`.
-- All injection regions are processed in parallel; the strategy is resolved
-  **per region**, so different injection languages can differ (e.g. a Python region
-  may concatenate two servers while a Lua region prefers one).
-- Pull diagnostics return a single `Full` report (`result_id: None`) merging all
-  regions; a 5-second per-request timeout applies.
-- Push diagnostics are collected and forwarded with the **host** URI; an empty
-  vector signals "clear diagnostics". The server advertises pull diagnostics and
-  forwards downstream `workspace/diagnostic/refresh` notifications upstream so the
-  editor re-pulls.
-- `interFileDependencies` and `workspaceDiagnostics` are both `false`.
+Reports errors and warnings from every embedded block, merged into the document.
+This is the one feature whose default combine strategy is **`concatenated`** — when
+multiple servers are configured for a block, all of their diagnostics are shown.
+The strategy is resolved per language, so different embedded languages can behave
+differently.
 
-### Document Color / Color Presentation (experimental)
+### Document color (experimental)
 
-[`textDocument/documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
-and [`textDocument/colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
+[`documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
+and [`colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
-- **Only available when built with the `experimental` feature** (`colorProvider` is
-  otherwise not advertised).
-- `documentColor`: whole-document, all regions in parallel, concatenated, returns
-  `[]` rather than `null` when empty.
-- `colorPresentation`: range-based, single region from `range.start`.
-- Strategy: **preferred** (documentColor concatenates across regions after
-  per-region preferred).
+Shows color swatches and color picker presentations for embedded blocks. **Only
+available in experimental builds** — standard builds do not advertise color
+support.
 
 ---
 
-## Lifecycle and synchronization
+## `kakehashi/*` methods
 
-| Method | Behavior |
-|--------|----------|
-| [`initialize`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#initialize) | Loads settings (initialization options merged over config files), stores client capabilities and workspace roots, forwards roots/folders/capabilities to the bridge pool, returns the capabilities above. |
-| [`initialized`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#initialized) | Starts the loop that forwards downstream `workspace/diagnostic/refresh` to the editor. |
-| [`shutdown`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#shutdown) | Persists crash-recovery state and gracefully shuts down all downstream servers. |
-| `textDocument/didOpen` / `didChange` / `didClose` / `didSave` | Incremental sync. `didChange` re-parses and repositions tracked nodes; `didClose` drops the document and its node IDs. Changes are propagated to bridged virtual documents. |
-| `workspace/didChangeConfiguration` | Re-applies settings. |
+Beyond the standard LSP features, kakehashi exposes custom methods under the
+`kakehashi/` namespace so that editor plugins and scripts can query the syntax tree
+directly — identify the node at a position, walk to its parent or children, and read
+its current text — **without bundling Tree-sitter on the client side**.
 
----
+A handle to a node (its `id`) stays valid across edits as long as the node survives,
+so a plugin can hold a reference to "this function" and keep using it while the user
+types.
 
-## `kakehashi/*` custom methods
+> `kakehashi/internal/*` methods are not part of this public surface and are not
+> documented here.
 
-kakehashi exposes a small set of syntax-tree primitives under the `kakehashi/`
-namespace (see the
-[node-reference-protocol ADR](architecture-decisions/node-reference-protocol.md)).
-They let any LSP client query the Tree-sitter tree — identify a node at a position,
-navigate parent/children, read its current text — **without bundling Tree-sitter on
-the client**.
-
-> `kakehashi/internal/*` methods are intentionally undocumented here — they are
-> implementation-internal and not part of the supported surface.
-
-### Node identity model
-
-`kakehashi/node` returns a stable **`NodeInfo`**:
+### `NodeInfo`
 
 ```typescript
 type NodeInfo = {
-  id: string;    // ULID, stable across edits as long as the node survives
+  id: string;    // stable handle, valid across edits until the node changes
   type: string;  // tree-sitter node type, e.g. "fenced_code_block"
 };
 ```
 
-- `type` (not `kind`) matches the tree-sitter web binding, the convention used by
-  editor plugins.
-- `range` and `named` are intentionally **not** included (kept orthogonal; may be
-  added later via dedicated endpoints).
-- The `id` survives `didChange` as long as the underlying node is not invalidated;
-  it is dropped on `didClose`.
-
 ### Methods
 
-All methods take a `TextDocumentIdentifier`. The id-based methods route by URI and
-reject mismatched `(uri, id)` pairs as `null`.
+Every method takes a `textDocument`. The `id`-based methods are tied to the document
+they came from; querying with an `id` from a different document returns `null`.
 
 | Method | Input | Output | Purpose |
 |--------|-------|--------|---------|
-| `kakehashi/node` | `{ textDocument, position, injection? }` | `NodeInfo \| null` | Smallest node containing `position` at the selected injection layer |
-| `kakehashi/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | One step toward the root (within the same tree) |
-| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | Immediate children (named **and** anonymous), in document order |
-| `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | Current text of the node, sliced from up-to-date content |
+| `kakehashi/node` | `{ textDocument, position, injection? }` | `NodeInfo \| null` | The smallest node at a position (on the chosen embedding layer) |
+| `kakehashi/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | The node's parent (within the same language tree) |
+| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate children, in document order |
+| `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | The node's current text |
 
-> **Implementation note.** The node-reference-protocol ADR also specifies a
-> `namedOnly` parameter on `kakehashi/node` and a `kakehashi/node/namedChildren`
-> method. These are **not implemented** yet — only the four methods above are
-> registered (`src/bin/main.rs`), and `kakehashi/node` accepts only
-> `textDocument`, `position`, and `injection`.
+Positions follow the LSP default encoding (UTF-16 code units) unless your editor
+negotiates otherwise.
 
-### The `injection` parameter (`boolean | number`, default `false`)
+### The `injection` parameter
 
-Selects which layer of the injection stack `[host, layer₁, …, deepest]` at the
-cursor to resolve in:
+`kakehashi/node` accepts an optional `injection` (`boolean | number`, default
+`false`) selecting which embedding layer to resolve the position in. Picture the
+layers under the cursor as `[host, layer 1, layer 2, …, deepest]`:
 
-| Value | Resolved layer |
+| Value | Layer selected |
 |-------|----------------|
-| absent / `false` / `0` | host (layer 0) — always succeeds |
-| `true` | deepest layer (saturating) — always succeeds |
-| positive `n` | exactly `stack[n]`; `null` if out of bounds |
-| negative `n` | `stack[len + n]` (from the deepest); `null` if out of bounds |
+| absent / `false` / `0` | the host document (always available) |
+| `true` | the deepest embedded layer at the cursor |
+| positive `n` | exactly layer `n`; `null` if there is no such layer |
+| negative `n` | the `n`-th layer counting from the deepest; `null` if out of range |
 
-Any other JSON shape (string, fractional number, explicit `null`) is rejected as
-`null`. Example, in Markdown → Python → regex: at a cursor inside the regex,
-`injection: 0` returns the Markdown node, `1` the Python node, `2`/`true`/`-1` the
-regex node, `3` returns `null`.
+Example — Markdown containing a Python block containing a regex. With the cursor
+inside the regex: `0` resolves the Markdown node, `1` the Python node,
+`2` / `true` / `-1` the regex node, and `3` returns `null` (only three layers
+exist).
 
-### Boundary and null semantics
+### Result semantics
 
-- **Half-open intervals** `[start, end)`: a cursor at byte `b` is inside `[s, e)`
-  iff `s ≤ b < e`. A cursor exactly at a node's end byte is *outside* it — so a
-  cursor on a closing code fence falls back into the host, not the injection.
-- **End-of-document exception** (only when document length `L > 0`): a cursor at
-  `b == L` is contained by nodes ending at `L`, so AST queries work at EOF. An empty
-  document (`L == 0`) always returns `null`.
-- **`null` is the universal "not currently resolvable" signal.** A client cannot
-  distinguish "id invalidated by an edit", "id never issued", or "document not
-  open" — all collapse to `null`. Treat `null` as "re-acquire via `kakehashi/node`".
-- **Navigation stays within one language tree.** `parent` of an injected tree's
-  root returns `null`, not the host node containing the injection — crossing
-  injection boundaries requires a fresh `kakehashi/node` call.
+- **`null` means "not currently resolvable."** Whether the `id` was invalidated by
+  an edit, never existed, or the document isn't open, the answer is the same. Treat
+  `null` as a signal to re-acquire the node via `kakehashi/node`.
+- **A cursor exactly at a node's end is outside it.** For example, a cursor on the
+  closing fence of a code block resolves to the surrounding document, not the block.
+- **A cursor at the very end of the document** still resolves (so syntax-aware
+  commands work at end-of-file). An empty document returns `null`.
+- **Navigation stays inside one language tree.** Asking for the parent of an
+  embedded block's root returns `null`, not the host node containing it — to cross
+  that boundary, call `kakehashi/node` again at the position.
+
+> `kakehashi/node/namedChildren` and a `namedOnly` option on `kakehashi/node`
+> (named-only navigation) are planned but **not yet available**.
 
 ---
 
 ## Not currently provided
 
-These spec methods are **not** advertised in `ServerCapabilities` and are not
-handled:
+kakehashi does not yet provide these LSP features:
 
-- `textDocument/codeAction` (and `codeAction/resolve`)
-- `textDocument/codeLens`
-- `textDocument/foldingRange`
-- `textDocument/documentOnTypeFormatting`
-- `textDocument/linkedEditingRange`
-- `textDocument/callHierarchy` / `textDocument/typeHierarchy`
-- `workspace/symbol`, `workspace/executeCommand`
-- `documentLink/resolve`, `codeLens/resolve`
-- Semantic tokens for ranges across multiple documents / workspace token refresh
+- Code actions / quick fixes (`textDocument/codeAction`)
+- Code lens (`textDocument/codeLens`)
+- Folding ranges (`textDocument/foldingRange`)
+- On-type formatting (`textDocument/onTypeFormatting`)
+- Linked editing (`textDocument/linkedEditingRange`)
+- Call hierarchy / type hierarchy
+- Workspace symbol search (`workspace/symbol`) and command execution
+  (`workspace/executeCommand`)
 
-Bridged features are additionally limited to **injection regions**: cross-region
-and most cross-file navigation/edits are filtered out (only jumps to real files on
-disk survive), and host-language content outside injections has no bridged support
-until `_self` host bridging is wired into dispatch.
+Bridged features are also limited to **embedded code blocks**: navigation and edits
+do not cross between blocks, and the surrounding host document has no bridged
+language support yet (only built-in highlighting and selection range).
