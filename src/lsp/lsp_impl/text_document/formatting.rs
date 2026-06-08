@@ -221,7 +221,8 @@ async fn dispatch_preferred_formatting(
 /// Runs the region's priority-listed servers serially over the region's virtual
 /// content — each server formats the previous server's output — then collapses
 /// the final text into a single host-coordinate region-replacement edit. When
-/// nothing changed, contributes no edit.
+/// the final text is byte-identical to the region's original content (no step
+/// changed anything, or the changes round-tripped), contributes no edit.
 ///
 /// Each step targets a unique scratch virtual document
 /// ([`scratch_region_id`]), so the bridge always sends a fresh `didOpen`
@@ -406,17 +407,14 @@ async fn dispatch_concatenated_formatting(
                     }
                 };
 
-                // Close the scratch document promptly on the happy path so it
-                // does not orphan tracking state or leak downstream diagnostics
-                // for the throwaway URI (concatenated-formatting-pipeline
-                // Decision point 7). Remove it from the tracker first so the
-                // post-`select!` sweep never closes it a second time.
-                if let Some(scratch_uri) = scratch_uri.as_ref()
-                    && remove_open_scratch(&open_scratch, scratch_uri)
-                {
-                    pool.close_scratch_document(&uri, scratch_uri, &server_name)
-                        .await;
-                }
+                // Scratch-document cleanup is deferred to the post-`select!`
+                // sweep (`close_remaining_scratch_docs`), NOT closed here per
+                // step. The sweep always runs to completion, so a cancel that
+                // drops this step's future mid-flight can never leak a scratch
+                // doc; closing per-step inside the (cancellable) pipeline future
+                // could be interrupted after the tracker entry was already
+                // removed, leaking it. The scratch doc stays tracked in
+                // `open_scratch` (registered above) for the sweep to close.
 
                 // Hand the (unchanged) virtual text back to the pipeline along
                 // with the result so the pipeline can move it forward without a
@@ -444,10 +442,12 @@ async fn dispatch_concatenated_formatting(
         }
     };
 
-    // ALWAYS sweep up any scratch documents the run left open — on both the
-    // completed and cancelled paths. On the happy path this is normally empty
-    // (each step removed its own entry before closing); on cancel it closes the
-    // in-flight step's scratch document that was dropped before its own close.
+    // Close every scratch document the run opened — on both the completed and
+    // cancelled paths. This sweep is the single cleanup point (steps only
+    // register their scratch docs, never close them), so it runs to completion
+    // regardless of cancellation and can never leak. `close_scratch_document` is
+    // idempotent, so a doc already gone (e.g. via a concurrent host close) is a
+    // no-op.
     close_remaining_scratch_docs(&pool, &host_uri_for_sweep, &open_scratch).await;
 
     // On cancel, contribute no edit (matches the prior early-return behavior).
@@ -475,22 +475,6 @@ struct OpenScratchDoc {
 /// lock-recovery convention.
 fn push_open_scratch(open: &std::sync::Mutex<Vec<OpenScratchDoc>>, doc: OpenScratchDoc) {
     lock_open_scratch(open).push(doc);
-}
-
-/// Remove a scratch document from the open set by URI, returning `true` if it
-/// was present (i.e. this caller now owns closing it). Prevents the happy-path
-/// per-step close and the post-`select!` sweep from both closing the same doc.
-fn remove_open_scratch(
-    open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
-    uri: &VirtualDocumentUri,
-) -> bool {
-    let mut guard = lock_open_scratch(open);
-    if let Some(pos) = guard.iter().position(|d| &d.uri == uri) {
-        guard.remove(pos);
-        true
-    } else {
-        false
-    }
 }
 
 /// Drain and return all still-open scratch documents.
@@ -854,45 +838,18 @@ mod tests {
     }
 
     #[test]
-    fn open_scratch_remove_prevents_double_close() {
-        // Happy path: a step removes its own scratch doc before closing it, so
-        // the post-select sweep must NOT see it again.
+    fn open_scratch_tracker_accumulates_every_step_for_the_sweep() {
+        // Steps only register their scratch docs; the post-select sweep is the
+        // single close point, so every pushed doc must still be present to drain.
         let open = std::sync::Mutex::new(Vec::new());
-        let doc = scratch_doc("file:///d.md", "R-scratch-0", "black");
-        let uri = doc.uri.clone();
-        push_open_scratch(&open, doc);
-
-        assert!(
-            remove_open_scratch(&open, &uri),
-            "first remove owns the close and returns true"
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
+        let drained = drain_open_scratch(&open);
+        assert_eq!(
+            drained.len(),
+            2,
+            "the sweep must see every step's scratch doc"
         );
-        assert!(
-            !remove_open_scratch(&open, &uri),
-            "second remove must return false (already owned) to avoid double-close"
-        );
-        assert!(
-            drain_open_scratch(&open).is_empty(),
-            "removed doc must not be swept again"
-        );
-    }
-
-    #[test]
-    fn open_scratch_remove_keeps_other_entries() {
-        // Removing one in-flight step's scratch doc must not disturb others
-        // still tracked open (e.g. a concurrent step in a different run shape).
-        let open = std::sync::Mutex::new(Vec::new());
-        let keep = scratch_doc("file:///d.md", "R-scratch-0", "black");
-        let keep_uri = keep.uri.clone();
-        let remove = scratch_doc("file:///d.md", "R-scratch-1", "isort");
-        let remove_uri = remove.uri.clone();
-        push_open_scratch(&open, keep);
-        push_open_scratch(&open, remove);
-
-        assert!(remove_open_scratch(&open, &remove_uri));
-
-        let remaining = drain_open_scratch(&open);
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].uri, keep_uri, "the other doc must survive");
     }
 
     #[test]

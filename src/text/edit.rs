@@ -97,10 +97,11 @@ mod tests {
 
     #[test]
     fn applies_multiple_disjoint_edits_regardless_of_order() {
-        // Two edits given in ascending order; applying the later one first must
-        // not shift the earlier one. Replace "a"->"AAAA" and "c"->"C".
+        // Edits supplied OUT OF ORDER (later span first) to actually exercise the
+        // sort: applying the later one must not shift the earlier one. Replace
+        // "a"->"AAAA" and "c"->"C".
         let text = "a b c";
-        let edits = vec![edit(0, 0, 0, 1, "AAAA"), edit(0, 4, 0, 5, "C")];
+        let edits = vec![edit(0, 4, 0, 5, "C"), edit(0, 0, 0, 1, "AAAA")];
         assert_eq!(apply_text_edits(text, &edits), "AAAA b C");
     }
 

@@ -2,6 +2,10 @@
 name = "kakehashi"
 version = "0.5.0"
 edition = "2024"
+# MSRV: edition 2024 needs >= 1.85, and the code uses `str::floor_char_boundary`
+# (stable since 1.95). Pin it so the build doesn't silently depend on whatever
+# toolchain is on the CI runner.
+rust-version = "1.95"
 
 [[bin]]
 name = "kakehashi"
