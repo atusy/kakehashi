@@ -421,6 +421,7 @@ fn collect_injection_contexts_sync<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_injection_tokens_parallel(
     host_text: &str,
+    host_lines: &[&str],
     host_tree: &Tree,
     host_filetype: Option<&str>,
     coordinator: &LanguageCoordinator,
@@ -428,9 +429,6 @@ pub(crate) fn collect_injection_tokens_parallel(
     supports_multiline: bool,
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use rayon::prelude::*;
-
-    // Pre-compute host lines for position calculations
-    let host_lines: Vec<&str> = host_text.lines().collect();
 
     // Collect top-level injection contexts and their byte ranges
     let (contexts, exclusion_byte_ranges) =
@@ -458,7 +456,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     coordinator,
                     capture_mappings,
                     host_text,
-                    &host_lines,
+                    host_lines,
                     1, // depth 1 (first level of injection, host is 0)
                     supports_multiline,
                 )
@@ -475,7 +473,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     coordinator,
                     capture_mappings,
                     host_text,
-                    &host_lines,
+                    host_lines,
                     1,
                     supports_multiline,
                 )
@@ -490,7 +488,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // regions that actually produced tokens (= "active" injection regions).
     let active_regions = compute_active_injection_regions(
         host_text,
-        &host_lines,
+        host_lines,
         &exclusion_byte_ranges,
         &all_tokens,
     );
@@ -891,8 +889,10 @@ mod tests {
         parser_pool.release("markdown".to_string(), parser);
 
         // Collect tokens - should be empty for empty document
+        let host_lines: Vec<&str> = text.lines().collect();
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
+            &host_lines,
             &tree,
             Some("markdown"),
             &coordinator,
@@ -943,8 +943,10 @@ local x = 42
         parser_pool.release("markdown".to_string(), parser);
 
         // Collect tokens in parallel
+        let host_lines: Vec<&str> = text.lines().collect();
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
+            &host_lines,
             &tree,
             Some("markdown"),
             &coordinator,
@@ -1019,8 +1021,10 @@ local b = 2
         };
         parser_pool.release("markdown".to_string(), parser);
 
+        let host_lines: Vec<&str> = text.lines().collect();
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
+            &host_lines,
             &tree,
             Some("markdown"),
             &coordinator,

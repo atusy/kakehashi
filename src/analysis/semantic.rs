@@ -65,6 +65,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         // Also returns active injection regions for finalize-time exclusion.
         let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
             &text,
+            &lines,
             &tree,
             filetype.as_deref(),
             &coordinator,
