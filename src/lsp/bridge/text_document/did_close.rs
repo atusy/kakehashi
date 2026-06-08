@@ -65,6 +65,38 @@ impl LanguageServerPool {
         }
     }
 
+    /// Close a single scratch virtual document by URI: send didClose and remove
+    /// it from tracking.
+    ///
+    /// Used by the concatenated formatting pipeline, which opens a throwaway
+    /// scratch virtual document per step (a unique URI carrying the accumulated
+    /// text) and must close it immediately afterward so it never orphans
+    /// tracking state, accumulates downstream documents, or leaks diagnostics
+    /// for the throwaway URI (concatenated-formatting-pipeline Decision point 7).
+    /// Unlike [`close_host_document`](Self::close_host_document) /
+    /// [`close_invalidated_docs`](Self::close_invalidated_docs), the scratch URI
+    /// is not registered under any host document, so it is addressed directly
+    /// rather than looked up via `host_to_virtual`. Best-effort: a didClose
+    /// failure is logged inside [`send_didclose_notification`] callers but never
+    /// surfaced, since the pipeline must not fail on cleanup.
+    pub(crate) async fn close_scratch_document(
+        &self,
+        scratch_uri: &VirtualDocumentUri,
+        server_name: &str,
+    ) {
+        if let Err(e) = self
+            .send_didclose_notification(scratch_uri, server_name)
+            .await
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to send didClose for scratch document {}: {}",
+                scratch_uri.to_uri_string(), e
+            );
+        }
+        self.untrack_document(scratch_uri, server_name).await;
+    }
+
     /// Close a single virtual document: send didClose and remove from tracking.
     ///
     /// This is the core cleanup operation used by both `close_host_document`
@@ -126,5 +158,77 @@ impl LanguageServerPool {
         for doc in &to_close {
             self.close_single_virtual_doc(doc).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::bridge::pool::test_helpers::url_to_uri;
+
+    /// `close_scratch_document` untracks a directly-addressed scratch virtual
+    /// document.
+    ///
+    /// The concatenated formatting pipeline opens a throwaway scratch document
+    /// per step (a unique URI not registered under any host document) and must
+    /// be able to close + untrack it by URI alone — without going through the
+    /// `host_to_virtual` lookup that `close_host_document` uses. This guards the
+    /// scratch lifecycle that isolates the pipeline's speculative state
+    /// (concatenated-formatting-pipeline Decision point 7).
+    #[tokio::test]
+    async fn close_scratch_document_untracks_directly_addressed_doc() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        // A scratch URI uses a step-suffixed region_id, distinct from the
+        // canonical region's virtual document.
+        let scratch_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
+
+        // Simulate the per-step didOpen having registered the scratch doc.
+        pool.register_opened_document(&host_uri, &scratch_uri, "black")
+            .await;
+        assert!(
+            pool.is_document_opened(&scratch_uri),
+            "scratch doc should be tracked after register"
+        );
+
+        // No connection exists for "black", so the didClose send is a no-op,
+        // but the untrack must still happen so the scratch doc never lingers.
+        pool.close_scratch_document(&scratch_uri, "black").await;
+
+        assert!(
+            !pool.is_document_opened(&scratch_uri),
+            "scratch doc must be untracked after close_scratch_document"
+        );
+    }
+
+    /// A scratch URI is distinct from the canonical region URI, so an
+    /// already-open canonical document does NOT suppress the scratch `didOpen`.
+    ///
+    /// This is the crux of the stale-content fix: when the canonical region
+    /// document is already open for a server (e.g. after a prior hover), the
+    /// formatting step targets a *different* URI, so `ensure_document_opened`
+    /// (gated on `is_document_opened`) still sends a fresh `didOpen` carrying the
+    /// current accumulated text rather than reusing the stale open document.
+    #[tokio::test]
+    async fn scratch_uri_is_not_suppressed_by_open_canonical_document() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let canonical_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION");
+        let scratch_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
+
+        // Canonical region document already open downstream (the bug trigger).
+        pool.register_opened_document(&host_uri, &canonical_uri, "black")
+            .await;
+
+        assert!(
+            pool.is_document_opened(&canonical_uri),
+            "canonical doc is open"
+        );
+        assert!(
+            !pool.is_document_opened(&scratch_uri),
+            "scratch doc must be seen as NOT open so a fresh didOpen carries the current text"
+        );
     }
 }

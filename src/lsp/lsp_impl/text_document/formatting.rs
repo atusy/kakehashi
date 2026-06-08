@@ -39,7 +39,9 @@ use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
 use crate::lsp::aggregation::server::run_sequential_format_pipeline;
-use crate::lsp::bridge::{RegionOffset, UpstreamId, translate_virtual_range_to_host};
+use crate::lsp::bridge::{
+    RegionOffset, UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
+};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 
@@ -219,14 +221,20 @@ async fn dispatch_preferred_formatting(
 /// the final text into a single host-coordinate region-replacement edit. When
 /// nothing changed, contributes no edit.
 ///
-/// TODO(concatenated-formatting-pipeline): this first slice reuses the existing
-/// `send_formatting_request` path for each step. Still to build (see the ADR):
-///   - scratch-document isolation (per-step didOpen/didClose with a unique
-///     scratch URI) so the canonical virtual document is never mutated;
+/// Each step targets a unique scratch virtual document
+/// ([`scratch_region_id`]), so the bridge always sends a fresh `didOpen`
+/// carrying the current accumulated text — fixing the stale-content bug where a
+/// step reused an already-open canonical document and formatted the *original*
+/// region text. The scratch document is `didClose`d after the step
+/// (concatenated-formatting-pipeline Decision point 7).
+///
+/// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
 ///   - capability-based full -> rangeFormatting fallback for range-only servers,
 ///     distinguishing "no capability" from a `null` "already formatted";
 ///   - per-step remaining-budget timeout and concurrent $/cancelRequest
-///     propagation (Decision points 6 and the Consequences cancellation note).
+///     propagation (Decision points 6 and the Consequences cancellation note);
+///   - discarding downstream `publishDiagnostics` targeting scratch URIs;
+///     prompt didClose currently minimizes (but does not eliminate) the window.
 async fn dispatch_concatenated_formatting(
     region_ctx: &DocumentRequestContext,
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
@@ -265,6 +273,23 @@ async fn dispatch_concatenated_formatting(
             .map(|c| Arc::clone(&c.config))
     };
 
+    // Each pipeline step targets a *fresh* scratch virtual document so the
+    // bridge always performs a new `didOpen` carrying the current accumulated
+    // text. Reusing the canonical region virtual document would make a step
+    // format STALE text whenever that document is already open downstream (e.g.
+    // after a prior hover/diagnostic), because `send_formatting_request` only
+    // pushes content on the first `didOpen` (concatenated-formatting-pipeline
+    // Decision point 7, stale-content bug). The per-step counter makes the
+    // scratch id unique; the scratch document is `didClose`d after the step so
+    // it never orphans tracking state or leaks diagnostics.
+    let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Convert the host URL to the bridge protocol's `Uri` once. On the
+    // unreachable conversion failure the per-step didClose is skipped (the
+    // scratch document is still cleaned up when the host document closes), but
+    // the unique-URI didOpen — the correctness core — still happens because the
+    // scratch id is passed to `send_formatting_request` directly.
+    let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&uri).ok();
+
     let pipeline_fut = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
         let pool = Arc::clone(&pool);
         move |server_name, current_text| {
@@ -275,28 +300,47 @@ async fn dispatch_concatenated_formatting(
             let uri = uri.clone();
             let upstream_id = upstream_id.clone();
             let server_config = server_config_for(&server_name);
+            let step_counter = Arc::clone(&step_counter);
+            let host_uri_lsp = host_uri_lsp.clone();
             async move {
                 let server_config = server_config?;
+                let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let scratch_id = scratch_region_id(&region_id, step);
                 // The bridge translates the returned edits back to host
                 // coordinates, but the pipeline applies them to the *virtual*
                 // accumulated text, so request a fresh virtual-coordinate
                 // result by passing the zero offset for the response transform.
                 // The region offset is only re-applied once, when the final
                 // text is collapsed into the host replacement edit below.
-                pool.send_formatting_request(
-                    &server_name,
-                    &server_config,
-                    &uri,
-                    &injection_language,
-                    &region_id,
-                    RegionOffset::new(0, 0),
-                    &current_text,
-                    options,
-                    upstream_id,
-                )
-                .await
-                .ok()
-                .flatten()
+                let result = pool
+                    .send_formatting_request(
+                        &server_name,
+                        &server_config,
+                        &uri,
+                        &injection_language,
+                        &scratch_id,
+                        RegionOffset::new(0, 0),
+                        &current_text,
+                        options,
+                        upstream_id,
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+
+                // Close the scratch document promptly so it does not orphan
+                // tracking state or leak downstream diagnostics for the
+                // throwaway URI (concatenated-formatting-pipeline Decision
+                // point 7). Best-effort: a close failure must not abort the
+                // pipeline step.
+                if let Some(host_uri_lsp) = host_uri_lsp.as_ref() {
+                    let scratch_uri =
+                        VirtualDocumentUri::new(host_uri_lsp, &injection_language, &scratch_id);
+                    pool.close_scratch_document(&scratch_uri, &server_name)
+                        .await;
+                }
+
+                result
             }
         }
     });
@@ -320,6 +364,31 @@ async fn dispatch_concatenated_formatting(
         final_text,
         &offset,
     )])
+}
+
+/// Derive a unique scratch `region_id` for one step of the concatenated
+/// formatting pipeline.
+///
+/// The pipeline feeds each server the *previous* server's output by passing the
+/// accumulated text to `send_formatting_request`. But the bridge only pushes
+/// that content downstream via `didOpen` when the virtual document is not yet
+/// open (`ensure_document_opened`); if the canonical region virtual document is
+/// already open for that server (common after a prior hover/diagnostic), the
+/// formatting request reuses the stale open document and the server formats the
+/// *original* region text, breaking the serial semantics
+/// (concatenated-formatting-pipeline, the stale-content bug). Giving each step a
+/// distinct `region_id` yields a distinct [`VirtualDocumentUri`], so the bridge
+/// always performs a fresh `didOpen` carrying the current accumulated text.
+///
+/// The id keeps the canonical `region_id` as a prefix (so it stays unique per
+/// region — no host-file collision) and appends a `-scratch-{step}` suffix so it
+/// is unique per pipeline step. It still flows through
+/// [`VirtualDocumentUri::new`], which wraps it in the distinctive
+/// `kakehashi-virtual-uri-` filename marker (Decision point 7) and preserves the
+/// host directory and language extension required for downstream config and
+/// parser discovery.
+fn scratch_region_id(region_id: &str, step: usize) -> String {
+    format!("{region_id}-scratch-{step}")
 }
 
 /// Build a single host-coordinate `TextEdit` that replaces the entire injection
@@ -524,6 +593,66 @@ mod tests {
             },
             new_text: new_text.to_string(),
         }
+    }
+
+    // ==========================================================================
+    // scratch_region_id (concatenated-formatting-pipeline: stale-content fix)
+    // ==========================================================================
+
+    #[test]
+    fn scratch_region_id_is_unique_per_step() {
+        // Each pipeline step must get a distinct scratch id so the bridge builds
+        // a distinct virtual URI and re-sends a fresh didOpen with the current
+        // accumulated text (rather than reusing the prior step's stale document).
+        let a = scratch_region_id("REGION", 0);
+        let b = scratch_region_id("REGION", 1);
+        let c = scratch_region_id("REGION", 2);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn scratch_region_id_differs_from_canonical_region_id() {
+        // The scratch document must never collide with the region's canonical
+        // virtual document (which other requests like hover keep open).
+        let region_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert_ne!(scratch_region_id(region_id, 0), region_id);
+    }
+
+    #[test]
+    fn scratch_region_id_keeps_region_id_as_prefix() {
+        // Preserving the region_id prefix keeps the scratch id unique per region
+        // (no host-file collision across regions).
+        let id = scratch_region_id("REGION", 3);
+        assert!(
+            id.starts_with("REGION"),
+            "scratch id should keep the region_id prefix: {id}"
+        );
+    }
+
+    #[test]
+    fn scratch_region_id_produces_virtual_uri_with_marker_and_extension() {
+        // The scratch id must flow through VirtualDocumentUri to keep the host
+        // directory + language extension (config/parser discovery) and the
+        // distinctive kakehashi-virtual-uri- marker (Decision point 7).
+        use crate::lsp::bridge::VirtualDocumentUri;
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///project/doc.md".parse().unwrap();
+        let id = scratch_region_id("REGION", 1);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "python", &id);
+        let uri_string = virtual_uri.to_uri_string();
+        assert!(
+            uri_string.starts_with("file:///project/kakehashi-virtual-uri-"),
+            "scratch URI must keep host dir + marker: {uri_string}"
+        );
+        assert!(
+            uri_string.ends_with(".py"),
+            "scratch URI must keep the language extension: {uri_string}"
+        );
+        assert!(
+            VirtualDocumentUri::is_virtual_uri(&uri_string),
+            "scratch URI must be recognized as virtual: {uri_string}"
+        );
     }
 
     #[test]
