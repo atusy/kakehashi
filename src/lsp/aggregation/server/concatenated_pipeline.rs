@@ -33,9 +33,12 @@ use crate::text::edit::apply_text_edits;
 ///   current accumulated text, never aborting the pipeline or discarding earlier
 ///   successful steps.
 ///
-/// Returns `Some(final_text)` when the final accumulated text differs from
-/// `initial_text`, or `None` when nothing changed (every server was a no-op,
-/// was skipped, or all failed) so the caller can emit no edit.
+/// Returns `Some(final_text)` when at least one server applied a non-empty
+/// edit, or `None` when nothing changed (every server was a no-op via empty
+/// edits, was skipped, or all failed) so the caller can emit no edit. An empty
+/// edit list — not byte-equality with `initial_text` — is the "no change"
+/// signal, which lets the pipeline avoid cloning `initial_text` up front and
+/// re-scanning the whole accumulated text at the end.
 pub(crate) async fn run_sequential_format_pipeline<F, Fut>(
     initial_text: String,
     server_names: &[String],
@@ -45,7 +48,14 @@ where
     F: Fn(String, String) -> Fut,
     Fut: Future<Output = Option<Vec<TextEdit>>>,
 {
-    let mut accumulated = initial_text.clone();
+    // Start from the moved-in `initial_text` and only ever allocate a new
+    // string when a step actually changes the text. `changed` tracks whether
+    // any step produced a real edit, so we avoid both the up-front clone of
+    // `initial_text` and the final whole-string `accumulated == initial_text`
+    // comparison (which would re-scan potentially large region text on every
+    // call). When nothing changed we return `None` so the caller emits no edit.
+    let mut accumulated = initial_text;
+    let mut changed = false;
 
     for server_name in server_names {
         match format_step(server_name.clone(), accumulated.clone()).await {
@@ -58,15 +68,12 @@ where
                     continue;
                 }
                 accumulated = apply_text_edits(&accumulated, &edits);
+                changed = true;
             }
         }
     }
 
-    if accumulated == initial_text {
-        None
-    } else {
-        Some(accumulated)
-    }
+    if changed { Some(accumulated) } else { None }
 }
 
 #[cfg(test)]
@@ -175,6 +182,25 @@ mod tests {
         .await;
 
         assert_eq!(result, None, "unchanged text must contribute no edit");
+    }
+
+    #[tokio::test]
+    async fn returns_some_when_a_step_applies_a_real_edit() {
+        // A non-empty edit list means the step changed the text. Even if the
+        // edit happens to reproduce the original bytes, the pipeline reports a
+        // change: emptiness — not byte-equality — is the "no-op" signal, and
+        // skipping the whole-string comparison is the point of the `changed`
+        // flag. The previous byte-equality check would have returned `None`
+        // here; this test pins the new contract.
+        let servers = vec!["echo".to_string()];
+        let result = run_sequential_format_pipeline("abc".to_string(), &servers, |_name, text| {
+            // Replace the whole text with identical content via a real edit.
+            let value = Some(vec![replace_all(&text)]);
+            async move { value }
+        })
+        .await;
+
+        assert_eq!(result, Some("abc".to_string()));
     }
 
     #[tokio::test]
