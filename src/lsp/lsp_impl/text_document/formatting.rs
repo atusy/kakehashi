@@ -254,6 +254,11 @@ async fn dispatch_concatenated_formatting(
         region_ctx.resolved.line_column_offsets.clone(),
     );
     let original_virtual = region_ctx.resolved.virtual_content.clone();
+    // Precompute the host replacement range now, while we still hold
+    // `original_virtual`, so it can be moved into the pipeline below without a
+    // second clone. An unresolvable end position means we emit no edit (bounded
+    // -range safety) — so bail before doing any downstream work.
+    let replacement_range = region_replacement_range(&original_virtual, &offset)?;
     let injection_language = region_ctx.resolved.injection_language.clone();
     let region_id = region_ctx.resolved.region.region_id.clone();
     let uri = region_ctx.uri.clone();
@@ -304,7 +309,7 @@ async fn dispatch_concatenated_formatting(
     // the per-step closure below.
     let host_uri_for_sweep = uri.clone();
 
-    let pipeline_fut = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
+    let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
         let pool = Arc::clone(&pool);
         let open_scratch = Arc::clone(&open_scratch);
         move |server_name, current_text| {
@@ -361,8 +366,8 @@ async fn dispatch_concatenated_formatting(
                 // EOF-clamped and host-translated by a zero offset — i.e. still
                 // in virtual coordinates relative to `current_text` — so applying
                 // them to the virtual accumulated text is correct. The single
-                // real region-offset translation happens once at the final
-                // collapse in `build_region_replacement_edit`.
+                // real region-offset translation happens once in the precomputed
+                // `region_replacement_range`.
                 // (`apply_text_edits` does its own clamping as a general safety
                 // net, independent of this transform.)
                 let send_result = pool
@@ -447,7 +452,10 @@ async fn dispatch_concatenated_formatting(
     }
 
     let final_text = final_text?;
-    build_region_replacement_edit(&original_virtual, final_text, &offset).map(|edit| vec![edit])
+    Some(vec![TextEdit {
+        range: replacement_range,
+        new_text: final_text,
+    }])
 }
 
 /// A scratch virtual document opened during a concatenated-formatting run that
@@ -523,24 +531,25 @@ async fn close_remaining_scratch_docs(
 /// always performs a fresh `didOpen` carrying the current accumulated text.
 ///
 /// The id keeps the canonical `region_id` as a prefix (so it stays unique per
-/// region — no host-file collision) and appends a `-scratch-{step}` suffix so it
-/// is unique per pipeline step. It still flows through
-/// [`VirtualDocumentUri::new`], which wraps it in the distinctive
-/// `kakehashi-virtual-uri-` filename marker (Decision point 7) and preserves the
+/// region — no host-file collision) and appends a `-kakehashi-scratch-{step}`
+/// suffix: unique per pipeline step, and carrying the standardized
+/// `kakehashi-scratch` marker (Decision point 7) so external tools (file
+/// watchers, build tools, test runners) can recognize and ignore these throwaway
+/// documents. It still flows through [`VirtualDocumentUri::new`], which also
+/// wraps it in the `kakehashi-virtual-uri-` filename marker and preserves the
 /// host directory and language extension required for downstream config and
 /// parser discovery.
 fn scratch_region_id(region_id: &str, step: usize) -> String {
-    format!("{region_id}-scratch-{step}")
+    format!("{region_id}-kakehashi-scratch-{step}")
 }
 
-/// Build a single host-coordinate `TextEdit` that replaces the entire injection
-/// region with `final_text`.
+/// Compute the host-coordinate `Range` that the concatenated pipeline's single
+/// whole-region replacement edit spans.
 ///
-/// The replacement range spans the whole *original* virtual document (`(0,0)`
-/// through the end of `original_virtual`), translated to host coordinates via
-/// the region [`RegionOffset`]. Emitting one whole-region edit keeps the LSP
-/// output trivially non-overlapping (concatenated-formatting-pipeline Decision
-/// point 4).
+/// The range covers the whole *original* virtual document (`(0,0)` through the
+/// end of `original_virtual`), translated to host coordinates via the region
+/// [`RegionOffset`]. Emitting one whole-region edit keeps the LSP output
+/// trivially non-overlapping (concatenated-formatting-pipeline Decision point 4).
 ///
 /// Returns `None` when the virtual end position cannot be resolved, rather than
 /// fabricating an unbounded range. `byte_to_position` should always succeed for
@@ -556,14 +565,12 @@ fn scratch_region_id(region_id: &str, step: usize) -> String {
 /// verbatim and relies on the existing range translation only, so multi-line /
 /// blockquoted regions still drop host indentation on replacement lines — the
 /// same limitation documented in `src/lsp/bridge/text_document/formatting.rs`.
-fn build_region_replacement_edit(
-    original_virtual: &str,
-    final_text: String,
-    offset: &RegionOffset,
-) -> Option<TextEdit> {
+fn region_replacement_range(original_virtual: &str, offset: &RegionOffset) -> Option<Range> {
     // Virtual end position = the position of the very last byte, derived via the
     // shared PositionMapper so line-ending handling (incl. `\r\n`) and UTF-16
-    // column math stay consistent with the rest of the codebase.
+    // column math stay consistent with the rest of the codebase. Computed from
+    // the original virtual text *before* it is moved into the pipeline, so the
+    // pipeline takes ownership without a second clone.
     let end = crate::text::PositionMapper::new(original_virtual)
         .byte_to_position(original_virtual.len())?;
 
@@ -575,11 +582,7 @@ fn build_region_replacement_edit(
         end,
     };
     translate_virtual_range_to_host(&mut range, offset);
-
-    Some(TextEdit {
-        range,
-        new_text: final_text,
-    })
+    Some(range)
 }
 
 /// Sort `edits` in place by `range.start` (line, then character).
@@ -895,33 +898,31 @@ mod tests {
     }
 
     // ==========================================================================
-    // build_region_replacement_edit (review: unbounded-range fallback)
+    // region_replacement_range (review: unbounded-range fallback)
     // ==========================================================================
 
     #[test]
-    fn build_region_replacement_edit_resolves_end_for_valid_text() {
+    fn region_replacement_range_resolves_end_for_valid_text() {
         // For any valid UTF-8 region the end position is resolvable, so we get a
-        // bounded replacement edit — never the old u32::MAX/u32::MAX fallback.
+        // bounded replacement range — never the old u32::MAX/u32::MAX fallback.
         let offset = RegionOffset::new(0, 0);
-        let edit = build_region_replacement_edit("line1\nline2", "formatted".to_string(), &offset)
+        let range = region_replacement_range("line1\nline2", &offset)
             .expect("end position must resolve for valid text");
-        assert_eq!(edit.new_text, "formatted");
         // End is the position just past the last byte: line 1, char 5 ("line2").
-        assert_eq!(edit.range.end.line, 1);
-        assert_eq!(edit.range.end.character, 5);
+        assert_eq!(range.end.line, 1);
+        assert_eq!(range.end.character, 5);
         // Crucially, the range is bounded (no fabricated u32::MAX).
-        assert_ne!(edit.range.end.line, u32::MAX);
-        assert_ne!(edit.range.end.character, u32::MAX);
+        assert_ne!(range.end.line, u32::MAX);
+        assert_ne!(range.end.character, u32::MAX);
     }
 
     #[test]
-    fn build_region_replacement_edit_handles_empty_region() {
-        // Empty region → end at (0,0), still a bounded Some(edit).
+    fn region_replacement_range_handles_empty_region() {
+        // Empty region → end at (0,0), still a bounded Some(range).
         let offset = RegionOffset::new(0, 0);
-        let edit = build_region_replacement_edit("", "new".to_string(), &offset)
-            .expect("empty region must still resolve to a bounded edit");
-        assert_eq!(edit.range.end.line, 0);
-        assert_eq!(edit.range.end.character, 0);
+        let range = region_replacement_range("", &offset).expect("empty region must still resolve");
+        assert_eq!(range.end.line, 0);
+        assert_eq!(range.end.character, 0);
     }
 
     #[test]
