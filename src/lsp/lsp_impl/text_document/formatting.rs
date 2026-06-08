@@ -229,6 +229,12 @@ async fn dispatch_preferred_formatting(
 /// region text. The scratch document is `didClose`d after the step
 /// (concatenated-formatting-pipeline Decision point 7).
 ///
+/// Cleanup is guaranteed even on cancel: every opened-but-not-yet-closed scratch
+/// document is tracked, and a sweep after the cancel-aware `select!` closes any
+/// the per-step path did not. Without this, a `$/cancelRequest` that drops the
+/// in-flight step future before its own `close_scratch_document` ran would leak
+/// that scratch virtual document downstream (review HIGH).
+///
 /// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
 ///   - capability-based full -> rangeFormatting fallback for range-only servers,
 ///     distinguishing "no capability" from a `null` "already formatted";
@@ -282,8 +288,23 @@ async fn dispatch_concatenated_formatting(
     // scratch id is passed to `send_formatting_request` directly.
     let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&uri).ok();
 
+    // Track every scratch document opened during this run that has NOT yet been
+    // closed, so we can guarantee cleanup even when a `tokio::select!` cancel
+    // drops the in-flight step future BEFORE its own `close_scratch_document`
+    // runs. Two reviewers flagged that drop-on-cancel as a scratch-document
+    // leak. The happy per-step path still closes immediately and removes its
+    // entry here, so the post-`select!` sweep only closes whatever a cancel
+    // left behind — no double-close.
+    let open_scratch: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Retained for the post-`select!` cleanup sweep, since `uri` is moved into
+    // the per-step closure below.
+    let host_uri_for_sweep = uri.clone();
+
     let pipeline_fut = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
         let pool = Arc::clone(&pool);
+        let open_scratch = Arc::clone(&open_scratch);
         move |server_name, current_text| {
             let pool = Arc::clone(&pool);
             let options = options.clone();
@@ -294,10 +315,30 @@ async fn dispatch_concatenated_formatting(
             let server_config = server_config_for(&server_name);
             let step_counter = Arc::clone(&step_counter);
             let host_uri_lsp = host_uri_lsp.clone();
+            let open_scratch = Arc::clone(&open_scratch);
             async move {
                 let server_config = server_config?;
                 let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let scratch_id = scratch_region_id(&region_id, step);
+
+                // Build the scratch URI up front and register it as "open" in the
+                // shared tracker BEFORE the request, so that if this future is
+                // dropped mid-send by a cancel, the post-`select!` sweep still
+                // closes it. Skipped only when the host URL could not be
+                // converted (then no didClose is possible anyway).
+                let scratch_uri = host_uri_lsp
+                    .as_ref()
+                    .map(|h| VirtualDocumentUri::new(h, &injection_language, &scratch_id));
+                if let Some(scratch_uri) = scratch_uri.as_ref() {
+                    push_open_scratch(
+                        &open_scratch,
+                        OpenScratchDoc {
+                            uri: scratch_uri.clone(),
+                            server_name: server_name.clone(),
+                        },
+                    );
+                }
+
                 // The bridge translates the returned edits back to host
                 // coordinates, but the pipeline applies them to the *virtual*
                 // accumulated text, so request a fresh virtual-coordinate
@@ -320,15 +361,15 @@ async fn dispatch_concatenated_formatting(
                     .ok()
                     .flatten();
 
-                // Close the scratch document promptly so it does not orphan
-                // tracking state or leak downstream diagnostics for the
-                // throwaway URI (concatenated-formatting-pipeline Decision
-                // point 7). Best-effort: a close failure must not abort the
-                // pipeline step.
-                if let Some(host_uri_lsp) = host_uri_lsp.as_ref() {
-                    let scratch_uri =
-                        VirtualDocumentUri::new(host_uri_lsp, &injection_language, &scratch_id);
-                    pool.close_scratch_document(&scratch_uri, &server_name)
+                // Close the scratch document promptly on the happy path so it
+                // does not orphan tracking state or leak downstream diagnostics
+                // for the throwaway URI (concatenated-formatting-pipeline
+                // Decision point 7). Remove it from the tracker first so the
+                // post-`select!` sweep never closes it a second time.
+                if let Some(scratch_uri) = scratch_uri.as_ref()
+                    && remove_open_scratch(&open_scratch, scratch_uri)
+                {
+                    pool.close_scratch_document(&uri, scratch_uri, &server_name)
                         .await;
                 }
 
@@ -341,21 +382,100 @@ async fn dispatch_concatenated_formatting(
     // $/cancelRequest aborts the region promptly rather than only between steps.
     // (Per-step $/cancelRequest propagation to the downstream server is a
     // follow-up — TODO(concatenated-formatting-pipeline).)
+    let cancelled;
     let final_text = match cancel_rx {
         Some(mut rx) => {
             tokio::select! {
-                res = pipeline_fut => res?,
-                _ = &mut rx => return None,
+                res = pipeline_fut => { cancelled = false; res }
+                _ = &mut rx => { cancelled = true; None }
             }
         }
-        None => pipeline_fut.await?,
+        None => {
+            cancelled = false;
+            pipeline_fut.await
+        }
     };
 
-    Some(vec![build_region_replacement_edit(
-        &original_virtual,
-        final_text,
-        &offset,
-    )])
+    // ALWAYS sweep up any scratch documents the run left open — on both the
+    // completed and cancelled paths. On the happy path this is normally empty
+    // (each step removed its own entry before closing); on cancel it closes the
+    // in-flight step's scratch document that was dropped before its own close.
+    close_remaining_scratch_docs(&pool, &host_uri_for_sweep, &open_scratch).await;
+
+    // On cancel, contribute no edit (matches the prior early-return behavior).
+    if cancelled {
+        return None;
+    }
+
+    let final_text = final_text?;
+    build_region_replacement_edit(&original_virtual, final_text, &offset).map(|edit| vec![edit])
+}
+
+/// A scratch virtual document opened during a concatenated-formatting run that
+/// has not yet been closed. Paired with its `server_name` so the `didClose`
+/// targets the connection the matching `didOpen` was sent on.
+struct OpenScratchDoc {
+    uri: VirtualDocumentUri,
+    server_name: String,
+}
+
+/// Record a scratch document as open. Poison-safe: a poisoned mutex is recovered
+/// (the tracked data is plain values, not invariants), logged per the project
+/// lock-recovery convention.
+fn push_open_scratch(open: &std::sync::Mutex<Vec<OpenScratchDoc>>, doc: OpenScratchDoc) {
+    lock_open_scratch(open).push(doc);
+}
+
+/// Remove a scratch document from the open set by URI, returning `true` if it
+/// was present (i.e. this caller now owns closing it). Prevents the happy-path
+/// per-step close and the post-`select!` sweep from both closing the same doc.
+fn remove_open_scratch(
+    open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
+    uri: &VirtualDocumentUri,
+) -> bool {
+    let mut guard = lock_open_scratch(open);
+    if let Some(pos) = guard.iter().position(|d| &d.uri == uri) {
+        guard.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Drain and return all still-open scratch documents.
+fn drain_open_scratch(open: &std::sync::Mutex<Vec<OpenScratchDoc>>) -> Vec<OpenScratchDoc> {
+    std::mem::take(&mut *lock_open_scratch(open))
+}
+
+/// Lock the open-scratch tracker, recovering from poisoning per the project
+/// convention (no `unwrap()` on locks).
+fn lock_open_scratch(
+    open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
+) -> std::sync::MutexGuard<'_, Vec<OpenScratchDoc>> {
+    match open.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!(
+                target: "kakehashi::lock_recovery",
+                "Recovered from poisoned scratch-document tracker lock"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Close every scratch document still tracked as open. Used on both the
+/// completed and cancelled paths so a cancel that drops an in-flight step never
+/// leaves its scratch virtual document open downstream.
+async fn close_remaining_scratch_docs(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    host_uri: &url::Url,
+    open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
+) {
+    for doc in drain_open_scratch(open) {
+        pool.close_scratch_document(host_uri, &doc.uri, &doc.server_name)
+            .await;
+    }
 }
 
 /// Derive a unique scratch `region_id` for one step of the concatenated
@@ -392,6 +512,13 @@ fn scratch_region_id(region_id: &str, step: usize) -> String {
 /// output trivially non-overlapping (concatenated-formatting-pipeline Decision
 /// point 4).
 ///
+/// Returns `None` when the virtual end position cannot be resolved, rather than
+/// fabricating an unbounded range. `byte_to_position` should always succeed for
+/// the document's own length, but if it ever returns `None` (a mapper bug or
+/// corrupt content), emitting a `u32::MAX`/`u32::MAX` range would translate into
+/// a host edit spanning essentially the whole file — silently corrupting it. We
+/// emit no edit for that region instead, which is the safe degradation.
+///
 /// TODO(concatenated-formatting-pipeline): Decision point 4 also requires
 /// re-applying the region's per-line host prefix/indentation to every line of
 /// `final_text` (and the region LCP for new lines on a line-count change), plus
@@ -403,16 +530,12 @@ fn build_region_replacement_edit(
     original_virtual: &str,
     final_text: String,
     offset: &RegionOffset,
-) -> TextEdit {
+) -> Option<TextEdit> {
     // Virtual end position = the position of the very last byte, derived via the
     // shared PositionMapper so line-ending handling (incl. `\r\n`) and UTF-16
     // column math stay consistent with the rest of the codebase.
     let end = crate::text::PositionMapper::new(original_virtual)
-        .byte_to_position(original_virtual.len())
-        .unwrap_or(Position {
-            line: u32::MAX,
-            character: u32::MAX,
-        });
+        .byte_to_position(original_virtual.len())?;
 
     let mut range = Range {
         start: Position {
@@ -423,10 +546,10 @@ fn build_region_replacement_edit(
     };
     translate_virtual_range_to_host(&mut range, offset);
 
-    TextEdit {
+    Some(TextEdit {
         range,
         new_text: final_text,
-    }
+    })
 }
 
 /// Sort `edits` in place by `range.start` (line, then character).
@@ -645,6 +768,130 @@ mod tests {
             VirtualDocumentUri::is_virtual_uri(&uri_string),
             "scratch URI must be recognized as virtual: {uri_string}"
         );
+    }
+
+    // ==========================================================================
+    // Scratch-document tracking/cleanup (review HIGH: leak-on-cancel)
+    // ==========================================================================
+
+    fn scratch_doc(host: &str, id: &str, server: &str) -> OpenScratchDoc {
+        let host_uri: tower_lsp_server::ls_types::Uri = host.parse().unwrap();
+        OpenScratchDoc {
+            uri: VirtualDocumentUri::new(&host_uri, "python", id),
+            server_name: server.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_scratch_tracker_drains_what_was_pushed() {
+        // The cancel-path sweep relies on draining everything that was recorded
+        // open but never removed by a per-step close.
+        let open = std::sync::Mutex::new(Vec::new());
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
+
+        let drained = drain_open_scratch(&open);
+        assert_eq!(drained.len(), 2, "both opened scratch docs must be drained");
+        assert!(
+            drain_open_scratch(&open).is_empty(),
+            "drain must leave the tracker empty (no double-close)"
+        );
+    }
+
+    #[test]
+    fn open_scratch_remove_prevents_double_close() {
+        // Happy path: a step removes its own scratch doc before closing it, so
+        // the post-select sweep must NOT see it again.
+        let open = std::sync::Mutex::new(Vec::new());
+        let doc = scratch_doc("file:///d.md", "R-scratch-0", "black");
+        let uri = doc.uri.clone();
+        push_open_scratch(&open, doc);
+
+        assert!(
+            remove_open_scratch(&open, &uri),
+            "first remove owns the close and returns true"
+        );
+        assert!(
+            !remove_open_scratch(&open, &uri),
+            "second remove must return false (already owned) to avoid double-close"
+        );
+        assert!(
+            drain_open_scratch(&open).is_empty(),
+            "removed doc must not be swept again"
+        );
+    }
+
+    #[test]
+    fn open_scratch_remove_keeps_other_entries() {
+        // Removing one in-flight step's scratch doc must not disturb others
+        // still tracked open (e.g. a concurrent step in a different run shape).
+        let open = std::sync::Mutex::new(Vec::new());
+        let keep = scratch_doc("file:///d.md", "R-scratch-0", "black");
+        let keep_uri = keep.uri.clone();
+        let remove = scratch_doc("file:///d.md", "R-scratch-1", "isort");
+        let remove_uri = remove.uri.clone();
+        push_open_scratch(&open, keep);
+        push_open_scratch(&open, remove);
+
+        assert!(remove_open_scratch(&open, &remove_uri));
+
+        let remaining = drain_open_scratch(&open);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].uri, keep_uri, "the other doc must survive");
+    }
+
+    #[test]
+    fn lock_open_scratch_recovers_from_poison() {
+        // Per the project convention, lock helpers must recover from poisoning
+        // rather than unwrap()-panic.
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+
+        // Poison the mutex by panicking while holding the guard.
+        let open_clone = Arc::clone(&open);
+        let _ = std::thread::spawn(move || {
+            let _guard = open_clone.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+
+        // Recovery path must still observe the previously-tracked doc.
+        let drained = drain_open_scratch(&open);
+        assert_eq!(
+            drained.len(),
+            1,
+            "poison recovery must preserve tracked scratch docs"
+        );
+    }
+
+    // ==========================================================================
+    // build_region_replacement_edit (review: unbounded-range fallback)
+    // ==========================================================================
+
+    #[test]
+    fn build_region_replacement_edit_resolves_end_for_valid_text() {
+        // For any valid UTF-8 region the end position is resolvable, so we get a
+        // bounded replacement edit — never the old u32::MAX/u32::MAX fallback.
+        let offset = RegionOffset::new(0, 0);
+        let edit = build_region_replacement_edit("line1\nline2", "formatted".to_string(), &offset)
+            .expect("end position must resolve for valid text");
+        assert_eq!(edit.new_text, "formatted");
+        // End is the position just past the last byte: line 1, char 5 ("line2").
+        assert_eq!(edit.range.end.line, 1);
+        assert_eq!(edit.range.end.character, 5);
+        // Crucially, the range is bounded (no fabricated u32::MAX).
+        assert_ne!(edit.range.end.line, u32::MAX);
+        assert_ne!(edit.range.end.character, u32::MAX);
+    }
+
+    #[test]
+    fn build_region_replacement_edit_handles_empty_region() {
+        // Empty region → end at (0,0), still a bounded Some(edit).
+        let offset = RegionOffset::new(0, 0);
+        let edit = build_region_replacement_edit("", "new".to_string(), &offset)
+            .expect("empty region must still resolve to a bounded edit");
+        assert_eq!(edit.range.end.line, 0);
+        assert_eq!(edit.range.end.character, 0);
     }
 
     #[test]

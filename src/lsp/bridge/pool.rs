@@ -364,6 +364,23 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Remove a virtual document's `host_to_virtual` registration.
+    ///
+    /// `untrack_document` clears `document_versions`, `opened_documents`, and
+    /// the reverse index but deliberately leaves `host_to_virtual` for the
+    /// host-close flow. Scratch documents (concatenated formatting pipeline) are
+    /// addressed directly and never go through that flow, so they must remove
+    /// their own `host_to_virtual` entry here to avoid lingering / double-close.
+    pub(crate) async fn unregister_virtual_doc(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+    ) {
+        self.document_tracker
+            .unregister_virtual_doc(host_uri, virtual_uri)
+            .await
+    }
+
     /// Whether a document has been claimed or opened on a downstream server (ls-bridge-message-ordering).
     ///
     /// Fast synchronous check used to gate operations on documents not yet known

@@ -66,21 +66,29 @@ impl LanguageServerPool {
     }
 
     /// Close a single scratch virtual document by URI: send didClose and remove
-    /// it from tracking.
+    /// it from ALL tracking state.
     ///
     /// Used by the concatenated formatting pipeline, which opens a throwaway
     /// scratch virtual document per step (a unique URI carrying the accumulated
     /// text) and must close it immediately afterward so it never orphans
     /// tracking state, accumulates downstream documents, or leaks diagnostics
     /// for the throwaway URI (concatenated-formatting-pipeline Decision point 7).
-    /// Unlike [`close_host_document`](Self::close_host_document) /
-    /// [`close_invalidated_docs`](Self::close_invalidated_docs), the scratch URI
-    /// is not registered under any host document, so it is addressed directly
-    /// rather than looked up via `host_to_virtual`. Best-effort: a didClose
-    /// failure is logged inside [`send_didclose_notification`] callers but never
-    /// surfaced, since the pipeline must not fail on cleanup.
+    ///
+    /// The scratch URI is addressed directly (by URI + host) rather than looked
+    /// up via the `host_to_virtual` ULID scan that
+    /// [`close_invalidated_docs`](Self::close_invalidated_docs) uses. But it IS
+    /// registered under its host document: `ensure_document_opened` calls
+    /// `register_opened_document`, which inserts the scratch URI into
+    /// `host_to_virtual` (alongside `document_versions`, `opened_documents`, and
+    /// the reverse index). `untrack_document` alone does NOT remove the
+    /// `host_to_virtual` entry, so we must also call `unregister_virtual_doc` —
+    /// otherwise the scratch URI lingers in `host_to_virtual` until the host doc
+    /// closes and gets a redundant second didClose then. Best-effort: a didClose
+    /// failure is logged but never surfaced, since the pipeline must not fail on
+    /// cleanup.
     pub(crate) async fn close_scratch_document(
         &self,
+        host_uri: &Url,
         scratch_uri: &VirtualDocumentUri,
         server_name: &str,
     ) {
@@ -95,6 +103,9 @@ impl LanguageServerPool {
             );
         }
         self.untrack_document(scratch_uri, server_name).await;
+        // Remove the host_to_virtual registration that ensure_document_opened
+        // added; untrack_document does not touch it.
+        self.unregister_virtual_doc(host_uri, scratch_uri).await;
     }
 
     /// Close a single virtual document: send didClose and remove from tracking.
@@ -194,11 +205,50 @@ mod tests {
 
         // No connection exists for "black", so the didClose send is a no-op,
         // but the untrack must still happen so the scratch doc never lingers.
-        pool.close_scratch_document(&scratch_uri, "black").await;
+        pool.close_scratch_document(&host_uri, &scratch_uri, "black")
+            .await;
 
         assert!(
             !pool.is_document_opened(&scratch_uri),
             "scratch doc must be untracked after close_scratch_document"
+        );
+    }
+
+    /// `close_scratch_document` removes the scratch URI from `host_to_virtual`.
+    ///
+    /// `ensure_document_opened` registers every virtual URI (scratch included)
+    /// in `host_to_virtual` via `register_opened_document`. `untrack_document`
+    /// alone does not clear that map, so without the extra `unregister_virtual_doc`
+    /// the scratch URI would linger under its host until the host doc closes —
+    /// where it would receive a redundant second didClose. This guards that the
+    /// scratch lifecycle leaves no `host_to_virtual` residue.
+    #[tokio::test]
+    async fn close_scratch_document_removes_host_to_virtual_registration() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let scratch_uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
+
+        // Same path ensure_document_opened takes: register under the host.
+        pool.register_opened_document(&host_uri, &scratch_uri, "black")
+            .await;
+        assert_eq!(
+            pool.get_all_servers_for_virtual_uri(&scratch_uri),
+            vec!["black".to_string()],
+            "scratch doc should be reachable via host_to_virtual after register"
+        );
+
+        pool.close_scratch_document(&host_uri, &scratch_uri, "black")
+            .await;
+
+        // After close, the host_to_virtual registration is gone: closing the
+        // host document must NOT surface the scratch doc again (no double-close).
+        let remaining = pool.close_host_document(&host_uri).await;
+        assert!(
+            remaining
+                .iter()
+                .all(|d| d.virtual_uri.to_uri_string() != scratch_uri.to_uri_string()),
+            "scratch doc must not linger in host_to_virtual after close_scratch_document"
         );
     }
 
