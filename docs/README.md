@@ -38,6 +38,12 @@ The server does not currently advertise `textDocument/codeAction`.
 
 See [Bridge Configuration](#bridge-configuration) for setup instructions.
 
+### Syntax-Aware Methods (`kakehashi/*`)
+
+Custom LSP methods that expose kakehashi's syntax tree to clients — resolve a node at a position, navigate parent/children, and read edit-stable node text — so editors and plugins can build structural selection, AST-aware refactoring, and long-lived node references without bundling Tree-sitter.
+
+See [Language Feature Methods](language-features.md) for the method reference.
+
 ## Prerequisites
 
 kakehashi automatically compiles Tree-sitter parsers from source, which requires these external tools:
