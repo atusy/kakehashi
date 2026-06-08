@@ -1019,12 +1019,16 @@ local x = 42
         );
 
         // Look for the "local" keyword token (should be at line 3, col 0)
+        let (keyword_type, keyword_mods) =
+            crate::analysis::semantic::legend::map_capture_to_token_type_and_modifiers("keyword")
+                .unwrap();
         let has_local_keyword = tokens.iter().any(|t| {
             t.line == 3
                 && t.column == 0
                 && t.kind
                     == crate::analysis::semantic::token_collector::TokenKind::Mapped(
-                        "keyword".to_string(),
+                        keyword_type,
+                        keyword_mods,
                     )
         });
 
