@@ -37,7 +37,7 @@ impl Kakehashi {
         // Apply content changes and build tree-sitter edits
         let (text, edits) = apply_content_changes_with_edits(&old_text, params.content_changes);
 
-        // lazy-node-identity-tracking: Apply START-priority invalidation to region ID tracker.
+        // lazy-node-identity-tracking: Apply START-priority invalidation to node tracker.
         // Use InputEdits directly for precise invalidation when available,
         // fall back to diff-based approach for full document sync.
         //

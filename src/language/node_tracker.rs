@@ -146,7 +146,7 @@ impl PositionKey {
     }
 }
 
-/// Edit position information for region ID tracking.
+/// Edit position information for node tracking.
 ///
 /// Represents byte positions of a text edit. Used to decouple
 /// NodeTracker from tree_sitter::InputEdit.
