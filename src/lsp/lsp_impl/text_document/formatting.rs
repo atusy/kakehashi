@@ -142,7 +142,13 @@ impl Kakehashi {
 
             outer_join_set.spawn(async move {
                 if use_concatenated {
-                    dispatch_concatenated_formatting(&region_ctx, pool.clone(), options).await
+                    dispatch_concatenated_formatting(
+                        &region_ctx,
+                        pool.clone(),
+                        options,
+                        region_cancel_rx,
+                    )
+                    .await
                 } else {
                     dispatch_preferred_formatting(
                         &region_ctx,
@@ -225,6 +231,7 @@ async fn dispatch_concatenated_formatting(
     region_ctx: &DocumentRequestContext,
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
     options: tower_lsp_server::ls_types::FormattingOptions,
+    cancel_rx: Option<CancelReceiver>,
 ) -> Option<Vec<TextEdit>> {
     let offset = RegionOffset::with_per_line_offsets(
         region_ctx.resolved.region.line_range.start,
@@ -258,7 +265,7 @@ async fn dispatch_concatenated_formatting(
             .map(|c| Arc::clone(&c.config))
     };
 
-    let final_text = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
+    let pipeline_fut = run_sequential_format_pipeline(original_virtual.clone(), &server_names, {
         let pool = Arc::clone(&pool);
         move |server_name, current_text| {
             let pool = Arc::clone(&pool);
@@ -292,8 +299,21 @@ async fn dispatch_concatenated_formatting(
                 .flatten()
             }
         }
-    })
-    .await?;
+    });
+
+    // Poll cancellation concurrently with the in-flight pipeline so an upstream
+    // $/cancelRequest aborts the region promptly rather than only between steps.
+    // (Per-step $/cancelRequest propagation to the downstream server is a
+    // follow-up — TODO(concatenated-formatting-pipeline).)
+    let final_text = match cancel_rx {
+        Some(mut rx) => {
+            tokio::select! {
+                res = pipeline_fut => res?,
+                _ = &mut rx => return None,
+            }
+        }
+        None => pipeline_fut.await?,
+    };
 
     Some(vec![build_region_replacement_edit(
         &original_virtual,
@@ -323,21 +343,22 @@ fn build_region_replacement_edit(
     final_text: String,
     offset: &RegionOffset,
 ) -> TextEdit {
-    // Virtual end position = last line index + its length, in the LSP line
-    // model (a trailing newline adds a final empty line).
-    let last_line = original_virtual.split('\n').next_back().unwrap_or("");
-    let end_line = u32::try_from(original_virtual.matches('\n').count()).unwrap_or(u32::MAX);
-    let end_char = u32::try_from(last_line.encode_utf16().count()).unwrap_or(u32::MAX);
+    // Virtual end position = the position of the very last byte, derived via the
+    // shared PositionMapper so line-ending handling (incl. `\r\n`) and UTF-16
+    // column math stay consistent with the rest of the codebase.
+    let end = crate::text::PositionMapper::new(original_virtual)
+        .byte_to_position(original_virtual.len())
+        .unwrap_or(Position {
+            line: u32::MAX,
+            character: u32::MAX,
+        });
 
     let mut range = Range {
         start: Position {
             line: 0,
             character: 0,
         },
-        end: Position {
-            line: end_line,
-            character: end_char,
-        },
+        end,
     };
     translate_virtual_range_to_host(&mut range, offset);
 
