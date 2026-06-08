@@ -20,7 +20,7 @@ use super::position::PositionMapper;
 /// (`start` after `end`) is normalized, byte offsets are floored to UTF-8 char
 /// boundaries, and an edit overlapping one already applied is dropped (LSP
 /// forbids overlap, but a buggy server must never make us panic or corrupt) —
-/// the earlier, higher-priority edit wins.
+/// resolved purely by sort order, so the lower-start edit wins.
 pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     if edits.is_empty() {
         return text.to_string();

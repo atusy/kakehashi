@@ -282,11 +282,12 @@ async fn dispatch_concatenated_formatting(
     // scratch id unique; the scratch document is `didClose`d after the step so
     // it never orphans tracking state or leaks diagnostics.
     let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // Convert the host URL to the bridge protocol's `Uri` once. On the
-    // unreachable conversion failure the per-step didClose is skipped (the
-    // scratch document is still cleaned up when the host document closes), but
-    // the unique-URI didOpen — the correctness core — still happens because the
-    // scratch id is passed to `send_formatting_request` directly.
+    // Convert the host URL to the bridge protocol's `Uri` once, for the per-step
+    // didClose. This conversion is effectively infallible for a valid host URL;
+    // if it ever failed, `send_formatting_request` (which performs the same
+    // conversion internally) would also fail, so the step would simply contribute
+    // no edit — there is no path where a step opens a scratch doc we then can't
+    // close. The scratch doc is also swept on the host document's own close.
     let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&uri).ok();
 
     // Track every scratch document opened during this run that has NOT yet been
