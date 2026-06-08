@@ -92,6 +92,13 @@ impl LanguageServerPool {
         scratch_uri: &VirtualDocumentUri,
         server_name: &str,
     ) {
+        // Idempotent close: if the scratch document is no longer open, a
+        // concurrent cleanup (e.g. `close_host_document`) already closed and
+        // untracked it, so another `didClose` would be a redundant notification
+        // the downstream server may warn about. Nothing left to do.
+        if !self.is_document_opened(scratch_uri) {
+            return;
+        }
         if let Err(e) = self
             .send_didclose_notification(scratch_uri, server_name)
             .await
@@ -211,6 +218,16 @@ mod tests {
         assert!(
             !pool.is_document_opened(&scratch_uri),
             "scratch doc must be untracked after close_scratch_document"
+        );
+
+        // Idempotent: a second close (the scratch doc is already gone, e.g. a
+        // concurrent close_host_document beat the per-step/sweep cleanup) is a
+        // safe no-op rather than a redundant didClose.
+        pool.close_scratch_document(&host_uri, &scratch_uri, "black")
+            .await;
+        assert!(
+            !pool.is_document_opened(&scratch_uri),
+            "second close must remain a no-op"
         );
     }
 
