@@ -336,7 +336,7 @@ Split the entry point into anonymous-inclusive and named-only methods instead of
 - Handlers live under `src/lsp/lsp_impl/kakehashi/node/` (one file per method) for symmetry with `kakehashi/internal/`
 - The entry point resolves `namedOnly` by switching `descendant_for_byte_range` → `named_descendant_for_byte_range` at the selected layer's tree; the end-of-document exception walks the right spine to the deepest node ending at `L`, restricted to named nodes when `namedOnly` is set
 - `namedChildren` reuses the `children` handler's tracker-minting path over `Node::named_children` instead of `Node::children`
-- `RegionIdTracker` is renamed to `NodeTracker` and extended with a reverse index (`Ulid → PositionKey`); see lazy-node-identity-tracking
+- `NodeTracker` (`src/language/node_tracker.rs`) backs all four id-based methods via a per-URI bidirectional index — forward (`PositionKey → Ulid`) for minting/dedup, reverse (`Ulid → PositionKey`) for resolving a held ULID back to a node range; see lazy-node-identity-tracking
 - Injection layer enumeration reuses the existing injection processing in `src/lsp/lsp_impl/coordinator/injection.rs`
 
 ## Summary
