@@ -228,7 +228,9 @@ async fn dispatch_preferred_formatting(
 /// ([`scratch_region_id`]), so the bridge always sends a fresh `didOpen`
 /// carrying the current accumulated text — fixing the stale-content bug where a
 /// step reused an already-open canonical document and formatted the *original*
-/// region text. The scratch document is `didClose`d after the step
+/// region text. Scratch documents are `didClose`d by the post-`select!` sweep at
+/// the end of the run — and by [`ScratchCleanupGuard`] if the task is aborted
+/// first — rather than per step, so cancellation can never leak one
 /// (concatenated-formatting-pipeline Decision point 7).
 ///
 /// Cleanup is guaranteed even on cancel: every opened-but-not-yet-closed scratch
@@ -285,8 +287,8 @@ async fn dispatch_concatenated_formatting(
     // after a prior hover/diagnostic), because `send_formatting_request` only
     // pushes content on the first `didOpen` (concatenated-formatting-pipeline
     // Decision point 7, stale-content bug). The per-step counter makes the
-    // scratch id unique; the scratch document is `didClose`d after the step so
-    // it never orphans tracking state or leaks diagnostics.
+    // scratch id unique; scratch documents are `didClose`d by the end-of-run
+    // sweep (and the abort-time guard), not per step, so a cancel can't leak one.
     let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Per-run sequence so scratch ids don't collide with a concurrent
     // concatenated-formatting request for the same region (which would also start
@@ -533,14 +535,32 @@ impl Drop for ScratchCleanupGuard {
         // Drop can't await, and the parent future is (in the case that matters)
         // being aborted — so finish the didCloses on a DETACHED task that is not a
         // child of the aborted future and therefore runs to completion.
+        //
+        // `tokio::spawn` panics outside a runtime, so spawn via a `Handle` from
+        // `try_current`. In practice this guard always drops inside the request's
+        // task (a runtime is present); the `Err` arm only guards pathological
+        // drops (shutdown / a synchronous context), where we log and rely on the
+        // host document's own close to reap the scratch docs rather than panicking.
+        let count = remaining.len();
         let pool = Arc::clone(&self.pool);
         let host_uri = self.host_uri.clone();
-        tokio::spawn(async move {
+        let cleanup = async move {
             for doc in remaining {
                 pool.close_scratch_document(&host_uri, &doc.uri, &doc.server_name)
                     .await;
             }
-        });
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(cleanup);
+            }
+            Err(_) => {
+                log::warn!(
+                    target: "kakehashi::formatting",
+                    "ScratchCleanupGuard dropped outside a Tokio runtime; {count} scratch document(s) left for host-close cleanup"
+                );
+            }
+        }
     }
 }
 
