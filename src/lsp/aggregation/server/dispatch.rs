@@ -21,7 +21,10 @@ use super::fan_in::{concatenated, preferred};
 use super::fan_out::{FanOutTask, fan_out};
 
 /// Pre-filter `ctx.priorities` to keep only server names present in `ctx.configs`.
-fn effective_priorities(ctx: &DocumentRequestContext) -> Vec<String> {
+///
+/// Shared by the preferred fan-out and the concatenated formatting pipeline so
+/// the "priorities is a membership allowlist + order" rule has a single source.
+pub(crate) fn effective_priorities(ctx: &DocumentRequestContext) -> Vec<String> {
     let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
     ctx.priorities
         .iter()

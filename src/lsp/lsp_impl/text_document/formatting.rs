@@ -38,6 +38,7 @@ use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::aggregation::server::effective_priorities;
 use crate::lsp::aggregation::server::run_sequential_format_pipeline;
 use crate::lsp::bridge::{
     RegionOffset, UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
@@ -252,18 +253,9 @@ async fn dispatch_concatenated_formatting(
     let upstream_id = region_ctx.upstream_request_id.clone();
 
     // `priorities` is both the membership allowlist and the application order;
-    // keep only entries that are actually configured for this region.
-    let configured: std::collections::HashSet<&str> = region_ctx
-        .configs
-        .iter()
-        .map(|c| c.server_name.as_str())
-        .collect();
-    let server_names: Vec<String> = region_ctx
-        .priorities
-        .iter()
-        .filter(|name| configured.contains(name.as_str()))
-        .cloned()
-        .collect();
+    // `effective_priorities` keeps only entries configured for this region —
+    // shared with the preferred fan-out so the rule has one source of truth.
+    let server_names = effective_priorities(region_ctx);
 
     let server_config_for = |name: &str| {
         region_ctx

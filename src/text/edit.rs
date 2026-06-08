@@ -154,6 +154,24 @@ mod tests {
     }
 
     #[test]
+    fn out_of_bounds_position_is_clamped_to_eof() {
+        // A downstream server may return an end past EOF (the canonical
+        // "insert final newline" shape). The position is clamped, not dropped.
+        let text = "abc";
+        let edits = vec![edit(0, 0, u32::MAX, u32::MAX, "X")];
+        assert_eq!(apply_text_edits(text, &edits), "X");
+    }
+
+    #[test]
+    fn inverted_range_is_normalized_not_panicking() {
+        // start after end: normalize to [end, start) rather than panicking.
+        // Here start=(0,3), end=(0,1) over "abcd" → replace "bc" with "Z".
+        let text = "abcd";
+        let edits = vec![edit(0, 3, 0, 1, "Z")];
+        assert_eq!(apply_text_edits(text, &edits), "aZd");
+    }
+
+    #[test]
     fn multibyte_text_is_not_corrupted() {
         // "café" — 'é' is two bytes. Replace "café" (cols 0..4 in UTF-16) with
         // "tea" and confirm no panic / clean result.
