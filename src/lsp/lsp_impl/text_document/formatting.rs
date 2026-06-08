@@ -34,6 +34,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
 
 use crate::config::settings::AggregationStrategy;
+use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
@@ -452,16 +453,7 @@ fn drain_open_scratch(open: &std::sync::Mutex<Vec<OpenScratchDoc>>) -> Vec<OpenS
 fn lock_open_scratch(
     open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
 ) -> std::sync::MutexGuard<'_, Vec<OpenScratchDoc>> {
-    match open.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            log::warn!(
-                target: "kakehashi::lock_recovery",
-                "Recovered from poisoned scratch-document tracker lock"
-            );
-            poisoned.into_inner()
-        }
-    }
+    open.lock().recover_poison("scratch-document tracker")
 }
 
 /// Close every scratch document still tracked as open. Used on both the
