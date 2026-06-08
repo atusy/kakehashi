@@ -188,9 +188,10 @@ mod tests {
     /// document.
     ///
     /// The concatenated formatting pipeline opens a throwaway scratch document
-    /// per step (a unique URI not registered under any host document) and must
-    /// be able to close + untrack it by URI alone — without going through the
-    /// `host_to_virtual` lookup that `close_host_document` uses. This guards the
+    /// per step (a unique URI registered in `host_to_virtual` under its host,
+    /// like any virtual doc) and must be able to close + untrack it by URI alone
+    /// — without going through the `host_to_virtual` ULID scan that
+    /// `close_host_document` uses. This guards the
     /// scratch lifecycle that isolates the pipeline's speculative state
     /// (concatenated-formatting-pipeline Decision point 7).
     #[tokio::test]
