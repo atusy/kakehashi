@@ -7,7 +7,7 @@
 //!
 //! - `actor` - Actor components (ResponseRouter, Reader task) for async I/O (ls-bridge-message-ordering)
 //! - `connection` - AsyncBridgeConnection for process spawning and I/O
-//! - `coordinator` - BridgeCoordinator for unified pool + region ID tracking
+//! - `coordinator` - BridgeCoordinator for unified pool + node tracking
 //! - `protocol` - VirtualDocumentUri, request building, and response transformation
 //! - `pool` - LanguageServerPool for server pool coordination (ls-bridge-server-pool-coordination)
 

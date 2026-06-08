@@ -134,7 +134,7 @@ pub struct Kakehashi {
     settings_manager: std::sync::Arc<SettingsManager>,
     /// Isolated coordinator for parser auto-installation
     auto_install: AutoInstallManager,
-    /// Bridge coordinator for downstream LS pool and region ID tracking
+    /// Bridge coordinator for downstream LS pool and node tracking
     bridge: std::sync::Arc<BridgeCoordinator>,
     /// Manager for synthetic (background) diagnostic push tasks (pull-first-diagnostic-forwarding Phase 2).
     /// Wrapped in Arc for sharing with debounced diagnostics (Phase 3).

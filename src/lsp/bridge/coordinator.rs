@@ -1,4 +1,4 @@
-//! Bridge coordinator unifying the language server pool and region ID tracker
+//! Bridge coordinator unifying the language server pool and node tracker
 //! into a single coherent API.
 
 use std::collections::BTreeMap;
@@ -132,7 +132,7 @@ impl BridgeCoordinator {
     // Accessor methods (leaky but pragmatic)
     // ========================================
 
-    /// Access the underlying region ID tracker.
+    /// Access the underlying node tracker.
     ///
     /// Used by handlers for `InjectionResolver::resolve_at_byte_offset()`.
     pub(crate) fn node_tracker(&self) -> &NodeTracker {
@@ -284,7 +284,7 @@ impl BridgeCoordinator {
     }
 
     // ========================================
-    // Region ID management (delegate to tracker)
+    // Node tracker management (delegate to tracker)
     // ========================================
 
     /// Apply input edits to update region positions using START-priority invalidation.
