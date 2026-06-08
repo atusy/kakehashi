@@ -3,16 +3,19 @@
 //!
 //! `textDocument/formatting` resolves every injection region in the document
 //! and asks the configured downstream language servers to format each one.
-//! Within a region, [`dispatch_preferred`] picks the highest-priority
-//! non-empty response (the `preferred` aggregation strategy). Across regions
-//! the resulting [`TextEdit`] lists are concatenated, since each region edits
-//! a disjoint span of the host document.
+//! Across regions the resulting [`TextEdit`] lists are concatenated, since each
+//! region edits a disjoint span of the host document.
 //!
-//! The `concatenated` aggregation strategy is intentionally not implemented
-//! here: formatters from different servers tend to produce conflicting edits
-//! over the same range, so merging them would violate the LSP "edits must not
-//! overlap" rule. If multiple servers are configured, configure a priority
-//! ordering (or rely on first-win) to pick one.
+//! Within a region, the aggregation strategy decides how multiple servers
+//! combine:
+//! - `preferred` (default) — [`dispatch_preferred_formatting`] picks the
+//!   highest-priority non-empty response.
+//! - `concatenated` (with a non-empty `priorities` allowlist) —
+//!   [`dispatch_concatenated_formatting`] runs the listed servers **serially**
+//!   (each formats the previous server's output) and collapses the result into
+//!   one region-replacement edit. Serial application keeps the output
+//!   overlap-free without merging conflicting edits. See
+//!   concatenated-formatting-pipeline.
 //!
 //! # Shared helpers exposed to `range_formatting`
 //!
