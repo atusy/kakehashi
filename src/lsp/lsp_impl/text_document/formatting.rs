@@ -314,6 +314,17 @@ async fn dispatch_concatenated_formatting(
     // the per-step closure below.
     let host_uri_for_sweep = uri.clone();
 
+    // Safety net for the abort-before-sweep case: if this whole future is aborted
+    // (outer `JoinSet` dropped / tower-lsp task cancelled) before the explicit
+    // sweep below runs, the sweep never executes and the tracked scratch docs
+    // would leak. The guard's Drop drains the tracker and detaches the didCloses
+    // onto a task that outlives the aborted parent. On the normal/select-cancel
+    // paths the sweep drains the tracker first, so the guard's Drop is a no-op
+    // (drain-under-lock ⇒ no double-close). Kept alive across the whole pipeline
+    // + sweep below.
+    let _scratch_guard =
+        ScratchCleanupGuard::new(Arc::clone(&pool), uri.clone(), Arc::clone(&open_scratch));
+
     let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
         let pool = Arc::clone(&pool);
         let open_scratch = Arc::clone(&open_scratch);
@@ -468,6 +479,69 @@ async fn dispatch_concatenated_formatting(
 struct OpenScratchDoc {
     uri: VirtualDocumentUri,
     server_name: String,
+}
+
+/// Drop-based safety net that closes any scratch documents still tracked open
+/// when the concatenated-formatting future is **aborted** (its outer `JoinSet`
+/// dropped or the tower-lsp task cancelled) BEFORE the explicit post-`select!`
+/// sweep runs.
+///
+/// The explicit awaited sweep ([`close_remaining_scratch_docs`]) handles the
+/// normal-completion and `select!`-cancel paths deterministically and drains the
+/// tracker; by the time this guard's `Drop` runs on those paths the tracker is
+/// already empty, so its Drop is a no-op (the drain-under-lock makes the sweep
+/// and the guard mutually exclusive — they can never double-close).
+///
+/// The hard case this guard exists for: a `future`-level abort drops the whole
+/// dispatch future at an `.await` point before the sweep is reached. `Drop`
+/// cannot `.await`, so it drains the tracker and, if anything remains, **spawns a
+/// detached `tokio::task`** to run the `didClose`s. A detached task is NOT a
+/// child of the aborted future, so it survives the parent's cancellation and runs
+/// the `close_scratch_document` calls to completion — which is also why
+/// `close_scratch_document` can keep its untrack-before-didClose ordering (the
+/// detached task guarantees the didClose await still completes).
+struct ScratchCleanupGuard {
+    pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+    host_uri: url::Url,
+    open: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>>,
+}
+
+impl ScratchCleanupGuard {
+    fn new(
+        pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+        host_uri: url::Url,
+        open: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>>,
+    ) -> Self {
+        Self {
+            pool,
+            host_uri,
+            open,
+        }
+    }
+}
+
+impl Drop for ScratchCleanupGuard {
+    fn drop(&mut self) {
+        // Drain under the lock. On the normal/select-cancel paths the explicit
+        // sweep already drained, so this is empty and we return without spawning
+        // — no double-close. On an abort-before-sweep, this is the leftover set.
+        let remaining = drain_open_scratch(&self.open);
+        if remaining.is_empty() {
+            return;
+        }
+
+        // Drop can't await, and the parent future is (in the case that matters)
+        // being aborted — so finish the didCloses on a DETACHED task that is not a
+        // child of the aborted future and therefore runs to completion.
+        let pool = Arc::clone(&self.pool);
+        let host_uri = self.host_uri.clone();
+        tokio::spawn(async move {
+            for doc in remaining {
+                pool.close_scratch_document(&host_uri, &doc.uri, &doc.server_name)
+                    .await;
+            }
+        });
+    }
 }
 
 /// Record a scratch document as open. Poison-safe: a poisoned mutex is recovered
@@ -849,6 +923,56 @@ mod tests {
             drained.len(),
             2,
             "the sweep must see every step's scratch doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_cleanup_guard_drains_tracker_on_drop() {
+        // The guard is the safety net for the abort-before-sweep case: if the
+        // dispatch future is aborted before the explicit sweep runs, the guard's
+        // Drop must drain the tracker (and detach the didClose), so no scratch
+        // doc leaks. Here we assert the drain-on-drop: the tracker is emptied.
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
+
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::new());
+        let host = url::Url::parse("file:///d.md").unwrap();
+        let guard = ScratchCleanupGuard::new(Arc::clone(&pool), host, Arc::clone(&open));
+
+        drop(guard);
+
+        assert!(
+            lock_open_scratch(&open).is_empty(),
+            "guard Drop must drain the tracker so nothing leaks on abort-before-sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_cleanup_guard_drop_is_noop_after_explicit_sweep() {
+        // Normal path: the explicit awaited sweep drains the tracker first, so the
+        // guard's Drop sees an empty tracker and does nothing — the sweep and the
+        // guard can never double-close.
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::new());
+        let host = url::Url::parse("file:///d.md").unwrap();
+        let guard = ScratchCleanupGuard::new(Arc::clone(&pool), host.clone(), Arc::clone(&open));
+
+        // Explicit sweep (the deterministic cleanup the normal/select-cancel paths
+        // run) drains the tracker.
+        close_remaining_scratch_docs(&pool, &host, &open).await;
+        assert!(
+            lock_open_scratch(&open).is_empty(),
+            "explicit sweep must drain the tracker"
+        );
+
+        // Guard Drop now sees an empty tracker → no-op, so no double-close.
+        drop(guard);
+        assert!(
+            lock_open_scratch(&open).is_empty(),
+            "guard Drop after sweep must remain a no-op"
         );
     }
 

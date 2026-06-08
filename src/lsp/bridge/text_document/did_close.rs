@@ -111,6 +111,14 @@ impl LanguageServerPool {
         // `is_document_opened` guard above also helps avoid.) `untrack_document`
         // does not touch `host_to_virtual`, so we remove that registration (added
         // by `ensure_document_opened`) explicitly.
+        //
+        // Untrack-first (rather than didClose-first) is safe against cancel-drop
+        // because the concatenated pipeline's `ScratchCleanupGuard` runs this on a
+        // DETACHED task that is not a child of the aborted dispatch future — so the
+        // didClose await below always completes even when the caller is cancelled
+        // mid-flight. The ordering is therefore kept to preserve the
+        // double-close-race fix without reintroducing an orphaned-downstream-doc
+        // leak on cancel.
         self.unregister_virtual_doc(host_uri, scratch_uri).await;
         self.untrack_document(scratch_uri, server_name).await;
         if let Err(e) = self
