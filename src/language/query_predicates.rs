@@ -210,17 +210,22 @@ fn check_has_ancestor(args: &[tree_sitter::QueryPredicateArg], node: tree_sitter
     false
 }
 
-pub fn filter_captures<'a>(
-    query: &Query,
+/// Yield the captures of `match_` that pass all general predicates, lazily.
+///
+/// Returns an iterator rather than a `Vec` so the hot token-collection loop
+/// (one call per query match on every semantic-tokens request) avoids a
+/// per-match heap allocation. `QueryCapture` is `Copy`, so yielding owned
+/// values is free.
+pub(crate) fn filter_captures<'a>(
+    query: &'a Query,
     match_: &'a QueryMatch<'a, 'a>,
-    text: &str,
-) -> Vec<QueryCapture<'a>> {
+    text: &'a str,
+) -> impl Iterator<Item = QueryCapture<'a>> + 'a {
     match_
         .captures
         .iter()
-        .filter(|capture| check_predicate(query, match_, capture, text))
-        .cloned()
-        .collect()
+        .filter(move |capture| check_predicate(query, match_, capture, text))
+        .copied()
 }
 
 #[cfg(test)]
