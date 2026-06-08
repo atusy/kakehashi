@@ -213,16 +213,24 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Cross-file | Filter out actions with cross-file edits |
 | Position mapping | All ranges in remaining actions |
 
-#### textDocument/formatting / rangeFormatting
+#### textDocument/formatting / textDocument/rangeFormatting
 
 | Aspect | Handling |
 |--------|----------|
-| Input | Options (or range for rangeFormatting) |
+| Input | Options (or range for `textDocument/rangeFormatting`) |
 | Output | TextEdit[] |
 | Cross-file | N/A (single document) |
 | Position mapping | All edit ranges |
+| Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run; planned, not yet implemented). `textDocument/rangeFormatting`: `preferred` only |
 
-Relatively simple—all edits are within the virtual document.
+Single-server formatting is simple—all edits are within the virtual document.
+For multiple servers, the **planned** (not yet implemented) `concatenated`
+behavior does **not** concatenate edit lists (that would overlap); it runs a
+sequential formatter pipeline over `priorities`, which is both the
+**membership allowlist** (servers not listed do not run) and the application order. This
+applies to **full formatting only** — `textDocument/rangeFormatting` always uses `preferred`, even though it
+shares the `textDocument/formatting` config key. See
+concatenated-formatting-pipeline.
 
 ### Strategy 4: Background Collection
 
@@ -281,6 +289,7 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
+| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — planned, full formatting only, not yet implemented. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
 
 ## Consequences
 
@@ -342,3 +351,4 @@ The original priority order (for reference):
 
 - [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How injections are represented as virtual documents
+- [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md): Multi-server formatting via a sequential pipeline (`strategy: "concatenated"`)

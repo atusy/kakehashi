@@ -114,7 +114,68 @@ enum ConfigAction {
     },
 }
 
+/// Restore the default `SIGPIPE` disposition (Unix only).
+///
+/// Rust ignores `SIGPIPE` at startup, which turns a broken pipe into a panic on
+/// the next `print!`/`println!` (e.g. `kakehashi config schema | head`, or even
+/// `kakehashi --help | head`). Restoring the conventional Unix behavior makes the
+/// process terminate quietly with `SIGPIPE` when the reader goes away. This is
+/// installed at the very start of `main` so it also covers clap's `--help` /
+/// `--version` output emitted during argument parsing; LSP server mode restores
+/// the ignored disposition afterwards via [`ignore_sigpipe`].
+#[cfg(unix)]
+fn reset_sigpipe() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    // SAFETY: `SigDfl` is async-signal-safe and installed before any output.
+    let result = unsafe { sigaction(Signal::SIGPIPE, &action) };
+    // Restoring the default disposition for a valid signal cannot realistically
+    // fail, but surface it on stderr rather than swallowing it: otherwise a
+    // silent failure would regress to panicking on a broken pipe. Use `writeln!`
+    // (ignoring its result) instead of `eprintln!`, which would itself panic if
+    // stderr is a broken pipe.
+    if let Err(e) = result {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: failed to restore default SIGPIPE handler: {e}"
+        );
+    }
+}
+
+/// Ignore `SIGPIPE` (Unix only) — the disposition the Rust runtime installs by
+/// default.
+///
+/// LSP server mode uses this to undo [`reset_sigpipe`]: the bridge writes to
+/// downstream language-server stdin and must observe a closed peer as a
+/// recoverable `BrokenPipe` I/O error rather than being killed by the signal.
+#[cfg(unix)]
+fn ignore_sigpipe() {
+    use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+    let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+    // SAFETY: `SigIgn` is async-signal-safe and installed before bridge I/O.
+    let result = unsafe { sigaction(Signal::SIGPIPE, &action) };
+    // LSP server mode relies on the ignored disposition so the bridge sees a
+    // closed downstream peer as a recoverable BrokenPipe; surface a failure
+    // rather than silently risking a SIGPIPE kill. Use `writeln!` (ignoring its
+    // result) instead of `eprintln!`, which would panic on a broken stderr.
+    if let Err(e) = result {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "warning: failed to ignore SIGPIPE: {e}");
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
+#[cfg(not(unix))]
+fn ignore_sigpipe() {}
+
 fn main() -> ExitCode {
+    // Restore the default SIGPIPE disposition before clap may write `--help` /
+    // `--version` to a (possibly piped) stdout during `Cli::parse()`.
+    reset_sigpipe();
+
     let cli = Cli::parse();
 
     // Set data directory override so default_data_dir() and config expansion
@@ -125,6 +186,13 @@ fn main() -> ExitCode {
 
     if !cli.config_file.is_empty() {
         kakehashi::config::set_config_file_override(cli.config_file);
+    }
+
+    // LSP server mode keeps SIGPIPE ignored so the bridge sees a closed
+    // downstream peer as a recoverable BrokenPipe error; subcommands keep the
+    // default disposition restored above.
+    if cli.command.is_none() {
+        ignore_sigpipe();
     }
 
     let result = match cli.command {

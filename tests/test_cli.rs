@@ -998,3 +998,91 @@ fn test_language_uninstall_cancel() {
         "Parser should still exist after cancellation"
     );
 }
+
+/// Run the kakehashi binary with `args`, giving it a stdout pipe whose read end
+/// is closed *before* the child is spawned, and return the finished output.
+///
+/// With no reader, the child inherits only the write end, so its first stdout
+/// write fails with EPIPE — and, once the default SIGPIPE disposition is
+/// restored, the process is killed by SIGPIPE. This reproduces a broken pipe
+/// deterministically, independent of the kernel pipe-buffer size and free of any
+/// spawn/write race.
+#[cfg(unix)]
+fn run_with_broken_stdout_pipe(args: &[&str]) -> std::process::Output {
+    use std::os::fd::OwnedFd;
+    use std::process::Stdio;
+
+    let (read_fd, write_fd): (OwnedFd, OwnedFd) = nix::unistd::pipe().expect("create pipe");
+    // Close the read end before spawning: the child gets only the write end, so
+    // there is no reader and the first write hits EPIPE.
+    drop(read_fd);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(args)
+        .stdout(Stdio::from(write_fd))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn command");
+
+    child
+        .wait_with_output()
+        .expect("Failed to wait for command")
+}
+
+/// The platform's `SIGPIPE` signal number (13 on Linux/macOS), taken from `nix`
+/// rather than hardcoded so it stays correct across architectures.
+#[cfg(unix)]
+const SIGPIPE: i32 = nix::sys::signal::Signal::SIGPIPE as i32;
+
+/// A CLI subcommand whose stdout reader is gone (e.g. `kakehashi config schema |
+/// head`) must not panic. Rust ignores SIGPIPE by default, turning a broken pipe
+/// into a panic on the next `print!`; the fix restores the default SIGPIPE
+/// disposition so the process is terminated quietly by the signal instead.
+///
+/// Unix-only: `reset_sigpipe` is a no-op on Windows (no SIGPIPE).
+#[cfg(unix)]
+#[test]
+fn config_schema_does_not_panic_on_broken_pipe() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = run_with_broken_stdout_pipe(&["config", "schema"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "Broken pipe must not cause a panic. stderr: {stderr}"
+    );
+    // The process must be terminated by SIGPIPE — proving the default disposition
+    // was restored — rather than exiting via a panic (code 101) or normally.
+    assert_eq!(
+        output.status.signal(),
+        Some(SIGPIPE),
+        "config schema should be terminated by SIGPIPE; status: {:?}, stderr: {stderr}",
+        output.status
+    );
+}
+
+/// `--help` output is written by clap during argument parsing, before any
+/// subcommand dispatch. `reset_sigpipe` runs as the first line of `main`, so a
+/// closed reader (e.g. `kakehashi --help | head`) must be handled the same way.
+///
+/// Unix-only for the same reason as `config_schema_does_not_panic_on_broken_pipe`.
+#[cfg(unix)]
+#[test]
+fn help_does_not_panic_on_broken_pipe() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = run_with_broken_stdout_pipe(&["--help"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "Broken pipe on --help must not cause a panic. stderr: {stderr}"
+    );
+    assert_eq!(
+        output.status.signal(),
+        Some(SIGPIPE),
+        "--help should be terminated by SIGPIPE; status: {:?}, stderr: {stderr}",
+        output.status
+    );
+}
