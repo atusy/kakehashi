@@ -8,7 +8,7 @@ how kakehashi combines results when several language servers are involved — be
 what the specification itself prescribes.
 
 For how to install language servers and configure bridging, see
-[README.md](README.md#bridge-configuration). This document describes
+[docs/README.md](README.md#bridge-configuration). This document describes
 **what the features do**; the README describes **how to set them up**.
 
 ---
@@ -77,7 +77,8 @@ Highlights the whole document from Tree-sitter queries,
 **including embedded code blocks** — you get highlighting inside fenced code blocks
 even without a language server configured for that language. Delta updates and range
 requests are supported. Highlight colors are driven by the token types/modifiers
-kakehashi exposes; capture names can be remapped via `captureMappings` (see README).
+kakehashi exposes; capture names can be remapped via `captureMappings`
+(see [docs/README.md](README.md#capturemappings)).
 
 ### Selection range
 
