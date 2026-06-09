@@ -13,11 +13,13 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tower_lsp_server::ls_types::{TextDocumentIdentifier, Uri};
+use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier, Uri};
 use ulid::Ulid;
+use url::Url;
 
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
+use crate::text::PositionMapper;
 
 /// A tracked node's `(start_byte, end_byte, kind)` triple, as produced by a
 /// navigation closure and consumed by the re-minting helpers below. `kind` is
@@ -90,6 +92,23 @@ pub struct NodeByteRangeParams {
     pub end_byte: i64,
 }
 
+/// Request parameters for point-range descendant lookups
+/// (`descendantForPointRange`, `namedDescendantForPointRange`).
+///
+/// `start` / `end` are LSP `Position`s (`{ line, character }`, **UTF-16** code
+/// units per the protocol's position encoding). The server converts each to a
+/// UTF-8 byte offset via [`PositionMapper`] before searching, so clients use the
+/// same coordinate space as every other LSP request — never tree-sitter's
+/// byte-column points.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodePointRangeParams {
+    pub text_document: TextDocumentIdentifier,
+    pub id: String,
+    pub start: Position,
+    pub end: Position,
+}
+
 impl Kakehashi {
     /// Resolve `id` to its tree-sitter node and run `f` on it, returning the
     /// minting `layer` alongside the closure's result.
@@ -111,8 +130,24 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         id: &str,
-        f: impl FnMut(tree_sitter::Node<'_>) -> R,
-    ) -> Option<(url::Url, usize, R)> {
+        mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
+    ) -> Option<(Url, usize, R)> {
+        // Most accessors don't need positions; ignore the mapper.
+        self.with_node_mapped(lsp_uri, id, move |node, _mapper| f(node))
+            .await
+    }
+
+    /// Like [`with_node_by_id`](Self::with_node_by_id) but also hands the closure
+    /// a [`PositionMapper`] over the host document, so position/range accessors
+    /// can convert tree-sitter byte offsets ↔ LSP `Position` (UTF-16) without a
+    /// second snapshot. This is the actual shared prelude; `with_node_by_id`
+    /// delegates here with the mapper ignored.
+    pub(super) async fn with_node_mapped<R>(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        mut f: impl FnMut(tree_sitter::Node<'_>, &PositionMapper) -> R,
+    ) -> Option<(Url, usize, R)> {
         // An unparseable URI signals a misbehaving client; warn for parity with
         // `node` / `node/text` / `node/parent` / `node/children` while still
         // collapsing to `null`.
@@ -146,6 +181,7 @@ impl Kakehashi {
 
         let host_tree = snapshot.tree();
         let host_language = self.document_language(&uri)?;
+        let mapper = PositionMapper::new(host_text);
 
         // A tracker hit that fails to resolve in its minting layer means the
         // tree drifted out from under the tracked range (e.g. an edit
@@ -162,7 +198,7 @@ impl Kakehashi {
             end,
             kind,
             layer,
-            f,
+            |node| f(node, &mapper),
         ) else {
             log::warn!(
                 target: "kakehashi::node",
@@ -172,6 +208,18 @@ impl Kakehashi {
             return None;
         };
         Some((uri, layer, result))
+    }
+
+    /// Mint (or reuse) a stable ULID for a related node in `layer` and shape it
+    /// as a `NodeInfo`. Shared by every handler that returns a single resolved
+    /// node, so the wire shape stays identical.
+    pub(super) fn mint_node_info(&self, uri: &Url, layer: usize, triple: NodeTriple) -> Value {
+        let (start, end, kind) = triple;
+        let ulid = self
+            .bridge
+            .node_tracker()
+            .get_or_create_in_layer(uri, start, end, kind, layer);
+        json!({ "id": ulid.to_string(), "kind": kind })
     }
 
     /// Resolve `id`, run `f` to pick a single related node (child, sibling,
@@ -192,14 +240,10 @@ impl Kakehashi {
         let Some((uri, layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
             return Value::Null;
         };
-        let Some((start, end, kind)) = picked else {
-            return Value::Null;
-        };
-        let ulid = self
-            .bridge
-            .node_tracker()
-            .get_or_create_in_layer(&uri, start, end, kind, layer);
-        json!({ "id": ulid.to_string(), "kind": kind })
+        match picked {
+            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            None => Value::Null,
+        }
     }
 
     /// Resolve `id`, run `f` to collect a list of related nodes (children,
@@ -217,13 +261,9 @@ impl Kakehashi {
         let Some((uri, layer, items)) = self.with_node_by_id(lsp_uri, id, f).await else {
             return Value::Null;
         };
-        let tracker = self.bridge.node_tracker();
         let infos: Vec<Value> = items
             .into_iter()
-            .map(|(start, end, kind)| {
-                let ulid = tracker.get_or_create_in_layer(&uri, start, end, kind, layer);
-                json!({ "id": ulid.to_string(), "kind": kind })
-            })
+            .map(|triple| self.mint_node_info(&uri, layer, triple))
             .collect();
         Value::Array(infos)
     }
