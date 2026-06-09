@@ -359,10 +359,10 @@ fn test_node_at_end_of_document_returns_node_info() {
     let id = result.get("id").expect("result must have id field");
     assert_ulid_shaped(id);
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type must be a string");
-    assert!(!ty.is_empty(), "type field should be a non-empty kind");
+        .expect("kind must be a string");
+    assert!(!ty.is_empty(), "kind field should be a non-empty kind");
 }
 
 /// Empty-document case: node-reference-protocol gates the end-of-document exception on `L > 0`,
@@ -425,23 +425,23 @@ fn test_node_at_heading_returns_node_info() {
     assert_ulid_shaped(id);
 
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("result must have a string type field");
+        .expect("result must have a string kind field");
 
     // The smallest node containing "Hello" inside `# Hello` is anonymous text
     // ("hello") or its named ancestor `inline`. Either is acceptable for the
-    // entry point — what matters is that the type is non-empty.
+    // entry point — what matters is that the kind is non-empty.
     assert!(
         !ty.is_empty(),
-        "type field should be the tree-sitter node kind, got empty string"
+        "kind field should be the tree-sitter node kind, got empty string"
     );
 }
 
 /// `kakehashi/node/parent` walks one step toward the root of the same language
 /// tree (node-reference-protocol §"Navigation Methods"). Acquiring an id deep inside a nested
 /// markdown structure and asking for its parent must yield a NodeInfo whose id
-/// is distinct from the child's and whose type is the kind of the immediate
+/// is distinct from the child's and whose kind is that of the immediate
 /// tree-sitter parent.
 #[test]
 fn test_node_parent_returns_immediate_parent_for_nested_node() {
@@ -461,10 +461,10 @@ fn test_node_parent_returns_immediate_parent_for_nested_node() {
         .and_then(Value::as_str)
         .expect("child id must be a string")
         .to_string();
-    let child_type = child
-        .get("type")
+    let child_kind = child
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("child type must be a string")
+        .expect("child kind must be a string")
         .to_string();
 
     let parent = request_node_parent(&mut client, uri, &child_id);
@@ -484,24 +484,24 @@ fn test_node_parent_returns_immediate_parent_for_nested_node() {
         "parent id must differ from the child id"
     );
 
-    let parent_type = parent
-        .get("type")
+    let parent_kind = parent
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("parent type must be a non-empty string");
+        .expect("parent kind must be a non-empty string");
     assert!(
-        !parent_type.is_empty(),
-        "parent type field should be the tree-sitter parent kind, got empty string"
+        !parent_kind.is_empty(),
+        "parent kind field should be the tree-sitter parent kind, got empty string"
     );
 
     // Sanity: the parent must be structurally distinct from the child. We
     // don't pin the exact grammar-derived names (tree-sitter-markdown's tag
-    // names can change across versions), but if the parent's type equals the
-    // child's type at the same span the handler is suspiciously returning the
+    // names can change across versions), but if the parent's kind equals the
+    // child's kind at the same span the handler is suspiciously returning the
     // input node rather than its parent.
     assert_ne!(
-        parent_type, child_type,
-        "parent's type ({:?}) must differ from child's type ({:?}); same-type hop suggests the handler returned the input node",
-        parent_type, child_type
+        parent_kind, child_kind,
+        "parent's kind ({:?}) must differ from child's kind ({:?}); same-kind hop suggests the handler returned the input node",
+        parent_kind, child_kind
     );
 }
 
@@ -638,19 +638,19 @@ fn test_node_children_returns_siblings_in_document_order() {
         );
     }
 
-    // Each child must be a well-formed NodeInfo with id + type.
+    // Each child must be a well-formed NodeInfo with id + kind.
     for (i, child) in children.iter().enumerate() {
         let id = child
             .get("id")
             .unwrap_or_else(|| panic!("child {} missing id field: {:?}", i, child));
         assert_ulid_shaped(id);
         let ty = child
-            .get("type")
+            .get("kind")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("child {} missing string type field: {:?}", i, child));
+            .unwrap_or_else(|| panic!("child {} missing string kind field: {:?}", i, child));
         assert!(
             !ty.is_empty(),
-            "child {} has empty type field: {:?}",
+            "child {} has empty kind field: {:?}",
             i,
             child
         );
@@ -816,9 +816,9 @@ fn test_node_injection_false_returns_host_node_inside_python_block() {
     );
 
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
+        .expect("kind field must be a string");
     // The host (markdown) node at that byte is some descendant of
     // `fenced_code_block` — usually `code_fence_content` or an inline child
     // of it. We assert on the markdown-side identifier set rather than pin
@@ -829,7 +829,7 @@ fn test_node_injection_false_returns_host_node_inside_python_block() {
             || ty == "block_continuation"
             || ty == "text"
             || ty == "inline",
-        "injection=false must return a markdown host node, got type={:?}",
+        "injection=false must return a markdown host node, got kind={:?}",
         ty
     );
 }
@@ -887,12 +887,12 @@ fn test_node_injection_true_returns_python_node_inside_python_block() {
     assert_ulid_shaped(result.get("id").expect("id field"));
 
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
+        .expect("kind field must be a string");
     assert!(
         is_python_kind(ty),
-        "injection=true must return a python node inside the code block, got type={:?}",
+        "injection=true must return a python node inside the code block, got kind={:?}",
         ty
     );
 }
@@ -916,12 +916,12 @@ fn test_node_injection_positive_one_returns_python_node_inside_python_block() {
         "injection=1 with a 2-layer stack must resolve to the python layer, got null"
     );
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
+        .expect("kind field must be a string");
     assert!(
         is_python_kind(ty),
-        "injection=1 must select the python layer, got type={:?}",
+        "injection=1 must select the python layer, got kind={:?}",
         ty
     );
 }
@@ -988,12 +988,12 @@ fn test_node_injection_negative_one_returns_deepest_layer() {
         "injection=-1 on a 2-layer stack must resolve to the python layer, got null"
     );
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
+        .expect("kind field must be a string");
     assert!(
         is_python_kind(ty),
-        "injection=-1 must select the python (deepest) layer, got type={:?}",
+        "injection=-1 must select the python (deepest) layer, got kind={:?}",
         ty
     );
 }
@@ -1015,16 +1015,16 @@ fn test_node_injection_negative_two_returns_host_on_two_layer_stack() {
         "injection=-2 on a 2-layer stack must resolve to the host layer, got null"
     );
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
+        .expect("kind field must be a string");
     assert!(
         ty == "code_fence_content"
             || ty == "fenced_code_block"
             || ty == "block_continuation"
             || ty == "text"
             || ty == "inline",
-        "injection=-2 must select the markdown host layer, got type={:?}",
+        "injection=-2 must select the markdown host layer, got kind={:?}",
         ty
     );
 }
@@ -1100,9 +1100,9 @@ fn test_node_injection_three_layer_saturates_to_regex() {
         .and_then(Value::as_str)
         .expect("deepest id");
     let deepest_ty = deepest
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("deepest type");
+        .expect("deepest kind");
 
     if deepest_id == python_id {
         eprintln!(
@@ -1147,7 +1147,7 @@ fn test_node_injection_negative_two_three_layer_returns_middle_layer() {
         return;
     }
     let saturated_ty = saturated
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -1164,13 +1164,13 @@ fn test_node_injection_negative_two_three_layer_returns_middle_layer() {
         "injection=-2 on a 3-layer stack must resolve to the middle (python) layer, got null"
     );
     let ty = result
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string");
+        .expect("kind field must be a string");
     assert!(
         is_python_kind(ty),
         "injection=-2 on a 3-layer stack must select the python middle layer, \
-         got type={:?}",
+         got kind={:?}",
         ty
     );
 }
@@ -1242,9 +1242,9 @@ fn test_node_parent_on_injected_id_stays_in_injected_tree() {
     let seed = request_node_with_injection(&mut client, uri, 3, 4, json!(true));
     assert!(!seed.is_null(), "injection=true must resolve a python node");
     let seed_ty = seed
-        .get("type")
+        .get("kind")
         .and_then(Value::as_str)
-        .expect("type field");
+        .expect("kind field");
     assert!(
         is_python_kind(seed_ty),
         "seed must be a python node, got {:?}",
@@ -1269,9 +1269,9 @@ fn test_node_parent_on_injected_id_stays_in_injected_tree() {
             break;
         }
         let ty = parent
-            .get("type")
+            .get("kind")
             .and_then(Value::as_str)
-            .expect("parent type field");
+            .expect("parent kind field");
         assert!(
             is_python_kind(ty),
             "parent hop {} left the injected tree: got non-python kind {:?}",
@@ -1339,9 +1339,9 @@ fn test_node_children_on_injected_id_stays_in_injected_tree() {
     );
     for child in arr {
         let ty = child
-            .get("type")
+            .get("kind")
             .and_then(Value::as_str)
-            .expect("child type field");
+            .expect("child kind field");
         assert!(
             is_python_kind(ty),
             "children of an injected node must stay in the injected tree, got {:?}",
@@ -1366,11 +1366,11 @@ fn test_node_children_on_injected_id_stays_in_injected_tree() {
 /// the injected `markdown_inline` tree whose root is also an `inline`.
 const MARKDOWN_PARAGRAPH: &str = "hello world\n";
 
-/// Read the `type` field as a string, asserting it is present.
-fn node_type(node: &Value) -> &str {
-    node.get("type")
+/// Read the `kind` field as a string, asserting it is present.
+fn node_kind(node: &Value) -> &str {
+    node.get("kind")
         .and_then(Value::as_str)
-        .expect("type field must be a string")
+        .expect("kind field must be a string")
 }
 
 /// Read the `id` field as a string, asserting it is present.
@@ -1402,12 +1402,12 @@ fn test_node_layer_collision_host_and_injected_inline_get_distinct_ids() {
     // resolve an `inline` node at the same span. If this regresses (e.g. an
     // upstream grammar change), the test below is no longer exercising #313.
     assert_eq!(
-        node_type(&host),
+        node_kind(&host),
         "inline",
         "expected the host node to be `inline` (the collision fixture)"
     );
     assert_eq!(
-        node_type(&injected),
+        node_kind(&injected),
         "inline",
         "expected the injected root to be `inline` (the collision fixture)"
     );
@@ -1443,10 +1443,10 @@ fn test_node_layer_collision_navigation_stays_in_layer() {
         "host inline must have a parent in the host tree"
     );
     assert_eq!(
-        node_type(&host_parent),
+        node_kind(&host_parent),
         "paragraph",
         "host inline's parent must be the host `paragraph`, got {:?}",
-        node_type(&host_parent)
+        node_kind(&host_parent)
     );
 
     // Injected inline is the root of the markdown_inline tree → null parent.
@@ -1482,7 +1482,7 @@ fn test_node_layer_collision_survives_edit_and_stays_in_layer() {
     let injected = request_node_with_injection(&mut client, uri, 0, 2, json!(true));
     assert!(!injected.is_null(), "injected layer must resolve a node");
     assert_eq!(
-        node_type(&injected),
+        node_kind(&injected),
         "inline",
         "expected the injected root to be `inline` (the collision fixture)"
     );

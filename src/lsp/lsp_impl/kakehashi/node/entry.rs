@@ -291,7 +291,7 @@ impl Kakehashi {
 
         Ok(json!({
             "id": ulid.to_string(),
-            "type": node.kind(),
+            "kind": node.kind(),
         }))
     }
 
@@ -317,7 +317,7 @@ impl Kakehashi {
 
         json!({
             "id": ulid.to_string(),
-            "type": node.kind(),
+            "kind": node.kind(),
         })
     }
 
