@@ -132,7 +132,13 @@ impl Kakehashi {
         let host_tree = snapshot.tree();
         let host_language = self.document_language(&uri)?;
 
-        let result = with_resolved_node(
+        // A tracker hit that fails to resolve in its minting layer means the
+        // tree drifted out from under the tracked range (e.g. an edit
+        // restructured the injection nesting). That is worth a warning for
+        // diagnosing drift — mirroring `node/parent` and `node/children` — and
+        // is distinct from the silent `None` cases above (never-issued ULID,
+        // unparsed document), which are expected and collapse to `null` quietly.
+        let Some(result) = with_resolved_node(
             &self.language,
             &host_language,
             host_text,
@@ -142,7 +148,14 @@ impl Kakehashi {
             kind,
             layer,
             f,
-        )?;
+        ) else {
+            log::warn!(
+                target: "kakehashi::node",
+                "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                layer, ulid, uri, start, end, kind
+            );
+            return None;
+        };
         Some((layer, result))
     }
 
