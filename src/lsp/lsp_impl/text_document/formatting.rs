@@ -517,9 +517,11 @@ impl ScratchCleanupGuard {
 
 impl Drop for ScratchCleanupGuard {
     fn drop(&mut self) {
-        // Drain under the lock. On the normal/select-cancel paths the explicit
-        // sweep already drained, so this is empty and we return without spawning
-        // — no double-close. On an abort-before-sweep, this is the leftover set.
+        // This guard is the sole scratch-document cleanup path: on every exit of
+        // `dispatch_concatenated_formatting` (normal return, select!-cancel
+        // return, or future-level abort) the guard drops and drains the tracker
+        // here. Nothing else drains it, so there is no double-close to guard
+        // against.
         let remaining = drain_open_scratch(&self.open);
         if remaining.is_empty() {
             return;
@@ -592,10 +594,11 @@ fn lock_open_scratch(
 /// always performs a fresh `didOpen` carrying the current accumulated text.
 ///
 /// The id keeps the canonical `region_id` as a prefix (so it stays unique per
-/// region — no host-file collision) and appends a `-kakehashi-scratch-{step}`
-/// suffix: unique per pipeline step, and carrying the standardized
-/// `kakehashi-scratch` marker (Decision point 7) so external tools (file
-/// watchers, build tools, test runners) can recognize and ignore these throwaway
+/// region — no host-file collision) and appends a `-kakehashi-scratch-{run}-{step}`
+/// suffix: the `run` (a process-global sequence) keeps concurrent runs for the
+/// same region distinct, and `step` keeps each step within a run distinct. The
+/// `kakehashi-scratch` marker (Decision point 7) lets external tools (file
+/// watchers, build tools, test runners) recognize and ignore these throwaway
 /// documents. It still flows through [`VirtualDocumentUri::new`], which also
 /// wraps it in the `kakehashi-virtual-uri-` filename marker and preserves the
 /// host directory and language extension required for downstream config and
