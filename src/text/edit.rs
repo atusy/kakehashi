@@ -46,9 +46,16 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     byte_edits.sort_by_key(|&(start, end, _)| (start, end));
 
     // Upper-bound the result capacity (original text + all inserted text) so the
-    // forward copy never reallocates, even with many insertions.
-    let extra: usize = byte_edits.iter().map(|&(_, _, t)| t.len()).sum();
-    let mut result = String::with_capacity(text.len() + extra);
+    // forward copy never reallocates, even with many insertions. Saturating
+    // arithmetic keeps a pathological edit list (whose `new_text` lengths sum past
+    // `usize::MAX`) from panicking here in debug or wrapping to an undersized
+    // capacity in release — consistent with this module's "a buggy server must
+    // never make us panic" contract. Capacity is only a hint, so a saturated
+    // value at most costs one reallocation.
+    let extra: usize = byte_edits
+        .iter()
+        .fold(0usize, |acc, &(_, _, t)| acc.saturating_add(t.len()));
+    let mut result = String::with_capacity(text.len().saturating_add(extra));
     let mut cursor = 0usize;
     for (start, end, new_text) in byte_edits {
         // Drop an edit that starts before the cursor — it overlaps one already
