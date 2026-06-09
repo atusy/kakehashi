@@ -98,7 +98,9 @@ def main() -> None:
             canceled += 1
         else:
             ok += 1
-            tokens = len(resp.get("result", {}).get("data", [])) // 5
+            # `result` may be null (the server can answer Ok(None)); `or {}`
+            # guards against `None.get`, which a `{}` default would not.
+            tokens = len((resp.get("result") or {}).get("data", [])) // 5
     elapsed = time.time() - t0
 
     request("shutdown", None)

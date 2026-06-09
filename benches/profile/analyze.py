@@ -39,7 +39,7 @@ def lib_name(libs, thread, func_idx):
     if r is None or r < 0:
         return "?"
     rl = res.get("lib")
-    if rl and r < len(rl) and rl[r] is not None and rl[r] >= 0:
+    if rl and r < len(rl) and rl[r] is not None and 0 <= rl[r] < len(libs):
         return libs[rl[r]].get("name", "?")
     return "?"
 
