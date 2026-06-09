@@ -8,7 +8,7 @@ how kakehashi combines results when several language servers are involved — be
 what the specification itself prescribes.
 
 For how to install language servers and configure bridging, see
-[docs/README.md](README.md#bridge-configuration). This document describes
+[the configuration guide](README.md#bridge-configuration). This document describes
 **what the features do**; the README describes **how to set them up**.
 
 ---
@@ -78,7 +78,7 @@ Highlights the whole document from Tree-sitter queries,
 even without a language server configured for that language. Delta updates and range
 requests are supported. Highlight colors are driven by the token types/modifiers
 kakehashi exposes; capture names can be remapped via `captureMappings`
-(see [docs/README.md](README.md#capturemappings)).
+(see [the configuration guide](README.md#capturemappings)).
 
 ### Selection range
 
@@ -109,9 +109,10 @@ and [`completionItem/resolve`](https://microsoft.github.io/language-server-proto
 
 Offers completions inside an embedded block (auto-triggered after `.` or `:`).
 Additional details for a highlighted item (documentation, extra edits) are resolved
-on demand from the server that produced it. Auto-import edits that would land
-outside the embedded block are not applied, because the surrounding document is not
-part of the snippet. Combine strategy: `preferred`.
+on demand from the server that produced it. Because the language server only sees
+the isolated snippet, any edits it returns — including auto-import edits — are
+placed relative to the embedded block, so file-level imports may not land where they
+would in a standalone file. Combine strategy: `preferred`.
 
 ### Signature help
 
@@ -269,7 +270,7 @@ layers under the cursor as `[host, layer 1, layer 2, …, deepest]`:
 | absent / `false` / `0` | the host document (always available) |
 | `true` | the deepest embedded layer at the cursor |
 | positive `n` | exactly layer `n`; `null` if there is no such layer |
-| negative `n` | the `n`-th layer counting from the deepest; `null` if out of range |
+| negative `n` | counts back from the deepest layer (`-1` = deepest, `-2` = next, …); `null` if out of range |
 
 Example — Markdown containing a Python block containing a regex. With the cursor
 inside the regex: `0` resolves the Markdown node, `1` the Python node,
