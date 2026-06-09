@@ -20,15 +20,20 @@ use super::fan_in::FanInResult;
 use super::fan_in::{concatenated, preferred};
 use super::fan_out::{FanOutTask, fan_out};
 
-/// Pre-filter `ctx.priorities` to keep only server names present in `ctx.configs`.
+/// Pre-filter `ctx.priorities` to keep only server names present in `ctx.configs`,
+/// dropping duplicates (first occurrence wins, order preserved).
 ///
 /// Shared by the preferred fan-out and the concatenated formatting pipeline so
 /// the "priorities is a membership allowlist + order" rule has a single source.
+/// Deduping matters for the sequential pipeline: a misconfigured
+/// `priorities: ["black", "black"]` would otherwise format with the same server
+/// twice; it also avoids fanning out twice to one server in the preferred path.
 pub(crate) fn effective_priorities(ctx: &DocumentRequestContext) -> Vec<String> {
     let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
     ctx.priorities
         .iter()
-        .filter(|name| configured.contains(name.as_str()))
+        .filter(|name| configured.contains(name.as_str()) && seen.insert(name.as_str()))
         .cloned()
         .collect()
 }
