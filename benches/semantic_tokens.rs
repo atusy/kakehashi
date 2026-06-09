@@ -202,6 +202,12 @@ impl Server {
                 continue;
             }
             if msg.get("id").and_then(Value::as_i64) == Some(id) {
+                // Fail fast on a JSON-RPC error: a misconfigured server (missing
+                // parser/query, bad setup) must not silently produce Null and
+                // bogus timings.
+                if let Some(error) = msg.get("error") {
+                    panic!("server returned a JSON-RPC error for request id={id}: {error}");
+                }
                 return msg.get("result").cloned().unwrap_or(Value::Null);
             }
         }
