@@ -228,16 +228,19 @@ async fn dispatch_preferred_formatting(
 /// ([`scratch_region_id`]), so the bridge always sends a fresh `didOpen`
 /// carrying the current accumulated text — fixing the stale-content bug where a
 /// step reused an already-open canonical document and formatted the *original*
-/// region text. Scratch documents are `didClose`d by the post-`select!` sweep at
-/// the end of the run — and by [`ScratchCleanupGuard`] if the task is aborted
-/// first — rather than per step, so cancellation can never leak one
-/// (concatenated-formatting-pipeline Decision point 7).
+/// region text. Scratch documents are `didClose`d solely by
+/// [`ScratchCleanupGuard`]'s Drop rather than per step, so cancellation can never
+/// leak one (concatenated-formatting-pipeline Decision point 7).
 ///
 /// Cleanup is guaranteed even on cancel: every opened-but-not-yet-closed scratch
-/// document is tracked, and a sweep after the cancel-aware `select!` closes any
-/// the per-step path did not. Without this, a `$/cancelRequest` that drops the
-/// in-flight step future before its own `close_scratch_document` ran would leak
-/// that scratch virtual document downstream (review HIGH).
+/// document is tracked, and the guard's Drop — which fires on the normal return,
+/// the `select!` cancel return, and a future-level abort alike — drains the
+/// tracker and detaches the didCloses onto a task that always runs to completion.
+/// Without this, a `$/cancelRequest` that drops the in-flight step future before
+/// its own `close_scratch_document` ran would leak that scratch virtual document
+/// downstream (review HIGH). Routing every cleanup through the detached task also
+/// removes the cancel-during-cleanup edge cases the old awaited sweep had: a
+/// cancel mid-`didClose` can no longer orphan a downstream doc.
 ///
 /// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
 ///   - capability-based full -> rangeFormatting fallback for range-only servers,
@@ -287,8 +290,8 @@ async fn dispatch_concatenated_formatting(
     // after a prior hover/diagnostic), because `send_formatting_request` only
     // pushes content on the first `didOpen` (concatenated-formatting-pipeline
     // Decision point 7, stale-content bug). The per-step counter makes the
-    // scratch id unique; scratch documents are `didClose`d by the end-of-run
-    // sweep (and the abort-time guard), not per step, so a cancel can't leak one.
+    // scratch id unique; scratch documents are `didClose`d solely by
+    // `ScratchCleanupGuard`'s Drop, not per step, so a cancel can't leak one.
     let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Per-run sequence so scratch ids don't collide with a concurrent
     // concatenated-formatting request for the same region (which would also start
@@ -304,26 +307,23 @@ async fn dispatch_concatenated_formatting(
 
     // Track every scratch document opened during this run. Steps only register
     // their scratch docs here; they never close them per step. All closing
-    // happens in the post-`select!` sweep (`close_remaining_scratch_docs`, which
-    // pops one at a time) and, if the task is aborted before the sweep runs, in
-    // `ScratchCleanupGuard`'s drop (which drains and closes on a detached task).
-    // Deferring all cleanup to those two cancel-safe points is what guarantees a
-    // cancel can never leak a scratch document downstream.
+    // happens in `ScratchCleanupGuard`'s Drop, which drains the tracker and
+    // closes each doc on a detached task. Deferring all cleanup to that single
+    // cancel-safe point is what guarantees a cancel can never leak a scratch
+    // document downstream.
     let open_scratch: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    // Retained for the post-`select!` cleanup sweep, since `uri` is moved into
-    // the per-step closure below.
-    let host_uri_for_sweep = uri.clone();
-
-    // Safety net for the abort-before-sweep case: if this whole future is aborted
-    // (outer `JoinSet` dropped / tower-lsp task cancelled) before the explicit
-    // sweep below runs, the sweep never executes and the tracked scratch docs
-    // would leak. The guard's Drop drains the tracker and detaches the didCloses
-    // onto a task that outlives the aborted parent. On the normal/select-cancel
-    // paths the sweep drains the tracker first, so the guard's Drop is a no-op
-    // (drain-under-lock ⇒ no double-close). Kept alive across the whole pipeline
-    // + sweep below.
+    // Sole scratch-document cleanup path: the guard's Drop runs on every exit
+    // from this function — normal return, the `select!` cancel return below, and
+    // a future-level abort (outer `JoinSet` dropped / tower-lsp task cancelled) at
+    // any `.await` point. Its Drop drains the tracker and, if anything remains,
+    // detaches the didCloses onto a task that outlives this (possibly aborted)
+    // future and runs them to completion. Because the close runs on a detached
+    // task that always completes, `close_scratch_document`'s untrack-before-didClose
+    // ordering is safe — there is no cancellable awaited sweep that could be
+    // interrupted mid-didClose and orphan a downstream doc. Kept alive across the
+    // whole pipeline below.
     let _scratch_guard =
         ScratchCleanupGuard::new(Arc::clone(&pool), uri.clone(), Arc::clone(&open_scratch));
 
@@ -352,7 +352,7 @@ async fn dispatch_concatenated_formatting(
 
                 // Build the scratch URI up front and register it as "open" in the
                 // shared tracker BEFORE the request, so that if this future is
-                // dropped mid-send by a cancel, the post-`select!` sweep still
+                // dropped mid-send by a cancel, `ScratchCleanupGuard`'s Drop still
                 // closes it. Skipped only when the host URL could not be
                 // converted (then no didClose is possible anyway).
                 let scratch_uri = host_uri_lsp
@@ -420,14 +420,14 @@ async fn dispatch_concatenated_formatting(
                     }
                 };
 
-                // Scratch-document cleanup is deferred to the post-`select!`
-                // sweep (`close_remaining_scratch_docs`), NOT closed here per
-                // step. The sweep always runs to completion, so a cancel that
-                // drops this step's future mid-flight can never leak a scratch
-                // doc; closing per-step inside the (cancellable) pipeline future
-                // could be interrupted after the tracker entry was already
+                // Scratch-document cleanup is deferred to `ScratchCleanupGuard`'s
+                // Drop, NOT closed here per step. The guard's Drop detaches the
+                // didCloses onto a task that always runs to completion, so a
+                // cancel that drops this step's future mid-flight can never leak a
+                // scratch doc; closing per-step inside the (cancellable) pipeline
+                // future could be interrupted after the tracker entry was already
                 // removed, leaking it. The scratch doc stays tracked in
-                // `open_scratch` (registered above) for the sweep to close.
+                // `open_scratch` (registered above) for the guard to close.
 
                 // Hand the (unchanged) virtual text back to the pipeline along
                 // with the result so the pipeline can move it forward without a
@@ -439,8 +439,11 @@ async fn dispatch_concatenated_formatting(
 
     // Poll cancellation concurrently with the in-flight pipeline so an upstream
     // $/cancelRequest aborts the region promptly rather than only between steps.
-    // (Per-step $/cancelRequest propagation to the downstream server is a
-    // follow-up — TODO(concatenated-formatting-pipeline).)
+    // On cancel we just stop polling the pipeline and return None; the scratch
+    // documents the run opened are closed by `_scratch_guard`'s Drop (which fires
+    // on this return as well as on a future-level abort), so there is no explicit
+    // sweep to interrupt. (Per-step $/cancelRequest propagation to the downstream
+    // server is a follow-up — TODO(concatenated-formatting-pipeline).)
     let cancelled;
     let final_text = match cancel_rx {
         Some(mut rx) => {
@@ -455,15 +458,8 @@ async fn dispatch_concatenated_formatting(
         }
     };
 
-    // Close every scratch document the run opened — on both the completed and
-    // cancelled paths. This sweep is the single cleanup point (steps only
-    // register their scratch docs, never close them), so it runs to completion
-    // regardless of cancellation and can never leak. `close_scratch_document` is
-    // idempotent, so a doc already gone (e.g. via a concurrent host close) is a
-    // no-op.
-    close_remaining_scratch_docs(&pool, &host_uri_for_sweep, &open_scratch).await;
-
     // On cancel, contribute no edit (matches the prior early-return behavior).
+    // Scratch cleanup is handled entirely by `_scratch_guard`'s Drop below.
     if cancelled {
         return None;
     }
@@ -484,25 +480,21 @@ struct OpenScratchDoc {
     server_name: String,
 }
 
-/// Drop-based safety net that closes any scratch documents still tracked open
-/// when the concatenated-formatting future is **aborted** (its outer `JoinSet`
-/// dropped or the tower-lsp task cancelled) BEFORE the explicit post-`select!`
-/// sweep runs.
+/// Drop-based cleanup that closes every scratch document still tracked open when
+/// the concatenated-formatting future exits — the **sole** scratch cleanup path.
 ///
-/// The explicit awaited sweep ([`close_remaining_scratch_docs`]) handles the
-/// normal-completion and `select!`-cancel paths deterministically and drains the
-/// tracker; by the time this guard's `Drop` runs on those paths the tracker is
-/// already empty, so its Drop is a no-op (the drain-under-lock makes the sweep
-/// and the guard mutually exclusive — they can never double-close).
+/// Its `Drop` runs on every exit from `dispatch_concatenated_formatting`: the
+/// normal return, the `select!` cancel return, and a future-level abort (its
+/// outer `JoinSet` dropped or the tower-lsp task cancelled) at any `.await`
+/// point.
 ///
-/// The hard case this guard exists for: a `future`-level abort drops the whole
-/// dispatch future at an `.await` point before the sweep is reached. `Drop`
-/// cannot `.await`, so it drains the tracker and, if anything remains, **spawns a
-/// detached `tokio::task`** to run the `didClose`s. A detached task is NOT a
-/// child of the aborted future, so it survives the parent's cancellation and runs
-/// the `close_scratch_document` calls to completion — which is also why
-/// `close_scratch_document` can keep its untrack-before-didClose ordering (the
-/// detached task guarantees the didClose await still completes).
+/// `Drop` cannot `.await`, so it drains the tracker and, if anything remains,
+/// **spawns a detached `tokio::task`** to run the `didClose`s. A detached task is
+/// NOT a child of the (possibly aborted) future, so it survives the parent's
+/// cancellation and runs the `close_scratch_document` calls to completion — which
+/// is also why `close_scratch_document` can keep its untrack-before-didClose
+/// ordering (the detached task guarantees the didClose await still completes,
+/// even on the abort path, so it can never orphan a downstream doc).
 struct ScratchCleanupGuard {
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
     host_uri: url::Url,
@@ -583,33 +575,6 @@ fn lock_open_scratch(
     open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
 ) -> std::sync::MutexGuard<'_, Vec<OpenScratchDoc>> {
     open.lock().recover_poison("scratch-document tracker")
-}
-
-/// Close every scratch document still tracked as open. Used on both the
-/// completed and cancelled paths so a cancel that drops an in-flight step never
-/// leaves its scratch virtual document open downstream.
-async fn close_remaining_scratch_docs(
-    pool: &crate::lsp::bridge::LanguageServerPool,
-    host_uri: &url::Url,
-    open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
-) {
-    // Peek-close-remove, one doc at a time: clone the last tracked doc WITHOUT
-    // removing it, close it, then remove it only after the close completes. If
-    // this sweep is itself cancelled mid-`.await`, the in-flight doc is still
-    // tracked, so `ScratchCleanupGuard` (which drains on drop) still catches it —
-    // zero leak, not even the single in-flight doc that a pop-then-close would
-    // drop. The lock guards are scoped to their `let`/block so the non-`Send`
-    // `MutexGuard` never crosses the `.await` (keeping the region task `Send`).
-    loop {
-        let next = {
-            let guard = lock_open_scratch(open);
-            guard.last().cloned()
-        };
-        let Some(doc) = next else { break };
-        pool.close_scratch_document(host_uri, &doc.uri, &doc.server_name)
-            .await;
-        lock_open_scratch(open).retain(|d| d.uri != doc.uri);
-    }
 }
 
 /// Derive a unique scratch `region_id` for one step of the concatenated
@@ -933,8 +898,8 @@ mod tests {
 
     #[test]
     fn open_scratch_tracker_drains_what_was_pushed() {
-        // The cancel-path sweep relies on draining everything that was recorded
-        // open but never removed by a per-step close.
+        // The guard's Drop relies on draining everything that was recorded open
+        // but never removed by a per-step close.
         let open = std::sync::Mutex::new(Vec::new());
         push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
         push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
@@ -948,9 +913,9 @@ mod tests {
     }
 
     #[test]
-    fn open_scratch_tracker_accumulates_every_step_for_the_sweep() {
-        // Steps only register their scratch docs; the post-select sweep is the
-        // single close point, so every pushed doc must still be present to drain.
+    fn open_scratch_tracker_accumulates_every_step_for_the_guard() {
+        // Steps only register their scratch docs; the guard's Drop is the single
+        // close point, so every pushed doc must still be present to drain.
         let open = std::sync::Mutex::new(Vec::new());
         push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
         push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
@@ -958,15 +923,15 @@ mod tests {
         assert_eq!(
             drained.len(),
             2,
-            "the sweep must see every step's scratch doc"
+            "the guard must see every step's scratch doc"
         );
     }
 
     #[tokio::test]
     async fn scratch_cleanup_guard_drains_tracker_on_drop() {
-        // The guard is the safety net for the abort-before-sweep case: if the
-        // dispatch future is aborted before the explicit sweep runs, the guard's
-        // Drop must drain the tracker (and detach the didClose), so no scratch
+        // The guard is the sole scratch cleanup path: on every exit from the
+        // dispatch future (normal return, select! cancel, or future-level abort)
+        // its Drop must drain the tracker (and detach the didClose), so no scratch
         // doc leaks. Here we assert the drain-on-drop: the tracker is emptied.
         let open = Arc::new(std::sync::Mutex::new(Vec::new()));
         push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
@@ -980,35 +945,7 @@ mod tests {
 
         assert!(
             lock_open_scratch(&open).is_empty(),
-            "guard Drop must drain the tracker so nothing leaks on abort-before-sweep"
-        );
-    }
-
-    #[tokio::test]
-    async fn scratch_cleanup_guard_drop_is_noop_after_explicit_sweep() {
-        // Normal path: the explicit awaited sweep drains the tracker first, so the
-        // guard's Drop sees an empty tracker and does nothing — the sweep and the
-        // guard can never double-close.
-        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
-        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
-
-        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::new());
-        let host = url::Url::parse("file:///d.md").unwrap();
-        let guard = ScratchCleanupGuard::new(Arc::clone(&pool), host.clone(), Arc::clone(&open));
-
-        // Explicit sweep (the deterministic cleanup the normal/select-cancel paths
-        // run) drains the tracker.
-        close_remaining_scratch_docs(&pool, &host, &open).await;
-        assert!(
-            lock_open_scratch(&open).is_empty(),
-            "explicit sweep must drain the tracker"
-        );
-
-        // Guard Drop now sees an empty tracker → no-op, so no double-close.
-        drop(guard);
-        assert!(
-            lock_open_scratch(&open).is_empty(),
-            "guard Drop after sweep must remain a no-op"
+            "guard Drop must drain the tracker so nothing leaks"
         );
     }
 
