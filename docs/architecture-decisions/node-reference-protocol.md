@@ -48,11 +48,11 @@ All methods carry a `TextDocumentIdentifier` even when an `id` (ULID) is provide
 ```typescript
 type NodeInfo = {
   id: string;    // ULID issued per lazy-node-identity-tracking
-  type: string;  // tree-sitter node type (e.g., "fenced_code_block")
+  kind: string;  // tree-sitter node kind (e.g., "fenced_code_block")
 };
 ```
 
-The field is named `type` (matching the tree-sitter web binding) rather than `kind` (the Rust binding). Kakehashi's LSP API surface is consumed predominantly by editor plugins in TypeScript/JavaScript, where `node.type` is the established convention. LSP's own `*Kind` types denote fixed enums (e.g., `SymbolKind.Function = 12`), whereas this field carries an open grammar-derived string — semantically closer to a structural "type" than to an enumerated "kind".
+The field is named `kind`, matching the Rust binding (`node.kind()`) that the server is built on. Keeping the wire name aligned with the implementation removes the type/kind translation at the serialization boundary and keeps the protocol vocabulary consistent with the rest of Kakehashi, which already speaks of a node's `(start, end, kind)` triple throughout the tracker and injection layers.
 
 Positional information (`range`) is **intentionally omitted** for two reasons:
 
@@ -61,7 +61,7 @@ Positional information (`range`) is **intentionally omitted** for two reasons:
 
 The cost is N+1 round trips for clients that need ranges of every child, accepted as an explicit trade-off. A bulk endpoint (e.g., `childrenWithRange`) may be added later if profiling shows it is needed.
 
-Namedness (`is_named()`) is likewise **not** a field on `NodeInfo`. Named-vs-anonymous is expressed through *selection* — the `namedOnly` parameter and the `namedChildren` method below — rather than reported per node, because the round-trip-sensitive use cases all want to *select* named nodes, not to *introspect* one already in hand. A `named: boolean` field remains available as a future addition: unlike `range` it is intrinsic, immutable, and one byte, so it would belong inline alongside `type` rather than behind its own endpoint. It is deferred until a concrete consumer needs to label nodes it already holds (e.g. a nearest-named-ancestor `parent` walk) — see Alternatives.
+Namedness (`is_named()`) is likewise **not** a field on `NodeInfo`. Named-vs-anonymous is expressed through *selection* — the `namedOnly` parameter and the `namedChildren` method below — rather than reported per node, because the round-trip-sensitive use cases all want to *select* named nodes, not to *introspect* one already in hand. A `named: boolean` field remains available as a future addition: unlike `range` it is intrinsic, immutable, and one byte, so it would belong inline alongside `kind` rather than behind its own endpoint. It is deferred until a concrete consumer needs to label nodes it already holds (e.g. a nearest-named-ancestor `parent` walk) — see Alternatives.
 
 ### Entry-Point Method: `kakehashi/node`
 
@@ -75,7 +75,7 @@ Namedness (`is_named()`) is likewise **not** a field on `NodeInfo`. Named-vs-ano
 }
 
 // Response: NodeInfo | null
-{ "id": "01HX...", "type": "fenced_code_block" }
+{ "id": "01HX...", "kind": "fenced_code_block" }
 ```
 
 **Resolution rule**: Returns the **smallest (deepest) node** containing `position` at the selected injection layer. With `namedOnly` absent or `false`, this is the smallest named *or anonymous* node (`descendant_for_byte_range`); with `namedOnly: true`, it is the smallest *named* node (`named_descendant_for_byte_range`) — see The `namedOnly` Parameter below. Returns `null` when the position is outside the document or the requested injection layer does not exist at that position.
@@ -345,7 +345,7 @@ Split the entry point into anonymous-inclusive and named-only methods instead of
 |--------|----------|
 | **Methods** | `kakehashi/node`, `/parent`, `/children`, `/namedChildren`, `/text` |
 | **Common params** | All methods carry `TextDocumentIdentifier` |
-| **`NodeInfo` shape** | `{ id, type }` (no range, no `named` — both deferred) |
+| **`NodeInfo` shape** | `{ id, kind }` (no range, no `named` — both deferred) |
 | **Entry resolution** | Smallest containing node at selected injection layer |
 | **Injection selector** | `boolean \| number`, default `false` |
 | **Named selection** | `namedOnly` param on entry (`named_descendant_for_byte_range`); `namedChildren` method (`named_children()`); no `parent` variant (tree-sitter has no `named_parent`) |

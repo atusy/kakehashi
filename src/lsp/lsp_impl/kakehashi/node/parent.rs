@@ -125,7 +125,7 @@ impl Kakehashi {
 
         Ok(json!({
             "id": parent_ulid.to_string(),
-            "type": p_kind,
+            "kind": p_kind,
         }))
     }
 }

@@ -131,7 +131,7 @@ impl Kakehashi {
                     tracker.get_or_create_in_layer(&uri, c_start, c_end, c_kind, layer);
                 json!({
                     "id": child_ulid.to_string(),
-                    "type": c_kind,
+                    "kind": c_kind,
                 })
             })
             .collect();
