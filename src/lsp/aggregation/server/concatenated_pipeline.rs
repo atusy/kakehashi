@@ -42,11 +42,17 @@ use crate::text::edit::apply_text_edits;
 ///   earlier successful steps.
 ///
 /// Returns `Some(final_text)` only when at least one server applied a non-empty
-/// edit **and** the resulting text is not byte-identical to `initial_text`;
+/// edit **and** the resulting text is not byte-identical to the original;
 /// otherwise `None`, so the caller emits no edit. Byte-equality with the
 /// original — not merely "some step returned edits" — is the "no change" signal,
 /// so a formatter that returns edits which round-trip to identical content does
 /// not produce a pointless whole-region replacement.
+///
+/// The original text is captured **lazily**: it is only cloned right before the
+/// first non-empty edit is applied (at which point `accumulated` still equals the
+/// original, since every prior step was a no-op that returned the text
+/// unchanged). The common "already formatted" case — where no step ever applies a
+/// non-empty edit — therefore never clones the text at all.
 pub(crate) async fn run_sequential_format_pipeline<F, Fut>(
     initial_text: String,
     server_names: &[String],
@@ -56,16 +62,18 @@ where
     F: Fn(String, String) -> Fut,
     Fut: Future<Output = (String, Option<Vec<TextEdit>>)>,
 {
-    // Keep one copy of the original text for the final equality check. The
-    // working copy is moved through each step (no per-step clone); `applied`
-    // skips the comparison entirely in the common case where no step produced a
-    // non-empty edit. The comparison matters because a step can return non-empty
-    // edits that nonetheless round-trip to byte-identical text (a formatter
-    // reformatting already-conformant code); without it the caller would emit a
-    // pointless whole-region replacement with identical content.
-    let original = initial_text.clone();
+    // The working copy is moved through each step (no per-step clone). The
+    // original is captured lazily into `original` only when the first non-empty
+    // edit is about to be applied — at that moment `accumulated` still equals the
+    // original (every prior step was a no-op that returned the text unchanged), so
+    // cloning it then is equivalent to cloning `initial_text` up front but avoids
+    // the clone entirely in the common "already formatted" case (no step ever
+    // applies a non-empty edit). The comparison matters because a step can return
+    // non-empty edits that nonetheless round-trip to byte-identical text (a
+    // formatter reformatting already-conformant code); without it the caller would
+    // emit a pointless whole-region replacement with identical content.
     let mut accumulated = initial_text;
-    let mut applied = false;
+    let mut original: Option<String> = None;
 
     for server_name in server_names {
         // Move the accumulated text into the step and take it back out — no
@@ -74,7 +82,11 @@ where
         accumulated = match result {
             // A non-empty edit list is the only thing that can change the text.
             Some(edits) if !edits.is_empty() => {
-                applied = true;
+                // Capture the original just before the first applied edit, while
+                // `text` still equals the original text.
+                if original.is_none() {
+                    original = Some(text.clone());
+                }
                 apply_text_edits(&text, &edits)
             }
             // Empty edits ("already formatted") or `None` (failed/unsupported
@@ -83,11 +95,11 @@ where
         };
     }
 
-    // Emit `Some` only when an edit was applied AND the bytes actually differ.
-    if applied && accumulated != original {
-        Some(accumulated)
-    } else {
-        None
+    // Emit `Some` only when an edit was captured-and-applied AND the bytes
+    // actually differ from the captured original.
+    match original {
+        Some(original) if accumulated != original => Some(accumulated),
+        _ => None,
     }
 }
 
