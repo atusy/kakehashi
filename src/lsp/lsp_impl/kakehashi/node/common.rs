@@ -112,8 +112,14 @@ impl Kakehashi {
         lsp_uri: &Uri,
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> R,
-    ) -> Option<(usize, R)> {
-        let uri = uri_to_url(lsp_uri).ok()?;
+    ) -> Option<(url::Url, usize, R)> {
+        // An unparseable URI signals a misbehaving client; warn for parity with
+        // `node` / `node/text` / `node/parent` / `node/children` while still
+        // collapsing to `null`.
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!(target: "kakehashi::node", "invalid URI: {}", lsp_uri.as_str());
+            return None;
+        };
 
         // Malformed ULID collapses to null, like a never-issued id.
         let ulid = id.parse::<Ulid>().ok()?;
@@ -129,6 +135,15 @@ impl Kakehashi {
         // Snapshot so we operate on a consistent (text, tree) pair.
         let snapshot = self.documents.get(&uri).and_then(|doc| doc.snapshot())?;
         let host_text = snapshot.text();
+
+        // Defensively reject an invalid or out-of-bounds tracked range before any
+        // tree work: an inverted range or one extending past the current text
+        // can't name a real node (and could panic byte slicing downstream). This
+        // collapses to `null` like the other not-found cases.
+        if start > end || end > host_text.len() {
+            return None;
+        }
+
         let host_tree = snapshot.tree();
         let host_language = self.document_language(&uri)?;
 
@@ -156,7 +171,7 @@ impl Kakehashi {
             );
             return None;
         };
-        Some((layer, result))
+        Some((uri, layer, result))
     }
 
     /// Resolve `id`, run `f` to pick a single related node (child, sibling,
@@ -174,15 +189,10 @@ impl Kakehashi {
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple>,
     ) -> Value {
-        let Some((layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
+        let Some((uri, layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
             return Value::Null;
         };
         let Some((start, end, kind)) = picked else {
-            return Value::Null;
-        };
-        // `uri_to_url` already succeeded inside `with_node_by_id`; re-deriving is
-        // cheap and infallible here, avoiding threading the `Url` back out.
-        let Ok(uri) = uri_to_url(lsp_uri) else {
             return Value::Null;
         };
         let ulid = self
@@ -204,10 +214,7 @@ impl Kakehashi {
         id: &str,
         f: impl FnMut(tree_sitter::Node<'_>) -> Vec<NodeTriple>,
     ) -> Value {
-        let Some((layer, items)) = self.with_node_by_id(lsp_uri, id, f).await else {
-            return Value::Null;
-        };
-        let Ok(uri) = uri_to_url(lsp_uri) else {
+        let Some((uri, layer, items)) = self.with_node_by_id(lsp_uri, id, f).await else {
             return Value::Null;
         };
         let tracker = self.bridge.node_tracker();

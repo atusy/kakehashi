@@ -480,7 +480,8 @@ fn test_field_name_lookups_on_python_assignment() {
     let uri = "file:///accessors_field_python.md";
     open_markdown(&mut client, uri, MARKDOWN_WITH_PYTHON);
 
-    // Saturate into the python layer at the `=` on line 3.
+    // Saturate into the python layer inside `y = 1 + 2` on line 3 (character 4
+    // is the `1`, which is unambiguously within the python tree).
     let py = call(
         &mut client,
         "kakehashi/node",

@@ -32,7 +32,7 @@ macro_rules! scalar_accessor {
         let value = $self
             .with_node_by_id(&$params.text_document.uri, &$params.id, $f)
             .await
-            .map(|(_layer, v)| json!({ $field: v }))
+            .map(|(_uri, _layer, v)| json!({ $field: v }))
             .unwrap_or(Value::Null);
         Ok(value)
     }};
@@ -102,7 +102,7 @@ impl Kakehashi {
                 |n| json!({ "startByte": n.start_byte(), "endByte": n.end_byte() }),
             )
             .await
-            .map(|(_layer, v)| v)
+            .map(|(_uri, _layer, v)| v)
             .unwrap_or(Value::Null);
         Ok(value)
     }
