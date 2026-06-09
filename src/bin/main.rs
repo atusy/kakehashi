@@ -658,6 +658,100 @@ async fn run_lsp_server() {
         "kakehashi/node/children",
         Kakehashi::kakehashi_node_children,
     )
+    // Scalar accessors (node-reference-protocol) — mirror tree-sitter `Node`.
+    .custom_method("kakehashi/node/kind", Kakehashi::kakehashi_node_kind)
+    .custom_method(
+        "kakehashi/node/grammarName",
+        Kakehashi::kakehashi_node_grammar_name,
+    )
+    .custom_method("kakehashi/node/isNamed", Kakehashi::kakehashi_node_is_named)
+    .custom_method("kakehashi/node/isExtra", Kakehashi::kakehashi_node_is_extra)
+    .custom_method(
+        "kakehashi/node/hasError",
+        Kakehashi::kakehashi_node_has_error,
+    )
+    .custom_method("kakehashi/node/isError", Kakehashi::kakehashi_node_is_error)
+    .custom_method(
+        "kakehashi/node/isMissing",
+        Kakehashi::kakehashi_node_is_missing,
+    )
+    .custom_method(
+        "kakehashi/node/startByte",
+        Kakehashi::kakehashi_node_start_byte,
+    )
+    .custom_method("kakehashi/node/endByte", Kakehashi::kakehashi_node_end_byte)
+    .custom_method(
+        "kakehashi/node/byteRange",
+        Kakehashi::kakehashi_node_byte_range,
+    )
+    .custom_method(
+        "kakehashi/node/childCount",
+        Kakehashi::kakehashi_node_child_count,
+    )
+    .custom_method(
+        "kakehashi/node/namedChildCount",
+        Kakehashi::kakehashi_node_named_child_count,
+    )
+    .custom_method(
+        "kakehashi/node/descendantCount",
+        Kakehashi::kakehashi_node_descendant_count,
+    )
+    .custom_method("kakehashi/node/toSexp", Kakehashi::kakehashi_node_to_sexp)
+    // Tree-walking accessors (node-reference-protocol).
+    .custom_method("kakehashi/node/child", Kakehashi::kakehashi_node_child)
+    .custom_method(
+        "kakehashi/node/namedChild",
+        Kakehashi::kakehashi_node_named_child,
+    )
+    .custom_method(
+        "kakehashi/node/namedChildren",
+        Kakehashi::kakehashi_node_named_children,
+    )
+    .custom_method(
+        "kakehashi/node/nextSibling",
+        Kakehashi::kakehashi_node_next_sibling,
+    )
+    .custom_method(
+        "kakehashi/node/prevSibling",
+        Kakehashi::kakehashi_node_prev_sibling,
+    )
+    .custom_method(
+        "kakehashi/node/nextNamedSibling",
+        Kakehashi::kakehashi_node_next_named_sibling,
+    )
+    .custom_method(
+        "kakehashi/node/prevNamedSibling",
+        Kakehashi::kakehashi_node_prev_named_sibling,
+    )
+    .custom_method(
+        "kakehashi/node/firstChildForByte",
+        Kakehashi::kakehashi_node_first_child_for_byte,
+    )
+    .custom_method(
+        "kakehashi/node/descendantForByteRange",
+        Kakehashi::kakehashi_node_descendant_for_byte_range,
+    )
+    .custom_method(
+        "kakehashi/node/namedDescendantForByteRange",
+        Kakehashi::kakehashi_node_named_descendant_for_byte_range,
+    )
+    // Field-aware accessors (node-reference-protocol).
+    .custom_method(
+        "kakehashi/node/childByFieldName",
+        Kakehashi::kakehashi_node_child_by_field_name,
+    )
+    .custom_method(
+        "kakehashi/node/childrenByFieldName",
+        Kakehashi::kakehashi_node_children_by_field_name,
+    )
+    .custom_method(
+        "kakehashi/node/fieldNameForChild",
+        Kakehashi::kakehashi_node_field_name_for_child,
+    )
+    .custom_method(
+        "kakehashi/node/fieldNameForNamedChild",
+        Kakehashi::kakehashi_node_field_name_for_named_child,
+    )
     .finish();
 
     // Wrap service with RequestIdCapture to:

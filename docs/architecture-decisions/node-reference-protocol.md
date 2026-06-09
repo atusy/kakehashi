@@ -43,6 +43,8 @@ These reduce to a small set of primitives: **identify a node at a position**, **
 
 All methods carry a `TextDocumentIdentifier` even when an `id` (ULID) is provided. While ULIDs are globally unique by construction, the `textDocument` field keeps the protocol aligned with LSP conventions, allows the server to route directly to the correct per-URI tracker, and lets the server reject mismatched (`uri`, `id`) pairs as `null` instead of silently querying another document.
 
+Beyond these core methods, a family of **node accessor methods** mirrors tree-sitter's [`Node`](https://docs.rs/tree-sitter/latest/tree_sitter/struct.Node.html) API one-for-one (`kind`, `childCount`, `child`, `nextSibling`, `childByFieldName`, …) so clients can introspect and walk the tree without bundling tree-sitter — see [Node Accessor Methods](#node-accessor-methods).
+
 ### `NodeInfo` Type
 
 ```typescript
@@ -203,6 +205,63 @@ This holds even when a host node and an injected node share an identical span **
 
 **No `namedParent`**: `parent` has no named-only variant, because tree-sitter's `Node` has no `named_parent` — `parent()` is singular. A client wanting the nearest *named* ancestor walks `parent` and stops at the first named node. Knowing which nodes are named for that walk is the one case that would motivate a `named` field on `NodeInfo` (mirroring `is_named()`); it is deferred until such a consumer exists (see Alternatives).
 
+### Node Accessor Methods
+
+To let clients introspect and walk the tree without re-implementing tree-sitter, the protocol exposes an accessor family mirroring [`tree_sitter::Node`](https://docs.rs/tree-sitter/latest/tree_sitter/struct.Node.html) method-for-method. Every accessor takes `{ textDocument, id }` (plus, where the tree-sitter method does, an `index` / `name` / `byte` / `startByte` + `endByte`) and resolves the held ULID **in the layer that minted it**, so the per-layer Scope rule holds uniformly: results of a navigation accessor are re-minted in the same layer as the input node.
+
+**Scalar accessors** return a single-field object (matching `text`'s `{ "text": ... }` shape — self-describing and additively extensible), or top-level `null` for an unresolvable id:
+
+| Method | Response | tree-sitter |
+|---|---|---|
+| `kind` | `{ "kind": string }` | `kind()` |
+| `grammarName` | `{ "grammarName": string }` | `grammar_name()` |
+| `isNamed` / `isExtra` | `{ "isNamed": bool }` / `{ "isExtra": bool }` | `is_named()` / `is_extra()` |
+| `hasError` / `isError` / `isMissing` | `{ "hasError": bool }` … | `has_error()` / `is_error()` / `is_missing()` |
+| `startByte` / `endByte` | `{ "startByte": int }` / `{ "endByte": int }` | `start_byte()` / `end_byte()` |
+| `byteRange` | `{ "startByte": int, "endByte": int }` | `byte_range()` |
+| `childCount` / `namedChildCount` | `{ "childCount": int }` … | `child_count()` / `named_child_count()` |
+| `descendantCount` | `{ "descendantCount": int }` | `descendant_count()` |
+| `toSexp` | `{ "sexp": string }` | `to_sexp()` |
+
+**Byte offsets are UTF-8** in host-document coordinates — tree-sitter's native space, the same one `text` slices and the byte-input accessors consume. This deliberately differs from `Position.character` (UTF-16); line/column reporting is the deferred `range` design below.
+
+**Navigation accessors** return `NodeInfo | null` (single) or `NodeInfo[] | null` (list — `null` only for an unresolvable id; an empty relation yields `[]`):
+
+| Method | Response | tree-sitter |
+|---|---|---|
+| `child` / `namedChild` (`index`) | `NodeInfo \| null` | `child(i)` / `named_child(i)` |
+| `namedChildren` | `NodeInfo[] \| null` | `named_children()` |
+| `nextSibling` / `prevSibling` | `NodeInfo \| null` | `next_sibling()` / `prev_sibling()` |
+| `nextNamedSibling` / `prevNamedSibling` | `NodeInfo \| null` | `next_named_sibling()` / `prev_named_sibling()` |
+| `firstChildForByte` (`byte`) | `NodeInfo \| null` | `first_child_for_byte(b)` |
+| `descendantForByteRange` (`startByte`, `endByte`) | `NodeInfo \| null` | `descendant_for_byte_range(s, e)` |
+| `namedDescendantForByteRange` (`startByte`, `endByte`) | `NodeInfo \| null` | `named_descendant_for_byte_range(s, e)` |
+
+Out-of-range / negative `index` or `byte` values collapse to `null` rather than erroring, consistent with the universal null semantics.
+
+**Field accessors** expose the name-keyed half of tree-sitter's field API:
+
+| Method | Response | tree-sitter |
+|---|---|---|
+| `childByFieldName` (`name`) | `NodeInfo \| null` | `child_by_field_name(name)` |
+| `childrenByFieldName` (`name`) | `NodeInfo[] \| null` | `children_by_field_name(name)` |
+| `fieldNameForChild` (`index`) | `{ "fieldName": string \| null } \| null` | `field_name_for_child(i)` |
+| `fieldNameForNamedChild` (`index`) | `{ "fieldName": string \| null } \| null` | `field_name_for_named_child(i)` |
+
+For `fieldNameFor*`, top-level `null` means the *id* is unresolvable, while `{ "fieldName": null }` means the node resolved but that child carries no field — the two are deliberately distinguished.
+
+#### Deferred accessors
+
+The following tree-sitter methods are **intentionally not implemented yet** because each carries a design decision that should be settled before freezing it on the wire. Each is tracked as an issue:
+
+| Method(s) | Open question | Issue |
+|---|---|---|
+| `range`, `startPosition`, `endPosition`, `descendantForPointRange`, `namedDescendantForPointRange` | tree-sitter `Point.column` is a UTF-8 byte column; LSP `Position.character` is UTF-16. Whether to return / accept native byte points or convert to LSP positions is the `kakehashi/node/range` endpoint design (see Alternative C). | [#331](https://github.com/atusy/kakehashi/issues/331) |
+| `language` | tree-sitter's `LanguageRef` carries no registered name; what to return (registered name? abi version?) and how to thread the layer's resolved language out is unresolved. | [#332](https://github.com/atusy/kakehashi/issues/332) |
+| `hasChanges` | Reflects pending `Tree::edit` state before a reparse. Kakehashi always serves freshly-parsed trees, so this would always be `false` — meaningless until/unless incremental reparsing is wired in. | [#333](https://github.com/atusy/kakehashi/issues/333) |
+| `childrenByFieldId` | Field **ids** are opaque, grammar-version-specific `u16`s. Exposing them raw invites version-coupling; clients should likely use field *names*. | [#334](https://github.com/atusy/kakehashi/issues/334) |
+| `childWithDescendant` | Takes a second node (the descendant) as an argument, requiring a two-id request whose both ids must resolve in the same layer — a richer contract than the other accessors. | [#335](https://github.com/atusy/kakehashi/issues/335) |
+
 ### Text Resolution: `kakehashi/node/text`
 
 ```jsonc
@@ -333,7 +392,7 @@ Split the entry point into anonymous-inclusive and named-only methods instead of
 ## Implementation Notes
 
 - Methods are registered via `LspService::build().custom_method(...)` in `src/bin/main.rs`, following the existing `kakehashi/internal/effectiveConfiguration` pattern
-- Handlers live under `src/lsp/lsp_impl/kakehashi/node/` (one file per method) for symmetry with `kakehashi/internal/`
+- Handlers live under `src/lsp/lsp_impl/kakehashi/node/`. The core methods keep one file each (`entry`, `text`, `parent`, `children`); the accessor family is grouped by category (`metadata`, `navigation`, `field`) since each method shrinks to a few lines over the shared `common` prelude (`with_node_by_id` / `navigate_to_node` / `navigate_to_nodes`), which centralises URI/ULID resolution, parse-readiness, snapshotting, and per-layer node resolution
 - The entry point resolves `namedOnly` by switching `descendant_for_byte_range` → `named_descendant_for_byte_range` at the selected layer's tree; the end-of-document exception walks the right spine to the deepest node ending at `L`, restricted to named nodes when `namedOnly` is set
 - `namedChildren` reuses the `children` handler's tracker-minting path over `Node::named_children` instead of `Node::children`
 - `NodeTracker` (`src/language/node_tracker.rs`) backs all four id-based methods via a per-URI bidirectional index — forward (`PositionKey → Ulid`) for minting/dedup, reverse (`Ulid → PositionKey`) for resolving a held ULID back to a node range; see lazy-node-identity-tracking
