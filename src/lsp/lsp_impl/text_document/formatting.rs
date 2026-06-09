@@ -643,11 +643,12 @@ fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
 /// blockquoted regions still drop host indentation on replacement lines — the
 /// same limitation documented in `src/lsp/bridge/text_document/formatting.rs`.
 fn region_replacement_range(original_virtual: &str, offset: &RegionOffset) -> Option<Range> {
-    // Virtual end position = the position of the very last byte, derived via the
-    // shared PositionMapper so line-ending handling (incl. `\r\n`) and UTF-16
-    // column math stay consistent with the rest of the codebase. Computed from
-    // the original virtual text *before* it is moved into the pipeline, so the
-    // pipeline takes ownership without a second clone.
+    // Virtual end position = the position one past the last byte (EOF), derived
+    // via the shared PositionMapper from `original_virtual.len()` so line-ending
+    // handling (incl. `\r\n`) and UTF-16 column math stay consistent with the rest
+    // of the codebase. Computed from the original virtual text *before* it is
+    // moved into the pipeline, so the pipeline takes ownership without a second
+    // clone.
     let end = crate::text::PositionMapper::new(original_virtual)
         .byte_to_position(original_virtual.len())?;
 

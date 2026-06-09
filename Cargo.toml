@@ -2,11 +2,6 @@
 name = "kakehashi"
 version = "0.5.0"
 edition = "2024"
-# MSRV: edition 2024 needs >= 1.85, and the code uses `str::floor_char_boundary`
-# (stable since 1.95). This declares the minimum supported Rust — Cargo fails
-# fast with a clear error on an older toolchain. It does not select a toolchain
-# (there's no rust-toolchain file); CI still runs whatever Rust is installed.
-rust-version = "1.95"
 
 [[bin]]
 name = "kakehashi"
