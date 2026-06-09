@@ -134,15 +134,19 @@ impl Kakehashi {
             let options = options.clone();
             let region_cancel_rx = cancel_state.derive_receiver();
 
-            // `strategy: "concatenated"` with a non-empty priorities list opts
-            // this region into the sequential formatter pipeline
-            // (concatenated-formatting-pipeline): run the priority-listed
-            // servers serially, each formatting the prior server's output, then
-            // emit one region-replacement edit. Everything else (default
-            // `preferred`, or `concatenated` with no priorities — a
-            // misconfiguration) keeps the existing first-non-empty-wins path.
+            // `strategy: "concatenated"` with a non-empty *effective* priorities
+            // list opts this region into the sequential formatter pipeline
+            // (concatenated-formatting-pipeline): run the priority-listed servers
+            // serially, each formatting the prior server's output, then emit one
+            // region-replacement edit. Gating on `effective_priorities` (not the
+            // raw `priorities`) means a list of only unknown/typo'd server names
+            // falls through to the `preferred` path — which still uses the
+            // region's configured servers — rather than entering the pipeline and
+            // formatting nothing. Default `preferred`, or `concatenated` with no
+            // effective priorities, keeps the first-non-empty-wins path.
+            let pipeline_servers = effective_priorities(&region_ctx);
             let use_concatenated = region_ctx.strategy == AggregationStrategy::Concatenated
-                && !region_ctx.priorities.is_empty();
+                && !pipeline_servers.is_empty();
 
             outer_join_set.spawn(async move {
                 if use_concatenated {
@@ -150,6 +154,7 @@ impl Kakehashi {
                         &region_ctx,
                         pool.clone(),
                         options,
+                        pipeline_servers,
                         region_cancel_rx,
                     )
                     .await
@@ -253,6 +258,9 @@ async fn dispatch_concatenated_formatting(
     region_ctx: &DocumentRequestContext,
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
     options: tower_lsp_server::ls_types::FormattingOptions,
+    // The effective (configured, deduped, order-preserving) priority list,
+    // computed by the caller — which also gates entry on it being non-empty.
+    server_names: Vec<String>,
     cancel_rx: Option<CancelReceiver>,
 ) -> Option<Vec<TextEdit>> {
     let offset = RegionOffset::with_per_line_offsets(
@@ -269,11 +277,6 @@ async fn dispatch_concatenated_formatting(
     let region_id = region_ctx.resolved.region.region_id.clone();
     let uri = region_ctx.uri.clone();
     let upstream_id = region_ctx.upstream_request_id.clone();
-
-    // `priorities` is both the membership allowlist and the application order;
-    // `effective_priorities` keeps only entries configured for this region —
-    // shared with the preferred fan-out so the rule has one source of truth.
-    let server_names = effective_priorities(region_ctx);
 
     let server_config_for = |name: &str| {
         region_ctx
