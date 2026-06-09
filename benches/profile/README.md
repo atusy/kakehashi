@@ -13,9 +13,16 @@ quantifies.
 
 ```sh
 cargo install samply inferno          # one-time
+cargo test --features e2e             # one-time: populate deps/test/kakehashi with parsers
 benches/profile/profile.sh --lang rust --size 150 --requests 150
-# -> /tmp/kakehashi-profile/flamegraph.svg  (+ a top-functions report on stdout)
+# -> $TMPDIR/kakehashi-profile/flamegraph.svg  (+ a top-functions report on stdout)
 ```
+
+The harness drives the server against `deps/test/kakehashi` for parsers/queries.
+If that dir has no installed parsers, the server auto-installs on the first
+request (slow, needs network) and the profile is dominated by install work —
+`profile.sh` warns when the `.installed` marker is missing. Running the test
+suite (or `make deps/tree-sitter`) once populates it.
 
 ## Why it's shaped this way
 

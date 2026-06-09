@@ -27,7 +27,11 @@ def main() -> None:
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
-    ap.add_argument("--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"))
+    ap.add_argument(
+        "--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
+        help="parser/query data dir; must already contain installed parsers "
+             "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
+             "else the server auto-installs on first request")
     args = ap.parse_args()
 
     if args.lang == "rust":
@@ -95,7 +99,13 @@ def main() -> None:
     for _ in range(args.requests):
         resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
         if "error" in resp:
-            canceled += 1
+            # Only -32800 (request cancelled) is expected here; any other error
+            # means a broken setup that would make the profile meaningless, so
+            # surface it instead of silently counting it as a cancellation.
+            if resp["error"].get("code") == -32800:
+                canceled += 1
+            else:
+                raise RuntimeError(f"server error (not a cancellation): {resp['error']}")
         else:
             ok += 1
             # `result` may be null (the server can answer Ok(None)); `or {}`

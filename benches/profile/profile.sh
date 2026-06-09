@@ -22,7 +22,11 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 for tool in samply inferno-flamegraph dsymutil atos python3; do
   command -v "$tool" >/dev/null 2>&1 || {
-    echo "error: required tool '$tool' not found (try: cargo install samply inferno)." >&2
+    case "$tool" in
+      dsymutil|atos) hint="install Xcode Command Line Tools: xcode-select --install";;
+      *) hint="cargo install samply inferno";;
+    esac
+    echo "error: required tool '$tool' not found ($hint)." >&2
     exit 1
   }
 done
@@ -47,6 +51,15 @@ ARCH="$(uname -m)"
 # users on a shared machine don't collide on a world-writable /tmp path.
 OUT="${TMPDIR:-/tmp}/kakehashi-profile"
 mkdir -p "$OUT"
+
+# The driver points the server at deps/test/kakehashi for parsers/queries. If it
+# isn't populated the server auto-installs on first request (slow, needs network)
+# and the profile is dominated by install work — warn so it's not a surprise.
+if [ ! -f "deps/test/kakehashi/.installed" ]; then
+  echo "warning: deps/test/kakehashi has no installed parsers; run" >&2
+  echo "         'cargo test --features e2e' or 'make deps/tree-sitter' first," >&2
+  echo "         else the first profiling request will auto-install (slow)." >&2
+fi
 
 echo "==> Building profiling binary (optimized + debug symbols)"
 cargo build --profile profiling --bin kakehashi
