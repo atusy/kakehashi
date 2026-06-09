@@ -44,9 +44,9 @@ a region shifts that region's position in the host document.
 
 ## Decision
 
-Wire the injection token cache into the hot path with **region-local
-`RawToken`s** as the cached representation, re-anchored to host coordinates at
-reuse time, and re-entering the pipeline *before* `finalize_tokens`.
+Wire the injection token cache into the hot path with **region-local `RawToken`s**
+as the cached representation, re-anchored to host coordinates at reuse time, and
+re-entering the pipeline *before* `finalize_tokens`.
 
 Per request, in `collect_injection_tokens_parallel`:
 

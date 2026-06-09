@@ -365,10 +365,11 @@ enum Kind {
 }
 
 /// Mutable per-run state for [`Kind::EditDelta`]: the next `didChange` version,
-/// an edit counter (parity selects insert vs delete), and the line edited.
+/// whether the next edit inserts (vs deletes) — flips each iteration to toggle —
+/// and the line edited.
 struct EditState {
     version: i64,
-    count: u64,
+    insert_next: bool,
     line: u32,
 }
 
@@ -409,7 +410,8 @@ fn measure(
     // middle of the document (representative of typical cursor position).
     let mut edit = EditState {
         version: 1,
-        count: 0,
+        // First edit must insert (the document opens with no extra space).
+        insert_next: true,
         line: (scn.content.lines().count() / 2) as u32,
     };
 
@@ -455,8 +457,8 @@ fn run_once(
         }
         Kind::EditDelta => {
             // Apply one toggle edit, then request a delta against the prior id.
-            let insert = edit.count.is_multiple_of(2);
-            edit.count += 1;
+            let insert = edit.insert_next;
+            edit.insert_next = !edit.insert_next;
             edit.version += 1;
             server.did_change_toggle(scn.uri, edit.version, edit.line, insert);
             // Fall back to a full request if we don't yet have a valid id
