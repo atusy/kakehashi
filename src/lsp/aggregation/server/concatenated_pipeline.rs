@@ -22,13 +22,16 @@ use crate::text::edit::apply_text_edits;
 /// Run the priority-ordered servers serially over `initial_text`.
 ///
 /// For each `server_name` in order, `format_step` is invoked with that server's
-/// name and the **current** accumulated text *by value* and must hand the text
-/// back (possibly unchanged) alongside its result. Handing the text in and out
-/// by move — rather than passing a borrowed `&str` plus a per-step
-/// `accumulated.clone()` — keeps the pipeline O(text_size) total instead of
+/// name and the **current** accumulated text *by value*, and must return that
+/// **same text moved straight back, unchanged**, alongside its result. The move
+/// in/out is purely to avoid cloning — rather than borrowing `&str` and cloning
+/// per step — and keeps the pipeline O(text_size) total instead of
 /// O(steps × text_size): no-op and failed steps no longer clone the whole
-/// accumulated text. The result is interpreted per
-/// concatenated-formatting-pipeline Decision points 3 and 6:
+/// accumulated text. `format_step` must **not** mutate the text it returns: all
+/// changes are conveyed via the returned edit list, and *this function* applies
+/// them (returning mutated text would double-apply on top of the edits). The
+/// result is interpreted per concatenated-formatting-pipeline Decision points 3
+/// and 6:
 ///
 /// - `Some(edits)` — apply `edits` (relative to the returned text) to produce
 ///   the next accumulated text. An empty list is the authoritative "already
