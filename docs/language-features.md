@@ -1,8 +1,8 @@
 # Language Features
 
 This document describes the editor features kakehashi provides, method by method,
-following the [LSP 3.18
-specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/).
+following the
+[LSP 3.18 specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/).
 For each feature it explains what you can expect in practice — where it works, and
 how kakehashi combines results when several language servers are involved — beyond
 what the specification itself prescribes.
@@ -24,9 +24,9 @@ extra setup:
 - **Selection range** (expand/shrink selection by syntax structure)
 
 **Bridged features** cover the rest of kakehashi's supported features (hover,
-completion, go-to-definition, diagnostics, …) — not every LSP method (see [Not
-currently provided](#not-currently-provided)). kakehashi cannot compute these
-itself; instead it forwards your request to a real language server that you
+completion, go-to-definition, diagnostics, …) — not every LSP method
+(see [Not currently provided](#not-currently-provided)). kakehashi cannot compute
+these itself; instead it forwards your request to a real language server that you
 configure for the embedded language. If no server is configured, these features
 simply return nothing.
 
