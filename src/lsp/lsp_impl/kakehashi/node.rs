@@ -9,8 +9,12 @@
 //! - [`children`]: `kakehashi/node/children` — id → immediate-children NodeInfo[]
 
 mod children;
+mod common;
 mod entry;
+mod field;
 mod injection_stack;
 mod lookup;
+mod metadata;
+mod navigation;
 mod parent;
 mod text;
