@@ -23,10 +23,12 @@ extra setup:
 - **Syntax highlighting** (semantic tokens)
 - **Selection range** (expand/shrink selection by syntax structure)
 
-**Bridged features** are everything else (hover, completion, go-to-definition,
-diagnostics, …). kakehashi cannot compute these itself; instead it forwards your
-request to a real language server that you configure for the embedded language. If
-no server is configured, these features simply return nothing.
+**Bridged features** cover the rest of kakehashi's supported features (hover,
+completion, go-to-definition, diagnostics, …) — not every LSP method (see [Not
+currently provided](#not-currently-provided)). kakehashi cannot compute these
+itself; instead it forwards your request to a real language server that you
+configure for the embedded language. If no server is configured, these features
+simply return nothing.
 
 ### Embedded code blocks
 
@@ -100,7 +102,7 @@ one yields no result.
 [`textDocument/hover`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_hover)
 
 Shows hover information for the symbol under the cursor, when the cursor is inside
-an embedded block. Combine strategy: `preferred`.
+an embedded block. Default combine strategy: `preferred`.
 
 ### Completion
 
@@ -112,14 +114,14 @@ Additional details for a highlighted item (documentation, extra edits) are resol
 on demand from the server that produced it. Because the language server only sees
 the isolated snippet, any edits it returns — including auto-import edits — are
 placed relative to the embedded block, so file-level imports may not land where they
-would in a standalone file. Combine strategy: `preferred`.
+would in a standalone file. Default combine strategy: `preferred`.
 
 ### Signature help
 
 [`textDocument/signatureHelp`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_signatureHelp)
 
 Shows parameter hints while typing a call inside an embedded block (auto-triggered
-after `(` or `,`). Combine strategy: `preferred`.
+after `(` or `,`). Default combine strategy: `preferred`.
 
 ### Go to Definition / Declaration / Type Definition / Implementation
 
@@ -131,7 +133,7 @@ after `(` or `,`). Combine strategy: `preferred`.
 Jumps from a symbol in an embedded block to its definition. The target can be
 **within the same block** or a **real file on disk** (e.g. a library dependency).
 Targets that live in a *different* embedded block of the same document are not
-offered, since blocks are independent snippets. Combine strategy: `preferred`.
+offered, since blocks are independent snippets. Default combine strategy: `preferred`.
 
 ### Find references
 
@@ -139,14 +141,14 @@ offered, since blocks are independent snippets. Combine strategy: `preferred`.
 
 Lists references to the symbol under the cursor. Like go-to-definition, results are
 limited to the same block and real files on disk; references in other embedded
-blocks are not included. Combine strategy: `preferred`.
+blocks are not included. Default combine strategy: `preferred`.
 
 ### Document highlight
 
 [`textDocument/documentHighlight`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentHighlight)
 
 Highlights other occurrences of the symbol under the cursor within its block.
-Combine strategy: `preferred`.
+Default combine strategy: `preferred`.
 
 ### Document symbols
 
@@ -167,7 +169,7 @@ Collects clickable links from all embedded blocks.
 and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
 Renames a symbol within its embedded block. Because each block is a standalone
-snippet, renames are confined to that block. Combine strategy: `preferred`.
+snippet, renames are confined to that block. Default combine strategy: `preferred`.
 
 ### Formatting
 
@@ -189,13 +191,13 @@ formatting, scoped to the selection.
 [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlayHint)
 
 Shows inline hints (types, parameter names) for the embedded block overlapping the
-requested range. Combine strategy: `preferred`.
+requested range. Default combine strategy: `preferred`.
 
 ### Moniker
 
 [`textDocument/moniker`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_moniker)
 
-Returns monikers for the symbol under the cursor. Combine strategy: `preferred`.
+Returns monikers for the symbol under the cursor. Default combine strategy: `preferred`.
 
 ### Diagnostics
 
