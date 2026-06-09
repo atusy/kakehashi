@@ -432,6 +432,45 @@ fn test_byte_based_descendant_lookups() {
         inverted_named.is_null(),
         "inverted byte range must collapse to null for the named variant too"
     );
+
+    // Out-of-bounds bytes (past the document end) collapse to null rather than
+    // being forwarded to tree-sitter, whose behaviour for ranges beyond the
+    // parsed tree is version-dependent (mirrors the defensive bound in
+    // lookup::find_node_at). `oob` is well past the end of `DOC`.
+    let oob = (DOC.len() + 10) as i64;
+
+    let oob_first_child = call(
+        &mut client,
+        "kakehashi/node/firstChildForByte",
+        json!({ "textDocument": { "uri": uri }, "id": root, "byte": oob }),
+    );
+    assert!(
+        oob_first_child.is_null(),
+        "firstChildForByte past EOF must collapse to null, got {:?}",
+        oob_first_child
+    );
+
+    let oob_desc = call(
+        &mut client,
+        "kakehashi/node/descendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": oob }),
+    );
+    assert!(
+        oob_desc.is_null(),
+        "descendantForByteRange past EOF must collapse to null, got {:?}",
+        oob_desc
+    );
+
+    let oob_named_desc = call(
+        &mut client,
+        "kakehashi/node/namedDescendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": oob }),
+    );
+    assert!(
+        oob_named_desc.is_null(),
+        "namedDescendantForByteRange past EOF must collapse to null, got {:?}",
+        oob_named_desc
+    );
 }
 
 #[test]
