@@ -65,6 +65,10 @@ def main() -> None:
                 break
             if line.lower().startswith(b"content-length:"):
                 length = int(line.split(b":")[1])
+        if length is None:
+            # Without a length, read(None) would block until EOF on the
+            # persistent server — fail fast instead.
+            raise RuntimeError("missing Content-Length header from server")
         return json.loads(srv.stdout.read(length))
 
     def read_until(want_id):

@@ -26,7 +26,11 @@ TEXT_BASE = 0x100000000  # __TEXT vmaddr for a macOS arm64/x86_64 executable
 
 
 def load(path):
-    return json.loads(gzip.open(path).read() if path.endswith(".gz") else open(path).read())
+    if path.endswith(".gz"):
+        with gzip.open(path) as f:
+            return json.loads(f.read())
+    with open(path, encoding="utf-8") as f:
+        return json.loads(f.read())
 
 
 def lib_name(libs, thread, func_idx):
@@ -47,7 +51,7 @@ def symbolicate(dsym, arch, addrs):
     runtime = [hex(TEXT_BASE + a) for a in addrs]
     out = subprocess.run(
         ["atos", "-o", dsym, "-arch", arch, "-l", hex(TEXT_BASE)] + runtime,
-        capture_output=True, text=True).stdout.splitlines()
+        capture_output=True, text=True, check=True).stdout.splitlines()
     clean = {}
     for a, line in zip(addrs, out):
         s = re.sub(r"::h[0-9a-f]{16}", "", line)
@@ -130,7 +134,7 @@ def main():
         print(f"{line(n)}  {nm}")
 
     if args.folded:
-        with open(args.folded, "w") as f:
+        with open(args.folded, "w", encoding="utf-8") as f:
             for stack, n in folded.items():
                 f.write(f"{stack} {n}\n")
         print(f"\ncollapsed stacks -> {args.folded} ({len(folded)} unique)")
