@@ -13,7 +13,6 @@ use std::collections::HashMap;
 
 use tower_lsp_server::ls_types::{SemanticToken, SemanticTokens, SemanticTokensResult};
 
-use super::legend::map_capture_to_token_type_and_modifiers;
 use super::token_collector::{ActiveInjectionBounds, RawToken, TokenKind};
 
 /// Priority key for token comparison. Higher values win.
@@ -499,20 +498,22 @@ pub(super) fn finalize_tokens(
     let mut last_start = 0usize;
 
     for token in all_tokens {
-        let TokenKind::Mapped(ref type_name) = token.kind else {
+        let (token_type, token_modifiers_bitset) = match token.kind {
+            // Token type/modifiers were resolved to legend indices at collection
+            // time, so encoding is just a copy here (no per-token re-parse).
+            TokenKind::Mapped(token_type, modifiers) => (token_type, modifiers),
+            // Invalid user mapping: competed in the sweep line but emits nothing.
+            TokenKind::MappedUnknown(ref type_name) => {
+                log::warn!(
+                    target: "kakehashi::semantic",
+                    "Skipping token with unknown type '{}' at line {} col {}",
+                    type_name, token.line, token.column
+                );
+                continue;
+            }
             // Transparent or NoneCapture tokens should not reach delta encoding,
             // but if they do, skip silently.
-            continue;
-        };
-        let Some((token_type, token_modifiers_bitset)) =
-            map_capture_to_token_type_and_modifiers(type_name)
-        else {
-            log::warn!(
-                target: "kakehashi::semantic",
-                "Skipping token with unknown type '{}' at line {} col {}",
-                type_name, token.line, token.column
-            );
-            continue;
+            TokenKind::Transparent | TokenKind::NoneCapture => continue,
         };
 
         let delta_line = token.line.saturating_sub(last_line);
@@ -542,12 +543,20 @@ pub(super) fn finalize_tokens(
 
 #[cfg(test)]
 mod tests {
+    use super::super::legend::map_capture_to_token_type_and_modifiers;
     use super::*;
     use rstest::rstest;
 
-    /// Shorthand for `TokenKind::Mapped(name.to_string())`.
+    /// Shorthand for a token kind from a name, so tests read in terms of names.
+    ///
+    /// Legend names resolve to `Mapped(token_type, modifiers)`; non-legend names
+    /// (e.g., "markup.raw.block") map to `MappedUnknown` — the kind that, like a
+    /// misconfigured user mapping, competes in the sweep line but emits nothing.
     fn mapped(name: &str) -> TokenKind {
-        TokenKind::Mapped(name.to_string())
+        match map_capture_to_token_type_and_modifiers(name) {
+            Some((token_type, modifiers)) => TokenKind::Mapped(token_type, modifiers),
+            None => TokenKind::MappedUnknown(name.into()),
+        }
     }
 
     /// Helper to create a RawToken with explicit priority (node_byte_len defaults to 0)

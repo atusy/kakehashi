@@ -1010,7 +1010,7 @@ impl LanguageCoordinator {
     ///
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
     /// layer (refactor) for custom capture-to-token-type mapping.
-    pub(crate) fn capture_mappings(&self) -> CaptureMappings {
+    pub(crate) fn capture_mappings(&self) -> Arc<CaptureMappings> {
         self.config_store.capture_mappings()
     }
 

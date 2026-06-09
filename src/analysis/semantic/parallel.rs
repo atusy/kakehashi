@@ -421,6 +421,7 @@ fn collect_injection_contexts_sync<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_injection_tokens_parallel(
     host_text: &str,
+    host_lines: &[&str],
     host_tree: &Tree,
     host_filetype: Option<&str>,
     coordinator: &LanguageCoordinator,
@@ -428,9 +429,6 @@ pub(crate) fn collect_injection_tokens_parallel(
     supports_multiline: bool,
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use rayon::prelude::*;
-
-    // Pre-compute host lines for position calculations
-    let host_lines: Vec<&str> = host_text.lines().collect();
 
     // Collect top-level injection contexts and their byte ranges
     let (contexts, exclusion_byte_ranges) =
@@ -458,7 +456,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     coordinator,
                     capture_mappings,
                     host_text,
-                    &host_lines,
+                    host_lines,
                     1, // depth 1 (first level of injection, host is 0)
                     supports_multiline,
                 )
@@ -475,7 +473,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     coordinator,
                     capture_mappings,
                     host_text,
-                    &host_lines,
+                    host_lines,
                     1,
                     supports_multiline,
                 )
@@ -490,7 +488,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     // regions that actually produced tokens (= "active" injection regions).
     let active_regions = compute_active_injection_regions(
         host_text,
-        &host_lines,
+        host_lines,
         &exclusion_byte_ranges,
         &all_tokens,
     );
@@ -500,25 +498,39 @@ pub(crate) fn collect_injection_tokens_parallel(
 
 /// Convert byte-based exclusion ranges to line/column `ActiveInjectionBounds`s,
 /// keeping only those regions that contain at least one injection token.
+///
+/// `tokens` MUST be sorted ascending by `(line, column)` (the caller sorts
+/// before invoking). That ordering lets each region binary-search its start
+/// position and scan only the tokens inside the region, rather than the whole
+/// token list — turning the cost from O(regions × tokens) into
+/// O(regions × log n + tokens-in-regions).
 fn compute_active_injection_regions(
     host_text: &str,
     host_lines: &[&str],
     byte_ranges: &[(usize, usize)],
     tokens: &[RawToken],
 ) -> Vec<ActiveInjectionBounds> {
+    // Precompute line-start offsets once so each conversion below is a binary
+    // search rather than an O(offset) scan (was O(regions × offset)).
+    let line_starts = build_line_start_bytes(host_text);
     byte_ranges
         .iter()
         .filter_map(|&(start_byte, end_byte)| {
             // Convert byte range to line/col
-            let (start_line, start_col) = byte_to_line_col(host_text, host_lines, start_byte);
-            let (end_line, end_col) = byte_to_line_col(host_text, host_lines, end_byte);
+            let (start_line, start_col) =
+                byte_to_line_col(host_text, host_lines, &line_starts, start_byte);
+            let (end_line, end_col) =
+                byte_to_line_col(host_text, host_lines, &line_starts, end_byte);
 
-            // Check if any token (depth ≥ 1) falls within this region
-            let has_injection_tokens = tokens.iter().any(|t| {
-                t.depth >= 1
-                    && ((t.line > start_line || (t.line == start_line && t.column >= start_col))
-                        && (t.line < end_line || (t.line == end_line && t.column < end_col)))
+            // Binary-search the first token at or after the region start, then
+            // scan forward only while tokens remain inside the region.
+            let start_idx = tokens.partition_point(|t| {
+                t.line < start_line || (t.line == start_line && t.column < start_col)
             });
+            let has_injection_tokens = tokens[start_idx..]
+                .iter()
+                .take_while(|t| t.line < end_line || (t.line == end_line && t.column < end_col))
+                .any(|t| t.depth >= 1);
 
             if has_injection_tokens {
                 Some(ActiveInjectionBounds {
@@ -534,8 +546,32 @@ fn compute_active_injection_regions(
         .collect()
 }
 
+/// Build an ascending index of the byte offset at which each line starts.
+///
+/// `line_starts[0]` is always 0; every subsequent entry is the byte just after
+/// a `\n`. Built once per request so each `byte_to_line_col` lookup is a binary
+/// search instead of an O(offset) scan of the host text. Scanning raw bytes for
+/// `\n` is safe because UTF-8 never places `0x0A` inside a multi-byte sequence.
+fn build_line_start_bytes(host_text: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(host_text.len() / 32 + 1);
+    starts.push(0);
+    for (i, b) in host_text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
 /// Convert a byte offset in host_text to a (line, utf16_col) pair.
-fn byte_to_line_col(host_text: &str, host_lines: &[&str], byte_offset: usize) -> (usize, usize) {
+///
+/// `line_starts` must come from [`build_line_start_bytes`] for the same text.
+fn byte_to_line_col(
+    host_text: &str,
+    host_lines: &[&str],
+    line_starts: &[usize],
+    byte_offset: usize,
+) -> (usize, usize) {
     let byte_offset = byte_offset.min(host_text.len());
     // Snap to valid UTF-8 char boundary (tree-sitter always provides valid offsets,
     // but guard defensively against unexpected inputs).
@@ -546,15 +582,10 @@ fn byte_to_line_col(host_text: &str, host_lines: &[&str], byte_offset: usize) ->
         }
         b
     };
-    let line = host_text[..byte_offset]
-        .chars()
-        .filter(|c| *c == '\n')
-        .count();
-    let line_start_byte = if line == 0 {
-        0
-    } else {
-        host_text[..byte_offset].rfind('\n').map_or(0, |p| p + 1)
-    };
+    // Largest line whose start byte is <= byte_offset. line_starts[0] == 0, so
+    // the predicate holds for at least one element and the subtraction is safe.
+    let line = line_starts.partition_point(|&s| s <= byte_offset) - 1;
+    let line_start_byte = line_starts[line];
     let col_byte = byte_offset - line_start_byte;
     let line_text = host_lines.get(line).unwrap_or(&"");
     let col_utf16 = byte_to_utf16_col(line_text, col_byte);
@@ -710,31 +741,55 @@ mod tests {
         // by snapping to the nearest valid char boundary.
         let text = "あいう"; // Three 3-byte UTF-8 characters (9 bytes total)
         let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(text);
 
         // Offset 0 is valid (start of first char)
-        let (line, col) = byte_to_line_col(text, &lines, 0);
+        let (line, col) = byte_to_line_col(text, &lines, &line_starts, 0);
         assert_eq!(line, 0);
         assert_eq!(col, 0);
 
         // Offset 1 is mid-character (should snap to 0)
-        let (line, col) = byte_to_line_col(text, &lines, 1);
+        let (line, col) = byte_to_line_col(text, &lines, &line_starts, 1);
         assert_eq!(line, 0, "Mid-character offset should snap to line 0");
         assert_eq!(col, 0, "Mid-character offset should snap to col 0");
 
         // Offset 2 is mid-character (should snap to 0)
-        let (line, col) = byte_to_line_col(text, &lines, 2);
+        let (line, col) = byte_to_line_col(text, &lines, &line_starts, 2);
         assert_eq!(line, 0);
         assert_eq!(col, 0);
 
         // Offset 3 is valid (start of second char)
-        let (line, col) = byte_to_line_col(text, &lines, 3);
+        let (line, col) = byte_to_line_col(text, &lines, &line_starts, 3);
         assert_eq!(line, 0);
         assert_eq!(col, 1); // One UTF-16 code unit (Japanese chars are in BMP)
 
         // Offset 4 is mid-character (should snap to 3)
-        let (line, col) = byte_to_line_col(text, &lines, 4);
+        let (line, col) = byte_to_line_col(text, &lines, &line_starts, 4);
         assert_eq!(line, 0);
         assert_eq!(col, 1); // Should snap to start of second char
+    }
+
+    #[test]
+    fn test_byte_to_line_col_multiline() {
+        // Exercises the binary-search line lookup across multiple lines, plus a
+        // multibyte char so byte offset != utf16 column.
+        let text = "ab\ncö\n\nde"; // ö is 2 bytes (U+00F6), 1 utf16 unit
+        let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(text);
+        // line_starts: [0, 3, 7, 8] -> starts of "ab", "cö", "", "de"
+        assert_eq!(line_starts, vec![0, 3, 7, 8]);
+
+        // 'a' at byte 0 -> line 0 col 0
+        assert_eq!(byte_to_line_col(text, &lines, &line_starts, 0), (0, 0));
+        // start of line 1 ("cö") at byte 3 -> line 1 col 0
+        assert_eq!(byte_to_line_col(text, &lines, &line_starts, 3), (1, 0));
+        // byte 5 is the start of the byte after 'ö' begins... 'c'=3, 'ö'=4..6,
+        // so byte 6 is end-of-line on line 1 -> col is utf16 width of "cö" = 2
+        assert_eq!(byte_to_line_col(text, &lines, &line_starts, 6), (1, 2));
+        // empty line 2 at byte 7 -> line 2 col 0
+        assert_eq!(byte_to_line_col(text, &lines, &line_starts, 7), (2, 0));
+        // 'e' on line 3: 'd'=8, 'e'=9 -> line 3 col 1
+        assert_eq!(byte_to_line_col(text, &lines, &line_starts, 9), (3, 1));
     }
 
     #[test]
@@ -891,8 +946,10 @@ mod tests {
         parser_pool.release("markdown".to_string(), parser);
 
         // Collect tokens - should be empty for empty document
+        let host_lines: Vec<&str> = text.lines().collect();
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
+            &host_lines,
             &tree,
             Some("markdown"),
             &coordinator,
@@ -943,8 +1000,10 @@ local x = 42
         parser_pool.release("markdown".to_string(), parser);
 
         // Collect tokens in parallel
+        let host_lines: Vec<&str> = text.lines().collect();
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
+            &host_lines,
             &tree,
             Some("markdown"),
             &coordinator,
@@ -960,12 +1019,16 @@ local x = 42
         );
 
         // Look for the "local" keyword token (should be at line 3, col 0)
+        let (keyword_type, keyword_mods) =
+            crate::analysis::semantic::legend::map_capture_to_token_type_and_modifiers("keyword")
+                .unwrap();
         let has_local_keyword = tokens.iter().any(|t| {
             t.line == 3
                 && t.column == 0
                 && t.kind
                     == crate::analysis::semantic::token_collector::TokenKind::Mapped(
-                        "keyword".to_string(),
+                        keyword_type,
+                        keyword_mods,
                     )
         });
 
@@ -1019,8 +1082,10 @@ local b = 2
         };
         parser_pool.release("markdown".to_string(), parser);
 
+        let host_lines: Vec<&str> = text.lines().collect();
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
+            &host_lines,
             &tree,
             Some("markdown"),
             &coordinator,

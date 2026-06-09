@@ -73,3 +73,11 @@ insta = { version = "1", features = ["json", "redactions"] }
 serial_test = "3"
 rstest = "0.26"
 
+# A/B performance comparison of the semantic-tokens hot path across two server
+# binaries (e.g. HEAD vs origin/main). Custom harness (no criterion): it drives
+# the compiled `kakehashi` binary over LSP, so it benchmarks the real process
+# without needing access to pub(crate) internals. See benches/semantic_tokens.rs.
+[[bench]]
+name = "semantic_tokens"
+harness = false
+

@@ -59,8 +59,15 @@ fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
 /// magic-string conventions.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TokenKind {
-    /// Normal semantic token with a mapped type name (e.g., "keyword", "variable.readonly").
-    Mapped(String),
+    /// Normal semantic token, pre-resolved to its legend `(token_type, modifiers)`
+    /// indices (e.g., keyword → `(1, 0)`, variable.readonly → `(17, 1 << 2)`).
+    Mapped(u32, u32),
+    /// User-config mapping to a value not in the legend. Competes in the sweep
+    /// line like a mapped token but emits nothing at encode time (where the
+    /// carried name is logged). Off the hot path — only occurs on misconfig.
+    /// Stored as `Box<str>` (not `String`) to keep `TokenKind`/`RawToken` small,
+    /// since this variant is the largest and never needs to grow.
+    MappedUnknown(Box<str>),
     /// Transparent breakpoint-only token — not emitted as a semantic token.
     Transparent,
     /// `@none` capture — punches holes in parent tokens during pre-processing.
@@ -68,9 +75,11 @@ pub(crate) enum TokenKind {
 }
 
 impl TokenKind {
-    /// Returns `true` for tokens that will be emitted as semantic tokens in the LSP response.
+    /// Returns `true` for tokens that compete for winner selection in the sweep
+    /// line. `MappedUnknown` competes (historical behavior) but is dropped at
+    /// encode time, so it is included here.
     pub(crate) fn is_emitted(&self) -> bool {
-        matches!(self, TokenKind::Mapped(_))
+        matches!(self, TokenKind::Mapped(..) | TokenKind::MappedUnknown(_))
     }
 }
 
@@ -341,7 +350,10 @@ pub(super) fn collect_host_tokens(
             let capture_name = &query.capture_names()[c.index as usize];
             let kind = match resolve_capture(capture_name, filetype, capture_mappings) {
                 CaptureResult::Suppressed => continue,
-                CaptureResult::Mapped(s) => TokenKind::Mapped(s),
+                CaptureResult::Mapped(token_type, modifiers) => {
+                    TokenKind::Mapped(token_type, modifiers)
+                }
+                CaptureResult::MappedUnknown(name) => TokenKind::MappedUnknown(name),
                 CaptureResult::Transparent => TokenKind::Transparent,
                 CaptureResult::NoneCapture => TokenKind::NoneCapture,
             };
@@ -491,7 +503,14 @@ mod tests {
 
     #[test]
     fn is_emitted_returns_true_for_mapped() {
-        assert!(TokenKind::Mapped("keyword".to_string()).is_emitted());
+        assert!(TokenKind::Mapped(1, 0).is_emitted());
+    }
+
+    #[test]
+    fn is_emitted_returns_true_for_mapped_unknown() {
+        // MappedUnknown competes in the sweep line (then dropped at encode),
+        // matching the historical behavior of an invalid user mapping.
+        assert!(TokenKind::MappedUnknown("bogus".into()).is_emitted());
     }
 
     #[test]
@@ -794,12 +813,15 @@ mod tests {
             &mut tokens2,
         );
 
+        use super::super::legend::map_capture_to_token_type_and_modifiers as resolve;
+        let keyword = resolve("keyword").unwrap();
+        let variable = resolve("variable").unwrap();
         let has_keyword = tokens2
             .iter()
-            .any(|t| t.kind == TokenKind::Mapped("keyword".to_string()));
+            .any(|t| t.kind == TokenKind::Mapped(keyword.0, keyword.1));
         let has_variable = tokens2
             .iter()
-            .any(|t| t.kind == TokenKind::Mapped("variable".to_string()));
+            .any(|t| t.kind == TokenKind::Mapped(variable.0, variable.1));
         assert!(has_keyword, "fn keyword outside exclusion should be kept");
         assert!(
             !has_variable,

@@ -599,6 +599,15 @@ impl Kakehashi {
                 self.cache.store_tokens(uri.clone(), tokens.clone());
                 SemanticTokensFullDeltaResult::Tokens(tokens)
             }
+            SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
+                // No-op delta: recomputed tokens are byte-identical to the cached
+                // tokens, which already carry `previous_result_id`. Reuse that id
+                // and skip re-storing — the version token shouldn't advance when
+                // nothing changed, and the cache entry stays valid for the next
+                // request. Saves a clone + cache store + id rotation.
+                delta.result_id = Some(previous_result_id.clone());
+                SemanticTokensFullDeltaResult::TokensDelta(delta)
+            }
             SemanticTokensFullDeltaResult::TokensDelta(mut delta) => {
                 // For delta, we still need to store the current tokens with new result_id
                 let mut stored_tokens = current_tokens;
@@ -955,6 +964,106 @@ mod tests {
         assert!(
             follow_up_result.is_ok(),
             "follow-up delta request should succeed"
+        );
+    }
+
+    /// Test that a no-op delta (no document change) reuses the previous
+    /// result_id instead of rotating it and re-storing identical tokens.
+    ///
+    /// When the document is unchanged, recomputed tokens are byte-identical to
+    /// the cached tokens, so the delta has zero edits. The LSP result_id is a
+    /// version token the client echoes back; keeping it stable avoids a wasted
+    /// clone + cache store + id increment, and the cache entry under the
+    /// previous id stays valid for the next request.
+    #[tokio::test]
+    async fn semantic_tokens_noop_delta_reuses_previous_result_id() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///noop_delta.lua").expect("should construct test uri");
+
+        server.documents.insert(
+            uri.clone(),
+            "local x = 1".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+
+        // Configure the grammar search path so the language actually loads
+        // (grammars live under deps/tree-sitter, or TREE_SITTER_GRAMMARS in Nix).
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = server.language.load_settings(&settings);
+
+        let load_result = server.language.ensure_language_loaded("lua");
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
+            eprintln!("Skipping: lua language parser or highlight query not available");
+            return;
+        }
+
+        // First request: semanticTokens/full to get the initial result_id.
+        let full_params = SemanticTokensParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let full_result = server
+            .semantic_tokens_full_impl(full_params)
+            .await
+            .expect("full request should succeed")
+            .expect("should return tokens");
+        let initial_result_id = match full_result {
+            SemanticTokensResult::Tokens(t) => t.result_id.expect("should have result_id"),
+            _ => panic!("expected Tokens variant"),
+        };
+
+        // Second request: delta WITHOUT changing the document → no edits.
+        let delta_params = SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+            },
+            previous_result_id: initial_result_id.clone(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let delta_result = server
+            .semantic_tokens_full_delta_impl(delta_params)
+            .await
+            .expect("delta request should succeed")
+            .expect("should return delta");
+
+        let delta = match delta_result {
+            SemanticTokensFullDeltaResult::TokensDelta(d) => d,
+            other => panic!("expected TokensDelta for unchanged document, got {other:?}"),
+        };
+
+        // No edits, since nothing changed.
+        assert!(
+            delta.edits.is_empty(),
+            "unchanged document should produce a delta with no edits, got {:?}",
+            delta.edits
+        );
+
+        // The result_id must be reused, not rotated.
+        assert_eq!(
+            delta.result_id.as_deref(),
+            Some(initial_result_id.as_str()),
+            "no-op delta should reuse the previous result_id"
+        );
+
+        // The cache entry under the initial result_id must still be valid.
+        assert!(
+            server
+                .cache
+                .get_tokens_if_valid(&uri, &initial_result_id)
+                .is_some(),
+            "cache should still hold tokens under the reused result_id"
         );
     }
 

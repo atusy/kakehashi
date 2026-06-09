@@ -25,7 +25,7 @@ pub(crate) async fn handle_semantic_tokens_range_parallel_async(
     query: std::sync::Arc<Query>,
     range: Range,
     filetype: Option<String>,
-    capture_mappings: Option<crate::config::CaptureMappings>,
+    capture_mappings: Option<std::sync::Arc<crate::config::CaptureMappings>>,
     coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
     supports_multiline: bool,
 ) -> Option<SemanticTokensResult> {
