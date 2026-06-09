@@ -478,6 +478,7 @@ async fn dispatch_concatenated_formatting(
 /// A scratch virtual document opened during a concatenated-formatting run that
 /// has not yet been closed. Paired with its `server_name` so the `didClose`
 /// targets the connection the matching `didOpen` was sent on.
+#[derive(Clone)]
 struct OpenScratchDoc {
     uri: VirtualDocumentUri,
     server_name: String,
@@ -592,20 +593,22 @@ async fn close_remaining_scratch_docs(
     host_uri: &url::Url,
     open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
 ) {
-    // Pop one at a time rather than draining the whole vector up front, so any
-    // docs not yet popped stay tracked in the mutex: if this sweep is itself
-    // cancelled mid-`.await`, the still-tracked docs remain visible to
-    // `ScratchCleanupGuard` (which drains on drop) instead of being lost — closing
-    // the leak window a drain-all-then-loop would open.
-    //
-    // NB: the `pop` is its own statement, not a `while let` scrutinee, so the
-    // non-`Send` `MutexGuard` is dropped at the `;` before the `.await` (otherwise
-    // the spawned region task's future would not be `Send`).
+    // Peek-close-remove, one doc at a time: clone the last tracked doc WITHOUT
+    // removing it, close it, then remove it only after the close completes. If
+    // this sweep is itself cancelled mid-`.await`, the in-flight doc is still
+    // tracked, so `ScratchCleanupGuard` (which drains on drop) still catches it —
+    // zero leak, not even the single in-flight doc that a pop-then-close would
+    // drop. The lock guards are scoped to their `let`/block so the non-`Send`
+    // `MutexGuard` never crosses the `.await` (keeping the region task `Send`).
     loop {
-        let next = lock_open_scratch(open).pop();
+        let next = {
+            let guard = lock_open_scratch(open);
+            guard.last().cloned()
+        };
         let Some(doc) = next else { break };
         pool.close_scratch_document(host_uri, &doc.uri, &doc.server_name)
             .await;
+        lock_open_scratch(open).retain(|d| d.uri != doc.uri);
     }
 }
 
