@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::error::LockResultExt;
 use regex::Regex;
@@ -9,11 +9,19 @@ use tree_sitter::{Query, QueryCapture, QueryMatch};
 /// Avoids recompiling the same pattern on every invocation during
 /// semantic token highlighting of large files.
 ///
+/// Stored as `Arc<Regex>` (not `Regex`) and shared by reference: a `Regex`
+/// owns an internal pool of lazy-DFA caches, and `Regex::clone` would hand each
+/// caller a *fresh, empty* pool — forcing the lazy DFA to rebuild its transition
+/// table on the first match of every call. Sharing one `Arc<Regex>` keeps a
+/// single pool alive across all predicate checks (the pool is internally
+/// thread-safe, so the parallel injection workers reuse it too), which removes
+/// the per-call `Cache::new`/`init_cache` that dominated the hot path.
+///
 /// Unbounded by design: patterns originate from static `.scm` query files,
 /// not user input, so the total number of unique entries is bounded by the
 /// finite set of `#lua-match?` / `#not-lua-match?` patterns across all
 /// loaded languages (typically well under 100).
-static LUA_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Option<Regex>>>> =
+static LUA_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Check if a capture passes all predicates returned by
@@ -110,7 +118,10 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
 
 /// Get a cached compiled regex for a Lua pattern, or compile and cache it.
 /// Returns `None` if the pattern cannot be compiled (parse/convert/compile error).
-fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Regex> {
+///
+/// Returns an `Arc<Regex>` (a refcount bump) so the shared regex's lazy-DFA
+/// cache pool is reused across calls — see [`LUA_REGEX_CACHE`].
+fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Arc<Regex>> {
     let mut cache = LUA_REGEX_CACHE
         .lock()
         .recover_poison("query_predicates::get_or_compile_lua_regex");
@@ -119,7 +130,7 @@ fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Regex> {
         return cached.clone();
     }
 
-    let result = compile_lua_regex(pattern_str);
+    let result = compile_lua_regex(pattern_str).map(Arc::new);
     cache.insert(pattern_str.to_string(), result.clone());
     result
 }
