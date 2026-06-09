@@ -57,7 +57,8 @@ pub(super) enum CaptureResult {
     /// Carries the offending name so the encode stage can log it. Competes in
     /// the sweep line like a mapped token but emits nothing (historical
     /// behavior); kept off the hot path since it only occurs on misconfig.
-    MappedUnknown(String),
+    /// `Box<str>` (not `String`) to keep the downstream `TokenKind` small.
+    MappedUnknown(Box<str>),
     /// Unknown base type — transparent breakpoint-only token (not emitted).
     Transparent,
     /// `@none` capture — pre-processed to punch holes in parent tokens.
@@ -123,7 +124,7 @@ fn resolve_user_mapping(mapped: &str) -> CaptureResult {
     }
     match map_capture_to_token_type_and_modifiers(mapped) {
         Some((token_type, modifiers)) => CaptureResult::Mapped(token_type, modifiers),
-        None => CaptureResult::MappedUnknown(mapped.to_string()),
+        None => CaptureResult::MappedUnknown(mapped.into()),
     }
 }
 

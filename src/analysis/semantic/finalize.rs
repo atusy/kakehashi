@@ -555,7 +555,7 @@ mod tests {
     fn mapped(name: &str) -> TokenKind {
         match map_capture_to_token_type_and_modifiers(name) {
             Some((token_type, modifiers)) => TokenKind::Mapped(token_type, modifiers),
-            None => TokenKind::MappedUnknown(name.to_string()),
+            None => TokenKind::MappedUnknown(name.into()),
         }
     }
 

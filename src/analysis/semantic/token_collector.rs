@@ -65,7 +65,9 @@ pub(crate) enum TokenKind {
     /// User-config mapping to a value not in the legend. Competes in the sweep
     /// line like a mapped token but emits nothing at encode time (where the
     /// carried name is logged). Off the hot path — only occurs on misconfig.
-    MappedUnknown(String),
+    /// Stored as `Box<str>` (not `String`) to keep `TokenKind`/`RawToken` small,
+    /// since this variant is the largest and never needs to grow.
+    MappedUnknown(Box<str>),
     /// Transparent breakpoint-only token — not emitted as a semantic token.
     Transparent,
     /// `@none` capture — punches holes in parent tokens during pre-processing.
@@ -508,7 +510,7 @@ mod tests {
     fn is_emitted_returns_true_for_mapped_unknown() {
         // MappedUnknown competes in the sweep line (then dropped at encode),
         // matching the historical behavior of an invalid user mapping.
-        assert!(TokenKind::MappedUnknown("bogus".to_string()).is_emitted());
+        assert!(TokenKind::MappedUnknown("bogus".into()).is_emitted());
     }
 
     #[test]
