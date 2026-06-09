@@ -8,8 +8,8 @@ how kakehashi combines results when several language servers are involved — be
 what the specification itself prescribes.
 
 For how to install language servers and configure bridging, see
-[README.md](README.md#bridge-configuration). This document describes **what the
-features do**; the README describes **how to set them up**.
+[README.md](README.md#bridge-configuration). This document describes
+**what the features do**; the README describes **how to set them up**.
 
 ---
 
@@ -73,11 +73,11 @@ conflicting edits).
 [`textDocument/semanticTokens`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_semanticTokens)
 (full, delta, and range)
 
-Highlights the whole document from Tree-sitter queries, **including embedded code
-blocks** — you get highlighting inside fenced code blocks even without a language
-server configured for that language. Delta updates and range requests are
-supported. Highlight colors are driven by the token types/modifiers kakehashi
-exposes; capture names can be remapped via `captureMappings` (see README).
+Highlights the whole document from Tree-sitter queries,
+**including embedded code blocks** — you get highlighting inside fenced code blocks
+even without a language server configured for that language. Delta updates and range
+requests are supported. Highlight colors are driven by the token types/modifiers
+kakehashi exposes; capture names can be remapped via `captureMappings` (see README).
 
 ### Selection range
 
@@ -213,8 +213,8 @@ differently.
 [`documentColor`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_documentColor)
 and [`colorPresentation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_colorPresentation)
 
-Shows color swatches and color picker presentations for embedded blocks. **Only
-available in experimental builds** — standard builds do not advertise color
+Shows color swatches and color picker presentations for embedded blocks.
+**Only available in experimental builds** — standard builds do not advertise color
 support.
 
 ---
@@ -254,8 +254,8 @@ they came from; querying with an `id` from a different document returns `null`.
 | `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate children, in document order |
 | `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | The node's current text |
 
-Positions follow the LSP default encoding (UTF-16 code units) unless your editor
-negotiates otherwise.
+Positions use the LSP default encoding, UTF-16 code units. kakehashi does not
+currently advertise or negotiate an alternate position encoding.
 
 ### The `injection` parameter
 
