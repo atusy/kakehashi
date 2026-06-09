@@ -14,6 +14,19 @@
 #   benches/profile/profile.sh [--lang rust|markdown] [--size N] [--requests N]
 set -euo pipefail
 
+# macOS-only: symbolication uses dsymutil + atos (and analyze.py assumes the
+# macOS __TEXT base). Fail early with a clear message rather than deep in the run.
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "error: this profiling harness is macOS-only (needs dsymutil/atos)." >&2
+  exit 1
+fi
+for tool in samply inferno-flamegraph dsymutil atos python3; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "error: required tool '$tool' not found (try: cargo install samply inferno)." >&2
+    exit 1
+  }
+done
+
 LANG_ARG=rust SIZE=150 REQUESTS=150
 while [ $# -gt 0 ]; do
   case "$1" in

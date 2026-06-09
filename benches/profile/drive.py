@@ -101,7 +101,11 @@ def main() -> None:
 
     request("shutdown", None)
     notify("exit", {})
-    srv.wait(timeout=5)
+    try:
+        srv.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        srv.kill()  # don't leave a hung server behind
+        srv.wait()
 
     sys.stderr.write(
         f"[drive] lang={args.lang} size={args.size} requests={args.requests} "

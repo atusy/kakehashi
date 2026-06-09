@@ -7,9 +7,9 @@ edition = "2024"
 name = "kakehashi"
 path = "src/bin/main.rs"
 
-# Profiling build: optimized like release but with debug symbols and frame
-# pointers so flamegraph/samply can symbolicate the semantic-tokens hot path.
-# Build with `cargo build --profile profiling --bin kakehashi`.
+# Profiling build: optimized like release but with debug symbols retained (not
+# stripped) so flamegraph/samply + atos can symbolicate the semantic-tokens hot
+# path. Build with `cargo build --profile profiling --bin kakehashi`.
 [profile.profiling]
 inherits = "release"
 debug = true

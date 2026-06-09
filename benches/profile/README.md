@@ -4,6 +4,11 @@ Flamegraph profiling of the `semanticTokens/full` hot path, used to find and
 verify bottlenecks that the A/B benchmark (`benches/semantic_tokens.rs`) then
 quantifies.
 
+> **macOS only.** Offline symbolication relies on `.dSYM` + `dsymutil`/`atos`,
+> and `analyze.py` assumes the macOS `__TEXT` base. `profile.sh` checks for this
+> and fails early elsewhere. (The benchmark in `benches/semantic_tokens.rs` is
+> cross-platform; only this profiling harness is macOS-specific.)
+
 ## Quick start
 
 ```sh
