@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Synchronously drive the kakehashi server through a heavy semanticTokens load.
+
+Unlike piping a static session, this waits for each response before sending the
+next request, so the server never coalesces/cancels a superseded request (it
+would otherwise answer most with `-32800 Canceled` and do no real work). Run the
+server under a sampler (samply/flamegraph) with this as the driver so the sampled
+process actually spends its time in the semantic-tokens hot path.
+
+Usage:
+    drive.py --bin ./target/profiling/kakehashi --lang rust --size 150 --requests 300
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bin", required=True)
+    ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
+    ap.add_argument("--size", type=int, default=150)
+    ap.add_argument("--requests", type=int, default=300)
+    ap.add_argument("--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"))
+    args = ap.parse_args()
+
+    if args.lang == "rust":
+        uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
+    else:
+        uri, lang, text = "file:///profile/inj.md", "markdown", gen_markdown_injections(args.size)
+
+    env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
+    srv = subprocess.Popen([args.bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, env=env)
+    rid = 0
+
+    def send(obj):
+        body = json.dumps(obj).encode()
+        srv.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        srv.stdin.flush()
+
+    def request(method, params):
+        nonlocal rid
+        rid += 1
+        send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        return read_until(rid)
+
+    def notify(method, params):
+        send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def read_message():
+        length = None
+        while True:
+            line = srv.stdout.readline()
+            if not line:
+                raise RuntimeError("server closed stdout")
+            line = line.strip()
+            if not line:
+                break
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":")[1])
+        return json.loads(srv.stdout.read(length))
+
+    def read_until(want_id):
+        while True:
+            m = read_message()
+            if m.get("method"):
+                continue  # server->client notification/request
+            if m.get("id") == want_id:
+                return m
+
+    request("initialize", {"processId": None, "rootUri": None, "capabilities": {
+        "textDocument": {"semanticTokens": {"requests": {"full": {"delta": True}},
+                                            "tokenTypes": [], "tokenModifiers": [],
+                                            "formats": ["relative"]}}}})
+    notify("initialized", {})
+    notify("textDocument/didOpen", {"textDocument": {
+        "uri": uri, "languageId": lang, "version": 1, "text": text}})
+    time.sleep(0.3)  # let the initial parse settle
+
+    ok, canceled, tokens = 0, 0, 0
+    t0 = time.time()
+    for _ in range(args.requests):
+        resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+        if "error" in resp:
+            canceled += 1
+        else:
+            ok += 1
+            tokens = len(resp.get("result", {}).get("data", [])) // 5
+    elapsed = time.time() - t0
+
+    request("shutdown", None)
+    notify("exit", {})
+    srv.wait(timeout=5)
+
+    sys.stderr.write(
+        f"[drive] lang={args.lang} size={args.size} requests={args.requests} "
+        f"ok={ok} canceled={canceled} tokens/req={tokens} "
+        f"wall={elapsed*1000:.0f}ms ({elapsed/args.requests*1000:.2f}ms/req)\n")
+
+
+if __name__ == "__main__":
+    main()
