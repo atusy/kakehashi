@@ -85,41 +85,47 @@ def main() -> None:
             if m.get("id") == want_id:
                 return m
 
-    request("initialize", {"processId": None, "rootUri": None, "capabilities": {
-        "textDocument": {"semanticTokens": {"requests": {"full": {"delta": True}},
-                                            "tokenTypes": [], "tokenModifiers": [],
-                                            "formats": ["relative"]}}}})
-    notify("initialized", {})
-    notify("textDocument/didOpen", {"textDocument": {
-        "uri": uri, "languageId": lang, "version": 1, "text": text}})
-    time.sleep(0.3)  # let the initial parse settle
-
-    ok, canceled, tokens = 0, 0, 0
-    t0 = time.time()
-    for _ in range(args.requests):
-        resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
-        if "error" in resp:
-            # Only -32800 (request cancelled) is expected here; any other error
-            # means a broken setup that would make the profile meaningless, so
-            # surface it instead of silently counting it as a cancellation.
-            if resp["error"].get("code") == -32800:
-                canceled += 1
-            else:
-                raise RuntimeError(f"server error (not a cancellation): {resp['error']}")
-        else:
-            ok += 1
-            # `result` may be null (the server can answer Ok(None)); `or {}`
-            # guards against `None.get`, which a `{}` default would not.
-            tokens = len((resp.get("result") or {}).get("data", [])) // 5
-    elapsed = time.time() - t0
-
-    request("shutdown", None)
-    notify("exit", {})
+    # Drive inside try/finally so any error (e.g. a server error raised in the
+    # loop, or a shutdown timeout) still reaps the server instead of leaving a
+    # stray process behind.
     try:
+        request("initialize", {"processId": None, "rootUri": None, "capabilities": {
+            "textDocument": {"semanticTokens": {"requests": {"full": {"delta": True}},
+                                                "tokenTypes": [], "tokenModifiers": [],
+                                                "formats": ["relative"]}}}})
+        notify("initialized", {})
+        notify("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": lang, "version": 1, "text": text}})
+        time.sleep(0.3)  # let the initial parse settle
+
+        ok, canceled, tokens = 0, 0, 0
+        t0 = time.time()
+        for _ in range(args.requests):
+            resp = request("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}})
+            if "error" in resp:
+                # Only -32800 (request cancelled) is expected here; any other
+                # error means a broken setup that would make the profile
+                # meaningless, so surface it instead of counting it as cancelled.
+                if resp["error"].get("code") == -32800:
+                    canceled += 1
+                else:
+                    raise RuntimeError(f"server error (not a cancellation): {resp['error']}")
+            else:
+                ok += 1
+                # `result` may be null (the server can answer Ok(None)); `or {}`
+                # guards against `None.get`, which a `{}` default would not.
+                tokens = len((resp.get("result") or {}).get("data", [])) // 5
+        elapsed = time.time() - t0
+
+        request("shutdown", None)
+        notify("exit", {})
         srv.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        srv.kill()  # don't leave a hung server behind
-        srv.wait()
+        pass  # graceful shutdown didn't land in time; the finally kills it
+    finally:
+        if srv.poll() is None:
+            srv.kill()
+            srv.wait()
 
     sys.stderr.write(
         f"[drive] lang={args.lang} size={args.size} requests={args.requests} "
