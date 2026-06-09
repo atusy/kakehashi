@@ -27,7 +27,7 @@ def gen_rust(funcs: int) -> str:
             f"    for (index, value) in items.iter().enumerate() {{\n"
             f'        lookup.insert(format!("key_{{}}", index), *value);\n'
             f"    }}\n"
-            f'        let message = format!("total is {{}} for {{}}", local_total, arg_b);\n'
+            f'    let message = format!("total is {{}} for {{}}", local_total, arg_b);\n'
             f"    if local_total > 100 && !items.is_empty() {{\n"
             f'        return Err(String::from("value too large"));\n'
             f"    }}\n"

@@ -36,8 +36,10 @@ def main() -> None:
         uri, lang, text = "file:///profile/inj.md", "markdown", gen_markdown_injections(args.size)
 
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
+    # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
+    # crash or panic is visible instead of being swallowed during profiling.
     srv = subprocess.Popen([args.bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, env=env)
+                           env=env)
     rid = 0
 
     def send(obj):
