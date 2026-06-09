@@ -592,7 +592,18 @@ async fn close_remaining_scratch_docs(
     host_uri: &url::Url,
     open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
 ) {
-    for doc in drain_open_scratch(open) {
+    // Pop one at a time rather than draining the whole vector up front, so any
+    // docs not yet popped stay tracked in the mutex: if this sweep is itself
+    // cancelled mid-`.await`, the still-tracked docs remain visible to
+    // `ScratchCleanupGuard` (which drains on drop) instead of being lost — closing
+    // the leak window a drain-all-then-loop would open.
+    //
+    // NB: the `pop` is its own statement, not a `while let` scrutinee, so the
+    // non-`Send` `MutexGuard` is dropped at the `;` before the `.await` (otherwise
+    // the spawned region task's future would not be `Send`).
+    loop {
+        let next = lock_open_scratch(open).pop();
+        let Some(doc) = next else { break };
         pool.close_scratch_document(host_uri, &doc.uri, &doc.server_name)
             .await;
     }
