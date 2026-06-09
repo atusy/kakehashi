@@ -410,6 +410,28 @@ fn test_byte_based_descendant_lookups() {
         json!({ "textDocument": { "uri": uri }, "id": root, "byte": -5 }),
     );
     assert!(neg.is_null(), "negative byte must collapse to null");
+
+    // Inverted range (startByte > endByte) is invalid → null, mirroring the
+    // defensive guard in lookup::find_node_at rather than handing tree-sitter an
+    // unspecified range.
+    let inverted = call(
+        &mut client,
+        "kakehashi/node/descendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 5, "endByte": 1 }),
+    );
+    assert!(
+        inverted.is_null(),
+        "inverted byte range must collapse to null"
+    );
+    let inverted_named = call(
+        &mut client,
+        "kakehashi/node/namedDescendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 5, "endByte": 1 }),
+    );
+    assert!(
+        inverted_named.is_null(),
+        "inverted byte range must collapse to null for the named variant too"
+    );
 }
 
 #[test]
