@@ -474,6 +474,57 @@ fn test_byte_based_descendant_lookups() {
     );
 }
 
+/// Byte/range arguments are scoped to the queried node: an offset *before* the
+/// node's own `start_byte` is outside it and must collapse to `null`, just like
+/// one past its end. Uses a node on line 2 (which starts well after byte 0).
+#[test]
+fn test_byte_lookups_before_node_start_are_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_byte_lowerbound.md";
+    open_markdown(&mut client, uri, DOC);
+
+    // A node inside the line-2 paragraph starts after "# Heading\n\n" (byte 11).
+    let node = node_at(&mut client, uri, 2, 2);
+    assert!(!node.is_null(), "expected a node on line 2");
+    let id = id_of(&node);
+    let start_byte = call(&mut client, "kakehashi/node/startByte", id_params(uri, &id))
+        .get("startByte")
+        .and_then(Value::as_u64)
+        .expect("startByte");
+    assert!(start_byte > 0, "fixture node must start after byte 0");
+
+    // firstChildForByte at byte 0 is before this node → null.
+    let before = call(
+        &mut client,
+        "kakehashi/node/firstChildForByte",
+        json!({ "textDocument": { "uri": uri }, "id": id, "byte": 0 }),
+    );
+    assert!(
+        before.is_null(),
+        "firstChildForByte before the node's start must be null, got {:?}",
+        before
+    );
+
+    // A range whose start is before this node → null (both variants).
+    for method in [
+        "kakehashi/node/descendantForByteRange",
+        "kakehashi/node/namedDescendantForByteRange",
+    ] {
+        let v = call(
+            &mut client,
+            method,
+            json!({ "textDocument": { "uri": uri }, "id": id, "startByte": 0, "endByte": start_byte }),
+        );
+        assert!(
+            v.is_null(),
+            "{} with a start before the node must be null, got {:?}",
+            method,
+            v
+        );
+    }
+}
+
 #[test]
 fn test_field_name_for_child_reports_or_nulls() {
     let mut client = LspClient::new();

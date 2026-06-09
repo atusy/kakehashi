@@ -115,10 +115,10 @@ impl Kakehashi {
             .with_node_mapped(&params.text_document.uri, &params.id, |n, mapper| {
                 let start_byte = mapper.position_to_byte(start)?;
                 let end_byte = mapper.position_to_byte(end)?;
-                // Mirror the byte-range guards: reject inverted ranges and ones
-                // reaching past the node, whose tree-sitter behaviour is
-                // unspecified (see navigation.rs / lookup::find_node_at).
-                if start_byte > end_byte || end_byte > n.end_byte() {
+                // Mirror the byte-range guards: reject inverted ranges and any
+                // range not contained in the node's own span, whose tree-sitter
+                // behaviour is unspecified (see navigation.rs / lookup::find_node_at).
+                if start_byte < n.start_byte() || start_byte > end_byte || end_byte > n.end_byte() {
                     return None;
                 }
                 let descendant = if named {
