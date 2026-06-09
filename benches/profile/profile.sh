@@ -43,7 +43,9 @@ HERE="benches/profile"
 BIN="target/profiling/kakehashi"
 DWARF="target/profiling/kakehashi.dSYM/Contents/Resources/DWARF/kakehashi"
 ARCH="$(uname -m)"
-OUT="/tmp/kakehashi-profile"
+# Per-user output dir ($TMPDIR is already user-private on macOS) so concurrent
+# users on a shared machine don't collide on a world-writable /tmp path.
+OUT="${TMPDIR:-/tmp}/kakehashi-profile"
 mkdir -p "$OUT"
 
 echo "==> Building profiling binary (optimized + debug symbols)"

@@ -49,9 +49,11 @@ def symbolicate(dsym, arch, addrs):
     if not addrs:
         return {}
     runtime = [hex(TEXT_BASE + a) for a in addrs]
+    # Feed addresses on stdin (atos reads them when none are given as args) so a
+    # large profile with thousands of unique addresses can't exceed ARG_MAX.
     out = subprocess.run(
-        ["atos", "-o", dsym, "-arch", arch, "-l", hex(TEXT_BASE)] + runtime,
-        capture_output=True, text=True, check=True).stdout.splitlines()
+        ["atos", "-o", dsym, "-arch", arch, "-l", hex(TEXT_BASE)],
+        input="\n".join(runtime), capture_output=True, text=True, check=True).stdout.splitlines()
     clean = {}
     for a, line in zip(addrs, out):
         s = re.sub(r"::h[0-9a-f]{16}", "", line)
