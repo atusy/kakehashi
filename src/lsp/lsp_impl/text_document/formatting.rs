@@ -302,13 +302,13 @@ async fn dispatch_concatenated_formatting(
     // close. The scratch doc is also swept on the host document's own close.
     let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&uri).ok();
 
-    // Track every scratch document opened during this run that has NOT yet been
-    // closed, so we can guarantee cleanup even when a `tokio::select!` cancel
-    // drops the in-flight step future BEFORE its own `close_scratch_document`
-    // runs. Two reviewers flagged that drop-on-cancel as a scratch-document
-    // leak. The happy per-step path still closes immediately and removes its
-    // entry here, so the post-`select!` sweep only closes whatever a cancel
-    // left behind — no double-close.
+    // Track every scratch document opened during this run. Steps only register
+    // their scratch docs here; they never close them per step. All closing
+    // happens in the post-`select!` sweep (`close_remaining_scratch_docs`, which
+    // pops one at a time) and, if the task is aborted before the sweep runs, in
+    // `ScratchCleanupGuard`'s drop (which drains and closes on a detached task).
+    // Deferring all cleanup to those two cancel-safe points is what guarantees a
+    // cancel can never leak a scratch document downstream.
     let open_scratch: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
