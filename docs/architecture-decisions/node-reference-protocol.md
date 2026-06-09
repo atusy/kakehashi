@@ -250,18 +250,6 @@ Out-of-range / negative `index` or `byte` values collapse to `null` rather than 
 
 For `fieldNameFor*`, top-level `null` means the *id* is unresolvable, while `{ "fieldName": null }` means the node resolved but that child carries no field — the two are deliberately distinguished.
 
-#### Deferred accessors
-
-The following tree-sitter methods are **intentionally not implemented yet** because each carries a design decision that should be settled before freezing it on the wire. Each is tracked as an issue:
-
-| Method(s) | Open question | Issue |
-|---|---|---|
-| `range`, `startPosition`, `endPosition`, `descendantForPointRange`, `namedDescendantForPointRange` | tree-sitter `Point.column` is a UTF-8 byte column; LSP `Position.character` is UTF-16. Whether to return / accept native byte points or convert to LSP positions is the `kakehashi/node/range` endpoint design (see Alternative C). | [#331](https://github.com/atusy/kakehashi/issues/331) |
-| `language` | tree-sitter's `LanguageRef` carries no registered name; what to return (registered name? abi version?) and how to thread the layer's resolved language out is unresolved. | [#332](https://github.com/atusy/kakehashi/issues/332) |
-| `hasChanges` | Reflects pending `Tree::edit` state before a reparse. Kakehashi always serves freshly-parsed trees, so this would always be `false` — meaningless until/unless incremental reparsing is wired in. | [#333](https://github.com/atusy/kakehashi/issues/333) |
-| `childrenByFieldId` | Field **ids** are opaque, grammar-version-specific `u16`s. Exposing them raw invites version-coupling; clients should likely use field *names*. | [#334](https://github.com/atusy/kakehashi/issues/334) |
-| `childWithDescendant` | Takes a second node (the descendant) as an argument, requiring a two-id request whose both ids must resolve in the same layer — a richer contract than the other accessors. | [#335](https://github.com/atusy/kakehashi/issues/335) |
-
 ### Text Resolution: `kakehashi/node/text`
 
 ```jsonc
