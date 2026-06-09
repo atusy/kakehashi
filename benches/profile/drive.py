@@ -33,6 +33,8 @@ def main() -> None:
              "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
              "else the server auto-installs on first request")
     args = ap.parse_args()
+    if args.requests <= 0:
+        ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
 
     if args.lang == "rust":
         uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
