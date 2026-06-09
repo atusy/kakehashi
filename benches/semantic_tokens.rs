@@ -130,6 +130,38 @@ impl Server {
         )
     }
 
+    /// Incremental `didChange` that toggles a single space at the start of
+    /// `line`: `insert` adds it, `!insert` removes it. Because the char at
+    /// column 0 after an insert is always that space, the delete restores the
+    /// document to its exact original bytes — so a type/untype pair round-trips
+    /// and keeps token count stable across iterations.
+    fn did_change_toggle(&mut self, uri: &str, version: i64, line: u32, insert: bool) {
+        let change = if insert {
+            json!({
+                "range": {
+                    "start": { "line": line, "character": 0 },
+                    "end": { "line": line, "character": 0 },
+                },
+                "text": " ",
+            })
+        } else {
+            json!({
+                "range": {
+                    "start": { "line": line, "character": 0 },
+                    "end": { "line": line, "character": 1 },
+                },
+                "text": "",
+            })
+        };
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [change],
+            }),
+        );
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
@@ -322,8 +354,22 @@ fn ms(d: Duration) -> f64 {
 
 #[derive(Clone, Copy)]
 enum Kind {
+    /// `semanticTokens/full` on an unchanging document.
     Full,
+    /// `semanticTokens/full/delta` with no edit between requests.
     DeltaNoop,
+    /// Realistic editing: a toggle `didChange` then `semanticTokens/full/delta`,
+    /// so each measured request pays incremental reparse + cache invalidation +
+    /// delta diff on top of the (full) token recompute.
+    EditDelta,
+}
+
+/// Mutable per-run state for [`Kind::EditDelta`]: the next `didChange` version,
+/// an edit counter (parity selects insert vs delete), and the line edited.
+struct EditState {
+    version: i64,
+    count: u64,
+    line: u32,
 }
 
 struct Scenario {
@@ -355,18 +401,26 @@ fn measure(
     // Let the initial parse settle (didOpen parse may be async).
     std::thread::sleep(Duration::from_millis(300));
 
-    // For delta scenarios we need a valid previous result_id; seed it from a
+    // For delta/edit scenarios we need a valid previous result_id; seed it from a
     // full request, then keep it current (a no-op delta may or may not rotate).
     let mut prev_result_id = seed_result_id(&mut server, scn);
 
+    // did_open used version 1; edits continue from there. Edit a line in the
+    // middle of the document (representative of typical cursor position).
+    let mut edit = EditState {
+        version: 1,
+        count: 0,
+        line: (scn.content.lines().count() / 2) as u32,
+    };
+
     for _ in 0..warmup {
-        run_once(&mut server, scn, &mut prev_result_id);
+        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
     }
 
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        run_once(&mut server, scn, &mut prev_result_id);
+        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
         samples.push(start.elapsed());
     }
     samples
@@ -375,11 +429,19 @@ fn measure(
 fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
     match scn.kind {
         Kind::Full => String::new(),
-        Kind::DeltaNoop => result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default(),
+        // Both delta-based scenarios need an initial result_id to diff against.
+        Kind::DeltaNoop | Kind::EditDelta => {
+            result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
+        }
     }
 }
 
-fn run_once(server: &mut Server, scn: &Scenario, prev_result_id: &mut String) {
+fn run_once(
+    server: &mut Server,
+    scn: &Scenario,
+    prev_result_id: &mut String,
+    edit: &mut EditState,
+) {
     match scn.kind {
         Kind::Full => {
             let _ = server.semantic_full(scn.uri);
@@ -387,6 +449,23 @@ fn run_once(server: &mut Server, scn: &Scenario, prev_result_id: &mut String) {
         Kind::DeltaNoop => {
             let result = server.semantic_delta(scn.uri, prev_result_id);
             // Keep the id valid for the next request whether or not it rotated.
+            if let Some(id) = result_id_of(&result) {
+                *prev_result_id = id;
+            }
+        }
+        Kind::EditDelta => {
+            // Apply one toggle edit, then request a delta against the prior id.
+            let insert = edit.count.is_multiple_of(2);
+            edit.count += 1;
+            edit.version += 1;
+            server.did_change_toggle(scn.uri, edit.version, edit.line, insert);
+            // Fall back to a full request if we don't yet have a valid id
+            // (e.g. a prior delta was cancelled and returned no result).
+            let result = if prev_result_id.is_empty() {
+                server.semantic_full(scn.uri)
+            } else {
+                server.semantic_delta(scn.uri, prev_result_id)
+            };
             if let Some(id) = result_id_of(&result) {
                 *prev_result_id = id;
             }
@@ -462,6 +541,22 @@ fn main() {
             content: gen_rust(150),
             kind: Kind::DeltaNoop,
             targets: "no-op delta result_id reuse",
+        },
+        Scenario {
+            name: "rust_large/edit_delta",
+            language_id: "rust",
+            uri: "file:///bench/large_edit.rs",
+            content: gen_rust(150),
+            kind: Kind::EditDelta,
+            targets: "edit→reparse→retokenize→delta diff (host path under typing)",
+        },
+        Scenario {
+            name: "markdown_injections/edit_delta",
+            language_id: "markdown",
+            uri: "file:///bench/injections_edit.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::EditDelta,
+            targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
         },
     ];
 
