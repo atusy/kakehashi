@@ -26,6 +26,16 @@ impl Kakehashi {
         {
             let edit_lock = self.documents.edit_lock(&uri);
             let _edit_guard = edit_lock.lock().await;
+            // Drop stored captures lineage BEFORE the removal and INSIDE the
+            // edit-lock section (captures-protocol): `store_lineage` inserts
+            // under this same lock, so clearing here cannot wipe a lineage a
+            // fast reopen's `full` stored after this close completed — that
+            // insert can only start once this section is over, against the
+            // reopened document's fresh open generation. (A didOpen landing
+            // *inside* this section is a wider lifecycle race; for captures it
+            // degrades to the self-healing "delta answers null → client calls
+            // full again", never to stale data.)
+            self.captures_cache.retain(|key, _| key.0 != uri);
             self.documents.remove(&uri);
         }
 
@@ -34,10 +44,6 @@ impl Kakehashi {
 
         // Clean up region ID mappings for this document (lazy-node-identity-tracking)
         self.bridge.cleanup(&uri);
-
-        // Drop stored captures results for this document (captures-protocol);
-        // a reopened document starts a fresh resultId lineage.
-        self.captures_cache.retain(|key, _| key.0 != uri);
 
         // Abort any in-progress synthetic diagnostic task for this document (pull-first-diagnostic-forwarding Phase 2)
         self.synthetic_diagnostics.remove_document(&uri);

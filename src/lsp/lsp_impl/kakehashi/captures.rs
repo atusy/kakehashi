@@ -338,6 +338,26 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
+        // The stale-id fallback was justified by exactly one live mode slot —
+        // but that was observed before the await, and another client may have
+        // opened the other mode's lineage since. Revalidate: if the mode is
+        // no longer unambiguously the one we computed under, answer `null`
+        // (and store nothing) rather than serve a guessed layer set.
+        if !matched {
+            let still_single = self.captures_cache.get(&key).is_some_and(|entry| {
+                let live: Vec<usize> = entry
+                    .value()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| slot.is_some().then_some(i))
+                    .collect();
+                matches!(live.as_slice(), [only] if *only == usize::from(injection))
+            });
+            if !still_single {
+                return Ok(Value::Null);
+            }
+        }
+
         let result_id = next_result_id();
         // Diff against the cached slot while borrowing it in place — cloning
         // the previous matches would tax every delta request, the hot repeat
