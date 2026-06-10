@@ -843,6 +843,18 @@ impl LanguageServerPool {
         request_desc: &str,
     ) -> Option<Arc<ConnectionHandle>> {
         let connections = self.connections().await;
+        self.ready_handle_for_cancel_in(&connections, server_name, request_desc)
+    }
+
+    /// Lock-free core of [`ready_connection_for_cancel`](Self::ready_connection_for_cancel):
+    /// look up `server_name` in an already-acquired connections map so callers
+    /// fanning out over several servers can pay the lock acquisition once.
+    fn ready_handle_for_cancel_in(
+        &self,
+        connections: &HashMap<String, Arc<ConnectionHandle>>,
+        server_name: &str,
+        request_desc: &str,
+    ) -> Option<Arc<ConnectionHandle>> {
         let Some(handle) = connections.get(server_name) else {
             // No connection - request may have completed or server never started.
             // Silently drop per best-effort semantics.
@@ -966,29 +978,37 @@ impl LanguageServerPool {
             }
         };
 
-        // 2. Capture each server's connection handle and in-flight downstream ids.
+        // 2. Capture each server's connection handle and in-flight downstream
+        //    ids under a single connections-lock acquisition, so the time until
+        //    `notify` wakes the upstream handler is bounded by one lock wait,
+        //    not one per server (PR #359 review).
         let mut targets: Vec<(String, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
-        for server_name in server_names {
-            let Some(handle) = self
-                .ready_connection_for_cancel(&server_name, &format!("upstream_id: {upstream_id}"))
-                .await
-            else {
-                continue;
-            };
-            let downstream_ids = handle.router().lookup_downstream_ids(&upstream_id);
-            if downstream_ids.is_empty() {
-                // Request already completed or ID never registered.
-                // Silently drop per best-effort semantics.
-                self.cancel_metrics.record_unknown_id();
-                log::debug!(
-                    target: "kakehashi::bridge::cancel",
-                    "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
-                    upstream_id,
-                    server_name
-                );
-                continue;
+        {
+            let connections = self.connections().await;
+            for server_name in server_names {
+                let Some(handle) = self.ready_handle_for_cancel_in(
+                    &connections,
+                    &server_name,
+                    &format!("upstream_id: {upstream_id}"),
+                ) else {
+                    continue;
+                };
+                let downstream_ids = handle.router().lookup_downstream_ids(&upstream_id);
+                if downstream_ids.is_empty() {
+                    // Request already completed or ID never registered.
+                    // Silently drop per best-effort semantics.
+                    self.cancel_metrics.record_unknown_id();
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
+                        upstream_id,
+                        server_name
+                    );
+                    continue;
+                }
+                targets.push((server_name, handle, downstream_ids));
             }
-            targets.push((server_name, handle, downstream_ids));
+            // Lock dropped here — notify and the sends below run without it.
         }
 
         // 3. Wake the upstream handler only now that targets are captured.
