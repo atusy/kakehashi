@@ -68,6 +68,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
             &text,
             &lines,
+            &line_starts,
             &tree,
             filetype.as_deref(),
             &coordinator,

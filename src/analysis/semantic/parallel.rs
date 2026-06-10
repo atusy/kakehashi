@@ -15,9 +15,7 @@ use std::collections::HashMap;
 use tree_sitter::{Parser, Tree};
 
 use super::injection::InjectionContext;
-use super::token_collector::{
-    ActiveInjectionBounds, RawToken, build_line_start_bytes, collect_host_tokens,
-};
+use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_tokens};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
@@ -422,12 +420,18 @@ fn collect_injection_contexts_sync<'a>(
 /// recurse on the same worker thread — no extra parallelism to avoid coordination
 /// overhead.
 ///
+/// `host_line_starts` must come from `build_line_start_bytes(host_text)`; the
+/// caller builds it once per request and it is shared by every injection (and
+/// the active-region conversion below) so byte→line/col mapping never rescans
+/// the host text per injection.
+///
 /// A region is *active* only if at least one token was produced from it (depth ≥ 1);
 /// resolved-but-empty injections don't suppress parent tokens.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_injection_tokens_parallel(
     host_text: &str,
     host_lines: &[&str],
+    host_line_starts: &[usize],
     host_tree: &Tree,
     host_filetype: Option<&str>,
     coordinator: &LanguageCoordinator,
@@ -447,10 +451,6 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Create factory from coordinator's registry (cloned for thread safety)
     let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
 
-    // Built once and shared by every injection (and the active-region conversion
-    // below) so byte→line/col mapping never rescans the host text per injection.
-    let host_line_starts = build_line_start_bytes(host_text);
-
     // Threshold for parallel processing - below this, Rayon scheduling overhead exceeds benefit
     const PARALLEL_THRESHOLD: usize = 4;
 
@@ -467,7 +467,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     capture_mappings,
                     host_text,
                     host_lines,
-                    &host_line_starts,
+                    host_line_starts,
                     1, // depth 1 (first level of injection, host is 0)
                     supports_multiline,
                 )
@@ -485,7 +485,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     capture_mappings,
                     host_text,
                     host_lines,
-                    &host_line_starts,
+                    host_line_starts,
                     1,
                     supports_multiline,
                 )
@@ -501,7 +501,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     let active_regions = compute_active_injection_regions(
         host_text,
         host_lines,
-        &host_line_starts,
+        host_line_starts,
         &exclusion_byte_ranges,
         &all_tokens,
     );
@@ -592,6 +592,7 @@ mod tests {
 
     use tree_sitter::Query;
 
+    use super::super::token_collector::build_line_start_bytes;
     use super::*;
     use crate::language::registry::LanguageRegistry;
 
@@ -946,6 +947,7 @@ mod tests {
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
             &host_lines,
+            &build_line_start_bytes(text),
             &tree,
             Some("markdown"),
             &coordinator,
@@ -1000,6 +1002,7 @@ local x = 42
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
             &host_lines,
+            &build_line_start_bytes(text),
             &tree,
             Some("markdown"),
             &coordinator,
@@ -1082,6 +1085,7 @@ local b = 2
         let (tokens, _regions) = collect_injection_tokens_parallel(
             text,
             &host_lines,
+            &build_line_start_bytes(text),
             &tree,
             Some("markdown"),
             &coordinator,
