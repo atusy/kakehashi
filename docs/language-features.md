@@ -377,15 +377,16 @@ re-request cheaply on every cursor move or edit:
 
 | Method | Input | Output |
 |--------|-------|--------|
-| `kakehashi/captures/full` | `{ textDocument, kind }` | `CapturesResult \| null` |
+| `kakehashi/captures/full` | `{ textDocument, kind, injection? }` | `CapturesResult \| null` |
 | `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
-| `kakehashi/captures/range` | `{ textDocument, kind, range }` | `{ matches, skipped } \| null` |
+| `kakehashi/captures/range` | `{ textDocument, kind, range, injection? }` | `{ matches, skipped } \| null` |
 
 ```typescript
 type CapturesResult = {
   resultId: string;                  // hand back as previousResultId for a delta
   matches: Match[];
   skipped: {                         // patterns dropped by tolerant compilation
+    language: string;                // which language's kind file had the problem
     startLine: number;               // 1-indexed; in the query file — or in the
     endLine: number;                 // combined query when `; inherits:` is used
     reason: string;                  // Tree-sitter's compile error for that pattern
@@ -393,7 +394,9 @@ type CapturesResult = {
 };
 
 type Match = {
-  patternIndex: number;              // which pattern in the query produced this match
+  patternIndex: number;              // pattern within that language's kind query —
+                                     // (language, patternIndex) is the unique key
+  language: string;                  // language of the layer this match came from
   captures: {
     name: string;                    // capture name without the '@', e.g. "context"
     node: NodeInfo;                  // { id, kind } — trackable like any other node
@@ -409,14 +412,29 @@ type CapturesDelta = {
 };
 ```
 
+- **The `injection` parameter** (`boolean`, default `false`): `false` runs the kind
+  query on the host document only; `true` runs it across **every** embedded layer
+  too — the host first, then each injected region in document order, nested
+  injections included. Each layer resolves **its own language's**
+  `queries/<lang>/<kind>.scm`, so a Markdown document with a Python block yields
+  the Markdown heading *and* the Python function in one response; a language
+  without the kind file simply contributes nothing. `language` is present on every
+  match either way, and captured node ids resolve in their own layer when handed
+  to `kakehashi/node/*`.
 - **`full` → `full/delta` loop**: call `full` once, keep its `resultId`, then send
-  `full/delta` on subsequent ticks. An unchanged document answers with empty
-  `edits`; a small edit ships only the changed matches. If the server doesn't
-  recognize `previousResultId` (e.g. after a reopen), it falls back to a full
-  result — clients need no special re-sync logic. Every response carries a fresh
+  `full/delta` on subsequent ticks. The delta carries **no `injection` parameter**
+  — your `previousResultId` identifies the lineage and with it the mode; switch
+  modes by issuing a new `full`. Lineages are kept **per mode**, so a host-only
+  client and an injection client on the same document don't disturb each other.
+  An unchanged document answers with empty `edits`; a small edit ships only the
+  changed matches. A stale `previousResultId` falls back to a full result when
+  the mode is unambiguous (only one mode in use); when it isn't — or the server
+  has no lineage at all (never `full`ed, closed, restarted) — the answer is
+  `null`: on `null`, call `full` again. Every response carries a fresh
   `resultId`; always hand back the latest one.
 - **`range`** scopes the query walk to a viewport (matches whose nodes intersect
-  the range). It carries no `resultId` — there is no delta over viewports.
+  the range); with `injection: true`, embedded layers outside the range are
+  skipped entirely. It carries no `resultId` — there is no delta over viewports.
 - **Captures are grouped by match**, so correlated captures within one pattern
   (e.g. `@context` and `@context.end`) stay together.
 - **Each capture carries both a `node` and its `range`**, so a bulk result needs no
@@ -427,13 +445,11 @@ type CapturesDelta = {
   highlighting. Unknown predicates are ignored.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
-- **`null` means "nothing here"**: the document isn't open, or the language has no
-  `<kind>.scm` on the search paths. A malformed `kind` (anything beyond
-  `[A-Za-z0-9_-]+`) is a client error, returned as JSON-RPC `InvalidParams`.
-
-> Capture queries run against the **host layer only** for now; patterns are not yet
-> matched inside embedded (injected) languages. Querying a Python block inside
-> Markdown, for example, is planned but not yet available.
+- **`null` means "nothing here"**: the document isn't open, or no involved
+  language has a `<kind>.scm` on the search paths (with `injection: true`, it's
+  enough for *any* layer's language to have one). A malformed `kind` (anything
+  beyond `[A-Za-z0-9_-]+`) is a client error, returned as JSON-RPC
+  `InvalidParams`.
 
 ---
 

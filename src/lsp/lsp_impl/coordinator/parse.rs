@@ -176,8 +176,17 @@ impl ParseCoordinator {
                 let for_store = edited.clone();
                 (edited, for_store)
             } else {
-                let tree = self.documents.get(&uri).and_then(|doc| doc.tree().cloned());
-                (tree, None)
+                // Full-text sync (and any other no-edits reparse): do NOT seed
+                // the parse with the stored tree. tree-sitter's incremental
+                // contract requires every text change to be applied to the old
+                // tree via ts_tree_edit first; reusing an unedited tree against
+                // different text makes external scanners deserialize state at
+                // wrong positions and (for the markdown grammar) overflow in
+                // scanner serialize — heap corruption that killed the whole
+                // server (#348). A full parse is the correct cost of full-text
+                // sync: without InputEdits there is nothing to be incremental
+                // about.
+                (None, None)
             };
 
             let text_clone = text.clone();
