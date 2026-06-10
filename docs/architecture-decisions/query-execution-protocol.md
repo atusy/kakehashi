@@ -63,8 +63,9 @@ type QueryCapture = {
 };
 
 type SkippedPattern = {
-  patternIndex: number;
-  reason: string;
+  startLine: number;   // 1-indexed line of the dropped pattern in the query string
+  endLine: number;
+  reason: string;      // tree-sitter's compile error for that pattern
 };
 ```
 

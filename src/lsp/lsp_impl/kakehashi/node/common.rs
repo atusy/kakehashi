@@ -216,7 +216,12 @@ impl Kakehashi {
     /// Mint (or reuse) a stable ULID for a related node in `layer` and shape it
     /// as a `NodeInfo`. Shared by every handler that returns a single resolved
     /// node, so the wire shape stays identical.
-    pub(super) fn mint_node_info(&self, uri: &Url, layer: usize, triple: NodeTriple) -> Value {
+    pub(in crate::lsp::lsp_impl::kakehashi) fn mint_node_info(
+        &self,
+        uri: &Url,
+        layer: usize,
+        triple: NodeTriple,
+    ) -> Value {
         let (start, end, kind) = triple;
         let ulid = self
             .bridge

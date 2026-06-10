@@ -651,6 +651,7 @@ async fn run_lsp_server() {
         "kakehashi/internal/effectiveConfiguration",
         Kakehashi::effective_configuration,
     )
+    .custom_method("kakehashi/query", Kakehashi::kakehashi_query)
     .custom_method("kakehashi/node", Kakehashi::kakehashi_node)
     .custom_method("kakehashi/node/text", Kakehashi::kakehashi_node_text)
     .custom_method("kakehashi/node/parent", Kakehashi::kakehashi_node_parent)
