@@ -477,6 +477,29 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Whether `server_name` advertises the capability backing `method`,
+    /// spawning the server (default handshake timeout) on a connection miss.
+    ///
+    /// Thin wrapper over [`ConnectionHandle::has_capability`] for callers
+    /// outside the bridge that need a capability answer *without* issuing a
+    /// request — the concatenated formatting pipeline keys its
+    /// full-vs-rangeFormatting step decision on this
+    /// (concatenated-formatting-pipeline Decision point 3.2). Mirrors the
+    /// request handlers' own pre-flight checks: a connection still
+    /// initializing reports `false` for now, exactly as the corresponding
+    /// `send_*_request` would decline to run.
+    pub(crate) async fn server_advertises(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        method: &str,
+    ) -> io::Result<bool> {
+        let handle = self
+            .get_or_create_connection(server_name, server_config)
+            .await?;
+        Ok(handle.has_capability(method))
+    }
+
     /// Get or create a connection for the specified server, spawning the server
     /// and running the LSP handshake with the default timeout on a miss.
     pub(super) async fn get_or_create_connection(

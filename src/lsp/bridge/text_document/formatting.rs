@@ -135,7 +135,14 @@ fn build_formatting_request(
 }
 
 /// Translate each `TextEdit` from virtual to host coordinates via `offset`.
-/// LSP returns `TextEdit[] | null`, so `null` or missing `result` collapses to `None`.
+///
+/// LSP returns `TextEdit[] | null`. A `null` result from a server that handled
+/// the request is the authoritative "no changes / already formatted" signal and
+/// maps to `Some(vec![])`; only a genuinely missing result — a JSON-RPC error
+/// or malformed payload — collapses to `None`. Keeping the two apart is what
+/// lets the concatenated pipeline's capability-based fallback distinguish
+/// "capable server, nothing to change" from "no usable response"
+/// (concatenated-formatting-pipeline Decision point 3.2).
 ///
 /// Downstream formatters often emit edits past the virtual EOF (e.g. enforce a
 /// trailing newline) as if it were a real file; the host bytes immediately past
@@ -156,7 +163,9 @@ pub(super) fn transform_formatting_response_to_host(
     let result = response.get_mut("result").map(serde_json::Value::take)?;
 
     if result.is_null() {
-        return None;
+        // Authoritative "no changes / already formatted" — an empty edit list,
+        // not a missing result (see function docs).
+        return Some(Vec::new());
     }
 
     // A non-null `result` that fails to deserialize as `Vec<TextEdit>` means
@@ -368,13 +377,32 @@ mod tests {
     }
 
     #[rstest]
-    #[case::null_result(json!({"jsonrpc": "2.0", "id": 42, "result": null}))]
     #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
     fn formatting_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
         let transformed =
             transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED);
         assert!(transformed.is_none());
+    }
+
+    #[test]
+    fn formatting_response_null_result_is_authoritative_empty_edit_list() {
+        // Per LSP, `null` from a server that handled the request means
+        // "no changes / already formatted" — an authoritative answer, not a
+        // missing one. It must come back as Some(vec![]) so callers can tell
+        // it apart from `None` ("no result": error or missing provider), which
+        // the concatenated pipeline's capability fallback depends on (ADR
+        // concatenated-formatting-pipeline Decision point 3.2).
+        let response = json!({"jsonrpc": "2.0", "id": 42, "result": null});
+
+        let transformed =
+            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED);
+
+        assert_eq!(
+            transformed,
+            Some(Vec::new()),
+            "null result must be an authoritative empty edit list, not None"
+        );
     }
 
     #[test]

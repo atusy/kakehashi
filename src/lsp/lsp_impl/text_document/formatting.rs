@@ -244,6 +244,54 @@ fn plan_region_format(
     }
 }
 
+/// Which request one concatenated-pipeline step issues for a server, keyed on
+/// the capabilities it advertises (concatenated-formatting-pipeline Decision
+/// point 3.2).
+#[derive(Debug, PartialEq, Eq)]
+enum PipelineStepRequest {
+    /// `documentFormattingProvider` advertised: full `textDocument/formatting`.
+    Full,
+    /// Range-only server (`documentRangeFormattingProvider` without
+    /// `documentFormattingProvider`): `textDocument/rangeFormatting` over the
+    /// entire region, so the server still participates in the pipeline.
+    WholeRegionRange,
+    /// Neither provider advertised: the step contributes nothing and sends no
+    /// unsupported request downstream.
+    Skip,
+}
+
+/// Pure capability-to-request mapping for one pipeline step (ADR Decision
+/// point 3.2). Full formatting always wins when advertised; the range
+/// fallback is itself gated on the range capability.
+fn select_pipeline_step_request(supports_full: bool, supports_range: bool) -> PipelineStepRequest {
+    if supports_full {
+        PipelineStepRequest::Full
+    } else if supports_range {
+        PipelineStepRequest::WholeRegionRange
+    } else {
+        PipelineStepRequest::Skip
+    }
+}
+
+/// Probe the server's advertised formatting capabilities (spawning it if
+/// needed) and map them to the step's request kind via
+/// [`select_pipeline_step_request`]. The second probe is skipped when full
+/// formatting is advertised — the answer can no longer matter.
+async fn pipeline_step_request_kind(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    server_name: &str,
+    server_config: &crate::config::settings::BridgeServerConfig,
+) -> std::io::Result<PipelineStepRequest> {
+    let supports_full = pool
+        .server_advertises(server_name, server_config, "textDocument/formatting")
+        .await?;
+    let supports_range = !supports_full
+        && pool
+            .server_advertises(server_name, server_config, "textDocument/rangeFormatting")
+            .await?;
+    Ok(select_pipeline_step_request(supports_full, supports_range))
+}
+
 /// `preferred`-strategy formatting for one region: the existing
 /// first-non-empty-wins fan-out, factored out of the per-region task body.
 async fn dispatch_preferred_formatting(
@@ -274,10 +322,12 @@ async fn dispatch_preferred_formatting(
             }
         },
         // `Some(vec![])` is an authoritative "no edits needed" from the
-        // formatter (e.g., ruff signaling the code is already formatted) —
+        // formatter — both an explicit empty list and (since the bridge
+        // transform stopped collapsing it) a `null` response per LSP — so
         // accept it instead of falling through to a lower-priority server that
-        // might re-format the same code. `None` still means "no response" and
-        // triggers fallback.
+        // might re-format the same code. `None` now strictly means "no usable
+        // response" (missing provider, error, malformed payload) and triggers
+        // fallback.
         |opt| opt.is_some(),
         region_cancel_rx,
     )
@@ -315,9 +365,15 @@ async fn dispatch_preferred_formatting(
 /// removes the cancel-during-cleanup edge cases the old awaited sweep had: a
 /// cancel mid-`didClose` can no longer orphan a downstream doc.
 ///
+/// Each step keys its request on the server's advertised capabilities
+/// ([`select_pipeline_step_request`], ADR Decision point 3.2): full formatting
+/// when `documentFormattingProvider` is advertised, whole-region
+/// `rangeFormatting` for range-only servers, and no request at all for servers
+/// advertising neither. A capable server's `null` response is authoritative
+/// "already formatted" (`Some(vec![])` from the bridge transform) and never
+/// triggers the fallback.
+///
 /// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
-///   - capability-based full -> rangeFormatting fallback for range-only servers,
-///     distinguishing "no capability" from a `null` "already formatted";
 ///   - per-step remaining-budget timeout and concurrent $/cancelRequest
 ///     propagation (Decision points 6 and the Consequences cancellation note);
 ///   - discarding downstream `publishDiagnostics` targeting scratch URIs;
@@ -418,6 +474,42 @@ async fn dispatch_concatenated_formatting(
                 let Some(server_config) = server_config else {
                     return (current_text, None);
                 };
+
+                // ADR Decision point 3.2: the pipeline prefers full formatting;
+                // the fallback to whole-region rangeFormatting keys on
+                // CAPABILITY, never on the response (a capable server's `null`
+                // is the authoritative "already formatted" and arrives as
+                // `Some(vec![])` from the bridge transform). A probe error
+                // (connection spawn/handshake failure) is a failed step:
+                // skip-and-continue (ADR point 6).
+                let step_request =
+                    match pipeline_step_request_kind(&pool, &server_name, &server_config).await {
+                        Ok(kind) => kind,
+                        Err(e) => {
+                            log::warn!(
+                                target: "kakehashi::formatting",
+                                "concatenated formatting step for server {} failed during \
+                                 capability probe; skipping (ADR point 6): {}",
+                                server_name,
+                                e
+                            );
+                            return (current_text, None);
+                        }
+                    };
+                if step_request == PipelineStepRequest::Skip {
+                    // Neither documentFormattingProvider nor
+                    // documentRangeFormattingProvider: contribute nothing and
+                    // send no unsupported request (ADR point 3.2).
+                    log::debug!(
+                        target: "kakehashi::formatting",
+                        "concatenated formatting step for server {} skipped: \
+                         server advertises neither documentFormattingProvider \
+                         nor documentRangeFormattingProvider",
+                        server_name
+                    );
+                    return (current_text, None);
+                }
+
                 let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let scratch_id = scratch_region_id(&region_id, run_seq, step);
 
@@ -459,8 +551,8 @@ async fn dispatch_concatenated_formatting(
                 // `region_replacement_range`.
                 // (`apply_text_edits` does its own clamping as a general safety
                 // net, independent of this transform.)
-                let send_result = pool
-                    .send_formatting_request(
+                let send_result = if step_request == PipelineStepRequest::Full {
+                    pool.send_formatting_request(
                         &server_name,
                         &server_config,
                         &uri,
@@ -471,7 +563,36 @@ async fn dispatch_concatenated_formatting(
                         options,
                         upstream_id,
                     )
-                    .await;
+                    .await
+                } else {
+                    // WholeRegionRange (Skip already returned above): the
+                    // range-only server formats the entire region, expressed
+                    // as a range over the step's current text. With the zero
+                    // offset, host and virtual coordinates coincide, so the
+                    // whole-region replacement range doubles as the request
+                    // range.
+                    match region_replacement_range(&current_text, &RegionOffset::new(0, 0)) {
+                        Some(whole_region) => {
+                            pool.send_range_formatting_request(
+                                &server_name,
+                                &server_config,
+                                &uri,
+                                &injection_language,
+                                &scratch_id,
+                                RegionOffset::new(0, 0),
+                                &current_text,
+                                whole_region,
+                                options,
+                                upstream_id,
+                            )
+                            .await
+                        }
+                        // Unresolvable end position (mapper bug / corrupt
+                        // content): treat as a failed step rather than sending
+                        // an unbounded range downstream.
+                        None => Ok(None),
+                    }
+                };
 
                 // ADR Decision point 6 (best-effort, skip-and-continue): a
                 // failed step is skipped — never surfaced to the editor — but is
@@ -964,6 +1085,46 @@ mod tests {
         assert_eq!(
             plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
             RegionFormatPlan::Concatenated(vec!["black".to_string()])
+        );
+    }
+
+    // ==========================================================================
+    // select_pipeline_step_request (concatenated-formatting-pipeline Decision
+    // point 3.2: capability-based full -> rangeFormatting fallback)
+    // ==========================================================================
+
+    #[test]
+    fn step_request_prefers_full_formatting_when_advertised() {
+        // A server with documentFormattingProvider gets a full formatting
+        // request — even if it also advertises range formatting.
+        assert_eq!(
+            select_pipeline_step_request(true, true),
+            PipelineStepRequest::Full
+        );
+        assert_eq!(
+            select_pipeline_step_request(true, false),
+            PipelineStepRequest::Full
+        );
+    }
+
+    #[test]
+    fn step_request_falls_back_to_whole_region_range_for_range_only_server() {
+        // No documentFormattingProvider but documentRangeFormattingProvider:
+        // the step issues rangeFormatting over the entire region so the
+        // range-only server still participates in the pipeline.
+        assert_eq!(
+            select_pipeline_step_request(false, true),
+            PipelineStepRequest::WholeRegionRange
+        );
+    }
+
+    #[test]
+    fn step_request_skips_server_advertising_neither_provider() {
+        // Neither provider: contribute nothing, and crucially send no
+        // unsupported request downstream.
+        assert_eq!(
+            select_pipeline_step_request(false, false),
+            PipelineStepRequest::Skip
         );
     }
 
