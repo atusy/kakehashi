@@ -27,6 +27,8 @@ def main() -> None:
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
+    ap.add_argument("--file", help="drive with this file's content instead of a "
+                                   "generated document (language from --lang)")
     ap.add_argument(
         "--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
         help="parser/query data dir; must already contain installed parsers "
@@ -36,7 +38,11 @@ def main() -> None:
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
 
-    if args.lang == "rust":
+    if args.file:
+        ext = "rs" if args.lang == "rust" else "md"
+        with open(args.file) as f:
+            uri, lang, text = f"file:///profile/input.{ext}", args.lang, f.read()
+    elif args.lang == "rust":
         uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
     else:
         uri, lang, text = "file:///profile/inj.md", "markdown", gen_markdown_injections(args.size)
