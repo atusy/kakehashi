@@ -92,6 +92,11 @@ fn build_linked_editing_range_request(
 /// All ranges describe occurrences of the same text inside the injection
 /// region, so each one is translated by the region offset. `wordPattern`
 /// carries no coordinates and passes through unchanged.
+///
+/// An empty `ranges` list normalizes to `None`: the preferred fan-in treats
+/// any `Some` as a winning result, so passing it through would let one
+/// server's "nothing here" mask another server's actual ranges and would
+/// surface an empty list instead of `null` upstream.
 fn transform_linked_editing_range_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
@@ -105,6 +110,9 @@ fn transform_linked_editing_range_response_to_host(
     }
 
     let mut linked: LinkedEditingRanges = serde_json::from_value(result).ok()?;
+    if linked.ranges.is_empty() {
+        return None;
+    }
 
     for range in &mut linked.ranges {
         translate_virtual_range_to_host(range, offset);
@@ -215,6 +223,7 @@ mod tests {
     #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42}))]
     #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_object"}))]
+    #[case::empty_ranges(json!({"jsonrpc": "2.0", "id": 42, "result": {"ranges": []}}))]
     fn linked_editing_range_response_returns_none_for_invalid(#[case] response: serde_json::Value) {
         let result =
             transform_linked_editing_range_response_to_host(response, &RegionOffset::new(5, 0));
