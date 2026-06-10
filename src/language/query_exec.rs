@@ -350,6 +350,38 @@ mod tests {
     }
 
     #[test]
+    fn zero_arg_predicate_neither_panics_nor_leaks_negated_matches() {
+        // A predicate with no arguments at all compiles — tree-sitter does
+        // not validate general predicates — and must not crash the server
+        // (Copilot review claimed `args[1..]` panics here). With no capture
+        // argument the predicate selects no nodes, so the aggregate is
+        // vacuously true: positive forms keep the match, `not-` forms fail
+        // closed, exactly like the typo-quoted-capture case above.
+        let src = "fn foo() {}";
+        let (language, tree) = rust_tree(src);
+        for operator in ["contains?", "has-parent?", "has-ancestor?"] {
+            let positive = compile(
+                &language,
+                &format!("((function_item name: (identifier) @name) (#{operator}))"),
+            );
+            assert_eq!(
+                execute_query(&positive, &tree, src, None).len(),
+                1,
+                "zero-arg #{operator} is vacuously true"
+            );
+
+            let negated = compile(
+                &language,
+                &format!("((function_item name: (identifier) @name) (#not-{operator}))"),
+            );
+            assert!(
+                execute_query(&negated, &tree, src, None).is_empty(),
+                "zero-arg #not-{operator} fails closed"
+            );
+        }
+    }
+
+    #[test]
     fn tolerant_compilation_skips_invalid_patterns() {
         // A valid pattern plus one referencing a node kind absent from the Rust
         // grammar: tolerant compilation keeps the good one and reports the bad
