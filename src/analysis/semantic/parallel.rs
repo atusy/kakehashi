@@ -283,7 +283,7 @@ fn clip_tokens_to_included_ranges(
     };
 
     // Allowed UTF-16 column intervals per host line.
-    let mut allowed: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    let mut allowed: HashMap<usize, Vec<(usize, usize)>> = HashMap::with_capacity(ranges.len());
     for r in ranges {
         let host_start = ctx.host_start_byte + r.start_byte;
         let host_end = ctx.host_start_byte + r.end_byte;
@@ -591,7 +591,7 @@ fn build_combined_context<'a>(
 
     // Each block contributes its child-exclusion gaps (or its whole node),
     // rebased from node-relative to group-relative coordinates.
-    let mut group_ranges: Vec<tree_sitter::Range> = Vec::new();
+    let mut group_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(regions.len());
     for region in regions {
         let node = &region.content_node;
         let node_start = node.start_byte();
