@@ -568,20 +568,6 @@ pub(super) fn ranges_contain_byte(
     })
 }
 
-/// Whether `byte` is acceptable as the **exclusive end bound** of a range
-/// argument against a layer's included ranges.
-///
-/// Unlike [`ranges_contain_byte`], a value equal to a range's `end_byte` is
-/// admitted: an exclusive end points one past the last byte actually queried,
-/// so landing exactly on a gap start still means "query up to the end of the
-/// included content". A value strictly inside a gap (its last queried byte
-/// would be excluded content) is rejected (#341).
-pub(super) fn ranges_admit_end_bound(ranges: &[tree_sitter::Range], byte: usize) -> bool {
-    ranges
-        .iter()
-        .any(|r| r.start_byte <= byte && byte <= r.end_byte)
-}
-
 /// Total byte length covered by `ranges`. Used as the smallest-injection
 /// tiebreaker — narrower effective spans win.
 fn total_span(ranges: &[tree_sitter::Range]) -> usize {

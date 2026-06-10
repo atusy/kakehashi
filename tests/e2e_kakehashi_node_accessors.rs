@@ -970,23 +970,42 @@ fn test_byte_lookups_in_excluded_gap_are_null() {
         "descendantForByteRange on included code bytes must resolve"
     );
 
-    // The `> ` prefix bytes (20..22) are an excluded gap → null.
-    for method in [
+    // A range crossing the gap with both endpoints on real content resolves
+    // the spanning node: [14, 23) starts on `x` and its last queried byte is
+    // the `y` at 22.
+    let spanning = call(
+        &mut client,
         "kakehashi/node/descendantForByteRange",
-        "kakehashi/node/namedDescendantForByteRange",
-    ] {
-        let v = call(
-            &mut client,
-            method,
-            json!({ "textDocument": { "uri": uri }, "id": root,
-                    "startByte": 20, "endByte": 21 }),
-        );
-        assert!(
-            v.is_null(),
-            "{} on excluded-gap bytes must return null, got {:?}",
-            method,
-            v
-        );
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "startByte": 14, "endByte": 23 }),
+    );
+    assert!(
+        !spanning.is_null(),
+        "a gap-spanning range with both bounds on code must still resolve"
+    );
+
+    // The `> ` prefix bytes (20..22) are an excluded gap → null. This covers
+    // a range inside the gap (20..21) and a range whose exclusive end lands
+    // on the next block's start (14..22): its last queried byte (21) is gap
+    // content even though 22 itself starts an included range.
+    for (start, end) in [(20, 21), (14, 22)] {
+        for method in [
+            "kakehashi/node/descendantForByteRange",
+            "kakehashi/node/namedDescendantForByteRange",
+        ] {
+            let v = call(
+                &mut client,
+                method,
+                json!({ "textDocument": { "uri": uri }, "id": root,
+                        "startByte": start, "endByte": end }),
+            );
+            assert!(
+                v.is_null(),
+                "{} on [{start}, {end}) must return null (gap content), got {:?}",
+                method,
+                v
+            );
+        }
     }
 
     let v = call(

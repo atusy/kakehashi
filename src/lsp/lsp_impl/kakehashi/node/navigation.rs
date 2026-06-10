@@ -20,9 +20,7 @@ use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{
     NodeByteParams, NodeByteRangeParams, NodeIdParams, NodeIndexParams,
 };
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
-    ranges_admit_end_bound, ranges_contain_byte,
-};
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte;
 
 /// Map a tree-sitter node to the `(start, end, kind)` triple the navigation
 /// helpers re-mint from.
@@ -178,19 +176,27 @@ impl Kakehashi {
 }
 
 /// Gap check for a `[start, end)` coordinate-range argument against the
-/// minting layer's included ranges (#341): the start (a queried byte) must lie
-/// in included content under the entry point's half-open rule, and the end (an
-/// exclusive bound) must not point past excluded content. Per-bound — not
-/// "both in one range" — because nodes legitimately span gaps (a multi-line
-/// statement in blockquoted code), and querying across a gap with both bounds
-/// on real content should still resolve that spanning node.
+/// minting layer's included ranges (#341): both the first queried byte
+/// (`start`) and the last queried byte (`end - 1`, since `end` is exclusive)
+/// must lie in included content under the entry point's half-open rule.
+/// `end` itself may sit on a gap start — one past the last included byte —
+/// but an `end` whose final queried byte falls in a gap (including an `end`
+/// anchored to a *later* range's start across a gap) queries excluded
+/// content and is rejected. Per-bound — not "both in one range" — because
+/// nodes legitimately span gaps (a multi-line statement in blockquoted code),
+/// and querying across a gap with both bounds on real content should still
+/// resolve that spanning node.
 pub(super) fn range_bounds_in_ranges(
     ranges: &[tree_sitter::Range],
     start: usize,
     end: usize,
     host_len: usize,
 ) -> bool {
-    ranges_contain_byte(ranges, start, host_len) && ranges_admit_end_bound(ranges, end)
+    if !ranges_contain_byte(ranges, start, host_len) {
+        return false;
+    }
+    // Zero-width queries are covered by the start check alone.
+    end == start || ranges_contain_byte(ranges, end - 1, host_len)
 }
 
 /// Convert the signed byte bounds to `usize`, returning `None` (→ `null`) if
