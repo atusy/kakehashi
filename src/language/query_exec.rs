@@ -33,10 +33,16 @@ pub(crate) struct CapturedNode {
 /// One query match, grouping its captures so correlated captures within a
 /// pattern (e.g. `@context` and `@context.end`) stay together
 /// (captures-protocol §"Result shapes").
+///
+/// `metadata` holds the pattern's match-level `#set!` directives — those
+/// without a capture argument, `(#set! key value)` — as `(key, value)` pairs
+/// in query-file order (treesitter-directive-set!). The value is `None` for
+/// the bare flag form `(#set! key)`.
 #[derive(Debug, Clone)]
 pub(crate) struct MatchData {
     pub pattern_index: usize,
     pub captures: Vec<CapturedNode>,
+    pub metadata: Vec<(String, Option<String>)>,
 }
 
 /// Run an already-compiled `query` over `tree`, collecting matches over `text`.
@@ -80,9 +86,20 @@ pub(crate) fn execute_query(
             continue;
         }
 
+        // `#set!` directives are parsed by tree-sitter into per-pattern
+        // property settings; the match-level ones (no capture argument) apply
+        // to every match of the pattern.
+        let metadata = query
+            .property_settings(m.pattern_index)
+            .iter()
+            .filter(|p| p.capture_id.is_none())
+            .map(|p| (p.key.to_string(), p.value.as_ref().map(|v| v.to_string())))
+            .collect();
+
         out.push(MatchData {
             pattern_index: m.pattern_index,
             captures,
+            metadata,
         });
     }
 
@@ -141,6 +158,26 @@ mod tests {
         assert_eq!(scoped.len(), 1, "only the function intersecting the range");
         let c = &scoped[0].captures[0];
         assert_eq!(&src[c.start_byte..c.end_byte], "b");
+    }
+
+    #[test]
+    fn set_directive_surfaces_match_level_metadata() {
+        // (#set! key value) without a capture sets match-level metadata
+        // (treesitter-directive-set!): every match of the pattern carries it.
+        let src = "fn foo() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @name) (#set! kind "function"))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].metadata,
+            vec![("kind".to_string(), Some("function".to_string()))]
+        );
     }
 
     #[test]

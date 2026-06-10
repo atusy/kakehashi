@@ -146,6 +146,24 @@ fn matches_delta_edit(previous: &[Value], current: &[Value]) -> Option<(usize, u
     Some((common_prefix, delete_count, data))
 }
 
+/// Shape `#set!` metadata pairs as a JSON object, or `None` when the pattern
+/// set none (so plain patterns carry no `metadata` field at all).
+///
+/// A valued key maps to its string; the bare flag form `(#set! key)` maps to
+/// `true` (a flag a client can test for, unlike Neovim's nil no-op). Duplicate
+/// keys are last-write-wins, matching Neovim's in-order directive application.
+fn metadata_object(pairs: &[(String, Option<String>)]) -> Option<Value> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (key, value) in pairs {
+        let value = value.as_ref().map_or(json!(true), |v| json!(v));
+        map.insert(key.clone(), value);
+    }
+    Some(Value::Object(map))
+}
+
 /// A kind query compiled for one language, with the patterns tolerant
 /// compilation dropped.
 struct KindQuery {
@@ -544,6 +562,7 @@ impl Kakehashi {
                 return;
             };
             for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
+                let match_metadata = metadata_object(&m.metadata);
                 let captures: Vec<Value> = m
                     .captures
                     .into_iter()
@@ -569,11 +588,18 @@ impl Kakehashi {
                 if captures.is_empty() {
                     continue;
                 }
-                matches.push(json!({
+                let mut envelope = json!({
                     "patternIndex": m.pattern_index,
                     "language": layer_language,
                     "captures": captures,
-                }));
+                });
+                // Match-level `#set!` metadata, only when the pattern set any
+                // (treesitter-directive-set!) — absent otherwise, so patterns
+                // without directives keep their pre-metadata wire shape.
+                if let Some(meta) = match_metadata {
+                    envelope["metadata"] = meta;
+                }
+                matches.push(envelope);
             }
         };
 

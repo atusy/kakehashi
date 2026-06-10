@@ -205,6 +205,46 @@ fn full_returns_grouped_matches_with_ranges_and_result_id() {
 }
 
 #[test]
+fn set_directive_yields_match_level_metadata() {
+    // `(#set! key value)` (treesitter-directive-set!) sets match-level
+    // metadata; patterns without `#set!` carry no metadata field at all.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let md = dir.path().join("queries").join("markdown");
+    std::fs::create_dir_all(&md).expect("create queries/markdown");
+    std::fs::write(
+        md.join("context.scm"),
+        "((atx_heading) @context (#set! kind \"heading\"))\n(thematic_break) @context\n",
+    )
+    .expect("write markdown context.scm");
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_set_match_metadata.md";
+    open_markdown(&mut client, uri, "# Title\n\n---\n");
+
+    let result = full(&mut client, uri, "context");
+
+    let matches = result
+        .get("matches")
+        .and_then(Value::as_array)
+        .expect("result.matches must be an array");
+    assert_eq!(
+        matches.len(),
+        2,
+        "one heading + one thematic break: {matches:?}"
+    );
+    assert_eq!(
+        matches[0].get("metadata"),
+        Some(&json!({ "kind": "heading" })),
+        "#set! pattern carries match-level metadata: {matches:?}"
+    );
+    assert_eq!(
+        matches[1].get("metadata"),
+        None,
+        "a pattern without #set! has no metadata field: {matches:?}"
+    );
+}
+
+#[test]
 fn delta_without_changes_returns_empty_edits() {
     let dir = context_query_dir();
     let mut client = LspClient::new();
