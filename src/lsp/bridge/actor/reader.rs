@@ -875,6 +875,7 @@ mod tests {
         // Using `sleep` ensures the reader blocks waiting for input
         let mut child = Command::new("sleep")
             .arg("60")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -922,6 +923,7 @@ mod tests {
         // only exit via drop-triggered cancellation (not EOF).
         let mut child = Command::new("sleep")
             .arg("60")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -965,6 +967,7 @@ mod tests {
         // only exit via cancellation (not EOF).
         let mut child = Command::new("sleep")
             .arg("60")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
