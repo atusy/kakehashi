@@ -305,6 +305,34 @@ mod tests {
     }
 
     #[test]
+    fn negated_predicate_with_non_capture_arg_rejects_the_match() {
+        // Neovim's handlers index match[predicate[2]] with the raw argument:
+        // a quoted "capture" finds no nodes, the handler returns vacuous
+        // true, and _match_predicates' not- inversion rejects the match. A
+        // typoed negated predicate must fail closed, not leak matches with
+        // #set! metadata (Codex review r3).
+        let src = "fn foo() {}";
+        let (language, tree) = rust_tree(src);
+        let negated = compile(
+            &language,
+            r#"((function_item name: (identifier) @name)
+                (#not-lua-match? "name" "^foo$"))"#,
+        );
+        assert!(
+            execute_query(&negated, &tree, src, None).is_empty(),
+            "vacuous true + not- inversion rejects the match"
+        );
+
+        // The positive form stays vacuously true, as in Neovim.
+        let positive = compile(
+            &language,
+            r#"((function_item name: (identifier) @name)
+                (#lua-match? "name" "^zzz$"))"#,
+        );
+        assert_eq!(execute_query(&positive, &tree, src, None).len(), 1);
+    }
+
+    #[test]
     fn builtin_eq_predicate_is_applied() {
         // #eq? is a built-in text predicate handled by tree-sitter's matches();
         // only the identifier literally equal to "wanted" should match.

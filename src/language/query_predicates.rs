@@ -127,22 +127,25 @@ pub(crate) fn check_predicate(
 /// both diverge exactly when a capture matches multiple nodes.
 pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &str) -> bool {
     for predicate in query.general_predicates(match_.pattern_index) {
-        // Predicates not led by a capture have no nodes to test (permissive).
-        let Some(tree_sitter::QueryPredicateArg::Capture(capture_id)) = predicate.args.first()
-        else {
-            continue;
-        };
-
         let (operator, should_match) = match predicate.operator.as_ref().strip_prefix("not-") {
             Some(base) => (base, false),
             None => (predicate.operator.as_ref(), true),
         };
 
+        // A first argument that isn't a capture (e.g. a typo-quoted
+        // "capture") selects no nodes — Neovim indexes match[predicate[2]]
+        // with the raw argument and gets none. The handler then answers
+        // vacuous true, which `not-` inverts into a rejection: a malformed
+        // negated predicate fails closed instead of leaking matches.
+        let capture_id = match predicate.args.first() {
+            Some(tree_sitter::QueryPredicateArg::Capture(id)) => Some(*id),
+            _ => None,
+        };
         let nodes = || {
             match_
                 .captures
                 .iter()
-                .filter(|c| c.index == *capture_id)
+                .filter(|c| Some(c.index) == capture_id)
                 .map(|c| c.node)
         };
         // A node whose span doesn't slice as UTF-8 passes its check
@@ -150,22 +153,18 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
         let node_text = |node: tree_sitter::Node| text.get(node.start_byte()..node.end_byte());
 
         let aggregate = match operator {
-            "lua-match?" => nodes().all(|n| {
-                node_text(n).is_none_or(|t| check_lua_match(predicate.args.get(1), t))
-            }),
-            "contains?" => nodes().all(|n| {
-                node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))
-            }),
+            "lua-match?" => nodes()
+                .all(|n| node_text(n).is_none_or(|t| check_lua_match(predicate.args.get(1), t))),
+            "contains?" => nodes()
+                .all(|n| node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))),
             // Neovim: vacuously true with no nodes, otherwise ANY node hit.
             "has-parent?" => {
                 let mut nodes = nodes().peekable();
-                nodes.peek().is_none()
-                    || nodes.any(|n| check_has_parent(&predicate.args[1..], n))
+                nodes.peek().is_none() || nodes.any(|n| check_has_parent(&predicate.args[1..], n))
             }
             "has-ancestor?" => {
                 let mut nodes = nodes().peekable();
-                nodes.peek().is_none()
-                    || nodes.any(|n| check_has_ancestor(&predicate.args[1..], n))
+                nodes.peek().is_none() || nodes.any(|n| check_has_ancestor(&predicate.args[1..], n))
             }
             unknown => {
                 log::debug!(
