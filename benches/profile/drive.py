@@ -135,8 +135,11 @@ def main() -> None:
             srv.kill()
             srv.wait()
 
+    n_lines = text.count("\n")
+    source = (f"file={args.file} ({len(text)}B/{n_lines}L)"
+              if args.file else f"size={args.size}")
     sys.stderr.write(
-        f"[drive] lang={args.lang} size={args.size} requests={args.requests} "
+        f"[drive] lang={args.lang} {source} requests={args.requests} "
         f"ok={ok} canceled={canceled} tokens/req={tokens} "
         f"wall={elapsed*1000:.0f}ms ({elapsed/args.requests*1000:.2f}ms/req)\n")
 
