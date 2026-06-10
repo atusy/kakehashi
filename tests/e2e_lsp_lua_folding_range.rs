@@ -15,13 +15,18 @@
 
 mod helpers;
 
-use helpers::lua_bridge::{create_lua_configured_client, shutdown_client};
+use helpers::lua_bridge::{
+    create_lua_configured_client, shutdown_client, skip_if_lua_ls_unavailable,
+};
 use serde_json::json;
 
 /// E2E test: folding ranges from the injected Lua region are translated to
 /// host document lines.
 #[test]
 fn e2e_folding_range_translated_to_host_lines() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
     let (mut client, _config_dir) = create_lua_configured_client();
 
     // Lines (0-based):           host
@@ -111,6 +116,9 @@ end
 /// E2E test: folding range for markdown without code blocks returns null.
 #[test]
 fn e2e_folding_range_no_injections_returns_null() {
+    if skip_if_lua_ls_unavailable() {
+        return;
+    }
     let (mut client, _config_dir) = create_lua_configured_client();
 
     let markdown_content = r#"# Test Document
