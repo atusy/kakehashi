@@ -9,19 +9,19 @@
 //!
 //! Compilation is the caller's job (the handlers load kind queries through
 //! [`QueryLoader`](crate::language::query_loader::QueryLoader)'s tolerant
-//! path). Predicate evaluation reuses [`check_predicate`] — the same
-//! evaluator behind semantic-token highlighting, covering the
-//! Neovim-flavored general predicates (`#lua-match?`, `#has-ancestor?`, …) —
-//! but gates the **whole match** like Neovim's `iter_matches`: one failing
-//! predicate discards the match and its captures entirely. Highlighting
-//! keeps its per-capture filtering (a guard capture there should not kill
-//! its siblings' colors); here the match envelope is the protocol unit, and
-//! `#set!` metadata must not survive a match Neovim would reject
-//! (captures-protocol §"Result shapes").
+//! path). Predicate evaluation uses [`check_match_predicates`] — Neovim's
+//! `iter_matches` semantics for the Neovim-flavored general predicates
+//! (`#lua-match?`, `#has-ancestor?`, …): each predicate is computed once
+//! over all nodes of its capture, `not-` negates that aggregate, and one
+//! failing predicate discards the match and its captures entirely.
+//! Highlighting keeps its per-capture filtering (a guard capture there
+//! should not kill its siblings' colors); here the match envelope is the
+//! protocol unit, and `#set!` metadata must not survive a match Neovim
+//! would reject (captures-protocol §"Result shapes").
 
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::language::query_predicates::check_predicate;
+use crate::language::query_predicates::check_match_predicates;
 
 /// One capture within a match: the capture name and the captured node's span.
 ///
@@ -92,11 +92,7 @@ pub(crate) fn execute_query(
         // One failing general predicate discards the whole match — Neovim's
         // iter_matches semantics, matching how tree-sitter's `matches()`
         // already gates the built-in #eq?/#match?/#any-of? per match.
-        if !m
-            .captures
-            .iter()
-            .all(|c| check_predicate(query, m, c, text))
-        {
+        if !check_match_predicates(query, m, text) {
             continue;
         }
 
@@ -256,6 +252,55 @@ mod tests {
         assert!(
             matches.is_empty(),
             "predicate failed on @params -> whole match discarded: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn not_predicate_negates_the_aggregate_once() {
+        // Neovim strips `not-` and negates the handler's MATCH-LEVEL result:
+        // #not-lua-match? passes when NOT ALL nodes of the capture match —
+        // not "no node matches". Here @id captures `foo` (matches ^foo$) and
+        // the parameters node (doesn't), so lua-match?-over-all is false and
+        // the negation keeps the match (Codex review r3).
+        let src = "fn foo(x: u32) {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @id (parameters) @id)
+                (#not-lua-match? @id "^foo$"))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(
+            matches.len(),
+            1,
+            "not all @id nodes match -> negated aggregate keeps the match"
+        );
+        assert_eq!(matches[0].captures.len(), 2, "both @id occurrences kept");
+    }
+
+    #[test]
+    fn has_parent_accepts_when_any_occurrence_satisfies() {
+        // Neovim's has-parent?/has-ancestor? handlers accept when ANY node of
+        // the capture has the requested parent — not every occurrence. @x
+        // captures the function name (parent function_item) and the parameter
+        // name (parent parameter); one hit must keep the match (Codex r3).
+        let src = "fn foo(x: u32) {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @x
+                  parameters: (parameters (parameter (identifier) @x)))
+                (#has-parent? @x "parameter"))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(
+            matches.len(),
+            1,
+            "one @x occurrence has a parameter parent -> match kept"
         );
     }
 

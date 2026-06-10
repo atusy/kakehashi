@@ -108,6 +108,83 @@ pub(crate) fn check_predicate(
     true
 }
 
+/// Evaluate a match's general predicates the way Neovim's `iter_matches`
+/// does (`Query:_match_predicates` in runtime/lua/vim/treesitter/query.lua):
+/// each predicate is computed once over **all nodes of its capture**, a
+/// `not-` prefix negates that aggregate once, and one false predicate
+/// rejects the whole match.
+///
+/// Aggregation per operator mirrors Neovim's handlers:
+/// - `lua-match?` / `contains?`: ALL nodes of the capture must satisfy;
+/// - `has-parent?` / `has-ancestor?`: ANY node suffices;
+/// - a capture with no nodes is vacuously true;
+/// - unknown operators (including the unimplemented `any-*` family) are
+///   skipped permissively, as everywhere else in kakehashi.
+///
+/// This is deliberately distinct from [`check_predicate`]'s per-capture
+/// model used by highlighting: per-node negation (`!m(a) && !m(b)`) is NOT
+/// `!(m(a) && m(b))`, and per-node ALL for has-parent? is NOT Neovim's ANY —
+/// both diverge exactly when a capture matches multiple nodes.
+pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &str) -> bool {
+    for predicate in query.general_predicates(match_.pattern_index) {
+        // Predicates not led by a capture have no nodes to test (permissive).
+        let Some(tree_sitter::QueryPredicateArg::Capture(capture_id)) = predicate.args.first()
+        else {
+            continue;
+        };
+
+        let (operator, should_match) = match predicate.operator.as_ref().strip_prefix("not-") {
+            Some(base) => (base, false),
+            None => (predicate.operator.as_ref(), true),
+        };
+
+        let nodes = || {
+            match_
+                .captures
+                .iter()
+                .filter(|c| c.index == *capture_id)
+                .map(|c| c.node)
+        };
+        // A node whose span doesn't slice as UTF-8 passes its check
+        // permissively, matching check_predicate's unreadable-text skip.
+        let node_text = |node: tree_sitter::Node| text.get(node.start_byte()..node.end_byte());
+
+        let aggregate = match operator {
+            "lua-match?" => nodes().all(|n| {
+                node_text(n).is_none_or(|t| check_lua_match(predicate.args.get(1), t))
+            }),
+            "contains?" => nodes().all(|n| {
+                node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))
+            }),
+            // Neovim: vacuously true with no nodes, otherwise ANY node hit.
+            "has-parent?" => {
+                let mut nodes = nodes().peekable();
+                nodes.peek().is_none()
+                    || nodes.any(|n| check_has_parent(&predicate.args[1..], n))
+            }
+            "has-ancestor?" => {
+                let mut nodes = nodes().peekable();
+                nodes.peek().is_none()
+                    || nodes.any(|n| check_has_ancestor(&predicate.args[1..], n))
+            }
+            unknown => {
+                log::debug!(
+                    target: "kakehashi::query",
+                    "Unrecognized general predicate: #{}",
+                    unknown
+                );
+                continue;
+            }
+        };
+
+        if aggregate != should_match {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Check lua-match? predicate - returns true if pattern matches or on error (permissive)
 fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str) -> bool {
     let Some(tree_sitter::QueryPredicateArg::String(pattern_str)) = arg else {
