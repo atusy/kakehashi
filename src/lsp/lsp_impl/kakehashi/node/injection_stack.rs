@@ -18,8 +18,8 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges, floor_char_boundary,
-    intersect_included_ranges, parse_offset_directive_for_pattern,
+    MAX_INJECTION_DEPTH, ceil_char_boundary, collect_all_injections, compute_included_ranges,
+    floor_char_boundary, intersect_included_ranges, parse_offset_directive_for_pattern,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -452,11 +452,12 @@ fn build_effective_ranges(
     let content_start_pos = region.content_node.start_position();
     let absolute_ranges: Vec<tree_sitter::Range> = if offset.is_some() {
         // #offset! shifts are byte arithmetic over i32 deltas, so the effective
-        // bounds can land mid-codepoint. Align both ends down to a UTF-8
-        // boundary before handing them to tree-sitter — passing a mid-char
-        // byte to set_included_ranges is UB / panic territory, and it would
-        // also desync from byte_to_point (which aligns internally).
-        let aligned_start = floor_char_boundary(host_text, eff_start);
+        // bounds can land mid-codepoint. Snap inward to UTF-8 boundaries
+        // (ceil the start, floor the end — matching the semantic and bridge
+        // paths) before handing them to tree-sitter: a mid-char byte in
+        // set_included_ranges is UB / panic territory, and flooring the start
+        // would re-include bytes the offset meant to exclude.
+        let aligned_start = ceil_char_boundary(host_text, eff_start);
         let aligned_end = floor_char_boundary(host_text, eff_end);
         // The alignment could, in pathological cases, collapse the range
         // (e.g. both ends fall inside the same multi-byte char). Guard so we

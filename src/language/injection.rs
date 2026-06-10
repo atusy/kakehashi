@@ -664,8 +664,11 @@ pub struct CacheableInjectionRegion {
 }
 
 /// Compute the (row, UTF-16 column) of `byte_pos`, using a nearby byte with a
-/// known row as an anchor so only the span between them is scanned (offset
-/// deltas are typically a few lines, never the whole document).
+/// known row as an anchor: the row counts newlines only in the span between
+/// them (offset deltas are typically a few lines, never the whole document).
+/// The column additionally scans back from `byte_pos` to its line start —
+/// bounded by the current line's length, or by `byte_pos` itself in a
+/// document without newlines.
 fn position_of_byte(
     text: &str,
     byte_pos: usize,
