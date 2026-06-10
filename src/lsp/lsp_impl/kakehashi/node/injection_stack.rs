@@ -18,8 +18,8 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges,
-    intersect_included_ranges, parse_offset_directive_for_pattern,
+    MAX_INJECTION_DEPTH, ceil_char_boundary, collect_all_injections, compute_included_ranges,
+    effective_offset_for_pattern, floor_char_boundary, intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -44,7 +44,7 @@ pub(super) struct InjectionLayer {
 /// the raw-content-node fast bounds check is safe: an offset can extend the
 /// effective range past the raw node, so the shortcut only holds without one.
 fn pattern_has_offset(injection_query: &tree_sitter::Query, pattern_index: usize) -> bool {
-    parse_offset_directive_for_pattern(injection_query, pattern_index).is_some()
+    effective_offset_for_pattern(injection_query, pattern_index).is_some()
 }
 
 /// Build the full-document range used to seed the host layer.
@@ -419,7 +419,7 @@ fn build_effective_ranges(
     injection_query: &tree_sitter::Query,
 ) -> Vec<tree_sitter::Range> {
     // 1. Apply #offset! to the raw content_node span.
-    let offset = parse_offset_directive_for_pattern(injection_query, region.pattern_index);
+    let offset = effective_offset_for_pattern(injection_query, region.pattern_index);
     let (eff_start, eff_end) = match offset {
         Some(off) => {
             let byte_range = ByteRange::new(
@@ -452,12 +452,13 @@ fn build_effective_ranges(
     let content_start_pos = region.content_node.start_position();
     let absolute_ranges: Vec<tree_sitter::Range> = if offset.is_some() {
         // #offset! shifts are byte arithmetic over i32 deltas, so the effective
-        // bounds can land mid-codepoint. Align both ends down to a UTF-8
-        // boundary before handing them to tree-sitter — passing a mid-char
-        // byte to set_included_ranges is UB / panic territory, and it would
-        // also desync from byte_to_point (which aligns internally).
-        let aligned_start = align_down(host_text, eff_start);
-        let aligned_end = align_down(host_text, eff_end);
+        // bounds can land mid-codepoint. Snap inward to UTF-8 boundaries
+        // (ceil the start, floor the end — matching the semantic and bridge
+        // paths) before handing them to tree-sitter: a mid-char byte in
+        // set_included_ranges is UB / panic territory, and flooring the start
+        // would re-include bytes the offset meant to exclude.
+        let aligned_start = ceil_char_boundary(host_text, eff_start);
+        let aligned_end = floor_char_boundary(host_text, eff_end);
         // The alignment could, in pathological cases, collapse the range
         // (e.g. both ends fall inside the same multi-byte char). Guard so we
         // never emit a zero/negative-width range to the parser.
@@ -530,19 +531,6 @@ fn total_span(ranges: &[tree_sitter::Range]) -> usize {
         .iter()
         .map(|r| r.end_byte.saturating_sub(r.start_byte))
         .sum()
-}
-
-/// Clamp `byte` into `text` and round down to the nearest UTF-8 character
-/// boundary. Byte values derived from `#offset!` directives (i32 deltas in
-/// byte space) are not guaranteed to land on boundaries; feeding a mid-char
-/// byte to tree-sitter's `set_included_ranges` or to a string slice would
-/// panic. Rounding down keeps the offset inside the intended content.
-fn align_down(text: &str, byte: usize) -> usize {
-    let mut aligned = byte.min(text.len());
-    while aligned > 0 && !text.is_char_boundary(aligned) {
-        aligned -= 1;
-    }
-    aligned
 }
 
 /// Materialize every child injection region of `parent_tree` with its
@@ -806,7 +794,7 @@ fn discover_child_languages(
 fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
     // Align first — slicing `&text[..clamped]` on a mid-character byte would
     // panic and crash the LSP server.
-    let clamped = align_down(text, byte);
+    let clamped = floor_char_boundary(text, byte);
     let prefix = &text[..clamped];
     let row = prefix.bytes().filter(|b| *b == b'\n').count();
     let last_nl = prefix.rfind('\n');
