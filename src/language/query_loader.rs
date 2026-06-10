@@ -199,8 +199,12 @@ impl QueryLoader {
         Ok(combined_query)
     }
 
-    /// Find a query file in search paths
-    fn find_query_file<P: AsRef<Path>>(
+    /// Find a query file in search paths.
+    ///
+    /// `pub(crate)` so the captures handler can distinguish "kind file absent"
+    /// (expected, debug log) from "file exists but failed to load" (asset
+    /// trouble, warn) — captures-protocol §"Null vs. error semantics".
+    pub(crate) fn find_query_file<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,

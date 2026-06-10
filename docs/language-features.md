@@ -386,8 +386,8 @@ type CapturesResult = {
   resultId: string;                  // hand back as previousResultId for a delta
   matches: Match[];
   skipped: {                         // patterns dropped by tolerant compilation
-    startLine: number;               // 1-indexed line in the query file
-    endLine: number;
+    startLine: number;               // 1-indexed; in the query file — or in the
+    endLine: number;                 // combined query when `; inherits:` is used
     reason: string;                  // Tree-sitter's compile error for that pattern
   }[];
 };

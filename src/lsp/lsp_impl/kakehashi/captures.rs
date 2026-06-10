@@ -268,10 +268,21 @@ impl Kakehashi {
         ) {
             Ok(parsed) => parsed,
             Err(err) => {
-                log::debug!(
-                    target: "kakehashi::captures",
-                    "no {file_name} for {language_id}: {err}"
-                );
+                // "No such kind for this language" is the expected common case
+                // and stays quiet; a file that exists but fails to load (IO
+                // error, broken `; inherits:` chain) is asset trouble and must
+                // be visible (captures-protocol §"Null vs. error semantics").
+                if QueryLoader::find_query_file(&search_paths, &language_id, &file_name).is_none() {
+                    log::debug!(
+                        target: "kakehashi::captures",
+                        "no {file_name} for {language_id}: {err}"
+                    );
+                } else {
+                    log::warn!(
+                        target: "kakehashi::captures",
+                        "failed to load {file_name} for {language_id}: {err}"
+                    );
+                }
                 return Ok(None);
             }
         };
@@ -305,7 +316,7 @@ impl Kakehashi {
 
         let matches: Vec<Value> = match_data
             .into_iter()
-            .map(|m| {
+            .filter_map(|m| {
                 let captures: Vec<Value> = m
                     .captures
                     .into_iter()
@@ -323,7 +334,12 @@ impl Kakehashi {
                         }))
                     })
                     .collect();
-                json!({ "patternIndex": m.pattern_index, "captures": captures })
+                // Mirror execute_query's invariant: clients never see an empty
+                // match envelope, even when every capture span fails to map.
+                if captures.is_empty() {
+                    return None;
+                }
+                Some(json!({ "patternIndex": m.pattern_index, "captures": captures }))
             })
             .collect();
 

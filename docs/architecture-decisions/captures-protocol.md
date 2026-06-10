@@ -58,6 +58,8 @@ type CapturesDelta = {
 type CapturesRangeResult = { matches: Match[]; skipped: SkippedPattern[] };
 
 type SkippedPattern = { startLine: number; endLine: number; reason: string };
+// startLine/endLine are 1-indexed lines in the query file — or in the combined
+// query string when `; inherits:` is used (the loader concatenates parents first).
 ```
 
 ### Kind resolution
