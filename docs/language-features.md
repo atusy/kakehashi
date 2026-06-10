@@ -355,6 +355,59 @@ same embedding layer as the input:
 > a position) is planned but **not yet available**. For named-only navigation today,
 > use `kakehashi/node/namedChildren` and the `named*` accessors.
 
+### Queries
+
+The node accessors above walk the tree one step at a time. `kakehashi/query` runs a
+whole Tree-sitter [query](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/)
+(an `.scm` pattern) over the document in a single request — so a client can do
+structural search, symbol extraction, fold-range computation, or a
+[treesitter-context](https://github.com/nvim-treesitter/nvim-treesitter-context)-style
+"sticky context" feature without re-implementing the query engine.
+
+| Method | Input | Output |
+|--------|-------|--------|
+| `kakehashi/query` | `{ textDocument, query, matchLimit? }` | `QueryResult \| null` |
+
+The `query` is an arbitrary Tree-sitter query string (the body of an `.scm`),
+compiled against the document's **host** grammar. `matchLimit` optionally caps how
+many matches come back (the server applies a safety cap when omitted).
+
+```typescript
+type QueryResult = {
+  matches: {
+    patternIndex: number;            // which pattern in the query produced this match
+    captures: {
+      name: string;                  // capture name without the '@', e.g. "context"
+      node: NodeInfo;                // { id, kind } — trackable like any other node
+      range: { start: Position, end: Position };  // LSP Position (UTF-16), inline
+    }[];
+  }[];
+  skipped: {                         // patterns dropped by tolerant compilation
+    startLine: number;               // 1-indexed line in the query string
+    endLine: number;
+    reason: string;                  // Tree-sitter's compile error for that pattern
+  }[];
+};
+```
+
+- **Captures are grouped by match**, so correlated captures within one pattern
+  (e.g. `@context` and `@context.end`) stay together.
+- **Each capture carries both a `node` and its `range`**, so a bulk result needs no
+  per-capture follow-up call. The `node.id` works with every accessor above.
+- **Predicates are evaluated server-side** — the built-in `#eq?` / `#match?` /
+  `#any-of?` and the Neovim-flavored `#lua-match?` / `#has-parent?` /
+  `#has-ancestor?` (and their negations) — so results match kakehashi's own
+  highlighting. Unknown predicates are ignored.
+- **Tolerant compilation**: if some patterns reference symbols absent from the
+  grammar, the valid patterns still run and the rest are reported in `skipped`.
+- **A document that isn't open returns `null`** (same as the node methods). A `query`
+  string that cannot be parsed at all is a client error, returned as a JSON-RPC
+  `InvalidParams` error rather than `null`.
+
+> Queries run against the **host layer only** for now; patterns are not yet matched
+> inside embedded (injected) languages. Querying a Python block inside Markdown,
+> for example, is planned but not yet available.
+
 ---
 
 ## Not currently provided
