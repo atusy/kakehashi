@@ -259,6 +259,35 @@ fn plan_region_format(
     }
 }
 
+/// Whole-pipeline time budget for one region's concatenated formatting run.
+///
+/// Reuses the explicit per-request aggregation timeout from
+/// ls-bridge-server-pool-coordination (5s for explicit user actions) as the
+/// whole-pipeline bound, per the concatenated-formatting-pipeline Consequences
+/// note — no formatting-specific timeout config is introduced. Each step's
+/// deadline is the *remaining* share of this budget
+/// ([`remaining_step_budget`]), so a slow early step exhausts the budget and
+/// the rest are skipped instead of stacking serial round-trips past the
+/// client's own request timeout.
+const PIPELINE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Minimum per-step budget worth issuing a request for (ADR Decision point 6:
+/// "below a small floor the pipeline skips the rest outright rather than
+/// issuing requests almost certain to time out").
+const PIPELINE_STEP_FLOOR: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Per-step deadline: the remaining share of the whole-pipeline budget
+/// (`budget − elapsed`), or `None` when the remainder is below `floor` (skip
+/// the step — and, since `elapsed` only grows, every step after it).
+fn remaining_step_budget(
+    budget: std::time::Duration,
+    elapsed: std::time::Duration,
+    floor: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let remaining = budget.checked_sub(elapsed)?;
+    (remaining >= floor).then_some(remaining)
+}
+
 /// Which request one concatenated-pipeline step issues for a server, keyed on
 /// the capabilities it advertises (concatenated-formatting-pipeline Decision
 /// point 3.2).
@@ -388,9 +417,15 @@ async fn dispatch_preferred_formatting(
 /// "already formatted" (`Some(vec![])` from the bridge transform) and never
 /// triggers the fallback.
 ///
+/// Each step runs under the remaining share of the whole-pipeline budget
+/// ([`PIPELINE_BUDGET`] / [`remaining_step_budget`], ADR Decision point 6): a
+/// timed-out step is skipped (its downstream request is best-effort cancelled
+/// via `$/cancelRequest`) and the budget keeps shrinking, so the pipeline can
+/// never stack serial round-trips past the client's own request timeout. An
+/// upstream `$/cancelRequest` reaches the in-flight downstream server through
+/// the `RequestIdCapture` middleware's existing fan-out.
+///
 /// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
-///   - per-step remaining-budget timeout and concurrent $/cancelRequest
-///     propagation (Decision points 6 and the Consequences cancellation note);
 ///   - discarding downstream `publishDiagnostics` targeting scratch URIs;
 ///     prompt didClose currently minimizes (but does not eliminate) the window.
 async fn dispatch_concatenated_formatting(
@@ -473,6 +508,11 @@ async fn dispatch_concatenated_formatting(
     let _scratch_guard =
         ScratchCleanupGuard::new(Arc::clone(&pool), uri.clone(), Arc::clone(&open_scratch));
 
+    // Start of the whole-pipeline budget window (ADR Decision point 6): every
+    // step's deadline is measured against this single origin, so serial
+    // round-trips share one bound instead of each getting a fresh timeout.
+    let pipeline_start = std::time::Instant::now();
+
     let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
         let pool = Arc::clone(&pool);
         let open_scratch = Arc::clone(&open_scratch);
@@ -494,139 +534,201 @@ async fn dispatch_concatenated_formatting(
                     return (current_text, None);
                 };
 
-                // ADR Decision point 3.2: the pipeline prefers full formatting;
-                // the fallback to whole-region rangeFormatting keys on
-                // CAPABILITY, never on the response (a capable server's `null`
-                // is the authoritative "already formatted" and arrives as
-                // `Some(vec![])` from the bridge transform). A probe error
-                // (connection spawn/handshake failure) is a failed step:
-                // skip-and-continue (ADR point 6).
-                let step_request =
-                    match pipeline_step_request_kind(&pool, &server_name, &server_config).await {
-                        Ok(kind) => kind,
+                // ADR Decision point 6: this step's deadline is the REMAINING
+                // share of the whole-pipeline budget. Below the floor, skip
+                // outright — a request almost certain to time out is pure
+                // waste, and every later step will skip the same way.
+                let Some(step_budget) = remaining_step_budget(
+                    PIPELINE_BUDGET,
+                    pipeline_start.elapsed(),
+                    PIPELINE_STEP_FLOOR,
+                ) else {
+                    log::warn!(
+                        target: "kakehashi::formatting",
+                        "concatenated formatting step for server {} skipped: \
+                         pipeline budget ({:?}) exhausted (ADR point 6)",
+                        server_name,
+                        PIPELINE_BUDGET
+                    );
+                    return (current_text, None);
+                };
+
+                // Keep a copy for $/cancelRequest propagation on timeout: the
+                // request future inside the timeout consumes `upstream_id`.
+                let upstream_id_for_cancel = upstream_id.clone();
+
+                // Everything that talks to the downstream server — capability
+                // probe (which may spawn/handshake a cold server), scratch
+                // didOpen, and the formatting request itself — runs under this
+                // step's deadline, so a hung or slow server can only consume
+                // its remaining share of the budget.
+                let step_fut = async {
+                    // ADR Decision point 3.2: the pipeline prefers full
+                    // formatting; the fallback to whole-region rangeFormatting
+                    // keys on CAPABILITY, never on the response (a capable
+                    // server's `null` is the authoritative "already formatted"
+                    // and arrives as `Some(vec![])` from the bridge transform).
+                    // A probe error (connection spawn/handshake failure) is a
+                    // failed step: skip-and-continue (ADR point 6).
+                    let step_request =
+                        match pipeline_step_request_kind(&pool, &server_name, &server_config).await
+                        {
+                            Ok(kind) => kind,
+                            Err(e) => {
+                                log::warn!(
+                                    target: "kakehashi::formatting",
+                                    "concatenated formatting step for server {} failed during \
+                                     capability probe; skipping (ADR point 6): {}",
+                                    server_name,
+                                    e
+                                );
+                                return None;
+                            }
+                        };
+                    if step_request == PipelineStepRequest::Skip {
+                        // Neither documentFormattingProvider nor
+                        // documentRangeFormattingProvider: contribute nothing and
+                        // send no unsupported request (ADR point 3.2).
+                        log::debug!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting step for server {} skipped: \
+                             server advertises neither documentFormattingProvider \
+                             nor documentRangeFormattingProvider",
+                            server_name
+                        );
+                        return None;
+                    }
+
+                    let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let scratch_id = scratch_region_id(&region_id, run_seq, step);
+
+                    // Build the scratch URI up front and register it as "open" in
+                    // the shared tracker BEFORE the request, so that if this
+                    // future is dropped mid-send by a cancel or the step timeout,
+                    // `ScratchCleanupGuard`'s Drop still closes it. Skipped only
+                    // when the host URL could not be converted (then no didClose
+                    // is possible anyway).
+                    let scratch_uri = host_uri_lsp
+                        .as_ref()
+                        .map(|h| VirtualDocumentUri::new(h, &injection_language, &scratch_id));
+                    if let Some(scratch_uri) = scratch_uri.as_ref() {
+                        push_open_scratch(
+                            &open_scratch,
+                            OpenScratchDoc {
+                                uri: scratch_uri.clone(),
+                                server_name: server_name.clone(),
+                            },
+                        );
+                    }
+
+                    // The bridge translates the returned edits back to host
+                    // coordinates, but the pipeline applies them to the *virtual*
+                    // accumulated text, so request a fresh virtual-coordinate
+                    // result by passing the zero offset for the response transform.
+                    // The region offset is only re-applied once, when the final
+                    // text is collapsed into the host replacement edit below.
+                    //
+                    // Per-step host-transform interaction: `send_formatting_request`
+                    // runs `transform_formatting_response_to_host`, which clamps
+                    // edits to a synthetic EOF and drops any past `virtual_line_count`
+                    // for *this step's* `current_text`. Because we pass
+                    // `RegionOffset::new(0, 0)` (an identity translation) and the
+                    // step's own current text, those edits come back already
+                    // EOF-clamped and host-translated by a zero offset — i.e. still
+                    // in virtual coordinates relative to `current_text` — so applying
+                    // them to the virtual accumulated text is correct. The single
+                    // real region-offset translation happens once in the precomputed
+                    // `region_replacement_range`.
+                    // (`apply_text_edits` does its own clamping as a general safety
+                    // net, independent of this transform.)
+                    let send_result = if step_request == PipelineStepRequest::Full {
+                        pool.send_formatting_request(
+                            &server_name,
+                            &server_config,
+                            &uri,
+                            &injection_language,
+                            &scratch_id,
+                            RegionOffset::new(0, 0),
+                            &current_text,
+                            options,
+                            upstream_id,
+                        )
+                        .await
+                    } else {
+                        // WholeRegionRange (Skip already returned above): the
+                        // range-only server formats the entire region, expressed
+                        // as a range over the step's current text. With the zero
+                        // offset, host and virtual coordinates coincide, so the
+                        // whole-region replacement range doubles as the request
+                        // range.
+                        match region_replacement_range(&current_text, &RegionOffset::new(0, 0)) {
+                            Some(whole_region) => {
+                                pool.send_range_formatting_request(
+                                    &server_name,
+                                    &server_config,
+                                    &uri,
+                                    &injection_language,
+                                    &scratch_id,
+                                    RegionOffset::new(0, 0),
+                                    &current_text,
+                                    whole_region,
+                                    options,
+                                    upstream_id,
+                                )
+                                .await
+                            }
+                            // Unresolvable end position (mapper bug / corrupt
+                            // content): treat as a failed step rather than sending
+                            // an unbounded range downstream.
+                            None => Ok(None),
+                        }
+                    };
+
+                    // ADR Decision point 6 (best-effort, skip-and-continue): a
+                    // failed step is skipped — never surfaced to the editor — but is
+                    // logged so the misbehaving server stays diagnosable. We log the
+                    // downstream error here (before mapping to `None`) instead of
+                    // silently dropping it with `.ok().flatten()`.
+                    match send_result {
+                        Ok(edits) => edits,
                         Err(e) => {
                             log::warn!(
                                 target: "kakehashi::formatting",
-                                "concatenated formatting step for server {} failed during \
-                                 capability probe; skipping (ADR point 6): {}",
+                                "concatenated formatting step for server {} failed; skipping (ADR point 6): {}",
                                 server_name,
                                 e
                             );
-                            return (current_text, None);
+                            None
                         }
-                    };
-                if step_request == PipelineStepRequest::Skip {
-                    // Neither documentFormattingProvider nor
-                    // documentRangeFormattingProvider: contribute nothing and
-                    // send no unsupported request (ADR point 3.2).
-                    log::debug!(
-                        target: "kakehashi::formatting",
-                        "concatenated formatting step for server {} skipped: \
-                         server advertises neither documentFormattingProvider \
-                         nor documentRangeFormattingProvider",
-                        server_name
-                    );
-                    return (current_text, None);
-                }
-
-                let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let scratch_id = scratch_region_id(&region_id, run_seq, step);
-
-                // Build the scratch URI up front and register it as "open" in the
-                // shared tracker BEFORE the request, so that if this future is
-                // dropped mid-send by a cancel, `ScratchCleanupGuard`'s Drop still
-                // closes it. Skipped only when the host URL could not be
-                // converted (then no didClose is possible anyway).
-                let scratch_uri = host_uri_lsp
-                    .as_ref()
-                    .map(|h| VirtualDocumentUri::new(h, &injection_language, &scratch_id));
-                if let Some(scratch_uri) = scratch_uri.as_ref() {
-                    push_open_scratch(
-                        &open_scratch,
-                        OpenScratchDoc {
-                            uri: scratch_uri.clone(),
-                            server_name: server_name.clone(),
-                        },
-                    );
-                }
-
-                // The bridge translates the returned edits back to host
-                // coordinates, but the pipeline applies them to the *virtual*
-                // accumulated text, so request a fresh virtual-coordinate
-                // result by passing the zero offset for the response transform.
-                // The region offset is only re-applied once, when the final
-                // text is collapsed into the host replacement edit below.
-                //
-                // Per-step host-transform interaction: `send_formatting_request`
-                // runs `transform_formatting_response_to_host`, which clamps
-                // edits to a synthetic EOF and drops any past `virtual_line_count`
-                // for *this step's* `current_text`. Because we pass
-                // `RegionOffset::new(0, 0)` (an identity translation) and the
-                // step's own current text, those edits come back already
-                // EOF-clamped and host-translated by a zero offset — i.e. still
-                // in virtual coordinates relative to `current_text` — so applying
-                // them to the virtual accumulated text is correct. The single
-                // real region-offset translation happens once in the precomputed
-                // `region_replacement_range`.
-                // (`apply_text_edits` does its own clamping as a general safety
-                // net, independent of this transform.)
-                let send_result = if step_request == PipelineStepRequest::Full {
-                    pool.send_formatting_request(
-                        &server_name,
-                        &server_config,
-                        &uri,
-                        &injection_language,
-                        &scratch_id,
-                        RegionOffset::new(0, 0),
-                        &current_text,
-                        options,
-                        upstream_id,
-                    )
-                    .await
-                } else {
-                    // WholeRegionRange (Skip already returned above): the
-                    // range-only server formats the entire region, expressed
-                    // as a range over the step's current text. With the zero
-                    // offset, host and virtual coordinates coincide, so the
-                    // whole-region replacement range doubles as the request
-                    // range.
-                    match region_replacement_range(&current_text, &RegionOffset::new(0, 0)) {
-                        Some(whole_region) => {
-                            pool.send_range_formatting_request(
-                                &server_name,
-                                &server_config,
-                                &uri,
-                                &injection_language,
-                                &scratch_id,
-                                RegionOffset::new(0, 0),
-                                &current_text,
-                                whole_region,
-                                options,
-                                upstream_id,
-                            )
-                            .await
-                        }
-                        // Unresolvable end position (mapper bug / corrupt
-                        // content): treat as a failed step rather than sending
-                        // an unbounded range downstream.
-                        None => Ok(None),
                     }
                 };
 
-                // ADR Decision point 6 (best-effort, skip-and-continue): a
-                // failed step is skipped — never surfaced to the editor — but is
-                // logged so the misbehaving server stays diagnosable. We log the
-                // downstream error here (before mapping to `None`) instead of
-                // silently dropping it with `.ok().flatten()`.
-                let result = match send_result {
-                    Ok(edits) => edits,
-                    Err(e) => {
+                let result = match tokio::time::timeout(step_budget, step_fut).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Per-step timeout: a failed step (ADR point 6) — skip
+                        // and continue with the unchanged text. Dropping the
+                        // step future abandons our side of the request, but the
+                        // downstream server is still computing; per the ADR
+                        // Consequences cancellation note, tell it to stop via
+                        // $/cancelRequest. Best-effort and detached: the
+                        // mapping may already be gone (the dropped future's
+                        // router cleanup races this), in which case
+                        // forward_cancel silently no-ops.
                         log::warn!(
                             target: "kakehashi::formatting",
-                            "concatenated formatting step for server {} failed; skipping (ADR point 6): {}",
+                            "concatenated formatting step for server {} timed out \
+                             after {:?}; skipping (ADR point 6)",
                             server_name,
-                            e
+                            step_budget
                         );
+                        if let Some(id) = upstream_id_for_cancel {
+                            let pool = Arc::clone(&pool);
+                            let server_name = server_name.clone();
+                            tokio::spawn(async move {
+                                let _ = pool.forward_cancel(&server_name, &id).await;
+                            });
+                        }
                         None
                     }
                 };
@@ -653,8 +755,11 @@ async fn dispatch_concatenated_formatting(
     // On cancel we just stop polling the pipeline and return None; the scratch
     // documents the run opened are closed by `_scratch_guard`'s Drop (which fires
     // on this return as well as on a future-level abort), so there is no explicit
-    // sweep to interrupt. (Per-step $/cancelRequest propagation to the downstream
-    // server is a follow-up — TODO(concatenated-formatting-pipeline).)
+    // sweep to interrupt. Downstream $/cancelRequest propagation needs no work
+    // here: the `RequestIdCapture` middleware already fans the upstream cancel
+    // out to every downstream server registered for this upstream id — which
+    // includes the step currently in flight (`forward_cancel_by_upstream_id`).
+    // The step-timeout path propagates its own cancel inside the step closure.
     let cancelled;
     let final_text = match cancel_rx {
         Some(mut rx) => {
@@ -1426,6 +1531,71 @@ mod tests {
             drained.len(),
             1,
             "poison recovery must preserve tracked scratch docs"
+        );
+    }
+
+    // ==========================================================================
+    // remaining_step_budget (concatenated-formatting-pipeline Decision point 6:
+    // per-step deadline = remaining share of the whole-pipeline budget)
+    // ==========================================================================
+
+    #[test]
+    fn step_budget_is_the_remaining_share_of_the_pipeline_budget() {
+        use std::time::Duration;
+        // 5s budget, 2s elapsed → the next step gets the remaining 3s, not a
+        // fixed per-step value: a slow early step must not let cumulative
+        // latency overrun the client's request timeout.
+        assert_eq!(
+            remaining_step_budget(
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                Duration::from_millis(50)
+            ),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn step_budget_skips_steps_below_the_floor() {
+        use std::time::Duration;
+        // Less than the floor remaining: issuing a request almost certain to
+        // time out is pointless — skip the rest outright (ADR point 6).
+        assert_eq!(
+            remaining_step_budget(
+                Duration::from_secs(5),
+                Duration::from_millis(4970),
+                Duration::from_millis(50)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn step_budget_exactly_at_floor_still_runs() {
+        use std::time::Duration;
+        // Boundary: exactly the floor remaining is still worth issuing.
+        assert_eq!(
+            remaining_step_budget(
+                Duration::from_secs(5),
+                Duration::from_millis(4950),
+                Duration::from_millis(50)
+            ),
+            Some(Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn step_budget_handles_elapsed_beyond_budget() {
+        use std::time::Duration;
+        // Elapsed past the budget (a step blocked long): no underflow panic,
+        // just skip.
+        assert_eq!(
+            remaining_step_budget(
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_millis(50)
+            ),
+            None
         );
     }
 
