@@ -427,9 +427,10 @@ async fn dispatch_preferred_formatting(
 /// upstream `$/cancelRequest` reaches the in-flight downstream server through
 /// the `RequestIdCapture` middleware's existing fan-out.
 ///
-/// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
-///   - discarding downstream `publishDiagnostics` targeting scratch URIs;
-///     prompt didClose currently minimizes (but does not eliminate) the window.
+/// Downstream `publishDiagnostics` targeting scratch URIs are discarded by
+/// the bridge reader (ADR Decision point 7; `is_scratch_publish_diagnostics`
+/// in `src/lsp/bridge/actor/reader.rs`), so the scratch documents this run
+/// opens can never surface speculative diagnostics to the editor.
 async fn dispatch_concatenated_formatting(
     region_ctx: &DocumentRequestContext,
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
