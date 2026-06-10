@@ -447,8 +447,10 @@ type CapturesDelta = {
   per-capture follow-up call. The `node.id` works with every accessor above.
 - **Predicates are evaluated server-side** — the built-in `#eq?` / `#match?` /
   `#any-of?` and the Neovim-flavored `#lua-match?` / `#has-parent?` /
-  `#has-ancestor?` (and their negations) — so results match kakehashi's own
-  highlighting. Unknown predicates are ignored.
+  `#has-ancestor?` (and their negations) — with Neovim's `iter_matches`
+  semantics: one failing predicate discards the **whole match**, so a guard
+  capture filters the matches it guards rather than just disappearing from
+  them. Unknown predicates are ignored.
 - **`#set!` metadata is returned** (the
   [Neovim `set!` directive](https://neovim.io/doc/user/treesitter.html#treesitter-directive-set!)):
   `(#set! key value)` rides on the match as `metadata[key]`,

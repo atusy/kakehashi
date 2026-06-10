@@ -9,13 +9,19 @@
 //!
 //! Compilation is the caller's job (the handlers load kind queries through
 //! [`QueryLoader`](crate::language::query_loader::QueryLoader)'s tolerant
-//! path). Predicate evaluation reuses [`filter_captures`] so capture results
-//! agree with semantic-token highlighting, including the Neovim-flavored
-//! general predicates (`#lua-match?`, `#has-ancestor?`, …).
+//! path). Predicate evaluation reuses [`check_predicate`] — the same
+//! evaluator behind semantic-token highlighting, covering the
+//! Neovim-flavored general predicates (`#lua-match?`, `#has-ancestor?`, …) —
+//! but gates the **whole match** like Neovim's `iter_matches`: one failing
+//! predicate discards the match and its captures entirely. Highlighting
+//! keeps its per-capture filtering (a guard capture there should not kill
+//! its siblings' colors); here the match envelope is the protocol unit, and
+//! `#set!` metadata must not survive a match Neovim would reject
+//! (captures-protocol §"Result shapes").
 
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::language::query_predicates::filter_captures;
+use crate::language::query_predicates::check_predicate;
 
 /// One capture within a match: the capture name and the captured node's span.
 ///
@@ -83,9 +89,20 @@ pub(crate) fn execute_query(
                 .collect()
         };
 
-        // `filter_captures` drops captures whose general predicates fail
-        // (built-in #eq?/#match?/#any-of? are already applied by `matches()`).
-        let captures: Vec<CapturedNode> = filter_captures(query, m, text)
+        // One failing general predicate discards the whole match — Neovim's
+        // iter_matches semantics, matching how tree-sitter's `matches()`
+        // already gates the built-in #eq?/#match?/#any-of? per match.
+        if !m
+            .captures
+            .iter()
+            .all(|c| check_predicate(query, m, c, text))
+        {
+            continue;
+        }
+
+        let captures: Vec<CapturedNode> = m
+            .captures
+            .iter()
             .map(|c| {
                 let node = c.node;
                 CapturedNode {
@@ -98,8 +115,8 @@ pub(crate) fn execute_query(
             })
             .collect();
 
-        // A match whose every capture was filtered out contributes nothing
-        // observable; skip it so clients don't see empty match envelopes.
+        // tree-sitter can yield capture-less matches for patterns whose
+        // captures are all quantified-out; an empty envelope says nothing.
         if captures.is_empty() {
             continue;
         }
@@ -205,13 +222,40 @@ mod tests {
 
         assert_eq!(matches.len(), 1);
         let m = &matches[0];
-        assert!(m.metadata.is_empty(), "capture-scoped #set! is not match-level");
+        assert!(
+            m.metadata.is_empty(),
+            "capture-scoped #set! is not match-level"
+        );
         let name = m.captures.iter().find(|c| c.name == "name").unwrap();
         let params = m.captures.iter().find(|c| c.name == "params").unwrap();
         assert!(name.metadata.is_empty(), "@name was not annotated");
         assert_eq!(
             params.metadata,
             vec![("kind".to_string(), Some("parameter-list".to_string()))]
+        );
+    }
+
+    #[test]
+    fn failing_general_predicate_drops_the_whole_match() {
+        // Neovim's iter_matches gates the ENTIRE match on its predicates,
+        // and #set! directives apply only after they pass
+        // (treesitter-directive-set!). A guard capture whose predicate fails
+        // must not leave a partial match — with the pattern's metadata
+        // attached — behind (Codex review).
+        let src = "fn foo(x: u32) {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @name (parameters) @params)
+                (#lua-match? @params "^%(%)$")
+                (#set! kind "no-args"))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert!(
+            matches.is_empty(),
+            "predicate failed on @params -> whole match discarded: {matches:?}"
         );
     }
 
