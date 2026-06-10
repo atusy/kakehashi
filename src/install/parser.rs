@@ -12,6 +12,7 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 use tree_sitter_loader::Loader;
 
+use super::http::agent_with_timeout;
 use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
 /// HTTP timeout for archive downloads.
@@ -263,11 +264,7 @@ fn download_and_extract_archive(
     revision: &str,
     dest: &Path,
 ) -> Result<(), ParserInstallError> {
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(ARCHIVE_HTTP_TIMEOUT))
-            .build(),
-    );
+    let agent = agent_with_timeout(ARCHIVE_HTTP_TIMEOUT);
 
     let response = agent.get(archive_url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => {

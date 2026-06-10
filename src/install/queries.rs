@@ -3,6 +3,9 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use super::http::agent_with_timeout;
 
 /// Base URL for nvim-treesitter query files on GitHub (main branch).
 /// Note: In the main branch, queries are under runtime/queries instead of queries.
@@ -11,6 +14,10 @@ const NVIM_TREESITTER_QUERIES_URL: &str =
 
 /// Query file types to download.
 const QUERY_FILES: &[&str] = &["highlights.scm", "locals.scm", "injections.scm"];
+
+/// HTTP timeout for query file downloads; keeps installs bounded when a
+/// response stalls (query files are small text files, so 60s is generous).
+const QUERY_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Error types for query installation.
 #[derive(Debug)]
@@ -271,12 +278,15 @@ fn install_queries_recursive(
 
 /// Download a file from a URL.
 fn download_file(url: &str) -> Result<String, QueryInstallError> {
-    let mut response = ureq::get(url).call().map_err(|e| match e {
-        ureq::Error::StatusCode(code) => {
-            QueryInstallError::HttpError(format!("HTTP {} for {}", code, url))
-        }
-        e => QueryInstallError::HttpError(e.to_string()),
-    })?;
+    let mut response = agent_with_timeout(QUERY_HTTP_TIMEOUT)
+        .get(url)
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => {
+                QueryInstallError::HttpError(format!("HTTP {} for {}", code, url))
+            }
+            e => QueryInstallError::HttpError(e.to_string()),
+        })?;
 
     response
         .body_mut()

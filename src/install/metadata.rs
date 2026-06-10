@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::cache::MetadataCache;
+use super::http::agent_with_timeout;
 
 /// URL for nvim-treesitter parsers.lua on GitHub (main branch).
 const PARSERS_LUA_URL: &str = "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/main/lua/nvim-treesitter/parsers.lua";
@@ -111,11 +112,7 @@ fn fetch_parsers_lua_with_options(
     }
 
     // Cache miss or no cache - fetch from network
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(PARSERS_LUA_HTTP_TIMEOUT))
-            .build(),
-    );
+    let agent = agent_with_timeout(PARSERS_LUA_HTTP_TIMEOUT);
 
     let mut response = agent.get(PARSERS_LUA_URL).call().map_err(|e| match e {
         ureq::Error::Timeout(_) => MetadataError::Timeout,
