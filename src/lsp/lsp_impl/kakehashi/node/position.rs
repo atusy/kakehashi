@@ -15,7 +15,7 @@
 //! tree-sitter `Point.column` is a UTF-8 byte offset, which diverges from LSP
 //! around any non-ASCII character (emoji, CJK). Returning native points would
 //! make these the only accessors a client must special-case. Instead the server
-//! converts each end via [`PositionMapper`](crate::text::PositionMapper):
+//! converts each end via [`PositionMapper`]:
 //! byte → `Position` on output, `Position` → byte on input. Byte-native spans
 //! remain available unambiguously via `startByte` / `endByte` / `byteRange` and
 //! `descendant*ForByteRange`.

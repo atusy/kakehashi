@@ -96,9 +96,9 @@ pub struct NodeByteRangeParams {
 ///
 /// `start` / `end` are LSP `Position`s (`{ line, character }`, **UTF-16** code
 /// units per the protocol's position encoding). The server converts each to a
-/// UTF-8 byte offset via [`PositionMapper`] before searching, so clients use the
-/// same coordinate space as every other LSP request — never tree-sitter's
-/// byte-column points.
+/// UTF-8 byte offset via [`PositionMapper`](crate::text::PositionMapper) before
+/// searching, so clients use the same coordinate space as every other LSP
+/// request — never tree-sitter's byte-column points.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodePointRangeParams {
@@ -138,8 +138,8 @@ impl Kakehashi {
 
     /// Like [`with_node_by_id`](Self::with_node_by_id) but also hands the closure
     /// the host document text, so the position/range accessors can build a
-    /// [`PositionMapper`] to convert tree-sitter byte offsets ↔ LSP `Position`
-    /// (UTF-16) without a second snapshot.
+    /// [`PositionMapper`](crate::text::PositionMapper) to convert tree-sitter byte
+    /// offsets ↔ LSP `Position` (UTF-16) without a second snapshot.
     ///
     /// The text — not a pre-built `PositionMapper` — is passed because
     /// `PositionMapper::new` indexes the whole document (O(doc)); building it

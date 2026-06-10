@@ -106,8 +106,8 @@ impl Kakehashi {
 
     /// `kakehashi/node/firstChildForByte` — the node's first child extending
     /// beyond `byte` (UTF-8, host coords), per `Node::first_child_for_byte`.
-    /// A `byte` outside the node's own `[start_byte, end_byte]` span (negative,
-    /// before the node, or past its end) resolves to `null`.
+    /// `byte` is rejected (→ `null`) unless `node.start_byte <= byte <=
+    /// node.end_byte` — i.e. negative, before the node, or past its end.
     pub async fn kakehashi_node_first_child_for_byte(
         &self,
         params: NodeByteParams,
@@ -128,9 +128,9 @@ impl Kakehashi {
 
     /// `kakehashi/node/descendantForByteRange` — the smallest descendant
     /// (named + anonymous) spanning `[startByte, endByte)` within this node's
-    /// subtree, per `Node::descendant_for_byte_range`. A range that is negative,
-    /// inverted (`startByte > endByte`), or not contained in the node's own
-    /// `[start_byte, end_byte]` span resolves to `null`.
+    /// subtree, per `Node::descendant_for_byte_range`. The range is rejected
+    /// (→ `null`) unless `node.start_byte <= startByte <= endByte <=
+    /// node.end_byte` — i.e. negative, inverted, or reaching outside the node.
     pub async fn kakehashi_node_descendant_for_byte_range(
         &self,
         params: NodeByteRangeParams,
@@ -148,9 +148,9 @@ impl Kakehashi {
 
     /// `kakehashi/node/namedDescendantForByteRange` — the smallest *named*
     /// descendant spanning `[startByte, endByte)` within this node's subtree, per
-    /// `Node::named_descendant_for_byte_range`. A range that is negative,
-    /// inverted (`startByte > endByte`), or not contained in the node's own
-    /// `[start_byte, end_byte]` span resolves to `null`.
+    /// `Node::named_descendant_for_byte_range`. The range is rejected (→ `null`)
+    /// unless `node.start_byte <= startByte <= endByte <= node.end_byte` — i.e.
+    /// negative, inverted, or reaching outside the node.
     pub async fn kakehashi_node_named_descendant_for_byte_range(
         &self,
         params: NodeByteRangeParams,
