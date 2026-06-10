@@ -163,8 +163,7 @@ fn metadata_object(pairs: Vec<(String, Option<String>)>) -> Option<Value> {
     }
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
-        let value = value.map_or(json!(true), |v| json!(v));
-        map.insert(key, value);
+        map.insert(key, value.map_or(Value::Bool(true), Value::String));
     }
     Some(Value::Object(map))
 }
