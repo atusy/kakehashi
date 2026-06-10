@@ -512,6 +512,10 @@ async fn dispatch_concatenated_formatting(
     // step's deadline is measured against this single origin, so serial
     // round-trips share one bound instead of each getting a fresh timeout.
     let pipeline_start = std::time::Instant::now();
+    // One-way sentinel so budget exhaustion is WARNed once per pipeline run:
+    // every remaining server skips the same way, and one WARN per skipped
+    // server would spam the log for a single formatting request.
+    let budget_exhaustion_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
         let pool = Arc::clone(&pool);
@@ -525,6 +529,7 @@ async fn dispatch_concatenated_formatting(
             let upstream_id = upstream_id.clone();
             let server_config = server_config_for(&server_name);
             let step_counter = Arc::clone(&step_counter);
+            let budget_exhaustion_warned = Arc::clone(&budget_exhaustion_warned);
             let host_uri_lsp = host_uri_lsp.clone();
             let open_scratch = Arc::clone(&open_scratch);
             async move {
@@ -543,13 +548,25 @@ async fn dispatch_concatenated_formatting(
                     pipeline_start.elapsed(),
                     PIPELINE_STEP_FLOOR,
                 ) else {
-                    log::warn!(
-                        target: "kakehashi::formatting",
-                        "concatenated formatting step for server {} skipped: \
-                         pipeline budget ({:?}) exhausted (ADR point 6)",
-                        server_name,
-                        PIPELINE_BUDGET
-                    );
+                    // WARN only for the first exhausted step; the remaining
+                    // servers skip identically, so they get debug level.
+                    if !budget_exhaustion_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        log::warn!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting pipeline budget ({:?}) \
+                             exhausted; skipping server {} and all remaining \
+                             steps (ADR point 6)",
+                            PIPELINE_BUDGET,
+                            server_name
+                        );
+                    } else {
+                        log::debug!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting step for server {} skipped: \
+                             pipeline budget exhausted",
+                            server_name
+                        );
+                    }
                     return (current_text, None);
                 };
 
