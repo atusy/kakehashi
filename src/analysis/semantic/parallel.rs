@@ -327,11 +327,12 @@ fn collect_injection_contexts_sync<'a>(
             let effective = calculate_effective_range(text, byte_range, off);
             // Column deltas are byte counts; a misconfigured query could land
             // inside a multi-byte character. Snap inward so the content slice
-            // below cannot panic (same guard as from_region_info).
-            (
-                ceil_char_boundary(text, effective.start),
-                floor_char_boundary(text, effective.end),
-            )
+            // below cannot panic, and normalize so a degenerate range (both
+            // ends inside one codepoint) becomes empty rather than inverted —
+            // same guards as from_region_info.
+            let start = ceil_char_boundary(text, effective.start);
+            let end = floor_char_boundary(text, effective.end);
+            (start.min(end), end)
         } else {
             (content_node.start_byte(), content_node.end_byte())
         };
