@@ -113,6 +113,22 @@ mod tests {
         assert_eq!(detect_from_first_line(content), expected.map(String::from));
     }
 
+    // syntect compiles first-line regexes lazily on first match attempt and
+    // panics on patterns the active regex engine rejects. A line matching no
+    // syntax forces every first-line regex in the two-face set through the
+    // fancy-regex engine, so an incompatible pattern fails here instead of at
+    // detection time in production.
+    #[test]
+    fn test_first_line_regexes_compile_with_fancy_engine() {
+        let result = SYNTAX_SET.find_syntax_by_first_line("\u{1}kakehashi-no-syntax-matches\u{1}");
+        assert!(
+            result.is_none(),
+            "sentinel line unexpectedly matched syntax {:?}; \
+             pick a new sentinel so all first-line regexes still get compiled",
+            result.map(|s| s.name.clone())
+        );
+    }
+
     // Token extraction from path tests
 
     #[rstest]

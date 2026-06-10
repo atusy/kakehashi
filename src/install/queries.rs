@@ -271,19 +271,16 @@ fn install_queries_recursive(
 
 /// Download a file from a URL.
 fn download_file(url: &str) -> Result<String, QueryInstallError> {
-    let response =
-        reqwest::blocking::get(url).map_err(|e| QueryInstallError::HttpError(e.to_string()))?;
-
-    if !response.status().is_success() {
-        return Err(QueryInstallError::HttpError(format!(
-            "HTTP {} for {}",
-            response.status(),
-            url
-        )));
-    }
+    let mut response = ureq::get(url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => {
+            QueryInstallError::HttpError(format!("HTTP {} for {}", code, url))
+        }
+        e => QueryInstallError::HttpError(e.to_string()),
+    })?;
 
     response
-        .text()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| QueryInstallError::HttpError(e.to_string()))
 }
 

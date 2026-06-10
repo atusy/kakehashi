@@ -38,12 +38,19 @@ log = "0.4"
 lua-pattern = { version = "0.1", features = ["to-regex"] }
 path-clean = "1"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 rust-lapper = "1.1"
 schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-onig"] }
-two-face = { version = "0.5", features = ["syntect-default-onig"] }
+# regex-fancy (pure Rust) over regex-onig (C oniguruma): we only compile
+# first-line-match regexes for language detection, never highlighting, so
+# fancy-regex's rare Sublime-syntax incompatibilities don't apply (covered by
+# a heuristic.rs test that compiles every first-line regex in the syntax set).
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
+# Sync-by-design HTTP client: kakehashi's install paths are blocking CLI code,
+# and reqwest::blocking's internal tokio runtime conflicted with the LSP
+# runtime (see src/bin/main.rs runtime setup).
+ureq = "3"
 serde_json = "1"
 shellexpand = "3"
 similar = "3"

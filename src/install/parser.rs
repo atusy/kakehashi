@@ -263,25 +263,22 @@ fn download_and_extract_archive(
     revision: &str,
     dest: &Path,
 ) -> Result<(), ParserInstallError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(ARCHIVE_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| ParserInstallError::ArchiveError(e.to_string()))?;
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(ARCHIVE_HTTP_TIMEOUT))
+            .build(),
+    );
 
-    let response = client
-        .get(archive_url)
-        .send()
-        .map_err(|e| ParserInstallError::ArchiveError(format!("Download failed: {}", e)))?;
+    let response = agent.get(archive_url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => {
+            ParserInstallError::ArchiveError(format!("HTTP {} downloading {}", code, archive_url))
+        }
+        e => ParserInstallError::ArchiveError(format!("Download failed: {}", e)),
+    })?;
 
-    if !response.status().is_success() {
-        return Err(ParserInstallError::ArchiveError(format!(
-            "HTTP {} downloading {}",
-            response.status(),
-            archive_url
-        )));
-    }
-
-    let decoder = GzDecoder::new(response);
+    // into_reader() streams without a size limit; parser archives can exceed
+    // ureq's 10MB read_to_* default.
+    let decoder = GzDecoder::new(response.into_body().into_reader());
     let mut archive = Archive::new(decoder);
 
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
