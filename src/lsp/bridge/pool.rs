@@ -32,7 +32,7 @@ pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::ConnectionHandleSender;
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -175,7 +175,7 @@ pub struct LanguageServerPool {
     /// Connection failure via `ResponseRouter::fail_all()` deliberately leaves
     /// entries dangling to avoid a router→pool back-reference — stale lookups
     /// fail gracefully and IDs get reused.
-    upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashSet<String>>>,
+    upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashMap<String, usize>>>,
     /// Metrics for cancel forwarding observability.
     cancel_metrics: CancelForwardingMetrics,
     /// Consecutive handshake-task panics per server (reset to 0 on success).
@@ -981,7 +981,7 @@ impl LanguageServerPool {
                 .lock()
                 .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id");
             match registry.get(&upstream_id) {
-                Some(servers) => servers.iter().cloned().collect(),
+                Some(servers) => servers.keys().cloned().collect(),
                 None => {
                     // Request not registered yet (still initializing) or already completed.
                     // This is expected - silently drop the cancel per best-effort semantics.
@@ -1020,10 +1020,12 @@ impl LanguageServerPool {
     /// can be forwarded to every downstream server handling that ID.
     ///
     /// For fan-out (e.g. diagnostics dispatched to multiple injected languages),
-    /// callers register the same `upstream_id` once per server; the `HashSet`
-    /// ensures cancel reaches all of them.
+    /// callers register the same `upstream_id` once per request. The per-server
+    /// count handles whole-document fan-out, where the SAME server receives one
+    /// request per injection region under one upstream id: the server must stay
+    /// registered until its last in-flight request completes.
     ///
-    /// Callers MUST call `unregister_upstream_request` per server on completion
+    /// Callers MUST call `unregister_upstream_request` per request on completion
     /// (success, error, or timeout) — typically after `wait_for_response()` or
     /// in `ensure_document_opened()` error cleanup — to avoid leaking entries.
     pub(crate) fn register_upstream_request(&self, upstream_id: UpstreamId, server_name: &str) {
@@ -1031,22 +1033,28 @@ impl LanguageServerPool {
             .upstream_request_registry
             .lock()
             .recover_poison("LanguageServerPool::register_upstream_request");
-        registry
+        *registry
             .entry(upstream_id)
             .or_default()
-            .insert(server_name.to_string());
+            .entry(server_name.to_string())
+            .or_insert(0) += 1;
     }
 
-    /// Unregister an upstream request ID for a specific server on response/error.
-    /// Removes only that server from the set; the entry is fully removed once all
-    /// servers have been unregistered.
+    /// Unregister one in-flight request for `(upstream_id, server_name)`.
+    /// The server is removed once its count reaches zero; the upstream entry is
+    /// fully removed once all servers have been unregistered.
     pub(crate) fn unregister_upstream_request(&self, upstream_id: &UpstreamId, server_name: &str) {
         let mut registry = self
             .upstream_request_registry
             .lock()
             .recover_poison("LanguageServerPool::unregister_upstream_request");
         if let Some(servers) = registry.get_mut(upstream_id) {
-            servers.remove(server_name);
+            if let Some(count) = servers.get_mut(server_name) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    servers.remove(server_name);
+                }
+            }
             if servers.is_empty() {
                 registry.remove(upstream_id);
             }
@@ -2608,7 +2616,7 @@ mod tests {
         let servers = registry
             .get(&UpstreamId::Number(42))
             .expect("should have entry");
-        assert!(servers.contains("lua"));
+        assert!(servers.contains_key("lua"));
         assert_eq!(servers.len(), 1);
     }
 
@@ -2620,6 +2628,32 @@ mod tests {
         pool.register_upstream_request(UpstreamId::Number(42), "lua");
         pool.unregister_upstream_request(&UpstreamId::Number(42), "lua");
 
+        let registry = pool.upstream_request_registry.lock().unwrap();
+        assert_eq!(registry.get(&UpstreamId::Number(42)), None);
+    }
+
+    /// Whole-document fan-out issues multiple concurrent requests to the SAME
+    /// server under one upstream id (one per injection region). Completing one
+    /// region must not unregister the server while a sibling request is still
+    /// in flight, or `forward_cancel_by_upstream_id` would skip that server
+    /// and the sibling's cancel would never reach it.
+    #[test]
+    fn unregister_upstream_request_keeps_server_while_sibling_requests_in_flight() {
+        let pool = LanguageServerPool::new();
+
+        pool.register_upstream_request(UpstreamId::Number(42), "lua");
+        pool.register_upstream_request(UpstreamId::Number(42), "lua");
+
+        pool.unregister_upstream_request(&UpstreamId::Number(42), "lua");
+        {
+            let registry = pool.upstream_request_registry.lock().unwrap();
+            assert!(
+                registry.contains_key(&UpstreamId::Number(42)),
+                "server must stay registered while its second request is in flight"
+            );
+        }
+
+        pool.unregister_upstream_request(&UpstreamId::Number(42), "lua");
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert_eq!(registry.get(&UpstreamId::Number(42)), None);
     }
@@ -3279,8 +3313,8 @@ mod tests {
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry.get(&upstream_id).expect("should have entry");
 
-        assert!(servers.contains("lua-ls"));
-        assert!(servers.contains("pyright"));
+        assert!(servers.contains_key("lua-ls"));
+        assert!(servers.contains_key("pyright"));
         assert_eq!(servers.len(), 2);
     }
 
@@ -3297,8 +3331,8 @@ mod tests {
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry.get(&upstream_id).expect("should still have entry");
 
-        assert!(!servers.contains("lua-ls"));
-        assert!(servers.contains("pyright"));
+        assert!(!servers.contains_key("lua-ls"));
+        assert!(servers.contains_key("pyright"));
         assert_eq!(servers.len(), 1);
     }
 
