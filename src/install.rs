@@ -4,6 +4,7 @@
 //! query files and compile parser shared libraries.
 
 pub(crate) mod cache;
+pub(crate) mod http;
 pub mod metadata;
 pub mod parser;
 pub mod queries;

@@ -217,7 +217,7 @@ fn main() -> ExitCode {
         },
         None => {
             // Start LSP server (backward compatible default behavior)
-            // Only create tokio runtime for LSP mode to avoid conflicts with reqwest::blocking
+            // Only LSP mode needs a tokio runtime; CLI subcommands are synchronous
             run_lsp_server();
             Ok(())
         }

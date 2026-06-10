@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::cache::MetadataCache;
+use super::http::agent_with_timeout;
 
 /// URL for nvim-treesitter parsers.lua on GitHub (main branch).
 const PARSERS_LUA_URL: &str = "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/main/lua/nvim-treesitter/parsers.lua";
@@ -111,29 +112,20 @@ fn fetch_parsers_lua_with_options(
     }
 
     // Cache miss or no cache - fetch from network
-    let client = reqwest::blocking::Client::builder()
-        .timeout(PARSERS_LUA_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| MetadataError::HttpError(e.to_string()))?;
+    let agent = agent_with_timeout(PARSERS_LUA_HTTP_TIMEOUT);
 
-    let response = client.get(PARSERS_LUA_URL).send().map_err(|e| {
-        if e.is_timeout() {
-            MetadataError::Timeout
-        } else {
-            MetadataError::HttpError(e.to_string())
+    let mut response = agent.get(PARSERS_LUA_URL).call().map_err(|e| match e {
+        ureq::Error::Timeout(_) => MetadataError::Timeout,
+        ureq::Error::StatusCode(code) => {
+            MetadataError::HttpError(format!("HTTP {} fetching parsers.lua", code))
         }
+        e => MetadataError::HttpError(e.to_string()),
     })?;
 
-    if !response.status().is_success() {
-        return Err(MetadataError::HttpError(format!(
-            "HTTP {} fetching parsers.lua",
-            response.status()
-        )));
-    }
-
-    let content = response
-        .text()
-        .map_err(|e| MetadataError::HttpError(e.to_string()))?;
+    let content = response.body_mut().read_to_string().map_err(|e| match e {
+        ureq::Error::Timeout(_) => MetadataError::Timeout,
+        e => MetadataError::HttpError(e.to_string()),
+    })?;
 
     // Update cache if available
     if let Some(cache) = cache {
