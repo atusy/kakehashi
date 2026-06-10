@@ -440,12 +440,12 @@ fn delta_inherits_injection_mode_from_lineage() {
 /// The edit-driven variant of inheritance: full(injection) → didChange →
 /// delta sees the new python match in its edits.
 ///
-/// Blocked by <https://github.com/atusy/kakehashi/issues/348>: editing a
-/// markdown document after the markdown_inline layer has been parsed crashes
-/// the server (pre-existing heap corruption, reproducible with kakehashi/node
-/// alone). Enable when #348 is fixed.
+/// Also the regression test for issue #348: a full-text didChange used to
+/// seed the reparse with the UNEDITED stored tree, which corrupts the heap in
+/// the markdown external scanner and killed the server. The crash needed a
+/// stored tree to exist at didChange time — exactly what the preceding
+/// `full` request guarantees via ensure_parsed.
 #[test]
-#[ignore = "blocked by #348: server crash on didChange after markdown_inline layer parse"]
 fn delta_after_edit_carries_injected_matches() {
     let dir = context_query_dir();
     let mut client = LspClient::new();
