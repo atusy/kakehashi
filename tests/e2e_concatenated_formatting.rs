@@ -46,12 +46,13 @@ fn init_client(config_toml: &str, language_servers: Value) -> (LspClient, tempfi
     (client, config_dir)
 }
 
-/// Issue `textDocument/formatting`, retrying while the result is null.
+/// Issue `textDocument/formatting`, retrying while the result is null or an
+/// empty edit list.
 ///
 /// Cold downstream servers are still handshaking when the first request
 /// arrives; the pipeline treats a not-yet-ready server as a failed step
-/// (skip-and-continue), which yields a null result. Retrying until the
-/// servers are Ready keeps the test free of timing assumptions.
+/// (skip-and-continue), which yields a null (or empty) result. Retrying
+/// until the servers are Ready keeps the test free of timing assumptions.
 fn request_formatting_with_retry(client: &mut LspClient, uri: &str) -> Option<Vec<Value>> {
     for _ in 0..30 {
         let response = client.send_request(

@@ -321,32 +321,20 @@ fn select_pipeline_step_request(supports_full: bool, supports_range: bool) -> Pi
 /// needed, and waiting up to `timeout` — the step's remaining budget — for a
 /// cold server to finish initializing so its capabilities are actually
 /// known) and map them to the step's request kind via
-/// [`select_pipeline_step_request`]. The second probe is skipped when full
-/// formatting is advertised — the answer can no longer matter — and reuses
-/// the already-Ready connection when it does run.
+/// [`select_pipeline_step_request`]. The connection handle is fetched once
+/// and both capabilities are read off it directly, so the probe locks the
+/// pool's connection map a single time.
 async fn pipeline_step_request_kind(
     pool: &crate::lsp::bridge::LanguageServerPool,
     server_name: &str,
     server_config: &crate::config::settings::BridgeServerConfig,
     timeout: std::time::Duration,
 ) -> std::io::Result<PipelineStepRequest> {
-    let supports_full = pool
-        .server_advertises(
-            server_name,
-            server_config,
-            "textDocument/formatting",
-            timeout,
-        )
+    let handle = pool
+        .get_or_create_connection_wait_ready(server_name, server_config, timeout)
         .await?;
-    let supports_range = !supports_full
-        && pool
-            .server_advertises(
-                server_name,
-                server_config,
-                "textDocument/rangeFormatting",
-                timeout,
-            )
-            .await?;
+    let supports_full = handle.has_capability("textDocument/formatting");
+    let supports_range = handle.has_capability("textDocument/rangeFormatting");
     Ok(select_pipeline_step_request(supports_full, supports_range))
 }
 
