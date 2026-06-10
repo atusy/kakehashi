@@ -334,6 +334,29 @@ fn gen_unicode_rust(funcs: usize) -> String {
     s
 }
 
+/// Rust source dense with constant-like (ALL_CAPS) and type-like identifiers.
+/// The rust highlight query runs `#lua-match?` predicates per identifier (e.g.
+/// `^[A-Z][A-Z0-9_]+$` for constants, `^[A-Z]` for constructors), so a high
+/// identifier density maximizes predicate evaluations — the path that the shared
+/// lua-match regex cache pool optimizes.
+fn gen_rust_predicate_heavy(groups: usize) -> String {
+    let mut s = String::with_capacity(groups * 320);
+    for i in 0..groups {
+        s.push_str(&format!(
+            "pub const MAX_VALUE_{i}: u64 = {i};\n\
+             pub const MIN_LIMIT_{i}: u64 = {i};\n\
+             pub const DEFAULT_NAME_{i}: &str = \"item_{i}\";\n\
+             pub static GLOBAL_COUNTER_{i}: u64 = {i};\n\
+             pub fn compute_{i}(InputValue: u64, OtherArg: u64) -> u64 {{\n\
+            \x20   let LocalResult = MAX_VALUE_{i} + MIN_LIMIT_{i} + InputValue;\n\
+            \x20   let AnotherName = GLOBAL_COUNTER_{i} * OtherArg + LocalResult;\n\
+            \x20   AnotherName.max(MAX_VALUE_{i})\n\
+             }}\n\n"
+        ));
+    }
+    s
+}
+
 // ─────────────────────────────── Statistics ───────────────────────────────────
 
 struct Stats {
@@ -517,6 +540,14 @@ fn main() {
             content: gen_rust(150),
             kind: Kind::Full,
             targets: "per-token String removal, ASCII fast-path, Arc mappings (amplified)",
+        },
+        Scenario {
+            name: "rust_predicate_heavy/full",
+            language_id: "rust",
+            uri: "file:///bench/predicates.rs",
+            content: gen_rust_predicate_heavy(120),
+            kind: Kind::Full,
+            targets: "#lua-match? predicate evaluation — shared regex lazy-DFA cache pool",
         },
         Scenario {
             name: "markdown_injections/full",

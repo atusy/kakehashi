@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::error::LockResultExt;
 use regex::Regex;
@@ -9,12 +9,25 @@ use tree_sitter::{Query, QueryCapture, QueryMatch};
 /// Avoids recompiling the same pattern on every invocation during
 /// semantic token highlighting of large files.
 ///
+/// Stored as `Arc<Regex>` (not `Regex`) and shared by reference: a `Regex`
+/// owns an internal pool of lazy-DFA caches, and `Regex::clone` would hand each
+/// caller a *fresh, empty* pool — forcing the lazy DFA to rebuild its transition
+/// table on the first match of every call. Sharing one `Arc<Regex>` keeps a
+/// single pool alive across all predicate checks (the pool is internally
+/// thread-safe, so the parallel injection workers reuse it too), which removes
+/// the per-call `Cache::new`/`init_cache` that dominated the hot path.
+///
+/// A `RwLock` (not `Mutex`) because the cache is overwhelmingly read-only after
+/// warmup: every predicate check on the hot path is a lookup, so a shared read
+/// lock lets the parallel injection workers proceed concurrently; only the rare
+/// first-compile of a pattern takes the write lock.
+///
 /// Unbounded by design: patterns originate from static `.scm` query files,
 /// not user input, so the total number of unique entries is bounded by the
 /// finite set of `#lua-match?` / `#not-lua-match?` patterns across all
 /// loaded languages (typically well under 100).
-static LUA_REGEX_CACHE: LazyLock<Mutex<HashMap<String, Option<Regex>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LUA_REGEX_CACHE: LazyLock<RwLock<HashMap<String, Option<Arc<Regex>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Check if a capture passes all predicates returned by
 /// [`Query::general_predicates`] for the capture's pattern.
@@ -110,18 +123,32 @@ fn check_lua_match(arg: Option<&tree_sitter::QueryPredicateArg>, node_text: &str
 
 /// Get a cached compiled regex for a Lua pattern, or compile and cache it.
 /// Returns `None` if the pattern cannot be compiled (parse/convert/compile error).
-fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Regex> {
-    let mut cache = LUA_REGEX_CACHE
-        .lock()
-        .recover_poison("query_predicates::get_or_compile_lua_regex");
-
-    if let Some(cached) = cache.get(pattern_str) {
-        return cached.clone();
+///
+/// Returns an `Arc<Regex>` (a refcount bump) so the shared regex's lazy-DFA
+/// cache pool is reused across calls — see [`LUA_REGEX_CACHE`].
+fn get_or_compile_lua_regex(pattern_str: &str) -> Option<Arc<Regex>> {
+    // Fast path: a shared read lock, so parallel injection workers look up
+    // concurrently (this is the hot path — one lookup per predicate check).
+    {
+        let cache = LUA_REGEX_CACHE
+            .read()
+            .recover_poison("query_predicates::get_or_compile_lua_regex (read)");
+        if let Some(cached) = cache.get(pattern_str) {
+            return cached.clone();
+        }
     }
 
-    let result = compile_lua_regex(pattern_str);
-    cache.insert(pattern_str.to_string(), result.clone());
-    result
+    // Miss (only the first time a pattern is seen): compile *outside* the lock so
+    // the CPU-bound Regex::new doesn't block other workers, then insert under a
+    // brief write lock. A concurrent miss on the same pattern just recompiles;
+    // `or_insert` keeps whichever landed first — the same regex either way.
+    let result = compile_lua_regex(pattern_str).map(Arc::new);
+    LUA_REGEX_CACHE
+        .write()
+        .recover_poison("query_predicates::get_or_compile_lua_regex (write)")
+        .entry(pattern_str.to_string())
+        .or_insert(result)
+        .clone()
 }
 
 /// Compile a Lua pattern string into a Regex. Returns None on any error.
