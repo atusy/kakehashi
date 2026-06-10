@@ -495,7 +495,17 @@ fn extract_virtual_content_and_offsets(
     cacheable: &CacheableInjectionRegion,
     text: &str,
 ) -> (String, Vec<u32>) {
-    let included_ranges = compute_included_ranges(&region.content_node, region.include_children);
+    // Disabled when an offset directive is active: compute_included_ranges()
+    // returns ranges relative to content_node.start_byte(), but with #offset!
+    // the cacheable byte_range starts elsewhere — misaligned ranges would
+    // extract wrong content. Mirrors the semantic path (parallel.rs); the
+    // offset × child-exclusion interaction is tracked in #186 (every vendored
+    // #offset! query sets include-children, so nothing is lost today).
+    let included_ranges = if region.offset.is_some() {
+        None
+    } else {
+        compute_included_ranges(&region.content_node, region.include_children)
+    };
     let virtual_content = extract_clean_content(
         text,
         cacheable.byte_range.clone(),
@@ -617,6 +627,11 @@ pub struct InjectionRegionInfo<'a> {
     /// When true, the injection parser sees the full content node (including named children).
     /// When false, named children (e.g., `block_continuation`) should be excluded.
     pub include_children: bool,
+    /// The `#offset!` directive for this pattern, resolved at collection time
+    /// (the query goes out of scope before consumers like
+    /// `CacheableInjectionRegion::from_region_info` run). `None` when the
+    /// pattern has no directive.
+    pub offset: Option<InjectionOffset>,
 }
 
 use std::ops::Range;
@@ -648,6 +663,46 @@ pub struct CacheableInjectionRegion {
     pub content_hash: u64,
 }
 
+/// Compute the (row, UTF-16 column) of `byte_pos`, using a nearby byte with a
+/// known row as an anchor so only the span between them is scanned (offset
+/// deltas are typically a few lines, never the whole document).
+fn position_of_byte(
+    text: &str,
+    byte_pos: usize,
+    anchor_byte: usize,
+    anchor_row: usize,
+) -> (u32, u32) {
+    let (lo, hi) = (byte_pos.min(anchor_byte), byte_pos.max(anchor_byte));
+    let newlines = text[lo..hi].bytes().filter(|&b| b == b'\n').count();
+    let row = if byte_pos >= anchor_byte {
+        anchor_row + newlines
+    } else {
+        anchor_row - newlines
+    };
+    let line_start = text[..byte_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = text[line_start..byte_pos].encode_utf16().count() as u32;
+    (row as u32, column)
+}
+
+/// Snap `index` forward to the nearest char boundary (stable alternative to
+/// the unstable `str::ceil_char_boundary`).
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index.min(text.len())
+}
+
+/// Snap `index` backward to the nearest char boundary (stable alternative to
+/// the unstable `str::floor_char_boundary`).
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 impl CacheableInjectionRegion {
     /// Create from an InjectionRegionInfo, extracting position data from the node.
     ///
@@ -661,7 +716,33 @@ impl CacheableInjectionRegion {
             "from_region_info called with zero-width node at byte {}",
             node.start_byte(),
         );
-        let content = &text[node.start_byte()..node.end_byte()];
+
+        // #offset! narrows the raw node span to the effective content range
+        // (e.g. trimming `---` frontmatter delimiters). The bridge consumes
+        // byte_range / line_range / start_column for virtual-document content
+        // extraction and coordinate translation, so all of them must reflect
+        // the effective range, mirroring the semantic path (#183).
+        let (start_byte, end_byte) = match info.offset {
+            Some(offset) => {
+                use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+                let effective = calculate_effective_range(
+                    text,
+                    ByteRange::new(node.start_byte(), node.end_byte()),
+                    offset,
+                );
+                // Column deltas are byte counts; a misconfigured query could
+                // land inside a multi-byte character. Snap inward so slicing
+                // below cannot panic.
+                (
+                    ceil_char_boundary(text, effective.start),
+                    floor_char_boundary(text, effective.end),
+                )
+            }
+            None => (node.start_byte(), node.end_byte()),
+        };
+        let (start_byte, end_byte) = (start_byte.min(end_byte), end_byte);
+
+        let content = &text[start_byte..end_byte];
 
         // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
         // Tree-sitter reports columns as byte offsets, but LSP positions use UTF-16.
@@ -669,26 +750,43 @@ impl CacheableInjectionRegion {
         // tree-sitter's `column` is a byte offset from the line start, so
         // `start_byte() - column` correctly recovers the line-start byte even
         // when the line contains multi-byte UTF-8 characters before the node.
-        let byte_column = node.start_position().column;
-        let line_start_byte = node.start_byte() - byte_column;
-        let line_prefix = &text[line_start_byte..node.start_byte()];
-        let start_column = line_prefix.encode_utf16().count() as u32;
+        let (start_line, start_column) = if start_byte == node.start_byte() {
+            let byte_column = node.start_position().column;
+            let line_start_byte = node.start_byte() - byte_column;
+            let line_prefix = &text[line_start_byte..node.start_byte()];
+            (
+                node.start_position().row as u32,
+                line_prefix.encode_utf16().count() as u32,
+            )
+        } else {
+            position_of_byte(
+                text,
+                start_byte,
+                node.start_byte(),
+                node.start_position().row,
+            )
+        };
 
-        let start_line = node.start_position().row as u32;
-        let end_pos = node.end_position();
         // end_position() points past the last byte. When that position is mid-line
         // (column > 0), the node still occupies that row → exclusive end is row + 1.
         // When column == 0 (node ended with newline), the row is already one past
         // the last occupied line — use it directly.
-        let end_line = if end_pos.column > 0 {
-            end_pos.row as u32 + 1
+        let end_line = if end_byte == node.end_byte() {
+            let end_pos = node.end_position();
+            if end_pos.column > 0 {
+                end_pos.row as u32 + 1
+            } else {
+                end_pos.row as u32
+            }
         } else {
-            end_pos.row as u32
+            let (end_row, end_column) =
+                position_of_byte(text, end_byte, node.end_byte(), node.end_position().row);
+            if end_column > 0 { end_row + 1 } else { end_row }
         };
 
         Self {
             language: info.language.clone(),
-            byte_range: node.start_byte()..node.end_byte(),
+            byte_range: start_byte..end_byte,
             line_range: start_line..end_line,
             start_column,
             region_id: region_id.to_string(),
@@ -732,6 +830,7 @@ pub fn collect_all_injections<'a>(
                     content_node: capture.node,
                     pattern_index: match_.pattern_index,
                     include_children: has_include_children_for_pattern(query, match_.pattern_index),
+                    offset: parse_offset_directive_for_pattern(query, match_.pattern_index),
                 });
             }
         }
@@ -1364,6 +1463,95 @@ mod tests {
         assert_eq!(cacheable.region_id, "test-result-id");
     }
 
+    #[test]
+    fn test_from_region_info_applies_column_offset() {
+        // #offset! with a column delta (e.g. regex content after a prefix)
+        // must shift byte_range and start_column to the effective position,
+        // so the bridge extracts the right content and translates coordinates
+        // correctly (#183).
+        let mut parser = create_rust_parser();
+        let text = "// regex content";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "regex")
+              (#offset! @injection.content 0 3 0 0))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
+        assert_eq!(regions.len(), 1);
+        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text);
+
+        assert_eq!(&text[cacheable.byte_range.clone()], "regex content");
+        assert_eq!(cacheable.byte_range, 3..text.len());
+        assert_eq!(cacheable.start_column, 3);
+        assert_eq!(cacheable.line_range, 0..1);
+    }
+
+    #[test]
+    fn test_from_region_info_applies_row_offset_for_frontmatter() {
+        // The vendored markdown query trims `---` frontmatter delimiters via
+        // (#offset! @injection.content 1 0 -1 0); the cacheable region must
+        // reflect the effective (delimiter-free) range (#183).
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: x\n---\n\n# heading\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children)
+              (#offset! @injection.content 1 0 -1 0))
+        "#;
+        let query = Query::new(&md_language, query_str).expect("valid query");
+
+        let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
+        assert_eq!(regions.len(), 1);
+        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text);
+
+        assert_eq!(&text[cacheable.byte_range.clone()], "title: x\n");
+        assert_eq!(cacheable.line_range, 1..2);
+        assert_eq!(cacheable.start_column, 0);
+    }
+
+    #[test]
+    fn test_resolved_injection_virtual_content_honors_offset() {
+        // End-to-end through the bridge resolution path: the virtual document
+        // sent downstream must contain only the effective (post-offset)
+        // content, not the raw node text with delimiters (#183).
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: x\n---\n\n# heading\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query_str = r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children)
+              (#offset! @injection.content 1 0 -1 0))
+        "#;
+        let query = Query::new(&md_language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("offset_frontmatter");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "title: x\n");
+        assert_eq!(resolved[0].region.line_range.start, 1);
+        assert_eq!(resolved[0].line_column_offsets, vec![0]);
+    }
+
     // ============================================================
     // Tests for InjectionResolver region_id generation
     // ============================================================
@@ -1556,18 +1744,21 @@ mod tests {
                 content_node: nodes[0],
                 pattern_index: 0,
                 include_children: false,
+                offset: None,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
                 content_node: nodes[1],
                 pattern_index: 0,
                 include_children: false,
+                offset: None,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
                 content_node: nodes[2],
                 pattern_index: 0,
                 include_children: false,
+                offset: None,
             },
         ];
 
@@ -1633,18 +1824,21 @@ mod tests {
                 content_node: nodes[0],
                 pattern_index: 0,
                 include_children: false,
+                offset: None,
             },
             InjectionRegionInfo {
                 language: "python".to_string(),
                 content_node: nodes[1],
                 pattern_index: 0,
                 include_children: false,
+                offset: None,
             },
             InjectionRegionInfo {
                 language: "lua".to_string(),
                 content_node: nodes[2],
                 pattern_index: 0,
                 include_children: false,
+                offset: None,
             },
         ];
 

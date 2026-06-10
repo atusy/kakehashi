@@ -275,7 +275,7 @@ fn collect_injection_contexts_sync<'a>(
     content_start_byte: usize,
     parent_included_ranges: Option<&[tree_sitter::Range]>,
 ) -> (Vec<InjectionContext<'a>>, Vec<(usize, usize)>) {
-    use crate::language::injection::{collect_all_injections, parse_offset_directive_for_pattern};
+    use crate::language::injection::collect_all_injections;
 
     let current_lang = filetype.unwrap_or("unknown");
     let Some(injection_query) = coordinator.injection_query(current_lang) else {
@@ -314,8 +314,9 @@ fn collect_injection_contexts_sync<'a>(
             continue;
         };
 
-        // Get offset directive if any
-        let offset = parse_offset_directive_for_pattern(&injection_query, injection.pattern_index);
+        // Offset directive resolved at collection time (single source of truth
+        // with the bridge path, which applies it in from_region_info)
+        let offset = injection.offset;
 
         // Calculate effective content range
         let content_node = injection.content_node;
