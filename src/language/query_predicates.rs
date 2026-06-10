@@ -159,12 +159,10 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
                 .all(|n| node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))),
             // Neovim: vacuously true with no nodes, otherwise ANY node hit.
             "has-parent?" => {
-                nodes().next().is_none()
-                    || nodes().any(|n| check_has_parent(&predicate.args[1..], n))
+                any_or_vacuously_true(nodes(), |n| check_has_parent(&predicate.args[1..], n))
             }
             "has-ancestor?" => {
-                nodes().next().is_none()
-                    || nodes().any(|n| check_has_ancestor(&predicate.args[1..], n))
+                any_or_vacuously_true(nodes(), |n| check_has_ancestor(&predicate.args[1..], n))
             }
             unknown => {
                 log::debug!(
@@ -182,6 +180,19 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
     }
 
     true
+}
+
+/// Neovim's any-node aggregation for `has-parent?`/`has-ancestor?`:
+/// vacuously true when the capture selected no nodes, otherwise true
+/// when ANY node passes. Single pass over the nodes.
+fn any_or_vacuously_true<N>(
+    mut nodes: impl Iterator<Item = N>,
+    mut check: impl FnMut(N) -> bool,
+) -> bool {
+    match nodes.next() {
+        None => true,
+        Some(first) => check(first) || nodes.any(check),
+    }
 }
 
 /// Check lua-match? predicate - returns true if pattern matches or on error (permissive)
