@@ -28,9 +28,9 @@ A first iteration shipped `kakehashi/query`: a one-shot method taking a **client
 
 | Method | Input | Output |
 |---|---|---|
-| `kakehashi/captures/full` | `{ textDocument, kind, matchLimit? }` | `CapturesResult \| null` |
-| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId, matchLimit? }` | `CapturesResult \| CapturesDelta \| null` |
-| `kakehashi/captures/range` | `{ textDocument, kind, range, matchLimit? }` | `CapturesRangeResult \| null` |
+| `kakehashi/captures/full` | `{ textDocument, kind }` | `CapturesResult \| null` |
+| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
+| `kakehashi/captures/range` | `{ textDocument, kind, range }` | `CapturesRangeResult \| null` |
 
 ### Result shapes
 
@@ -103,6 +103,10 @@ Matches existing config-time loading, but every new kind becomes a code change, 
 ### E. Per-`(uri, kind)` server cache of compiled queries
 
 Deferred, not rejected: v1 reloads and recompiles the kind query per request. The files are small (a `context.scm` is ~1 KB) and execution over the tree dominates; a compiled-query cache keyed by `(language, kind)` with config-reload invalidation is a contained optimization if profiling warrants it.
+
+### F. A `matchLimit` result cap
+
+The first iteration carried an optional per-request cap (plus a server default). Rejected on review: truncation is **silent** — a client cannot tell a complete result from a clipped one, which for the motivating consumer means silently wrong contexts — and a truncated `full` poisons the delta lineage (edits computed over a clipped array, worse if `full` and `delta` use different limits). The scoping tool for "too much data" is `range`; semanticTokens, the protocol this mirrors, has no limit parameter either. Result size is bounded in practice by the query asset the server owns, not by hostile client input.
 
 ## Consequences
 

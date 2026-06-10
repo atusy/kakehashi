@@ -377,9 +377,9 @@ re-request cheaply on every cursor move or edit:
 
 | Method | Input | Output |
 |--------|-------|--------|
-| `kakehashi/captures/full` | `{ textDocument, kind, matchLimit? }` | `CapturesResult \| null` |
-| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId, matchLimit? }` | `CapturesResult \| CapturesDelta \| null` |
-| `kakehashi/captures/range` | `{ textDocument, kind, range, matchLimit? }` | `{ matches, skipped } \| null` |
+| `kakehashi/captures/full` | `{ textDocument, kind }` | `CapturesResult \| null` |
+| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
+| `kakehashi/captures/range` | `{ textDocument, kind, range }` | `{ matches, skipped } \| null` |
 
 ```typescript
 type CapturesResult = {

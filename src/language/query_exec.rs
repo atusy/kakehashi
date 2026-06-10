@@ -42,14 +42,15 @@ pub(crate) struct MatchData {
 /// Run an already-compiled `query` over `tree`, collecting matches over `text`.
 ///
 /// `byte_range` restricts matching via `QueryCursor::set_byte_range` (matches
-/// whose nodes intersect the range); `None` walks the whole tree.
-/// `match_limit` caps the number of matches returned; `None` means no cap.
+/// whose nodes intersect the range); `None` walks the whole tree. There is
+/// deliberately no match cap: silent truncation would poison the captures
+/// delta lineage, and scoping is the byte range's job (captures-protocol
+/// §"Considered Options").
 pub(crate) fn execute_query(
     query: &Query,
     tree: &Tree,
     text: &str,
     byte_range: Option<std::ops::Range<usize>>,
-    match_limit: Option<usize>,
 ) -> Vec<MatchData> {
     let capture_names = query.capture_names();
     let mut out = Vec::new();
@@ -59,13 +60,6 @@ pub(crate) fn execute_query(
     }
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
     while let Some(m) = matches.next() {
-        // Cap on returned matches (server safety bound). Break rather than
-        // continue: matches arrive in a stable order, so the first `limit` are a
-        // deterministic prefix.
-        if match_limit.is_some_and(|limit| out.len() >= limit) {
-            break;
-        }
-
         // `filter_captures` drops captures whose general predicates fail
         // (built-in #eq?/#match?/#any-of? are already applied by `matches()`).
         let captures: Vec<CapturedNode> = filter_captures(query, m, text)
@@ -122,7 +116,7 @@ mod tests {
         let (language, tree) = rust_tree(src);
         let query = compile(&language, "(function_item name: (identifier) @name)");
 
-        let matches = execute_query(&query, &tree, src, None, None);
+        let matches = execute_query(&query, &tree, src, None);
 
         assert_eq!(matches.len(), 1, "one function -> one match");
         let m = &matches[0];
@@ -134,30 +128,16 @@ mod tests {
     }
 
     #[test]
-    fn match_limit_caps_returned_matches() {
-        let src = "fn a() {} fn b() {} fn c() {}";
-        let (language, tree) = rust_tree(src);
-        let query = compile(&language, "(function_item name: (identifier) @name)");
-
-        let all = execute_query(&query, &tree, src, None, None);
-        assert_eq!(all.len(), 3, "three functions without a cap");
-
-        let capped = execute_query(&query, &tree, src, None, Some(2));
-        assert_eq!(capped.len(), 2, "match_limit truncates to a prefix");
-        assert_eq!(
-            &src[capped[0].captures[0].start_byte..capped[0].captures[0].end_byte],
-            "a"
-        );
-    }
-
-    #[test]
     fn byte_range_scopes_the_walk() {
         let src = "fn a() {} fn b() {} fn c() {}";
         let (language, tree) = rust_tree(src);
         let query = compile(&language, "(function_item name: (identifier) @name)");
 
+        let all = execute_query(&query, &tree, src, None);
+        assert_eq!(all.len(), 3, "whole-tree walk sees all three functions");
+
         // Bytes 10..19 cover exactly `fn b() {}`; a and c lie outside.
-        let scoped = execute_query(&query, &tree, src, Some(10..19), None);
+        let scoped = execute_query(&query, &tree, src, Some(10..19));
         assert_eq!(scoped.len(), 1, "only the function intersecting the range");
         let c = &scoped[0].captures[0];
         assert_eq!(&src[c.start_byte..c.end_byte], "b");
@@ -174,7 +154,7 @@ mod tests {
             r#"((function_item name: (identifier) @name) (#eq? @name "wanted"))"#,
         );
 
-        let matches = execute_query(&query, &tree, src, None, None);
+        let matches = execute_query(&query, &tree, src, None);
         assert_eq!(matches.len(), 1);
         let c = &matches[0].captures[0];
         assert_eq!(&src[c.start_byte..c.end_byte], "wanted");
@@ -196,7 +176,7 @@ mod tests {
         let query = parsed.query.expect("valid pattern still compiles");
         assert_eq!(parsed.skipped.len(), 1, "the invalid pattern is reported");
 
-        let matches = execute_query(&query, &tree, src, None, None);
+        let matches = execute_query(&query, &tree, src, None);
         assert_eq!(matches.len(), 1, "the valid pattern still runs");
         assert_eq!(matches[0].captures[0].name, "good");
     }

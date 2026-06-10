@@ -34,12 +34,13 @@ use crate::language::query_loader::QueryLoader;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
-/// Server safety cap on matches returned when the client gives no `matchLimit`,
-/// so a broad query over a large file cannot produce an unbounded response.
-/// Clients that need more pass an explicit larger `matchLimit`.
-const DEFAULT_MATCH_LIMIT: usize = 10_000;
-
 /// Request parameters for `kakehashi/captures/full`.
+///
+/// There is deliberately no result cap: a truncated `full` would silently
+/// poison the delta lineage (edits computed over a clipped array), and the
+/// scoping tool for "too much data" is `kakehashi/captures/range` —
+/// matching semanticTokens, which has no limit parameter either
+/// (captures-protocol §"Considered Options").
 ///
 /// `pub` because the handlers are registered as custom LSP methods in the
 /// `kakehashi` binary (see `src/bin/main.rs`), outside the library crate.
@@ -49,10 +50,6 @@ pub struct CapturesFullParams {
     pub text_document: TextDocumentIdentifier,
     /// Query kind, resolved as `queries/<lang>/<kind>.scm` on the search paths.
     pub kind: String,
-    /// Optional cap on the number of matches returned. Absent → the server's
-    /// [`DEFAULT_MATCH_LIMIT`].
-    #[serde(default)]
-    pub match_limit: Option<usize>,
 }
 
 /// Request parameters for `kakehashi/captures/full/delta`.
@@ -64,8 +61,6 @@ pub struct CapturesDeltaParams {
     /// The `resultId` from a prior `full` (or delta) response for the same
     /// `(textDocument, kind)`. Unknown / stale ids get a full result back.
     pub previous_result_id: String,
-    #[serde(default)]
-    pub match_limit: Option<usize>,
 }
 
 /// Request parameters for `kakehashi/captures/range`.
@@ -77,8 +72,6 @@ pub struct CapturesRangeParams {
     /// LSP range (UTF-16 positions) scoping the query walk; matches whose
     /// nodes intersect the range are returned.
     pub range: Range,
-    #[serde(default)]
-    pub match_limit: Option<usize>,
 }
 
 /// Whitelist for `kind`: it names a file under `queries/<lang>/`, so anything
@@ -135,12 +128,7 @@ impl Kakehashi {
     /// Handler for `kakehashi/captures/full`.
     pub async fn kakehashi_captures_full(&self, params: CapturesFullParams) -> Result<Value> {
         let computed = self
-            .compute_captures(
-                &params.text_document.uri,
-                &params.kind,
-                None,
-                params.match_limit,
-            )
+            .compute_captures(&params.text_document.uri, &params.kind, None)
             .await?;
         let Some(c) = computed else {
             return Ok(Value::Null);
@@ -166,12 +154,7 @@ impl Kakehashi {
         params: CapturesDeltaParams,
     ) -> Result<Value> {
         let computed = self
-            .compute_captures(
-                &params.text_document.uri,
-                &params.kind,
-                None,
-                params.match_limit,
-            )
+            .compute_captures(&params.text_document.uri, &params.kind, None)
             .await?;
         let Some(c) = computed else {
             return Ok(Value::Null);
@@ -213,12 +196,7 @@ impl Kakehashi {
     /// likewise has no delta variant).
     pub async fn kakehashi_captures_range(&self, params: CapturesRangeParams) -> Result<Value> {
         let computed = self
-            .compute_captures(
-                &params.text_document.uri,
-                &params.kind,
-                Some(params.range),
-                params.match_limit,
-            )
+            .compute_captures(&params.text_document.uri, &params.kind, Some(params.range))
             .await?;
         Ok(match computed {
             Some(c) => json!({ "matches": c.matches, "skipped": c.skipped }),
@@ -238,7 +216,6 @@ impl Kakehashi {
         lsp_uri: &Uri,
         kind: &str,
         lsp_range: Option<Range>,
-        match_limit: Option<usize>,
     ) -> Result<Option<ComputedCaptures>> {
         if !is_valid_kind(kind) {
             return Err(JsonRpcError::invalid_params(format!(
@@ -324,8 +301,7 @@ impl Kakehashi {
             }
         };
 
-        let limit = match_limit.or(Some(DEFAULT_MATCH_LIMIT));
-        let match_data = execute_query(&query, tree, text, byte_range, limit);
+        let match_data = execute_query(&query, tree, text, byte_range);
 
         let matches: Vec<Value> = match_data
             .into_iter()
