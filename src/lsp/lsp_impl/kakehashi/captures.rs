@@ -157,14 +157,14 @@ fn matches_delta_edit(previous: &[Value], current: &[Value]) -> Option<(usize, u
 /// A valued key maps to its string; the bare flag form `(#set! key)` maps to
 /// `true` (a flag a client can test for, unlike Neovim's nil no-op). Duplicate
 /// keys are last-write-wins, matching Neovim's in-order directive application.
-fn metadata_object(pairs: &[(String, Option<String>)]) -> Option<Value> {
+fn metadata_object(pairs: Vec<(String, Option<String>)>) -> Option<Value> {
     if pairs.is_empty() {
         return None;
     }
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
-        let value = value.as_ref().map_or(json!(true), |v| json!(v));
-        map.insert(key.clone(), value);
+        let value = value.map_or(json!(true), |v| json!(v));
+        map.insert(key, value);
     }
     Some(Value::Object(map))
 }
@@ -567,7 +567,7 @@ impl Kakehashi {
                 return;
             };
             for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
-                let match_metadata = metadata_object(&m.metadata);
+                let match_metadata = metadata_object(m.metadata);
                 let captures: Vec<Value> = m
                     .captures
                     .into_iter()
@@ -588,7 +588,7 @@ impl Kakehashi {
                         });
                         // Capture-scoped `#set! @cap key value` metadata,
                         // only when the capture was annotated.
-                        if let Some(meta) = metadata_object(&c.metadata) {
+                        if let Some(meta) = metadata_object(c.metadata) {
                             capture["metadata"] = meta;
                         }
                         Some(capture)
@@ -780,7 +780,7 @@ mod tests {
     fn metadata_object_is_none_when_no_directives() {
         // Patterns without #set! must keep their pre-metadata wire shape —
         // an empty object would churn every delta lineage.
-        assert_eq!(metadata_object(&[]), None);
+        assert_eq!(metadata_object(vec![]), None);
     }
 
     #[test]
@@ -788,19 +788,19 @@ mod tests {
         // (#set! key) without a value is a flag (e.g. injection.combined
         // style); JSON true lets clients test for it, where Neovim's nil
         // assignment would make the key undetectable.
-        let pairs = [("combined".to_string(), None)];
-        assert_eq!(metadata_object(&pairs), Some(json!({ "combined": true })));
+        let pairs = vec![("combined".to_string(), None)];
+        assert_eq!(metadata_object(pairs), Some(json!({ "combined": true })));
     }
 
     #[test]
     fn metadata_object_duplicate_keys_last_write_wins() {
         // Neovim applies directives in order, so a later #set! of the same
         // key overwrites the earlier one.
-        let pairs = [
+        let pairs = vec![
             ("kind".to_string(), Some("first".to_string())),
             ("kind".to_string(), Some("second".to_string())),
         ];
-        assert_eq!(metadata_object(&pairs), Some(json!({ "kind": "second" })));
+        assert_eq!(metadata_object(pairs), Some(json!({ "kind": "second" })));
     }
 
     #[test]
