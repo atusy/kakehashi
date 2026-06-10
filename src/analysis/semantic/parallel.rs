@@ -313,6 +313,7 @@ fn clip_tokens_to_included_ranges(
     }
 
     let original = std::mem::take(tokens);
+    let mut clipped = Vec::with_capacity(original.len());
     for tok in original {
         let Some(intervals) = allowed.get(&tok.line) else {
             continue;
@@ -322,14 +323,11 @@ fn clip_tokens_to_included_ranges(
             let s = tok.column.max(a);
             let e = tok_end.min(b);
             if s < e {
-                tokens.push(RawToken {
-                    column: s,
-                    length: e - s,
-                    ..tok.clone()
-                });
+                clipped.push(tok.with_span(tok.line, s, e - s));
             }
         }
     }
+    *tokens = clipped;
 }
 
 /// Collect injection contexts from a parsed tree (sync version).
@@ -528,6 +526,12 @@ fn collect_injection_contexts_sync<'a>(
 /// `start_point.column` is the byte width of the excluded prefix (e.g. `> `)
 /// before the content on that line. Only the first range on a row sets it.
 fn derive_prefix_byte_widths(ranges: &[tree_sitter::Range]) -> Vec<usize> {
+    // All-zero widths carry no information, and combined groups spanning a
+    // large host gap would otherwise allocate a dense O(rows) vector keyed by
+    // the last block's relative row. Empty means "no prefixes" downstream.
+    if ranges.iter().all(|r| r.start_point.column == 0) {
+        return Vec::new();
+    }
     let mut widths = Vec::new();
     for r in ranges {
         let row = r.start_point.row;
