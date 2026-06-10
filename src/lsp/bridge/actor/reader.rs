@@ -575,11 +575,11 @@ async fn handle_message(
 /// Decision point 7). The prompt `didClose` after each pipeline run shrinks
 /// but cannot eliminate the window in which a downstream server pushes them.
 fn is_scratch_publish_diagnostics(message: &serde_json::Value) -> bool {
-    message.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
-        && message
-            .get("params")
-            .and_then(|p| p.get("uri"))
-            .and_then(|u| u.as_str())
+    // `Value` indexing returns `Null` for missing keys / non-objects, so the
+    // lookups below are panic-free on malformed messages.
+    message["method"].as_str() == Some("textDocument/publishDiagnostics")
+        && message["params"]["uri"]
+            .as_str()
             .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
 }
 
