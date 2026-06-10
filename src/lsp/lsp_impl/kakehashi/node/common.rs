@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier, Uri};
 use ulid::Ulid;
 use url::Url;
 
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node_ranges;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// A tracked node's `(start_byte, end_byte, kind)` triple, as produced by a
@@ -152,6 +152,23 @@ impl Kakehashi {
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>, &str) -> R,
     ) -> Option<(Url, usize, R)> {
+        // Most accessors don't need the minting layer's included ranges.
+        self.with_node_text_ranges(lsp_uri, id, move |node, text, _ranges| f(node, text))
+            .await
+    }
+
+    /// Like [`with_node_text`](Self::with_node_text) but additionally hands the
+    /// closure the included ranges the minting layer's tree was parsed against
+    /// (host coordinates; the whole document for layer 0). The coordinate-input
+    /// accessors use them to reject byte/point arguments that land in an
+    /// injected layer's excluded gaps — e.g. blockquote `> ` prefixes — which
+    /// are inside a node's contiguous span but are not injected content (#341).
+    pub(super) async fn with_node_text_ranges<R>(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        mut f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> R,
+    ) -> Option<(Url, usize, R)> {
         // An unparseable URI signals a misbehaving client; warn for parity with
         // `node` / `node/text` / `node/parent` / `node/children` while still
         // collapsing to `null`.
@@ -192,7 +209,7 @@ impl Kakehashi {
         // diagnosing drift — mirroring `node/parent` and `node/children` — and
         // is distinct from the silent `None` cases above (never-issued ULID,
         // unparsed document), which are expected and collapse to `null` quietly.
-        let Some(result) = with_resolved_node(
+        let Some(result) = with_resolved_node_ranges(
             &self.language,
             &host_language,
             host_text,
@@ -201,7 +218,7 @@ impl Kakehashi {
             end,
             kind,
             layer,
-            |node| f(node, host_text),
+            |node, ranges| f(node, host_text, ranges),
         ) else {
             log::warn!(
                 target: "kakehashi::node",
@@ -246,6 +263,25 @@ impl Kakehashi {
         f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple>,
     ) -> Value {
         let Some((uri, layer, picked)) = self.with_node_by_id(lsp_uri, id, f).await else {
+            return Value::Null;
+        };
+        match picked {
+            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            None => Value::Null,
+        }
+    }
+
+    /// Like [`navigate_to_node`](Self::navigate_to_node), but `f` also receives
+    /// the host text and the minting layer's included ranges. Used by the
+    /// coordinate-input accessors so they can reject byte/point arguments
+    /// landing in an injected layer's excluded gaps (#341).
+    pub(super) async fn navigate_to_node_in_ranges(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> Option<NodeTriple>,
+    ) -> Value {
+        let Some((uri, layer, picked)) = self.with_node_text_ranges(lsp_uri, id, f).await else {
             return Value::Null;
         };
         match picked {

@@ -248,6 +248,42 @@ pub(super) fn with_resolved_node<R>(
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
 ) -> Option<R> {
+    with_resolved_node_ranges(
+        coordinator,
+        host_language,
+        host_text,
+        host_tree,
+        start,
+        end,
+        kind,
+        layer,
+        |node, _ranges| f(node),
+    )
+}
+
+/// Like [`with_resolved_node`], but also hands the closure the **included
+/// ranges the minting layer's tree was parsed against** (host coordinates).
+///
+/// The coordinate-input accessors (`firstChildForByte`,
+/// `descendant*For{Byte,Point}Range`) need them: an injected layer parsed with
+/// non-contiguous `included_ranges` (e.g. blockquoted code, where `> `
+/// prefixes are excluded) has *gap* bytes inside a node's contiguous span that
+/// are not real injected content. A coordinate argument landing in a gap must
+/// collapse to `null` — consistent with the entry point, which never pushes an
+/// injection layer for a gap byte (#341). For the host layer the ranges are
+/// the whole document, so gap checks are vacuous there.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn with_resolved_node_ranges<R>(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+    start: usize,
+    end: usize,
+    kind: &'static str,
+    layer: usize,
+    mut f: impl FnMut(tree_sitter::Node<'_>, &[tree_sitter::Range]) -> R,
+) -> Option<R> {
     // Reject obviously-invalid ranges up front — same guard `find_node_at`
     // applies internally, but checking here also avoids the expensive
     // `injection_stack_at` walk (which clones and re-parses layers) for a
@@ -259,15 +295,16 @@ pub(super) fn with_resolved_node<R>(
     // Host layer: resolve against the host tree without the stack walk.
     if layer == 0 {
         let node = find_node_at(host_tree, start, end, kind)?;
-        return Some(f(node));
+        let ranges = [whole_document_range(host_text)];
+        return Some(f(node, &ranges));
     }
 
     // Deeper layer: rebuild the stack at `start` and search the minting layer
     // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
-    let layer_tree = &stack.get(layer)?.tree;
-    let node = find_node_at(layer_tree, start, end, kind)?;
-    Some(f(node))
+    let layer_entry = stack.get(layer)?;
+    let node = find_node_at(&layer_entry.tree, start, end, kind)?;
+    Some(f(node, &layer_entry.ranges))
 }
 
 /// Collect the injection languages along the cursor's injection path at
@@ -511,7 +548,14 @@ fn build_effective_ranges(
 /// Half-open containment over a list of disjoint ranges, with the node-reference-protocol decision's
 /// end-of-document exception (`byte == host_len` includes nodes whose
 /// `end_byte == host_len`).
-fn ranges_contain_byte(ranges: &[tree_sitter::Range], byte: usize, host_len: usize) -> bool {
+///
+/// `pub(super)` so the coordinate accessors can apply the same rule the entry
+/// point uses to their byte / start-position arguments (#341).
+pub(super) fn ranges_contain_byte(
+    ranges: &[tree_sitter::Range],
+    byte: usize,
+    host_len: usize,
+) -> bool {
     let at_eod = byte == host_len;
     ranges.iter().any(|r| {
         let s = r.start_byte;
@@ -522,6 +566,20 @@ fn ranges_contain_byte(ranges: &[tree_sitter::Range], byte: usize, host_len: usi
             s <= byte && byte < e
         }
     })
+}
+
+/// Whether `byte` is acceptable as the **exclusive end bound** of a range
+/// argument against a layer's included ranges.
+///
+/// Unlike [`ranges_contain_byte`], a value equal to a range's `end_byte` is
+/// admitted: an exclusive end points one past the last byte actually queried,
+/// so landing exactly on a gap start still means "query up to the end of the
+/// included content". A value strictly inside a gap (its last queried byte
+/// would be excluded content) is rejected (#341).
+pub(super) fn ranges_admit_end_bound(ranges: &[tree_sitter::Range], byte: usize) -> bool {
+    ranges
+        .iter()
+        .any(|r| r.start_byte <= byte && byte <= r.end_byte)
 }
 
 /// Total byte length covered by `ranges`. Used as the smallest-injection

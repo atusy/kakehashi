@@ -20,6 +20,9 @@ use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{
     NodeByteParams, NodeByteRangeParams, NodeIdParams, NodeIndexParams,
 };
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
+    ranges_admit_end_bound, ranges_contain_byte,
+};
 
 /// Map a tree-sitter node to the `(start, end, kind)` triple the navigation
 /// helpers re-mint from.
@@ -107,19 +110,22 @@ impl Kakehashi {
     /// `kakehashi/node/firstChildForByte` — the node's first child extending
     /// beyond `byte` (UTF-8, host coords), per `Node::first_child_for_byte`.
     /// `byte` is rejected (→ `null`) unless `node.start_byte <= byte <=
-    /// node.end_byte` — i.e. negative, before the node, or past its end.
+    /// node.end_byte` — i.e. negative, before the node, or past its end — and,
+    /// for injected layers, unless it lies in the layer's included ranges
+    /// (an excluded-gap byte is not injected content, #341).
     pub async fn kakehashi_node_first_child_for_byte(
         &self,
         params: NodeByteParams,
     ) -> Result<Value> {
         let byte = usize::try_from(params.byte).ok();
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, |n| {
+            .navigate_to_node_in_ranges(&params.text_document.uri, &params.id, |n, text, ranges| {
                 // Keep the byte inside the node's own span before handing it to
                 // tree-sitter, whose behaviour for offsets outside the queried
                 // node is version-dependent (mirrors lookup::find_node_at). These
                 // are node-scoped accessors, so an out-of-node argument is null.
                 byte.filter(|&b| n.start_byte() <= b && b <= n.end_byte())
+                    .filter(|&b| ranges_contain_byte(ranges, b, text.len()))
                     .and_then(|b| n.first_child_for_byte(b))
                     .map(triple)
             })
@@ -130,16 +136,18 @@ impl Kakehashi {
     /// (named + anonymous) spanning `[startByte, endByte)` within this node's
     /// subtree, per `Node::descendant_for_byte_range`. The range is rejected
     /// (→ `null`) unless `node.start_byte <= startByte <= endByte <=
-    /// node.end_byte` — i.e. negative, inverted, or reaching outside the node.
+    /// node.end_byte` — i.e. negative, inverted, or reaching outside the node —
+    /// and unless both bounds clear the minting layer's included ranges (#341).
     pub async fn kakehashi_node_descendant_for_byte_range(
         &self,
         params: NodeByteRangeParams,
     ) -> Result<Value> {
         let range = byte_range(&params);
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, |n| {
+            .navigate_to_node_in_ranges(&params.text_document.uri, &params.id, |n, text, ranges| {
                 range
                     .filter(|&(s, e)| n.start_byte() <= s && e <= n.end_byte())
+                    .filter(|&(s, e)| range_bounds_in_ranges(ranges, s, e, text.len()))
                     .and_then(|(s, e)| n.descendant_for_byte_range(s, e))
                     .map(triple)
             })
@@ -150,21 +158,39 @@ impl Kakehashi {
     /// descendant spanning `[startByte, endByte)` within this node's subtree, per
     /// `Node::named_descendant_for_byte_range`. The range is rejected (→ `null`)
     /// unless `node.start_byte <= startByte <= endByte <= node.end_byte` — i.e.
-    /// negative, inverted, or reaching outside the node.
+    /// negative, inverted, or reaching outside the node — and unless both bounds
+    /// clear the minting layer's included ranges (#341).
     pub async fn kakehashi_node_named_descendant_for_byte_range(
         &self,
         params: NodeByteRangeParams,
     ) -> Result<Value> {
         let range = byte_range(&params);
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, |n| {
+            .navigate_to_node_in_ranges(&params.text_document.uri, &params.id, |n, text, ranges| {
                 range
                     .filter(|&(s, e)| n.start_byte() <= s && e <= n.end_byte())
+                    .filter(|&(s, e)| range_bounds_in_ranges(ranges, s, e, text.len()))
                     .and_then(|(s, e)| n.named_descendant_for_byte_range(s, e))
                     .map(triple)
             })
             .await)
     }
+}
+
+/// Gap check for a `[start, end)` coordinate-range argument against the
+/// minting layer's included ranges (#341): the start (a queried byte) must lie
+/// in included content under the entry point's half-open rule, and the end (an
+/// exclusive bound) must not point past excluded content. Per-bound — not
+/// "both in one range" — because nodes legitimately span gaps (a multi-line
+/// statement in blockquoted code), and querying across a gap with both bounds
+/// on real content should still resolve that spanning node.
+pub(super) fn range_bounds_in_ranges(
+    ranges: &[tree_sitter::Range],
+    start: usize,
+    end: usize,
+    host_len: usize,
+) -> bool {
+    ranges_contain_byte(ranges, start, host_len) && ranges_admit_end_bound(ranges, end)
 }
 
 /// Convert the signed byte bounds to `usize`, returning `None` (→ `null`) if
@@ -175,8 +201,8 @@ impl Kakehashi {
 /// it up front rather than relying on the C bindings' behaviour.
 ///
 /// Per-call the handlers additionally bound the range to the queried node's
-/// contiguous span. Known limitation (#341): that span check does not exclude
-/// bytes in the gaps of an injected layer's non-contiguous included ranges.
+/// contiguous span and to the minting layer's included ranges
+/// ([`range_bounds_in_ranges`], #341).
 fn byte_range(params: &NodeByteRangeParams) -> Option<(usize, usize)> {
     let start = usize::try_from(params.start_byte).ok()?;
     let end = usize::try_from(params.end_byte).ok()?;

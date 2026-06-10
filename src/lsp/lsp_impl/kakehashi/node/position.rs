@@ -28,6 +28,7 @@ use tower_lsp_server::jsonrpc::Result;
 
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{NodeIdParams, NodePointRangeParams};
+use crate::lsp::lsp_impl::kakehashi::node::navigation::range_bounds_in_ranges;
 use crate::text::PositionMapper;
 
 impl Kakehashi {
@@ -114,7 +115,7 @@ impl Kakehashi {
         let start = params.start;
         let end = params.end;
         let resolved = self
-            .with_node_text(&params.text_document.uri, &params.id, |n, text| {
+            .with_node_text_ranges(&params.text_document.uri, &params.id, |n, text, ranges| {
                 let mapper = PositionMapper::new(text);
                 // Strict conversion: a `character` past a line's end must mean
                 // "no such location" (null), NOT spill onto a later line as plain
@@ -124,12 +125,13 @@ impl Kakehashi {
                 // Mirror the byte-range guards: reject inverted ranges and any
                 // range not contained in the node's own span, whose tree-sitter
                 // behaviour is unspecified (see navigation.rs / lookup::find_node_at).
-                //
-                // Known limitation (#341): for an injected layer with
-                // non-contiguous included ranges (e.g. blockquoted code), this
-                // contiguous-span check does not exclude bytes in the gaps, so a
-                // coordinate on an excluded prefix can still resolve a node.
                 if start_byte < n.start_byte() || start_byte > end_byte || end_byte > n.end_byte() {
+                    return None;
+                }
+                // And reject coordinates landing in an injected layer's
+                // excluded gaps (e.g. blockquote `> ` prefixes) — they are not
+                // injected content (#341; same rule as the byte accessors).
+                if !range_bounds_in_ranges(ranges, start_byte, end_byte, text.len()) {
                     return None;
                 }
                 let descendant = if named {
