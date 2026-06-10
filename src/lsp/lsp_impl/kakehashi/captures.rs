@@ -153,10 +153,24 @@ struct KindQuery {
     skipped: Vec<crate::language::query_loader::SkippedPattern>,
 }
 
+/// Per-language outcome of resolving `queries/<lang>/<kind>.scm`.
+///
+/// `Broken` is distinct from `Unavailable` so a kind file that exists but
+/// compiled to nothing still surfaces its `skipped` diagnostics whenever
+/// another language yields a result — without counting as "available" for
+/// the overall null decision (captures-protocol §"Null vs. error semantics").
+enum KindQueryLoad {
+    /// Compiled; this layer executes the query.
+    Loaded(KindQuery),
+    /// The file exists but produced no usable patterns; carries the dropped
+    /// patterns for `skipped` reporting. Contributes no matches.
+    Broken(Vec<crate::language::query_loader::SkippedPattern>),
+    /// No grammar, no kind file, or the file could not be read.
+    Unavailable,
+}
+
 /// Resolve and compile `queries/<language_id>/<file_name>` for one language.
 ///
-/// `None` covers both "no grammar loaded" and "no kind file / broken asset":
-/// the caller treats every `None` as "this layer contributes nothing".
 /// Logging separates the expected from the troubling: a missing file is the
 /// common "no such kind for this language" case (debug); a file that exists
 /// but fails to load or compiles to nothing is asset trouble (warn) —
@@ -166,8 +180,10 @@ fn load_kind_query(
     search_paths: &[PathBuf],
     language_id: &str,
     file_name: &str,
-) -> Option<KindQuery> {
-    let language = registry.get(language_id)?;
+) -> KindQueryLoad {
+    let Some(language) = registry.get(language_id) else {
+        return KindQueryLoad::Unavailable;
+    };
     let parsed = match QueryLoader::load_query_with_inheritance(
         &language,
         search_paths,
@@ -187,7 +203,7 @@ fn load_kind_query(
                     "failed to load {file_name} for {language_id}: {err}"
                 );
             }
-            return None;
+            return KindQueryLoad::Unavailable;
         }
     };
     let Some(query) = parsed.query else {
@@ -196,9 +212,9 @@ fn load_kind_query(
             "{file_name} for {language_id} compiled to nothing: {:?}",
             parsed.failure_reason
         );
-        return None;
+        return KindQueryLoad::Broken(parsed.skipped);
     };
-    Some(KindQuery {
+    KindQueryLoad::Loaded(KindQuery {
         query,
         skipped: parsed.skipped,
     })
@@ -515,7 +531,7 @@ impl Kakehashi {
         // the same language (e.g. dozens of python blocks), the memo keeps
         // file IO + compilation at one per language, and yields each
         // language's `skipped` exactly once.
-        let mut kind_queries: HashMap<String, Option<KindQuery>> = HashMap::new();
+        let mut kind_queries: HashMap<String, KindQueryLoad> = HashMap::new();
         let mut matches: Vec<Value> = Vec::new();
 
         let mut visit = |layer_language: &str, layer_tree: &tree_sitter::Tree, depth: usize| {
@@ -524,7 +540,7 @@ impl Kakehashi {
                 .or_insert_with(|| {
                     load_kind_query(&registry, &search_paths, layer_language, &file_name)
                 });
-            let Some(kind_query) = entry else {
+            let KindQueryLoad::Loaded(kind_query) = entry else {
                 return;
             };
             for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
@@ -574,26 +590,39 @@ impl Kakehashi {
             visit(&language_id, tree, 0);
         }
 
-        // The kind is "available" when at least one visited language has the
-        // file — a host without a context.scm still surfaces the embedded
-        // layers' contexts. No language having it collapses to null.
-        if kind_queries.values().all(Option::is_none) {
+        // The kind is "available" when at least one visited language COMPILED
+        // the file — a host without a context.scm still surfaces the embedded
+        // layers' contexts. A `Broken` file does not make the kind available
+        // (a sole broken asset degrades to null, per the ADR), but its
+        // diagnostics are surfaced below whenever another language yields a
+        // result.
+        if !kind_queries
+            .values()
+            .any(|load| matches!(load, KindQueryLoad::Loaded(_)))
+        {
             return Ok(None);
         }
 
         // Sort by language so the wire order is deterministic — the memo is a
         // HashMap, whose iteration order would otherwise vary per process.
         // Within a language, the loader already reports skipped patterns in
-        // file order.
-        let mut loaded: Vec<(&String, &KindQuery)> = kind_queries
-            .iter()
-            .filter_map(|(lang, kq)| kq.as_ref().map(|kq| (lang, kq)))
-            .collect();
-        loaded.sort_by(|a, b| a.0.cmp(b.0));
-        let skipped: Vec<Value> = loaded
+        // file order. `Broken` languages contribute their diagnostics too:
+        // a wholly-invalid kind file would otherwise be silently invisible
+        // exactly when other layers still produce matches.
+        let mut reportable: Vec<(&String, &[crate::language::query_loader::SkippedPattern])> =
+            kind_queries
+                .iter()
+                .filter_map(|(lang, load)| match load {
+                    KindQueryLoad::Loaded(kq) => Some((lang, kq.skipped.as_slice())),
+                    KindQueryLoad::Broken(skipped) => Some((lang, skipped.as_slice())),
+                    KindQueryLoad::Unavailable => None,
+                })
+                .collect();
+        reportable.sort_by(|a, b| a.0.cmp(b.0));
+        let skipped: Vec<Value> = reportable
             .into_iter()
-            .flat_map(|(lang, kq)| {
-                kq.skipped.iter().map(move |s| {
+            .flat_map(|(lang, patterns)| {
+                patterns.iter().map(move |s| {
                     json!({
                         "language": lang,
                         "startLine": s.start_line,

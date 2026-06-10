@@ -604,3 +604,39 @@ fn stale_id_with_both_modes_live_returns_null() {
         "ambiguous mode for a stale id must be null, not a guessed full"
     );
 }
+
+#[test]
+fn broken_kind_file_still_reports_skipped_when_other_layers_match() {
+    // markdown context.scm is valid; python's exists but is wholly invalid.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let md = dir.path().join("queries").join("markdown");
+    std::fs::create_dir_all(&md).unwrap();
+    std::fs::write(md.join("context.scm"), "(atx_heading) @context\n").unwrap();
+    let py = dir.path().join("queries").join("python");
+    std::fs::create_dir_all(&py).unwrap();
+    std::fs::write(py.join("context.scm"), "(no_such_python_node) @broken\n").unwrap();
+
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_broken_kind.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    let result = full_with_injection(&mut client, uri, "context");
+
+    // markdown still matches; python contributes nothing...
+    let langs = match_languages(&result);
+    assert!(langs.contains(&"markdown".to_string()));
+    assert!(!langs.contains(&"python".to_string()));
+
+    // ...but its broken patterns surface in `skipped` for debuggability.
+    let skipped = result
+        .get("skipped")
+        .and_then(Value::as_array)
+        .expect("result.skipped must be an array");
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.get("language").and_then(Value::as_str) == Some("python")),
+        "the broken python kind file must appear in skipped: {skipped:?}"
+    );
+}
