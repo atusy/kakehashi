@@ -159,12 +159,12 @@ pub(crate) fn check_match_predicates(query: &Query, match_: &QueryMatch, text: &
                 .all(|n| node_text(n).is_none_or(|t| check_contains(&predicate.args[1..], t))),
             // Neovim: vacuously true with no nodes, otherwise ANY node hit.
             "has-parent?" => {
-                let mut nodes = nodes().peekable();
-                nodes.peek().is_none() || nodes.any(|n| check_has_parent(&predicate.args[1..], n))
+                nodes().next().is_none()
+                    || nodes().any(|n| check_has_parent(&predicate.args[1..], n))
             }
             "has-ancestor?" => {
-                let mut nodes = nodes().peekable();
-                nodes.peek().is_none() || nodes.any(|n| check_has_ancestor(&predicate.args[1..], n))
+                nodes().next().is_none()
+                    || nodes().any(|n| check_has_ancestor(&predicate.args[1..], n))
             }
             unknown => {
                 log::debug!(
