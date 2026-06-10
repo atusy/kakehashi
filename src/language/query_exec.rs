@@ -102,10 +102,34 @@ pub(crate) fn run_query(
         });
     };
 
+    Ok(QueryExecOutcome {
+        matches: execute_query(&query, tree, text, None, match_limit),
+        skipped: parsed.skipped,
+    })
+}
+
+/// Run an already-compiled `query` over `tree`, collecting matches over `text`.
+///
+/// Split from compilation so callers holding a precompiled query (e.g. a
+/// server-owned kind query) can execute without re-parsing, and so a byte
+/// range can scope the walk. `byte_range` restricts matching via
+/// `QueryCursor::set_byte_range` (matches whose nodes intersect the range);
+/// `None` walks the whole tree. `match_limit` caps the number of matches
+/// returned; `None` means no cap.
+pub(crate) fn execute_query(
+    query: &tree_sitter::Query,
+    tree: &Tree,
+    text: &str,
+    byte_range: Option<std::ops::Range<usize>>,
+    match_limit: Option<usize>,
+) -> Vec<MatchData> {
     let capture_names = query.capture_names();
     let mut out = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    if let Some(range) = byte_range {
+        cursor.set_byte_range(range);
+    }
+    let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
     while let Some(m) = matches.next() {
         // Cap on returned matches (server safety bound). Break rather than
         // continue: matches arrive in a stable order, so the first `limit` are a
@@ -116,7 +140,7 @@ pub(crate) fn run_query(
 
         // `filter_captures` drops captures whose general predicates fail
         // (built-in #eq?/#match?/#any-of? are already applied by `matches()`).
-        let captures: Vec<CapturedNode> = filter_captures(&query, m, text)
+        let captures: Vec<CapturedNode> = filter_captures(query, m, text)
             .map(|c| {
                 let node = c.node;
                 CapturedNode {
@@ -140,10 +164,7 @@ pub(crate) fn run_query(
         });
     }
 
-    Ok(QueryExecOutcome {
-        matches: out,
-        skipped: parsed.skipped,
-    })
+    out
 }
 
 #[cfg(test)]
