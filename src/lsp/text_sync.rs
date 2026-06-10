@@ -17,26 +17,6 @@ use tree_sitter::{InputEdit, Point};
 
 use crate::text::PositionMapper;
 
-/// Tree-sitter `Point` (row, byte-column) of a byte offset within `text`.
-///
-/// Derived from the *byte offset* — not the original LSP position — so it stays
-/// consistent with the (possibly clamped) `start_byte`/`old_end_byte` of an
-/// `InputEdit`. Tree-sitter requires the byte offsets and points of an edit to
-/// agree; a point taken from an out-of-bounds LSP position (which spills onto a
-/// later row as `line_start + character`) would not, and corrupts incremental
-/// parsing. The offset is snapped back to a char boundary defensively so the
-/// `\n` count never slices mid-character.
-fn byte_to_point(text: &str, byte: usize) -> Point {
-    let mut b = byte.min(text.len());
-    while b > 0 && !text.is_char_boundary(b) {
-        b -= 1;
-    }
-    let prefix = &text[..b];
-    let row = prefix.bytes().filter(|&c| c == b'\n').count();
-    let col = b - prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
-    Point::new(row, col)
-}
-
 /// Apply LSP content changes to `old_text`, returning the updated text and the
 /// matching tree-sitter `InputEdit`s. Changes with `range` build an `InputEdit`;
 /// rangeless full-sync changes replace the whole text and emit no edit.
@@ -74,10 +54,11 @@ pub(crate) fn apply_content_changes_with_edits(
             // last_line_len is in BYTES (not UTF-16) because .len() on &str returns byte count
             let last_line_len = lines.last().map(|l| l.len()).unwrap_or(0);
 
-            // Points are derived from the (clamped) byte offsets, not the raw LSP
-            // positions, so they stay consistent with start_byte/old_end_byte.
-            let start_point = byte_to_point(&text, start_offset);
-            let old_end_point = byte_to_point(&text, end_offset);
+            // Points are derived from the (clamped) byte offsets via the same
+            // `LineIndex` (O(log n)), not the raw LSP positions, so they stay
+            // consistent with start_byte/old_end_byte for incremental parsing.
+            let start_point = mapper.byte_to_point(start_offset);
+            let old_end_point = mapper.byte_to_point(end_offset);
 
             // Calculate new end Point (tree-sitter uses byte columns)
             let new_end_point = if line_count > 1 {

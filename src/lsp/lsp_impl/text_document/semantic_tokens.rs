@@ -64,6 +64,13 @@ impl Kakehashi {
     /// Returns `(tree, text)` tuple where tree was verified to be parsed from text,
     /// or `None` if the document is missing or parsing failed.
     async fn get_tree_with_wait(&self, uri: &Url, language_name: &str) -> Option<(Tree, String)> {
+        // If the document isn't open there is nothing to settle or snapshot.
+        // Return before taking the edit lock so we don't create a lock entry for
+        // a never-opened/closed URI (language detection can resolve a language
+        // from the path alone, so this point is reachable without a document).
+        // The handle is dropped immediately; we only need the existence check.
+        self.documents.get(uri)?;
+
         // Settle pending edits before snapshotting. A large paste arrives as
         // several back-to-back `didChange` chunks; the editor then sends one
         // semantic-tokens request for the final state. Each `didChange` holds

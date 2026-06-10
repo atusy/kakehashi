@@ -712,7 +712,7 @@ fn test_semantic_tokens_large_paste_covers_last_line() {
     }
 
     let total_lines = CHUNKS * LINES_PER_CHUNK; // lines 0..total_lines-1 carry code
-    let last_code_line = (total_lines - 1) as u32; // e.g. line 149
+    let last_code_line = (total_lines - 1) as u32; // 8 * 40 - 1 = line 319
 
     // Immediately request tokens for the final state — the server must settle
     // the pending edits before answering.

@@ -20,8 +20,11 @@ pub struct DocumentStore {
     /// stale base text, so a later edit's range (authored against a newer state)
     /// is applied to an older one — corrupting the text and, before clamping,
     /// panicking in `replace_range`. Holding this per-URI async lock across a
-    /// document's edit critical section forces edits to apply in arrival order,
-    /// each seeing the previous one's persisted result. Different documents keep
+    /// document's edit critical section gives each edit mutual exclusion and lets
+    /// it see the previous one's persisted result. Handlers take the lock as their
+    /// first `.await`, so acquisition follows first-poll order — a practical
+    /// mitigation, not a hard JSON-RPC wire-order guarantee (tracked in
+    /// <https://github.com/atusy/kakehashi/issues/342>). Different documents keep
     /// their own locks and run concurrently.
     edit_locks: DashMap<Url, Arc<Mutex<()>>>,
 }
@@ -236,6 +239,18 @@ impl DocumentStore {
             .clone()
     }
 
+    /// Drop the per-URI edit lock entry without touching the document itself.
+    ///
+    /// `edit_lock` get-or-inserts, so a handler that takes the lock and then
+    /// finds the document missing (a `didChange`/semantic request for a never-
+    /// opened or already-closed URI, e.g. a reordered notification) would leave a
+    /// lock entry behind forever. Such handlers call this on their miss path to
+    /// keep the map bounded. Safe to call while holding the lock's `Arc` guard —
+    /// the guard keeps the mutex alive; only the map entry is removed.
+    pub(crate) fn remove_edit_lock(&self, uri: &Url) {
+        self.edit_locks.remove(uri);
+    }
+
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
@@ -405,15 +420,23 @@ mod tests {
         );
 
         // Removing the document drops its lock entry; a later edit_lock call
-        // creates a fresh one (no unbounded growth across open/close cycles).
-        drop((a1, a2));
+        // mints a fresh, distinct lock (open/close cycles don't reuse a stale
+        // mutex). Compare pointer identity directly — `a1` is kept alive so the
+        // check doesn't depend on incidental Arc clone counts.
         store.remove(&uri_a);
         let a3 = store.edit_lock(&uri_a);
-        // The map entry was cleared, so this is a newly allocated lock.
-        assert_eq!(
-            Arc::strong_count(&a3),
-            2,
-            "fresh lock after remove should only be held by the map and this binding"
+        assert!(
+            !Arc::ptr_eq(&a1, &a3),
+            "lock after remove must be a fresh instance, not the cleared one"
+        );
+
+        // remove_edit_lock drops the entry on the document-missing path, so the
+        // next lock for the same URI is again a fresh instance.
+        store.remove_edit_lock(&uri_a);
+        let a4 = store.edit_lock(&uri_a);
+        assert!(
+            !Arc::ptr_eq(&a3, &a4),
+            "lock after remove_edit_lock must be a fresh instance"
         );
     }
 

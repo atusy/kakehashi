@@ -79,6 +79,28 @@ impl PositionMapper {
         (self.byte_to_position(byte)? == position).then_some(byte)
     }
 
+    /// Convert a byte offset to a tree-sitter `Point` (row, byte-column).
+    ///
+    /// Reuses the precomputed `LineIndex` (O(log n) line lookup) instead of
+    /// rescanning the text, and yields a byte-based column — exactly what a
+    /// tree-sitter `InputEdit` needs. The offset is clamped to the document
+    /// length, so `try_line_col` resolves for every input; the `None` arm is
+    /// unreachable and degrades to the document start.
+    pub fn byte_to_point(&self, offset: usize) -> tree_sitter::Point {
+        let len: usize = self.line_index.len().into();
+        let offset = offset.min(len);
+        match offset
+            .try_into()
+            .ok()
+            .and_then(|o| self.line_index.try_line_col(o))
+        {
+            Some(line_col) => {
+                tree_sitter::Point::new(line_col.line as usize, line_col.col as usize)
+            }
+            None => tree_sitter::Point::new(0, 0),
+        }
+    }
+
     /// Convert byte offset to LSP Position
     pub fn byte_to_position(&self, offset: usize) -> Option<Position> {
         // Convert byte offset to LineCol
