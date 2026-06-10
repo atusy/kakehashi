@@ -142,6 +142,25 @@ pub(crate) struct ActiveInjectionBounds {
     pub end_col: usize,
 }
 
+/// Build an ascending index of the byte offset at which each line starts.
+///
+/// `line_starts[0]` is always 0; every subsequent entry is the byte just after
+/// a `\n`. Built once per request and shared across all injections so that
+/// byte→line/col conversions are binary searches instead of O(offset) scans of
+/// the host text (which made token collection O(injections × document size)).
+/// Scanning raw bytes for `\n` is safe because UTF-8 never places `0x0A` inside
+/// a multi-byte sequence.
+pub(super) fn build_line_start_bytes(host_text: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(host_text.len() / 32 + 1);
+    starts.push(0);
+    for (i, b) in host_text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
 /// Calculate the `(line_start_byte, line_end_byte)` host-coordinate offsets for one
 /// row of a multiline token, mapping from injected-content to host coordinates.
 fn calculate_line_byte_offsets(
@@ -279,6 +298,10 @@ fn effective_prefix_widths(node: &Node, prefix_byte_widths: &[usize]) -> Vec<usi
 /// Collect tokens from a single document's highlight query (no injection processing),
 /// mapping positions from content-local to host document coordinates.
 ///
+/// `host_line_starts` must come from [`build_line_start_bytes`] for `host_text`;
+/// it is built once per request so the per-injection byte→line/col mapping below
+/// is a binary search rather than an O(content_start_byte) scan.
+///
 /// When `supports_multiline` is false, multiline tokens are split into per-line tokens
 /// for clients that lack `multilineTokenSupport` (LSP 3.16.0+).
 #[allow(clippy::too_many_arguments)]
@@ -290,6 +313,7 @@ pub(super) fn collect_host_tokens(
     capture_mappings: Option<&CaptureMappings>,
     host_text: &str,
     host_lines: &[&str],
+    host_line_starts: &[usize],
     content_start_byte: usize,
     depth: usize,
     supports_multiline: bool,
@@ -303,25 +327,17 @@ pub(super) fn collect_host_tokens(
         return;
     }
 
-    // Calculate position mapping from content-local to host document
-    let content_start_line = if content_start_byte == 0 {
-        0
-    } else {
-        host_text[..content_start_byte]
-            .chars()
-            .filter(|c| *c == '\n')
-            .count()
-    };
-
-    let content_start_col = if content_start_byte == 0 {
-        0
-    } else {
-        let last_newline = host_text[..content_start_byte].rfind('\n');
-        match last_newline {
-            Some(pos) => content_start_byte - pos - 1,
-            None => content_start_byte,
-        }
-    };
+    // Calculate position mapping from content-local to host document.
+    // Largest line whose start byte is <= content_start_byte; line_starts[0] == 0,
+    // so the predicate holds for at least one element.
+    let content_start_line = host_line_starts
+        .partition_point(|&s| s <= content_start_byte)
+        .saturating_sub(1);
+    let content_start_col = content_start_byte
+        - host_line_starts
+            .get(content_start_line)
+            .copied()
+            .unwrap_or(0);
 
     // Split content text into lines for byte offset calculations
     let content_lines: Vec<&str> = text.lines().collect();
@@ -690,6 +706,7 @@ mod tests {
             None,
             code,
             &lines,
+            &build_line_start_bytes(code),
             0,
             0,
             false,
@@ -712,6 +729,7 @@ mod tests {
             None,
             code,
             &lines,
+            &build_line_start_bytes(code),
             0,
             0,
             false,
@@ -746,6 +764,7 @@ mod tests {
             None,
             code,
             &lines,
+            &build_line_start_bytes(code),
             0,
             0,
             false,
@@ -780,6 +799,7 @@ mod tests {
             None,
             code,
             &lines,
+            &build_line_start_bytes(code),
             0,
             0,
             false,
@@ -805,6 +825,7 @@ mod tests {
             None,
             code,
             &lines,
+            &build_line_start_bytes(code),
             0,
             0,
             false,

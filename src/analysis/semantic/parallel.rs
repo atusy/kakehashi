@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use tree_sitter::{Parser, Tree};
 
 use super::injection::InjectionContext;
-use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_tokens};
+use super::token_collector::{
+    ActiveInjectionBounds, RawToken, build_line_start_bytes, collect_host_tokens,
+};
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
@@ -178,6 +180,7 @@ impl ThreadLocalParserFactory {
 
 /// Parse one injection and collect its tokens (plus any nested injections,
 /// recursed on the same thread). `depth = 0` is the host document.
+/// `host_line_starts` must come from `build_line_start_bytes(host_text)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_injection_sync(
     ctx: &InjectionContext<'_>,
@@ -186,6 +189,7 @@ pub(crate) fn process_injection_sync(
     capture_mappings: Option<&CaptureMappings>,
     host_text: &str,
     host_lines: &[&str],
+    host_line_starts: &[usize],
     depth: usize,
     supports_multiline: bool,
 ) -> Vec<RawToken> {
@@ -227,6 +231,7 @@ pub(crate) fn process_injection_sync(
         capture_mappings,
         host_text,
         host_lines,
+        host_line_starts,
         ctx.host_start_byte,
         depth,
         supports_multiline,
@@ -244,6 +249,7 @@ pub(crate) fn process_injection_sync(
             capture_mappings,
             host_text,
             host_lines,
+            host_line_starts,
             depth + 1,
             supports_multiline,
         );
@@ -441,6 +447,10 @@ pub(crate) fn collect_injection_tokens_parallel(
     // Create factory from coordinator's registry (cloned for thread safety)
     let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
 
+    // Built once and shared by every injection (and the active-region conversion
+    // below) so byte→line/col mapping never rescans the host text per injection.
+    let host_line_starts = build_line_start_bytes(host_text);
+
     // Threshold for parallel processing - below this, Rayon scheduling overhead exceeds benefit
     const PARALLEL_THRESHOLD: usize = 4;
 
@@ -457,6 +467,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     capture_mappings,
                     host_text,
                     host_lines,
+                    &host_line_starts,
                     1, // depth 1 (first level of injection, host is 0)
                     supports_multiline,
                 )
@@ -474,6 +485,7 @@ pub(crate) fn collect_injection_tokens_parallel(
                     capture_mappings,
                     host_text,
                     host_lines,
+                    &host_line_starts,
                     1,
                     supports_multiline,
                 )
@@ -489,6 +501,7 @@ pub(crate) fn collect_injection_tokens_parallel(
     let active_regions = compute_active_injection_regions(
         host_text,
         host_lines,
+        &host_line_starts,
         &exclusion_byte_ranges,
         &all_tokens,
     );
@@ -507,20 +520,18 @@ pub(crate) fn collect_injection_tokens_parallel(
 fn compute_active_injection_regions(
     host_text: &str,
     host_lines: &[&str],
+    line_starts: &[usize],
     byte_ranges: &[(usize, usize)],
     tokens: &[RawToken],
 ) -> Vec<ActiveInjectionBounds> {
-    // Precompute line-start offsets once so each conversion below is a binary
-    // search rather than an O(offset) scan (was O(regions × offset)).
-    let line_starts = build_line_start_bytes(host_text);
     byte_ranges
         .iter()
         .filter_map(|&(start_byte, end_byte)| {
             // Convert byte range to line/col
             let (start_line, start_col) =
-                byte_to_line_col(host_text, host_lines, &line_starts, start_byte);
+                byte_to_line_col(host_text, host_lines, line_starts, start_byte);
             let (end_line, end_col) =
-                byte_to_line_col(host_text, host_lines, &line_starts, end_byte);
+                byte_to_line_col(host_text, host_lines, line_starts, end_byte);
 
             // Binary-search the first token at or after the region start, then
             // scan forward only while tokens remain inside the region.
@@ -544,23 +555,6 @@ fn compute_active_injection_regions(
             }
         })
         .collect()
-}
-
-/// Build an ascending index of the byte offset at which each line starts.
-///
-/// `line_starts[0]` is always 0; every subsequent entry is the byte just after
-/// a `\n`. Built once per request so each `byte_to_line_col` lookup is a binary
-/// search instead of an O(offset) scan of the host text. Scanning raw bytes for
-/// `\n` is safe because UTF-8 never places `0x0A` inside a multi-byte sequence.
-fn build_line_start_bytes(host_text: &str) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(host_text.len() / 32 + 1);
-    starts.push(0);
-    for (i, b) in host_text.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
 }
 
 /// Convert a byte offset in host_text to a (line, utf16_col) pair.
@@ -840,6 +834,7 @@ mod tests {
             None,
             host_text,
             &host_lines,
+            &build_line_start_bytes(host_text),
             1, // depth 1 (not host document)
             false,
         );
@@ -897,6 +892,7 @@ mod tests {
             None,
             host_text,
             &host_lines,
+            &build_line_start_bytes(host_text),
             MAX_INJECTION_DEPTH,
             false,
         );
