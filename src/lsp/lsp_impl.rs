@@ -152,10 +152,14 @@ pub struct Kakehashi {
     /// process lifetime.
     home_dir: Option<String>,
     /// Previous full result per `(uri, kind)` for `kakehashi/captures/full/delta`
-    /// (captures-protocol §"Delta semantics"): `(resultId, matches as wire JSON)`.
-    /// Entries are dropped on `didClose`; a delta against a missing or mismatched
-    /// `resultId` falls back to a full response.
-    captures_cache: dashmap::DashMap<(Url, String), (String, Vec<serde_json::Value>)>,
+    /// (captures-protocol §"Delta semantics"):
+    /// `(resultId, injection flag, matches as wire JSON)`. Deltas carry no
+    /// `injection` parameter — they inherit the stored flag, so it is lineage
+    /// state. Entries are dropped on `didClose`; a delta against a stale
+    /// `resultId` falls back to a full response under the stored flag, and a
+    /// delta with no entry at all returns `null` (the inherited mode is
+    /// unknowable).
+    captures_cache: dashmap::DashMap<(Url, String), (String, bool, Vec<serde_json::Value>)>,
 }
 
 impl std::fmt::Debug for Kakehashi {

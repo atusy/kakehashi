@@ -25,13 +25,19 @@ mod helpers;
 use helpers::lsp_client::LspClient;
 use serde_json::{Value, json};
 
-/// Create a search-path root holding `queries/markdown/context.scm`.
+/// Create a search-path root holding `queries/markdown/context.scm` and
+/// `queries/python/context.scm` (the latter exercises injection-aware
+/// collection: each layer resolves its own language's kind file).
 fn context_query_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let qdir = dir.path().join("queries").join("markdown");
-    std::fs::create_dir_all(&qdir).expect("create queries/markdown");
-    std::fs::write(qdir.join("context.scm"), "(atx_heading) @context\n")
-        .expect("write context.scm");
+    let md = dir.path().join("queries").join("markdown");
+    std::fs::create_dir_all(&md).expect("create queries/markdown");
+    std::fs::write(md.join("context.scm"), "(atx_heading) @context\n")
+        .expect("write markdown context.scm");
+    let py = dir.path().join("queries").join("python");
+    std::fs::create_dir_all(&py).expect("create queries/python");
+    std::fs::write(py.join("context.scm"), "(function_definition) @context\n")
+        .expect("write python context.scm");
     dir
 }
 
@@ -100,6 +106,30 @@ fn full(client: &mut LspClient, uri: &str, kind: &str) -> Value {
         "kakehashi/captures/full",
         json!({ "textDocument": { "uri": uri }, "kind": kind }),
     )
+}
+
+fn full_with_injection(client: &mut LspClient, uri: &str, kind: &str) -> Value {
+    request(
+        client,
+        "kakehashi/captures/full",
+        json!({ "textDocument": { "uri": uri }, "kind": kind, "injection": true }),
+    )
+}
+
+/// Languages of the matches in a full/range result, in match order.
+fn match_languages(result: &Value) -> Vec<String> {
+    result
+        .get("matches")
+        .and_then(Value::as_array)
+        .expect("result.matches must be an array")
+        .iter()
+        .map(|m| {
+            m.get("language")
+                .and_then(Value::as_str)
+                .expect("every match must carry a language")
+                .to_string()
+        })
+        .collect()
 }
 
 fn delta(client: &mut LspClient, uri: &str, kind: &str, previous_result_id: &str) -> Value {
@@ -316,5 +346,179 @@ fn malformed_kind_returns_error() {
     assert!(
         response.get("error").is_some(),
         "a path-traversal kind must surface a JSON-RPC error, got: {response:?}"
+    );
+}
+
+/// Markdown with an embedded Python block — the cross-language sticky-context
+/// case: `injection: true` should yield the markdown heading AND the python
+/// function in one response.
+const DOC_WITH_PYTHON: &str = "# Title\n\n```python\ndef f():\n    pass\n```\n";
+
+#[test]
+fn full_with_injection_collects_all_layers() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_injection.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    let result = full_with_injection(&mut client, uri, "context");
+    let langs = match_languages(&result);
+    assert!(
+        langs.contains(&"markdown".to_string()),
+        "host heading match expected: {langs:?}"
+    );
+    assert!(
+        langs.contains(&"python".to_string()),
+        "injected function match expected: {langs:?}"
+    );
+
+    // Ordering: document-order DFS — the host heading precedes the python match.
+    assert_eq!(langs.first().map(String::as_str), Some("markdown"));
+
+    // The python match's node is minted in its layer and composes with
+    // kakehashi/node/*: feeding the id back resolves to the python node kind.
+    let matches = result.get("matches").and_then(Value::as_array).unwrap();
+    let py = matches
+        .iter()
+        .find(|m| m.get("language").and_then(Value::as_str) == Some("python"))
+        .expect("python match present");
+    let id = py
+        .pointer("/captures/0/node/id")
+        .and_then(Value::as_str)
+        .expect("python capture has a node id");
+    let response = client.send_request(
+        "kakehashi/node/kind",
+        json!({ "textDocument": { "uri": uri }, "id": id }),
+    );
+    assert_eq!(
+        response.pointer("/result/kind").and_then(Value::as_str),
+        Some("function_definition"),
+        "injected-layer node id must resolve in its minting layer"
+    );
+}
+
+#[test]
+fn full_without_injection_stays_host_only_with_language() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_host_only.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    let result = full(&mut client, uri, "context");
+    let langs = match_languages(&result);
+    assert_eq!(
+        langs,
+        vec!["markdown".to_string()],
+        "host-only mode must not surface injected layers, and still tags language"
+    );
+}
+
+#[test]
+fn delta_inherits_injection_mode_from_lineage() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_delta_injection.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    let _ = full_with_injection(&mut client, uri, "context");
+
+    // A stale previousResultId forces the full-fallback path, which recomputes
+    // under the lineage's STORED mode. The delta request itself carries no
+    // injection parameter, so the python match appearing in the fallback
+    // proves the mode was inherited from the initial full.
+    let d = delta(&mut client, uri, "context", "stale-id");
+    let langs = match_languages(&d);
+    assert!(
+        langs.contains(&"python".to_string()),
+        "inherited injection mode must surface python matches: {langs:?}"
+    );
+}
+
+/// The edit-driven variant of inheritance: full(injection) → didChange →
+/// delta sees the new python match in its edits.
+///
+/// Blocked by <https://github.com/atusy/kakehashi/issues/348>: editing a
+/// markdown document after the markdown_inline layer has been parsed crashes
+/// the server (pre-existing heap corruption, reproducible with kakehashi/node
+/// alone). Enable when #348 is fixed.
+#[test]
+#[ignore = "blocked by #348: server crash on didChange after markdown_inline layer parse"]
+fn delta_after_edit_carries_injected_matches() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_delta_injection_edit.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    let id1 = result_id_of(&full_with_injection(&mut client, uri, "context"));
+
+    let edited = format!("{DOC_WITH_PYTHON}\n```python\ndef g():\n    pass\n```\n");
+    change_full_text(&mut client, uri, 2, &edited);
+
+    let d = delta(&mut client, uri, "context", &id1);
+    let edits = d
+        .get("edits")
+        .and_then(Value::as_array)
+        .expect("matching previousResultId -> delta with edits");
+    let added_langs: Vec<&str> = edits
+        .iter()
+        .flat_map(|e| {
+            e.get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|m| m.get("language").and_then(Value::as_str))
+        .collect();
+    assert!(
+        added_langs.contains(&"python"),
+        "inherited injection mode must surface the new python match: {d:?}"
+    );
+}
+
+#[test]
+fn delta_without_lineage_returns_null() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_delta_no_lineage.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    // No prior full: the server cannot know the client's injection intent, so
+    // a full fallback could silently serve the wrong layer set -> null.
+    let result = delta(&mut client, uri, "context", "never-issued-id");
+    assert_eq!(result, Value::Null, "lineage-less delta must be null");
+}
+
+#[test]
+fn range_with_injection_prunes_to_intersecting_layers() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_range_injection.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    // Lines 3-4 cover only the python function body, not the heading.
+    let result = request(
+        &mut client,
+        "kakehashi/captures/range",
+        json!({
+            "textDocument": { "uri": uri },
+            "kind": "context",
+            "injection": true,
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 5, "character": 0 }
+            }
+        }),
+    );
+    let langs = match_languages(&result);
+    assert_eq!(
+        langs,
+        vec!["python".to_string()],
+        "only the python layer intersects the range: {result:?}"
     );
 }

@@ -545,6 +545,230 @@ fn align_down(text: &str, byte: usize) -> usize {
     aligned
 }
 
+/// Materialize every child injection region of `parent_tree` with its
+/// effective absolute ranges, sorted by start byte (document order across
+/// siblings — the deterministic order captures-protocol's positional delta
+/// requires). Shared by the cursor-path stack ([`injection_stack_at`]) and the
+/// document-wide walkers below; unlike the cursor path there is no byte
+/// containment or smallest-wins selection — every region qualifies, optionally
+/// pruned to those intersecting `byte_filter`.
+fn effective_child_regions<'t>(
+    coordinator: &LanguageCoordinator,
+    parent_language: &str,
+    parent_tree: &'t tree_sitter::Tree,
+    parent_ranges: &[tree_sitter::Range],
+    host_text: &str,
+    byte_filter: Option<&std::ops::Range<usize>>,
+) -> Vec<(
+    crate::language::injection::InjectionRegionInfo<'t>,
+    Vec<tree_sitter::Range>,
+)> {
+    let Some(injection_query) = coordinator.injection_query(parent_language) else {
+        return Vec::new();
+    };
+    let root = parent_tree.root_node();
+    let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query)) else {
+        return Vec::new();
+    };
+
+    let mut regions = Vec::new();
+    for region in injections {
+        let own_ranges = build_effective_ranges(&region, host_text, &injection_query);
+        if own_ranges.is_empty() {
+            continue;
+        }
+        // Inherit parent exclusions (blockquote prefixes etc.), as the
+        // cursor-path stack does.
+        let absolute_ranges = intersect_included_ranges(parent_ranges, &own_ranges);
+        if absolute_ranges.is_empty() {
+            continue;
+        }
+        if let Some(filter) = byte_filter
+            && !ranges_intersect(&absolute_ranges, filter)
+        {
+            continue;
+        }
+        regions.push((region, absolute_ranges));
+    }
+    regions.sort_by_key(|(_, ranges)| ranges.first().map_or(0, |r| r.start_byte));
+    regions
+}
+
+/// Half-open intersection of a disjoint range list with `filter`. A zero-width
+/// filter degenerates to point containment so a cursor-sized range still
+/// selects the layer under it.
+fn ranges_intersect(ranges: &[tree_sitter::Range], filter: &std::ops::Range<usize>) -> bool {
+    if filter.start == filter.end {
+        let p = filter.start;
+        return ranges.iter().any(|r| r.start_byte <= p && p < r.end_byte);
+    }
+    ranges
+        .iter()
+        .any(|r| r.start_byte < filter.end && filter.start < r.end_byte)
+}
+
+/// Visit every injection layer of the document in **document-order DFS**: the
+/// host first, then each injection region by ascending start byte, recursing
+/// into nested injections before moving to the next sibling
+/// (captures-protocol §"The `injection` parameter").
+///
+/// `visit` receives the layer's resolved language, its tree (parsed against
+/// the full host text via `set_included_ranges`, so byte coordinates are in
+/// host space), and its depth — the same depth index `injection_stack_at`
+/// assigns, so nodes minted with it resolve through the per-layer Scope rule.
+///
+/// Regions whose grammar is not loaded (or fails to parse) are skipped
+/// silently — discovery and auto-install are the caller's job, via
+/// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
+/// (and their entire subtrees) that don't intersect the given host-byte range.
+pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+    byte_filter: Option<&std::ops::Range<usize>>,
+    visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
+) {
+    visit(host_language, host_tree, 0);
+    walk_child_layers(
+        coordinator,
+        host_language,
+        host_tree,
+        &[whole_document_range(host_text)],
+        host_text,
+        1,
+        byte_filter,
+        visit,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_child_layers(
+    coordinator: &LanguageCoordinator,
+    parent_language: &str,
+    parent_tree: &tree_sitter::Tree,
+    parent_ranges: &[tree_sitter::Range],
+    host_text: &str,
+    depth: usize,
+    byte_filter: Option<&std::ops::Range<usize>>,
+    visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
+) {
+    if depth > MAX_INJECTION_DEPTH {
+        return;
+    }
+    for (region, absolute_ranges) in effective_child_regions(
+        coordinator,
+        parent_language,
+        parent_tree,
+        parent_ranges,
+        host_text,
+        byte_filter,
+    ) {
+        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let Some((resolved_lang, _)) =
+            coordinator.resolve_injection_language(&region.language, content)
+        else {
+            continue;
+        };
+        let Some(language) = coordinator
+            .language_registry_for_parallel()
+            .get(&resolved_lang)
+        else {
+            continue;
+        };
+        let Some(tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges) else {
+            continue;
+        };
+        visit(&resolved_lang, &tree, depth);
+        walk_child_layers(
+            coordinator,
+            &resolved_lang,
+            &tree,
+            &absolute_ranges,
+            host_text,
+            depth + 1,
+            byte_filter,
+            visit,
+        );
+    }
+}
+
+/// Collect the injection languages appearing **anywhere** in the document, at
+/// all currently-parseable depths — the document-wide analog of
+/// [`collect_injection_languages_at`], with the same fixpoint contract: a
+/// language is *recorded* once its `@injection.language` resolves, but the
+/// walk only *descends* into layers whose parser is already loaded, so callers
+/// that install the returned set and call again discover one tier deeper per
+/// round.
+pub(in crate::lsp::lsp_impl::kakehashi) fn collect_injection_languages_in_document(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+) -> std::collections::HashSet<String> {
+    let mut languages = std::collections::HashSet::new();
+    discover_child_languages(
+        coordinator,
+        host_language,
+        host_tree,
+        &[whole_document_range(host_text)],
+        host_text,
+        1,
+        &mut languages,
+    );
+    languages
+}
+
+fn discover_child_languages(
+    coordinator: &LanguageCoordinator,
+    parent_language: &str,
+    parent_tree: &tree_sitter::Tree,
+    parent_ranges: &[tree_sitter::Range],
+    host_text: &str,
+    depth: usize,
+    languages: &mut std::collections::HashSet<String>,
+) {
+    if depth > MAX_INJECTION_DEPTH {
+        return;
+    }
+    for (region, absolute_ranges) in effective_child_regions(
+        coordinator,
+        parent_language,
+        parent_tree,
+        parent_ranges,
+        host_text,
+        None,
+    ) {
+        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+        let Some((resolved_lang, _)) =
+            coordinator.resolve_injection_language(&region.language, content)
+        else {
+            continue;
+        };
+        languages.insert(resolved_lang.clone());
+
+        // Descend only when the parser is loaded (fixpoint contract).
+        let Some(language) = coordinator
+            .language_registry_for_parallel()
+            .get(&resolved_lang)
+        else {
+            continue;
+        };
+        let Some(tree) = parse_with_absolute_ranges(&language, host_text, &absolute_ranges) else {
+            continue;
+        };
+        discover_child_languages(
+            coordinator,
+            &resolved_lang,
+            &tree,
+            &absolute_ranges,
+            host_text,
+            depth + 1,
+            languages,
+        );
+    }
+}
+
 /// Convert an absolute byte offset to a `tree_sitter::Point`. Used when an
 /// offset directive shifts the injection boundary away from a known node
 /// position, so we can't reuse the content node's start/end points.

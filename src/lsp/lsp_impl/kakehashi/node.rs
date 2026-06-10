@@ -12,7 +12,10 @@ mod children;
 mod common;
 mod entry;
 mod field;
-mod injection_stack;
+// Widened beyond `node/`: the captures handlers reuse the injection-layer
+// machinery (document-wide layer walk, language discovery) for
+// captures-protocol's `injection: true` mode.
+pub(in crate::lsp::lsp_impl::kakehashi) mod injection_stack;
 mod lookup;
 mod metadata;
 mod navigation;
