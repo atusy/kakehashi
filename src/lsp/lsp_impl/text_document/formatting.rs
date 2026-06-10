@@ -372,6 +372,7 @@ async fn dispatch_preferred_formatting(
                         &t.virtual_content,
                         options,
                         t.upstream_id,
+                        None,
                     )
                     .await
             }
@@ -584,7 +585,15 @@ async fn dispatch_concatenated_formatting(
 
                 // Keep a copy for $/cancelRequest propagation on timeout: the
                 // request future inside the timeout consumes `upstream_id`.
-                let upstream_id_for_cancel = upstream_id.clone();
+                // Receives this step's downstream request id as soon as the
+                // bridge allocates it. The timeout arm below needs it because
+                // dropping the timed-out step future removes the request's
+                // upstream-id cancel mapping (router cleanup guard) before any
+                // cancel task could look it up — and the upstream id may also
+                // map to sibling regions' in-flight requests, which must NOT
+                // be cancelled by this step's timeout.
+                let step_downstream_id: std::sync::OnceLock<crate::lsp::bridge::RequestId> =
+                    std::sync::OnceLock::new();
 
                 // Everything that talks to the downstream server — capability
                 // probe (which may spawn/handshake a cold server), scratch
@@ -689,6 +698,7 @@ async fn dispatch_concatenated_formatting(
                             &current_text,
                             options,
                             upstream_id,
+                            Some(&step_downstream_id),
                         )
                         .await
                     } else {
@@ -711,6 +721,7 @@ async fn dispatch_concatenated_formatting(
                                     whole_region,
                                     options,
                                     upstream_id,
+                                    Some(&step_downstream_id),
                                 )
                                 .await
                             }
@@ -748,10 +759,16 @@ async fn dispatch_concatenated_formatting(
                         // step future abandons our side of the request, but the
                         // downstream server is still computing; per the ADR
                         // Consequences cancellation note, tell it to stop via
-                        // $/cancelRequest. Best-effort and detached: the
-                        // mapping may already be gone (the dropped future's
-                        // router cleanup races this), in which case
-                        // forward_cancel silently no-ops.
+                        // $/cancelRequest — scoped to the step's OWN downstream
+                        // request id (captured via the probe before the drop):
+                        // the upstream-id route is unusable here, both because
+                        // the dropped future's router cleanup has already
+                        // removed the mapping and because the upstream id can
+                        // fan out to sibling regions' in-flight requests.
+                        // Best-effort and detached. The probe is unset only
+                        // when the timeout fired before the request was even
+                        // registered (capability probe / didOpen), where there
+                        // is nothing to cancel.
                         log::warn!(
                             target: "kakehashi::formatting",
                             "concatenated formatting step for server {} timed out \
@@ -759,11 +776,13 @@ async fn dispatch_concatenated_formatting(
                             server_name,
                             step_budget
                         );
-                        if let Some(id) = upstream_id_for_cancel {
+                        if let Some(downstream_id) = step_downstream_id.get().copied() {
                             let pool = Arc::clone(&pool);
                             let server_name = server_name.clone();
                             tokio::spawn(async move {
-                                let _ = pool.forward_cancel(&server_name, &id).await;
+                                let _ = pool
+                                    .forward_cancel_downstream(&server_name, downstream_id)
+                                    .await;
                             });
                         }
                         None

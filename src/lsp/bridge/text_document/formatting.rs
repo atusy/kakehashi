@@ -42,6 +42,11 @@ impl LanguageServerPool {
     ///
     /// Returns `Ok(None)` when the downstream server does not advertise
     /// `documentFormattingProvider`.
+    ///
+    /// `downstream_id_probe`, when provided, receives the allocated downstream
+    /// request id as soon as it is known so a caller that drops this future
+    /// (the pipeline's per-step timeout) can still cancel the in-flight
+    /// request precisely.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_formatting_request(
         &self,
@@ -54,6 +59,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         options: FormattingOptions,
         upstream_request_id: Option<UpstreamId>,
+        downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config)
@@ -62,7 +68,7 @@ impl LanguageServerPool {
             return Ok(None);
         }
         let virtual_line_count = count_lines(virtual_content);
-        self.execute_bridge_request_with_handle(
+        self.execute_bridge_request_observed(
             handle,
             server_name,
             host_uri,
@@ -75,6 +81,7 @@ impl LanguageServerPool {
             |response, ctx| {
                 transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
             },
+            downstream_id_probe,
         )
         .await
     }

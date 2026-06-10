@@ -59,6 +59,7 @@ impl LanguageServerPool {
         host_range: Range,
         options: FormattingOptions,
         upstream_request_id: Option<UpstreamId>,
+        downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config)
@@ -68,7 +69,7 @@ impl LanguageServerPool {
         }
         let virtual_line_count = count_lines(virtual_content);
         let offset_for_request = offset.clone();
-        self.execute_bridge_request_with_handle(
+        self.execute_bridge_request_observed(
             handle,
             server_name,
             host_uri,
@@ -89,6 +90,7 @@ impl LanguageServerPool {
             |response, ctx| {
                 transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
             },
+            downstream_id_probe,
         )
         .await
     }
