@@ -318,20 +318,34 @@ fn select_pipeline_step_request(supports_full: bool, supports_range: bool) -> Pi
 }
 
 /// Probe the server's advertised formatting capabilities (spawning it if
-/// needed) and map them to the step's request kind via
+/// needed, and waiting up to `timeout` — the step's remaining budget — for a
+/// cold server to finish initializing so its capabilities are actually
+/// known) and map them to the step's request kind via
 /// [`select_pipeline_step_request`]. The second probe is skipped when full
-/// formatting is advertised — the answer can no longer matter.
+/// formatting is advertised — the answer can no longer matter — and reuses
+/// the already-Ready connection when it does run.
 async fn pipeline_step_request_kind(
     pool: &crate::lsp::bridge::LanguageServerPool,
     server_name: &str,
     server_config: &crate::config::settings::BridgeServerConfig,
+    timeout: std::time::Duration,
 ) -> std::io::Result<PipelineStepRequest> {
     let supports_full = pool
-        .server_advertises(server_name, server_config, "textDocument/formatting")
+        .server_advertises(
+            server_name,
+            server_config,
+            "textDocument/formatting",
+            timeout,
+        )
         .await?;
     let supports_range = !supports_full
         && pool
-            .server_advertises(server_name, server_config, "textDocument/rangeFormatting")
+            .server_advertises(
+                server_name,
+                server_config,
+                "textDocument/rangeFormatting",
+                timeout,
+            )
             .await?;
     Ok(select_pipeline_step_request(supports_full, supports_range))
 }
@@ -587,34 +601,38 @@ async fn dispatch_concatenated_formatting(
                     // and arrives as `Some(vec![])` from the bridge transform).
                     // A probe error (connection spawn/handshake failure) is a
                     // failed step: skip-and-continue (ADR point 6).
-                    let step_request =
-                        match pipeline_step_request_kind(&pool, &server_name, &server_config).await
-                        {
-                            Ok(kind) => kind,
-                            Err(e) => {
-                                log::warn!(
-                                    target: "kakehashi::formatting",
-                                    "concatenated formatting step for server {} failed during \
-                                     capability probe; skipping (ADR point 6): {}",
-                                    server_name,
-                                    e
-                                );
-                                return None;
-                            }
-                        };
+                    let step_request = match pipeline_step_request_kind(
+                        &pool,
+                        &server_name,
+                        &server_config,
+                        step_budget,
+                    )
+                    .await
+                    {
+                        Ok(kind) => kind,
+                        Err(e) => {
+                            log::warn!(
+                                target: "kakehashi::formatting",
+                                "concatenated formatting step for server {} failed during \
+                                 capability probe; skipping (ADR point 6): {}",
+                                server_name,
+                                e
+                            );
+                            return None;
+                        }
+                    };
                     if step_request == PipelineStepRequest::Skip {
                         // Neither documentFormattingProvider nor
                         // documentRangeFormattingProvider: contribute nothing and
                         // send no unsupported request (ADR point 3.2). The probe
-                        // also reports no capability while the connection is
-                        // still initializing (cold start), so the log mentions
-                        // that case — a later request will see the Ready server.
+                        // waits (within the step budget) for an initializing
+                        // connection to reach Ready, so this is a genuine
+                        // capability answer, not a cold-start artifact.
                         log::debug!(
                             target: "kakehashi::formatting",
                             "concatenated formatting step for server {} skipped: \
                              server advertises neither documentFormattingProvider \
-                             nor documentRangeFormattingProvider (or its \
-                             connection is still initializing)",
+                             nor documentRangeFormattingProvider",
                             server_name
                         );
                         return None;
