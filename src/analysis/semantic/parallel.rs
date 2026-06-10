@@ -302,8 +302,10 @@ fn clip_tokens_to_included_ranges(
             let seg_start = host_start.saturating_sub(line_start).min(line_text.len());
             let seg_end = (host_end - line_start).min(line_text.len());
             // A range ending in the newline still admits the full line; an
-            // empty segment (range starts past the line text) admits nothing.
-            if seg_start > seg_end {
+            // empty segment (range starting past the line text, or touching
+            // the line only at a boundary) admits nothing — skip it instead
+            // of recording an interval no token can intersect.
+            if seg_start >= seg_end {
                 continue;
             }
             let col_start = byte_to_utf16_col(line_text, seg_start);
