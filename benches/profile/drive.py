@@ -135,8 +135,9 @@ def main() -> None:
             srv.kill()
             srv.wait()
 
+    n_bytes = len(text.encode("utf-8"))
     n_lines = text.count("\n")
-    source = (f"file={args.file} ({len(text)}B/{n_lines}L)"
+    source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
               if args.file else f"size={args.size}")
     sys.stderr.write(
         f"[drive] lang={args.lang} {source} requests={args.requests} "
