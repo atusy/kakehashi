@@ -151,15 +151,18 @@ pub struct Kakehashi {
     /// Computed once at construction — `dirs::home_dir()` is stable for the
     /// process lifetime.
     home_dir: Option<String>,
-    /// Previous full result per `(uri, kind)` for `kakehashi/captures/full/delta`
-    /// (captures-protocol §"Delta semantics"):
-    /// `(resultId, injection flag, matches as wire JSON)`. Deltas carry no
-    /// `injection` parameter — they inherit the stored flag, so it is lineage
-    /// state. Entries are dropped on `didClose`; a delta against a stale
-    /// `resultId` falls back to a full response under the stored flag, and a
-    /// delta with no entry at all returns `null` (the inherited mode is
-    /// unknowable).
-    captures_cache: dashmap::DashMap<(Url, String), (String, bool, Vec<serde_json::Value>)>,
+    /// Previous full results per `(uri, kind)` for `kakehashi/captures/full/delta`
+    /// (captures-protocol §"Delta semantics"). One lineage slot **per
+    /// injection mode** — index `0` host-only, index `1` injection — each
+    /// holding `(resultId, matches as wire JSON)`. Deltas carry no `injection`
+    /// parameter: `previousResultId` selects its mode by matching a slot, so a
+    /// host-only client and an injection client sharing a document never
+    /// clobber each other's mode. Entries are dropped on `didClose` (the
+    /// insert sites serialize with close via the per-URI edit lock); a stale
+    /// `resultId` falls back to a full response only when a single mode slot
+    /// is live (unambiguous), otherwise `null`.
+    #[allow(clippy::type_complexity)]
+    captures_cache: dashmap::DashMap<(Url, String), [Option<(String, Vec<serde_json::Value>)>; 2]>,
 }
 
 impl std::fmt::Debug for Kakehashi {

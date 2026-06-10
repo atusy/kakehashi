@@ -423,13 +423,15 @@ type CapturesDelta = {
   to `kakehashi/node/*`.
 - **`full` → `full/delta` loop**: call `full` once, keep its `resultId`, then send
   `full/delta` on subsequent ticks. The delta carries **no `injection` parameter**
-  — it inherits the mode from the initial `full`; switch modes by issuing a new
-  `full`. An unchanged document answers with empty `edits`; a small edit ships
-  only the changed matches. A stale `previousResultId` falls back to a full
-  result (under the inherited mode); a `(document, kind)` the server has **no
-  lineage for** (never `full`ed, closed, or server restarted) answers `null` —
-  on `null`, call `full` again. Every response carries a fresh `resultId`;
-  always hand back the latest one.
+  — your `previousResultId` identifies the lineage and with it the mode; switch
+  modes by issuing a new `full`. Lineages are kept **per mode**, so a host-only
+  client and an injection client on the same document don't disturb each other.
+  An unchanged document answers with empty `edits`; a small edit ships only the
+  changed matches. A stale `previousResultId` falls back to a full result when
+  the mode is unambiguous (only one mode in use); when it isn't — or the server
+  has no lineage at all (never `full`ed, closed, restarted) — the answer is
+  `null`: on `null`, call `full` again. Every response carries a fresh
+  `resultId`; always hand back the latest one.
 - **`range`** scopes the query walk to a viewport (matches whose nodes intersect
   the range); with `injection: true`, embedded layers outside the range are
   skipped entirely. It carries no `resultId` — there is no delta over viewports.

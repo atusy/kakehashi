@@ -584,7 +584,7 @@ fn effective_child_regions<'t>(
             continue;
         }
         if let Some(filter) = byte_filter
-            && !ranges_intersect(&absolute_ranges, filter)
+            && !ranges_intersect(&absolute_ranges, filter, host_text.len())
         {
             continue;
         }
@@ -596,11 +596,16 @@ fn effective_child_regions<'t>(
 
 /// Half-open intersection of a disjoint range list with `filter`. A zero-width
 /// filter degenerates to point containment so a cursor-sized range still
-/// selects the layer under it.
-fn ranges_intersect(ranges: &[tree_sitter::Range], filter: &std::ops::Range<usize>) -> bool {
+/// selects the layer under it — including the protocol's end-of-document
+/// exception (a point at `host_len` selects layers ending exactly there),
+/// mirroring [`ranges_contain_byte`].
+fn ranges_intersect(
+    ranges: &[tree_sitter::Range],
+    filter: &std::ops::Range<usize>,
+    host_len: usize,
+) -> bool {
     if filter.start == filter.end {
-        let p = filter.start;
-        return ranges.iter().any(|r| r.start_byte <= p && p < r.end_byte);
+        return ranges_contain_byte(ranges, filter.start, host_len);
     }
     ranges
         .iter()
@@ -621,6 +626,15 @@ fn ranges_intersect(ranges: &[tree_sitter::Range], filter: &std::ops::Range<usiz
 /// silently — discovery and auto-install are the caller's job, via
 /// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
 /// (and their entire subtrees) that don't intersect the given host-byte range.
+///
+/// Known limitation (#350): when two injection regions at the same depth
+/// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
+/// minted id by rebuilding the cursor-path stack, which keeps only the
+/// smallest region containing the byte — so an id minted from the larger
+/// sibling may fail to re-resolve (collapsing to `null`, the protocol's
+/// re-acquire signal). Same depth-as-identity weakness documented in
+/// lazy-node-identity-tracking; disjoint same-depth regions (the norm) are
+/// unaffected.
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -653,6 +667,12 @@ fn walk_child_layers(
     byte_filter: Option<&std::ops::Range<usize>>,
     visit: &mut dyn FnMut(&str, &tree_sitter::Tree, usize),
 ) {
+    // Allows injected depths 1..=MAX_INJECTION_DEPTH — deliberately matching
+    // `injection_stack_at` (`for _depth in 0..MAX` pushes up to MAX injected
+    // layers), because minted node ids must resolve through that stack's
+    // depth indexing. The semantic-tokens collector caps one layer shallower
+    // (`depth >= MAX` with a different base); resolution does not depend on
+    // it, so the cursor-path stack is the convention that matters here.
     if depth > MAX_INJECTION_DEPTH {
         return;
     }

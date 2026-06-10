@@ -522,3 +522,85 @@ fn range_with_injection_prunes_to_intersecting_layers() {
         "only the python layer intersects the range: {result:?}"
     );
 }
+
+#[test]
+fn per_mode_lineages_do_not_clobber_each_other() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_mode_isolation.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    // Injection lineage first, then a host-only full for the SAME (uri, kind):
+    // the host full must not clobber the injection lineage's mode.
+    let id_injection = result_id_of(&full_with_injection(&mut client, uri, "context"));
+    let id_host = result_id_of(&full(&mut client, uri, "context"));
+
+    // Edit so the injection-mode delta has something to report.
+    let edited = format!("{DOC_WITH_PYTHON}\n```python\ndef g():\n    pass\n```\n");
+    change_full_text(&mut client, uri, 2, &edited);
+
+    let d = delta(&mut client, uri, "context", &id_injection);
+    let edits = d
+        .get("edits")
+        .and_then(Value::as_array)
+        .expect("injection lineage must still answer with a delta: {d:?}");
+    let added_langs: Vec<&str> = edits
+        .iter()
+        .flat_map(|e| {
+            e.get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|m| m.get("language").and_then(Value::as_str))
+        .collect();
+    assert!(
+        added_langs.contains(&"python"),
+        "the injection-mode lineage must surface the new python match \
+         despite the interleaved host-only full: {d:?}"
+    );
+
+    // The host lineage answers under host mode: its edits must not contain
+    // python matches (only the markdown side of the edit, if any).
+    let dh = delta(&mut client, uri, "context", &id_host);
+    let host_edits = dh
+        .get("edits")
+        .and_then(Value::as_array)
+        .expect("host lineage must also answer with a delta: {dh:?}");
+    let host_langs: Vec<&str> = host_edits
+        .iter()
+        .flat_map(|e| {
+            e.get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|m| m.get("language").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !host_langs.contains(&"python"),
+        "the host-only lineage must stay host-only: {dh:?}"
+    );
+}
+
+#[test]
+fn stale_id_with_both_modes_live_returns_null() {
+    let dir = context_query_dir();
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_mode_ambiguous.md";
+    open_markdown(&mut client, uri, DOC_WITH_PYTHON);
+
+    let _ = full_with_injection(&mut client, uri, "context");
+    let _ = full(&mut client, uri, "context");
+
+    // With BOTH mode lineages live, a stale id cannot pick a mode without
+    // guessing — the protocol answers null ("re-acquire via full").
+    let d = delta(&mut client, uri, "context", "stale-id");
+    assert_eq!(
+        d,
+        Value::Null,
+        "ambiguous mode for a stale id must be null, not a guessed full"
+    );
+}

@@ -235,26 +235,47 @@ impl Kakehashi {
             "matches": c.matches,
             "skipped": c.skipped,
         });
-        // Skip caching when the document closed while this request was in
-        // flight — didClose clears the cache, and an unconditional insert
-        // would resurrect a stale lineage entry for the closed document. A
-        // close racing past this check leaves at most one entry, which the
-        // next didClose for the URI clears again.
-        if self.documents.get(&c.uri).is_some() {
-            self.captures_cache.insert(
-                (c.uri, params.kind),
-                (result_id, params.injection, c.matches),
-            );
-        }
+        self.store_lineage(c.uri, params.kind, params.injection, result_id, c.matches)
+            .await;
         Ok(response)
+    }
+
+    /// Store a fresh lineage in this mode's slot, unless the document closed
+    /// while the request was in flight.
+    ///
+    /// The liveness check + insert are serialized with `didClose`'s document
+    /// removal through the same per-URI edit lock, so a request racing a close
+    /// can never resurrect lineage for a closed document: either the insert
+    /// completes before the close removes the document — and the close's
+    /// cache cleanup (which runs after the removal) clears it — or the close
+    /// wins the lock first and the check sees the document gone.
+    async fn store_lineage(
+        &self,
+        uri: Url,
+        kind: String,
+        injection: bool,
+        result_id: String,
+        matches: Vec<Value>,
+    ) {
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _guard = edit_lock.lock().await;
+        if self.documents.get(&uri).is_some() {
+            let mut entry = self.captures_cache.entry((uri, kind)).or_default();
+            entry[usize::from(injection)] = Some((result_id, matches));
+        }
     }
 
     /// Handler for `kakehashi/captures/full/delta`.
     ///
-    /// Recomputes the current matches under the lineage's stored `injection`
-    /// mode (delta saves wire bytes, not compute — same trade-off as semantic
-    /// tokens) and diffs against the stored result when `previousResultId`
-    /// matches; a stale id falls back to a full result under the stored mode.
+    /// `previousResultId` selects its lineage **and so its injection mode** by
+    /// matching one of the per-mode slots; the current matches are then
+    /// recomputed under that mode (delta saves wire bytes, not compute — same
+    /// trade-off as semantic tokens) and diffed against the slot. A stale id
+    /// falls back to a full result only when a single mode slot is live —
+    /// with both modes live the intended mode is ambiguous, and guessing
+    /// could silently serve the wrong layer set, so the answer is `null`
+    /// ("re-acquire via full"), as is a delta with no lineage at all
+    /// (captures-protocol §"Delta semantics").
     pub async fn kakehashi_captures_full_delta(
         &self,
         params: CapturesDeltaParams,
@@ -274,13 +295,30 @@ impl Kakehashi {
         };
         let key = (uri, params.kind.clone());
 
-        // The lineage carries the inherited injection mode. Without it the
-        // mode is unknowable — a full fallback would have to guess, and a
-        // host-only guess would silently serve an injection client the wrong
-        // layer set — so a lineage-less delta is `null` ("re-acquire via
-        // full"), the protocol's one deliberate deviation from semanticTokens'
-        // always-full fallback (captures-protocol §"Delta semantics").
-        let Some(injection) = self.captures_cache.get(&key).map(|e| e.value().1) else {
+        // Resolve the mode from the id; for a stale id, fall back to the sole
+        // live slot's mode when unambiguous. `matched` records whether the id
+        // selected its slot (diff possible) or we are already on the
+        // full-fallback path. The guard drops at the end of the statement —
+        // before the await below.
+        let probe = self.captures_cache.get(&key).and_then(|entry| {
+            let slots = entry.value();
+            if let Some(mode) = slots.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|(id, _)| *id == params.previous_result_id)
+            }) {
+                return Some((mode == 1, true));
+            }
+            let live: Vec<usize> = slots
+                .iter()
+                .enumerate()
+                .filter_map(|(i, slot)| slot.is_some().then_some(i))
+                .collect();
+            match live.as_slice() {
+                [only] => Some((*only == 1, false)),
+                _ => None,
+            }
+        });
+        let Some((injection, matched)) = probe else {
             return Ok(Value::Null);
         };
 
@@ -292,15 +330,26 @@ impl Kakehashi {
         };
 
         let result_id = next_result_id();
-        // Diff against the cached entry while borrowing it in place — cloning
+        // Diff against the cached slot while borrowing it in place — cloning
         // the previous matches would tax every delta request, the hot repeat
         // path. The read guard (the match scrutinee temporary) drops at the
-        // end of this statement, before the insert below touches the same
-        // DashMap shard. `json!` serializes by reference, so `result_id` and
-        // `c.matches` stay owned here and move into the cache insert.
+        // end of this statement. The slot is re-verified against
+        // `previousResultId` because another request for the same mode may
+        // have advanced the lineage during the await above; if it did, fall
+        // back to a full result. `json!` serializes by reference, so
+        // `result_id` and `c.matches` stay owned and move into the store.
+        let slot_index = usize::from(injection);
         let response = match self.captures_cache.get(&key) {
-            Some(entry) if entry.value().0 == params.previous_result_id => {
-                let edits = match matches_delta_edit(&entry.value().2, &c.matches) {
+            Some(entry)
+                if matched
+                    && entry.value()[slot_index]
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == params.previous_result_id) =>
+            {
+                let (_, prev_matches) = entry.value()[slot_index]
+                    .as_ref()
+                    .expect("slot verified Some by the guard above");
+                let edits = match matches_delta_edit(prev_matches, &c.matches) {
                     None => json!([]),
                     Some((start, delete_count, data)) => json!([{
                         "start": start,
@@ -310,20 +359,17 @@ impl Kakehashi {
                 };
                 json!({ "resultId": result_id, "edits": edits })
             }
-            // Stale previousResultId: full result under the stored mode (LSP
-            // convention — a server may always answer a delta with a full).
+            // Stale id (or lineage advanced during the await): full result
+            // under the resolved mode (LSP convention — a server may always
+            // answer a delta with a full).
             _ => json!({
                 "resultId": result_id,
                 "matches": c.matches,
                 "skipped": c.skipped,
             }),
         };
-        // Same didClose-race guard as `full`: never resurrect lineage state
-        // for a document that closed while this request was in flight.
-        if self.documents.get(&key.0).is_some() {
-            self.captures_cache
-                .insert(key, (result_id, injection, c.matches));
-        }
+        self.store_lineage(key.0, key.1, injection, result_id, c.matches)
+            .await;
         Ok(response)
     }
 
