@@ -802,50 +802,6 @@ impl LanguageServerPool {
         }
     }
 
-    /// Translate `upstream_id` to its downstream ID(s) via the cancel map and
-    /// send `$/cancelRequest` to `server_name` for **each** of them — one
-    /// upstream id can have several in-flight downstream requests on the same
-    /// connection (concurrent injection regions of one request), and all of
-    /// them belong to the cancelled upstream request. The pending entries stay
-    /// in place: the server may still respond with a result or
-    /// `REQUEST_CANCELLED` (-32800).
-    ///
-    /// Returns `Ok(())` when the cancel is unforwardable (no connection, not
-    /// Ready, or unknown upstream ID) per LSP best-effort semantics; only real
-    /// I/O write failures bubble up as `Err`.
-    pub(crate) async fn forward_cancel(
-        &self,
-        server_name: &str,
-        upstream_id: &UpstreamId,
-    ) -> io::Result<()> {
-        let Some(handle) = self
-            .ready_connection_for_cancel(server_name, &format!("upstream_id: {upstream_id}"))
-            .await
-        else {
-            return Ok(());
-        };
-
-        // Look up every in-flight downstream ID for this upstream request
-        let downstream_ids = handle.router().lookup_downstream_ids(upstream_id);
-        if downstream_ids.is_empty() {
-            // Request already completed or ID never registered.
-            // Silently drop per best-effort semantics.
-            self.cancel_metrics.record_unknown_id();
-            log::debug!(
-                target: "kakehashi::bridge::cancel",
-                "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
-                upstream_id,
-                server_name
-            );
-            return Ok(());
-        }
-
-        for downstream_id in downstream_ids {
-            self.send_cancel_notification(&handle, server_name, downstream_id)?;
-        }
-        Ok(())
-    }
-
     /// Send `$/cancelRequest` for a **specific** downstream request id on
     /// `server_name`'s connection — no upstream-id lookup involved.
     ///
@@ -857,9 +813,10 @@ impl LanguageServerPool {
     /// regions' in-flight requests sharing the same upstream id, spuriously
     /// cancelling unrelated work (PR #347 review).
     ///
-    /// Best-effort like [`forward_cancel`](Self::forward_cancel): an absent
-    /// or non-Ready connection silently drops the cancel; only real send
-    /// failures bubble up as `Err`.
+    /// Best-effort like
+    /// [`forward_cancel_by_upstream_id_with_notify`](Self::forward_cancel_by_upstream_id_with_notify):
+    /// an absent or non-Ready connection silently drops the cancel; only real
+    /// send failures bubble up as `Err`.
     pub(crate) async fn forward_cancel_downstream(
         &self,
         server_name: &str,
@@ -963,18 +920,30 @@ impl LanguageServerPool {
         }
     }
 
-    /// Fan out `$/cancelRequest` to every server registered for `upstream_id`.
-    /// Invoked by `RequestIdCapture` when the client cancels.
+    /// Fan out `$/cancelRequest` to every server registered for `upstream_id`,
+    /// invoking `notify` after every `(connection, downstream ids)` target has
+    /// been captured and before any cancel is sent. Invoked by
+    /// `RequestIdCapture` (via `CancelForwarder::forward_cancel`) when the
+    /// client cancels.
     ///
     /// LSP cancel is best-effort, so we silently return `Ok(())` (rather than
     /// erroring) when: the ID is unknown, the connection is still initializing,
     /// the downstream ID was already cleaned up, or an individual server send
     /// fails. This avoids racing cancel against handshake completion.
-    pub(crate) async fn forward_cancel_by_upstream_id(
+    ///
+    /// Capture-before-notify ordering is load-bearing: `notify` wakes the
+    /// upstream handler (via `CancelForwarder::notify_cancel`), whose
+    /// cancellation path immediately destroys the very state this lookup reads —
+    /// `unregister_all_for_upstream_id` empties the registry, and dropping the
+    /// in-flight request futures removes their router cancel mappings. Capturing
+    /// first makes that cleanup harmless; sending a cancel for a request the
+    /// server already answered is a documented no-op.
+    pub(crate) async fn forward_cancel_by_upstream_id_with_notify(
         &self,
         upstream_id: UpstreamId,
+        notify: impl FnOnce(),
     ) -> io::Result<()> {
-        // Look up all server names from the registry
+        // 1. Snapshot the servers registered for this upstream id.
         let server_names: Vec<String> = {
             let registry = self
                 .upstream_request_registry
@@ -991,25 +960,54 @@ impl LanguageServerPool {
                         "Cancel dropped: upstream ID {} not in registry (expected during init or after completion)",
                         upstream_id
                     );
+                    notify();
                     return Ok(());
                 }
             }
         };
 
-        // Forward cancel to all servers in parallel (best-effort, log I/O errors).
-        let cancel_futures = server_names
-            .iter()
-            .map(|server_name| self.forward_cancel(server_name, &upstream_id));
-        for result in futures::future::join_all(cancel_futures).await {
-            if let Err(e) = result {
-                // Log I/O errors (queue full, channel closed) for observability.
-                // These indicate connection issues worth investigating.
-                log::warn!(
+        // 2. Capture each server's connection handle and in-flight downstream ids.
+        let mut targets: Vec<(String, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
+        for server_name in server_names {
+            let Some(handle) = self
+                .ready_connection_for_cancel(&server_name, &format!("upstream_id: {upstream_id}"))
+                .await
+            else {
+                continue;
+            };
+            let downstream_ids = handle.router().lookup_downstream_ids(&upstream_id);
+            if downstream_ids.is_empty() {
+                // Request already completed or ID never registered.
+                // Silently drop per best-effort semantics.
+                self.cancel_metrics.record_unknown_id();
+                log::debug!(
                     target: "kakehashi::bridge::cancel",
-                    "Error forwarding cancel for upstream_id {}: {}",
+                    "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
                     upstream_id,
-                    e
+                    server_name
                 );
+                continue;
+            }
+            targets.push((server_name, handle, downstream_ids));
+        }
+
+        // 3. Wake the upstream handler only now that targets are captured.
+        notify();
+
+        // 4. Send the cancels (best-effort, log I/O errors).
+        for (server_name, handle, downstream_ids) in targets {
+            for downstream_id in downstream_ids {
+                if let Err(e) = self.send_cancel_notification(&handle, &server_name, downstream_id)
+                {
+                    // Log I/O errors (queue full, channel closed) for observability.
+                    // These indicate connection issues worth investigating.
+                    log::warn!(
+                        target: "kakehashi::bridge::cancel",
+                        "Error forwarding cancel for upstream_id {}: {}",
+                        upstream_id,
+                        e
+                    );
+                }
             }
         }
 
@@ -2479,9 +2477,12 @@ mod tests {
             .lock()
             .await
             .insert("lua".to_string(), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), "lua");
 
         // Forward cancel request
-        let result = pool.forward_cancel("lua", &upstream_id).await;
+        let result = pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
+            .await;
 
         // Should succeed (the notification was sent)
         assert!(
@@ -2562,13 +2563,15 @@ mod tests {
         );
     }
 
-    /// Test that forward_cancel silently drops when no connection exists (best-effort semantics).
+    /// Test that cancel forwarding silently drops when no connection exists (best-effort semantics).
     #[tokio::test]
     async fn forward_cancel_silently_drops_when_no_connection() {
         let pool = LanguageServerPool::new();
+        let upstream_id = UpstreamId::Number(42);
+        pool.register_upstream_request(upstream_id.clone(), "nonexistent");
 
         let result = pool
-            .forward_cancel("nonexistent", &UpstreamId::Number(42))
+            .forward_cancel_by_upstream_id_with_notify(upstream_id, || {})
             .await;
 
         // Per best-effort semantics, this should succeed (silent drop)
@@ -2578,7 +2581,8 @@ mod tests {
         );
     }
 
-    /// Test that forward_cancel silently drops when upstream ID not found (best-effort semantics).
+    /// Test that cancel forwarding silently drops when the upstream ID has no
+    /// in-flight downstream request on the server (best-effort semantics).
     #[tokio::test]
     async fn forward_cancel_silently_drops_when_upstream_id_not_found() {
         use std::sync::Arc;
@@ -2586,13 +2590,17 @@ mod tests {
         let pool = LanguageServerPool::new();
         let handle = create_handle_with_state(ConnectionState::Ready).await;
 
-        // Insert connection but don't register any request
+        // Insert connection but don't register any request with the router
         pool.connections
             .lock()
             .await
             .insert("lua".to_string(), Arc::clone(&handle));
+        let upstream_id = UpstreamId::Number(999);
+        pool.register_upstream_request(upstream_id.clone(), "lua");
 
-        let result = pool.forward_cancel("lua", &UpstreamId::Number(999)).await;
+        let result = pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id, || {})
+            .await;
 
         // Per best-effort semantics, this should succeed (silent drop)
         assert!(
@@ -2630,6 +2638,58 @@ mod tests {
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert_eq!(registry.get(&UpstreamId::Number(42)), None);
+    }
+
+    /// `notify` wakes the upstream handler, whose cancellation path immediately
+    /// tears down the registry entry (`unregister_all_for_upstream_id`). If the
+    /// forwarder read the registry only after notifying, that cleanup could win
+    /// the race and the downstream `$/cancelRequest` would silently vanish.
+    /// The capture-before-notify contract makes the cleanup harmless.
+    #[tokio::test]
+    async fn forward_cancel_with_notify_survives_handler_cleanup_in_notify() {
+        use std::sync::Arc;
+
+        let pool = Arc::new(LanguageServerPool::new());
+        let handle = create_handle_with_state(ConnectionState::Ready).await;
+
+        let upstream_id = UpstreamId::Number(42);
+        let (downstream_id, _response_rx) = handle
+            .register_request_with_upstream(Some(upstream_id.clone()))
+            .expect("should register request");
+
+        pool.connections
+            .lock()
+            .await
+            .insert("lua".to_string(), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), "lua");
+
+        // Simulate the handler waking on the cancel notification and running
+        // its cleanup before the forwarding pass sends anything.
+        let cleanup_pool = Arc::clone(&pool);
+        let cleanup_id = upstream_id.clone();
+        let result = pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), move || {
+                cleanup_pool.unregister_all_for_upstream_id(Some(&cleanup_id));
+            })
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "forwarding should succeed despite cleanup in notify: {:?}",
+            result.err()
+        );
+        // The cancel must still have been sent: the pending entry stays (cancel
+        // never removes it) and the router mapping still names the downstream id.
+        assert_eq!(
+            handle.router().lookup_downstream_ids(&upstream_id),
+            vec![downstream_id],
+            "downstream request should have been captured before notify ran"
+        );
+        assert_eq!(
+            pool.cancel_metrics.snapshot().0,
+            1,
+            "exactly one $/cancelRequest should have been sent downstream"
+        );
     }
 
     /// Whole-document fan-out issues multiple concurrent requests to the SAME
@@ -2683,7 +2743,7 @@ mod tests {
 
         // Forward cancel by upstream ID only (no language parameter)
         let result = pool
-            .forward_cancel_by_upstream_id(upstream_id.clone())
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
             .await;
 
         // Should succeed because the registry has the mapping
@@ -2701,7 +2761,7 @@ mod tests {
 
         // Don't register anything in the registry
         let result = pool
-            .forward_cancel_by_upstream_id(UpstreamId::Number(999))
+            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(999), || {})
             .await;
 
         // Per best-effort semantics, this should succeed (silent drop)
@@ -2732,9 +2792,12 @@ mod tests {
             .lock()
             .await
             .insert("lua".to_string(), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), "lua");
 
         // Forward cancel request (simulating client cancelling the request)
-        let cancel_result = pool.forward_cancel("lua", &upstream_id).await;
+        let cancel_result = pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
+            .await;
         assert!(cancel_result.is_ok(), "cancel should succeed");
 
         // Now simulate the downstream server responding (with a normal result)
@@ -2804,9 +2867,12 @@ mod tests {
             .lock()
             .await
             .insert("lua".to_string(), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), "lua");
 
         // Forward cancel request
-        let cancel_result = pool.forward_cancel("lua", &upstream_id).await;
+        let cancel_result = pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
+            .await;
         assert!(cancel_result.is_ok(), "cancel should succeed");
 
         // Simulate the downstream server responding with RequestCancelled error
@@ -2856,9 +2922,12 @@ mod tests {
             .lock()
             .await
             .insert("lua".to_string(), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), "lua");
 
         // Forward cancel
-        let _ = pool.forward_cancel("lua", &upstream_id).await;
+        let _ = pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
+            .await;
 
         // Check metrics
         let (successful, no_conn, not_ready, unknown_id, not_in_reg) =
@@ -2878,13 +2947,14 @@ mod tests {
         let pool = LanguageServerPool::new();
 
         // Test: no connection
+        pool.register_upstream_request(UpstreamId::Number(1), "nonexistent");
         let _ = pool
-            .forward_cancel("nonexistent", &UpstreamId::Number(1))
+            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(1), || {})
             .await;
 
         // Test: not in registry
         let _ = pool
-            .forward_cancel_by_upstream_id(UpstreamId::Number(999))
+            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(999), || {})
             .await;
 
         // Test: connection not ready
@@ -2893,8 +2963,9 @@ mod tests {
             .lock()
             .await
             .insert("init_lang".to_string(), Arc::clone(&handle_init));
+        pool.register_upstream_request(UpstreamId::Number(2), "init_lang");
         let _ = pool
-            .forward_cancel("init_lang", &UpstreamId::Number(2))
+            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(2), || {})
             .await;
 
         // Test: unknown upstream ID
@@ -2903,8 +2974,9 @@ mod tests {
             .lock()
             .await
             .insert("ready_lang".to_string(), Arc::clone(&handle_ready));
+        pool.register_upstream_request(UpstreamId::Number(3), "ready_lang");
         let _ = pool
-            .forward_cancel("ready_lang", &UpstreamId::Number(3))
+            .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(3), || {})
             .await;
 
         // Check metrics
@@ -3384,7 +3456,7 @@ mod tests {
 
         // Forward cancel - should succeed for both servers
         let result = pool
-            .forward_cancel_by_upstream_id(upstream_id.clone())
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {})
             .await;
         assert!(result.is_ok());
 
