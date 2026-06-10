@@ -832,7 +832,12 @@ pub fn collect_all_injections<'a>(
                     content_node: capture.node,
                     pattern_index: match_.pattern_index,
                     include_children: has_include_children_for_pattern(query, match_.pattern_index),
-                    offset: parse_offset_directive_for_pattern(query, match_.pattern_index),
+                    // An all-zero offset (malformed directive, or an explicit
+                    // `#offset! … 0 0 0 0`) is a no-op; normalize it to None
+                    // so consumers don't disable included-range stripping for
+                    // an offset that changes nothing.
+                    offset: parse_offset_directive_for_pattern(query, match_.pattern_index)
+                        .filter(|off| *off != InjectionOffset::default()),
                 });
             }
         }

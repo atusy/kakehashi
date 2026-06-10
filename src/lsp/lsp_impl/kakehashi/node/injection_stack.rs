@@ -18,7 +18,7 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges,
+    MAX_INJECTION_DEPTH, collect_all_injections, compute_included_ranges, floor_char_boundary,
     intersect_included_ranges, parse_offset_directive_for_pattern,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
@@ -456,8 +456,8 @@ fn build_effective_ranges(
         // boundary before handing them to tree-sitter — passing a mid-char
         // byte to set_included_ranges is UB / panic territory, and it would
         // also desync from byte_to_point (which aligns internally).
-        let aligned_start = align_down(host_text, eff_start);
-        let aligned_end = align_down(host_text, eff_end);
+        let aligned_start = floor_char_boundary(host_text, eff_start);
+        let aligned_end = floor_char_boundary(host_text, eff_end);
         // The alignment could, in pathological cases, collapse the range
         // (e.g. both ends fall inside the same multi-byte char). Guard so we
         // never emit a zero/negative-width range to the parser.
@@ -530,19 +530,6 @@ fn total_span(ranges: &[tree_sitter::Range]) -> usize {
         .iter()
         .map(|r| r.end_byte.saturating_sub(r.start_byte))
         .sum()
-}
-
-/// Clamp `byte` into `text` and round down to the nearest UTF-8 character
-/// boundary. Byte values derived from `#offset!` directives (i32 deltas in
-/// byte space) are not guaranteed to land on boundaries; feeding a mid-char
-/// byte to tree-sitter's `set_included_ranges` or to a string slice would
-/// panic. Rounding down keeps the offset inside the intended content.
-fn align_down(text: &str, byte: usize) -> usize {
-    let mut aligned = byte.min(text.len());
-    while aligned > 0 && !text.is_char_boundary(aligned) {
-        aligned -= 1;
-    }
-    aligned
 }
 
 /// Materialize every child injection region of `parent_tree` with its
@@ -806,7 +793,7 @@ fn discover_child_languages(
 fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
     // Align first — slicing `&text[..clamped]` on a mid-character byte would
     // panic and crash the LSP server.
-    let clamped = align_down(text, byte);
+    let clamped = floor_char_boundary(text, byte);
     let prefix = &text[..clamped];
     let row = prefix.bytes().filter(|b| *b == b'\n').count();
     let last_nl = prefix.rfind('\n');
