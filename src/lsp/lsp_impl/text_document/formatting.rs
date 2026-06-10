@@ -131,10 +131,6 @@ impl Kakehashi {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
             };
-            let pool = Arc::clone(&pool);
-            let options = options.clone();
-            let region_cancel_rx = cancel_state.derive_receiver();
-
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -146,7 +142,30 @@ impl Kakehashi {
             ) {
                 RegionFormatPlan::Concatenated(servers) => Some(servers),
                 RegionFormatPlan::Preferred => None,
+                RegionFormatPlan::Skip => {
+                    // `concatenated` with a non-empty `priorities` that names only
+                    // unconfigured servers: the allowlist resolved to nothing, so
+                    // running the region's other servers would violate it. Leave
+                    // the region unformatted and warn so the typo'd/missing name
+                    // surfaces instead of silently formatting with the wrong
+                    // server.
+                    log::warn!(
+                        target: "kakehashi::formatting",
+                        "concatenated formatting for {}->{} lists only unconfigured \
+                         server(s) {:?}; none are configured for this region, so it \
+                         is left unformatted (priorities is an allowlist — \
+                         non-listed servers are not run)",
+                        language_name,
+                        region_ctx.resolved.injection_language,
+                        region_ctx.priorities,
+                    );
+                    continue;
+                }
             };
+
+            let pool = Arc::clone(&pool);
+            let options = options.clone();
+            let region_cancel_rx = cancel_state.derive_receiver();
 
             outer_join_set.spawn(async move {
                 if let Some(servers) = pipeline_servers {
@@ -185,15 +204,27 @@ enum RegionFormatPlan {
     Concatenated(Vec<String>),
     /// Use the `preferred` first-non-empty-wins fan-out over the region's servers.
     Preferred,
+    /// Run nothing for this region. Reached only when `concatenated` is active
+    /// with a NON-empty `priorities` whose names are all unconfigured/typo'd, so
+    /// the effective list is empty: every configured server is *absent from the
+    /// allowlist*, and the allowlist (concatenated-formatting-pipeline Decision
+    /// point 2) forbids running any of them. Falling through to `preferred` here
+    /// would wrongly run exactly the servers the user's `priorities` excluded.
+    Skip,
 }
 
 /// Decide the [`RegionFormatPlan`] for a region from its aggregation `strategy`,
 /// `priorities`, and configured server `configs`.
 ///
-/// `concatenated` opts the region into the sequential formatter pipeline
-/// (concatenated-formatting-pipeline) over `effective_priorities_from`; any other
-/// strategy uses `preferred`. An empty effective list falls through to
-/// `preferred`.
+/// Mirrors concatenated-formatting-pipeline Decision points 1–2:
+/// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins);
+/// - `concatenated` with an **empty** `priorities` is a misconfiguration (order
+///   would be undefined) → `Preferred` (a once-per-config warning is emitted at
+///   settings-apply time, see `format_concatenated_formatting_warning`);
+/// - `concatenated` with a **non-empty** `priorities` puts the allowlist in
+///   force: run the effective (configured ∩ `priorities`) servers as a pipeline,
+///   or — when none of the listed names are configured — `Skip`, since the
+///   allowlist forbids running the non-listed servers `preferred` would pick.
 fn plan_region_format(
     strategy: AggregationStrategy,
     priorities: &[String],
@@ -202,9 +233,12 @@ fn plan_region_format(
     if strategy != AggregationStrategy::Concatenated {
         return RegionFormatPlan::Preferred;
     }
+    if priorities.is_empty() {
+        return RegionFormatPlan::Preferred;
+    }
     let effective = effective_priorities_from(priorities, configs);
     if effective.is_empty() {
-        RegionFormatPlan::Preferred
+        RegionFormatPlan::Skip
     } else {
         RegionFormatPlan::Concatenated(effective)
     }
@@ -892,6 +926,44 @@ mod tests {
         assert_eq!(
             plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
             RegionFormatPlan::Concatenated(vec!["isort".to_string(), "black".to_string()])
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_empty_priorities_falls_back_to_preferred() {
+        // ADR point 2: `concatenated` with an EMPTY `priorities` is a
+        // misconfiguration (order is undefined) and falls back to `preferred`.
+        let configs = vec![config("black")];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &[], &configs),
+            RegionFormatPlan::Preferred
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_only_unconfigured_priorities_skips() {
+        // ADR point 2 (allowlist): a NON-empty `priorities` naming only
+        // servers that aren't configured for the region resolves to an empty
+        // effective list. Every configured server is absent from the allowlist,
+        // so the region must run NOTHING — not fall through to `preferred`,
+        // which would run the very servers the allowlist excluded.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["blackk".to_string(), "ruff".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Skip
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_drops_unconfigured_names_but_keeps_configured_ones() {
+        // A partially-typo'd list still runs the configured subset (allowlist
+        // membership), not a skip: only an all-unconfigured list skips.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["ruff".to_string(), "black".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Concatenated(vec!["black".to_string()])
         );
     }
 
