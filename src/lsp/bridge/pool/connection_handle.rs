@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
-    ServerCapabilities, TypeDefinitionProviderCapability,
+    ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability,
+    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
+    TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -444,6 +445,14 @@ impl ConnectionHandle {
                 )
             ),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
+            "textDocument/foldingRange" => matches!(
+                caps.folding_range_provider,
+                Some(
+                    FoldingRangeProviderCapability::Simple(true)
+                        | FoldingRangeProviderCapability::FoldingProvider(_)
+                        | FoldingRangeProviderCapability::Options(_)
+                )
+            ),
             "textDocument/formatting" => {
                 matches!(
                     caps.document_formatting_provider,

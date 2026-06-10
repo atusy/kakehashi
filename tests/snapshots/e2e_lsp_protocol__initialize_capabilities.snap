@@ -40,6 +40,7 @@ expression: capabilities
     "prepareProvider": true
   },
   "documentLinkProvider": {},
+  "foldingRangeProvider": true,
   "declarationProvider": true,
   "semanticTokensProvider": {
     "legend": {
