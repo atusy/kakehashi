@@ -134,14 +134,15 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
         let result_id = next_result_id();
-        let response = json!({
+        // Clone what the delta cache needs up front; the originals then flow
+        // into the response, keeping the ownership split explicit.
+        self.captures_cache
+            .insert((c.uri, params.kind), (result_id.clone(), c.matches.clone()));
+        Ok(json!({
             "resultId": result_id,
             "matches": c.matches,
             "skipped": c.skipped,
-        });
-        self.captures_cache
-            .insert((c.uri, params.kind), (result_id, c.matches));
-        Ok(response)
+        }))
     }
 
     /// Handler for `kakehashi/captures/full/delta`.
@@ -165,6 +166,9 @@ impl Kakehashi {
         let previous = self.captures_cache.get(&key).map(|e| e.value().clone());
 
         let result_id = next_result_id();
+        // Per-branch clones feed the response; the originals move into the
+        // cache insert below. The common edits branch clones only the cheap
+        // result id, never the matches.
         let response = match previous {
             Some((prev_id, prev_matches)) if prev_id == params.previous_result_id => {
                 let edits = match matches_delta_edit(&prev_matches, &c.matches) {
@@ -175,13 +179,13 @@ impl Kakehashi {
                         "data": data,
                     }]),
                 };
-                json!({ "resultId": result_id, "edits": edits })
+                json!({ "resultId": result_id.clone(), "edits": edits })
             }
             // Unknown or stale previousResultId: full result (LSP convention —
             // a server may always answer a delta request with a full result).
             _ => json!({
-                "resultId": result_id,
-                "matches": c.matches,
+                "resultId": result_id.clone(),
+                "matches": c.matches.clone(),
                 "skipped": c.skipped,
             }),
         };
