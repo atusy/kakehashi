@@ -136,8 +136,16 @@ impl Kakehashi {
         let result_id = next_result_id();
         // Clone what the delta cache needs up front; the originals then flow
         // into the response, keeping the ownership split explicit.
-        self.captures_cache
-            .insert((c.uri, params.kind), (result_id.clone(), c.matches.clone()));
+        //
+        // Skip caching when the document closed while this request was in
+        // flight — didClose clears the cache, and an unconditional insert
+        // would resurrect a stale lineage entry for the closed document. A
+        // close racing past this check leaves at most one entry, which the
+        // next didClose for the URI clears again.
+        if self.documents.get(&c.uri).is_some() {
+            self.captures_cache
+                .insert((c.uri, params.kind), (result_id.clone(), c.matches.clone()));
+        }
         Ok(json!({
             "resultId": result_id,
             "matches": c.matches,
@@ -189,7 +197,11 @@ impl Kakehashi {
                 "skipped": c.skipped,
             }),
         };
-        self.captures_cache.insert(key, (result_id, c.matches));
+        // Same didClose-race guard as `full`: never resurrect lineage state
+        // for a document that closed while this request was in flight.
+        if self.documents.get(&key.0).is_some() {
+            self.captures_cache.insert(key, (result_id, c.matches));
+        }
         Ok(response)
     }
 

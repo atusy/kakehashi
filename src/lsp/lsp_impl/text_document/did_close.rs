@@ -37,7 +37,7 @@ impl Kakehashi {
 
         // Drop stored captures results for this document (captures-protocol);
         // a reopened document starts a fresh resultId lineage.
-        self.captures_cache.retain(|(u, _kind), _| u != &uri);
+        self.captures_cache.retain(|key, _| key.0 != uri);
 
         // Abort any in-progress synthetic diagnostic task for this document (pull-first-diagnostic-forwarding Phase 2)
         self.synthetic_diagnostics.remove_document(&uri);
