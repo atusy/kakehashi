@@ -295,7 +295,18 @@ pub(super) fn with_resolved_node_ranges<R>(
     // Host layer: resolve against the host tree without the stack walk.
     if layer == 0 {
         let node = find_node_at(host_tree, start, end, kind)?;
-        let ranges = [whole_document_range(host_text)];
+        // This is the shared prelude for EVERY id-based accessor, so the
+        // whole-document range must be O(1): reuse the root's end position
+        // instead of whole_document_range, whose byte_to_point would rescan
+        // the document on each call. The end point only matters if a consumer
+        // ever reads it — the gap checks are byte-based — and the root's end
+        // position is the document end for a whole-document parse anyway.
+        let ranges = [tree_sitter::Range {
+            start_byte: 0,
+            end_byte: host_text.len(),
+            start_point: tree_sitter::Point { row: 0, column: 0 },
+            end_point: host_tree.root_node().end_position(),
+        }];
         return Some(f(node, &ranges));
     }
 
