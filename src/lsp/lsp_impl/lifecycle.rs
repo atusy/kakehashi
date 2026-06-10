@@ -7,9 +7,9 @@ use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     CompletionOptions, DeclarationCapability, DiagnosticOptions, DiagnosticServerCapabilities,
     DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, OneOf, RenameOptions, SaveOptions,
-    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    InitializeParams, InitializeResult, InitializedParams, LinkedEditingRangeServerCapabilities,
+    OneOf, RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
@@ -251,6 +251,9 @@ impl Kakehashi {
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
+                    true,
+                )),
                 #[cfg(feature = "experimental")]
                 color_provider: Some(ColorProviderCapability::Simple(true)),
                 #[cfg(not(feature = "experimental"))]

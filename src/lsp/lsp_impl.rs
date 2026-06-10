@@ -21,12 +21,12 @@ use tower_lsp_server::ls_types::{
     DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentLink,
     DocumentLinkParams, DocumentRangeFormattingParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams, Location,
-    Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange,
-    SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
-    Uri, WorkspaceEdit,
+    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams,
+    LinkedEditingRangeParams, LinkedEditingRanges, Location, Moniker, MonikerParams,
+    PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 use url::Url;
@@ -462,6 +462,13 @@ impl LanguageServer for Kakehashi {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         self.inlay_hint_impl(params).await
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        self.linked_editing_range_impl(params).await
     }
 
     #[cfg(feature = "experimental")]

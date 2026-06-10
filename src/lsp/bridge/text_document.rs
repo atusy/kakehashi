@@ -24,6 +24,7 @@ mod formatting;
 mod hover;
 mod implementation;
 mod inlay_hint;
+mod linked_editing_range;
 mod moniker;
 mod prepare_rename;
 mod range_formatting;

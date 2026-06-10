@@ -87,6 +87,7 @@ expression: capabilities
     }
   },
   "monikerProvider": true,
+  "linkedEditingRangeProvider": true,
   "inlayHintProvider": true,
   "diagnosticProvider": {
     "interFileDependencies": false,

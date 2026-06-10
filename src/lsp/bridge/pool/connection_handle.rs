@@ -13,8 +13,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-    ImplementationProviderCapability, OneOf, RenameOptions, ServerCapabilities,
-    TypeDefinitionProviderCapability,
+    ImplementationProviderCapability, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions,
+    ServerCapabilities, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -435,6 +435,14 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/linkedEditingRange" => matches!(
+                caps.linked_editing_range_provider,
+                Some(
+                    LinkedEditingRangeServerCapabilities::Simple(true)
+                        | LinkedEditingRangeServerCapabilities::Options(_)
+                        | LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
+                )
+            ),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
             "textDocument/formatting" => {
                 matches!(
