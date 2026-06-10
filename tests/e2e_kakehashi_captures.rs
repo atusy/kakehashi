@@ -245,6 +245,58 @@ fn set_directive_yields_match_level_metadata() {
 }
 
 #[test]
+fn set_directive_with_capture_yields_capture_level_metadata() {
+    // `(#set! @capture key value)` scopes the metadata to that capture
+    // (treesitter-directive-set!): it rides on the capture entry, not the
+    // match envelope, and unannotated captures stay metadata-free.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let md = dir.path().join("queries").join("markdown");
+    std::fs::create_dir_all(&md).expect("create queries/markdown");
+    std::fs::write(
+        md.join("context.scm"),
+        "((atx_heading (inline) @text) @context (#set! @text role \"title\"))\n",
+    )
+    .expect("write markdown context.scm");
+    let mut client = LspClient::new();
+    initialize(&mut client, dir.path());
+    let uri = "file:///captures_set_capture_metadata.md";
+    open_markdown(&mut client, uri, "# Title\n");
+
+    let result = full(&mut client, uri, "context");
+
+    let matches = result
+        .get("matches")
+        .and_then(Value::as_array)
+        .expect("result.matches must be an array");
+    assert_eq!(matches.len(), 1, "one heading: {matches:?}");
+    assert_eq!(
+        matches[0].get("metadata"),
+        None,
+        "capture-scoped #set! does not appear match-level: {matches:?}"
+    );
+    let captures = matches[0]
+        .get("captures")
+        .and_then(Value::as_array)
+        .expect("match must carry captures");
+    let by_name = |name: &str| {
+        captures
+            .iter()
+            .find(|c| c.get("name").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("capture @{name} present: {captures:?}"))
+    };
+    assert_eq!(
+        by_name("text").get("metadata"),
+        Some(&json!({ "role": "title" })),
+        "@text carries its #set! metadata: {captures:?}"
+    );
+    assert_eq!(
+        by_name("context").get("metadata"),
+        None,
+        "unannotated @context has no metadata field: {captures:?}"
+    );
+}
+
+#[test]
 fn delta_without_changes_returns_empty_edits() {
     let dir = context_query_dir();
     let mut client = LspClient::new();

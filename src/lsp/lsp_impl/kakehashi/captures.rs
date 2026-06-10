@@ -576,11 +576,17 @@ impl Kakehashi {
                         // Scope rule).
                         let node =
                             self.mint_node_info(&uri, depth, (c.start_byte, c.end_byte, c.kind));
-                        Some(json!({
+                        let mut capture = json!({
                             "name": c.name,
                             "node": node,
                             "range": { "start": start, "end": end },
-                        }))
+                        });
+                        // Capture-scoped `#set! @cap key value` metadata,
+                        // only when the capture was annotated.
+                        if let Some(meta) = metadata_object(&c.metadata) {
+                            capture["metadata"] = meta;
+                        }
+                        Some(capture)
                     })
                     .collect();
                 // Mirror execute_query's invariant: clients never see an empty

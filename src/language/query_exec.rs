@@ -22,12 +22,17 @@ use crate::language::query_predicates::filter_captures;
 /// `kind` is `&'static str` because tree-sitter interns node kinds in the
 /// grammar's static data, matching the `(start, end, kind)` triple the node
 /// tracker keys on (lazy-node-identity-tracking).
+///
+/// `metadata` holds the pattern's capture-scoped `#set!` directives —
+/// `(#set! @capture key value)` — for this capture, as `(key, value)` pairs
+/// in query-file order (treesitter-directive-set!).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedNode {
     pub name: String,
     pub start_byte: usize,
     pub end_byte: usize,
     pub kind: &'static str,
+    pub metadata: Vec<(String, Option<String>)>,
 }
 
 /// One query match, grouping its captures so correlated captures within a
@@ -66,6 +71,18 @@ pub(crate) fn execute_query(
     }
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
     while let Some(m) = matches.next() {
+        // `#set!` directives are parsed by tree-sitter into per-pattern
+        // property settings; a capture argument scopes one to that capture,
+        // its absence makes it match-level (treesitter-directive-set!).
+        let properties = query.property_settings(m.pattern_index);
+        let metadata_for = |capture_id: Option<usize>| -> Vec<(String, Option<String>)> {
+            properties
+                .iter()
+                .filter(|p| p.capture_id == capture_id)
+                .map(|p| (p.key.to_string(), p.value.as_ref().map(|v| v.to_string())))
+                .collect()
+        };
+
         // `filter_captures` drops captures whose general predicates fail
         // (built-in #eq?/#match?/#any-of? are already applied by `matches()`).
         let captures: Vec<CapturedNode> = filter_captures(query, m, text)
@@ -76,6 +93,7 @@ pub(crate) fn execute_query(
                     start_byte: node.start_byte(),
                     end_byte: node.end_byte(),
                     kind: node.kind(),
+                    metadata: metadata_for(Some(c.index as usize)),
                 }
             })
             .collect();
@@ -86,20 +104,10 @@ pub(crate) fn execute_query(
             continue;
         }
 
-        // `#set!` directives are parsed by tree-sitter into per-pattern
-        // property settings; the match-level ones (no capture argument) apply
-        // to every match of the pattern.
-        let metadata = query
-            .property_settings(m.pattern_index)
-            .iter()
-            .filter(|p| p.capture_id.is_none())
-            .map(|p| (p.key.to_string(), p.value.as_ref().map(|v| v.to_string())))
-            .collect();
-
         out.push(MatchData {
             pattern_index: m.pattern_index,
             captures,
-            metadata,
+            metadata: metadata_for(None),
         });
     }
 
@@ -177,6 +185,33 @@ mod tests {
         assert_eq!(
             matches[0].metadata,
             vec![("kind".to_string(), Some("function".to_string()))]
+        );
+    }
+
+    #[test]
+    fn set_directive_with_capture_attaches_metadata_to_that_capture() {
+        // (#set! @capture key value) is capture-scoped
+        // (treesitter-directive-set!): only the named capture carries it,
+        // and it does not leak into the match-level metadata.
+        let src = "fn foo(x: u32) {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @name (parameters) @params)
+                (#set! @params kind "parameter-list"))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        let m = &matches[0];
+        assert!(m.metadata.is_empty(), "capture-scoped #set! is not match-level");
+        let name = m.captures.iter().find(|c| c.name == "name").unwrap();
+        let params = m.captures.iter().find(|c| c.name == "params").unwrap();
+        assert!(name.metadata.is_empty(), "@name was not annotated");
+        assert_eq!(
+            params.metadata,
+            vec![("kind".to_string(), Some("parameter-list".to_string()))]
         );
     }
 
