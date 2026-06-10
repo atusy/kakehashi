@@ -202,6 +202,29 @@ mod tests {
     }
 
     #[test]
+    fn set_directive_flag_form_extracts_as_none_value() {
+        // (#set! key) with no value is the flag form the wire contract maps
+        // to JSON true. That mapping assumes tree-sitter's property_settings
+        // exposes the missing value as None — pin it here so a change to
+        // Some("") (or dropping the property) can't silently rewrite every
+        // flag's wire value (Copilot review).
+        let src = "fn foo() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @name) (#set! injection.combined))"#,
+        );
+
+        let matches = execute_query(&query, &tree, src, None);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].metadata,
+            vec![("injection.combined".to_string(), None)]
+        );
+    }
+
+    #[test]
     fn set_directive_with_capture_attaches_metadata_to_that_capture() {
         // (#set! @capture key value) is capture-scoped
         // (treesitter-directive-set!): only the named capture carries it,
