@@ -3,16 +3,19 @@
 //!
 //! `textDocument/formatting` resolves every injection region in the document
 //! and asks the configured downstream language servers to format each one.
-//! Within a region, [`dispatch_preferred`] picks the highest-priority
-//! non-empty response (the `preferred` aggregation strategy). Across regions
-//! the resulting [`TextEdit`] lists are concatenated, since each region edits
-//! a disjoint span of the host document.
+//! Across regions the resulting [`TextEdit`] lists are concatenated, since each
+//! region edits a disjoint span of the host document.
 //!
-//! The `concatenated` aggregation strategy is intentionally not implemented
-//! here: formatters from different servers tend to produce conflicting edits
-//! over the same range, so merging them would violate the LSP "edits must not
-//! overlap" rule. If multiple servers are configured, configure a priority
-//! ordering (or rely on first-win) to pick one.
+//! Within a region, the aggregation strategy decides how multiple servers
+//! combine:
+//! - `preferred` (default) — [`dispatch_preferred_formatting`] picks the
+//!   highest-priority non-empty response.
+//! - `concatenated` (with a non-empty `priorities` allowlist) —
+//!   [`dispatch_concatenated_formatting`] runs the listed servers **serially**
+//!   (each formats the previous server's output) and collapses the result into
+//!   one region-replacement edit. Serial application keeps the output
+//!   overlap-free without merging conflicting edits. See
+//!   concatenated-formatting-pipeline.
 //!
 //! # Shared helpers exposed to `range_formatting`
 //!
@@ -28,13 +31,20 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentFormattingParams, TextEdit};
+use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
 
+use crate::config::settings::AggregationStrategy;
+use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::bridge::UpstreamId;
+use crate::lsp::aggregation::server::effective_priorities_from;
+use crate::lsp::aggregation::server::run_sequential_format_pipeline;
+use crate::lsp::bridge::{
+    RegionOffset, ResolvedServerConfig, UpstreamId, VirtualDocumentUri,
+    translate_virtual_range_to_host,
+};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 
@@ -121,44 +131,60 @@ impl Kakehashi {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
             };
+            // Decide how this region formats — concatenated pipeline, preferred
+            // fan-out, or skip — from its resolved aggregation config. See
+            // [`plan_region_format`] for the allowlist rule
+            // (concatenated-formatting-pipeline Decision point 2).
+            let pipeline_servers = match plan_region_format(
+                region_ctx.strategy,
+                &region_ctx.priorities,
+                &region_ctx.configs,
+            ) {
+                RegionFormatPlan::Concatenated(servers) => Some(servers),
+                RegionFormatPlan::Preferred => None,
+                RegionFormatPlan::Skip => {
+                    // `concatenated` with a non-empty `priorities` that names only
+                    // unconfigured servers: the allowlist resolved to nothing, so
+                    // running the region's other servers would violate it. Leave
+                    // the region unformatted and warn so the typo'd/missing name
+                    // surfaces instead of silently formatting with the wrong
+                    // server.
+                    log::warn!(
+                        target: "kakehashi::formatting",
+                        "concatenated formatting for {}->{} lists only unconfigured \
+                         server(s) {:?}; none are configured for this region, so it \
+                         is left unformatted (priorities is an allowlist — \
+                         non-listed servers are not run)",
+                        language_name,
+                        region_ctx.resolved.injection_language,
+                        region_ctx.priorities,
+                    );
+                    continue;
+                }
+            };
+
             let pool = Arc::clone(&pool);
             let options = options.clone();
             let region_cancel_rx = cancel_state.derive_receiver();
 
             outer_join_set.spawn(async move {
-                let result = dispatch_preferred(
-                    &region_ctx,
-                    pool.clone(),
-                    move |t| {
-                        let options = options.clone();
-                        async move {
-                            t.pool
-                                .send_formatting_request(
-                                    &t.server_name,
-                                    &t.server_config,
-                                    &t.uri,
-                                    &t.injection_language,
-                                    &t.region_id,
-                                    t.offset,
-                                    &t.virtual_content,
-                                    options,
-                                    t.upstream_id,
-                                )
-                                .await
-                        }
-                    },
-                    // `Some(vec![])` is an authoritative "no edits needed" from
-                    // the formatter (e.g., ruff signaling the code is already
-                    // formatted) — accept it instead of falling through to a
-                    // lower-priority server that might re-format the same code.
-                    // `None` still means "no response" and triggers fallback.
-                    |opt| opt.is_some(),
-                    region_cancel_rx,
-                )
-                .await;
-                match result {
-                    FanInResult::Done(edits) => edits,
-                    FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+                if let Some(servers) = pipeline_servers {
+                    dispatch_concatenated_formatting(
+                        &region_ctx,
+                        pool.clone(),
+                        options,
+                        servers,
+                        region_cancel_rx,
+                    )
+                    .await
+                } else {
+                    dispatch_preferred_formatting(
+                        &region_ctx,
+                        pool.clone(),
+                        options,
+                        region_cancel_rx,
+                    )
+                    .await
                 }
             });
         }
@@ -167,6 +193,542 @@ impl Kakehashi {
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
         response
     }
+}
+
+/// How a single injection region should be formatted, derived from its resolved
+/// aggregation config. Extracted so the gating rule lives in one testable place.
+#[derive(Debug, PartialEq, Eq)]
+enum RegionFormatPlan {
+    /// Run the sequential concatenated pipeline over these effective servers
+    /// (`priorities` filtered to configured servers, deduped, order preserved).
+    Concatenated(Vec<String>),
+    /// Use the `preferred` first-non-empty-wins fan-out over the region's servers.
+    Preferred,
+    /// Run nothing for this region. Reached only when `concatenated` is active
+    /// with a NON-empty `priorities` whose names are all unconfigured/typo'd, so
+    /// the effective list is empty: every configured server is *absent from the
+    /// allowlist*, and the allowlist (concatenated-formatting-pipeline Decision
+    /// point 2) forbids running any of them. Falling through to `preferred` here
+    /// would wrongly run exactly the servers the user's `priorities` excluded.
+    Skip,
+}
+
+/// Decide the [`RegionFormatPlan`] for a region from its aggregation `strategy`,
+/// `priorities`, and configured server `configs`.
+///
+/// Mirrors concatenated-formatting-pipeline Decision points 1–2:
+/// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins);
+/// - `concatenated` with an **empty** `priorities` is a misconfiguration (order
+///   would be undefined) → `Preferred` (a once-per-config warning is emitted at
+///   settings-apply time, see `format_concatenated_formatting_warning`);
+/// - `concatenated` with a **non-empty** `priorities` puts the allowlist in
+///   force: run the effective (configured ∩ `priorities`) servers as a pipeline,
+///   or — when none of the listed names are configured — `Skip`, since the
+///   allowlist forbids running the non-listed servers `preferred` would pick.
+fn plan_region_format(
+    strategy: AggregationStrategy,
+    priorities: &[String],
+    configs: &[ResolvedServerConfig],
+) -> RegionFormatPlan {
+    if strategy != AggregationStrategy::Concatenated {
+        return RegionFormatPlan::Preferred;
+    }
+    if priorities.is_empty() {
+        return RegionFormatPlan::Preferred;
+    }
+    let effective = effective_priorities_from(priorities, configs);
+    if effective.is_empty() {
+        RegionFormatPlan::Skip
+    } else {
+        RegionFormatPlan::Concatenated(effective)
+    }
+}
+
+/// `preferred`-strategy formatting for one region: the existing
+/// first-non-empty-wins fan-out, factored out of the per-region task body.
+async fn dispatch_preferred_formatting(
+    region_ctx: &DocumentRequestContext,
+    pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+    options: tower_lsp_server::ls_types::FormattingOptions,
+    region_cancel_rx: Option<CancelReceiver>,
+) -> Option<Vec<TextEdit>> {
+    let result = dispatch_preferred(
+        region_ctx,
+        pool,
+        move |t| {
+            let options = options.clone();
+            async move {
+                t.pool
+                    .send_formatting_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &t.uri,
+                        &t.injection_language,
+                        &t.region_id,
+                        t.offset,
+                        &t.virtual_content,
+                        options,
+                        t.upstream_id,
+                    )
+                    .await
+            }
+        },
+        // `Some(vec![])` is an authoritative "no edits needed" from the
+        // formatter (e.g., ruff signaling the code is already formatted) —
+        // accept it instead of falling through to a lower-priority server that
+        // might re-format the same code. `None` still means "no response" and
+        // triggers fallback.
+        |opt| opt.is_some(),
+        region_cancel_rx,
+    )
+    .await;
+    match result {
+        FanInResult::Done(edits) => edits,
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+    }
+}
+
+/// `concatenated`-strategy formatting for one region: the sequential formatter
+/// pipeline (concatenated-formatting-pipeline).
+///
+/// Runs the region's priority-listed servers serially over the region's virtual
+/// content — each server formats the previous server's output — then collapses
+/// the final text into a single host-coordinate region-replacement edit. When
+/// the final text is byte-identical to the region's original content (no step
+/// changed anything, or the changes round-tripped), contributes no edit.
+///
+/// Each step targets a unique scratch virtual document
+/// ([`scratch_region_id`]), so the bridge always sends a fresh `didOpen`
+/// carrying the current accumulated text — fixing the stale-content bug where a
+/// step reused an already-open canonical document and formatted the *original*
+/// region text. Scratch documents are `didClose`d solely by
+/// [`ScratchCleanupGuard`]'s Drop rather than per step, so cancellation can never
+/// leak one (concatenated-formatting-pipeline Decision point 7).
+///
+/// Cleanup is guaranteed even on cancel: every opened-but-not-yet-closed scratch
+/// document is tracked, and the guard's Drop — which fires on the normal return,
+/// the `select!` cancel return, and a future-level abort alike — drains the
+/// tracker and detaches the didCloses onto a task that always runs to completion.
+/// Without this, a `$/cancelRequest` that drops the in-flight step future before
+/// its own `close_scratch_document` ran would leak that scratch virtual document
+/// downstream (review HIGH). Routing every cleanup through the detached task also
+/// removes the cancel-during-cleanup edge cases the old awaited sweep had: a
+/// cancel mid-`didClose` can no longer orphan a downstream doc.
+///
+/// TODO(concatenated-formatting-pipeline): still to build (see the ADR):
+///   - capability-based full -> rangeFormatting fallback for range-only servers,
+///     distinguishing "no capability" from a `null` "already formatted";
+///   - per-step remaining-budget timeout and concurrent $/cancelRequest
+///     propagation (Decision points 6 and the Consequences cancellation note);
+///   - discarding downstream `publishDiagnostics` targeting scratch URIs;
+///     prompt didClose currently minimizes (but does not eliminate) the window.
+async fn dispatch_concatenated_formatting(
+    region_ctx: &DocumentRequestContext,
+    pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+    options: tower_lsp_server::ls_types::FormattingOptions,
+    // The effective (configured, deduped, order-preserving) priority list,
+    // computed by the caller — which also gates entry on it being non-empty.
+    server_names: Vec<String>,
+    cancel_rx: Option<CancelReceiver>,
+) -> Option<Vec<TextEdit>> {
+    let offset = RegionOffset::with_per_line_offsets(
+        region_ctx.resolved.region.line_range.start,
+        region_ctx.resolved.line_column_offsets.clone(),
+    );
+    let original_virtual = region_ctx.resolved.virtual_content.clone();
+    // Precompute the host replacement range now, while we still hold
+    // `original_virtual`, so it can be moved into the pipeline below without a
+    // second clone. An unresolvable end position means we emit no edit (bounded
+    // -range safety) — so bail before doing any downstream work.
+    let replacement_range = region_replacement_range(&original_virtual, &offset)?;
+    let injection_language = region_ctx.resolved.injection_language.clone();
+    let region_id = region_ctx.resolved.region.region_id.clone();
+    let uri = region_ctx.uri.clone();
+    let upstream_id = region_ctx.upstream_request_id.clone();
+
+    let server_config_for = |name: &str| {
+        region_ctx
+            .configs
+            .iter()
+            .find(|c| c.server_name == name)
+            .map(|c| Arc::clone(&c.config))
+    };
+
+    // Each pipeline step targets a *fresh* scratch virtual document so the
+    // bridge always performs a new `didOpen` carrying the current accumulated
+    // text. Reusing the canonical region virtual document would make a step
+    // format STALE text whenever that document is already open downstream (e.g.
+    // after a prior hover/diagnostic), because `send_formatting_request` only
+    // pushes content on the first `didOpen` (concatenated-formatting-pipeline
+    // Decision point 7, stale-content bug). The per-step counter makes the
+    // scratch id unique; scratch documents are `didClose`d solely by
+    // `ScratchCleanupGuard`'s Drop, not per step, so a cancel can't leak one.
+    let step_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Per-run sequence so scratch ids don't collide with a concurrent
+    // concatenated-formatting request for the same region (which would also start
+    // at step 0).
+    let run_seq = SCRATCH_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Convert the host URL to the bridge protocol's `Uri` once, for the per-step
+    // didClose. This conversion is effectively infallible for a valid host URL;
+    // if it ever failed, `send_formatting_request` (which performs the same
+    // conversion internally) would also fail, so the step would simply contribute
+    // no edit — there is no path where a step opens a scratch doc we then can't
+    // close. The scratch doc is also swept on the host document's own close.
+    let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&uri).ok();
+
+    // Track every scratch document opened during this run. Steps only register
+    // their scratch docs here; they never close them per step. All closing
+    // happens in `ScratchCleanupGuard`'s Drop, which drains the tracker and
+    // closes each doc on a detached task. Deferring all cleanup to that single
+    // cancel-safe point is what guarantees a cancel can never leak a scratch
+    // document downstream.
+    let open_scratch: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Sole scratch-document cleanup path: the guard's Drop runs on every exit
+    // from this function — normal return, the `select!` cancel return below, and
+    // a future-level abort (outer `JoinSet` dropped / tower-lsp task cancelled) at
+    // any `.await` point. Its Drop drains the tracker and, if anything remains,
+    // detaches the didCloses onto a task that outlives this (possibly aborted)
+    // future and runs them to completion. Because the close runs on a detached
+    // task that always completes, `close_scratch_document`'s untrack-before-didClose
+    // ordering is safe — there is no cancellable awaited sweep that could be
+    // interrupted mid-didClose and orphan a downstream doc. Kept alive across the
+    // whole pipeline below.
+    let _scratch_guard =
+        ScratchCleanupGuard::new(Arc::clone(&pool), uri.clone(), Arc::clone(&open_scratch));
+
+    let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
+        let pool = Arc::clone(&pool);
+        let open_scratch = Arc::clone(&open_scratch);
+        move |server_name, current_text| {
+            let pool = Arc::clone(&pool);
+            let options = options.clone();
+            let injection_language = injection_language.clone();
+            let region_id = region_id.clone();
+            let uri = uri.clone();
+            let upstream_id = upstream_id.clone();
+            let server_config = server_config_for(&server_name);
+            let step_counter = Arc::clone(&step_counter);
+            let host_uri_lsp = host_uri_lsp.clone();
+            let open_scratch = Arc::clone(&open_scratch);
+            async move {
+                // No config for this server name: skip-and-continue, handing the
+                // unchanged text back to the pipeline (ADR Decision point 6).
+                let Some(server_config) = server_config else {
+                    return (current_text, None);
+                };
+                let step = step_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let scratch_id = scratch_region_id(&region_id, run_seq, step);
+
+                // Build the scratch URI up front and register it as "open" in the
+                // shared tracker BEFORE the request, so that if this future is
+                // dropped mid-send by a cancel, `ScratchCleanupGuard`'s Drop still
+                // closes it. Skipped only when the host URL could not be
+                // converted (then no didClose is possible anyway).
+                let scratch_uri = host_uri_lsp
+                    .as_ref()
+                    .map(|h| VirtualDocumentUri::new(h, &injection_language, &scratch_id));
+                if let Some(scratch_uri) = scratch_uri.as_ref() {
+                    push_open_scratch(
+                        &open_scratch,
+                        OpenScratchDoc {
+                            uri: scratch_uri.clone(),
+                            server_name: server_name.clone(),
+                        },
+                    );
+                }
+
+                // The bridge translates the returned edits back to host
+                // coordinates, but the pipeline applies them to the *virtual*
+                // accumulated text, so request a fresh virtual-coordinate
+                // result by passing the zero offset for the response transform.
+                // The region offset is only re-applied once, when the final
+                // text is collapsed into the host replacement edit below.
+                //
+                // Per-step host-transform interaction: `send_formatting_request`
+                // runs `transform_formatting_response_to_host`, which clamps
+                // edits to a synthetic EOF and drops any past `virtual_line_count`
+                // for *this step's* `current_text`. Because we pass
+                // `RegionOffset::new(0, 0)` (an identity translation) and the
+                // step's own current text, those edits come back already
+                // EOF-clamped and host-translated by a zero offset — i.e. still
+                // in virtual coordinates relative to `current_text` — so applying
+                // them to the virtual accumulated text is correct. The single
+                // real region-offset translation happens once in the precomputed
+                // `region_replacement_range`.
+                // (`apply_text_edits` does its own clamping as a general safety
+                // net, independent of this transform.)
+                let send_result = pool
+                    .send_formatting_request(
+                        &server_name,
+                        &server_config,
+                        &uri,
+                        &injection_language,
+                        &scratch_id,
+                        RegionOffset::new(0, 0),
+                        &current_text,
+                        options,
+                        upstream_id,
+                    )
+                    .await;
+
+                // ADR Decision point 6 (best-effort, skip-and-continue): a
+                // failed step is skipped — never surfaced to the editor — but is
+                // logged so the misbehaving server stays diagnosable. We log the
+                // downstream error here (before mapping to `None`) instead of
+                // silently dropping it with `.ok().flatten()`.
+                let result = match send_result {
+                    Ok(edits) => edits,
+                    Err(e) => {
+                        log::warn!(
+                            target: "kakehashi::formatting",
+                            "concatenated formatting step for server {} failed; skipping (ADR point 6): {}",
+                            server_name,
+                            e
+                        );
+                        None
+                    }
+                };
+
+                // Scratch-document cleanup is deferred to `ScratchCleanupGuard`'s
+                // Drop, NOT closed here per step. The guard's Drop detaches the
+                // didCloses onto a task that always runs to completion, so a
+                // cancel that drops this step's future mid-flight can never leak a
+                // scratch doc; closing per-step inside the (cancellable) pipeline
+                // future could be interrupted after the tracker entry was already
+                // removed, leaking it. The scratch doc stays tracked in
+                // `open_scratch` (registered above) for the guard to close.
+
+                // Hand the (unchanged) virtual text back to the pipeline along
+                // with the result so the pipeline can move it forward without a
+                // per-step clone.
+                (current_text, result)
+            }
+        }
+    });
+
+    // Poll cancellation concurrently with the in-flight pipeline so an upstream
+    // $/cancelRequest aborts the region promptly rather than only between steps.
+    // On cancel we just stop polling the pipeline and return None; the scratch
+    // documents the run opened are closed by `_scratch_guard`'s Drop (which fires
+    // on this return as well as on a future-level abort), so there is no explicit
+    // sweep to interrupt. (Per-step $/cancelRequest propagation to the downstream
+    // server is a follow-up — TODO(concatenated-formatting-pipeline).)
+    let cancelled;
+    let final_text = match cancel_rx {
+        Some(mut rx) => {
+            tokio::select! {
+                res = pipeline_fut => { cancelled = false; res }
+                _ = &mut rx => { cancelled = true; None }
+            }
+        }
+        None => {
+            cancelled = false;
+            pipeline_fut.await
+        }
+    };
+
+    // On cancel, contribute no edit (matches the prior early-return behavior).
+    // Scratch cleanup is handled entirely by `_scratch_guard`'s Drop below.
+    if cancelled {
+        return None;
+    }
+
+    let final_text = final_text?;
+    Some(vec![TextEdit {
+        range: replacement_range,
+        new_text: final_text,
+    }])
+}
+
+/// A scratch virtual document opened during a concatenated-formatting run that
+/// has not yet been closed. Paired with its `server_name` so the `didClose`
+/// targets the connection the matching `didOpen` was sent on.
+#[derive(Clone)]
+struct OpenScratchDoc {
+    uri: VirtualDocumentUri,
+    server_name: String,
+}
+
+/// Drop-based cleanup that closes every scratch document still tracked open when
+/// the concatenated-formatting future exits — the **sole** scratch cleanup path.
+///
+/// Its `Drop` runs on every exit from `dispatch_concatenated_formatting`: the
+/// normal return, the `select!` cancel return, and a future-level abort (its
+/// outer `JoinSet` dropped or the tower-lsp task cancelled) at any `.await`
+/// point.
+///
+/// `Drop` cannot `.await`, so it drains the tracker and, if anything remains,
+/// **spawns a detached `tokio::task`** to run the `didClose`s. A detached task is
+/// NOT a child of the (possibly aborted) future, so it survives the parent's
+/// cancellation and runs the `close_scratch_document` calls to completion — which
+/// is also why `close_scratch_document` can keep its untrack-before-didClose
+/// ordering (the detached task guarantees the didClose await still completes,
+/// even on the abort path, so it can never orphan a downstream doc).
+struct ScratchCleanupGuard {
+    pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+    host_uri: url::Url,
+    open: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>>,
+}
+
+impl ScratchCleanupGuard {
+    fn new(
+        pool: Arc<crate::lsp::bridge::LanguageServerPool>,
+        host_uri: url::Url,
+        open: Arc<std::sync::Mutex<Vec<OpenScratchDoc>>>,
+    ) -> Self {
+        Self {
+            pool,
+            host_uri,
+            open,
+        }
+    }
+}
+
+impl Drop for ScratchCleanupGuard {
+    fn drop(&mut self) {
+        // This guard is the sole scratch-document cleanup path: on every exit of
+        // `dispatch_concatenated_formatting` (normal return, select!-cancel
+        // return, or future-level abort) the guard drops and drains the tracker
+        // here. Nothing else drains it, so there is no double-close to guard
+        // against.
+        let remaining = drain_open_scratch(&self.open);
+        if remaining.is_empty() {
+            return;
+        }
+
+        // Drop can't await, and the parent future is (in the case that matters)
+        // being aborted — so finish the didCloses on a DETACHED task that is not a
+        // child of the aborted future and therefore runs to completion.
+        //
+        // `tokio::spawn` panics outside a runtime, so spawn via a `Handle` from
+        // `try_current`. In practice this guard always drops inside the request's
+        // task (a runtime is present); the `Err` arm only guards pathological
+        // drops (shutdown / a synchronous context), where we log and rely on the
+        // host document's own close to reap the scratch docs rather than panicking.
+        let count = remaining.len();
+        let pool = Arc::clone(&self.pool);
+        let host_uri = self.host_uri.clone();
+        let cleanup = async move {
+            for doc in remaining {
+                pool.close_scratch_document(&host_uri, &doc.uri, &doc.server_name)
+                    .await;
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(cleanup);
+            }
+            Err(_) => {
+                log::warn!(
+                    target: "kakehashi::formatting",
+                    "ScratchCleanupGuard dropped outside a Tokio runtime; {count} scratch document(s) left for host-close cleanup"
+                );
+            }
+        }
+    }
+}
+
+/// Record a scratch document as open. Poison-safe: a poisoned mutex is recovered
+/// (the tracked data is plain values, not invariants), logged per the project
+/// lock-recovery convention.
+fn push_open_scratch(open: &std::sync::Mutex<Vec<OpenScratchDoc>>, doc: OpenScratchDoc) {
+    lock_open_scratch(open).push(doc);
+}
+
+/// Drain and return all still-open scratch documents.
+fn drain_open_scratch(open: &std::sync::Mutex<Vec<OpenScratchDoc>>) -> Vec<OpenScratchDoc> {
+    std::mem::take(&mut *lock_open_scratch(open))
+}
+
+/// Lock the open-scratch tracker, recovering from poisoning per the project
+/// convention (no `unwrap()` on locks).
+fn lock_open_scratch(
+    open: &std::sync::Mutex<Vec<OpenScratchDoc>>,
+) -> std::sync::MutexGuard<'_, Vec<OpenScratchDoc>> {
+    open.lock().recover_poison("scratch-document tracker")
+}
+
+/// Derive a unique scratch `region_id` for one step of the concatenated
+/// formatting pipeline.
+///
+/// The pipeline feeds each server the *previous* server's output by passing the
+/// accumulated text to `send_formatting_request`. But the bridge only pushes
+/// that content downstream via `didOpen` when the virtual document is not yet
+/// open (`ensure_document_opened`); if the canonical region virtual document is
+/// already open for that server (common after a prior hover/diagnostic), the
+/// formatting request reuses the stale open document and the server formats the
+/// *original* region text, breaking the serial semantics
+/// (concatenated-formatting-pipeline, the stale-content bug). Giving each step a
+/// distinct `region_id` yields a distinct [`VirtualDocumentUri`], so the bridge
+/// always performs a fresh `didOpen` carrying the current accumulated text.
+///
+/// The id keeps the canonical `region_id` as a prefix (so it stays unique per
+/// region — no host-file collision) and appends a `-kakehashi-scratch-{run}-{step}`
+/// suffix: the `run` (a process-global sequence) keeps concurrent runs for the
+/// same region distinct, and `step` keeps each step within a run distinct. The
+/// `kakehashi-scratch` marker (Decision point 7) lets external tools (file
+/// watchers, build tools, test runners) recognize and ignore these throwaway
+/// documents. It still flows through [`VirtualDocumentUri::new`], which also
+/// wraps it in the `kakehashi-virtual-uri-` filename marker and preserves the
+/// host directory and language extension required for downstream config and
+/// parser discovery.
+/// Process-global, monotonically increasing pipeline-run sequence. The per-step
+/// counter alone only makes scratch ids unique *within* a single pipeline run;
+/// two concatenated-formatting requests for the same host region overlapping in
+/// time (concurrent LSP requests, or a cancel+restart race) would otherwise both
+/// start at step 0 and collide on the same scratch virtual URI. Mixing in this
+/// run sequence makes scratch ids unique across concurrent runs in the process.
+// `AtomicUsize` (not `AtomicU64`) so the build stays portable to targets without
+// native 64-bit atomics; a pointer-width counter is more than enough for run ids.
+static SCRATCH_RUN_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
+    format!("{region_id}-kakehashi-scratch-{run}-{step}")
+}
+
+/// Compute the host-coordinate `Range` that the concatenated pipeline's single
+/// whole-region replacement edit spans.
+///
+/// The range covers the whole *original* virtual document (`(0,0)` through the
+/// end of `original_virtual`), translated to host coordinates via the region
+/// [`RegionOffset`]. Emitting one whole-region edit keeps the LSP output
+/// trivially non-overlapping (concatenated-formatting-pipeline Decision point 4).
+///
+/// Returns `None` when the virtual end position cannot be resolved, rather than
+/// fabricating an unbounded range. `byte_to_position` should always succeed for
+/// the document's own length, but if it ever returns `None` (a mapper bug or
+/// corrupt content), emitting a `u32::MAX`/`u32::MAX` range would translate into
+/// a host edit spanning essentially the whole file — silently corrupting it. We
+/// emit no edit for that region instead, which is the safe degradation.
+///
+/// TODO(concatenated-formatting-pipeline): Decision point 4 also requires
+/// re-applying the region's per-line host prefix/indentation to every line of
+/// `final_text` (and the region LCP for new lines on a line-count change), plus
+/// trimming trailing whitespace on empty lines. This slice emits `final_text`
+/// verbatim and relies on the existing range translation only, so multi-line /
+/// blockquoted regions still drop host indentation on replacement lines — the
+/// same limitation documented in `src/lsp/bridge/text_document/formatting.rs`.
+fn region_replacement_range(original_virtual: &str, offset: &RegionOffset) -> Option<Range> {
+    // Virtual end position = the position one past the last byte (EOF), derived
+    // via the shared PositionMapper from `original_virtual.len()` so line-ending
+    // handling (incl. `\r\n`) and UTF-16 column math stay consistent with the rest
+    // of the codebase. Computed from the original virtual text *before* it is
+    // moved into the pipeline, so the pipeline takes ownership without a second
+    // clone.
+    let end = crate::text::PositionMapper::new(original_virtual)
+        .byte_to_position(original_virtual.len())?;
+
+    let mut range = Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end,
+    };
+    translate_virtual_range_to_host(&mut range, offset);
+    Some(range)
 }
 
 /// Sort `edits` in place by `range.start` (line, then character).
@@ -325,6 +887,271 @@ mod tests {
             },
             new_text: new_text.to_string(),
         }
+    }
+
+    // ==========================================================================
+    // plan_region_format (concatenated-formatting-pipeline Decision point 2:
+    // `priorities` is an allowlist + order)
+    // ==========================================================================
+
+    fn config(name: &str) -> ResolvedServerConfig {
+        ResolvedServerConfig {
+            server_name: name.to_string(),
+            config: Arc::new(crate::config::settings::BridgeServerConfig {
+                cmd: vec![name.to_string()],
+                languages: vec![],
+                initialization_options: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn plan_non_concatenated_strategy_uses_preferred() {
+        // Default `preferred` keeps the first-non-empty-wins fan-out regardless
+        // of priorities.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["black".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Preferred, &priorities, &configs),
+            RegionFormatPlan::Preferred
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_configured_priorities_runs_pipeline() {
+        // `concatenated` + priorities that resolve to configured servers opts
+        // into the sequential pipeline over exactly those servers, in order.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["isort".to_string(), "black".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Concatenated(vec!["isort".to_string(), "black".to_string()])
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_empty_priorities_falls_back_to_preferred() {
+        // ADR point 2: `concatenated` with an EMPTY `priorities` is a
+        // misconfiguration (order is undefined) and falls back to `preferred`.
+        let configs = vec![config("black")];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &[], &configs),
+            RegionFormatPlan::Preferred
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_only_unconfigured_priorities_skips() {
+        // ADR point 2 (allowlist): a NON-empty `priorities` naming only
+        // servers that aren't configured for the region resolves to an empty
+        // effective list. Every configured server is absent from the allowlist,
+        // so the region must run NOTHING — not fall through to `preferred`,
+        // which would run the very servers the allowlist excluded.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["blackk".to_string(), "ruff".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Skip
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_drops_unconfigured_names_but_keeps_configured_ones() {
+        // A partially-typo'd list still runs the configured subset (allowlist
+        // membership), not a skip: only an all-unconfigured list skips.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["ruff".to_string(), "black".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Concatenated(vec!["black".to_string()])
+        );
+    }
+
+    // ==========================================================================
+    // scratch_region_id (concatenated-formatting-pipeline: stale-content fix)
+    // ==========================================================================
+
+    #[test]
+    fn scratch_region_id_is_unique_per_step() {
+        // Each pipeline step must get a distinct scratch id so the bridge builds
+        // a distinct virtual URI and re-sends a fresh didOpen with the current
+        // accumulated text (rather than reusing the prior step's stale document).
+        let a = scratch_region_id("REGION", 0, 0);
+        let b = scratch_region_id("REGION", 0, 1);
+        let c = scratch_region_id("REGION", 0, 2);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn scratch_region_id_is_unique_across_runs_for_the_same_step() {
+        // Two concurrent format requests for the same region both start at step 0;
+        // the per-run sequence must still make their scratch ids distinct.
+        assert_ne!(
+            scratch_region_id("REGION", 7, 0),
+            scratch_region_id("REGION", 8, 0)
+        );
+    }
+
+    #[test]
+    fn scratch_region_id_differs_from_canonical_region_id() {
+        // The scratch document must never collide with the region's canonical
+        // virtual document (which other requests like hover keep open).
+        let region_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert_ne!(scratch_region_id(region_id, 0, 0), region_id);
+    }
+
+    #[test]
+    fn scratch_region_id_keeps_region_id_as_prefix() {
+        // Preserving the region_id prefix keeps the scratch id unique per region
+        // (no host-file collision across regions).
+        let id = scratch_region_id("REGION", 0, 3);
+        assert!(
+            id.starts_with("REGION"),
+            "scratch id should keep the region_id prefix: {id}"
+        );
+    }
+
+    #[test]
+    fn scratch_region_id_produces_virtual_uri_with_marker_and_extension() {
+        // The scratch id must flow through VirtualDocumentUri to keep the host
+        // directory + language extension (config/parser discovery) and the
+        // distinctive kakehashi-virtual-uri- marker (Decision point 7).
+        use crate::lsp::bridge::VirtualDocumentUri;
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///project/doc.md".parse().unwrap();
+        let id = scratch_region_id("REGION", 0, 1);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "python", &id);
+        let uri_string = virtual_uri.to_uri_string();
+        assert!(
+            uri_string.starts_with("file:///project/kakehashi-virtual-uri-"),
+            "scratch URI must keep host dir + marker: {uri_string}"
+        );
+        assert!(
+            uri_string.ends_with(".py"),
+            "scratch URI must keep the language extension: {uri_string}"
+        );
+        assert!(
+            VirtualDocumentUri::is_virtual_uri(&uri_string),
+            "scratch URI must be recognized as virtual: {uri_string}"
+        );
+    }
+
+    // ==========================================================================
+    // Scratch-document tracking/cleanup (review HIGH: leak-on-cancel)
+    // ==========================================================================
+
+    fn scratch_doc(host: &str, id: &str, server: &str) -> OpenScratchDoc {
+        let host_uri: tower_lsp_server::ls_types::Uri = host.parse().unwrap();
+        OpenScratchDoc {
+            uri: VirtualDocumentUri::new(&host_uri, "python", id),
+            server_name: server.to_string(),
+        }
+    }
+
+    #[test]
+    fn open_scratch_tracker_drains_what_was_pushed() {
+        // The guard's Drop relies on draining everything that was recorded open
+        // but never removed by a per-step close.
+        let open = std::sync::Mutex::new(Vec::new());
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
+
+        let drained = drain_open_scratch(&open);
+        assert_eq!(drained.len(), 2, "both opened scratch docs must be drained");
+        assert!(
+            drain_open_scratch(&open).is_empty(),
+            "drain must leave the tracker empty (no double-close)"
+        );
+    }
+
+    #[test]
+    fn open_scratch_tracker_accumulates_every_step_for_the_guard() {
+        // Steps only register their scratch docs; the guard's Drop is the single
+        // close point, so every pushed doc must still be present to drain.
+        let open = std::sync::Mutex::new(Vec::new());
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
+        let drained = drain_open_scratch(&open);
+        assert_eq!(
+            drained.len(),
+            2,
+            "the guard must see every step's scratch doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_cleanup_guard_drains_tracker_on_drop() {
+        // The guard is the sole scratch cleanup path: on every exit from the
+        // dispatch future (normal return, select! cancel, or future-level abort)
+        // its Drop must drain the tracker (and detach the didClose), so no scratch
+        // doc leaks. Here we assert the drain-on-drop: the tracker is emptied.
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-1", "isort"));
+
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::new());
+        let host = url::Url::parse("file:///d.md").unwrap();
+        let guard = ScratchCleanupGuard::new(Arc::clone(&pool), host, Arc::clone(&open));
+
+        drop(guard);
+
+        assert!(
+            lock_open_scratch(&open).is_empty(),
+            "guard Drop must drain the tracker so nothing leaks"
+        );
+    }
+
+    #[test]
+    fn lock_open_scratch_recovers_from_poison() {
+        // Per the project convention, lock helpers must recover from poisoning
+        // rather than unwrap()-panic.
+        let open = Arc::new(std::sync::Mutex::new(Vec::new()));
+        push_open_scratch(&open, scratch_doc("file:///d.md", "R-scratch-0", "black"));
+
+        // Poison the mutex by panicking while holding the guard.
+        let open_clone = Arc::clone(&open);
+        let _ = std::thread::spawn(move || {
+            let _guard = open_clone.lock().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+
+        // Recovery path must still observe the previously-tracked doc.
+        let drained = drain_open_scratch(&open);
+        assert_eq!(
+            drained.len(),
+            1,
+            "poison recovery must preserve tracked scratch docs"
+        );
+    }
+
+    // ==========================================================================
+    // region_replacement_range (review: unbounded-range fallback)
+    // ==========================================================================
+
+    #[test]
+    fn region_replacement_range_resolves_end_for_valid_text() {
+        // For any valid UTF-8 region the end position is resolvable, so we get a
+        // bounded replacement range — never the old u32::MAX/u32::MAX fallback.
+        let offset = RegionOffset::new(0, 0);
+        let range = region_replacement_range("line1\nline2", &offset)
+            .expect("end position must resolve for valid text");
+        // End is the position just past the last byte: line 1, char 5 ("line2").
+        assert_eq!(range.end.line, 1);
+        assert_eq!(range.end.character, 5);
+        // Crucially, the range is bounded (no fabricated u32::MAX).
+        assert_ne!(range.end.line, u32::MAX);
+        assert_ne!(range.end.character, u32::MAX);
+    }
+
+    #[test]
+    fn region_replacement_range_handles_empty_region() {
+        // Empty region → end at (0,0), still a bounded Some(range).
+        let offset = RegionOffset::new(0, 0);
+        let range = region_replacement_range("", &offset).expect("empty region must still resolve");
+        assert_eq!(range.end.line, 0);
+        assert_eq!(range.end.character, 0);
     }
 
     #[test]
