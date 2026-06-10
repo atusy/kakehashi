@@ -901,7 +901,8 @@ fn test_position_accessors_return_null_for_unknown_id() {
 const BLOCKQUOTED_PYTHON: &str = "> ```python\n> x = 1\n> y = 2\n> ```\n";
 
 /// Resolve the injected python layer's root by entering the layer at a cursor
-/// on `x` (line 1, character 4 — after the `> ` prefix) and climbing parents;
+/// at the `=` of `x = 1` (line 1, character 4 — past the `> ` prefix) and
+/// climbing parents;
 /// per-layer scope keeps the walk inside the python tree.
 fn python_layer_root(client: &mut LspClient, uri: &str) -> String {
     let node = call(
