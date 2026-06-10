@@ -588,12 +588,16 @@ async fn dispatch_concatenated_formatting(
                     if step_request == PipelineStepRequest::Skip {
                         // Neither documentFormattingProvider nor
                         // documentRangeFormattingProvider: contribute nothing and
-                        // send no unsupported request (ADR point 3.2).
+                        // send no unsupported request (ADR point 3.2). The probe
+                        // also reports no capability while the connection is
+                        // still initializing (cold start), so the log mentions
+                        // that case — a later request will see the Ready server.
                         log::debug!(
                             target: "kakehashi::formatting",
                             "concatenated formatting step for server {} skipped: \
                              server advertises neither documentFormattingProvider \
-                             nor documentRangeFormattingProvider",
+                             nor documentRangeFormattingProvider (or its \
+                             connection is still initializing)",
                             server_name
                         );
                         return None;
@@ -1016,8 +1020,15 @@ fn extract_host_line_prefixes(
                 line,
                 character: column,
             });
+            // `get` instead of indexing: the offsets come from the same
+            // snapshot so they always land on char boundaries, but if that
+            // invariant were ever violated, degrading to "no prefix" beats
+            // both a panic and a fabricated misaligned prefix.
             match (start, end) {
-                (Some(start), Some(end)) if start <= end => host_text[start..end].to_string(),
+                (Some(start), Some(end)) if start <= end => host_text
+                    .get(start..end)
+                    .map(str::to_string)
+                    .unwrap_or_default(),
                 _ => String::new(),
             }
         })
@@ -1039,6 +1050,12 @@ fn extract_host_line_prefixes(
 /// - **Line count changed**: the pipeline computes no diff/alignment, so
 ///   every continuation line takes the region's longest common prefix — exact
 ///   for the usual uniform-prefix region, a documented limitation otherwise.
+///   The LCP excludes trailing empty-prefix entries: a region whose content
+///   ends with `\n` carries a synthetic final line bucket whose host prefix
+///   belongs to the line *after* the replacement range, and including its
+///   empty prefix would collapse the LCP to `""` for uniformly prefixed
+///   blockquotes. Symmetrically, a trailing **empty** output line stays
+///   unprefixed — it abuts the host's own prefix at the region end.
 /// - **Empty output lines** get the prefix with trailing whitespace trimmed
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
@@ -1053,7 +1070,20 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
     let lcp = if line_count_preserved {
         String::new()
     } else {
-        longest_common_prefix(host_line_prefixes)
+        // A region whose content ends with '\n' carries a trailing
+        // empty-prefix entry for the synthetic line bucket after the final
+        // newline; that host line's own prefix sits OUTSIDE the replacement
+        // range (the range ends at its column 0). Including it would
+        // collapse the LCP to "" for a uniformly prefixed blockquote, so the
+        // LCP is computed over the content lines' prefixes only.
+        let mut content_prefixes = host_line_prefixes;
+        while let [rest @ .., last] = content_prefixes {
+            if !last.is_empty() {
+                break;
+            }
+            content_prefixes = rest;
+        }
+        longest_common_prefix(content_prefixes)
     };
 
     // Reserve for the prefixes being prepended too (slight over-reserve when
@@ -1070,14 +1100,24 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
             continue;
         }
         out.push('\n');
+        // `split('\n')` keeps a trailing '\r' on CRLF content; a line is
+        // "empty" for the prefix rules with or without it.
+        let line_is_empty = line.trim_end_matches('\r').is_empty();
         let prefix = if line_count_preserved {
             host_line_prefixes[i].as_str()
+        } else if line_is_empty && i == lines.len() - 1 {
+            // The trailing empty output line sits at the region end, where
+            // the host's own prefix (e.g. the closing fence's "> ") follows
+            // immediately outside the replacement range — prefixing it here
+            // would double the marker.
+            ""
         } else {
             lcp.as_str()
         };
-        // `split('\n')` keeps a trailing '\r' on CRLF content; a line is
-        // "empty" for the trailing-whitespace rule with or without it.
-        if line.trim_end_matches('\r').is_empty() {
+        // Empty output lines take the prefix with trailing whitespace
+        // trimmed so the pipeline introduces no trailing-whitespace
+        // violations.
+        if line_is_empty {
             out.push_str(prefix.trim_end());
         } else {
             out.push_str(prefix);
@@ -1670,6 +1710,33 @@ mod tests {
             reapply_host_line_prefixes("a\nb\nc\nd", &prefixes),
             "a\n> b\n> c\n> d"
         );
+    }
+
+    #[test]
+    fn reapply_lcp_ignores_trailing_synthetic_empty_prefix() {
+        // A blockquote region whose content ends with '\n' carries a trailing
+        // empty-prefix entry for the synthetic line after the final newline
+        // (its host prefix belongs to the closing-fence line, OUTSIDE the
+        // replacement range). The LCP must be computed over the content
+        // lines' prefixes only — otherwise it collapses to "" and a uniformly
+        // "> "-prefixed blockquote loses every marker on a line-count change.
+        let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
+        // 4 output lines vs 3 region lines → LCP path. The trailing empty
+        // output line sits at the region end and must stay unprefixed (the
+        // host's own "> " follows it).
+        assert_eq!(
+            reapply_host_line_prefixes("a\nb\nc\n", &prefixes),
+            "a\n> b\n> c\n"
+        );
+    }
+
+    #[test]
+    fn reapply_lcp_keeps_trailing_empty_output_line_unprefixed() {
+        // Even with a uniformly non-empty prefix list, a trailing empty
+        // output line abuts the host's own prefix on the region's end line —
+        // prefixing it would double the marker (">> ```").
+        let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
+        assert_eq!(reapply_host_line_prefixes("a\n", &prefixes), "a\n");
     }
 
     #[test]
