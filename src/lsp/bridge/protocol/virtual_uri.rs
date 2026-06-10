@@ -126,7 +126,9 @@ impl VirtualDocumentUri {
     /// `textDocument/publishDiagnostics`) must be discarded rather than
     /// forwarded (Decision point 7).
     pub(crate) fn is_scratch_uri(uri: &str) -> bool {
-        Self::is_virtual_uri(uri) && uri.contains(Self::SCRATCH_ID_MARKER)
+        // Substring check first: it cheaply rejects the vast majority of URIs
+        // (every non-scratch one) before `is_virtual_uri`'s URL parse.
+        uri.contains(Self::SCRATCH_ID_MARKER) && Self::is_virtual_uri(uri)
     }
 
     /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,

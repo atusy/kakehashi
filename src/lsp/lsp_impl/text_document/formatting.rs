@@ -1056,7 +1056,14 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
         longest_common_prefix(host_line_prefixes)
     };
 
-    let mut out = String::with_capacity(final_text.len());
+    // Reserve for the prefixes being prepended too (slight over-reserve when
+    // empty lines get a trimmed prefix), so the string never reallocates.
+    let added_len = if line_count_preserved {
+        host_line_prefixes.iter().skip(1).map(String::len).sum()
+    } else {
+        (lines.len() - 1) * lcp.len()
+    };
+    let mut out = String::with_capacity(final_text.len() + added_len);
     for (i, line) in lines.iter().enumerate() {
         if i == 0 {
             out.push_str(line);
