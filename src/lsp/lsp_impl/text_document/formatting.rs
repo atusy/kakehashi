@@ -39,10 +39,11 @@ use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::aggregation::server::effective_priorities;
+use crate::lsp::aggregation::server::effective_priorities_from;
 use crate::lsp::aggregation::server::run_sequential_format_pipeline;
 use crate::lsp::bridge::{
-    RegionOffset, UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
+    RegionOffset, ResolvedServerConfig, UpstreamId, VirtualDocumentUri,
+    translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
@@ -134,27 +135,26 @@ impl Kakehashi {
             let options = options.clone();
             let region_cancel_rx = cancel_state.derive_receiver();
 
-            // `strategy: "concatenated"` with a non-empty *effective* priorities
-            // list opts this region into the sequential formatter pipeline
-            // (concatenated-formatting-pipeline): run the priority-listed servers
-            // serially, each formatting the prior server's output, then emit one
-            // region-replacement edit. Gating on `effective_priorities` (not the
-            // raw `priorities`) means a list of only unknown/typo'd server names
-            // falls through to the `preferred` path — which still uses the
-            // region's configured servers — rather than entering the pipeline and
-            // formatting nothing. Default `preferred`, or `concatenated` with no
-            // effective priorities, keeps the first-non-empty-wins path.
-            let pipeline_servers = effective_priorities(&region_ctx);
-            let use_concatenated = region_ctx.strategy == AggregationStrategy::Concatenated
-                && !pipeline_servers.is_empty();
+            // Decide how this region formats — concatenated pipeline, preferred
+            // fan-out, or skip — from its resolved aggregation config. See
+            // [`plan_region_format`] for the allowlist rule
+            // (concatenated-formatting-pipeline Decision point 2).
+            let pipeline_servers = match plan_region_format(
+                region_ctx.strategy,
+                &region_ctx.priorities,
+                &region_ctx.configs,
+            ) {
+                RegionFormatPlan::Concatenated(servers) => Some(servers),
+                RegionFormatPlan::Preferred => None,
+            };
 
             outer_join_set.spawn(async move {
-                if use_concatenated {
+                if let Some(servers) = pipeline_servers {
                     dispatch_concatenated_formatting(
                         &region_ctx,
                         pool.clone(),
                         options,
-                        pipeline_servers,
+                        servers,
                         region_cancel_rx,
                     )
                     .await
@@ -173,6 +173,40 @@ impl Kakehashi {
         let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
         response
+    }
+}
+
+/// How a single injection region should be formatted, derived from its resolved
+/// aggregation config. Extracted so the gating rule lives in one testable place.
+#[derive(Debug, PartialEq, Eq)]
+enum RegionFormatPlan {
+    /// Run the sequential concatenated pipeline over these effective servers
+    /// (`priorities` filtered to configured servers, deduped, order preserved).
+    Concatenated(Vec<String>),
+    /// Use the `preferred` first-non-empty-wins fan-out over the region's servers.
+    Preferred,
+}
+
+/// Decide the [`RegionFormatPlan`] for a region from its aggregation `strategy`,
+/// `priorities`, and configured server `configs`.
+///
+/// `concatenated` opts the region into the sequential formatter pipeline
+/// (concatenated-formatting-pipeline) over `effective_priorities_from`; any other
+/// strategy uses `preferred`. An empty effective list falls through to
+/// `preferred`.
+fn plan_region_format(
+    strategy: AggregationStrategy,
+    priorities: &[String],
+    configs: &[ResolvedServerConfig],
+) -> RegionFormatPlan {
+    if strategy != AggregationStrategy::Concatenated {
+        return RegionFormatPlan::Preferred;
+    }
+    let effective = effective_priorities_from(priorities, configs);
+    if effective.is_empty() {
+        RegionFormatPlan::Preferred
+    } else {
+        RegionFormatPlan::Concatenated(effective)
     }
 }
 
@@ -819,6 +853,46 @@ mod tests {
             },
             new_text: new_text.to_string(),
         }
+    }
+
+    // ==========================================================================
+    // plan_region_format (concatenated-formatting-pipeline Decision point 2:
+    // `priorities` is an allowlist + order)
+    // ==========================================================================
+
+    fn config(name: &str) -> ResolvedServerConfig {
+        ResolvedServerConfig {
+            server_name: name.to_string(),
+            config: Arc::new(crate::config::settings::BridgeServerConfig {
+                cmd: vec![name.to_string()],
+                languages: vec![],
+                initialization_options: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn plan_non_concatenated_strategy_uses_preferred() {
+        // Default `preferred` keeps the first-non-empty-wins fan-out regardless
+        // of priorities.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["black".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Preferred, &priorities, &configs),
+            RegionFormatPlan::Preferred
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_configured_priorities_runs_pipeline() {
+        // `concatenated` + priorities that resolve to configured servers opts
+        // into the sequential pipeline over exactly those servers, in order.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["isort".to_string(), "black".to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Concatenated(vec!["isort".to_string(), "black".to_string()])
+        );
     }
 
     // ==========================================================================

@@ -12,7 +12,7 @@ use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
-use crate::lsp::bridge::LanguageServerPool;
+use crate::lsp::bridge::{LanguageServerPool, ResolvedServerConfig};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
@@ -28,10 +28,25 @@ use super::fan_out::{FanOutTask, fan_out};
 /// Deduping matters for the sequential pipeline: a misconfigured
 /// `priorities: ["black", "black"]` would otherwise format with the same server
 /// twice; it also avoids fanning out twice to one server in the preferred path.
-pub(crate) fn effective_priorities(ctx: &DocumentRequestContext) -> Vec<String> {
-    let configured: HashSet<&str> = ctx.configs.iter().map(|c| c.server_name.as_str()).collect();
+fn effective_priorities(ctx: &DocumentRequestContext) -> Vec<String> {
+    effective_priorities_from(&ctx.priorities, &ctx.configs)
+}
+
+/// Slice-based core of [`effective_priorities`]: keep only `priorities` names
+/// present in `configs`, dropping duplicates (first occurrence wins, order
+/// preserved).
+///
+/// Split out from the [`DocumentRequestContext`] wrapper so callers that only
+/// have the two relevant fields — notably the formatting gating decision
+/// ([`crate::lsp::lsp_impl::text_document::formatting`]) and its unit tests —
+/// can reuse the exact allowlist rule without building a full context.
+pub(crate) fn effective_priorities_from(
+    priorities: &[String],
+    configs: &[ResolvedServerConfig],
+) -> Vec<String> {
+    let configured: HashSet<&str> = configs.iter().map(|c| c.server_name.as_str()).collect();
     let mut seen: HashSet<&str> = HashSet::new();
-    ctx.priorities
+    priorities
         .iter()
         .filter(|name| configured.contains(name.as_str()) && seen.insert(name.as_str()))
         .cloned()
