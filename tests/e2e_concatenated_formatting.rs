@@ -54,7 +54,11 @@ fn init_client(config_toml: &str, language_servers: Value) -> (LspClient, tempfi
 /// (skip-and-continue), which yields a null (or empty) result. Retrying
 /// until the servers are Ready keeps the test free of timing assumptions.
 fn request_formatting_with_retry(client: &mut LspClient, uri: &str) -> Option<Vec<Value>> {
-    for _ in 0..30 {
+    // Short interval, many attempts (~15s total): the capability probe
+    // already waits for initializing servers, so the loop usually succeeds
+    // on the first or second attempt — fast polling just keeps the rare
+    // retry cheap.
+    for _ in 0..300 {
         let response = client.send_request(
             "textDocument/formatting",
             json!({
@@ -72,7 +76,7 @@ fn request_formatting_with_retry(client: &mut LspClient, uri: &str) -> Option<Ve
         {
             return Some(edits.clone());
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     None
 }
