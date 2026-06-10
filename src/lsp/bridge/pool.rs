@@ -800,9 +800,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Translate `upstream_id` to the downstream ID via the cancel map and send
-    /// `$/cancelRequest` to `server_name`. The pending entry stays in place: the
-    /// server may still respond with a result or `REQUEST_CANCELLED` (-32800).
+    /// Translate `upstream_id` to its downstream ID(s) via the cancel map and
+    /// send `$/cancelRequest` to `server_name` for **each** of them — one
+    /// upstream id can have several in-flight downstream requests on the same
+    /// connection (concurrent injection regions of one request), and all of
+    /// them belong to the cancelled upstream request. The pending entries stay
+    /// in place: the server may still respond with a result or
+    /// `REQUEST_CANCELLED` (-32800).
     ///
     /// Returns `Ok(())` when the cancel is unforwardable (no connection, not
     /// Ready, or unknown upstream ID) per LSP best-effort semantics; only real
@@ -846,59 +850,66 @@ impl LanguageServerPool {
             std::sync::Arc::clone(handle)
         };
 
-        // Look up the downstream ID
-        let downstream_id = match handle.router().lookup_downstream_id(upstream_id) {
-            Some(id) => id,
-            None => {
-                // Request already completed or ID never registered.
-                // Silently drop per best-effort semantics.
-                self.cancel_metrics.record_unknown_id();
-                log::debug!(
-                    target: "kakehashi::bridge::cancel",
-                    "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
-                    upstream_id,
-                    server_name
-                );
-                return Ok(());
-            }
-        };
-
-        // Build and send the cancel notification via single-writer loop (ls-bridge-message-ordering)
-        // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
-        let notification = JsonRpcNotification::new(
-            "$/cancelRequest",
-            CancelParams {
-                // Safe: IDs are generated from an atomic counter starting at 0,
-                // well within i32 range. ls-types constrains Number to i32.
-                id: NumberOrString::Number(downstream_id.as_i64() as i32),
-            },
-        );
-
-        match handle.send_notification(notification) {
-            NotificationSendResult::Queued => {
-                self.cancel_metrics.record_success();
-                log::debug!(
-                    target: "kakehashi::bridge::cancel",
-                    "Cancel forwarded: upstream {} -> downstream {} for server '{}'",
-                    upstream_id,
-                    downstream_id.as_i64(),
-                    server_name
-                );
-                Ok(())
-            }
-            NotificationSendResult::QueueFull => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "bridge: cancel notification queue full",
-            )),
-            NotificationSendResult::ChannelClosed => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "bridge: cancel notification channel closed",
-            )),
-            NotificationSendResult::SerializationFailed => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "bridge: failed to serialize cancel notification",
-            )),
+        // Look up every in-flight downstream ID for this upstream request
+        let downstream_ids = handle.router().lookup_downstream_ids(upstream_id);
+        if downstream_ids.is_empty() {
+            // Request already completed or ID never registered.
+            // Silently drop per best-effort semantics.
+            self.cancel_metrics.record_unknown_id();
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
+                upstream_id,
+                server_name
+            );
+            return Ok(());
         }
+
+        // Build and send one cancel notification per downstream request via the
+        // single-writer loop (ls-bridge-message-ordering).
+        // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
+        for downstream_id in downstream_ids {
+            let notification = JsonRpcNotification::new(
+                "$/cancelRequest",
+                CancelParams {
+                    // Safe: IDs are generated from an atomic counter starting at 0,
+                    // well within i32 range. ls-types constrains Number to i32.
+                    id: NumberOrString::Number(downstream_id.as_i64() as i32),
+                },
+            );
+
+            match handle.send_notification(notification) {
+                NotificationSendResult::Queued => {
+                    self.cancel_metrics.record_success();
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "Cancel forwarded: upstream {} -> downstream {} for server '{}'",
+                        upstream_id,
+                        downstream_id.as_i64(),
+                        server_name
+                    );
+                }
+                NotificationSendResult::QueueFull => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "bridge: cancel notification queue full",
+                    ));
+                }
+                NotificationSendResult::ChannelClosed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "bridge: cancel notification channel closed",
+                    ));
+                }
+                NotificationSendResult::SerializationFailed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bridge: failed to serialize cancel notification",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Fan out `$/cancelRequest` to every server registered for `upstream_id`.
@@ -2430,8 +2441,8 @@ mod tests {
         // Verify the cancel_map entry is still there (cancel does NOT remove it)
         // The mapping is only removed when the actual response arrives
         assert_eq!(
-            handle.router().lookup_downstream_id(&upstream_id),
-            Some(downstream_id),
+            handle.router().lookup_downstream_ids(&upstream_id),
+            vec![downstream_id],
             "Cancel map entry should still exist after cancel forwarding"
         );
     }
@@ -2620,9 +2631,11 @@ mod tests {
             0,
             "pending entry should be removed after response"
         );
-        assert_eq!(
-            handle.router().lookup_downstream_id(&upstream_id),
-            None,
+        assert!(
+            handle
+                .router()
+                .lookup_downstream_ids(&upstream_id)
+                .is_empty(),
             "cancel map entry should be removed after response"
         );
     }
