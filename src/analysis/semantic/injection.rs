@@ -27,4 +27,9 @@ pub(super) struct InjectionContext<'a> {
     /// Per-content-line byte prefix widths (e.g., `[0, 2, 2, 2]` for blockquote).
     /// Empty when no `included_ranges` (non-blockquote injections).
     pub prefix_byte_widths: Vec<usize>,
+    /// Whether this context merges multiple `injection.combined` regions into
+    /// one parse (#187). Combined contexts force per-line token emission and
+    /// clip tokens to `included_ranges`, because a capture node may span the
+    /// excluded text between blocks.
+    pub combined: bool,
 }
