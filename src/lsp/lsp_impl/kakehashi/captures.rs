@@ -469,6 +469,11 @@ impl Kakehashi {
                 snapshot.tree(),
             )
             .await;
+            // A didChange processed during the await above may have scheduled
+            // a reparse; wait for it like the initial prelude does, so the
+            // snapshot below is the settled (text, tree) pair and never a
+            // mid-parse combination.
+            self.ensure_parsed_for_node_lookup(&uri).await;
         }
 
         // Fetch the open generation BEFORE snapshotting: if a close+reopen
@@ -478,6 +483,11 @@ impl Kakehashi {
         // the new document with stale lineage.
         let open_generation = self.documents.open_generation(&uri);
         let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
+            // The generation ask above may have lazily created an entry for a
+            // URI that a racing didClose just removed; drop it again so
+            // closed URIs don't accumulate entries (safety never depended on
+            // it — the counter is monotonic).
+            self.documents.forget_open_generation_if_closed(&uri);
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
         };
@@ -571,9 +581,17 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let skipped: Vec<Value> = kind_queries
+        // Sort by language so the wire order is deterministic — the memo is a
+        // HashMap, whose iteration order would otherwise vary per process.
+        // Within a language, the loader already reports skipped patterns in
+        // file order.
+        let mut loaded: Vec<(&String, &KindQuery)> = kind_queries
             .iter()
             .filter_map(|(lang, kq)| kq.as_ref().map(|kq| (lang, kq)))
+            .collect();
+        loaded.sort_by(|a, b| a.0.cmp(b.0));
+        let skipped: Vec<Value> = loaded
+            .into_iter()
             .flat_map(|(lang, kq)| {
                 kq.skipped.iter().map(move |s| {
                     json!({

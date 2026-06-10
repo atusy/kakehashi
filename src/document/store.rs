@@ -283,6 +283,19 @@ impl DocumentStore {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         })
     }
+
+    /// Drop the lazily-created generation entry for a URI that turned out to
+    /// have no document — the cleanup for an [`open_generation`](Self::open_generation)
+    /// ask that raced a `didClose`. Safety does not depend on this (the
+    /// counter is monotonic, so a pre-close generation can never equal any
+    /// later one); it only prevents entries accumulating for closed URIs. The
+    /// removal re-checks absence so a concurrent reopen's live entry is left
+    /// alone; losing that race merely hands the reopened document a fresh
+    /// number on its next ask, which is the conservative direction.
+    pub(crate) fn forget_open_generation_if_closed(&self, uri: &Url) {
+        self.open_generations
+            .remove_if(uri, |_, _| self.documents.get(uri).is_none());
+    }
 }
 
 #[cfg(test)]

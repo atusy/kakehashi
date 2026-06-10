@@ -590,7 +590,17 @@ fn effective_child_regions<'t>(
         }
         regions.push((region, absolute_ranges));
     }
-    regions.sort_by_key(|(_, ranges)| ranges.first().map_or(0, |r| r.start_byte));
+    // `sort_by_key` is stable, so ties would already keep the deterministic
+    // query-match order — the extra raw-span/pattern components just make the
+    // order independent of insertion order outright (the captures positional
+    // delta requires a deterministic document order).
+    regions.sort_by_key(|(region, ranges)| {
+        (
+            ranges.first().map_or(0, |r| r.start_byte),
+            region.content_node.start_byte(),
+            region.pattern_index,
+        )
+    });
     regions
 }
 
