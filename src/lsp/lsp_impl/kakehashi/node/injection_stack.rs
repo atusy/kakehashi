@@ -19,7 +19,7 @@ use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     MAX_INJECTION_DEPTH, ceil_char_boundary, collect_all_injections, compute_included_ranges,
-    floor_char_boundary, intersect_included_ranges, parse_offset_directive_for_pattern,
+    effective_offset_for_pattern, floor_char_boundary, intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -44,7 +44,7 @@ pub(super) struct InjectionLayer {
 /// the raw-content-node fast bounds check is safe: an offset can extend the
 /// effective range past the raw node, so the shortcut only holds without one.
 fn pattern_has_offset(injection_query: &tree_sitter::Query, pattern_index: usize) -> bool {
-    parse_offset_directive_for_pattern(injection_query, pattern_index).is_some()
+    effective_offset_for_pattern(injection_query, pattern_index).is_some()
 }
 
 /// Build the full-document range used to seed the host layer.
@@ -419,7 +419,7 @@ fn build_effective_ranges(
     injection_query: &tree_sitter::Query,
 ) -> Vec<tree_sitter::Range> {
     // 1. Apply #offset! to the raw content_node span.
-    let offset = parse_offset_directive_for_pattern(injection_query, region.pattern_index);
+    let offset = effective_offset_for_pattern(injection_query, region.pattern_index);
     let (eff_start, eff_end) = match offset {
         Some(off) => {
             let byte_range = ByteRange::new(

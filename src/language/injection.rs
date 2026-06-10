@@ -19,6 +19,21 @@ pub struct InjectionOffset {
     pub end_column: i32,
 }
 
+/// The `#offset!` directive for a pattern, normalized: a directive that
+/// parses to all zeros (malformed, or an explicit `#offset! … 0 0 0 0`) is a
+/// no-op and is reported as `None`, so consumers never disable
+/// included-range stripping — or skip raw-span fast paths — for an offset
+/// that changes nothing. Use this instead of
+/// [`parse_offset_directive_for_pattern`] anywhere behavior branches on the
+/// offset's presence.
+pub(crate) fn effective_offset_for_pattern(
+    query: &Query,
+    pattern_index: usize,
+) -> Option<InjectionOffset> {
+    parse_offset_directive_for_pattern(query, pattern_index)
+        .filter(|off| *off != InjectionOffset::default())
+}
+
 /// Parses offset directive for a specific pattern in the query.
 /// Returns None if the specified pattern has no #offset! directive for @injection.content.
 pub(crate) fn parse_offset_directive_for_pattern(
@@ -835,12 +850,7 @@ pub fn collect_all_injections<'a>(
                     content_node: capture.node,
                     pattern_index: match_.pattern_index,
                     include_children: has_include_children_for_pattern(query, match_.pattern_index),
-                    // An all-zero offset (malformed directive, or an explicit
-                    // `#offset! … 0 0 0 0`) is a no-op; normalize it to None
-                    // so consumers don't disable included-range stripping for
-                    // an offset that changes nothing.
-                    offset: parse_offset_directive_for_pattern(query, match_.pattern_index)
-                        .filter(|off| *off != InjectionOffset::default()),
+                    offset: effective_offset_for_pattern(query, match_.pattern_index),
                 });
             }
         }
