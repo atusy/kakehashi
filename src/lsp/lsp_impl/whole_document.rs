@@ -47,6 +47,16 @@ impl Kakehashi {
 
         log::debug!("{} called for {}", method_name, uri);
 
+        // Tower-LSP runs requests concurrently, so a whole-document request can
+        // arrive before didOpen/didChange has finished parsing. Wait briefly
+        // for any in-flight parse to land a tree before snapshotting, matching
+        // the read-handler pattern (semantic tokens, rangeFormatting, node
+        // lookups); otherwise an otherwise-valid request would degrade to
+        // `Ok(None)` purely due to a parse race.
+        self.documents
+            .wait_for_parse_completion(&uri, std::time::Duration::from_millis(200))
+            .await;
+
         // Get document snapshot (minimizes lock duration)
         let snapshot = match self.documents.get(&uri) {
             None => {
