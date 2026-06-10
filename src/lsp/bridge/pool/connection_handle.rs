@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
-    ColorProviderCapability, DeclarationCapability, HoverProviderCapability,
-    ImplementationProviderCapability, OneOf, RenameOptions, ServerCapabilities,
+    ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability,
+    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
     TypeDefinitionProviderCapability,
 };
 
@@ -435,7 +436,24 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/linkedEditingRange" => matches!(
+                caps.linked_editing_range_provider,
+                Some(
+                    LinkedEditingRangeServerCapabilities::Simple(true)
+                        | LinkedEditingRangeServerCapabilities::Options(_)
+                        | LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
+                )
+            ),
+            "textDocument/codeLens" => caps.code_lens_provider.is_some(),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
+            "textDocument/foldingRange" => matches!(
+                caps.folding_range_provider,
+                Some(
+                    FoldingRangeProviderCapability::Simple(true)
+                        | FoldingRangeProviderCapability::FoldingProvider(_)
+                        | FoldingRangeProviderCapability::Options(_)
+                )
+            ),
             "textDocument/formatting" => {
                 matches!(
                     caps.document_formatting_provider,

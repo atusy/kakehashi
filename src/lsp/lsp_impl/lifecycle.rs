@@ -5,9 +5,10 @@ use tower_lsp_server::jsonrpc::Result;
 #[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CompletionOptions, DeclarationCapability, DiagnosticOptions, DiagnosticServerCapabilities,
-    DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, OneOf, RenameOptions, SaveOptions,
+    CodeLensOptions, CompletionOptions, DeclarationCapability, DiagnosticOptions,
+    DiagnosticServerCapabilities, DocumentLinkOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions,
     SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
     SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
@@ -244,6 +245,12 @@ impl Kakehashi {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                // Lazy resolution is not supported yet: bridged lenses without a
+                // command are dropped (see bridge/text_document/code_lens.rs).
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: None,
+                }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -251,6 +258,9 @@ impl Kakehashi {
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
+                    true,
+                )),
                 #[cfg(feature = "experimental")]
                 color_provider: Some(ColorProviderCapability::Simple(true)),
                 #[cfg(not(feature = "experimental"))]

@@ -34,12 +34,14 @@ expression: capabilities
   "referencesProvider": true,
   "documentHighlightProvider": true,
   "documentSymbolProvider": true,
+  "codeLensProvider": {},
   "documentFormattingProvider": true,
   "documentRangeFormattingProvider": true,
   "renameProvider": {
     "prepareProvider": true
   },
   "documentLinkProvider": {},
+  "foldingRangeProvider": true,
   "declarationProvider": true,
   "semanticTokensProvider": {
     "legend": {
@@ -87,6 +89,7 @@ expression: capabilities
     }
   },
   "monikerProvider": true,
+  "linkedEditingRangeProvider": true,
   "inlayHintProvider": true,
   "diagnosticProvider": {
     "interFileDependencies": false,

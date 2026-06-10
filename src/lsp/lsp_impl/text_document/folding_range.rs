@@ -1,21 +1,21 @@
-//! Document link method for Kakehashi.
+//! Folding range method for Kakehashi.
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentLink, DocumentLinkParams};
+use tower_lsp_server::ls_types::{FoldingRange, FoldingRangeParams};
 
 use super::super::Kakehashi;
 
 impl Kakehashi {
-    pub(crate) async fn document_link_impl(
+    pub(crate) async fn folding_range_impl(
         &self,
-        params: DocumentLinkParams,
-    ) -> Result<Option<Vec<DocumentLink>>> {
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
         self.whole_document_preferred_fan_out(
             &params.text_document.uri,
-            "textDocument/documentLink",
+            "textDocument/foldingRange",
             |t| async move {
                 t.pool
-                    .send_document_link_request(
+                    .send_folding_range_request(
                         &t.server_name,
                         &t.server_config,
                         &t.uri,

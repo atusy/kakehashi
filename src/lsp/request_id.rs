@@ -94,11 +94,23 @@ impl CancelForwarder {
         }
     }
 
-    /// Forward a cancel request to the downstream server(s) for `upstream_id`.
+    /// Forward a cancel request to the downstream server(s) for `upstream_id`,
+    /// waking the upstream subscriber (`notify_cancel`) along the way.
     /// Per LSP best-effort semantics, "not forwardable" cases (ID not in registry,
     /// connection not ready) return `Ok(())`; only real I/O write errors are `Err`.
+    ///
+    /// The subscriber is notified only after the pool has captured the cancel
+    /// targets: the woken handler's cleanup (`unregister_all_for_upstream_id`,
+    /// dropping request futures) destroys the registry and router state the
+    /// forwarding pass reads, so notifying first could silently drop the
+    /// downstream `$/cancelRequest` (capture-before-notify; see
+    /// `forward_cancel_by_upstream_id_with_notify`).
     pub(crate) async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
-        self.pool.forward_cancel_by_upstream_id(upstream_id).await
+        self.pool
+            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {
+                self.notify_cancel(&upstream_id);
+            })
+            .await
     }
 
     /// Return a oneshot receiver that fires when `$/cancelRequest` arrives for
@@ -256,10 +268,6 @@ where
                 });
 
             if let Some(upstream_id) = id_to_cancel {
-                // Notify upstream subscribers immediately (synchronous)
-                // This allows handlers using tokio::select! to abort immediately
-                forwarder.notify_cancel(&upstream_id);
-
                 let forwarder = forwarder.clone();
                 // Fire-and-forget: spawn without tracking JoinHandle.
                 //
@@ -269,6 +277,11 @@ where
                 // 3. We must not block the main request flow
                 // 4. Graceful shutdown doesn't need to wait for cancels - the downstream
                 //    server will clean up its own state when it shuts down
+                //
+                // Upstream subscribers are notified inside forward_cancel, AFTER
+                // it captures the downstream targets — notifying here first would
+                // let the woken handler tear down the registry/router state the
+                // forwarding pass is about to read (capture-before-notify).
                 tokio::spawn(async move {
                     if let Err(e) = forwarder.forward_cancel(upstream_id.clone()).await {
                         // Log the error but don't fail - cancel forwarding is best-effort

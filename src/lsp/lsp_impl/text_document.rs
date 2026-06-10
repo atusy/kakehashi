@@ -1,5 +1,6 @@
 //! Text document related LSP methods.
 
+mod code_lens;
 #[cfg(feature = "experimental")]
 mod color_presentation;
 mod completion;
@@ -16,10 +17,12 @@ mod document_color;
 mod document_highlight;
 mod document_link;
 mod document_symbol;
+mod folding_range;
 mod formatting;
 mod hover;
 mod implementation;
 mod inlay_hint;
+mod linked_editing_range;
 mod moniker;
 mod prepare_rename;
 pub(crate) mod publish_diagnostic;
