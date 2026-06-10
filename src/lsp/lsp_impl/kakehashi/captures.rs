@@ -13,6 +13,11 @@
 //! per-pattern compilation) used for highlights. Kinds are therefore
 //! open-ended — defined by what files exist, not by an enum.
 //!
+//! `#set!` directives in the kind file ride along as `metadata` objects —
+//! match-level for `(#set! key value)`, on the capture entry for
+//! `(#set! @cap key value)` — following Neovim's treesitter-directive-set!
+//! scoping (captures-protocol §"Result shapes").
+//!
 //! With `injection: true` the kind query runs across **every** layer — the
 //! host, then each injection region in document-order DFS — each layer
 //! resolving its own language's kind file, with result nodes minted in their
@@ -144,6 +149,23 @@ fn matches_delta_edit(previous: &[Value], current: &[Value]) -> Option<(usize, u
     let delete_count = prev_rest.len() - common_suffix;
     let data = curr_rest[..curr_rest.len() - common_suffix].to_vec();
     Some((common_prefix, delete_count, data))
+}
+
+/// Shape `#set!` metadata pairs as a JSON object, or `None` when the pattern
+/// set none (so plain patterns carry no `metadata` field at all).
+///
+/// A valued key maps to its string; the bare flag form `(#set! key)` maps to
+/// `true` (a flag a client can test for, unlike Neovim's nil no-op). Duplicate
+/// keys are last-write-wins, matching Neovim's in-order directive application.
+fn metadata_object(pairs: Vec<(String, Option<String>)>) -> Option<Value> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (key, value) in pairs {
+        map.insert(key, value.map_or(Value::Bool(true), Value::String));
+    }
+    Some(Value::Object(map))
 }
 
 /// A kind query compiled for one language, with the patterns tolerant
@@ -544,6 +566,7 @@ impl Kakehashi {
                 return;
             };
             for m in execute_query(&kind_query.query, layer_tree, text, byte_range.clone()) {
+                let match_metadata = metadata_object(m.metadata);
                 let captures: Vec<Value> = m
                     .captures
                     .into_iter()
@@ -557,11 +580,17 @@ impl Kakehashi {
                         // Scope rule).
                         let node =
                             self.mint_node_info(&uri, depth, (c.start_byte, c.end_byte, c.kind));
-                        Some(json!({
+                        let mut capture = json!({
                             "name": c.name,
                             "node": node,
                             "range": { "start": start, "end": end },
-                        }))
+                        });
+                        // Capture-scoped `#set! @cap key value` metadata,
+                        // only when the capture was annotated.
+                        if let Some(meta) = metadata_object(c.metadata) {
+                            capture["metadata"] = meta;
+                        }
+                        Some(capture)
                     })
                     .collect();
                 // Mirror execute_query's invariant: clients never see an empty
@@ -569,11 +598,18 @@ impl Kakehashi {
                 if captures.is_empty() {
                     continue;
                 }
-                matches.push(json!({
+                let mut envelope = json!({
                     "patternIndex": m.pattern_index,
                     "language": layer_language,
                     "captures": captures,
-                }));
+                });
+                // Match-level `#set!` metadata, only when the pattern set any
+                // (treesitter-directive-set!) — absent otherwise, so patterns
+                // without directives keep their pre-metadata wire shape.
+                if let Some(meta) = match_metadata {
+                    envelope["metadata"] = meta;
+                }
+                matches.push(envelope);
             }
         };
 
@@ -737,6 +773,33 @@ mod tests {
         let (start, del, data) = matches_delta_edit(&[], &vals(&[1])).unwrap();
         assert_eq!((start, del), (0, 0));
         assert_eq!(data, vals(&[1]));
+    }
+
+    #[test]
+    fn metadata_object_is_none_when_no_directives() {
+        // Patterns without #set! must keep their pre-metadata wire shape —
+        // an empty object would churn every delta lineage.
+        assert_eq!(metadata_object(vec![]), None);
+    }
+
+    #[test]
+    fn metadata_object_flag_form_maps_to_true() {
+        // (#set! key) without a value is a flag (e.g. injection.combined
+        // style); JSON true lets clients test for it, where Neovim's nil
+        // assignment would make the key undetectable.
+        let pairs = vec![("combined".to_string(), None)];
+        assert_eq!(metadata_object(pairs), Some(json!({ "combined": true })));
+    }
+
+    #[test]
+    fn metadata_object_duplicate_keys_last_write_wins() {
+        // Neovim applies directives in order, so a later #set! of the same
+        // key overwrites the earlier one.
+        let pairs = vec![
+            ("kind".to_string(), Some("first".to_string())),
+            ("kind".to_string(), Some("second".to_string())),
+        ];
+        assert_eq!(metadata_object(pairs), Some(json!({ "kind": "second" })));
     }
 
     #[test]

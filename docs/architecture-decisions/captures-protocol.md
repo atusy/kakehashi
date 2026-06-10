@@ -45,12 +45,16 @@ type Match = {
   patternIndex: number;        // within the producing language's kind query —
                                // (language, patternIndex) is the unambiguous key
   language: string;            // language of the layer that produced this match
+  metadata?: Metadata;         // match-level `#set!` directives
   captures: {
     name: string;              // capture name without '@', e.g. "context"
     node: NodeInfo;            // { id, kind } — trackable via kakehashi/node/*
     range: Range;              // LSP Range (UTF-16), inline to avoid N+1
+    metadata?: Metadata;       // capture-scoped `#set! @cap` directives
   }[];
 };
+
+type Metadata = { [key: string]: string | true };
 
 type CapturesDelta = {
   resultId: string;
@@ -69,6 +73,23 @@ wire shape never branches on the request mode, and it lives **per match** (not
 per capture, which would be redundant; not as a per-layer grouping, which would
 break the flat-array delta). Because the diff is plain JSON equality over match
 objects, adding `language` required no change to the delta algorithm.
+
+**`#set!` metadata** (the Neovim
+[`treesitter-directive-set!`](https://neovim.io/doc/user/treesitter.html#treesitter-directive-set!)
+convention) follows its two scopes onto the wire: `(#set! key value)` becomes
+the match's `metadata`, `(#set! @cap key value)` becomes that capture's —
+mirroring Neovim's `metadata[key]` vs. `metadata[capture_id][key]` split, with
+the capture *name* standing in for the capture id (the index is meaningless
+across the wire). The field is **omitted when a pattern sets nothing**, keeping
+pre-metadata wire shapes byte-identical; and because the directives are static
+per pattern, the positional delta diff is unaffected — equal JSON still means
+an identical match. Values stay the strings written in the query (clients
+coerce, as Neovim consumers do); the bare flag form `(#set! key)` surfaces as
+`true` rather than Neovim's nil no-op, so a flag is actually observable.
+Repeated keys are last-write-wins, matching Neovim's in-order directive
+application. Other directives (`#offset!`, `#gsub!`, `#trim!`) compute
+runtime-dependent metadata and are **not** implemented — `#set!` is purely
+static, so it falls out of tree-sitter's own `property_settings` parsing.
 
 ### Kind resolution
 
@@ -161,4 +182,4 @@ The first iteration carried an optional per-request cap (plus a server default).
 
 * `resultId` state is per `(uri, kind)` and dropped on `didClose`; a delta against a stale id falls back to a full result under the stored mode, and a delta with no lineage at all returns `null` (see Delta semantics), so the client's only re-sync rule is "on null, call `full` again".
 * Adding `language` to the match shape invalidates pre-upgrade lineages: the first delta after a server upgrade diffs against differently-shaped matches and degrades to a full response — self-healing, no client action needed.
-* Predicate evaluation and tolerant compilation inherit the existing semantics (including permissive unknown-predicate handling), keeping capture results consistent with semantic-token highlighting.
+* Predicate evaluation reuses the highlighting evaluator (same operators, same permissive unknown-predicate handling) but gates the **whole match**, mirroring Neovim's `iter_matches` and tree-sitter's own built-in-predicate handling: one failing general predicate discards the match and its captures entirely. Highlighting keeps per-capture filtering — there a guard capture should not strip its siblings' colors; here a partial match would leak `#set!` metadata onto matches Neovim rejects.
