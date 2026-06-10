@@ -119,19 +119,22 @@ pub(crate) fn resolve_aggregation_config_from_settings(
 }
 
 /// Find every (host_language, injection_language) pair whose configured
-/// aggregation strategy for `textDocument/formatting` is `Concatenated`.
+/// aggregation for `textDocument/formatting` is the **misconfigured**
+/// `Concatenated`-with-empty-`priorities` combination.
 ///
-/// The formatting handler intentionally ignores `Concatenated` — running
-/// multiple formatters over the same region produces overlapping `TextEdit`s
-/// and violates the LSP "edits must not overlap" rule. We warn the user once
-/// at settings-apply time (initialize + didChangeConfiguration) so the
-/// configuration mistake surfaces immediately rather than silently degrading
-/// every format request.
+/// Since the concatenated formatting pipeline landed
+/// (concatenated-formatting-pipeline), `strategy = "concatenated"` with a
+/// non-empty `priorities` is a valid configuration that runs the sequential
+/// pipeline — only an empty `priorities` is a misconfiguration (the pipeline's
+/// order would be undefined, so the region falls back to `preferred`; ADR
+/// Decision point 2). We warn the user once at settings-apply time
+/// (initialize + didChangeConfiguration) so the mistake surfaces immediately
+/// rather than silently degrading every format request.
 ///
-/// Walks the explicit configuration tree (not the resolved-with-wildcard
-/// view): both per-method (`textDocument/formatting`) and per-bridge wildcard
-/// (`_`) strategy entries are considered, with the per-method entry winning
-/// when both are present.
+/// Each bridge entry is resolved through
+/// [`BridgeLanguageConfig::resolve_aggregation`] — the same field-level
+/// wildcard merge the runtime uses — so priorities supplied via the `_`
+/// wildcard entry count as configured.
 pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec<(String, String)> {
     use crate::config::settings::AggregationStrategy;
 
@@ -141,15 +144,8 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
             continue;
         };
         for (injection_language, bridge_cfg) in bridge_map {
-            let Some(agg_map) = bridge_cfg.aggregation.as_ref() else {
-                continue;
-            };
-            let method_strategy = agg_map
-                .get("textDocument/formatting")
-                .and_then(|a| a.strategy);
-            let wildcard_strategy = agg_map.get("_").and_then(|a| a.strategy);
-            // Per-method entry wins over wildcard, matching resolve_aggregation.
-            if method_strategy.or(wildcard_strategy) == Some(AggregationStrategy::Concatenated) {
+            let agg = bridge_cfg.resolve_aggregation("textDocument/formatting");
+            if agg.strategy == AggregationStrategy::Concatenated && agg.priorities.is_empty() {
                 pairs.push((host_language.clone(), injection_language.clone()));
             }
         }
@@ -180,9 +176,10 @@ pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)])
         .join(", ");
     Some(format!(
         "Bridge config sets aggregation strategy 'concatenated' for \
-         textDocument/formatting on {} (host->injection) pair(s): {}. \
-         Formatting always uses 'preferred' to avoid overlapping TextEdits; \
-         the configured strategy is ignored.",
+         textDocument/formatting with an empty 'priorities' list on {} \
+         (host->injection) pair(s): {}. The concatenated formatting pipeline \
+         requires a non-empty 'priorities' (it defines which servers run and \
+         in what order); these pairs fall back to 'preferred'.",
         pairs.len(),
         listed
     ))
@@ -538,6 +535,107 @@ mod tests {
         assert!(
             pairs.is_empty(),
             "method-specific Preferred must override wildcard Concatenated"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_excludes_pairs_with_non_empty_priorities() {
+        // Since the concatenated formatting pipeline landed (#327), a
+        // `concatenated` strategy WITH a non-empty `priorities` list is a valid
+        // configuration that runs the pipeline — it must NOT be warned about.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec!["black".to_string(), "isort".to_string()]),
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "concatenated formatting with non-empty priorities runs the \
+             pipeline and must not be flagged as a misconfiguration"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_inherits_priorities_from_wildcard_entry() {
+        // Field-level wildcard inheritance: the method entry sets the strategy,
+        // the "_" wildcard supplies the priorities. The resolved config has a
+        // non-empty priorities list, so the pipeline runs — no warning.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: None,
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        agg.insert(
+            "_".to_string(),
+            AggregationConfig {
+                priorities: Some(vec!["black".to_string()]),
+                strategy: None,
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "priorities inherited from the wildcard entry must count as \
+             a configured (non-empty) pipeline definition"
+        );
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_explains_empty_priorities_fallback() {
+        // The warning is now scoped to the actual misconfiguration —
+        // `concatenated` with EMPTY priorities — so the message must say the
+        // pipeline needs a non-empty priorities list and that these pairs fall
+        // back to 'preferred', not that the strategy is always ignored.
+        let msg = format_concatenated_formatting_warning(&[(
+            "markdown".to_string(),
+            "python".to_string(),
+        )])
+        .expect("non-empty input must yield a message");
+        assert!(
+            msg.contains("priorities"),
+            "message must mention the empty priorities cause; got: {msg}"
+        );
+        assert!(
+            msg.contains("preferred"),
+            "message must state the preferred fallback; got: {msg}"
+        );
+        assert!(
+            !msg.contains("the configured strategy is ignored"),
+            "stale 'strategy is ignored' phrasing must be retired; got: {msg}"
         );
     }
 
