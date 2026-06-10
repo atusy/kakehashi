@@ -1092,7 +1092,7 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
 
     let line_count_preserved = lines.len() == host_line_prefixes.len();
     let lcp = if line_count_preserved {
-        String::new()
+        ""
     } else {
         // A region whose content ends with '\n' carries a trailing
         // empty-prefix entry for the synthetic line bucket after the final
@@ -1136,7 +1136,7 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
             // would double the marker.
             ""
         } else {
-            lcp.as_str()
+            lcp
         };
         // Empty output lines take the prefix with trailing whitespace
         // trimmed so the pipeline introduces no trailing-whitespace
@@ -1152,11 +1152,12 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
 }
 
 /// Longest common prefix of all strings, on char boundaries. Empty input or
-/// any empty string yields the empty prefix.
-fn longest_common_prefix(strings: &[String]) -> String {
+/// any empty string yields the empty prefix. Returns a slice of the first
+/// string (the prefix is by definition a substring of it), so no allocation.
+fn longest_common_prefix(strings: &[String]) -> &str {
     let mut iter = strings.iter();
     let Some(first) = iter.next() else {
-        return String::new();
+        return "";
     };
     let mut prefix = first.as_str();
     for s in iter {
@@ -1171,7 +1172,7 @@ fn longest_common_prefix(strings: &[String]) -> String {
             break;
         }
     }
-    prefix.to_string()
+    prefix
 }
 
 /// Sort `edits` in place by `range.start` (line, then character).
