@@ -917,12 +917,15 @@ fn lock_open_scratch(
 /// region — no host-file collision) and appends a `-kakehashi-scratch-{run}-{step}`
 /// suffix: the `run` (a process-global sequence) keeps concurrent runs for the
 /// same region distinct, and `step` keeps each step within a run distinct. The
-/// `kakehashi-scratch` marker (Decision point 7) lets external tools (file
-/// watchers, build tools, test runners) recognize and ignore these throwaway
-/// documents. It still flows through [`VirtualDocumentUri::new`], which also
-/// wraps it in the `kakehashi-virtual-uri-` filename marker and preserves the
-/// host directory and language extension required for downstream config and
-/// parser discovery.
+/// scratch marker ([`VirtualDocumentUri::SCRATCH_ID_MARKER`], Decision
+/// point 7) lets external tools (file watchers, build tools, test runners)
+/// recognize and ignore these throwaway documents, and is what the bridge
+/// reader keys on to discard downstream `publishDiagnostics` targeting them
+/// (`VirtualDocumentUri::is_scratch_uri`). It still flows through
+/// [`VirtualDocumentUri::new`], which also wraps it in the
+/// `kakehashi-virtual-uri-` filename marker and preserves the host directory
+/// and language extension required for downstream config and parser
+/// discovery.
 /// Process-global, monotonically increasing pipeline-run sequence. The per-step
 /// counter alone only makes scratch ids unique *within* a single pipeline run;
 /// two concatenated-formatting requests for the same host region overlapping in
@@ -934,7 +937,8 @@ fn lock_open_scratch(
 static SCRATCH_RUN_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
-    format!("{region_id}-kakehashi-scratch-{run}-{step}")
+    let marker = VirtualDocumentUri::SCRATCH_ID_MARKER;
+    format!("{region_id}{marker}{run}-{step}")
 }
 
 /// Compute the host-coordinate `Range` that the concatenated pipeline's single
@@ -1443,6 +1447,24 @@ mod tests {
             VirtualDocumentUri::is_virtual_uri(&uri_string),
             "scratch URI must be recognized as virtual: {uri_string}"
         );
+    }
+
+    #[test]
+    fn scratch_region_id_produces_uri_recognized_as_scratch() {
+        // The reader discards downstream publishDiagnostics for scratch URIs
+        // by keying on the shared SCRATCH_ID_MARKER; the id construction and
+        // that detection must agree (Decision point 7).
+        use crate::lsp::bridge::VirtualDocumentUri;
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///project/doc.md".parse().unwrap();
+        let id = scratch_region_id("REGION", 4, 2);
+        let uri = VirtualDocumentUri::new(&host_uri, "python", &id).to_uri_string();
+        assert!(
+            VirtualDocumentUri::is_scratch_uri(&uri),
+            "scratch id must yield a URI the reader recognizes as scratch: {uri}"
+        );
+        // And the canonical region document must NOT be flagged.
+        let canonical = VirtualDocumentUri::new(&host_uri, "python", "REGION").to_uri_string();
+        assert!(!VirtualDocumentUri::is_scratch_uri(&canonical));
     }
 
     // ==========================================================================

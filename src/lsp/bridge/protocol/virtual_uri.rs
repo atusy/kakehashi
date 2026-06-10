@@ -111,6 +111,24 @@ impl VirtualDocumentUri {
                 .is_some_and(|(_name, ext)| !ext.is_empty())
     }
 
+    /// Marker embedded in the `region_id` of throwaway scratch documents the
+    /// concatenated formatting pipeline opens per step
+    /// (concatenated-formatting-pipeline Decision point 7). Shared here so the
+    /// id construction (`scratch_region_id` in the formatting handler) and the
+    /// notification filtering ([`Self::is_scratch_uri`]) can never drift apart.
+    pub(crate) const SCRATCH_ID_MARKER: &str = "-kakehashi-scratch-";
+
+    /// Check if a URI string identifies a pipeline *scratch* virtual document
+    /// — a virtual URI whose region id carries [`Self::SCRATCH_ID_MARKER`].
+    ///
+    /// Scratch documents hold speculative pipeline state the editor never
+    /// sees; server-initiated notifications targeting them (notably
+    /// `textDocument/publishDiagnostics`) must be discarded rather than
+    /// forwarded (Decision point 7).
+    pub(crate) fn is_scratch_uri(uri: &str) -> bool {
+        Self::is_virtual_uri(uri) && uri.contains(Self::SCRATCH_ID_MARKER)
+    }
+
     /// Format: `{scheme}:///{host_dir}/kakehashi-virtual-uri-{region_id}.{ext}`,
     /// preserving the host URI's scheme (file://, https://, …) and directory so
     /// downstream servers can resolve relative imports and discover project
@@ -185,6 +203,46 @@ mod tests {
     // Helper function to convert url::Url to tower_lsp_server::ls_types::Uri for tests
     fn url_to_uri(url: &Url) -> Uri {
         crate::lsp::lsp_impl::url_to_uri(url).expect("test URL should convert to URI")
+    }
+
+    // ==========================================================================
+    // is_scratch_uri tests (concatenated-formatting-pipeline Decision point 7)
+    // ==========================================================================
+
+    #[test]
+    fn is_scratch_uri_detects_pipeline_scratch_documents() {
+        // The shape `scratch_region_id` produces: canonical region id plus the
+        // scratch marker and run/step counters, flowed through the virtual URI.
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let scratch_id = format!("01ARZ3NDEKTSV4{}7-0", VirtualDocumentUri::SCRATCH_ID_MARKER);
+        let uri =
+            VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", &scratch_id).to_uri_string();
+        assert!(
+            VirtualDocumentUri::is_scratch_uri(&uri),
+            "scratch virtual URI must be detected: {uri}"
+        );
+    }
+
+    #[test]
+    fn is_scratch_uri_rejects_canonical_virtual_documents() {
+        // The canonical region virtual document (hover/diagnostics keep it
+        // open) is NOT scratch — its notifications follow the normal rules.
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "01ARZ3NDEKTSV4")
+            .to_uri_string();
+        assert!(!VirtualDocumentUri::is_scratch_uri(&uri));
+    }
+
+    #[test]
+    fn is_scratch_uri_rejects_real_files_even_with_marker_in_path() {
+        // A real file that merely contains the marker somewhere in its name is
+        // not a virtual document at all, let alone a scratch one.
+        assert!(!VirtualDocumentUri::is_scratch_uri(
+            "file:///project/notes-kakehashi-scratch-1.md"
+        ));
+        assert!(!VirtualDocumentUri::is_scratch_uri(
+            "file:///project/src/main.rs"
+        ));
     }
 
     // ==========================================================================

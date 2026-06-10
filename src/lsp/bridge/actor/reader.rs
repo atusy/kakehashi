@@ -535,7 +535,19 @@ async fn handle_message(
             handle_server_request(message, lang_prefix, deps).await;
         }
         MessageKind::Notification => {
-            // Notifications are silently ignored (no logging needed)
+            // Server-initiated notifications are not forwarded upstream today;
+            // `publishDiagnostics` targeting a pipeline *scratch* document is
+            // discarded EXPLICITLY (concatenated-formatting-pipeline Decision
+            // point 7: scratch state is speculative and must never reach the
+            // editor) so the invariant survives if notification forwarding is
+            // ever implemented. Everything else is silently ignored.
+            if is_scratch_publish_diagnostics(&message) {
+                debug!(
+                    target: "kakehashi::bridge::reader",
+                    "{}Discarding publishDiagnostics targeting a scratch virtual document",
+                    lang_prefix
+                );
+            }
         }
         MessageKind::Invalid => {
             warn!(
@@ -546,6 +558,24 @@ async fn handle_message(
             );
         }
     }
+}
+
+/// Whether `message` is a `textDocument/publishDiagnostics` notification
+/// targeting a concatenated-formatting *scratch* virtual document
+/// ([`VirtualDocumentUri::is_scratch_uri`]).
+///
+/// Scratch documents carry speculative pipeline text the editor has never
+/// seen; diagnostics computed against them are meaningless to the user and
+/// must be discarded, not forwarded (concatenated-formatting-pipeline
+/// Decision point 7). The prompt `didClose` after each pipeline run shrinks
+/// but cannot eliminate the window in which a downstream server pushes them.
+fn is_scratch_publish_diagnostics(message: &serde_json::Value) -> bool {
+    message.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+        && message
+            .get("params")
+            .and_then(|p| p.get("uri"))
+            .and_then(|u| u.as_str())
+            .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
 }
 
 /// Handle a server-initiated request by dispatching on its method.
@@ -1286,6 +1316,82 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+    }
+
+    /// Scratch-targeted publishDiagnostics must be dropped on the floor:
+    /// nothing forwarded upstream, nothing written back downstream
+    /// (concatenated-formatting-pipeline Decision point 7).
+    #[tokio::test]
+    async fn handle_message_discards_publish_diagnostics_for_scratch_uri() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+        };
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///project/kakehashi-virtual-uri-REGION-kakehashi-scratch-3-0.py",
+                "diagnostics": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "message": "speculative-state diagnostic"
+                }]
+            }
+        });
+
+        handle_message(message, &router, "", &deps).await;
+
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "scratch publishDiagnostics must not be forwarded upstream"
+        );
+        assert!(
+            response_rx.try_recv().is_err(),
+            "a notification must not trigger any downstream response"
+        );
+    }
+
+    #[test]
+    fn is_scratch_publish_diagnostics_matches_only_scratch_targets() {
+        let scratch = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": "file:///p/kakehashi-virtual-uri-R-kakehashi-scratch-0-1.py", "diagnostics": []}
+        });
+        assert!(is_scratch_publish_diagnostics(&scratch));
+
+        // Canonical virtual document: not scratch.
+        let canonical = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": "file:///p/kakehashi-virtual-uri-R.py", "diagnostics": []}
+        });
+        assert!(!is_scratch_publish_diagnostics(&canonical));
+
+        // Different method on a scratch URI: not publishDiagnostics.
+        let other_method = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {"uri": "file:///p/kakehashi-virtual-uri-R-kakehashi-scratch-0-1.py"}
+        });
+        assert!(!is_scratch_publish_diagnostics(&other_method));
+
+        // Missing params: must not panic, just no match.
+        let no_params = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics"
+        });
+        assert!(!is_scratch_publish_diagnostics(&no_params));
     }
 
     #[tokio::test]
