@@ -173,6 +173,10 @@ impl Kakehashi {
 /// The inversion guard mirrors `lookup::find_node_at`: tree-sitter's
 /// `descendant_for_byte_range` is not specified for `start > end`, so we reject
 /// it up front rather than relying on the C bindings' behaviour.
+///
+/// Per-call the handlers additionally bound the range to the queried node's
+/// contiguous span. Known limitation (#341): that span check does not exclude
+/// bytes in the gaps of an injected layer's non-contiguous included ranges.
 fn byte_range(params: &NodeByteRangeParams) -> Option<(usize, usize)> {
     let start = usize::try_from(params.start_byte).ok()?;
     let end = usize::try_from(params.end_byte).ok()?;

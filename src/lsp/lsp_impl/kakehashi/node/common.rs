@@ -19,7 +19,6 @@ use url::Url;
 
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
-use crate::text::PositionMapper;
 
 /// A tracked node's `(start_byte, end_byte, kind)` triple, as produced by a
 /// navigation closure and consumed by the re-minting helpers below. `kind` is
@@ -132,21 +131,26 @@ impl Kakehashi {
         id: &str,
         mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
     ) -> Option<(Url, usize, R)> {
-        // Most accessors don't need positions; ignore the mapper.
-        self.with_node_mapped(lsp_uri, id, move |node, _mapper| f(node))
+        // Most accessors don't need the document text; ignore it.
+        self.with_node_text(lsp_uri, id, move |node, _text| f(node))
             .await
     }
 
     /// Like [`with_node_by_id`](Self::with_node_by_id) but also hands the closure
-    /// a [`PositionMapper`] over the host document, so position/range accessors
-    /// can convert tree-sitter byte offsets ↔ LSP `Position` (UTF-16) without a
-    /// second snapshot. This is the actual shared prelude; `with_node_by_id`
-    /// delegates here with the mapper ignored.
-    pub(super) async fn with_node_mapped<R>(
+    /// the host document text, so the position/range accessors can build a
+    /// [`PositionMapper`] to convert tree-sitter byte offsets ↔ LSP `Position`
+    /// (UTF-16) without a second snapshot.
+    ///
+    /// The text — not a pre-built `PositionMapper` — is passed because
+    /// `PositionMapper::new` indexes the whole document (O(doc)); building it
+    /// unconditionally here would tax every scalar/navigation accessor that never
+    /// touches positions. Only the handful of position accessors build the mapper,
+    /// inside their own closure.
+    pub(super) async fn with_node_text<R>(
         &self,
         lsp_uri: &Uri,
         id: &str,
-        mut f: impl FnMut(tree_sitter::Node<'_>, &PositionMapper) -> R,
+        mut f: impl FnMut(tree_sitter::Node<'_>, &str) -> R,
     ) -> Option<(Url, usize, R)> {
         // An unparseable URI signals a misbehaving client; warn for parity with
         // `node` / `node/text` / `node/parent` / `node/children` while still
@@ -181,7 +185,6 @@ impl Kakehashi {
 
         let host_tree = snapshot.tree();
         let host_language = self.document_language(&uri)?;
-        let mapper = PositionMapper::new(host_text);
 
         // A tracker hit that fails to resolve in its minting layer means the
         // tree drifted out from under the tracked range (e.g. an edit
@@ -198,7 +201,7 @@ impl Kakehashi {
             end,
             kind,
             layer,
-            |node| f(node, &mapper),
+            |node| f(node, host_text),
         ) else {
             log::warn!(
                 target: "kakehashi::node",
