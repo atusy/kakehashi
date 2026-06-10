@@ -355,41 +355,68 @@ same embedding layer as the input:
 > a position) is planned but **not yet available**. For named-only navigation today,
 > use `kakehashi/node/namedChildren` and the `named*` accessors.
 
-### Queries
+### Captures
 
-The node accessors above walk the tree one step at a time. `kakehashi/query` runs a
-whole Tree-sitter [query](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/)
-(an `.scm` pattern) over the document in a single request — so a client can do
-structural search, symbol extraction, fold-range computation, or a
+The node accessors above walk the tree one step at a time. The
+`kakehashi/captures/*` methods run a whole Tree-sitter
+[query](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/) over the
+document in a single request — so a client can do structural search, symbol
+extraction, fold-range computation, or a
 [treesitter-context](https://github.com/nvim-treesitter/nvim-treesitter-context)-style
 "sticky context" feature without re-implementing the query engine.
 
+The query itself is **not sent by the client**. A `kind` (e.g. `"context"`) names a
+per-language query file, resolved as `queries/<language>/<kind>.scm` across the
+configured `searchPaths` — the same place highlight queries live, with the same
+`; inherits:` support. Drop a file into a search path and the kind exists; no
+server configuration needed. (nvim-treesitter-context's own `context.scm` files
+work as-is once their directory is on a search path.)
+
+The three methods mirror `textDocument/semanticTokens`, so live features can
+re-request cheaply on every cursor move or edit:
+
 | Method | Input | Output |
 |--------|-------|--------|
-| `kakehashi/query` | `{ textDocument, query, matchLimit? }` | `QueryResult \| null` |
-
-The `query` is an arbitrary Tree-sitter query string (the body of an `.scm`),
-compiled against the document's **host** grammar. `matchLimit` optionally caps how
-many matches come back (the server applies a safety cap when omitted).
+| `kakehashi/captures/full` | `{ textDocument, kind, matchLimit? }` | `CapturesResult \| null` |
+| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId, matchLimit? }` | `CapturesResult \| CapturesDelta \| null` |
+| `kakehashi/captures/range` | `{ textDocument, kind, range, matchLimit? }` | `{ matches, skipped } \| null` |
 
 ```typescript
-type QueryResult = {
-  matches: {
-    patternIndex: number;            // which pattern in the query produced this match
-    captures: {
-      name: string;                  // capture name without the '@', e.g. "context"
-      node: NodeInfo;                // { id, kind } — trackable like any other node
-      range: { start: Position, end: Position };  // LSP Position (UTF-16), inline
-    }[];
-  }[];
+type CapturesResult = {
+  resultId: string;                  // hand back as previousResultId for a delta
+  matches: Match[];
   skipped: {                         // patterns dropped by tolerant compilation
-    startLine: number;               // 1-indexed line in the query string
+    startLine: number;               // 1-indexed line in the query file
     endLine: number;
     reason: string;                  // Tree-sitter's compile error for that pattern
   }[];
 };
+
+type Match = {
+  patternIndex: number;              // which pattern in the query produced this match
+  captures: {
+    name: string;                    // capture name without the '@', e.g. "context"
+    node: NodeInfo;                  // { id, kind } — trackable like any other node
+    range: { start: Position, end: Position };  // LSP Position (UTF-16), inline
+  }[];
+};
+
+type CapturesDelta = {
+  resultId: string;
+  // Splice edits over the previous matches array (indices are match indices):
+  // matches.splice(start, deleteCount, ...data)
+  edits: { start: number; deleteCount: number; data: Match[] }[];
+};
 ```
 
+- **`full` → `full/delta` loop**: call `full` once, keep its `resultId`, then send
+  `full/delta` on subsequent ticks. An unchanged document answers with empty
+  `edits`; a small edit ships only the changed matches. If the server doesn't
+  recognize `previousResultId` (e.g. after a reopen), it falls back to a full
+  result — clients need no special re-sync logic. Every response carries a fresh
+  `resultId`; always hand back the latest one.
+- **`range`** scopes the query walk to a viewport (matches whose nodes intersect
+  the range). It carries no `resultId` — there is no delta over viewports.
 - **Captures are grouped by match**, so correlated captures within one pattern
   (e.g. `@context` and `@context.end`) stay together.
 - **Each capture carries both a `node` and its `range`**, so a bulk result needs no
@@ -400,13 +427,13 @@ type QueryResult = {
   highlighting. Unknown predicates are ignored.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
-- **A document that isn't open returns `null`** (same as the node methods). A `query`
-  string that cannot be parsed at all is a client error, returned as a JSON-RPC
-  `InvalidParams` error rather than `null`.
+- **`null` means "nothing here"**: the document isn't open, or the language has no
+  `<kind>.scm` on the search paths. A malformed `kind` (anything beyond
+  `[A-Za-z0-9_-]+`) is a client error, returned as JSON-RPC `InvalidParams`.
 
-> Queries run against the **host layer only** for now; patterns are not yet matched
-> inside embedded (injected) languages. Querying a Python block inside Markdown,
-> for example, is planned but not yet available.
+> Capture queries run against the **host layer only** for now; patterns are not yet
+> matched inside embedded (injected) languages. Querying a Python block inside
+> Markdown, for example, is planned but not yet available.
 
 ---
 
