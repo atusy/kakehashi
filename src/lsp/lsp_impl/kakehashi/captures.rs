@@ -134,9 +134,14 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
         let result_id = next_result_id();
-        // Clone what the delta cache needs up front; the originals then flow
-        // into the response, keeping the ownership split explicit.
-        //
+        // `json!` serializes interpolated values **by reference**, so the
+        // originals are still owned afterwards and move into the cache insert
+        // below — exactly one materialization of the matches per request.
+        let response = json!({
+            "resultId": result_id,
+            "matches": c.matches,
+            "skipped": c.skipped,
+        });
         // Skip caching when the document closed while this request was in
         // flight — didClose clears the cache, and an unconditional insert
         // would resurrect a stale lineage entry for the closed document. A
@@ -144,13 +149,9 @@ impl Kakehashi {
         // next didClose for the URI clears again.
         if self.documents.get(&c.uri).is_some() {
             self.captures_cache
-                .insert((c.uri, params.kind), (result_id.clone(), c.matches.clone()));
+                .insert((c.uri, params.kind), (result_id, c.matches));
         }
-        Ok(json!({
-            "resultId": result_id,
-            "matches": c.matches,
-            "skipped": c.skipped,
-        }))
+        Ok(response)
     }
 
     /// Handler for `kakehashi/captures/full/delta`.
@@ -175,8 +176,8 @@ impl Kakehashi {
         // the previous matches would tax every delta request, the hot repeat
         // path. The read guard (the match scrutinee temporary) drops at the
         // end of this statement, before the insert below touches the same
-        // DashMap shard. Per-branch clones feed the response; the originals
-        // move into the cache insert.
+        // DashMap shard. `json!` serializes by reference, so `result_id` and
+        // `c.matches` stay owned here and move into the cache insert.
         let response = match self.captures_cache.get(&key) {
             Some(entry) if entry.value().0 == params.previous_result_id => {
                 let edits = match matches_delta_edit(&entry.value().1, &c.matches) {
@@ -187,13 +188,13 @@ impl Kakehashi {
                         "data": data,
                     }]),
                 };
-                json!({ "resultId": result_id.clone(), "edits": edits })
+                json!({ "resultId": result_id, "edits": edits })
             }
             // Unknown or stale previousResultId: full result (LSP convention —
             // a server may always answer a delta request with a full result).
             _ => json!({
-                "resultId": result_id.clone(),
-                "matches": c.matches.clone(),
+                "resultId": result_id,
+                "matches": c.matches,
                 "skipped": c.skipped,
             }),
         };
@@ -315,18 +316,14 @@ impl Kakehashi {
 
         // Range scoping: clamped conversion (like other viewport-shaped
         // requests) — an out-of-bounds position means "to the document edge",
-        // not an error. An inverted range can't name any bytes → null.
-        let byte_range = match lsp_range {
-            None => None,
-            Some(r) => {
-                let start = mapper.position_to_byte_clamped(r.start);
-                let end = mapper.position_to_byte_clamped(r.end);
-                if start > end {
-                    return Ok(None);
-                }
-                Some(start..end)
-            }
-        };
+        // not an error. An inverted range is normalized to [min, max], the
+        // same forgiveness range_formatting applies, rather than collapsing
+        // to null (which the protocol reserves for unresolvable states).
+        let byte_range = lsp_range.map(|r| {
+            let a = mapper.position_to_byte_clamped(r.start);
+            let b = mapper.position_to_byte_clamped(r.end);
+            a.min(b)..a.max(b)
+        });
 
         let match_data = execute_query(&query, tree, text, byte_range);
 
