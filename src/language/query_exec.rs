@@ -1,23 +1,20 @@
-//! Run a client-supplied tree-sitter query over a parsed tree and collect its
-//! matches as plain byte-range data (query-execution-protocol).
+//! Execute a precompiled tree-sitter query over a parsed tree and collect its
+//! matches as plain byte-range data (captures-protocol).
 //!
-//! This is the grammar-level core behind the `kakehashi/query` LSP method. It is
-//! kept free of LSP / `Kakehashi` concerns (no URI, no ULID minting, no
-//! coordinate conversion) so it can be unit-tested with a bare grammar and so
-//! the handler stays a thin adapter: run the query here, then map each capture
-//! to a `NodeInfo` + LSP `Range`.
+//! This is the grammar-level core behind the `kakehashi/captures/*` LSP
+//! methods. It is kept free of LSP / `Kakehashi` concerns (no URI, no ULID
+//! minting, no coordinate conversion) so it can be unit-tested with a bare
+//! grammar and so the handlers stay thin adapters: execute here, then map
+//! each capture to a `NodeInfo` + LSP `Range`.
 //!
-//! Compilation reuses the tolerant [`QueryLoader::parse_query`] path so a query
-//! whose individual patterns are valid but reference symbols absent from this
-//! grammar yields the valid patterns' matches plus a `skipped` list, rather than
-//! failing wholesale (query-execution-protocol §"Tolerant compilation").
-//! Predicate evaluation reuses [`filter_captures`] so query results agree with
-//! semantic-token highlighting, including the Neovim-flavored general predicates
-//! (`#lua-match?`, `#has-ancestor?`, …).
+//! Compilation is the caller's job (the handlers load kind queries through
+//! [`QueryLoader`](crate::language::query_loader::QueryLoader)'s tolerant
+//! path). Predicate evaluation reuses [`filter_captures`] so capture results
+//! agree with semantic-token highlighting, including the Neovim-flavored
+//! general predicates (`#lua-match?`, `#has-ancestor?`, …).
 
-use tree_sitter::{Language, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::language::query_loader::{ParseFailure, QueryLoader, SkippedPattern};
 use crate::language::query_predicates::filter_captures;
 
 /// One capture within a match: the capture name and the captured node's span.
@@ -35,89 +32,20 @@ pub(crate) struct CapturedNode {
 
 /// One query match, grouping its captures so correlated captures within a
 /// pattern (e.g. `@context` and `@context.end`) stay together
-/// (query-execution-protocol §"Grouping by match").
+/// (captures-protocol §"Result shapes").
 #[derive(Debug, Clone)]
 pub(crate) struct MatchData {
     pub pattern_index: usize,
     pub captures: Vec<CapturedNode>,
 }
 
-/// Successful outcome: the matches plus any patterns dropped by tolerant
-/// compilation.
-#[derive(Debug)]
-pub(crate) struct QueryExecOutcome {
-    pub matches: Vec<MatchData>,
-    pub skipped: Vec<SkippedPattern>,
-}
-
-/// The query string could not be compiled into any usable pattern — a client
-/// error (query-execution-protocol §"Null vs. error semantics"). Per-pattern
-/// detail is summarized into `reason`; partial-compilation diagnostics travel
-/// the success path via [`QueryExecOutcome::skipped`] instead.
-#[derive(Debug)]
-pub(crate) struct QueryCompileError {
-    pub reason: String,
-}
-
-/// Summarize a total compilation failure into a human-readable reason for the
-/// JSON-RPC error message. For "all patterns invalid" we fold in the first
-/// pattern's tree-sitter error, which is what a client debugging its `.scm`
-/// actually needs.
-fn describe_failure(reason: Option<&ParseFailure>, skipped: &[SkippedPattern]) -> String {
-    match reason {
-        Some(ParseFailure::PatternSplitFailed(msg)) => {
-            format!("malformed query syntax: {msg}")
-        }
-        Some(ParseFailure::CombinationFailed(msg)) => {
-            format!("patterns valid individually but failed combined: {msg}")
-        }
-        Some(ParseFailure::AllPatternsInvalid) => match skipped.first() {
-            Some(first) => format!(
-                "no valid patterns (e.g. line {}: {})",
-                first.start_line, first.error
-            ),
-            None => "no valid patterns in query".to_string(),
-        },
-        None => "query produced no compilable patterns".to_string(),
-    }
-}
-
-/// Compile `query_str` against `language` and run it over `tree`, returning the
-/// matches over `text`. `match_limit` caps the number of matches returned (the
-/// server's safety bound); `None` means no cap.
-pub(crate) fn run_query(
-    language: &Language,
-    tree: &Tree,
-    text: &str,
-    query_str: &str,
-    match_limit: Option<usize>,
-) -> Result<QueryExecOutcome, QueryCompileError> {
-    // Tolerant compilation: keep matches from the valid patterns and report the
-    // dropped ones. `used_inheritance: false` — client queries are standalone,
-    // so skipped line numbers refer to the query string as given.
-    let parsed = QueryLoader::parse_query(language, query_str, false);
-    let Some(query) = parsed.query else {
-        return Err(QueryCompileError {
-            reason: describe_failure(parsed.failure_reason.as_ref(), &parsed.skipped),
-        });
-    };
-
-    Ok(QueryExecOutcome {
-        matches: execute_query(&query, tree, text, None, match_limit),
-        skipped: parsed.skipped,
-    })
-}
-
 /// Run an already-compiled `query` over `tree`, collecting matches over `text`.
 ///
-/// Split from compilation so callers holding a precompiled query (e.g. a
-/// server-owned kind query) can execute without re-parsing, and so a byte
-/// range can scope the walk. `byte_range` restricts matching via
-/// `QueryCursor::set_byte_range` (matches whose nodes intersect the range);
-/// `None` walks the whole tree. `match_limit` caps the number of matches
-/// returned; `None` means no cap.
+/// `byte_range` restricts matching via `QueryCursor::set_byte_range` (matches
+/// whose nodes intersect the range); `None` walks the whole tree.
+/// `match_limit` caps the number of matches returned; `None` means no cap.
 pub(crate) fn execute_query(
-    query: &tree_sitter::Query,
+    query: &Query,
     tree: &Tree,
     text: &str,
     byte_range: Option<std::ops::Range<usize>>,
@@ -170,7 +98,8 @@ pub(crate) fn execute_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::Parser;
+    use crate::language::query_loader::QueryLoader;
+    use tree_sitter::{Language, Parser};
 
     fn rust_tree(src: &str) -> (Language, Tree) {
         let language: Language = tree_sitter_rust::LANGUAGE.into();
@@ -180,22 +109,23 @@ mod tests {
         (language, tree)
     }
 
+    /// Compile through the same tolerant path the captures handlers use.
+    fn compile(language: &Language, query_str: &str) -> Query {
+        QueryLoader::parse_query(language, query_str, false)
+            .query
+            .expect("query compiles")
+    }
+
     #[test]
     fn captures_function_name() {
         let src = "fn foo() {}";
         let (language, tree) = rust_tree(src);
+        let query = compile(&language, "(function_item name: (identifier) @name)");
 
-        let outcome = run_query(
-            &language,
-            &tree,
-            src,
-            "(function_item name: (identifier) @name)",
-            None,
-        )
-        .expect("valid query compiles");
+        let matches = execute_query(&query, &tree, src, None, None);
 
-        assert_eq!(outcome.matches.len(), 1, "one function -> one match");
-        let m = &outcome.matches[0];
+        assert_eq!(matches.len(), 1, "one function -> one match");
+        let m = &matches[0];
         assert_eq!(m.captures.len(), 1);
         let c = &m.captures[0];
         assert_eq!(c.name, "name");
@@ -207,17 +137,30 @@ mod tests {
     fn match_limit_caps_returned_matches() {
         let src = "fn a() {} fn b() {} fn c() {}";
         let (language, tree) = rust_tree(src);
-        let query = "(function_item name: (identifier) @name)";
+        let query = compile(&language, "(function_item name: (identifier) @name)");
 
-        let all = run_query(&language, &tree, src, query, None).unwrap();
-        assert_eq!(all.matches.len(), 3, "three functions without a cap");
+        let all = execute_query(&query, &tree, src, None, None);
+        assert_eq!(all.len(), 3, "three functions without a cap");
 
-        let capped = run_query(&language, &tree, src, query, Some(2)).unwrap();
-        assert_eq!(capped.matches.len(), 2, "match_limit truncates to a prefix");
+        let capped = execute_query(&query, &tree, src, None, Some(2));
+        assert_eq!(capped.len(), 2, "match_limit truncates to a prefix");
         assert_eq!(
-            &src[capped.matches[0].captures[0].start_byte..capped.matches[0].captures[0].end_byte],
+            &src[capped[0].captures[0].start_byte..capped[0].captures[0].end_byte],
             "a"
         );
+    }
+
+    #[test]
+    fn byte_range_scopes_the_walk() {
+        let src = "fn a() {} fn b() {} fn c() {}";
+        let (language, tree) = rust_tree(src);
+        let query = compile(&language, "(function_item name: (identifier) @name)");
+
+        // Bytes 10..19 cover exactly `fn b() {}`; a and c lie outside.
+        let scoped = execute_query(&query, &tree, src, Some(10..19), None);
+        assert_eq!(scoped.len(), 1, "only the function intersecting the range");
+        let c = &scoped[0].captures[0];
+        assert_eq!(&src[c.start_byte..c.end_byte], "b");
     }
 
     #[test]
@@ -226,35 +169,35 @@ mod tests {
         // only the identifier literally equal to "wanted" should match.
         let src = "fn wanted() {} fn other() {}";
         let (language, tree) = rust_tree(src);
-        let query = r#"((function_item name: (identifier) @name) (#eq? @name "wanted"))"#;
+        let query = compile(
+            &language,
+            r#"((function_item name: (identifier) @name) (#eq? @name "wanted"))"#,
+        );
 
-        let outcome = run_query(&language, &tree, src, query, None).unwrap();
-        assert_eq!(outcome.matches.len(), 1);
-        let c = &outcome.matches[0].captures[0];
+        let matches = execute_query(&query, &tree, src, None, None);
+        assert_eq!(matches.len(), 1);
+        let c = &matches[0].captures[0];
         assert_eq!(&src[c.start_byte..c.end_byte], "wanted");
     }
 
     #[test]
-    fn unparseable_query_is_a_compile_error() {
-        let src = "fn foo() {}";
-        let (language, tree) = rust_tree(src);
-
-        let err = run_query(&language, &tree, src, "(this is not balanced", None)
-            .expect_err("a malformed query must not silently succeed");
-        assert!(!err.reason.is_empty());
-    }
-
-    #[test]
-    fn pattern_referencing_unknown_node_is_skipped_not_fatal() {
+    fn tolerant_compilation_skips_invalid_patterns() {
         // A valid pattern plus one referencing a node kind absent from the Rust
-        // grammar: tolerant compilation keeps the good one and reports the bad.
+        // grammar: tolerant compilation keeps the good one and reports the bad
+        // (the handlers surface `skipped` to the client).
         let src = "fn foo() {}";
         let (language, tree) = rust_tree(src);
-        let query = "(function_item name: (identifier) @good)\n(no_such_node) @bad";
+        let parsed = QueryLoader::parse_query(
+            &language,
+            "(function_item name: (identifier) @good)\n(no_such_node) @bad",
+            false,
+        );
 
-        let outcome = run_query(&language, &tree, src, query, None).unwrap();
-        assert_eq!(outcome.matches.len(), 1, "the valid pattern still runs");
-        assert_eq!(outcome.matches[0].captures[0].name, "good");
-        assert_eq!(outcome.skipped.len(), 1, "the invalid pattern is reported");
+        let query = parsed.query.expect("valid pattern still compiles");
+        assert_eq!(parsed.skipped.len(), 1, "the invalid pattern is reported");
+
+        let matches = execute_query(&query, &tree, src, None, None);
+        assert_eq!(matches.len(), 1, "the valid pattern still runs");
+        assert_eq!(matches[0].captures[0].name, "good");
     }
 }

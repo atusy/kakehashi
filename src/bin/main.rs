@@ -651,7 +651,20 @@ async fn run_lsp_server() {
         "kakehashi/internal/effectiveConfiguration",
         Kakehashi::effective_configuration,
     )
-    .custom_method("kakehashi/query", Kakehashi::kakehashi_query)
+    // Captures (captures-protocol) — semanticTokens-style triple over a
+    // server-owned query kind.
+    .custom_method(
+        "kakehashi/captures/full",
+        Kakehashi::kakehashi_captures_full,
+    )
+    .custom_method(
+        "kakehashi/captures/full/delta",
+        Kakehashi::kakehashi_captures_full_delta,
+    )
+    .custom_method(
+        "kakehashi/captures/range",
+        Kakehashi::kakehashi_captures_range,
+    )
     .custom_method("kakehashi/node", Kakehashi::kakehashi_node)
     .custom_method("kakehashi/node/text", Kakehashi::kakehashi_node_text)
     .custom_method("kakehashi/node/parent", Kakehashi::kakehashi_node_parent)

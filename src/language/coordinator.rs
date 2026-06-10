@@ -1128,6 +1128,13 @@ impl LanguageCoordinator {
     pub(crate) fn language_registry_for_parallel(&self) -> LanguageRegistry {
         self.language_registry.clone()
     }
+
+    /// Configured root search paths, for request-time resolution of dynamic
+    /// capture query kinds — `queries/<lang>/<kind>.scm` lookups against the
+    /// same bases config-time loading uses (captures-protocol §"Kind resolution").
+    pub(crate) fn search_paths(&self) -> Vec<std::path::PathBuf> {
+        self.config_store.search_paths()
+    }
 }
 
 /// Truncate a pattern string for display in log messages.
