@@ -772,6 +772,33 @@ mod tests {
     }
 
     #[test]
+    fn metadata_object_is_none_when_no_directives() {
+        // Patterns without #set! must keep their pre-metadata wire shape —
+        // an empty object would churn every delta lineage.
+        assert_eq!(metadata_object(&[]), None);
+    }
+
+    #[test]
+    fn metadata_object_flag_form_maps_to_true() {
+        // (#set! key) without a value is a flag (e.g. injection.combined
+        // style); JSON true lets clients test for it, where Neovim's nil
+        // assignment would make the key undetectable.
+        let pairs = [("combined".to_string(), None)];
+        assert_eq!(metadata_object(&pairs), Some(json!({ "combined": true })));
+    }
+
+    #[test]
+    fn metadata_object_duplicate_keys_last_write_wins() {
+        // Neovim applies directives in order, so a later #set! of the same
+        // key overwrites the earlier one.
+        let pairs = [
+            ("kind".to_string(), Some("first".to_string())),
+            ("kind".to_string(), Some("second".to_string())),
+        ];
+        assert_eq!(metadata_object(&pairs), Some(json!({ "kind": "second" })));
+    }
+
+    #[test]
     fn kind_whitelist() {
         assert!(is_valid_kind("context"));
         assert!(is_valid_kind("my-kind_2"));
