@@ -13,6 +13,11 @@
 //! per-pattern compilation) used for highlights. Kinds are therefore
 //! open-ended — defined by what files exist, not by an enum.
 //!
+//! `#set!` directives in the kind file ride along as `metadata` objects —
+//! match-level for `(#set! key value)`, on the capture entry for
+//! `(#set! @cap key value)` — following Neovim's treesitter-directive-set!
+//! scoping (captures-protocol §"Result shapes").
+//!
 //! With `injection: true` the kind query runs across **every** layer — the
 //! host, then each injection region in document-order DFS — each layer
 //! resolving its own language's kind file, with result nodes minted in their

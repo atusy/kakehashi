@@ -397,12 +397,18 @@ type Match = {
   patternIndex: number;              // pattern within that language's kind query —
                                      // (language, patternIndex) is the unique key
   language: string;                  // language of the layer this match came from
+  metadata?: Metadata;               // match-level (#set! key value); absent when none
   captures: {
     name: string;                    // capture name without the '@', e.g. "context"
     node: NodeInfo;                  // { id, kind } — trackable like any other node
     range: { start: Position, end: Position };  // LSP Position (UTF-16), inline
+    metadata?: Metadata;             // capture-level (#set! @cap key value); absent when none
   }[];
 };
+
+// Values from #set! directives: strings as written in the query; the bare
+// flag form (#set! key) surfaces as true.
+type Metadata = { [key: string]: string | true };
 
 type CapturesDelta = {
   resultId: string;
@@ -443,6 +449,12 @@ type CapturesDelta = {
   `#any-of?` and the Neovim-flavored `#lua-match?` / `#has-parent?` /
   `#has-ancestor?` (and their negations) — so results match kakehashi's own
   highlighting. Unknown predicates are ignored.
+- **`#set!` metadata is returned** (the
+  [Neovim `set!` directive](https://neovim.io/doc/user/treesitter.html#treesitter-directive-set!)):
+  `(#set! key value)` rides on the match as `metadata[key]`,
+  `(#set! @cap key value)` rides on that capture as its `metadata[key]` —
+  e.g. `((codeblock) @context (#set! kind "block"))` lets a client label
+  matches without parsing capture names. Repeated keys are last-write-wins.
 - **Tolerant compilation**: if some patterns reference symbols absent from the
   grammar, the valid patterns still run and the rest are reported in `skipped`.
 - **`null` means "nothing here"**: the document isn't open, or no involved

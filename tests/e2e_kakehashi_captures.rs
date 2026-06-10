@@ -13,6 +13,8 @@
 //! - `full/delta` after an edit → a single positional edit with the new match
 //! - `full/delta` with an unknown `previousResultId` → full result fallback
 //! - `range` returning only matches intersecting the range (no `resultId`)
+//! - `#set!` directives → `metadata` on the match (`(#set! k v)`) or on the
+//!   capture (`(#set! @cap k v)`), absent on unannotated patterns/captures
 //! - a kind with no query file → `null`
 //! - a malformed kind (path traversal) → JSON-RPC error
 //!
