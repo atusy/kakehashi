@@ -20,7 +20,7 @@ use parallel::collect_injection_tokens_parallel;
 
 // Internal re-exports for production code
 use finalize::finalize_tokens;
-use token_collector::{RawToken, collect_host_tokens};
+use token_collector::{RawToken, build_line_start_bytes, collect_host_tokens};
 
 // Test-only imports
 #[cfg(test)]
@@ -43,6 +43,7 @@ pub(crate) async fn handle_semantic_tokens_full(
     tokio::task::spawn_blocking(move || {
         let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
+        let line_starts = build_line_start_bytes(&text);
 
         // Collect host document tokens first (no exclusion — finalize handles it).
         collect_host_tokens(
@@ -53,6 +54,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             capture_mappings.as_deref(),
             &text,
             &lines,
+            &line_starts,
             0,
             0,
             supports_multiline,
@@ -66,6 +68,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
             &text,
             &lines,
+            &line_starts,
             &tree,
             filetype.as_deref(),
             &coordinator,
