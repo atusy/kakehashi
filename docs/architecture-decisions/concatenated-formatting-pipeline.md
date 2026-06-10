@@ -345,17 +345,26 @@ change without affecting the config surface.
 
 ## Decision–Implementation Gap
 
-Not yet implemented as of this decision. `textDocument/formatting` currently runs
-the `preferred` strategy per region regardless of config, and a misconfigured
-`concatenated` formatting configuration only emits a warning rather than running
-a pipeline. This record defines the target behavior for full formatting; the
-warning path is the placeholder to be replaced.
+Implemented as decided. The first vertical slice (PR #327) delivered the core
+pipeline — strategy dispatch, serial application over `priorities`, scratch
+document isolation, and the single region-replacement edit. The follow-up
+slices (issue #340) closed the rest:
 
-The current code also collapses a `null` formatting result to "no result", so a
-capable server's `null` ("already formatted") is today indistinguishable from a
-missing provider and falls through to lower-priority servers. The pipeline's
-capability-based fallback (Decision point 3.2) depends on telling these apart, so
-that collapse is part of the gap to close.
+- capability-based full → `rangeFormatting` fallback (Decision point 3.2),
+  including keeping a capable server's `null` ("already formatted",
+  `Some(vec![])`) distinct from a missing provider;
+- per-line host prefix re-application on multi-line output, with the region
+  LCP on line-count changes and trailing-whitespace trimming on empty lines
+  (Decision point 4);
+- the per-step remaining-budget timeout (5s whole-pipeline bound, the
+  explicit per-request aggregation timeout from
+  ls-bridge-server-pool-coordination) with best-effort `$/cancelRequest`
+  to the active downstream server on a timed-out step (Decision point 6);
+- discarding downstream `publishDiagnostics` targeting scratch URIs
+  (Decision point 7);
+- the misconfiguration warning narrowed to the `concatenated`-with-empty-
+  `priorities` case that actually falls back to `preferred`;
+- an E2E test driving a real two-server chain.
 
 `textDocument/rangeFormatting` keeps the `preferred` behavior **by design**, not
 just pending implementation — it is out of scope for the pipeline (see *Decision*
