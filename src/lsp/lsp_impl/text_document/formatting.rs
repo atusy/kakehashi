@@ -108,6 +108,12 @@ impl Kakehashi {
         // Outer JoinSet: one task per injection region, all in parallel
         let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
+        // Shared host-text position mapper for prefix extraction, built at
+        // most once per request: constructing it is O(document size), so
+        // rebuilding per region would make many-region documents quadratic.
+        // Lazy because only concatenated-plan regions need it.
+        let mut host_mapper: Option<crate::text::PositionMapper> = None;
+
         for resolved in all_regions {
             let configs = self.bridge_configs_for_injection_language(
                 &language_name,
@@ -147,7 +153,10 @@ impl Kakehashi {
                     // (Decision point 4, `reapply_host_line_prefixes`).
                     let virtual_line_count =
                         region_ctx.resolved.virtual_content.matches('\n').count() + 1;
+                    let mapper = host_mapper
+                        .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
+                        mapper,
                         snapshot.text(),
                         region_ctx.resolved.region.line_range.start,
                         &region_ctx.resolved.line_column_offsets,
@@ -1020,13 +1029,17 @@ fn region_replacement_range(original_virtual: &str, offset: &RegionOffset) -> Op
 /// An unresolvable position (stale offsets racing a host edit) degrades to an
 /// empty prefix for that line rather than failing the whole region — the same
 /// saturating posture the position translation code takes.
+///
+/// `mapper` must be built over the same `host_text`; the caller shares one
+/// mapper across all regions of a request, since constructing it is
+/// O(document size).
 fn extract_host_line_prefixes(
+    mapper: &crate::text::PositionMapper,
     host_text: &str,
     region_start_line: u32,
     line_column_offsets: &[u32],
     virtual_line_count: usize,
 ) -> Vec<String> {
-    let mapper = crate::text::PositionMapper::new(host_text);
     (0..virtual_line_count)
         .map(|i| {
             let column = line_column_offsets.get(i).copied().unwrap_or(0);
@@ -1797,7 +1810,8 @@ mod tests {
         // Region: python inside a blockquote, host lines 1..=2, content starts
         // at column 2 on each line ("> " prefix).
         let host = "before\n> x = 1\n> y = 2\nafter\n";
-        let prefixes = extract_host_line_prefixes(host, 1, &[2, 2], 2);
+        let mapper = crate::text::PositionMapper::new(host);
+        let prefixes = extract_host_line_prefixes(&mapper, host, 1, &[2, 2], 2);
         assert_eq!(prefixes, vec!["> ".to_string(), "> ".to_string()]);
     }
 
@@ -1806,7 +1820,8 @@ mod tests {
         // Non-blockquote regions carry a single-entry offset list (line 0
         // only); continuation lines have no prefix.
         let host = "# Doc\ncode line 0\ncode line 1\n";
-        let prefixes = extract_host_line_prefixes(host, 1, &[0], 2);
+        let mapper = crate::text::PositionMapper::new(host);
+        let prefixes = extract_host_line_prefixes(&mapper, host, 1, &[0], 2);
         assert_eq!(prefixes, vec![String::new(), String::new()]);
     }
 
@@ -1816,7 +1831,8 @@ mod tests {
         // correct byte boundary.
         let host = "héllo→x = 1\n";
         // "héllo→" is 6 UTF-16 code units (é and → are 1 each).
-        let prefixes = extract_host_line_prefixes(host, 0, &[6], 1);
+        let mapper = crate::text::PositionMapper::new(host);
+        let prefixes = extract_host_line_prefixes(&mapper, host, 0, &[6], 1);
         assert_eq!(prefixes, vec!["héllo→".to_string()]);
     }
 
