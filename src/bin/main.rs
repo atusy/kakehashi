@@ -735,6 +735,24 @@ async fn run_lsp_server() {
         "kakehashi/node/namedDescendantForByteRange",
         Kakehashi::kakehashi_node_named_descendant_for_byte_range,
     )
+    // Position / range accessors (node-reference-protocol) — LSP Position (UTF-16).
+    .custom_method("kakehashi/node/range", Kakehashi::kakehashi_node_range)
+    .custom_method(
+        "kakehashi/node/startPosition",
+        Kakehashi::kakehashi_node_start_position,
+    )
+    .custom_method(
+        "kakehashi/node/endPosition",
+        Kakehashi::kakehashi_node_end_position,
+    )
+    .custom_method(
+        "kakehashi/node/descendantForPointRange",
+        Kakehashi::kakehashi_node_descendant_for_point_range,
+    )
+    .custom_method(
+        "kakehashi/node/namedDescendantForPointRange",
+        Kakehashi::kakehashi_node_named_descendant_for_point_range,
+    )
     // Field-aware accessors (node-reference-protocol).
     .custom_method(
         "kakehashi/node/childByFieldName",

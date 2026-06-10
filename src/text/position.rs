@@ -63,6 +63,22 @@ impl PositionMapper {
         }
     }
 
+    /// Convert an LSP `Position` to a byte offset, returning `None` for any
+    /// position that does not address a real location in the document.
+    ///
+    /// Unlike [`position_to_byte`](Self::position_to_byte) — which, as its own
+    /// callers' docs note, spills a `character` past a line's end into a byte on
+    /// a *later* line (`line_start + character`) — this validates the input by
+    /// requiring the offset to round-trip: `byte_to_position(b) == position`. An
+    /// over-long column maps to some `b` whose real position differs from the
+    /// requested one, so it is rejected rather than silently resolving the wrong
+    /// location. Use this for *client-supplied* positions where an out-of-bounds
+    /// column must mean "no such location" (null), not "snap somewhere".
+    pub fn position_to_byte_strict(&self, position: Position) -> Option<usize> {
+        let byte = self.position_to_byte(position)?;
+        (self.byte_to_position(byte)? == position).then_some(byte)
+    }
+
     /// Convert byte offset to LSP Position
     pub fn byte_to_position(&self, offset: usize) -> Option<Position> {
         // Convert byte offset to LineCol
@@ -252,6 +268,33 @@ mod tests {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
         assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 6);
+    }
+
+    #[test]
+    fn strict_accepts_in_bounds_and_rejects_overlong_or_eof() {
+        let text = "hello\nworld\n";
+        let mapper = PositionMapper::new(text);
+
+        // In-bounds positions map exactly, identical to position_to_byte.
+        assert_eq!(mapper.position_to_byte_strict(Position::new(0, 0)), Some(0));
+        assert_eq!(mapper.position_to_byte_strict(Position::new(0, 5)), Some(5)); // end of "hello"
+        assert_eq!(mapper.position_to_byte_strict(Position::new(1, 2)), Some(8));
+
+        // A character past the line's end must NOT spill onto the next line.
+        assert_eq!(mapper.position_to_byte_strict(Position::new(0, 999)), None);
+        // A line past EOF is rejected too.
+        assert_eq!(mapper.position_to_byte_strict(Position::new(99, 0)), None);
+    }
+
+    #[test]
+    fn strict_rejects_overlong_column_for_multibyte_line() {
+        // "あい" is 2 chars / 6 bytes / 2 UTF-16 units on line 0.
+        let text = "あい\nx\n";
+        let mapper = PositionMapper::new(text);
+        // col 2 = end of "あい" (byte 6) is valid.
+        assert_eq!(mapper.position_to_byte_strict(Position::new(0, 2)), Some(6));
+        // col 5 is past the line's end → None, not a byte on line 1.
+        assert_eq!(mapper.position_to_byte_strict(Position::new(0, 5)), None);
     }
 
     #[test]

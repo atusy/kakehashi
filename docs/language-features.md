@@ -227,8 +227,11 @@ support.
 
 Beyond the standard LSP features, kakehashi exposes custom methods under the
 `kakehashi/` namespace so that editor plugins and scripts can query the syntax tree
-directly — identify the node at a position, walk to its parent or children, and read
-its current text — **without bundling Tree-sitter on the client side**.
+directly — identify the node at a position, walk it (parent, children, siblings,
+descendants, fields), introspect it (kind, flags, byte/line-column spans), and read
+its current text — **without bundling Tree-sitter on the client side**. These
+mirror the Tree-sitter
+[`Node`](https://docs.rs/tree-sitter/latest/tree_sitter/struct.Node.html) API.
 
 A handle to a node (its `id`) stays valid across edits as long as the node survives,
 so a plugin can hold a reference to "this function" and keep using it while the user
@@ -242,11 +245,11 @@ types.
 ```typescript
 type NodeInfo = {
   id: string;    // stable handle, valid across edits until the node changes
-  type: string;  // tree-sitter node type, e.g. "fenced_code_block"
+  kind: string;  // tree-sitter node kind, e.g. "fenced_code_block"
 };
 ```
 
-### Methods
+### Core methods
 
 Every method takes a `textDocument`. The `id`-based methods are tied to the document
 they came from; querying with an `id` from a different document returns `null`.
@@ -255,7 +258,8 @@ they came from; querying with an `id` from a different document returns `null`.
 |--------|-------|--------|---------|
 | `kakehashi/node` | `{ textDocument, position, injection? }` | `NodeInfo \| null` | The smallest node at a position (on the chosen embedding layer) |
 | `kakehashi/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | The node's parent (within the same language tree) |
-| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate children, in document order |
+| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate children (named + anonymous), in document order |
+| `kakehashi/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate **named** children, in document order |
 | `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | The node's current text |
 
 Positions use the LSP default encoding, UTF-16 code units. kakehashi does not
@@ -279,6 +283,61 @@ inside the regex: `0` resolves the Markdown node, `1` the Python node,
 `2` / `true` / `-1` the regex node, and `3` returns `null` (only three layers
 exist).
 
+### Node accessors
+
+Once you hold a node `id`, these methods expose the rest of the Tree-sitter
+[`Node`](https://docs.rs/tree-sitter/latest/tree_sitter/struct.Node.html) API
+one-for-one, so you can introspect and walk the tree without bundling Tree-sitter.
+Every accessor takes `{ textDocument, id }` (plus the extra fields noted below);
+any unresolvable `id` — or out-of-range argument — returns `null`.
+
+**Introspection** — one property per call, returned as a single-field object
+(e.g. `{ "kind": "fenced_code_block" }`):
+
+| Method | Output |
+|--------|--------|
+| `kakehashi/node/kind` | `{ kind: string }` — the node's grammar symbol |
+| `kakehashi/node/grammarName` | `{ grammarName: string }` — grammar name (differs from `kind` for aliased nodes) |
+| `kakehashi/node/isNamed` · `isExtra` | `{ isNamed: bool }` · `{ isExtra: bool }` |
+| `kakehashi/node/hasError` · `isError` · `isMissing` | `{ hasError: bool }` … (error-recovery flags) |
+| `kakehashi/node/startByte` · `endByte` | `{ startByte: int }` · `{ endByte: int }` |
+| `kakehashi/node/byteRange` | `{ startByte: int, endByte: int }` |
+| `kakehashi/node/childCount` · `namedChildCount` · `descendantCount` | `{ childCount: int }` … |
+| `kakehashi/node/toSexp` | `{ sexp: string }` — the subtree as an s-expression |
+
+**Navigation** — returns `NodeInfo | null` (or `NodeInfo[] | null`), minted in the
+same embedding layer as the input:
+
+| Method | Extra input | Output |
+|--------|-------------|--------|
+| `kakehashi/node/child` · `namedChild` | `index` | `NodeInfo \| null` |
+| `kakehashi/node/nextSibling` · `prevSibling` | — | `NodeInfo \| null` |
+| `kakehashi/node/nextNamedSibling` · `prevNamedSibling` | — | `NodeInfo \| null` |
+| `kakehashi/node/firstChildForByte` | `byte` | `NodeInfo \| null` |
+| `kakehashi/node/descendantForByteRange` · `namedDescendantForByteRange` | `startByte`, `endByte` | `NodeInfo \| null` |
+
+**Fields** — children labelled by the grammar (e.g. a function's `name` / `body`):
+
+| Method | Extra input | Output |
+|--------|-------------|--------|
+| `kakehashi/node/childByFieldName` | `name` | `NodeInfo \| null` |
+| `kakehashi/node/childrenByFieldName` | `name` | `NodeInfo[] \| null` |
+| `kakehashi/node/fieldNameForChild` · `fieldNameForNamedChild` | `index` | `{ fieldName: string \| null } \| null` |
+
+**Position / range** — line/column as LSP `Position` (`{ line, character }`, UTF-16):
+
+| Method | Extra input | Output |
+|--------|-------------|--------|
+| `kakehashi/node/startPosition` · `endPosition` | — | `{ startPosition: Position }` · `{ endPosition: Position }` |
+| `kakehashi/node/range` | — | `{ start: Position, end: Position }` |
+| `kakehashi/node/descendantForPointRange` · `namedDescendantForPointRange` | `start`, `end` (Positions) | `NodeInfo \| null` |
+
+> **Two coordinate systems.** Byte accessors (`startByte`, `byteRange`,
+> `descendantForByteRange`, `firstChildForByte`, …) use **UTF-8 byte offsets** —
+> Tree-sitter's native space, matching `kakehashi/node/text`. Position accessors use
+> **LSP `Position` (UTF-16)**, matching `kakehashi/node` and every other LSP request.
+> Pick whichever your client already works in; they address the same nodes.
+
 ### Result semantics
 
 - **`null` means "not currently resolvable."** Whether the `id` was invalidated by
@@ -292,8 +351,9 @@ exist).
   embedded block's root returns `null`, not the host node containing it — to cross
   that boundary, call `kakehashi/node` again at the position.
 
-> `kakehashi/node/namedChildren` and a `namedOnly` option on `kakehashi/node`
-> (named-only navigation) are planned but **not yet available**.
+> A `namedOnly` option on `kakehashi/node` (resolving the smallest *named* node at
+> a position) is planned but **not yet available**. For named-only navigation today,
+> use `kakehashi/node/namedChildren` and the `named*` accessors.
 
 ---
 

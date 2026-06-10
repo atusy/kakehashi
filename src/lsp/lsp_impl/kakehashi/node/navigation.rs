@@ -106,7 +106,8 @@ impl Kakehashi {
 
     /// `kakehashi/node/firstChildForByte` — the node's first child extending
     /// beyond `byte` (UTF-8, host coords), per `Node::first_child_for_byte`.
-    /// Negative bytes resolve to `null`.
+    /// `byte` is rejected (→ `null`) unless `node.start_byte <= byte <=
+    /// node.end_byte` — i.e. negative, before the node, or past its end.
     pub async fn kakehashi_node_first_child_for_byte(
         &self,
         params: NodeByteParams,
@@ -114,15 +115,22 @@ impl Kakehashi {
         let byte = usize::try_from(params.byte).ok();
         Ok(self
             .navigate_to_node(&params.text_document.uri, &params.id, |n| {
-                byte.and_then(|b| n.first_child_for_byte(b)).map(triple)
+                // Keep the byte inside the node's own span before handing it to
+                // tree-sitter, whose behaviour for offsets outside the queried
+                // node is version-dependent (mirrors lookup::find_node_at). These
+                // are node-scoped accessors, so an out-of-node argument is null.
+                byte.filter(|&b| n.start_byte() <= b && b <= n.end_byte())
+                    .and_then(|b| n.first_child_for_byte(b))
+                    .map(triple)
             })
             .await)
     }
 
     /// `kakehashi/node/descendantForByteRange` — the smallest descendant
     /// (named + anonymous) spanning `[startByte, endByte)` within this node's
-    /// subtree, per `Node::descendant_for_byte_range`. Negative or inverted
-    /// (`startByte > endByte`) ranges resolve to `null`.
+    /// subtree, per `Node::descendant_for_byte_range`. The range is rejected
+    /// (→ `null`) unless `node.start_byte <= startByte <= endByte <=
+    /// node.end_byte` — i.e. negative, inverted, or reaching outside the node.
     pub async fn kakehashi_node_descendant_for_byte_range(
         &self,
         params: NodeByteRangeParams,
@@ -131,6 +139,7 @@ impl Kakehashi {
         Ok(self
             .navigate_to_node(&params.text_document.uri, &params.id, |n| {
                 range
+                    .filter(|&(s, e)| n.start_byte() <= s && e <= n.end_byte())
                     .and_then(|(s, e)| n.descendant_for_byte_range(s, e))
                     .map(triple)
             })
@@ -139,8 +148,9 @@ impl Kakehashi {
 
     /// `kakehashi/node/namedDescendantForByteRange` — the smallest *named*
     /// descendant spanning `[startByte, endByte)` within this node's subtree, per
-    /// `Node::named_descendant_for_byte_range`. Negative or inverted
-    /// (`startByte > endByte`) ranges resolve to `null`.
+    /// `Node::named_descendant_for_byte_range`. The range is rejected (→ `null`)
+    /// unless `node.start_byte <= startByte <= endByte <= node.end_byte` — i.e.
+    /// negative, inverted, or reaching outside the node.
     pub async fn kakehashi_node_named_descendant_for_byte_range(
         &self,
         params: NodeByteRangeParams,
@@ -149,6 +159,7 @@ impl Kakehashi {
         Ok(self
             .navigate_to_node(&params.text_document.uri, &params.id, |n| {
                 range
+                    .filter(|&(s, e)| n.start_byte() <= s && e <= n.end_byte())
                     .and_then(|(s, e)| n.named_descendant_for_byte_range(s, e))
                     .map(triple)
             })
@@ -162,6 +173,10 @@ impl Kakehashi {
 /// The inversion guard mirrors `lookup::find_node_at`: tree-sitter's
 /// `descendant_for_byte_range` is not specified for `start > end`, so we reject
 /// it up front rather than relying on the C bindings' behaviour.
+///
+/// Per-call the handlers additionally bound the range to the queried node's
+/// contiguous span. Known limitation (#341): that span check does not exclude
+/// bytes in the gaps of an injected layer's non-contiguous included ranges.
 fn byte_range(params: &NodeByteRangeParams) -> Option<(usize, usize)> {
     let start = usize::try_from(params.start_byte).ok()?;
     let end = usize::try_from(params.end_byte).ok()?;

@@ -56,9 +56,9 @@ type NodeInfo = {
 
 The field is named `kind`, matching the Rust binding (`node.kind()`) that the server is built on. Keeping the wire name aligned with the implementation removes the type/kind translation at the serialization boundary and keeps the protocol vocabulary consistent with the rest of Kakehashi, which already speaks of a node's `(start, end, kind)` triple throughout the tracker and injection layers.
 
-Positional information (`range`) is **intentionally omitted** for two reasons:
+Positional information (`range`) is **intentionally omitted from `NodeInfo`** for two reasons:
 
-1. **Orthogonality**: A future `kakehashi/node/range` endpoint can return positions when needed, mirroring the `text` endpoint shape
+1. **Orthogonality**: positions are served by the dedicated `range` / `startPosition` / `endPosition` accessors (see [Node Accessor Methods](#node-accessor-methods)), mirroring the `text` endpoint shape, rather than riding inline on every `NodeInfo`
 2. **Cheap navigation**: `parent`/`children` traversals do not need to resolve positions, keeping per-call cost low
 
 The cost is N+1 round trips for clients that need ranges of every child, accepted as an explicit trade-off. A bulk endpoint (e.g., `childrenWithRange`) may be added later if profiling shows it is needed.
@@ -223,7 +223,7 @@ To let clients introspect and walk the tree without re-implementing tree-sitter,
 | `descendantCount` | `{ "descendantCount": int }` | `descendant_count()` |
 | `toSexp` | `{ "sexp": string }` | `to_sexp()` |
 
-**Byte offsets are UTF-8** in host-document coordinates — tree-sitter's native space, the same one `text` slices and the byte-input accessors consume. This deliberately differs from `Position.character` (UTF-16); line/column reporting is the deferred `range` design below.
+**Byte offsets are UTF-8** in host-document coordinates — tree-sitter's native space, the same one `text` slices and the byte-input accessors consume. This deliberately differs from `Position.character` (UTF-16); line/column reporting lives in the position/range accessors below, which speak LSP `Position`.
 
 **Navigation accessors** return `NodeInfo | null` (single) or `NodeInfo[] | null` (list — `null` only for an unresolvable id; an empty relation yields `[]`):
 
@@ -238,6 +238,20 @@ To let clients introspect and walk the tree without re-implementing tree-sitter,
 | `namedDescendantForByteRange` (`startByte`, `endByte`) | `NodeInfo \| null` | `named_descendant_for_byte_range(s, e)` |
 
 Out-of-range / negative `index` or `byte` values collapse to `null` rather than erroring, consistent with the universal null semantics.
+
+**Position / range accessors** report and accept line/column as LSP `Position` (`{ line, character }`), **not** tree-sitter's native `Point`:
+
+| Method | Input | Response | tree-sitter |
+|---|---|---|---|
+| `startPosition` | `{ id }` | `{ "startPosition": Position }` | `start_position()` |
+| `endPosition` | `{ id }` | `{ "endPosition": Position }` | `end_position()` |
+| `range` | `{ id }` | `{ "start": Position, "end": Position }` | `range()` |
+| `descendantForPointRange` | `{ id, start, end }` | `NodeInfo \| null` | `descendant_for_point_range(s, e)` |
+| `namedDescendantForPointRange` | `{ id, start, end }` | `NodeInfo \| null` | `named_descendant_for_point_range(s, e)` |
+
+**Why LSP `Position`, not tree-sitter `Point`**: tree-sitter's `Point.column` is a **UTF-8 byte** offset within the line, whereas the protocol speaks LSP `Position` (UTF-16 code units) everywhere else (§"Position Encoding"). Returning native points would diverge from every other LSP coordinate around non-ASCII (emoji, CJK) and force clients to special-case these accessors. Instead the server converts each end via `PositionMapper`: byte → `Position` on output, `Position` → byte on input (reusing the byte-range search and its inverted / out-of-bounds guards). Clients that genuinely want byte-native spans use `startByte` / `endByte` / `byteRange` and `descendant*ForByteRange`, which are unambiguous. A `Position` that cannot be mapped into the current document collapses to `null`.
+
+This supersedes the earlier deferral of range reporting (Alternative C): rather than a single bulk `kakehashi/node/range` endpoint, each tree-sitter method is exposed individually for 1:1 parity with the `Node` API; bulk range retrieval (e.g. `childrenWithRange`) remains a possible future addition if profiling shows the N+1 cost dominates.
 
 **Field accessors** expose the name-keyed half of tree-sitter's field API:
 
@@ -311,7 +325,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 
 ### Negative
 
-- **N+1 for positions**: Clients building outline views must call `kakehashi/node/range` (future) once per node, or accept paying for it only when needed
+- **N+1 for positions**: Clients building outline views must call `range` once per node (a bulk `childrenWithRange` remains a possible future addition), or accept paying for it only when needed
 - **No invalidate diagnostics**: Clients cannot tell why an ID failed; they must re-acquire blindly
 - **Cross-injection navigation is two-step**: `parent` does not transparently cross into a host tree
 - **`injection` mixed mode**: `true` saturates while integer indices are strict (resolve via a single formula, return `null` when out of bounds) — clients must remember which mode they want
@@ -344,8 +358,8 @@ Identify nodes by `(uri, start_byte, end_byte, type)` directly.
 
 Include `range` in every `NodeInfo` returned.
 
-* Acceptable trade-off, but rejected for now in favor of the orthogonal `kakehashi/node/range` endpoint (future)
-* Reconsider if profiling shows the N+1 round-trip cost dominates
+* Acceptable trade-off, but rejected in favor of orthogonal `range` / `startPosition` / `endPosition` accessors (now implemented — see [Node Accessor Methods](#node-accessor-methods))
+* Reconsider a bulk variant (`childrenWithRange`) if profiling shows the N+1 round-trip cost dominates
 
 ### Alternative D: Auto-Cross Injection in `parent`
 
@@ -392,7 +406,7 @@ Split the entry point into anonymous-inclusive and named-only methods instead of
 |--------|----------|
 | **Methods** | `kakehashi/node`, `/parent`, `/children`, `/namedChildren`, `/text` |
 | **Common params** | All methods carry `TextDocumentIdentifier` |
-| **`NodeInfo` shape** | `{ id, kind }` (no range, no `named` — both deferred) |
+| **`NodeInfo` shape** | `{ id, kind }` (range via separate `range`/`startPosition`/`endPosition` accessors, not inline; `named` deferred) |
 | **Entry resolution** | Smallest containing node at selected injection layer |
 | **Injection selector** | `boolean \| number`, default `false` |
 | **Named selection** | `namedOnly` param on entry (`named_descendant_for_byte_range`); `namedChildren` method (`named_children()`); no `parent` variant (tree-sitter has no `named_parent`) |

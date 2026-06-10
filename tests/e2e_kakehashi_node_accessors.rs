@@ -8,7 +8,8 @@
 //! `namedChildren`, `nextSibling`, `prevSibling`, `nextNamedSibling`,
 //! `prevNamedSibling`, `firstChildForByte`, `descendantForByteRange`,
 //! `namedDescendantForByteRange`, `childByFieldName`, `childrenByFieldName`,
-//! `fieldNameForChild`, `fieldNameForNamedChild`.
+//! `fieldNameForChild`, `fieldNameForNamedChild`, `range`, `startPosition`,
+//! `endPosition`, `descendantForPointRange`, `namedDescendantForPointRange`.
 //!
 //! Run with: `cargo test --test e2e_kakehashi_node_accessors --features e2e`
 
@@ -432,6 +433,96 @@ fn test_byte_based_descendant_lookups() {
         inverted_named.is_null(),
         "inverted byte range must collapse to null for the named variant too"
     );
+
+    // Out-of-bounds bytes (past the document end) collapse to null rather than
+    // being forwarded to tree-sitter, whose behaviour for ranges beyond the
+    // parsed tree is version-dependent (mirrors the defensive bound in
+    // lookup::find_node_at). `oob` is well past the end of `DOC`.
+    let oob = (DOC.len() + 10) as i64;
+
+    let oob_first_child = call(
+        &mut client,
+        "kakehashi/node/firstChildForByte",
+        json!({ "textDocument": { "uri": uri }, "id": root, "byte": oob }),
+    );
+    assert!(
+        oob_first_child.is_null(),
+        "firstChildForByte past EOF must collapse to null, got {:?}",
+        oob_first_child
+    );
+
+    let oob_desc = call(
+        &mut client,
+        "kakehashi/node/descendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": oob }),
+    );
+    assert!(
+        oob_desc.is_null(),
+        "descendantForByteRange past EOF must collapse to null, got {:?}",
+        oob_desc
+    );
+
+    let oob_named_desc = call(
+        &mut client,
+        "kakehashi/node/namedDescendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": oob }),
+    );
+    assert!(
+        oob_named_desc.is_null(),
+        "namedDescendantForByteRange past EOF must collapse to null, got {:?}",
+        oob_named_desc
+    );
+}
+
+/// Byte/range arguments are scoped to the queried node: an offset *before* the
+/// node's own `start_byte` is outside it and must collapse to `null`, just like
+/// one past its end. Uses a node on line 2 (which starts well after byte 0).
+#[test]
+fn test_byte_lookups_before_node_start_are_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_byte_lowerbound.md";
+    open_markdown(&mut client, uri, DOC);
+
+    // A node inside the line-2 paragraph starts after "# Heading\n\n" (byte 11).
+    let node = node_at(&mut client, uri, 2, 2);
+    assert!(!node.is_null(), "expected a node on line 2");
+    let id = id_of(&node);
+    let start_byte = call(&mut client, "kakehashi/node/startByte", id_params(uri, &id))
+        .get("startByte")
+        .and_then(Value::as_u64)
+        .expect("startByte");
+    assert!(start_byte > 0, "fixture node must start after byte 0");
+
+    // firstChildForByte at byte 0 is before this node → null.
+    let before = call(
+        &mut client,
+        "kakehashi/node/firstChildForByte",
+        json!({ "textDocument": { "uri": uri }, "id": id, "byte": 0 }),
+    );
+    assert!(
+        before.is_null(),
+        "firstChildForByte before the node's start must be null, got {:?}",
+        before
+    );
+
+    // A range whose start is before this node → null (both variants).
+    for method in [
+        "kakehashi/node/descendantForByteRange",
+        "kakehashi/node/namedDescendantForByteRange",
+    ] {
+        let v = call(
+            &mut client,
+            method,
+            json!({ "textDocument": { "uri": uri }, "id": id, "startByte": 0, "endByte": start_byte }),
+        );
+        assert!(
+            v.is_null(),
+            "{} with a start before the node must be null, got {:?}",
+            method,
+            v
+        );
+    }
 }
 
 #[test]
@@ -598,4 +689,195 @@ fn test_accessors_return_null_for_unknown_id() {
         json!({ "textDocument": { "uri": uri }, "id": stray, "name": "left" }),
     );
     assert!(v.is_null(), "childByFieldName on unknown id must be null");
+}
+
+/// Read an LSP `Position` object as `(line, character)`.
+fn lsp_pos(v: &Value) -> (u64, u64) {
+    (
+        v.get("line")
+            .and_then(Value::as_u64)
+            .expect("Position.line"),
+        v.get("character")
+            .and_then(Value::as_u64)
+            .expect("Position.character"),
+    )
+}
+
+#[test]
+fn test_position_accessors_return_lsp_positions() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_position.md";
+    open_markdown(&mut client, uri, DOC);
+    let root = root_id(&mut client, uri);
+
+    // The document root starts at the very beginning.
+    let start_pos = call(
+        &mut client,
+        "kakehashi/node/startPosition",
+        id_params(uri, &root),
+    );
+    assert_eq!(
+        lsp_pos(start_pos.get("startPosition").expect("startPosition field")),
+        (0, 0),
+        "root startPosition must be line 0, character 0"
+    );
+
+    let end_pos = call(
+        &mut client,
+        "kakehashi/node/endPosition",
+        id_params(uri, &root),
+    );
+    let end = lsp_pos(end_pos.get("endPosition").expect("endPosition field"));
+
+    // range bundles the two into { start, end } and must agree with the singular
+    // accessors.
+    let range = call(&mut client, "kakehashi/node/range", id_params(uri, &root));
+    assert_eq!(
+        lsp_pos(range.get("start").expect("range.start")),
+        (0, 0),
+        "range.start must match startPosition"
+    );
+    assert_eq!(
+        lsp_pos(range.get("end").expect("range.end")),
+        end,
+        "range.end must match endPosition"
+    );
+}
+
+/// `character` is a UTF-16 code unit offset (LSP), NOT tree-sitter's UTF-8 byte
+/// column. With an all-CJK line each character is 3 UTF-8 bytes but 1 UTF-16
+/// code unit, so the reported column must be `endByte / 3`, strictly less than
+/// the byte offset — proving the server converts rather than leaking byte points.
+#[test]
+fn test_positions_are_utf16_not_byte_columns() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_utf16.md";
+    // Two CJK characters on line 0 (3 UTF-8 bytes each), then a newline.
+    open_markdown(&mut client, uri, "あい\n");
+
+    // Smallest node at the very start — some inline/text node spanning CJK bytes.
+    let node = node_at(&mut client, uri, 0, 0);
+    assert!(!node.is_null(), "expected a node at the CJK line start");
+    let id = id_of(&node);
+
+    let end_byte = call(&mut client, "kakehashi/node/endByte", id_params(uri, &id))
+        .get("endByte")
+        .and_then(Value::as_u64)
+        .expect("endByte");
+    let end_pos = call(
+        &mut client,
+        "kakehashi/node/endPosition",
+        id_params(uri, &id),
+    );
+    let (line, character) = lsp_pos(end_pos.get("endPosition").expect("endPosition field"));
+
+    assert_eq!(line, 0, "the node ends on line 0");
+    assert!(
+        end_byte >= 3 && end_byte.is_multiple_of(3),
+        "CJK node end byte should fall on a 3-byte boundary, got {}",
+        end_byte
+    );
+    assert_eq!(
+        character,
+        end_byte / 3,
+        "endPosition.character must be the UTF-16 column ({}), not the byte column ({})",
+        end_byte / 3,
+        end_byte
+    );
+    assert!(
+        character < end_byte,
+        "UTF-16 column must be strictly less than the byte offset for CJK content"
+    );
+}
+
+#[test]
+fn test_descendant_for_point_range_takes_lsp_positions() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_point_range.md";
+    open_markdown(&mut client, uri, DOC);
+    let root = root_id(&mut client, uri);
+
+    // A Position range covering the first byte resolves a descendant.
+    let desc = call(
+        &mut client,
+        "kakehashi/node/descendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 0, "character": 1 } }),
+    );
+    assert!(
+        !desc.is_null(),
+        "descendantForPointRange must resolve a node"
+    );
+    assert!(desc.get("id").and_then(Value::as_str).is_some());
+
+    let named = call(
+        &mut client,
+        "kakehashi/node/namedDescendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 0, "character": 1 } }),
+    );
+    assert!(
+        !named.is_null(),
+        "namedDescendantForPointRange must resolve"
+    );
+
+    // Inverted Position range collapses to null.
+    let inverted = call(
+        &mut client,
+        "kakehashi/node/descendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "start": { "line": 0, "character": 5 },
+                "end":   { "line": 0, "character": 1 } }),
+    );
+    assert!(inverted.is_null(), "inverted Position range must be null");
+
+    // A `character` past line 0's end ("# Heading" = 9 cols) must NOT spill onto
+    // a later line — an over-long column means "no such location" → null, not a
+    // descendant resolved elsewhere in the document.
+    let overlong = call(
+        &mut client,
+        "kakehashi/node/descendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 0, "character": 999 } }),
+    );
+    assert!(
+        overlong.is_null(),
+        "an over-long character must collapse to null, not spill to a later line, got {:?}",
+        overlong
+    );
+}
+
+#[test]
+fn test_position_accessors_return_null_for_unknown_id() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_position_unknown.md";
+    open_markdown(&mut client, uri, DOC);
+    let stray = "01HXXXXXXXXXXXXXXXXXXXXXXX";
+
+    for method in [
+        "kakehashi/node/range",
+        "kakehashi/node/startPosition",
+        "kakehashi/node/endPosition",
+    ] {
+        let v = call(&mut client, method, id_params(uri, stray));
+        assert!(v.is_null(), "{} must return null for an unknown id", method);
+    }
+    let v = call(
+        &mut client,
+        "kakehashi/node/descendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": stray,
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 0, "character": 1 } }),
+    );
+    assert!(
+        v.is_null(),
+        "descendantForPointRange on unknown id must be null"
+    );
 }
