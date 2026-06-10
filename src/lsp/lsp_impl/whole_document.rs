@@ -16,9 +16,9 @@ use tower_lsp_server::ls_types::Uri;
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{FanInResult, FanOutTask, dispatch_preferred};
-use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
-use super::super::{Kakehashi, uri_to_url};
+use super::bridge_context::DocumentRequestContext;
+use super::{Kakehashi, uri_to_url};
 
 impl Kakehashi {
     /// Fan out a whole-document bridged request to all injection regions.

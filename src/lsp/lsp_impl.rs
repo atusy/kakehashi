@@ -3,6 +3,7 @@ mod coordinator;
 mod kakehashi;
 mod lifecycle;
 pub(crate) mod text_document;
+mod whole_document;
 mod workspace;
 
 use tower_lsp_server::jsonrpc::Result;
