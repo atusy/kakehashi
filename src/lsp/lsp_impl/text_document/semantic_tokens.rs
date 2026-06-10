@@ -86,6 +86,18 @@ impl Kakehashi {
         let edit_lock = self.documents.edit_lock(uri);
         let _settle_guard = edit_lock.lock().await;
 
+        // Re-check existence now that we hold the lock: the document could have
+        // been closed between the pre-check and here (e.g. `didClose` took the
+        // edit lock first, removed the document — and its lock entry — then
+        // released). In that case `edit_lock()` above re-created a fresh entry,
+        // so drop it and bail rather than leaving an orphan behind for a gone
+        // document.
+        if self.documents.get(uri).is_none() {
+            drop(_settle_guard);
+            self.documents.remove_edit_lock(uri);
+            return None;
+        }
+
         // Wait for any in-flight parse to complete
         self.documents
             .wait_for_parse_completion(uri, Duration::from_millis(200))
