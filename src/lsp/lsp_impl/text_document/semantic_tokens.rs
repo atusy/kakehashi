@@ -64,6 +64,21 @@ impl Kakehashi {
     /// Returns `(tree, text)` tuple where tree was verified to be parsed from text,
     /// or `None` if the document is missing or parsing failed.
     async fn get_tree_with_wait(&self, uri: &Url, language_name: &str) -> Option<(Tree, String)> {
+        // Settle pending edits before snapshotting. A large paste arrives as
+        // several back-to-back `didChange` chunks; the editor then sends one
+        // semantic-tokens request for the final state. Each `didChange` holds
+        // the document's edit lock across its reparse, so acquiring the same
+        // lock here blocks until every edit received before this request has
+        // been applied and parsed. Without it the request can snapshot a tree
+        // from a half-applied paste and return tokens for only the first chunks
+        // — the later lines render unhighlighted (white). The guard is held
+        // across the tree read (and the on-demand parse fallback) so no edit can
+        // interleave between settling and snapshotting; it is released when this
+        // function returns, before token computation, so edits never wait on the
+        // (slower) tokenization.
+        let edit_lock = self.documents.edit_lock(uri);
+        let _settle_guard = edit_lock.lock().await;
+
         // Wait for any in-flight parse to complete
         self.documents
             .wait_for_parse_completion(uri, Duration::from_millis(200))
