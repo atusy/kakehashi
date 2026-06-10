@@ -406,6 +406,10 @@ async fn reader_loop_with_liveness(
                     "{}Reader task cancelled, shutting down",
                     lang_prefix
                 );
+                // The router outlives this task (Arc-shared with ConnectionHandle),
+                // so pending waiters must be failed here or they hang until the
+                // per-request timeout.
+                router.fail_all("bridge: reader task cancelled");
                 break;
             }
 
@@ -900,6 +904,60 @@ mod tests {
         );
 
         // Clean up
+        let _ = child.kill().await;
+    }
+
+    /// Pending requests must fail fast on cancellation: the ResponseRouter is
+    /// Arc-shared with ConnectionHandle, so reader exit alone does not drop the
+    /// pending oneshot senders — without fail_all, waiters hang until the
+    /// per-request timeout.
+    #[tokio::test]
+    async fn reader_loop_fails_all_on_cancellation() {
+        use crate::lsp::bridge::connection::BridgeReader;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        // Long-running process that never writes to stdout, so the loop can
+        // only exit via cancellation (not EOF).
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep should spawn");
+
+        let stdout = child.stdout.take().expect("stdout should be available");
+        let reader = BridgeReader::new(stdout);
+
+        let router = Arc::new(ResponseRouter::new());
+        let rx = router.register(RequestId::new(1)).unwrap();
+
+        let cancel_token = CancellationToken::new();
+        let token_clone = cancel_token.clone();
+
+        let handle = tokio::spawn(reader_loop(reader, Arc::clone(&router), token_clone));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        cancel_token.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            result.is_ok(),
+            "reader_loop should exit quickly after cancellation"
+        );
+
+        assert_eq!(
+            router.pending_count(),
+            0,
+            "cancellation should fail all pending requests"
+        );
+        let response = rx.await.expect("should receive error response");
+        assert!(
+            response.get("error").is_some(),
+            "pending request should receive an error response on cancellation"
+        );
+
         let _ = child.kill().await;
     }
 
