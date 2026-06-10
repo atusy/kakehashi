@@ -627,3 +627,127 @@ fn test_snapshot_heading_inline_decoration_binary() {
 
     insta::assert_json_snapshot!("heading_inline_decoration_binary", data_u32);
 }
+
+/// Regression: a large paste split into several back-to-back `didChange`
+/// chunks must not leave the later lines unhighlighted (rendered white).
+///
+/// The editor sends the paste as multiple incremental `didChange`s and then a
+/// single `semanticTokens/full` for the final state. Those notifications are
+/// dispatched concurrently with the token request, so without serialization the
+/// request could snapshot a half-applied document and return tokens covering
+/// only the first chunks — the symptom this guards against. The server must
+/// settle all pending edits before computing, so the tokens reach the last
+/// line.
+#[test]
+fn test_semantic_tokens_large_paste_covers_last_line() {
+    let mut client = LspClient::new();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "dynamicRegistration": false,
+                        "requests": { "full": { "delta": true } },
+                        "tokenTypes": ["keyword", "variable", "function"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///large_paste.lua";
+    // Open an empty Lua buffer, then let the parser/language load.
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "lua", "version": 1, "text": "" }
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Simulate a large paste: many chunks appended back-to-back with NO delay
+    // between them, immediately followed by the token request, so the edits are
+    // still being applied/parsed when the request arrives. The paste is sized
+    // generously (hundreds of lines) so the race window is reliably open even on
+    // a fast machine — without the settle fix the request snapshots a partially
+    // applied document and the assertion below fails.
+    const CHUNKS: usize = 8;
+    const LINES_PER_CHUNK: usize = 40;
+    let mut text = String::new();
+    let mut version = 1i64;
+    for c in 0..CHUNKS {
+        // End-of-document position: line = number of newlines so far, col 0
+        // (every chunk ends in a newline, so the insertion point is the start
+        // of the trailing empty line).
+        let end_line = text.matches('\n').count() as u32;
+        let end_col = (text.len() - text.rfind('\n').map(|p| p + 1).unwrap_or(0)) as u32;
+
+        let mut chunk = String::new();
+        for l in 0..LINES_PER_CHUNK {
+            let n = c * LINES_PER_CHUNK + l;
+            chunk.push_str(&format!("local var_{n} = {n}\n"));
+        }
+
+        version += 1;
+        client.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": end_line, "character": end_col },
+                        "end": { "line": end_line, "character": end_col },
+                    },
+                    "text": chunk,
+                }],
+            }),
+        );
+        text.push_str(&chunk);
+    }
+
+    let total_lines = CHUNKS * LINES_PER_CHUNK; // lines 0..total_lines-1 carry code
+    let last_code_line = (total_lines - 1) as u32; // 8 * 40 - 1 = line 319
+
+    // Immediately request tokens for the final state — the server must settle
+    // the pending edits before answering.
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+
+    let result = response
+        .get("result")
+        .unwrap_or_else(|| panic!("semantic tokens response missing result: {response:?}"));
+    let data = result
+        .get("data")
+        .expect("result should have data")
+        .as_array()
+        .expect("data should be array");
+    let data_u32: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let tokens = decode_semantic_tokens(&data_u32);
+
+    let max_line = tokens.iter().map(|t| t.line).max().unwrap_or(0);
+    assert!(
+        max_line >= last_code_line,
+        "tokens must cover the whole pasted document: last code line is {last_code_line} \
+         but tokens stop at line {max_line} ({} tokens) — the later part would render white",
+        tokens.len()
+    );
+
+    // The last line is `local var_N = N`; its `local` keyword must be tokenized.
+    let last_line_keyword = tokens
+        .iter()
+        .find(|t| t.line == last_code_line && t.start == 0)
+        .map(|t| token_type_name(t.token_type));
+    assert_eq!(
+        last_line_keyword,
+        Some("keyword"),
+        "the `local` keyword on the last pasted line ({last_code_line}) must be highlighted"
+    );
+}

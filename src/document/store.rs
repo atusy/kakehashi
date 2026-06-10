@@ -3,7 +3,8 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use dashmap::mapref::one::Ref;
 use std::ops::Deref;
-use tokio::sync::watch;
+use std::sync::Arc;
+use tokio::sync::{Mutex, watch};
 use tree_sitter::{InputEdit, Tree};
 use url::Url;
 
@@ -11,6 +12,21 @@ use url::Url;
 pub struct DocumentStore {
     documents: DashMap<Url, Document>,
     parse_states: DashMap<Url, watch::Sender<ParseState>>,
+    /// Per-document serialization lock for `didChange` application.
+    ///
+    /// `didChange` handlers read the current text, apply incremental ranges, and
+    /// only persist the result after an async reparse. Without serialization,
+    /// concurrently-dispatched handlers for the same document all read the same
+    /// stale base text, so a later edit's range (authored against a newer state)
+    /// is applied to an older one — corrupting the text and, before clamping,
+    /// panicking in `replace_range`. Holding this per-URI async lock across a
+    /// document's edit critical section gives each edit mutual exclusion and lets
+    /// it see the previous one's persisted result. Handlers take the lock as their
+    /// first `.await`, so acquisition follows first-poll order — a practical
+    /// mitigation, not a hard JSON-RPC wire-order guarantee (tracked in
+    /// <https://github.com/atusy/kakehashi/issues/342>). Different documents keep
+    /// their own locks and run concurrently.
+    edit_locks: DashMap<Url, Arc<Mutex<()>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,6 +59,7 @@ impl Default for DocumentStore {
         Self {
             documents: DashMap::new(),
             parse_states: DashMap::new(),
+            edit_locks: DashMap::new(),
         }
     }
 }
@@ -211,9 +228,33 @@ impl DocumentStore {
         })
     }
 
+    /// Return the per-document `didChange` serialization lock, creating it on
+    /// first use. Callers hold the guard across the document's edit critical
+    /// section so concurrent edits to the same document apply in order. See the
+    /// `edit_locks` field docs for why this is required.
+    pub(crate) fn edit_lock(&self, uri: &Url) -> Arc<Mutex<()>> {
+        self.edit_locks
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Drop the per-URI edit lock entry without touching the document itself.
+    ///
+    /// `edit_lock` get-or-inserts, so a handler that takes the lock and then
+    /// finds the document missing (a `didChange`/semantic request for a never-
+    /// opened or already-closed URI, e.g. a reordered notification) would leave a
+    /// lock entry behind forever. Such handlers call this on their miss path to
+    /// keep the map bounded. Safe to call while holding the lock's `Arc` guard —
+    /// the guard keeps the mutex alive; only the map entry is removed.
+    pub(crate) fn remove_edit_lock(&self, uri: &Url) {
+        self.edit_locks.remove(uri);
+    }
+
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
+        self.edit_locks.remove(uri);
         self.documents.remove(uri).map(|(_, doc)| doc)
     }
 }
@@ -357,6 +398,46 @@ mod tests {
         let doc = store.get(&uri).unwrap();
         assert_eq!(doc.text(), text2);
         assert_eq!(doc.language_id(), Some("rust"));
+    }
+
+    #[test]
+    fn test_edit_lock_is_stable_per_uri_and_cleared_on_remove() {
+        let store = DocumentStore::new();
+        let uri_a = Url::parse("file:///a.rs").unwrap();
+        let uri_b = Url::parse("file:///b.rs").unwrap();
+
+        // Same URI yields the same lock instance, so concurrent didChange
+        // handlers for one document serialize on a shared mutex.
+        let a1 = store.edit_lock(&uri_a);
+        let a2 = store.edit_lock(&uri_a);
+        assert!(Arc::ptr_eq(&a1, &a2), "same URI must share one edit lock");
+
+        // Different URIs get distinct locks so unrelated documents stay parallel.
+        let b1 = store.edit_lock(&uri_b);
+        assert!(
+            !Arc::ptr_eq(&a1, &b1),
+            "different URIs must not share an edit lock"
+        );
+
+        // Removing the document drops its lock entry; a later edit_lock call
+        // mints a fresh, distinct lock (open/close cycles don't reuse a stale
+        // mutex). Compare pointer identity directly — `a1` is kept alive so the
+        // check doesn't depend on incidental Arc clone counts.
+        store.remove(&uri_a);
+        let a3 = store.edit_lock(&uri_a);
+        assert!(
+            !Arc::ptr_eq(&a1, &a3),
+            "lock after remove must be a fresh instance, not the cleared one"
+        );
+
+        // remove_edit_lock drops the entry on the document-missing path, so the
+        // next lock for the same URI is again a fresh instance.
+        store.remove_edit_lock(&uri_a);
+        let a4 = store.edit_lock(&uri_a);
+        assert!(
+            !Arc::ptr_eq(&a3, &a4),
+            "lock after remove_edit_lock must be a fresh instance"
+        );
     }
 
     #[test]

@@ -16,6 +16,21 @@ impl Kakehashi {
             return;
         };
 
+        // Serialize edits to this document, acquired as the FIRST `.await` of
+        // the handler. `didChange` handlers are dispatched concurrently and the
+        // read-of-old-text → reparse → persist cycle below is not atomic, so
+        // without this a later edit can read the same stale base text as an
+        // earlier one and apply its range to the wrong state (corrupting the
+        // text, and — before clamping — panicking in `replace_range`). Taking
+        // the lock before any other `.await` removes the known pre-lock yield,
+        // so handlers acquire it in first-poll order. That is a strong practical
+        // mitigation, not a hard guarantee of JSON-RPC wire order (tower-lsp
+        // first-polls buffered futures); hard ingress-level ordering is tracked
+        // in https://github.com/atusy/kakehashi/issues/342. Other documents are
+        // unaffected.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+
         self.notifier()
             .log_trace(format!("[DID_CHANGE] START uri={}", uri))
             .await;
@@ -29,6 +44,10 @@ impl Kakehashi {
                     self.notifier()
                         .log_warning("Document not found for change event")
                         .await;
+                    // We created an edit-lock entry above for a document that
+                    // doesn't exist (a stray/reordered notification). Drop it so
+                    // the map can't grow unboundedly from such notifications.
+                    self.documents.remove_edit_lock(&uri);
                     return;
                 }
             }

@@ -13,7 +13,7 @@
 //! for tree-sitter's incremental parsing API.
 
 use tower_lsp_server::ls_types::TextDocumentContentChangeEvent;
-use tree_sitter::InputEdit;
+use tree_sitter::{InputEdit, Point};
 
 use crate::text::PositionMapper;
 
@@ -32,10 +32,20 @@ pub(crate) fn apply_content_changes_with_edits(
 
     for change in content_changes {
         if let Some(range) = change.range {
-            // Incremental change - create InputEdit for tree editing
+            // Incremental change - create InputEdit for tree editing.
+            //
+            // Use the *clamped* position→byte mapping: `position_to_byte` returns
+            // `line_start + character` without bounding it to the line/document,
+            // so a range end past the current text yields an offset > text.len().
+            // That overflows `replace_range` below ("range end index N out of
+            // range for slice of length M"). This is reachable when a stale,
+            // shorter base text is edited with a range authored against a later
+            // document state (concurrent `didChange` processing). Clamping keeps
+            // the splice in bounds; `start <= end` is enforced so the range never
+            // inverts.
             let mapper = PositionMapper::new(&text);
-            let start_offset = mapper.position_to_byte(range.start).unwrap_or(text.len());
-            let end_offset = mapper.position_to_byte(range.end).unwrap_or(text.len());
+            let start_offset = mapper.position_to_byte_clamped(range.start);
+            let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
             let new_end_offset = start_offset + change.text.len();
 
             // Calculate the new end position for tree-sitter (using byte columns)
@@ -44,22 +54,19 @@ pub(crate) fn apply_content_changes_with_edits(
             // last_line_len is in BYTES (not UTF-16) because .len() on &str returns byte count
             let last_line_len = lines.last().map(|l| l.len()).unwrap_or(0);
 
-            // Get start position with proper byte column conversion
-            let start_point =
-                mapper
-                    .position_to_point(range.start)
-                    .unwrap_or(tree_sitter::Point::new(
-                        range.start.line as usize,
-                        start_offset,
-                    ));
+            // Points are derived from the (clamped) byte offsets via the same
+            // `LineIndex` (O(log n)), not the raw LSP positions, so they stay
+            // consistent with start_byte/old_end_byte for incremental parsing.
+            let start_point = mapper.byte_to_point(start_offset);
+            let old_end_point = mapper.byte_to_point(end_offset);
 
             // Calculate new end Point (tree-sitter uses byte columns)
             let new_end_point = if line_count > 1 {
                 // New content spans multiple lines
-                tree_sitter::Point::new(start_point.row + line_count - 1, last_line_len)
+                Point::new(start_point.row + line_count - 1, last_line_len)
             } else {
                 // New content is on same line as start
-                tree_sitter::Point::new(start_point.row, start_point.column + last_line_len)
+                Point::new(start_point.row, start_point.column + last_line_len)
             };
 
             // Create InputEdit for incremental parsing
@@ -68,9 +75,7 @@ pub(crate) fn apply_content_changes_with_edits(
                 old_end_byte: end_offset,
                 new_end_byte: new_end_offset,
                 start_position: start_point,
-                old_end_position: mapper
-                    .position_to_point(range.end)
-                    .unwrap_or(tree_sitter::Point::new(range.end.line as usize, end_offset)),
+                old_end_position: old_end_point,
                 new_end_position: new_end_point,
             };
             edits.push(edit);
@@ -132,6 +137,95 @@ mod tests {
         assert_eq!(edits[0].start_byte, 6);
         assert_eq!(edits[0].old_end_byte, 11);
         assert_eq!(edits[0].new_end_byte, 10); // "rust" is 4 bytes
+    }
+
+    #[test]
+    fn test_apply_content_changes_out_of_range_does_not_panic() {
+        // Regression: a change whose range extends past the current text must not
+        // panic in `replace_range`. This happens under concurrent `didChange`
+        // processing, where a handler reads a stale (shorter) base text but the
+        // client-authored range targets a later, longer document state. Here the
+        // base text is "local x = {\n}\n" (14 bytes); the range end maps to byte
+        // 15 (line 1, col 3 = line_start 12 + 3), one past the text — the exact
+        // shape of the observed `range end index 15 out of range for slice of
+        // length 14` crash. The change must be applied (clamped), not panic.
+        let old_text = "local x = {\n}\n"; // 14 bytes
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 1,
+                    character: 2,
+                },
+                end: Position {
+                    line: 1,
+                    character: 3,
+                },
+            }),
+            range_length: Some(1),
+            text: "\n  }".to_string(),
+        }];
+
+        // Must not panic.
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+        assert!(
+            !edits.is_empty(),
+            "incremental change should produce an edit"
+        );
+        // The offsets are clamped to the text length, so the edit stays in bounds
+        // and the resulting text is well-formed (no slice panic).
+        assert!(new_text.starts_with("local x = {"));
+    }
+
+    #[test]
+    fn test_out_of_range_edit_keeps_inputedit_byte_and_point_consistent() {
+        // When the range is clamped, the InputEdit's tree-sitter points must be
+        // derived from the clamped byte offsets, not the original out-of-bounds
+        // LSP positions — otherwise byte and point disagree and incremental
+        // parsing corrupts. Base "local x = {\n}\n" (14 bytes): line 1 is "}"
+        // (one char), so character 2/3 are past it. Both ends clamp to byte 14,
+        // which is row 2, col 0 — NOT the raw position's row 1.
+        let old_text = "local x = {\n}\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 1,
+                    character: 2,
+                },
+                end: Position {
+                    line: 1,
+                    character: 3,
+                },
+            }),
+            range_length: Some(1),
+            text: "\n  }".to_string(),
+        }];
+
+        let (_new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+        let edit = edits.first().expect("one edit");
+
+        // Each point must match the row/col of its byte offset in the old text.
+        let point_of = |byte: usize| {
+            let prefix = &old_text[..byte];
+            let row = prefix.bytes().filter(|&c| c == b'\n').count();
+            let col = byte - prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            (row, col)
+        };
+        assert_eq!(
+            (edit.start_position.row, edit.start_position.column),
+            point_of(edit.start_byte),
+            "start_position must correspond to start_byte"
+        );
+        assert_eq!(
+            (edit.old_end_position.row, edit.old_end_position.column),
+            point_of(edit.old_end_byte),
+            "old_end_position must correspond to old_end_byte"
+        );
+        // Concretely: both ends clamped to byte 14 → row 2, col 0.
+        assert_eq!(edit.old_end_byte, 14);
+        assert_eq!(
+            (edit.old_end_position.row, edit.old_end_position.column),
+            (2, 0)
+        );
     }
 
     #[test]

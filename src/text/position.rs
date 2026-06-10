@@ -79,6 +79,28 @@ impl PositionMapper {
         (self.byte_to_position(byte)? == position).then_some(byte)
     }
 
+    /// Convert a byte offset to a tree-sitter `Point` (row, byte-column).
+    ///
+    /// Reuses the precomputed `LineIndex` (O(log n) line lookup) instead of
+    /// rescanning the text, and yields a byte-based column — exactly what a
+    /// tree-sitter `InputEdit` needs. The offset is clamped to the document
+    /// length, so `try_line_col` resolves for every input; the `None` arm is
+    /// unreachable and degrades to the document start.
+    pub fn byte_to_point(&self, offset: usize) -> tree_sitter::Point {
+        let len: usize = self.line_index.len().into();
+        let offset = offset.min(len);
+        match offset
+            .try_into()
+            .ok()
+            .and_then(|o| self.line_index.try_line_col(o))
+        {
+            Some(line_col) => {
+                tree_sitter::Point::new(line_col.line as usize, line_col.col as usize)
+            }
+            None => tree_sitter::Point::new(0, 0),
+        }
+    }
+
     /// Convert byte offset to LSP Position
     pub fn byte_to_position(&self, offset: usize) -> Option<Position> {
         // Convert byte offset to LineCol
@@ -88,24 +110,6 @@ impl PositionMapper {
         let wide_line_col = self.line_index.to_wide(WideEncoding::Utf16, line_col)?;
 
         Some(Position::new(wide_line_col.line, wide_line_col.col))
-    }
-
-    /// Convert LSP Position to tree-sitter Point with proper byte column
-    ///
-    /// LSP Position uses UTF-16 code units for the character field.
-    /// Tree-sitter Point uses byte offsets for the column field.
-    /// This method performs the correct conversion.
-    pub fn position_to_point(&self, position: Position) -> Option<tree_sitter::Point> {
-        // First get the byte offset for this position
-        let byte_offset = self.position_to_byte(position)?;
-
-        // Then get the LineCol (which has byte-based column) from the byte offset
-        let line_col = self.line_index.try_line_col(byte_offset.try_into().ok()?)?;
-
-        Some(tree_sitter::Point::new(
-            line_col.line as usize,
-            line_col.col as usize,
-        ))
     }
 }
 
@@ -219,19 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn utf16_to_byte_column_for_multibyte() {
-        // "あいうx" — each hiragana is 3 bytes UTF-8, 1 code unit UTF-16
-        // UTF-16 col 3 (after 3 hiragana) → byte col 9
-        let text = "あいうx\n";
-        let mapper = PositionMapper::new(text);
-        let point = mapper
-            .position_to_point(tower_lsp_server::ls_types::Position::new(0, 3))
-            .expect("valid position");
-        assert_eq!(point.row, 0);
-        assert_eq!(point.column, 9);
-    }
-
-    #[test]
     fn position_to_byte_for_multibyte() {
         // "let x = \"あいう\";" — ASCII prefix then 3 hiragana (3 bytes each)
         let text = "let x = \"あいう\";\n";
@@ -247,6 +238,27 @@ mod tests {
             mapper.position_to_byte(tower_lsp_server::ls_types::Position::new(0, 12)),
             Some(18)
         );
+    }
+
+    #[test]
+    fn byte_to_point_for_multibyte() {
+        // Multi-line, multi-byte: byte→Point must use BYTE columns (tree-sitter),
+        // so a hiragana past the prefix lands at byte col 9 (9 ASCII), and the
+        // first char of line 1 is row 1 col 0. Covers the UTF-16→byte→Point path
+        // now that `byte_to_point` feeds the incremental-parse `InputEdit`.
+        let text = "let x = \"あいう\";\nlocal y = 2\n";
+        let mapper = PositionMapper::new(text);
+
+        // Start of the first hiragana (byte 9, after `let x = "`).
+        let p = mapper.byte_to_point(9);
+        assert_eq!((p.row, p.column), (0, 9));
+        // Just after the 3 hiragana (9 + 3×3 = byte 18) — still row 0, byte col 18.
+        let p = mapper.byte_to_point(18);
+        assert_eq!((p.row, p.column), (0, 18));
+        // First byte of line 1 (`local`) is row 1, col 0.
+        let line1_start = text.find("local").unwrap();
+        let p = mapper.byte_to_point(line1_start);
+        assert_eq!((p.row, p.column), (1, 0));
     }
 
     #[test]
