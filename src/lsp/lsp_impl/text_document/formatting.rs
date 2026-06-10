@@ -135,12 +135,26 @@ impl Kakehashi {
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
             // (concatenated-formatting-pipeline Decision point 2).
-            let pipeline_servers = match plan_region_format(
+            let pipeline = match plan_region_format(
                 region_ctx.strategy,
                 &region_ctx.priorities,
                 &region_ctx.configs,
             ) {
-                RegionFormatPlan::Concatenated(servers) => Some(servers),
+                RegionFormatPlan::Concatenated(servers) => {
+                    // Capture the region's per-line host prefixes now, while
+                    // the host snapshot is at hand: the pipeline's whole-region
+                    // replacement must re-apply them to its multi-line output
+                    // (Decision point 4, `reapply_host_line_prefixes`).
+                    let virtual_line_count =
+                        region_ctx.resolved.virtual_content.matches('\n').count() + 1;
+                    let host_line_prefixes = extract_host_line_prefixes(
+                        snapshot.text(),
+                        region_ctx.resolved.region.line_range.start,
+                        &region_ctx.resolved.line_column_offsets,
+                        virtual_line_count,
+                    );
+                    Some((servers, host_line_prefixes))
+                }
                 RegionFormatPlan::Preferred => None,
                 RegionFormatPlan::Skip => {
                     // `concatenated` with a non-empty `priorities` that names only
@@ -168,12 +182,13 @@ impl Kakehashi {
             let region_cancel_rx = cancel_state.derive_receiver();
 
             outer_join_set.spawn(async move {
-                if let Some(servers) = pipeline_servers {
+                if let Some((servers, host_line_prefixes)) = pipeline {
                     dispatch_concatenated_formatting(
                         &region_ctx,
                         pool.clone(),
                         options,
                         servers,
+                        host_line_prefixes,
                         region_cancel_rx,
                     )
                     .await
@@ -385,6 +400,10 @@ async fn dispatch_concatenated_formatting(
     // The effective (configured, deduped, order-preserving) priority list,
     // computed by the caller — which also gates entry on it being non-empty.
     server_names: Vec<String>,
+    // Per-line host prefixes of the region (caller extracts them from the
+    // host snapshot), re-applied to the final multi-line output (Decision
+    // point 4, `reapply_host_line_prefixes`).
+    host_line_prefixes: Vec<String>,
     cancel_rx: Option<CancelReceiver>,
 ) -> Option<Vec<TextEdit>> {
     let offset = RegionOffset::with_per_line_offsets(
@@ -657,6 +676,10 @@ async fn dispatch_concatenated_formatting(
     }
 
     let final_text = final_text?;
+    // Decision point 4: the virtual output starts at column 0 of the embedded
+    // language, so every continuation line must re-gain its host prefix before
+    // the whole-region replacement is emitted.
+    let final_text = reapply_host_line_prefixes(&final_text, &host_line_prefixes);
     Some(vec![TextEdit {
         range: replacement_range,
         new_text: final_text,
@@ -824,13 +847,9 @@ fn scratch_region_id(region_id: &str, run: usize, step: usize) -> String {
 /// a host edit spanning essentially the whole file — silently corrupting it. We
 /// emit no edit for that region instead, which is the safe degradation.
 ///
-/// TODO(concatenated-formatting-pipeline): Decision point 4 also requires
-/// re-applying the region's per-line host prefix/indentation to every line of
-/// `final_text` (and the region LCP for new lines on a line-count change), plus
-/// trimming trailing whitespace on empty lines. This slice emits `final_text`
-/// verbatim and relies on the existing range translation only, so multi-line /
-/// blockquoted regions still drop host indentation on replacement lines — the
-/// same limitation documented in `src/lsp/bridge/text_document/formatting.rs`.
+/// The replacement's `new_text` is built by [`reapply_host_line_prefixes`],
+/// which restores the host prefix on every continuation line (Decision
+/// point 4); this function only provides the range.
 fn region_replacement_range(original_virtual: &str, offset: &RegionOffset) -> Option<Range> {
     // Virtual end position = the position one past the last byte (EOF), derived
     // via the shared PositionMapper from `original_virtual.len()` so line-ending
@@ -850,6 +869,129 @@ fn region_replacement_range(original_virtual: &str, offset: &RegionOffset) -> Op
     };
     translate_virtual_range_to_host(&mut range, offset);
     Some(range)
+}
+
+/// Extract the host-text prefix of every line of an injection region.
+///
+/// `prefixes[i]` is the host text that precedes the region's content on
+/// virtual line `i` — the blockquote `> ` markers and/or indentation that the
+/// injection extraction stripped. `line_column_offsets` carries the UTF-16
+/// column where content starts on each line (`ResolvedInjection`
+/// semantics: a single-entry list means only line 0 is offset; missing
+/// entries default to column 0, i.e. no prefix).
+///
+/// An unresolvable position (stale offsets racing a host edit) degrades to an
+/// empty prefix for that line rather than failing the whole region — the same
+/// saturating posture the position translation code takes.
+fn extract_host_line_prefixes(
+    host_text: &str,
+    region_start_line: u32,
+    line_column_offsets: &[u32],
+    virtual_line_count: usize,
+) -> Vec<String> {
+    let mapper = crate::text::PositionMapper::new(host_text);
+    (0..virtual_line_count)
+        .map(|i| {
+            let column = line_column_offsets.get(i).copied().unwrap_or(0);
+            if column == 0 {
+                return String::new();
+            }
+            let Some(line) = u32::try_from(i)
+                .ok()
+                .and_then(|i| region_start_line.checked_add(i))
+            else {
+                return String::new();
+            };
+            let start = mapper.position_to_byte(Position { line, character: 0 });
+            let end = mapper.position_to_byte(Position {
+                line,
+                character: column,
+            });
+            match (start, end) {
+                (Some(start), Some(end)) if start <= end => host_text[start..end].to_string(),
+                _ => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// Re-apply the region's host per-line prefixes to the pipeline's final text
+/// (concatenated-formatting-pipeline Decision point 4).
+///
+/// The whole-region replacement range starts *after* the first line's host
+/// prefix, but every later line of `new_text` lands at host column 0 — so
+/// without this step a blockquoted/indented injection loses its `> ` markers
+/// or indentation on every continuation line.
+///
+/// - **Line count preserved** (output lines == region lines): each output
+///   line `i` re-gains its own original prefix `host_line_prefixes[i]` — a
+///   1:1 mapping, exact even when prefixes differ per line (nested
+///   blockquotes).
+/// - **Line count changed**: the pipeline computes no diff/alignment, so
+///   every continuation line takes the region's longest common prefix — exact
+///   for the usual uniform-prefix region, a documented limitation otherwise.
+/// - **Empty output lines** get the prefix with trailing whitespace trimmed
+///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
+///   introduces no trailing-whitespace violations.
+fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -> String {
+    let lines: Vec<&str> = final_text.split('\n').collect();
+    if lines.len() <= 1 {
+        // Single-line output sits entirely after the first line's host prefix.
+        return final_text.to_string();
+    }
+
+    let line_count_preserved = lines.len() == host_line_prefixes.len();
+    let lcp = if line_count_preserved {
+        String::new()
+    } else {
+        longest_common_prefix(host_line_prefixes)
+    };
+
+    let mut out = String::with_capacity(final_text.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            out.push_str(line);
+            continue;
+        }
+        out.push('\n');
+        let prefix = if line_count_preserved {
+            host_line_prefixes[i].as_str()
+        } else {
+            lcp.as_str()
+        };
+        // `split('\n')` keeps a trailing '\r' on CRLF content; a line is
+        // "empty" for the trailing-whitespace rule with or without it.
+        if line.trim_end_matches('\r').is_empty() {
+            out.push_str(prefix.trim_end());
+        } else {
+            out.push_str(prefix);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Longest common prefix of all strings, on char boundaries. Empty input or
+/// any empty string yields the empty prefix.
+fn longest_common_prefix(strings: &[String]) -> String {
+    let mut iter = strings.iter();
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut prefix = first.as_str();
+    for s in iter {
+        let common_len = prefix
+            .chars()
+            .zip(s.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum();
+        prefix = &prefix[..common_len];
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.to_string()
 }
 
 /// Sort `edits` in place by `range.start` (line, then character).
@@ -1285,6 +1427,106 @@ mod tests {
             1,
             "poison recovery must preserve tracked scratch docs"
         );
+    }
+
+    // ==========================================================================
+    // reapply_host_line_prefixes / extract_host_line_prefixes
+    // (concatenated-formatting-pipeline Decision point 4: multi-line output
+    // must re-gain the host prefix per line)
+    // ==========================================================================
+
+    #[test]
+    fn reapply_uses_per_line_prefixes_when_line_count_is_preserved() {
+        // 3 output lines, 3 region lines: 1:1 mapping. The first line needs no
+        // prefix (the replacement range starts after its host prefix); each
+        // later line re-gains its own original prefix.
+        let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
+        assert_eq!(
+            reapply_host_line_prefixes("a\nb\nc", &prefixes),
+            "a\n> b\n> c"
+        );
+    }
+
+    #[test]
+    fn reapply_handles_per_line_prefixes_that_differ() {
+        // Nested blockquote: line prefixes differ per line and must be applied
+        // per line (not the first line's prefix everywhere).
+        let prefixes = vec!["> ".to_string(), "> > ".to_string(), "> ".to_string()];
+        assert_eq!(
+            reapply_host_line_prefixes("a\nb\nc", &prefixes),
+            "a\n> > b\n> c"
+        );
+    }
+
+    #[test]
+    fn reapply_uses_region_lcp_when_line_count_changes() {
+        // Formatter changed the line count (2 output lines, 3 region lines):
+        // there is no diff/alignment, so every continuation line takes the
+        // region's longest common prefix (ADR point 4).
+        let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
+        assert_eq!(reapply_host_line_prefixes("a\nb", &prefixes), "a\n> b");
+        // Non-uniform prefixes: the LCP is the shared "> ".
+        let prefixes = vec!["> ".to_string(), "> > ".to_string(), "> ".to_string()];
+        assert_eq!(
+            reapply_host_line_prefixes("a\nb\nc\nd", &prefixes),
+            "a\n> b\n> c\n> d"
+        );
+    }
+
+    #[test]
+    fn reapply_trims_trailing_whitespace_on_empty_output_lines() {
+        // ADR point 4: an empty output line must not gain trailing whitespace —
+        // emit ">" (not "> "), and leave a space-only prefix off entirely.
+        let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
+        assert_eq!(reapply_host_line_prefixes("a\n\nb", &prefixes), "a\n>\n> b");
+        let prefixes = vec!["  ".to_string(), "  ".to_string(), "  ".to_string()];
+        assert_eq!(reapply_host_line_prefixes("a\n\nb", &prefixes), "a\n\n  b");
+    }
+
+    #[test]
+    fn reapply_leaves_single_line_output_verbatim() {
+        // A single-line output sits entirely after the first line's host
+        // prefix; nothing to re-apply.
+        let prefixes = vec!["> ".to_string()];
+        assert_eq!(reapply_host_line_prefixes("a", &prefixes), "a");
+    }
+
+    #[test]
+    fn reapply_is_identity_for_unprefixed_regions() {
+        // The common fenced-code-block case: every continuation line starts at
+        // host column 0, so the output passes through unchanged — both for
+        // preserved and changed line counts.
+        let prefixes = vec![String::new(), String::new()];
+        assert_eq!(reapply_host_line_prefixes("a\nb", &prefixes), "a\nb");
+        assert_eq!(reapply_host_line_prefixes("a\nb\nc", &prefixes), "a\nb\nc");
+    }
+
+    #[test]
+    fn extract_prefixes_reads_blockquote_markers_from_host_lines() {
+        // Region: python inside a blockquote, host lines 1..=2, content starts
+        // at column 2 on each line ("> " prefix).
+        let host = "before\n> x = 1\n> y = 2\nafter\n";
+        let prefixes = extract_host_line_prefixes(host, 1, &[2, 2], 2);
+        assert_eq!(prefixes, vec!["> ".to_string(), "> ".to_string()]);
+    }
+
+    #[test]
+    fn extract_prefixes_defaults_missing_offsets_to_column_zero() {
+        // Non-blockquote regions carry a single-entry offset list (line 0
+        // only); continuation lines have no prefix.
+        let host = "# Doc\ncode line 0\ncode line 1\n";
+        let prefixes = extract_host_line_prefixes(host, 1, &[0], 2);
+        assert_eq!(prefixes, vec![String::new(), String::new()]);
+    }
+
+    #[test]
+    fn extract_prefixes_handles_utf16_columns() {
+        // Offsets are UTF-16 code units; a multibyte prefix must slice on the
+        // correct byte boundary.
+        let host = "héllo→x = 1\n";
+        // "héllo→" is 6 UTF-16 code units (é and → are 1 each).
+        let prefixes = extract_host_line_prefixes(host, 0, &[6], 1);
+        assert_eq!(prefixes, vec!["héllo→".to_string()]);
     }
 
     // ==========================================================================
