@@ -14,9 +14,20 @@ impl Kakehashi {
             return;
         };
 
-        // Remove the document from the store when it's closed
-        // This ensures that reopening the file will properly reinitialize everything
-        self.documents.remove(&uri);
+        // Remove the document from the store when it's closed.
+        // This ensures that reopening the file will properly reinitialize everything.
+        //
+        // Serialize the removal behind any in-flight edit by acquiring this
+        // document's edit lock first (the same lock `did_change` holds across its
+        // reparse). Without it, `remove` could drop the lock entry while an edit
+        // still holds the old `Arc`, so a later edit would create a *fresh* lock
+        // and stop serializing with the in-flight one. The guard is dropped right
+        // after the removal — the remaining cleanups touch other subsystems.
+        {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            self.documents.remove(&uri);
+        }
 
         // Clean up all caches for this document (semantic tokens, injections, requests)
         self.cache.remove_document(&uri);

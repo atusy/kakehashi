@@ -16,19 +16,24 @@ impl Kakehashi {
             return;
         };
 
+        // Serialize edits to this document, acquired as the FIRST `.await` of
+        // the handler. `didChange` handlers are dispatched concurrently and the
+        // read-of-old-text → reparse → persist cycle below is not atomic, so
+        // without this a later edit can read the same stale base text as an
+        // earlier one and apply its range to the wrong state (corrupting the
+        // text, and — before clamping — panicking in `replace_range`). Taking
+        // the lock before any other `.await` removes the known pre-lock yield,
+        // so handlers acquire it in first-poll order. That is a strong practical
+        // mitigation, not a hard guarantee of JSON-RPC wire order (tower-lsp
+        // first-polls buffered futures); hard ingress-level ordering is tracked
+        // in https://github.com/atusy/kakehashi/issues/342. Other documents are
+        // unaffected.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+
         self.notifier()
             .log_trace(format!("[DID_CHANGE] START uri={}", uri))
             .await;
-
-        // Serialize edits to this document. `didChange` handlers are dispatched
-        // concurrently; the read-of-old-text → reparse → persist cycle below is
-        // not atomic, so without this lock a later edit can read the same stale
-        // base text as an earlier one and apply its range to the wrong state
-        // (corrupting the text, and — before clamping — panicking in
-        // `replace_range`). Holding this guard for the whole handler forces
-        // edits to apply in arrival order; other documents are unaffected.
-        let edit_lock = self.documents.edit_lock(&uri);
-        let _edit_guard = edit_lock.lock().await;
 
         // Retrieve the stored document info
         let (language_id, old_text) = {

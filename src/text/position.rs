@@ -89,24 +89,6 @@ impl PositionMapper {
 
         Some(Position::new(wide_line_col.line, wide_line_col.col))
     }
-
-    /// Convert LSP Position to tree-sitter Point with proper byte column
-    ///
-    /// LSP Position uses UTF-16 code units for the character field.
-    /// Tree-sitter Point uses byte offsets for the column field.
-    /// This method performs the correct conversion.
-    pub fn position_to_point(&self, position: Position) -> Option<tree_sitter::Point> {
-        // First get the byte offset for this position
-        let byte_offset = self.position_to_byte(position)?;
-
-        // Then get the LineCol (which has byte-based column) from the byte offset
-        let line_col = self.line_index.try_line_col(byte_offset.try_into().ok()?)?;
-
-        Some(tree_sitter::Point::new(
-            line_col.line as usize,
-            line_col.col as usize,
-        ))
-    }
 }
 
 /// Convert byte column position to UTF-16 column position within a line.
@@ -216,19 +198,6 @@ mod tests {
         assert_eq!(byte_to_utf16_col(line, 2), 1);
         // byte 3 is mid-emoji → falls back to 1
         assert_eq!(byte_to_utf16_col(line, 3), 1);
-    }
-
-    #[test]
-    fn utf16_to_byte_column_for_multibyte() {
-        // "あいうx" — each hiragana is 3 bytes UTF-8, 1 code unit UTF-16
-        // UTF-16 col 3 (after 3 hiragana) → byte col 9
-        let text = "あいうx\n";
-        let mapper = PositionMapper::new(text);
-        let point = mapper
-            .position_to_point(tower_lsp_server::ls_types::Position::new(0, 3))
-            .expect("valid position");
-        assert_eq!(point.row, 0);
-        assert_eq!(point.column, 9);
     }
 
     #[test]

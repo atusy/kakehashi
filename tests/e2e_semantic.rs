@@ -671,10 +671,14 @@ fn test_semantic_tokens_large_paste_covers_last_line() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    // Simulate a large paste: several chunks appended back-to-back with NO
-    // delay between them, so the edits and the following token request race.
-    const CHUNKS: usize = 6;
-    const LINES_PER_CHUNK: usize = 25;
+    // Simulate a large paste: many chunks appended back-to-back with NO delay
+    // between them, immediately followed by the token request, so the edits are
+    // still being applied/parsed when the request arrives. The paste is sized
+    // generously (hundreds of lines) so the race window is reliably open even on
+    // a fast machine — without the settle fix the request snapshots a partially
+    // applied document and the assertion below fails.
+    const CHUNKS: usize = 8;
+    const LINES_PER_CHUNK: usize = 40;
     let mut text = String::new();
     let mut version = 1i64;
     for c in 0..CHUNKS {
