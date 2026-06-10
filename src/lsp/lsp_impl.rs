@@ -151,6 +151,11 @@ pub struct Kakehashi {
     /// Computed once at construction — `dirs::home_dir()` is stable for the
     /// process lifetime.
     home_dir: Option<String>,
+    /// Previous full result per `(uri, kind)` for `kakehashi/captures/full/delta`
+    /// (captures-protocol §"Delta semantics"): `(resultId, matches as wire JSON)`.
+    /// Entries are dropped on `didClose`; a delta against a missing or mismatched
+    /// `resultId` falls back to a full response.
+    captures_cache: dashmap::DashMap<(Url, String), (String, Vec<serde_json::Value>)>,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -216,6 +221,7 @@ impl Kakehashi {
             debounced_diagnostics: std::sync::Arc::new(DebouncedDiagnosticsManager::new()),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
+            captures_cache: dashmap::DashMap::new(),
         }
     }
 
