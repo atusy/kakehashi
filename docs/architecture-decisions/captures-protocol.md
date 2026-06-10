@@ -28,9 +28,9 @@ A first iteration shipped `kakehashi/query`: a one-shot method taking a **client
 
 | Method | Input | Output |
 |---|---|---|
-| `kakehashi/captures/full` | `{ textDocument, kind }` | `CapturesResult \| null` |
+| `kakehashi/captures/full` | `{ textDocument, kind, injection? }` | `CapturesResult \| null` |
 | `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
-| `kakehashi/captures/range` | `{ textDocument, kind, range }` | `CapturesRangeResult \| null` |
+| `kakehashi/captures/range` | `{ textDocument, kind, range, injection? }` | `CapturesRangeResult \| null` |
 
 ### Result shapes
 
@@ -42,7 +42,9 @@ type CapturesResult = {
 };
 
 type Match = {
-  patternIndex: number;
+  patternIndex: number;        // within the producing language's kind query —
+                               // (language, patternIndex) is the unambiguous key
+  language: string;            // language of the layer that produced this match
   captures: {
     name: string;              // capture name without '@', e.g. "context"
     node: NodeInfo;            // { id, kind } — trackable via kakehashi/node/*
@@ -57,21 +59,39 @@ type CapturesDelta = {
 
 type CapturesRangeResult = { matches: Match[]; skipped: SkippedPattern[] };
 
-type SkippedPattern = { startLine: number; endLine: number; reason: string };
+type SkippedPattern = { language: string; startLine: number; endLine: number; reason: string };
 // startLine/endLine are 1-indexed lines in the query file — or in the combined
 // query string when `; inherits:` is used (the loader concatenates parents first).
 ```
+
+`language` is present on every match — including host-only requests — so the
+wire shape never branches on the request mode, and it lives **per match** (not
+per capture, which would be redundant; not as a per-layer grouping, which would
+break the flat-array delta). Because the diff is plain JSON equality over match
+objects, adding `language` required no change to the delta algorithm.
 
 ### Kind resolution
 
 `kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (first hit wins), honoring `; inherits:` directives and tolerant per-pattern compilation — the identical pipeline used for highlights/locals/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `kakehashi/captures/kinds` discovery method with no protocol change.
 
+### The `injection` parameter
+
+`injection` is a plain boolean (default `false`) on `full` and `range`:
+
+- `false` / absent — run the kind query against the **host** tree only (all result nodes minted in layer 0);
+- `true` — run it across **every** layer: the host first, then each injection region in document order, recursing into nested injections up to the same depth cap the semantic-tokens collector uses. Each layer resolves **its own language's** `queries/<lang>/<kind>.scm`; a layer whose language has no kind file simply contributes nothing. Result nodes are minted in their layer's depth, so they compose with `kakehashi/node/*` under the node-reference-protocol per-layer Scope rule (with the same depth-index caveats lazy-node-identity-tracking documents).
+
+Unlike `kakehashi/node`'s `boolean | number` selector, there is no layer *indexing*: captures have no cursor position to anchor a layer stack, so the only meaningful modes are "host only" and "everything". The kind is considered available when **at least one** visited layer's language has the kind file — e.g. a host language without a `context.scm` still yields the embedded layers' contexts; only "no visited language has the file" collapses to `null`.
+
+**Match ordering** is document-order DFS — the host layer's matches in query order, then each injection region by ascending start byte, each region's matches (and its nested regions) before the next sibling region. The order is deterministic, which the positional delta diff requires.
+
 ### Delta semantics
 
-`full` responses carry a `resultId` scoped to `(uri, kind)`. A `full/delta` request recomputes the current matches and:
+`full` responses carry a `resultId` scoped to `(uri, kind)`, and the lineage stores the `injection` flag alongside the matches: **delta requests carry no `injection` parameter — they inherit the mode from the lineage**, so a client switches modes by issuing a new `full`. A `full/delta` request recomputes the current matches under the stored mode and:
 
+- if no lineage exists for `(uri, kind)` — never `full`ed, or dropped by `didClose` / server restart — returns **`null`**. This deliberately deviates from semanticTokens' "a server may always answer a delta with a full result": with the mode inherited rather than carried, a fallback would have to *guess* the client's `injection` intent, and a host-only guess would silently serve an injection client the wrong layer set. Universal `null` ("re-acquire") routes the client back to `full`, which carries the flag;
 - if `previousResultId` matches the stored result, returns a **single-edit diff** over the matches array — common prefix and suffix are dropped, the middle is replaced (`start` / `deleteCount` are match indices, mirroring the semantic-tokens delta algorithm in `src/analysis/semantic/delta.rs`);
-- otherwise returns a full `CapturesResult` (the standard LSP fallback: a server may always answer a delta request with a full result).
+- otherwise (lineage exists but the id is stale) returns a full `CapturesResult` computed under the **stored** mode — the lineage reflects the most recent `full` for that `(uri, kind)`, so the inherited intent is preserved.
 
 Unlike token deltas, match deltas need no line-count safety guard: each match carries **absolute** ranges, so equal JSON means an identical match regardless of what changed elsewhere. Note the diff is positional, not identity-based — and intentionally so: a surviving node whose range shifted *must* appear in the edit (the client needs the new range), which `(id, range)` JSON equality gives for free.
 
@@ -79,10 +99,6 @@ Unlike token deltas, match deltas need no line-count safety guard: each match ca
 
 * `null` — the document is unresolvable (unknown URI, not parsed, no host language) **or the kind has no query file for this language**. A missing `context.scm` for some language is the expected common case, not an error: it means "no such captures here". A query file that exists but compiles to nothing also degrades to `null` with a server-side warning — it is a configuration/asset problem, mirroring how broken highlight queries degrade.
 * JSON-RPC `InvalidParams` — a malformed `kind` (fails the character whitelist). This differs from the replaced `kakehashi/query`, where a malformed query *string* was the client's bug; here the query content is a server asset, so only the kind *name* remains the client's responsibility.
-
-### Scope: host layer only (v1)
-
-Queries compile against one grammar, so v1 resolves and runs the kind query against the **host** tree only, and mints all result nodes in layer 0. Injection-aware capture collection (running each layer's own `<kind>.scm`, as the semantic-tokens collector does for highlights) is the natural follow-up and the reserved evolution path — deferred exactly as node-reference-protocol deferred injection (PR-1 → PR-4).
 
 ## Considered Options
 
@@ -106,7 +122,19 @@ Matches existing config-time loading, but every new kind becomes a code change, 
 
 Deferred, not rejected: v1 reloads and recompiles the kind query per request. The files are small (a `context.scm` is ~1 KB) and execution over the tree dominates; a compiled-query cache keyed by `(language, kind)` with config-reload invalidation is a contained optimization if profiling warrants it.
 
-### F. A `matchLimit` result cap
+### F. Richer `injection` selector (`boolean | number`, as on `kakehashi/node`)
+
+`kakehashi/node` indexes a layer *stack at a cursor position*; captures run over the whole document, where injection regions are siblings, not a stack — an integer index has nothing well-defined to select. The two meaningful modes are "host only" and "all layers", which a boolean expresses exactly. Rejected as YAGNI; a future filter (e.g. by language name) would be a new parameter, not an integer.
+
+### G. Per-capture `language`, or matches grouped by layer
+
+Per-capture is redundant (all captures in a match come from one layer). Grouping (`layers: [{language, matches}]`) preserves structure but abandons the flat matches array the positional delta diffs over. Rejected; `language` per match keeps the delta algorithm untouched — the diff is JSON equality, so schema additions are free.
+
+### H. Delta fallback to host-only when the lineage is missing
+
+Answering a lineage-less delta with a host-only full (the semanticTokens convention of "always may answer full") would silently serve the wrong layer set to a client that had requested `injection: true`. Rejected in favor of `null` — the protocol's universal "re-acquire" signal — because only a new `full` carries the client's intended mode. See Delta semantics.
+
+### I. A `matchLimit` result cap
 
 The first iteration carried an optional per-request cap (plus a server default). Rejected on review: truncation is **silent** — a client cannot tell a complete result from a clipped one, which for the motivating consumer means silently wrong contexts — and a truncated `full` poisons the delta lineage (edits computed over a clipped array, worse if `full` and `delta` use different limits). The scoping tool for "too much data" is `range`; semanticTokens, the protocol this mirrors, has no limit parameter either. Result size is bounded in practice by the query asset the server owns, not by hostile client input.
 
@@ -118,14 +146,17 @@ The first iteration carried an optional per-request cap (plus a server default).
 * Query assets live where the ecosystem already puts them (`queries/<lang>/<kind>.scm` in runtime paths); nvim-treesitter-context's own query files work unmodified once on a search path.
 * Kinds are open-ended without protocol or code changes; folds, textobjects, or custom plugin kinds ride the same three methods.
 * Captured nodes remain trackable `NodeInfo`s, composing with the entire `kakehashi/node/*` family.
+* `injection: true` makes the cross-language sticky-context case (Markdown heading **and** the Python function inside the block) a single request, with each layer's own ecosystem query assets.
 
 ### Negative
 
 * Ad-hoc query execution (arbitrary string, no file) is no longer possible over the wire; experimentation requires writing a file into a search path.
 * Clients cannot ship inline query variations per request; behavior changes require editing the asset.
-* Each request re-reads and recompiles the kind query (see Option E) — acceptable now, a known lever later.
+* Each request re-reads and recompiles the kind queries (see Option E) — acceptable now, a known lever later.
+* `injection: true` re-parses every injection region per request (deltas included — they recompute under the stored mode). The semantic-tokens pipeline pays the same cost per request; sharing or caching layer trees across both is a future optimization, not a v1 concern.
 
 ### Neutral
 
-* `resultId` state is per `(uri, kind)` and dropped on `didClose`; a delta against an unknown id falls back to a full result, so clients need no special re-sync logic.
+* `resultId` state is per `(uri, kind)` and dropped on `didClose`; a delta against a stale id falls back to a full result under the stored mode, and a delta with no lineage at all returns `null` (see Delta semantics), so the client's only re-sync rule is "on null, call `full` again".
+* Adding `language` to the match shape invalidates pre-upgrade lineages: the first delta after a server upgrade diffs against differently-shaped matches and degrades to a full response — self-healing, no client action needed.
 * Predicate evaluation and tolerant compilation inherit the existing semantics (including permissive unknown-predicate handling), keeping capture results consistent with semantic-token highlighting.
