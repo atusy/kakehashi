@@ -27,6 +27,14 @@ pub struct DocumentStore {
     /// <https://github.com/atusy/kakehashi/issues/342>). Different documents keep
     /// their own locks and run concurrently.
     edit_locks: DashMap<Url, Arc<Mutex<()>>>,
+    /// Monotonic "open generation" per URI, lazily assigned on first ask and
+    /// cleared by [`remove`](Self::remove). A consumer that captures the
+    /// generation alongside a snapshot can later detect that the document was
+    /// closed and reopened in between — the reopened document draws a fresh
+    /// generation even though the URI looks alive again. See
+    /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
+    open_generations: DashMap<Url, u64>,
+    open_counter: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +68,8 @@ impl Default for DocumentStore {
             documents: DashMap::new(),
             parse_states: DashMap::new(),
             edit_locks: DashMap::new(),
+            open_generations: DashMap::new(),
+            open_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -255,7 +265,23 @@ impl DocumentStore {
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
         self.edit_locks.remove(uri);
+        self.open_generations.remove(uri);
         self.documents.remove(uri).map(|(_, doc)| doc)
+    }
+
+    /// The current open generation for `uri`, lazily assigned. Two reads
+    /// straddling a [`remove`](Self::remove) (didClose) return different
+    /// values, because the removal clears the entry and the next ask draws a
+    /// fresh number — letting callers detect a close-then-reopen even when the
+    /// URI looks alive on both sides. Fetch it **before** snapshotting: if a
+    /// reopen races in between, the stale generation makes the later
+    /// comparison fail (conservative), whereas the reverse order could pair an
+    /// old snapshot with the new document's generation.
+    pub(crate) fn open_generation(&self, uri: &Url) -> u64 {
+        *self.open_generations.entry(uri.clone()).or_insert_with(|| {
+            self.open_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        })
     }
 }
 

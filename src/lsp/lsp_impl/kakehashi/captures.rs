@@ -205,9 +205,12 @@ fn load_kind_query(
 }
 
 /// Outcome of the shared resolution + execution pipeline: the resolved `Url`
-/// (cache key half) and the wire-shaped `matches` / `skipped` arrays.
+/// (cache key half), the document's open generation at snapshot time (so the
+/// lineage store can detect a close-then-reopen racing the request), and the
+/// wire-shaped `matches` / `skipped` arrays.
 struct ComputedCaptures {
     uri: Url,
+    open_generation: u64,
     matches: Vec<Value>,
     skipped: Vec<Value>,
 }
@@ -235,33 +238,39 @@ impl Kakehashi {
             "matches": c.matches,
             "skipped": c.skipped,
         });
-        self.store_lineage(c.uri, params.kind, params.injection, result_id, c.matches)
+        self.store_lineage(c, params.kind, params.injection, result_id)
             .await;
         Ok(response)
     }
 
     /// Store a fresh lineage in this mode's slot, unless the document closed
-    /// while the request was in flight.
+    /// (or closed-and-reopened) while the request was in flight.
     ///
-    /// The liveness check + insert are serialized with `didClose`'s document
-    /// removal through the same per-URI edit lock, so a request racing a close
-    /// can never resurrect lineage for a closed document: either the insert
-    /// completes before the close removes the document — and the close's
-    /// cache cleanup (which runs after the removal) clears it — or the close
-    /// wins the lock first and the check sees the document gone.
+    /// Two guards, both under the same per-URI edit lock `didClose` holds
+    /// around its document removal:
+    /// - liveness: a close that won the lock first leaves the document gone,
+    ///   so the check skips the insert; an insert that won first is cleared by
+    ///   the close's cache cleanup, which runs after the removal;
+    /// - generation: a close **followed by a fast reopen** makes the URI look
+    ///   alive again, but the reopened document draws a fresh open generation,
+    ///   so a stale request's snapshot-time generation no longer matches and
+    ///   the insert is skipped — a reopened document starts its lineage fresh
+    ///   (captures-protocol §"Delta semantics").
     async fn store_lineage(
         &self,
-        uri: Url,
+        computed: ComputedCaptures,
         kind: String,
         injection: bool,
         result_id: String,
-        matches: Vec<Value>,
     ) {
+        let uri = computed.uri;
         let edit_lock = self.documents.edit_lock(&uri);
         let _guard = edit_lock.lock().await;
-        if self.documents.get(&uri).is_some() {
+        if self.documents.get(&uri).is_some()
+            && self.documents.open_generation(&uri) == computed.open_generation
+        {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
-            entry[usize::from(injection)] = Some((result_id, matches));
+            entry[usize::from(injection)] = Some((result_id, computed.matches));
         }
     }
 
@@ -368,8 +377,7 @@ impl Kakehashi {
                 "skipped": c.skipped,
             }),
         };
-        self.store_lineage(key.0, key.1, injection, result_id, c.matches)
-            .await;
+        self.store_lineage(c, key.1, injection, result_id).await;
         Ok(response)
     }
 
@@ -443,6 +451,12 @@ impl Kakehashi {
             .await;
         }
 
+        // Fetch the open generation BEFORE snapshotting: if a close+reopen
+        // races in between, the stale generation makes store_lineage's
+        // comparison fail (conservative skip). The reverse order could pair
+        // an old snapshot with the reopened document's generation and seed
+        // the new document with stale lineage.
+        let open_generation = self.documents.open_generation(&uri);
         let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
             log::debug!(target: "kakehashi::captures", "no parsed document for {uri}");
             return Ok(None);
@@ -554,6 +568,7 @@ impl Kakehashi {
 
         Ok(Some(ComputedCaptures {
             uri,
+            open_generation,
             matches,
             skipped,
         }))

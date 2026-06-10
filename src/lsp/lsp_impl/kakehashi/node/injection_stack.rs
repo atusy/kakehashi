@@ -631,10 +631,11 @@ fn ranges_intersect(
 /// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
 /// minted id by rebuilding the cursor-path stack, which keeps only the
 /// smallest region containing the byte — so an id minted from the larger
-/// sibling may fail to re-resolve (collapsing to `null`, the protocol's
-/// re-acquire signal). Same depth-as-identity weakness documented in
-/// lazy-node-identity-tracking; disjoint same-depth regions (the norm) are
-/// unaffected.
+/// sibling may resolve in the **wrong same-depth region** (if that region's
+/// tree happens to hold a node with the identical `(start, end, kind)`) or
+/// return `null` (the protocol's re-acquire signal). Same depth-as-identity
+/// weakness documented in lazy-node-identity-tracking; disjoint same-depth
+/// regions (the norm) are unaffected.
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,
