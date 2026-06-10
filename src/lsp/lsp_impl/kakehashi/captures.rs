@@ -162,16 +162,16 @@ impl Kakehashi {
         };
 
         let key = (c.uri, params.kind);
-        // Clone out so the DashMap read guard drops before the insert below.
-        let previous = self.captures_cache.get(&key).map(|e| e.value().clone());
-
         let result_id = next_result_id();
-        // Per-branch clones feed the response; the originals move into the
-        // cache insert below. The common edits branch clones only the cheap
-        // result id, never the matches.
-        let response = match previous {
-            Some((prev_id, prev_matches)) if prev_id == params.previous_result_id => {
-                let edits = match matches_delta_edit(&prev_matches, &c.matches) {
+        // Diff against the cached entry while borrowing it in place — cloning
+        // the previous matches would tax every delta request, the hot repeat
+        // path. The read guard (the match scrutinee temporary) drops at the
+        // end of this statement, before the insert below touches the same
+        // DashMap shard. Per-branch clones feed the response; the originals
+        // move into the cache insert.
+        let response = match self.captures_cache.get(&key) {
+            Some(entry) if entry.value().0 == params.previous_result_id => {
+                let edits = match matches_delta_edit(&entry.value().1, &c.matches) {
                     None => json!([]),
                     Some((start, delete_count, data)) => json!([{
                         "start": start,
