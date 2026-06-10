@@ -20,6 +20,16 @@ impl Kakehashi {
             .log_trace(format!("[DID_CHANGE] START uri={}", uri))
             .await;
 
+        // Serialize edits to this document. `didChange` handlers are dispatched
+        // concurrently; the read-of-old-text → reparse → persist cycle below is
+        // not atomic, so without this lock a later edit can read the same stale
+        // base text as an earlier one and apply its range to the wrong state
+        // (corrupting the text, and — before clamping — panicking in
+        // `replace_range`). Holding this guard for the whole handler forces
+        // edits to apply in arrival order; other documents are unaffected.
+        let edit_lock = self.documents.edit_lock(&uri);
+        let _edit_guard = edit_lock.lock().await;
+
         // Retrieve the stored document info
         let (language_id, old_text) = {
             let doc = self.documents.get(&uri);

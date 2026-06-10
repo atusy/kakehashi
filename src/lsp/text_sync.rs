@@ -32,10 +32,20 @@ pub(crate) fn apply_content_changes_with_edits(
 
     for change in content_changes {
         if let Some(range) = change.range {
-            // Incremental change - create InputEdit for tree editing
+            // Incremental change - create InputEdit for tree editing.
+            //
+            // Use the *clamped* position→byte mapping: `position_to_byte` returns
+            // `line_start + character` without bounding it to the line/document,
+            // so a range end past the current text yields an offset > text.len().
+            // That overflows `replace_range` below ("range end index N out of
+            // range for slice of length M"). This is reachable when a stale,
+            // shorter base text is edited with a range authored against a later
+            // document state (concurrent `didChange` processing). Clamping keeps
+            // the splice in bounds; `start <= end` is enforced so the range never
+            // inverts.
             let mapper = PositionMapper::new(&text);
-            let start_offset = mapper.position_to_byte(range.start).unwrap_or(text.len());
-            let end_offset = mapper.position_to_byte(range.end).unwrap_or(text.len());
+            let start_offset = mapper.position_to_byte_clamped(range.start);
+            let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
             let new_end_offset = start_offset + change.text.len();
 
             // Calculate the new end position for tree-sitter (using byte columns)
@@ -132,6 +142,43 @@ mod tests {
         assert_eq!(edits[0].start_byte, 6);
         assert_eq!(edits[0].old_end_byte, 11);
         assert_eq!(edits[0].new_end_byte, 10); // "rust" is 4 bytes
+    }
+
+    #[test]
+    fn test_apply_content_changes_out_of_range_does_not_panic() {
+        // Regression: a change whose range extends past the current text must not
+        // panic in `replace_range`. This happens under concurrent `didChange`
+        // processing, where a handler reads a stale (shorter) base text but the
+        // client-authored range targets a later, longer document state. Here the
+        // base text is "local x = {\n}\n" (14 bytes); the range end maps to byte
+        // 15 (line 1, col 3 = line_start 12 + 3), one past the text — the exact
+        // shape of the observed `range end index 15 out of range for slice of
+        // length 14` crash. The change must be applied (clamped), not panic.
+        let old_text = "local x = {\n}\n"; // 14 bytes
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: 1,
+                    character: 2,
+                },
+                end: Position {
+                    line: 1,
+                    character: 3,
+                },
+            }),
+            range_length: Some(1),
+            text: "\n  }".to_string(),
+        }];
+
+        // Must not panic.
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+        assert!(
+            !edits.is_empty(),
+            "incremental change should produce an edit"
+        );
+        // The offsets are clamped to the text length, so the edit stays in bounds
+        // and the resulting text is well-formed (no slice panic).
+        assert!(new_text.starts_with("local x = {"));
     }
 
     #[test]

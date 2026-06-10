@@ -3,7 +3,8 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use dashmap::mapref::one::Ref;
 use std::ops::Deref;
-use tokio::sync::watch;
+use std::sync::Arc;
+use tokio::sync::{Mutex, watch};
 use tree_sitter::{InputEdit, Tree};
 use url::Url;
 
@@ -11,6 +12,18 @@ use url::Url;
 pub struct DocumentStore {
     documents: DashMap<Url, Document>,
     parse_states: DashMap<Url, watch::Sender<ParseState>>,
+    /// Per-document serialization lock for `didChange` application.
+    ///
+    /// `didChange` handlers read the current text, apply incremental ranges, and
+    /// only persist the result after an async reparse. Without serialization,
+    /// concurrently-dispatched handlers for the same document all read the same
+    /// stale base text, so a later edit's range (authored against a newer state)
+    /// is applied to an older one — corrupting the text and, before clamping,
+    /// panicking in `replace_range`. Holding this per-URI async lock across a
+    /// document's edit critical section forces edits to apply in arrival order,
+    /// each seeing the previous one's persisted result. Different documents keep
+    /// their own locks and run concurrently.
+    edit_locks: DashMap<Url, Arc<Mutex<()>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -43,6 +56,7 @@ impl Default for DocumentStore {
         Self {
             documents: DashMap::new(),
             parse_states: DashMap::new(),
+            edit_locks: DashMap::new(),
         }
     }
 }
@@ -211,9 +225,21 @@ impl DocumentStore {
         })
     }
 
+    /// Return the per-document `didChange` serialization lock, creating it on
+    /// first use. Callers hold the guard across the document's edit critical
+    /// section so concurrent edits to the same document apply in order. See the
+    /// `edit_locks` field docs for why this is required.
+    pub(crate) fn edit_lock(&self, uri: &Url) -> Arc<Mutex<()>> {
+        self.edit_locks
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     // Lock safety: Single remove() call - no read lock held before or during write
     pub(crate) fn remove(&self, uri: &Url) -> Option<Document> {
         self.parse_states.remove(uri);
+        self.edit_locks.remove(uri);
         self.documents.remove(uri).map(|(_, doc)| doc)
     }
 }
@@ -357,6 +383,38 @@ mod tests {
         let doc = store.get(&uri).unwrap();
         assert_eq!(doc.text(), text2);
         assert_eq!(doc.language_id(), Some("rust"));
+    }
+
+    #[test]
+    fn test_edit_lock_is_stable_per_uri_and_cleared_on_remove() {
+        let store = DocumentStore::new();
+        let uri_a = Url::parse("file:///a.rs").unwrap();
+        let uri_b = Url::parse("file:///b.rs").unwrap();
+
+        // Same URI yields the same lock instance, so concurrent didChange
+        // handlers for one document serialize on a shared mutex.
+        let a1 = store.edit_lock(&uri_a);
+        let a2 = store.edit_lock(&uri_a);
+        assert!(Arc::ptr_eq(&a1, &a2), "same URI must share one edit lock");
+
+        // Different URIs get distinct locks so unrelated documents stay parallel.
+        let b1 = store.edit_lock(&uri_b);
+        assert!(
+            !Arc::ptr_eq(&a1, &b1),
+            "different URIs must not share an edit lock"
+        );
+
+        // Removing the document drops its lock entry; a later edit_lock call
+        // creates a fresh one (no unbounded growth across open/close cycles).
+        drop((a1, a2));
+        store.remove(&uri_a);
+        let a3 = store.edit_lock(&uri_a);
+        // The map entry was cleared, so this is a newly allocated lock.
+        assert_eq!(
+            Arc::strong_count(&a3),
+            2,
+            "fresh lock after remove should only be held by the map and this binding"
+        );
     }
 
     #[test]
