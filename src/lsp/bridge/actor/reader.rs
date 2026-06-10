@@ -547,6 +547,11 @@ async fn handle_message(
                     "{}Discarding publishDiagnostics targeting a scratch virtual document",
                     lang_prefix
                 );
+            } else {
+                // All other notifications are silently ignored. The if/else
+                // makes the scratch discard structural: any future
+                // notification forwarding belongs HERE, where a
+                // scratch-targeted publishDiagnostics can never reach it.
             }
         }
         MessageKind::Invalid => {
