@@ -241,6 +241,27 @@ mod tests {
     }
 
     #[test]
+    fn byte_to_point_for_multibyte() {
+        // Multi-line, multi-byte: byte→Point must use BYTE columns (tree-sitter),
+        // so a hiragana past the prefix lands at byte col 9 (9 ASCII), and the
+        // first char of line 1 is row 1 col 0. Covers the UTF-16→byte→Point path
+        // now that `byte_to_point` feeds the incremental-parse `InputEdit`.
+        let text = "let x = \"あいう\";\nlocal y = 2\n";
+        let mapper = PositionMapper::new(text);
+
+        // Start of the first hiragana (byte 9, after `let x = "`).
+        let p = mapper.byte_to_point(9);
+        assert_eq!((p.row, p.column), (0, 9));
+        // Just after the 3 hiragana (9 + 3×3 = byte 18) — still row 0, byte col 18.
+        let p = mapper.byte_to_point(18);
+        assert_eq!((p.row, p.column), (0, 18));
+        // First byte of line 1 (`local`) is row 1, col 0.
+        let line1_start = text.find("local").unwrap();
+        let p = mapper.byte_to_point(line1_start);
+        assert_eq!((p.row, p.column), (1, 0));
+    }
+
+    #[test]
     fn clamped_maps_in_bounds_position_exactly() {
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);

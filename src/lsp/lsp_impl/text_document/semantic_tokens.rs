@@ -71,14 +71,18 @@ impl Kakehashi {
         // The handle is dropped immediately; we only need the existence check.
         self.documents.get(uri)?;
 
-        // Settle pending edits before snapshotting. A large paste arrives as
+        // Settle in-flight edits before snapshotting. A large paste arrives as
         // several back-to-back `didChange` chunks; the editor then sends one
         // semantic-tokens request for the final state. Each `didChange` holds
         // the document's edit lock across its reparse, so acquiring the same
-        // lock here blocks until every edit received before this request has
-        // been applied and parsed. Without it the request can snapshot a tree
-        // from a half-applied paste and return tokens for only the first chunks
-        // — the later lines render unhighlighted (white). The guard is held
+        // lock here waits for any edit currently applying/parsing to finish
+        // before snapshotting. Without it the request can snapshot a tree from a
+        // half-applied paste and return tokens for only the first chunks — the
+        // later lines render unhighlighted (white). Acquisition follows first-poll
+        // order (a practical mitigation, not a hard JSON-RPC wire-order
+        // guarantee — see https://github.com/atusy/kakehashi/issues/342), so a
+        // request polled before a still-pending edit may not wait for it; the
+        // common debounced-after-paste case settles correctly. The guard is held
         // across the tree read (and the on-demand parse fallback) so no edit can
         // interleave between settling and snapshotting; it is released when this
         // function returns, before token computation, so edits never wait on the
