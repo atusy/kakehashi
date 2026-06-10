@@ -677,7 +677,9 @@ fn position_of_byte(
     let row = if byte_pos >= anchor_byte {
         anchor_row + newlines
     } else {
-        anchor_row - newlines
+        // Defensive: a stale tree whose row metadata disagrees with `text`
+        // must not panic the server on underflow.
+        anchor_row.saturating_sub(newlines)
     };
     let line_start = text[..byte_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let column = text[line_start..byte_pos].encode_utf16().count() as u32;
@@ -686,7 +688,7 @@ fn position_of_byte(
 
 /// Snap `index` forward to the nearest char boundary (stable alternative to
 /// the unstable `str::ceil_char_boundary`).
-fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+pub(crate) fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     while index < text.len() && !text.is_char_boundary(index) {
         index += 1;
     }
@@ -695,7 +697,7 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
 
 /// Snap `index` backward to the nearest char boundary (stable alternative to
 /// the unstable `str::floor_char_boundary`).
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+pub(crate) fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {
         index -= 1;

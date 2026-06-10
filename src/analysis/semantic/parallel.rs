@@ -322,9 +322,16 @@ fn collect_injection_contexts_sync<'a>(
         let content_node = injection.content_node;
         let (inj_start_byte, inj_end_byte) = if let Some(off) = offset {
             use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+            use crate::language::injection::{ceil_char_boundary, floor_char_boundary};
             let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
             let effective = calculate_effective_range(text, byte_range, off);
-            (effective.start, effective.end)
+            // Column deltas are byte counts; a misconfigured query could land
+            // inside a multi-byte character. Snap inward so the content slice
+            // below cannot panic (same guard as from_region_info).
+            (
+                ceil_char_boundary(text, effective.start),
+                floor_char_boundary(text, effective.end),
+            )
         } else {
             (content_node.start_byte(), content_node.end_byte())
         };
