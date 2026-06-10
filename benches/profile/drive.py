@@ -28,7 +28,8 @@ def main() -> None:
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
     ap.add_argument("--file", help="drive with this file's content instead of a "
-                                   "generated document (language from --lang)")
+                                   "generated document (language inferred from the "
+                                   "extension, falling back to --lang)")
     ap.add_argument(
         "--data-dir", default=os.path.join(os.getcwd(), "deps/test/kakehashi"),
         help="parser/query data dir; must already contain installed parsers "
@@ -39,9 +40,15 @@ def main() -> None:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
 
     if args.file:
-        ext = "rs" if args.lang == "rust" else "md"
+        if args.file.endswith(".md"):
+            lang, ext = "markdown", "md"
+        elif args.file.endswith(".rs"):
+            lang, ext = "rust", "rs"
+        else:
+            lang = args.lang
+            ext = "rs" if lang == "rust" else "md"
         with open(args.file, encoding="utf-8") as f:
-            uri, lang, text = f"file:///profile/input.{ext}", args.lang, f.read()
+            uri, text = f"file:///profile/input.{ext}", f.read()
     elif args.lang == "rust":
         uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
     else:
@@ -136,11 +143,11 @@ def main() -> None:
             srv.wait()
 
     n_bytes = len(text.encode("utf-8"))
-    n_lines = text.count("\n")
+    n_lines = len(text.splitlines())
     source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
               if args.file else f"size={args.size}")
     sys.stderr.write(
-        f"[drive] lang={args.lang} {source} requests={args.requests} "
+        f"[drive] lang={lang} {source} requests={args.requests} "
         f"ok={ok} canceled={canceled} tokens/req={tokens} "
         f"wall={elapsed*1000:.0f}ms ({elapsed/args.requests*1000:.2f}ms/req)\n")
 

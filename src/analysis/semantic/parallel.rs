@@ -559,7 +559,9 @@ fn compute_active_injection_regions(
 
 /// Convert a byte offset in host_text to a (line, utf16_col) pair.
 ///
-/// `line_starts` must come from [`build_line_start_bytes`] for the same text.
+/// `line_starts` must come from
+/// [`build_line_start_bytes`](super::token_collector::build_line_start_bytes)
+/// for the same text.
 fn byte_to_line_col(
     host_text: &str,
     host_lines: &[&str],
