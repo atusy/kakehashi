@@ -1,5 +1,6 @@
 //! Text document related LSP methods.
 
+mod code_lens;
 #[cfg(feature = "experimental")]
 mod color_presentation;
 mod completion;

@@ -444,6 +444,7 @@ impl ConnectionHandle {
                         | LinkedEditingRangeServerCapabilities::RegistrationOptions(_)
                 )
             ),
+            "textDocument/codeLens" => caps.code_lens_provider.is_some(),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
             "textDocument/foldingRange" => matches!(
                 caps.folding_range_provider,

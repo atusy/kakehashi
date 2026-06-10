@@ -10,24 +10,24 @@ use tower_lsp_server::ls_types::request::{
     GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
     GotoImplementationResponse, GotoTypeDefinitionParams, GotoTypeDefinitionResponse,
 };
+use tower_lsp_server::ls_types::{
+    CodeLens, CodeLensParams, CompletionItem, CompletionParams, CompletionResponse,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
+    DocumentDiagnosticReportResult, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightParams, DocumentLink, DocumentLinkParams, DocumentRangeFormattingParams,
+    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, InitializeParams,
+    InitializeResult, InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams,
+    LinkedEditingRanges, Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams,
+    RenameParams, SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
+    TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
+};
 #[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
-};
-use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionParams, CompletionResponse, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
-    DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentLink,
-    DocumentLinkParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
-    InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams, LinkedEditingRanges,
-    Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams, RenameParams,
-    SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
-    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
-    SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
-    Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 use url::Url;
@@ -430,6 +430,10 @@ impl LanguageServer for Kakehashi {
 
     async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
         self.document_link_impl(params).await
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        self.code_lens_impl(params).await
     }
 
     async fn document_symbol(
