@@ -835,6 +835,22 @@ fn test_descendant_for_point_range_takes_lsp_positions() {
                 "end":   { "line": 0, "character": 1 } }),
     );
     assert!(inverted.is_null(), "inverted Position range must be null");
+
+    // A `character` past line 0's end ("# Heading" = 9 cols) must NOT spill onto
+    // a later line — an over-long column means "no such location" → null, not a
+    // descendant resolved elsewhere in the document.
+    let overlong = call(
+        &mut client,
+        "kakehashi/node/descendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "start": { "line": 0, "character": 0 },
+                "end":   { "line": 0, "character": 999 } }),
+    );
+    assert!(
+        overlong.is_null(),
+        "an over-long character must collapse to null, not spill to a later line, got {:?}",
+        overlong
+    );
 }
 
 #[test]

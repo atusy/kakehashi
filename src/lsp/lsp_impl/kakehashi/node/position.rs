@@ -113,8 +113,11 @@ impl Kakehashi {
         let end = params.end;
         let resolved = self
             .with_node_mapped(&params.text_document.uri, &params.id, |n, mapper| {
-                let start_byte = mapper.position_to_byte(start)?;
-                let end_byte = mapper.position_to_byte(end)?;
+                // Strict conversion: a `character` past a line's end must mean
+                // "no such location" (null), NOT spill onto a later line as plain
+                // `position_to_byte` would (it computes line_start + character).
+                let start_byte = mapper.position_to_byte_strict(start)?;
+                let end_byte = mapper.position_to_byte_strict(end)?;
                 // Mirror the byte-range guards: reject inverted ranges and any
                 // range not contained in the node's own span, whose tree-sitter
                 // behaviour is unspecified (see navigation.rs / lookup::find_node_at).
