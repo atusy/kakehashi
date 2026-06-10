@@ -1112,10 +1112,10 @@ mod tests {
             .expect("should register request");
 
         // Verify the mapping was stored in the router
-        let looked_up = handle.router().lookup_downstream_id(&upstream_id);
+        let looked_up = handle.router().lookup_downstream_ids(&upstream_id);
         assert_eq!(
             looked_up,
-            Some(downstream_id),
+            vec![downstream_id],
             "Router should have upstream->downstream mapping"
         );
     }

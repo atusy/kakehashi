@@ -251,10 +251,12 @@ impl Kakehashi {
     }
 
     /// Emit a single client-visible warning summarizing all (host, injection)
-    /// pairs whose configured `textDocument/formatting` aggregation strategy
-    /// is `Concatenated`. The formatting handler ignores `Concatenated`
-    /// because merging edits from multiple formatters produces overlapping
-    /// `TextEdit`s (an LSP spec violation); surfacing the mismatch at
+    /// pairs whose configured `textDocument/formatting` aggregation is the
+    /// misconfigured `Concatenated`-with-empty-`priorities` combination. The
+    /// concatenated formatting pipeline requires a non-empty `priorities`
+    /// list (it defines pipeline membership and order — ADR
+    /// concatenated-formatting-pipeline Decision point 2); without one the
+    /// region falls back to `preferred`. Surfacing the mismatch at
     /// settings-apply time avoids silent misbehavior on every format request.
     ///
     /// Previously this emitted one notification per pair, which floods the

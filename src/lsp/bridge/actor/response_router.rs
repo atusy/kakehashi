@@ -42,13 +42,21 @@ pub(crate) struct ResponseRouter {
 struct ResponseRouterState {
     /// Pending requests waiting for responses.
     pending: HashMap<RequestId, oneshot::Sender<serde_json::Value>>,
-    /// Maps upstream request ID (from client) to downstream request ID (to LS).
+    /// Maps upstream request ID (from client) to downstream request IDs (to LS).
     ///
     /// Used for $/cancelRequest forwarding: when the client cancels request 42,
-    /// we look up that 42 maps to downstream ID 7, and forward the cancel to LS.
+    /// we look up the downstream IDs 42 spawned and forward a cancel for each.
+    ///
+    /// One upstream id can map to SEVERAL in-flight downstream requests on the
+    /// same connection — e.g. concurrent injection regions of one formatting
+    /// request, each issuing its own downstream request. A single-value map
+    /// would let the latest registration overwrite earlier ones, so a cancel
+    /// could target the wrong request and completing one request would orphan
+    /// its siblings' mappings (PR #347 review). `Vec` keeps registration order
+    /// for deterministic behavior; entries are tiny (a handful per upstream).
     ///
     /// Supports both numeric and string IDs per LSP spec.
-    upstream_to_downstream: HashMap<UpstreamId, RequestId>,
+    upstream_to_downstream: HashMap<UpstreamId, Vec<RequestId>>,
     /// Reverse mapping: downstream request ID -> upstream request ID.
     ///
     /// Enables O(1) cleanup when a response is routed or a request is removed.
@@ -100,28 +108,37 @@ impl ResponseRouter {
 
         state.pending.insert(downstream_id, tx);
 
-        // Store bidirectional mapping if upstream_id is provided
+        // Store bidirectional mapping if upstream_id is provided. Appending
+        // (not inserting) keeps every concurrent downstream request for this
+        // upstream id cancellable, not just the latest one.
         if let Some(upstream) = upstream_id {
             state
                 .upstream_to_downstream
-                .insert(upstream.clone(), downstream_id);
+                .entry(upstream.clone())
+                .or_default()
+                .push(downstream_id);
             state.downstream_to_upstream.insert(downstream_id, upstream);
         }
 
         Some(rx)
     }
 
-    /// Look up the downstream request ID for an upstream request ID (O(1)).
+    /// Look up every in-flight downstream request ID for an upstream request
+    /// ID, in registration order (empty when none).
     ///
     /// Used by `$/cancelRequest` forwarding to translate the client's request ID
-    /// to the language server's. Does NOT remove the entry — a cancelled request
-    /// must still receive its response.
-    pub(crate) fn lookup_downstream_id(&self, upstream_id: &UpstreamId) -> Option<RequestId> {
+    /// to the language server's. Does NOT remove the entries — a cancelled
+    /// request must still receive its response.
+    pub(crate) fn lookup_downstream_ids(&self, upstream_id: &UpstreamId) -> Vec<RequestId> {
         let state = self
             .state
             .lock()
-            .recover_poison("ResponseRouter::lookup_downstream_id");
-        state.upstream_to_downstream.get(upstream_id).copied()
+            .recover_poison("ResponseRouter::lookup_downstream_ids");
+        state
+            .upstream_to_downstream
+            .get(upstream_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Route a response to its pending request, also cleaning up both cancel-map
@@ -150,12 +167,19 @@ impl ResponseRouter {
         }
     }
 
-    /// Remove both cancel-map directions for a downstream request ID (O(1)).
+    /// Remove both cancel-map directions for a downstream request ID.
     ///
-    /// Caller must hold the lock.
+    /// Only this downstream id leaves the upstream's list — completing one
+    /// request must not orphan the cancel mappings of its still-in-flight
+    /// siblings sharing the same upstream id. Caller must hold the lock.
     fn remove_cancel_mapping_inner(state: &mut ResponseRouterState, downstream_id: RequestId) {
-        if let Some(upstream_id) = state.downstream_to_upstream.remove(&downstream_id) {
-            state.upstream_to_downstream.remove(&upstream_id);
+        if let Some(upstream_id) = state.downstream_to_upstream.remove(&downstream_id)
+            && let Some(ids) = state.upstream_to_downstream.get_mut(&upstream_id)
+        {
+            ids.retain(|id| *id != downstream_id);
+            if ids.is_empty() {
+                state.upstream_to_downstream.remove(&upstream_id);
+            }
         }
     }
 
@@ -488,11 +512,63 @@ mod tests {
         assert_eq!(router.pending_count(), 1);
 
         // Should be able to look up downstream ID by upstream ID
-        let looked_up = router.lookup_downstream_id(&upstream_id);
+        let looked_up = router.lookup_downstream_ids(&upstream_id);
         assert_eq!(
             looked_up,
-            Some(downstream_id),
+            vec![downstream_id],
             "lookup should return downstream ID for upstream ID"
+        );
+    }
+
+    /// One upstream id with several concurrent downstream requests (parallel
+    /// injection regions of one client request on the same connection): the
+    /// cancel map must track ALL of them, in registration order. The old
+    /// single-value map let the latest registration overwrite earlier ones,
+    /// so a timeout-driven cancel could target the wrong downstream request
+    /// (PR #347 review).
+    #[test]
+    fn cancel_map_tracks_multiple_downstream_ids_per_upstream() {
+        let router = ResponseRouter::new();
+        let upstream_id = UpstreamId::Number(100);
+
+        let _rx1 = router
+            .register_with_upstream(RequestId::new(1), Some(upstream_id.clone()))
+            .expect("first registration should succeed");
+        let _rx2 = router
+            .register_with_upstream(RequestId::new(2), Some(upstream_id.clone()))
+            .expect("second registration should succeed");
+
+        assert_eq!(
+            router.lookup_downstream_ids(&upstream_id),
+            vec![RequestId::new(1), RequestId::new(2)],
+            "both in-flight downstream requests must stay cancellable"
+        );
+    }
+
+    /// Completing one downstream request must not orphan the cancel mapping
+    /// of a still-in-flight sibling sharing the same upstream id. The old
+    /// single-value map removed the whole upstream entry when ANY of its
+    /// requests completed, leaving the sibling uncancellable.
+    #[tokio::test]
+    async fn routing_one_response_keeps_sibling_cancel_mappings() {
+        let router = ResponseRouter::new();
+        let upstream_id = UpstreamId::Number(100);
+
+        let rx1 = router
+            .register_with_upstream(RequestId::new(1), Some(upstream_id.clone()))
+            .expect("first registration should succeed");
+        let _rx2 = router
+            .register_with_upstream(RequestId::new(2), Some(upstream_id.clone()))
+            .expect("second registration should succeed");
+
+        let result = router.route(json!({"jsonrpc": "2.0", "id": 1, "result": null}));
+        assert_eq!(result, RouteResult::Delivered);
+        let _ = rx1.await;
+
+        assert_eq!(
+            router.lookup_downstream_ids(&upstream_id),
+            vec![RequestId::new(2)],
+            "sibling's cancel mapping must survive the other request's completion"
         );
     }
 
@@ -512,10 +588,10 @@ mod tests {
     fn lookup_downstream_id_returns_none_for_unknown() {
         let router = ResponseRouter::new();
 
-        let result = router.lookup_downstream_id(&UpstreamId::Number(999));
-        assert_eq!(
-            result, None,
-            "lookup should return None for unknown upstream ID"
+        let result = router.lookup_downstream_ids(&UpstreamId::Number(999));
+        assert!(
+            result.is_empty(),
+            "lookup should return no ids for unknown upstream ID"
         );
     }
 
@@ -535,8 +611,8 @@ mod tests {
 
         // Verify mapping exists before route
         assert_eq!(
-            router.lookup_downstream_id(&upstream_id),
-            Some(downstream_id)
+            router.lookup_downstream_ids(&upstream_id),
+            vec![downstream_id]
         );
 
         // Route the response
@@ -549,9 +625,8 @@ mod tests {
         assert_eq!(result, RouteResult::Delivered, "route should succeed");
 
         // Verify mapping is removed after route
-        assert_eq!(
-            router.lookup_downstream_id(&upstream_id),
-            None,
+        assert!(
+            router.lookup_downstream_ids(&upstream_id).is_empty(),
             "cancel map entry should be removed after route"
         );
 
@@ -572,8 +647,8 @@ mod tests {
 
         // Verify mapping exists before remove
         assert_eq!(
-            router.lookup_downstream_id(&upstream_id),
-            Some(downstream_id)
+            router.lookup_downstream_ids(&upstream_id),
+            vec![downstream_id]
         );
 
         // Remove the pending request
@@ -581,9 +656,8 @@ mod tests {
         assert!(removed, "remove should succeed");
 
         // Verify mapping is removed
-        assert_eq!(
-            router.lookup_downstream_id(&upstream_id),
-            None,
+        assert!(
+            router.lookup_downstream_ids(&upstream_id).is_empty(),
             "cancel map entry should be removed after remove"
         );
     }
@@ -602,25 +676,30 @@ mod tests {
 
         // Verify mappings exist
         assert!(
-            router
-                .lookup_downstream_id(&UpstreamId::Number(100))
-                .is_some()
+            !router
+                .lookup_downstream_ids(&UpstreamId::Number(100))
+                .is_empty()
         );
         assert!(
-            router
-                .lookup_downstream_id(&UpstreamId::Number(200))
-                .is_some()
+            !router
+                .lookup_downstream_ids(&UpstreamId::Number(200))
+                .is_empty()
         );
 
         router.fail_all("connection lost");
 
         // Verify mappings are cleared
-        assert_eq!(
-            router.lookup_downstream_id(&UpstreamId::Number(100)),
-            None,
+        assert!(
+            router
+                .lookup_downstream_ids(&UpstreamId::Number(100))
+                .is_empty(),
             "cancel map should be cleared by fail_all"
         );
-        assert_eq!(router.lookup_downstream_id(&UpstreamId::Number(200)), None);
+        assert!(
+            router
+                .lookup_downstream_ids(&UpstreamId::Number(200))
+                .is_empty()
+        );
     }
 
     /// Test that lookup_downstream_id does NOT remove the pending entry.
@@ -645,19 +724,19 @@ mod tests {
         // Verify initial state
         assert_eq!(router.pending_count(), 1);
         assert_eq!(
-            router.lookup_downstream_id(&upstream_id),
-            Some(downstream_id)
+            router.lookup_downstream_ids(&upstream_id),
+            vec![downstream_id]
         );
 
         // Look up the downstream ID (as we would when forwarding a cancel)
-        let looked_up = router.lookup_downstream_id(&upstream_id);
-        assert_eq!(looked_up, Some(downstream_id));
+        let looked_up = router.lookup_downstream_ids(&upstream_id);
+        assert_eq!(looked_up, vec![downstream_id]);
 
         // Key assertion: pending entry should still exist after lookup
         assert_eq!(
             router.pending_count(),
             1,
-            "lookup_downstream_id should NOT remove the pending entry"
+            "lookup_downstream_ids should NOT remove the pending entry"
         );
 
         // We should still be able to route a response
@@ -703,10 +782,10 @@ mod tests {
 
         // Look up the downstream ID multiple times
         for _ in 0..3 {
-            let result = router.lookup_downstream_id(&upstream_id);
+            let result = router.lookup_downstream_ids(&upstream_id);
             assert_eq!(
                 result,
-                Some(downstream_id),
+                vec![downstream_id],
                 "cancel map entry should persist after lookup"
             );
         }
@@ -783,13 +862,13 @@ mod tests {
             .expect("should register");
 
         // Verify mapping exists
-        assert!(router.lookup_downstream_id(&upstream_id).is_some());
+        assert!(!router.lookup_downstream_ids(&upstream_id).is_empty());
 
         // Fail the request
         router.fail_request(downstream_id, "test");
 
         // Cancel mapping should be cleaned up
-        assert_eq!(router.lookup_downstream_id(&upstream_id), None);
+        assert!(router.lookup_downstream_ids(&upstream_id).is_empty());
     }
 
     /// Test double cleanup is safe (both remove and fail_request on same ID).

@@ -54,6 +54,44 @@ impl LanguageServerPool {
         build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
     ) -> io::Result<T> {
+        self.execute_bridge_request_observed(
+            handle,
+            server_name,
+            host_uri,
+            injection_language,
+            region_id,
+            offset,
+            virtual_content,
+            upstream_request_id,
+            build_request,
+            transform_response,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle),
+    /// but additionally publishes the allocated downstream [`RequestId`] into
+    /// `downstream_id_probe` as soon as it is known. A caller that may drop
+    /// this future (e.g. the formatting pipeline's per-step timeout) can then
+    /// still cancel the in-flight downstream request precisely by that id —
+    /// the upstream-id cancel mapping is removed by the router cleanup guard
+    /// the moment the future is dropped, so it cannot be looked up afterward.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_bridge_request_observed<T, P: serde::Serialize>(
+        &self,
+        handle: Arc<ConnectionHandle>,
+        server_name: &str,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        offset: &RegionOffset,
+        virtual_content: &str,
+        upstream_request_id: Option<UpstreamId>,
+        build_request: impl FnOnce(&VirtualDocumentUri, RequestId) -> JsonRpcRequest<P>,
+        transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
+        downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
+    ) -> io::Result<T> {
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -81,6 +119,12 @@ impl LanguageServerPool {
                     return Err(e);
                 }
             };
+
+        // Publish the downstream id immediately so a caller that drops this
+        // future (per-step timeout) can still cancel the request precisely.
+        if let Some(probe) = downstream_id_probe {
+            let _ = probe.set(request_id);
+        }
 
         // Build the request via caller-provided closure
         let request = build_request(&virtual_uri, request_id);

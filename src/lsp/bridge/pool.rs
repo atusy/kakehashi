@@ -45,7 +45,9 @@ use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
 
 use crate::error::LockResultExt;
 
-use super::protocol::{JsonRpcNotification, VirtualDocumentUri, build_didopen_notification};
+use super::protocol::{
+    JsonRpcNotification, RequestId, VirtualDocumentUri, build_didopen_notification,
+};
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
 /// initializing server (ls-bridge-timeout-hierarchy Tier 0: 30-60s recommended). A downstream
@@ -800,9 +802,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Translate `upstream_id` to the downstream ID via the cancel map and send
-    /// `$/cancelRequest` to `server_name`. The pending entry stays in place: the
-    /// server may still respond with a result or `REQUEST_CANCELLED` (-32800).
+    /// Translate `upstream_id` to its downstream ID(s) via the cancel map and
+    /// send `$/cancelRequest` to `server_name` for **each** of them — one
+    /// upstream id can have several in-flight downstream requests on the same
+    /// connection (concurrent injection regions of one request), and all of
+    /// them belong to the cancelled upstream request. The pending entries stay
+    /// in place: the server may still respond with a result or
+    /// `REQUEST_CANCELLED` (-32800).
     ///
     /// Returns `Ok(())` when the cancel is unforwardable (no connection, not
     /// Ready, or unknown upstream ID) per LSP best-effort semantics; only real
@@ -812,58 +818,115 @@ impl LanguageServerPool {
         server_name: &str,
         upstream_id: &UpstreamId,
     ) -> io::Result<()> {
-        // Get the connection for this server
-        let handle = {
-            let connections = self.connections().await;
-            let Some(handle) = connections.get(server_name) else {
-                // No connection - request may have completed or server never started.
-                // Silently drop per best-effort semantics.
-                self.cancel_metrics.record_no_connection();
-                log::debug!(
-                    target: "kakehashi::bridge::cancel",
-                    "Cancel dropped: no connection for server '{}' (upstream_id: {}, expected if request completed)",
-                    server_name,
-                    upstream_id
-                );
-                return Ok(());
-            };
-
-            // Only forward if connection is Ready
-            if handle.state() != ConnectionState::Ready {
-                // Connection still initializing or failed - can't forward cancels.
-                // Silently drop per best-effort semantics.
-                self.cancel_metrics.record_not_ready();
-                log::debug!(
-                    target: "kakehashi::bridge::cancel",
-                    "Cancel dropped: connection not ready for server '{}' (upstream_id: {}, state: {:?})",
-                    server_name,
-                    upstream_id,
-                    handle.state()
-                );
-                return Ok(());
-            }
-
-            std::sync::Arc::clone(handle)
+        let Some(handle) = self
+            .ready_connection_for_cancel(server_name, &format!("upstream_id: {upstream_id}"))
+            .await
+        else {
+            return Ok(());
         };
 
-        // Look up the downstream ID
-        let downstream_id = match handle.router().lookup_downstream_id(upstream_id) {
-            Some(id) => id,
-            None => {
-                // Request already completed or ID never registered.
-                // Silently drop per best-effort semantics.
-                self.cancel_metrics.record_unknown_id();
-                log::debug!(
-                    target: "kakehashi::bridge::cancel",
-                    "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
-                    upstream_id,
-                    server_name
-                );
-                return Ok(());
-            }
+        // Look up every in-flight downstream ID for this upstream request
+        let downstream_ids = handle.router().lookup_downstream_ids(upstream_id);
+        if downstream_ids.is_empty() {
+            // Request already completed or ID never registered.
+            // Silently drop per best-effort semantics.
+            self.cancel_metrics.record_unknown_id();
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
+                upstream_id,
+                server_name
+            );
+            return Ok(());
+        }
+
+        for downstream_id in downstream_ids {
+            self.send_cancel_notification(&handle, server_name, downstream_id)?;
+        }
+        Ok(())
+    }
+
+    /// Send `$/cancelRequest` for a **specific** downstream request id on
+    /// `server_name`'s connection — no upstream-id lookup involved.
+    ///
+    /// Used by the concatenated formatting pipeline's per-step timeout, which
+    /// must cancel exactly the request it issued: routing through the
+    /// upstream id would (a) find nothing — dropping the timed-out step
+    /// future has already removed its cancel mapping via the router cleanup
+    /// guard by the time any cancel task runs — and (b) fan out to sibling
+    /// regions' in-flight requests sharing the same upstream id, spuriously
+    /// cancelling unrelated work (PR #347 review).
+    ///
+    /// Best-effort like [`forward_cancel`](Self::forward_cancel): an absent
+    /// or non-Ready connection silently drops the cancel; only real send
+    /// failures bubble up as `Err`.
+    pub(crate) async fn forward_cancel_downstream(
+        &self,
+        server_name: &str,
+        downstream_id: RequestId,
+    ) -> io::Result<()> {
+        let Some(handle) = self
+            .ready_connection_for_cancel(
+                server_name,
+                &format!("downstream_id: {}", downstream_id.as_i64()),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        self.send_cancel_notification(&handle, server_name, downstream_id)
+    }
+
+    /// Fetch `server_name`'s connection for cancel forwarding, returning
+    /// `None` (after best-effort metrics/logging) when there is no connection
+    /// or it is not Ready. `request_desc` identifies the request in logs.
+    async fn ready_connection_for_cancel(
+        &self,
+        server_name: &str,
+        request_desc: &str,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let connections = self.connections().await;
+        let Some(handle) = connections.get(server_name) else {
+            // No connection - request may have completed or server never started.
+            // Silently drop per best-effort semantics.
+            self.cancel_metrics.record_no_connection();
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "Cancel dropped: no connection for server '{}' ({}, expected if request completed)",
+                server_name,
+                request_desc
+            );
+            return None;
         };
 
-        // Build and send the cancel notification via single-writer loop (ls-bridge-message-ordering)
+        // Only forward if connection is Ready
+        if handle.state() != ConnectionState::Ready {
+            // Connection still initializing or failed - can't forward cancels.
+            // Silently drop per best-effort semantics.
+            self.cancel_metrics.record_not_ready();
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "Cancel dropped: connection not ready for server '{}' ({}, state: {:?})",
+                server_name,
+                request_desc,
+                handle.state()
+            );
+            return None;
+        }
+
+        Some(Arc::clone(handle))
+    }
+
+    /// Build and send one `$/cancelRequest` notification for `downstream_id`
+    /// via the single-writer loop (ls-bridge-message-ordering). The pending
+    /// entry stays in place: the server may still respond with a result or
+    /// `REQUEST_CANCELLED` (-32800).
+    fn send_cancel_notification(
+        &self,
+        handle: &ConnectionHandle,
+        server_name: &str,
+        downstream_id: RequestId,
+    ) -> io::Result<()> {
         // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
         let notification = JsonRpcNotification::new(
             "$/cancelRequest",
@@ -879,8 +942,7 @@ impl LanguageServerPool {
                 self.cancel_metrics.record_success();
                 log::debug!(
                     target: "kakehashi::bridge::cancel",
-                    "Cancel forwarded: upstream {} -> downstream {} for server '{}'",
-                    upstream_id,
+                    "Cancel forwarded: downstream {} for server '{}'",
                     downstream_id.as_i64(),
                     server_name
                 );
@@ -2430,9 +2492,65 @@ mod tests {
         // Verify the cancel_map entry is still there (cancel does NOT remove it)
         // The mapping is only removed when the actual response arrives
         assert_eq!(
-            handle.router().lookup_downstream_id(&upstream_id),
-            Some(downstream_id),
+            handle.router().lookup_downstream_ids(&upstream_id),
+            vec![downstream_id],
             "Cancel map entry should still exist after cancel forwarding"
+        );
+    }
+
+    /// `forward_cancel_downstream` sends the cancel for the EXACT downstream
+    /// id it is given, with no upstream-id lookup — the formatting pipeline's
+    /// per-step timeout uses it because the timed-out step's upstream-id
+    /// mapping is already gone (router cleanup on future drop) and the
+    /// upstream id can fan out to sibling regions' requests.
+    #[tokio::test]
+    async fn forward_cancel_downstream_sends_notification_for_specific_id() {
+        use std::sync::Arc;
+
+        let pool = LanguageServerPool::new();
+        let handle = create_handle_with_state(ConnectionState::Ready).await;
+
+        // Two in-flight requests sharing one upstream id (sibling regions).
+        let upstream_id = UpstreamId::Number(42);
+        let (first_id, _rx1) = handle
+            .register_request_with_upstream(Some(upstream_id.clone()))
+            .expect("should register first request");
+        let (_second_id, _rx2) = handle
+            .register_request_with_upstream(Some(upstream_id.clone()))
+            .expect("should register second request");
+
+        pool.connections
+            .lock()
+            .await
+            .insert("lua".to_string(), Arc::clone(&handle));
+
+        // Cancel exactly the first request by its downstream id.
+        let result = pool.forward_cancel_downstream("lua", first_id).await;
+        assert!(
+            result.is_ok(),
+            "forward_cancel_downstream should succeed: {:?}",
+            result.err()
+        );
+
+        // Pending entries and cancel mappings stay (cancel never removes them;
+        // responses do).
+        assert_eq!(handle.router().pending_count(), 2);
+    }
+
+    /// `forward_cancel_downstream` silently drops when there is no connection
+    /// (best-effort semantics, same as forward_cancel).
+    #[tokio::test]
+    async fn forward_cancel_downstream_silently_drops_when_no_connection() {
+        let pool = LanguageServerPool::new();
+
+        let result = pool
+            .forward_cancel_downstream("nonexistent", RequestId::new(7))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "best-effort cancel must not error on a missing connection: {:?}",
+            result.err()
         );
     }
 
@@ -2620,9 +2738,11 @@ mod tests {
             0,
             "pending entry should be removed after response"
         );
-        assert_eq!(
-            handle.router().lookup_downstream_id(&upstream_id),
-            None,
+        assert!(
+            handle
+                .router()
+                .lookup_downstream_ids(&upstream_id)
+                .is_empty(),
             "cancel map entry should be removed after response"
         );
     }

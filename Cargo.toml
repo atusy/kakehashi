@@ -7,6 +7,16 @@ edition = "2024"
 name = "kakehashi"
 path = "src/bin/main.rs"
 
+# Mock downstream LSP formatter driven by the concatenated-formatting E2E
+# tests (tests/e2e_concatenated_formatting.rs) via CARGO_BIN_EXE_mock-lsp-formatter.
+# Gated on the e2e feature so normal builds don't ship it.
+[[bin]]
+name = "mock-lsp-formatter"
+path = "tests/bin/mock_formatter.rs"
+required-features = ["e2e"]
+test = false
+bench = false
+
 # Profiling build: optimized like release but with debug symbols retained (not
 # stripped) so flamegraph/samply + atos can symbolicate the semantic-tokens hot
 # path. Build with `cargo build --profile profiling --bin kakehashi`.

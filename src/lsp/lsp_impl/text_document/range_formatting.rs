@@ -219,6 +219,7 @@ impl Kakehashi {
                                         &t.virtual_content,
                                         options.clone(),
                                         t.upstream_id.clone(),
+                                        None,
                                     )
                                     .await
                                 {
@@ -238,6 +239,7 @@ impl Kakehashi {
                                     clipped_host_range,
                                     options,
                                     t.upstream_id,
+                                    None,
                                 )
                                 .await
                         }
