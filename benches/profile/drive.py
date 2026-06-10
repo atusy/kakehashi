@@ -40,7 +40,7 @@ def main() -> None:
 
     if args.file:
         ext = "rs" if args.lang == "rust" else "md"
-        with open(args.file) as f:
+        with open(args.file, encoding="utf-8") as f:
             uri, lang, text = f"file:///profile/input.{ext}", args.lang, f.read()
     elif args.lang == "rust":
         uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
