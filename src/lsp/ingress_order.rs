@@ -19,8 +19,9 @@
 //!   which in turn can wait on upstream client interaction — ticketing it
 //!   deadlocks a client that blocks on a gated request (e.g. a readiness
 //!   poll via `textDocument/diagnostic`) while the server waits for that
-//!   same client. Handlers already tolerate open/edit reordering for
-//!   missing documents, the pre-gate status quo.
+//!   same client. The residual open/edit and close/reopen first-poll-order
+//!   races are the pre-gate status quo; gating `didOpen` properly (fast
+//!   handler + spawned downstream work) is tracked in #374.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename requests, pull
 //!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
