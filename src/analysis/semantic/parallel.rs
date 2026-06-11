@@ -19,8 +19,9 @@ use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_token
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, compute_included_ranges, intersect_included_ranges, parse_with_ranges,
-    sub_select_included_ranges,
+    InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
+    effective_offset_for_pattern, has_combined_for_pattern, intersect_included_ranges,
+    parse_with_ranges, sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -220,7 +221,10 @@ pub(crate) fn process_injection_sync(
     let mut tokens = Vec::new();
 
     // Collect tokens from this injection's highlight query, excluding
-    // regions covered by nested injections
+    // regions covered by nested injections. Combined contexts force per-line
+    // emission: a capture node may span the excluded host text between
+    // combined blocks (e.g. a string opened in one block, closed in the
+    // next), and only per-line tokens can be clipped back to the blocks.
     collect_host_tokens(
         ctx.content_text,
         &tree,
@@ -232,11 +236,14 @@ pub(crate) fn process_injection_sync(
         host_line_starts,
         ctx.host_start_byte,
         depth,
-        supports_multiline,
+        supports_multiline && !ctx.combined,
         &nested_exclusion_ranges,
         &ctx.prefix_byte_widths,
         &mut tokens,
     );
+    if ctx.combined {
+        clip_tokens_to_included_ranges(&mut tokens, ctx, host_lines, host_line_starts);
+    }
 
     // Recursively process nested injections (same thread, no parallelism)
     for nested_ctx in nested_contexts {
@@ -255,6 +262,74 @@ pub(crate) fn process_injection_sync(
     }
 
     tokens
+}
+
+/// Clip a combined context's tokens to its included ranges (#187).
+///
+/// The combined parse sees the host text between blocks as excluded, but a
+/// capture node can still *span* it (a string opened in one block and closed
+/// in the next). Its per-line tokens on the excluded rows — markdown prose,
+/// fence markers — must not survive, and tokens on boundary lines keep only
+/// the columns inside a range. Tokens are per-line here (combined contexts
+/// disable multiline emission), so clipping is a per-line interval intersect.
+fn clip_tokens_to_included_ranges(
+    tokens: &mut Vec<RawToken>,
+    ctx: &InjectionContext<'_>,
+    host_lines: &[&str],
+    host_line_starts: &[usize],
+) {
+    let Some(ranges) = ctx.included_ranges.as_deref() else {
+        return;
+    };
+
+    // Allowed UTF-16 column intervals per host line.
+    let mut allowed: HashMap<usize, Vec<(usize, usize)>> = HashMap::with_capacity(ranges.len());
+    for r in ranges {
+        let host_start = ctx.host_start_byte + r.start_byte;
+        let host_end = ctx.host_start_byte + r.end_byte;
+        if host_start >= host_end {
+            continue;
+        }
+        let first_line = host_line_starts
+            .partition_point(|&s| s <= host_start)
+            .saturating_sub(1);
+        let last_line = host_line_starts
+            .partition_point(|&s| s < host_end)
+            .saturating_sub(1);
+        for line in first_line..=last_line {
+            let line_start = host_line_starts.get(line).copied().unwrap_or(0);
+            let line_text = host_lines.get(line).copied().unwrap_or("");
+            let seg_start = host_start.saturating_sub(line_start).min(line_text.len());
+            let seg_end = (host_end - line_start).min(line_text.len());
+            // A range ending in the newline still admits the full line; an
+            // empty segment (range starting past the line text, or touching
+            // the line only at a boundary) admits nothing — skip it instead
+            // of recording an interval no token can intersect.
+            if seg_start >= seg_end {
+                continue;
+            }
+            let col_start = byte_to_utf16_col(line_text, seg_start);
+            let col_end = byte_to_utf16_col(line_text, seg_end);
+            allowed.entry(line).or_default().push((col_start, col_end));
+        }
+    }
+
+    let original = std::mem::take(tokens);
+    let mut clipped = Vec::with_capacity(original.len());
+    for tok in original {
+        let Some(intervals) = allowed.get(&tok.line) else {
+            continue;
+        };
+        let tok_end = tok.column + tok.length;
+        for &(a, b) in intervals {
+            let s = tok.column.max(a);
+            let e = tok_end.min(b);
+            if s < e {
+                clipped.push(tok.with_span(tok.line, s, e - s));
+            }
+        }
+    }
+    *tokens = clipped;
 }
 
 /// Collect injection contexts from a parsed tree (sync version).
@@ -290,7 +365,33 @@ fn collect_injection_contexts_sync<'a>(
     let mut contexts = Vec::with_capacity(injections.len());
     let mut exclusion_ranges = Vec::with_capacity(injections.len());
 
+    // Partition out `injection.combined` regions: every capture of one
+    // (language, pattern) pair parses as a single document so cross-block
+    // context survives (#187). Patterns that also carry #offset! stay on the
+    // per-region path — offset adjustment and multi-region merging don't
+    // compose (same exclusivity the included_ranges handling applies below),
+    // and no vendored query combines them.
+    let mut singles = Vec::new();
+    let mut combined_groups: indexmap::IndexMap<(String, usize), Vec<InjectionRegionInfo>> =
+        indexmap::IndexMap::new();
     for injection in injections {
+        if has_combined_for_pattern(&injection_query, injection.pattern_index)
+            // effective_offset_for_pattern (not the raw directive parser):
+            // an all-zero #offset! is a no-op and must not exile the pattern
+            // to the singles path — the rest of the codebase branches on the
+            // effective offset for the same reason (cf. injection_stack.rs).
+            && effective_offset_for_pattern(&injection_query, injection.pattern_index).is_none()
+        {
+            combined_groups
+                .entry((injection.language.clone(), injection.pattern_index))
+                .or_default()
+                .push(injection);
+        } else {
+            singles.push(injection);
+        }
+    }
+
+    for injection in singles {
         let start = injection.content_node.start_byte();
         let end = injection.content_node.end_byte();
 
@@ -395,19 +496,7 @@ fn collect_injection_contexts_sync<'a>(
         // Each range's start_point.column tells us how many bytes of prefix
         // (e.g., "> ") precede the actual content on that line.
         let prefix_byte_widths = match &included_ranges {
-            Some(ranges) => {
-                let mut widths = Vec::new();
-                for r in ranges {
-                    let row = r.start_point.row;
-                    if row >= widths.len() {
-                        widths.resize(row + 1, 0);
-                    }
-                    if widths[row] == 0 {
-                        widths[row] = r.start_point.column;
-                    }
-                }
-                widths
-            }
+            Some(ranges) => derive_prefix_byte_widths(ranges),
             None => Vec::new(),
         };
 
@@ -418,10 +507,158 @@ fn collect_injection_contexts_sync<'a>(
             host_start_byte: content_start_byte + inj_start_byte,
             included_ranges,
             prefix_byte_widths,
+            combined: false,
         });
     }
 
+    for (_group_key, regions) in combined_groups {
+        if let Some(ctx) = build_combined_context(
+            &regions,
+            text,
+            coordinator,
+            content_start_byte,
+            parent_included_ranges,
+            &mut exclusion_ranges,
+        ) {
+            contexts.push(ctx);
+        }
+    }
+
     (contexts, exclusion_ranges)
+}
+
+/// Per-line byte prefix widths from included ranges: each range's
+/// `start_point.column` is the byte width of the excluded prefix (e.g. `> `)
+/// before the content on that line. Only the first range on a row sets it.
+fn derive_prefix_byte_widths(ranges: &[tree_sitter::Range]) -> Vec<usize> {
+    // All-zero widths carry no information, and combined groups spanning a
+    // large host gap would otherwise allocate a dense O(rows) vector keyed by
+    // the last block's relative row. Empty means "no prefixes" downstream.
+    if ranges.iter().all(|r| r.start_point.column == 0) {
+        return Vec::new();
+    }
+    let mut widths = Vec::new();
+    for r in ranges {
+        let row = r.start_point.row;
+        if row >= widths.len() {
+            widths.resize(row + 1, 0);
+        }
+        if widths[row] == 0 {
+            widths[row] = r.start_point.column;
+        }
+    }
+    widths
+}
+
+/// Build one [`InjectionContext`] covering every region of an
+/// `injection.combined` group (#187): the content slice spans from the first
+/// block's start to the last block's end, and `included_ranges` restricts the
+/// parser to each block, so cross-block context survives (e.g. an HTML tag
+/// opened in one `html_block` and closed in another) while the host text
+/// between blocks stays invisible to the injected parser.
+///
+/// Returns `None` when the group's language/query doesn't resolve or every
+/// range is clipped away by the parent's exclusions — the regions then simply
+/// produce no tokens, like any unresolvable injection.
+fn build_combined_context<'a>(
+    regions: &[InjectionRegionInfo<'_>],
+    text: &'a str,
+    coordinator: &LanguageCoordinator,
+    content_start_byte: usize,
+    parent_included_ranges: Option<&[tree_sitter::Range]>,
+    exclusion_ranges: &mut Vec<(usize, usize)>,
+) -> Option<InjectionContext<'a>> {
+    // collect_all_injections sorts by start byte, so `first` anchors the group.
+    let first = regions.first()?;
+    let group_start = first.content_node.start_byte();
+    let group_start_pos = first.content_node.start_position();
+    let group_end = regions.iter().map(|r| r.content_node.end_byte()).max()?;
+    if group_start >= group_end || group_end > text.len() {
+        return None;
+    }
+
+    // Resolve the language once from the first block's content — the grouping
+    // key guarantees every region shares the raw injection language.
+    let first_content = &text[first.content_node.start_byte()..first.content_node.end_byte()];
+    let (resolved_lang, _) =
+        coordinator.resolve_injection_language(&first.language, first_content)?;
+    let highlight_query = coordinator.highlight_query(&resolved_lang)?;
+
+    // Rebase an absolute point into the combined content's coordinate space.
+    let to_relative_point = |abs: tree_sitter::Point| tree_sitter::Point {
+        row: abs.row - group_start_pos.row,
+        column: if abs.row == group_start_pos.row {
+            abs.column - group_start_pos.column
+        } else {
+            abs.column
+        },
+    };
+
+    // Each block contributes its child-exclusion gaps (or its whole node),
+    // rebased from node-relative to group-relative coordinates.
+    let mut group_ranges: Vec<tree_sitter::Range> = Vec::with_capacity(regions.len());
+    for region in regions {
+        let node = &region.content_node;
+        let node_start = node.start_byte();
+        let node_pos = node.start_position();
+        let lift_point = |rel: tree_sitter::Point| tree_sitter::Point {
+            row: node_pos.row + rel.row,
+            column: if rel.row == 0 {
+                node_pos.column + rel.column
+            } else {
+                rel.column
+            },
+        };
+        match compute_included_ranges(node, region.include_children) {
+            Some(gaps) => {
+                for g in gaps {
+                    group_ranges.push(tree_sitter::Range {
+                        start_byte: node_start - group_start + g.start_byte,
+                        end_byte: node_start - group_start + g.end_byte,
+                        start_point: to_relative_point(lift_point(g.start_point)),
+                        end_point: to_relative_point(lift_point(g.end_point)),
+                    });
+                }
+            }
+            None => group_ranges.push(tree_sitter::Range {
+                start_byte: node_start - group_start,
+                end_byte: node.end_byte() - group_start,
+                start_point: to_relative_point(node_pos),
+                end_point: to_relative_point(node.end_position()),
+            }),
+        }
+    }
+
+    // Inherit parent exclusions exactly like the per-region path.
+    let from_parent = parent_included_ranges
+        .and_then(|pr| sub_select_included_ranges(pr, group_start, group_end));
+    let included_ranges = match from_parent {
+        Some(parent_ranges) => {
+            let intersected = intersect_included_ranges(&group_ranges, &parent_ranges);
+            if intersected.is_empty() {
+                return None;
+            }
+            intersected
+        }
+        None => group_ranges,
+    };
+
+    // Suppress this layer's parent tokens within every combined block.
+    for r in &included_ranges {
+        exclusion_ranges.push((group_start + r.start_byte, group_start + r.end_byte));
+    }
+
+    let prefix_byte_widths = derive_prefix_byte_widths(&included_ranges);
+
+    Some(InjectionContext {
+        resolved_lang,
+        highlight_query,
+        content_text: &text[group_start..group_end],
+        host_start_byte: content_start_byte + group_start,
+        included_ranges: Some(included_ranges),
+        prefix_byte_widths,
+        combined: true,
+    })
 }
 
 /// Walk top-level injections of the host doc in parallel via Rayon work-stealing,
@@ -734,6 +971,7 @@ mod tests {
             host_start_byte: 100,
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
+            combined: false,
         };
 
         assert_eq!(ctx.resolved_lang, "rust");
@@ -837,6 +1075,7 @@ mod tests {
             host_start_byte: 0,
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
+            combined: false,
         };
 
         let tokens = process_injection_sync(
@@ -894,6 +1133,7 @@ mod tests {
             host_start_byte: 0,
             included_ranges: None,
             prefix_byte_widths: Vec::new(),
+            combined: false,
         };
 
         // Process at MAX_INJECTION_DEPTH should return empty
@@ -1234,5 +1474,308 @@ local b = 2
 
         assert_eq!(cache.len(), 0);
         assert!(!cache.contains("rust"));
+    }
+
+    /// Shared setup for the injection.combined tests: a coordinator with
+    /// markdown + lua loaded and markdown's injection query replaced by one
+    /// that marks lua fences `injection.combined` (the vendored query reserves
+    /// combined for html blocks, whose parser isn't in the test language set).
+    /// Returns `None` (→ skip) when parsers are unavailable.
+    fn combined_lua_coordinator() -> Option<LanguageCoordinator> {
+        use crate::config::WorkspaceSettings;
+
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(&settings);
+
+        let md_result = coordinator.ensure_language_loaded("markdown");
+        let lua_result = coordinator.ensure_language_loaded("lua");
+        if !md_result.success || !lua_result.success {
+            eprintln!("Skipping: markdown or lua parser not available");
+            return None;
+        }
+
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .expect("markdown language must be loaded");
+        let query = Query::new(
+            &md_language,
+            r#"
+            (fenced_code_block
+              (info_string (language) @injection.language)
+              (code_fence_content) @injection.content
+              (#set! injection.combined)
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("valid combined injection query");
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+        Some(coordinator)
+    }
+
+    /// Two lua fences separated by markdown prose.
+    ///
+    /// Byte map:
+    ///   "```lua\n"        0..7
+    ///   "local x = 1\n"   7..19   (block 1 content)
+    ///   "```\n"          19..23
+    ///   "\n"             23..24
+    ///   "plain text\n"   24..35
+    ///   "\n"             35..36
+    ///   "```lua\n"       36..43
+    ///   "local y = 2\n"  43..55   (block 2 content)
+    ///   "```\n"          55..59
+    const COMBINED_LUA_DOC: &str =
+        "```lua\nlocal x = 1\n```\n\nplain text\n\n```lua\nlocal y = 2\n```\n";
+
+    #[test]
+    fn test_combined_injections_group_into_single_context() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        };
+        let tree = parser
+            .parse(COMBINED_LUA_DOC, None)
+            .expect("markdown must parse");
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, exclusions) = collect_injection_contexts_sync(
+            COMBINED_LUA_DOC,
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            0,
+            None,
+        );
+
+        assert_eq!(
+            contexts.len(),
+            1,
+            "combined regions of one (language, pattern) must merge into a single context"
+        );
+        let ctx = &contexts[0];
+        assert_eq!(ctx.resolved_lang, "lua");
+        assert_eq!(
+            ctx.host_start_byte, 7,
+            "combined content must start at the first block's content"
+        );
+        assert_eq!(ctx.content_text, &COMBINED_LUA_DOC[7..55]);
+
+        let ranges = ctx
+            .included_ranges
+            .as_ref()
+            .expect("combined context must carry per-block included ranges");
+        let byte_ranges: Vec<(usize, usize)> =
+            ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect();
+        assert_eq!(
+            byte_ranges,
+            vec![(0, 12), (36, 48)],
+            "ranges must cover each block's content, relative to the combined start"
+        );
+
+        // Host tokens over both blocks must be suppressed.
+        assert!(
+            exclusions.contains(&(7, 19)) && exclusions.contains(&(43, 55)),
+            "each combined block must register an exclusion range, got {:?}",
+            exclusions
+        );
+    }
+
+    /// The **vendored** markdown injection query marks `html_block` combined —
+    /// the real-world case #187 was filed for (PHP/ERB-style cross-block
+    /// elements). Unlike the synthetic lua setup above, this exercises the
+    /// shipped query end to end: an element opened in one `html_block` and
+    /// closed in another must merge into a single html context so the html
+    /// parser sees one document.
+    #[test]
+    fn test_vendored_html_block_injection_combines_across_blocks() {
+        use crate::config::WorkspaceSettings;
+
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(&settings);
+        let md_result = coordinator.ensure_language_loaded("markdown");
+        let html_result = coordinator.ensure_language_loaded("html");
+        if !md_result.success || !html_result.success {
+            eprintln!("Skipping: markdown or html parser not available");
+            return;
+        }
+
+        // `<div>` opens in the first html block and closes in the second;
+        // markdown prose separates them.
+        let doc = "<div>\n\nsome *prose*\n\n</div>\n";
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        };
+        let tree = parser.parse(doc, None).expect("markdown must parse");
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, _exclusions) =
+            collect_injection_contexts_sync(doc, &tree, Some("markdown"), &coordinator, 0, None);
+
+        // The vendored query injects more than html (markdown_inline for the
+        // prose); only the html contexts matter here.
+        let html_contexts: Vec<&InjectionContext> = contexts
+            .iter()
+            .filter(|c| c.resolved_lang == "html")
+            .collect();
+        assert_eq!(
+            html_contexts.len(),
+            1,
+            "vendored html_block combined pattern must merge into one context, got {:?}",
+            contexts
+                .iter()
+                .map(|c| (&c.resolved_lang, c.host_start_byte))
+                .collect::<Vec<_>>()
+        );
+        let ctx = html_contexts[0];
+        assert!(
+            ctx.content_text.contains("<div>") && ctx.content_text.contains("</div>"),
+            "combined html content must span both blocks, got {:?}",
+            ctx.content_text
+        );
+        let ranges = ctx
+            .included_ranges
+            .as_ref()
+            .expect("combined context must carry per-block included ranges");
+        assert_eq!(
+            ranges.len(),
+            2,
+            "one included range per html block, got {:?}",
+            ranges
+        );
+    }
+
+    #[test]
+    fn test_combined_injection_tokens_keep_host_coordinates() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        };
+        let tree = parser
+            .parse(COMBINED_LUA_DOC, None)
+            .expect("markdown must parse");
+        parser_pool.release("markdown".to_string(), parser);
+
+        let host_lines: Vec<&str> = COMBINED_LUA_DOC.lines().collect();
+        let (tokens, _regions) = collect_injection_tokens_parallel(
+            COMBINED_LUA_DOC,
+            &host_lines,
+            &build_line_start_bytes(COMBINED_LUA_DOC),
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+        );
+
+        let (keyword_type, keyword_mods) =
+            crate::analysis::semantic::legend::map_capture_to_token_type_and_modifiers("keyword")
+                .unwrap();
+        let local_keyword_lines: Vec<usize> = tokens
+            .iter()
+            .filter(|t| {
+                t.column == 0
+                    && t.kind
+                        == crate::analysis::semantic::token_collector::TokenKind::Mapped(
+                            keyword_type,
+                            keyword_mods,
+                        )
+            })
+            .map(|t| t.line)
+            .collect();
+        assert!(
+            local_keyword_lines.contains(&1) && local_keyword_lines.contains(&7),
+            "combined parse must emit 'local' keywords at host lines 1 and 7, got lines {:?} from {:?}",
+            local_keyword_lines,
+            tokens
+        );
+    }
+
+    /// A lua long string opened in block 1 (`[[`) and closed in block 2 (`]]`).
+    /// Only a combined parse makes block 2 valid lua, and the spanning string
+    /// node covers the markdown prose between the blocks.
+    ///
+    /// Host lines:
+    ///   0 "```lua"   1 "local s = [["   2 "```"   3 ""   4 "prose here"
+    ///   5 ""   6 "```lua"   7 "]]"   8 "print(s)"   9 "```"
+    const COMBINED_SPANNING_DOC: &str =
+        "```lua\nlocal s = [[\n```\n\nprose here\n\n```lua\n]]\nprint(s)\n```\n";
+
+    #[test]
+    fn test_combined_injection_does_not_leak_tokens_into_gap_lines() {
+        let Some(coordinator) = combined_lua_coordinator() else {
+            return;
+        };
+
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        };
+        let tree = parser
+            .parse(COMBINED_SPANNING_DOC, None)
+            .expect("markdown must parse");
+        parser_pool.release("markdown".to_string(), parser);
+
+        let host_lines: Vec<&str> = COMBINED_SPANNING_DOC.lines().collect();
+        let (tokens, _regions) = collect_injection_tokens_parallel(
+            COMBINED_SPANNING_DOC,
+            &host_lines,
+            &build_line_start_bytes(COMBINED_SPANNING_DOC),
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            // Multiline client support must not let the spanning string token
+            // bleed across the gap either.
+            true,
+        );
+
+        // The combined parse produces lua tokens inside both blocks…
+        assert!(
+            tokens.iter().any(|t| t.line == 1),
+            "expected lua tokens on host line 1, got {:?}",
+            tokens
+        );
+        assert!(
+            tokens.iter().any(|t| t.line == 8),
+            "expected lua tokens on host line 8 (print call), got {:?}",
+            tokens
+        );
+
+        // …but none on the markdown lines between the blocks: the spanning
+        // string node covers them, and clipping to the included ranges must
+        // drop those rows.
+        let leaked: Vec<_> = tokens
+            .iter()
+            .filter(|t| (2..=6).contains(&t.line))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "combined-layer tokens must not leak into gap lines 2..=6, got {:?}",
+            leaked
+        );
     }
 }

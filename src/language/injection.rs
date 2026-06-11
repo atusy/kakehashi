@@ -180,6 +180,24 @@ fn extract_injection_language(query: &Query, match_: &QueryMatch, text: &str) ->
     extract_dynamic_language(query, match_, text)
 }
 
+/// Checks whether the given pattern has `#set! injection.combined`.
+///
+/// Like `injection.include-children`, this is a value-less property — its
+/// **presence** means all `@injection.content` captures of the pattern (for
+/// the same language) are parsed as one document via `set_included_ranges`,
+/// so cross-region context survives (e.g. an HTML tag opened in one
+/// `html_block` and closed in another). See #187.
+pub(crate) fn has_combined_for_pattern(query: &Query, pattern_index: usize) -> bool {
+    for predicate in get_all_predicates(query, pattern_index) {
+        if let UnifiedPredicate::Property(prop) = predicate
+            && prop.key.as_ref() == "injection.combined"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Checks whether the given pattern has `#set! injection.include-children`.
 ///
 /// This is a value-less property — its **presence** alone means "include children"
@@ -2056,6 +2074,32 @@ mod tests {
         assert!(
             has_include_children_for_pattern(&query, 1),
             "Pattern 1 should have include-children"
+        );
+    }
+
+    #[test]
+    fn test_has_combined_for_pattern() {
+        // Pattern 0 has no combined property; pattern 1 mirrors the vendored
+        // markdown html_block pattern shape.
+        let query_str = r#"
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ((line_comment) @injection.content
+              (#set! injection.language "html")
+              (#set! injection.combined)
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_combined_for_pattern(&query, 0),
+            "Pattern without #set! injection.combined should return false"
+        );
+        assert!(
+            has_combined_for_pattern(&query, 1),
+            "Pattern with #set! injection.combined should return true"
         );
     }
 
