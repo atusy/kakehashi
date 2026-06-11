@@ -19,9 +19,9 @@ use super::token_collector::{ActiveInjectionBounds, RawToken, collect_host_token
 use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges, has_combined_for_pattern,
-    intersect_included_ranges, parse_offset_directive_for_pattern, parse_with_ranges,
-    sub_select_included_ranges,
+    InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
+    effective_offset_for_pattern, has_combined_for_pattern, intersect_included_ranges,
+    parse_with_ranges, sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -376,8 +376,11 @@ fn collect_injection_contexts_sync<'a>(
         indexmap::IndexMap::new();
     for injection in injections {
         if has_combined_for_pattern(&injection_query, injection.pattern_index)
-            && parse_offset_directive_for_pattern(&injection_query, injection.pattern_index)
-                .is_none()
+            // effective_offset_for_pattern (not the raw directive parser):
+            // an all-zero #offset! is a no-op and must not exile the pattern
+            // to the singles path — the rest of the codebase branches on the
+            // effective offset for the same reason (cf. injection_stack.rs).
+            && effective_offset_for_pattern(&injection_query, injection.pattern_index).is_none()
         {
             combined_groups
                 .entry((injection.language.clone(), injection.pattern_index))
@@ -1586,6 +1589,76 @@ local b = 2
             exclusions.contains(&(7, 19)) && exclusions.contains(&(43, 55)),
             "each combined block must register an exclusion range, got {:?}",
             exclusions
+        );
+    }
+
+    /// The **vendored** markdown injection query marks `html_block` combined —
+    /// the real-world case #187 was filed for (PHP/ERB-style cross-block
+    /// elements). Unlike the synthetic lua setup above, this exercises the
+    /// shipped query end to end: an element opened in one `html_block` and
+    /// closed in another must merge into a single html context so the html
+    /// parser sees one document.
+    #[test]
+    fn test_vendored_html_block_injection_combines_across_blocks() {
+        use crate::config::WorkspaceSettings;
+
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(&settings);
+        let md_result = coordinator.ensure_language_loaded("markdown");
+        let html_result = coordinator.ensure_language_loaded("html");
+        if !md_result.success || !html_result.success {
+            eprintln!("Skipping: markdown or html parser not available");
+            return;
+        }
+
+        // `<div>` opens in the first html block and closes in the second;
+        // markdown prose separates them.
+        let doc = "<div>\n\nsome *prose*\n\n</div>\n";
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        };
+        let tree = parser.parse(doc, None).expect("markdown must parse");
+        parser_pool.release("markdown".to_string(), parser);
+
+        let (contexts, _exclusions) =
+            collect_injection_contexts_sync(doc, &tree, Some("markdown"), &coordinator, 0, None);
+
+        // The vendored query injects more than html (markdown_inline for the
+        // prose); only the html contexts matter here.
+        let html_contexts: Vec<&InjectionContext> = contexts
+            .iter()
+            .filter(|c| c.resolved_lang == "html")
+            .collect();
+        assert_eq!(
+            html_contexts.len(),
+            1,
+            "vendored html_block combined pattern must merge into one context, got {:?}",
+            contexts
+                .iter()
+                .map(|c| (&c.resolved_lang, c.host_start_byte))
+                .collect::<Vec<_>>()
+        );
+        let ctx = html_contexts[0];
+        assert!(
+            ctx.content_text.contains("<div>") && ctx.content_text.contains("</div>"),
+            "combined html content must span both blocks, got {:?}",
+            ctx.content_text
+        );
+        let ranges = ctx
+            .included_ranges
+            .as_ref()
+            .expect("combined context must carry per-block included ranges");
+        assert_eq!(
+            ranges.len(),
+            2,
+            "one included range per html block, got {:?}",
+            ranges
         );
     }
 
