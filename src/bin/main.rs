@@ -722,6 +722,10 @@ async fn run_lsp_server() {
         Kakehashi::kakehashi_node_named_children,
     )
     .custom_method(
+        "kakehashi/node/childWithDescendant",
+        Kakehashi::kakehashi_node_child_with_descendant,
+    )
+    .custom_method(
         "kakehashi/node/nextSibling",
         Kakehashi::kakehashi_node_next_sibling,
     )

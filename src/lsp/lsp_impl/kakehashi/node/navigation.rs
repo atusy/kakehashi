@@ -18,7 +18,7 @@ use tower_lsp_server::jsonrpc::Result;
 
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{
-    NodeByteParams, NodeByteRangeParams, NodeIdParams, NodeIndexParams,
+    NodeByteParams, NodeByteRangeParams, NodeDescendantParams, NodeIdParams, NodeIndexParams,
 };
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte;
 
@@ -62,6 +62,42 @@ impl Kakehashi {
                 let mut cursor = n.walk();
                 n.named_children(&mut cursor).map(triple).collect()
             })
+            .await)
+    }
+
+    /// `kakehashi/node/childWithDescendant` — the immediate child of `id` that
+    /// contains `descendantId`, per `Node::child_with_descendant` (issue #335).
+    ///
+    /// The only two-id accessor: both ids must have been minted in the
+    /// **same** injection layer (a cross-layer pair is `null`), and `null`
+    /// also covers a descendant that is not actually inside `id` — including
+    /// `descendantId == id`, since no child contains the node itself.
+    pub async fn kakehashi_node_child_with_descendant(
+        &self,
+        params: NodeDescendantParams,
+    ) -> Result<Value> {
+        Ok(self
+            .navigate_with_descendant(
+                &params.text_document.uri,
+                &params.id,
+                &params.descendant_id,
+                |node, descendant| {
+                    // tree-sitter leaves child_with_descendant undefined when
+                    // `descendant` is not in `node`'s subtree: byte containment
+                    // ties on equal-range unary chains (e.g. markdown's
+                    // document → section) make it return a child for
+                    // descendant == self or an ancestor. The first step of the
+                    // descent is the answer; keep descending until we actually
+                    // reach `descendant` by node id, so every unrelated pair
+                    // normalizes to the protocol's universal null instead.
+                    let answer = node.child_with_descendant(descendant)?;
+                    let mut current = answer;
+                    while current.id() != descendant.id() {
+                        current = current.child_with_descendant(descendant)?;
+                    }
+                    Some(triple(answer))
+                },
+            )
             .await)
     }
 

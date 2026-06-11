@@ -318,6 +318,55 @@ pub(super) fn with_resolved_node_ranges<R>(
     Some(f(node, &layer_entry.ranges))
 }
 
+/// Resolve **two** tracked nodes in the **same** minting layer and run `f` on
+/// the pair — the two-id contract behind `childWithDescendant` (issue #335).
+///
+/// Both `(start, end, kind)` triples must name nodes in one tree: the layer's
+/// tree is materialised once and both lookups run against it, so the pair can
+/// never straddle two layers. The stack walk is anchored at the *descendant's*
+/// start byte — the method's contract requires the descendant to lie inside
+/// `node`, so when the pair is genuinely related the smallest-region path at
+/// that byte reaches the layer that minted both. An unrelated pair (descendant
+/// outside `node`, or minted from a different same-depth region — the #350
+/// overlap caveat applies here too) simply fails one of the lookups and
+/// collapses to `None`, the protocol's re-acquire signal.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn with_resolved_node_pair<R>(
+    coordinator: &LanguageCoordinator,
+    host_language: &str,
+    host_text: &str,
+    host_tree: &tree_sitter::Tree,
+    node: (usize, usize, &'static str),
+    descendant: (usize, usize, &'static str),
+    layer: usize,
+    mut f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> R,
+) -> Option<R> {
+    let (node_start, node_end, node_kind) = node;
+    let (desc_start, desc_end, desc_kind) = descendant;
+    // Same defensive range guards as the single-node path: a stale tracker
+    // entry must collapse to null before any tree work.
+    if node_start > node_end
+        || node_end > host_text.len()
+        || desc_start > desc_end
+        || desc_end > host_text.len()
+    {
+        return None;
+    }
+
+    // Host layer: both resolve against the host tree, no stack walk.
+    if layer == 0 {
+        let resolved_node = find_node_at(host_tree, node_start, node_end, node_kind)?;
+        let resolved_desc = find_node_at(host_tree, desc_start, desc_end, desc_kind)?;
+        return Some(f(resolved_node, resolved_desc));
+    }
+
+    let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
+    let layer_entry = stack.get(layer)?;
+    let resolved_node = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)?;
+    let resolved_desc = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)?;
+    Some(f(resolved_node, resolved_desc))
+}
+
 /// Collect the injection languages along the cursor's injection path at
 /// `byte`, at all depths that are currently parseable.
 ///

@@ -236,8 +236,11 @@ To let clients introspect and walk the tree without re-implementing tree-sitter,
 | `firstChildForByte` (`byte`) | `NodeInfo \| null` | `first_child_for_byte(b)` |
 | `descendantForByteRange` (`startByte`, `endByte`) | `NodeInfo \| null` | `descendant_for_byte_range(s, e)` |
 | `namedDescendantForByteRange` (`startByte`, `endByte`) | `NodeInfo \| null` | `named_descendant_for_byte_range(s, e)` |
+| `childWithDescendant` (`descendantId`) | `NodeInfo \| null` | `child_with_descendant(d)` |
 
 Out-of-range / negative `index` or `byte` values collapse to `null` rather than erroring, consistent with the universal null semantics.
+
+`childWithDescendant` is the only **two-id** accessor: `{ textDocument, id, descendantId }` resolves both ids and returns the immediate child of `id` that contains `descendantId`. Both ids must have been minted in the **same** injection layer — both nodes must live in one tree for the ancestor/descendant relation to be meaningful, so a cross-layer pair collapses to `null` rather than resolving either id against the other's layer. tree-sitter leaves `child_with_descendant` undefined when the argument is not actually a descendant (byte-containment ties on equal-range unary chains); the server verifies the relation during the descent and normalizes every unrelated pair — including `descendantId == id` — to the universal `null`.
 
 **Position / range accessors** report and accept line/column as LSP `Position` (`{ line, character }`), **not** tree-sitter's native `Point`:
 

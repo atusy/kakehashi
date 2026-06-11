@@ -17,7 +17,9 @@ use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier, Uri};
 use ulid::Ulid;
 use url::Url;
 
-use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node_ranges;
+use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
+    with_resolved_node_pair, with_resolved_node_ranges,
+};
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 /// A tracked node's `(start_byte, end_byte, kind)` triple, as produced by a
@@ -62,6 +64,18 @@ pub struct NodeFieldNameParams {
     pub text_document: TextDocumentIdentifier,
     pub id: String,
     pub name: String,
+}
+
+/// Request parameters for the two-id accessor `childWithDescendant`
+/// (issue #335): `id` names the prospective ancestor, `descendantId` the node
+/// whose containing immediate child is requested. Both ids must have been
+/// minted in the same injection layer; a cross-layer pair collapses to `null`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeDescendantParams {
+    pub text_document: TextDocumentIdentifier,
+    pub id: String,
+    pub descendant_id: String,
 }
 
 /// Request parameters for `firstChildForByte`.
@@ -282,6 +296,89 @@ impl Kakehashi {
         f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> Option<NodeTriple>,
     ) -> Value {
         let Some((uri, layer, picked)) = self.with_node_text_ranges(lsp_uri, id, f).await else {
+            return Value::Null;
+        };
+        match picked {
+            Some(triple) => self.mint_node_info(&uri, layer, triple),
+            None => Value::Null,
+        }
+    }
+
+    /// Resolve `id` **and** `descendant_id` in the layer that minted them, run
+    /// `f` on the pair to pick a related node, and return its `NodeInfo` — or
+    /// JSON `null` (issue #335, two-id contract).
+    ///
+    /// On top of the single-id null cases (invalid URI, malformed/unknown
+    /// ULID, unparsed document, drifted range), the pair collapses to `null`
+    /// when the two ids were minted in **different** layers: both nodes must
+    /// live in one tree for tree-sitter's ancestor/descendant queries to be
+    /// meaningful, and resolving them against different layers' trees would
+    /// break the per-layer Scope rule. The result is re-minted in that shared
+    /// layer, like every other navigation accessor.
+    pub(super) async fn navigate_with_descendant(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        descendant_id: &str,
+        f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> Option<NodeTriple>,
+    ) -> Value {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!(target: "kakehashi::node", "invalid URI: {}", lsp_uri.as_str());
+            return Value::Null;
+        };
+
+        // Either ULID being malformed collapses to null, like a never-issued id.
+        let Ok(ulid) = id.parse::<Ulid>() else {
+            return Value::Null;
+        };
+        let Ok(descendant_ulid) = descendant_id.parse::<Ulid>() else {
+            return Value::Null;
+        };
+
+        let tracker = self.bridge.node_tracker();
+        let Some((start, end, kind, layer)) = tracker.lookup_node(&uri, &ulid) else {
+            return Value::Null;
+        };
+        let Some((desc_start, desc_end, desc_kind, desc_layer)) =
+            tracker.lookup_node(&uri, &descendant_ulid)
+        else {
+            return Value::Null;
+        };
+        // Two-id same-layer contract: ids minted in different layers never
+        // share a tree, so the relation is undefined — null, not an error.
+        if layer != desc_layer {
+            return Value::Null;
+        }
+
+        // Same didOpen race guard as the single-id prelude.
+        self.ensure_parsed_for_node_lookup(&uri).await;
+        let Some(snapshot) = self.documents.get(&uri).and_then(|doc| doc.snapshot()) else {
+            return Value::Null;
+        };
+        let host_text = snapshot.text();
+        let host_tree = snapshot.tree();
+        let Some(host_language) = self.document_language(&uri) else {
+            return Value::Null;
+        };
+
+        let Some(picked) = with_resolved_node_pair(
+            &self.language,
+            &host_language,
+            host_text,
+            host_tree,
+            (start, end, kind),
+            (desc_start, desc_end, desc_kind),
+            layer,
+            f,
+        ) else {
+            // A tracker hit that fails pair resolution mirrors the single-id
+            // drift warning: worth surfacing for diagnosis, still null on the
+            // wire.
+            log::warn!(
+                target: "kakehashi::node",
+                "tracker hit but pair did not resolve in minting layer {} for uri={} self=[{},{}) {} descendant=[{},{}) {}",
+                layer, uri, start, end, kind, desc_start, desc_end, desc_kind
+            );
             return Value::Null;
         };
         match picked {
