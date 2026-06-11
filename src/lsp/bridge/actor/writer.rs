@@ -302,6 +302,9 @@ mod tests {
     /// token; exiting drops the writer, whose Drop kills the child. Without
     /// that race a cancelled writer task leaks itself, the writer, and the
     /// child process.
+    ///
+    /// Unix-only: spawns `sleep` and probes child liveness via `ps`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancel_reclaims_writer_blocked_on_full_stdin_pipe() {
         use crate::lsp::bridge::pool::test_helpers::process_stat;

@@ -223,7 +223,9 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::lsp::bridge::pool::test_helpers::{create_handle_with_state_and_pid, process_stat};
+    #[cfg(unix)]
     use std::time::Duration;
 
     /// A sink server never answers the shutdown request, so its
@@ -232,6 +234,10 @@ mod tests {
     /// task: aborting drops the reclaimed writer, whose Drop kills the child.
     /// Without the abort the task lingers detached, the writer stays alive,
     /// and the child survives until process exit.
+    ///
+    /// Unix-only: probes child liveness via `ps`, like the other shutdown
+    /// lifecycle tests.
+    #[cfg(unix)]
     #[tokio::test]
     async fn force_kill_timeout_aborts_shutdown_task_and_kills_child() {
         let (handle, pid) = create_handle_with_state_and_pid(ConnectionState::Ready).await;

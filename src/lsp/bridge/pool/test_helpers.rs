@@ -77,6 +77,7 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
 /// (zombies show as `Z…`), `Ok(None)` once it is gone/reaped. For tests that
 /// assert a child process actually dies. `Err` means `ps` itself could not
 /// run (sandboxed runners) — callers should skip rather than fail.
+#[cfg(unix)]
 pub(in crate::lsp::bridge) fn process_stat(pid: u32) -> std::io::Result<Option<String>> {
     let output = std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])

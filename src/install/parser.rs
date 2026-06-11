@@ -358,9 +358,9 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Build a git command that can never prompt, so a private/renamed
 /// repository fails fast instead of waiting for credentials nobody can type:
 /// stdin is nulled, `GIT_TERMINAL_PROMPT=0` covers terminal prompts,
-/// `GIT_ASKPASS`/`SSH_ASKPASS` are pointed at `true` (immediately answers
-/// with an empty string), and ssh runs in BatchMode (fails instead of
-/// prompting). stdout is nulled too — when this runs inside the LSP server,
+/// `GIT_ASKPASS`/`SSH_ASKPASS` are pointed at `true` on unix (immediately
+/// answers with an empty string), and ssh runs in BatchMode (fails instead
+/// of prompting). stdout is nulled too — when this runs inside the LSP server,
 /// stdout is the JSON-RPC channel and no child chatter may reach it; git's
 /// diagnostics go to stderr, which stays inherited for the logs.
 fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
@@ -368,9 +368,15 @@ fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "true")
-        .env("SSH_ASKPASS", "true");
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // `true` as an askpass helper answers any credential prompt with an empty
+    // string immediately. POSIX guarantees the binary; Windows does not ship
+    // one (git would fail trying to run it), so gate to unix — Windows relies
+    // on GIT_TERMINAL_PROMPT plus run_with_timeout's deadline.
+    #[cfg(unix)]
+    {
+        cmd.env("GIT_ASKPASS", "true").env("SSH_ASKPASS", "true");
+    }
     // GIT_SSH_COMMAND: extend an OpenSSH command with BatchMode so ssh auth
     // fails fast instead of prompting; for OpenSSH the first -o value obtained
     // wins, so a user-set BatchMode is respected. Leave non-OpenSSH commands
@@ -498,6 +504,8 @@ mod tests {
         assert!(ext == "so" || ext == "dylib" || ext == "dll");
     }
 
+    // Unix-only: relies on the `sleep` binary.
+    #[cfg(unix)]
     #[test]
     fn run_with_timeout_kills_stuck_command() {
         // Spawn `sleep` directly: with `sh -c` the kill would reach the
@@ -524,6 +532,8 @@ mod tests {
         );
     }
 
+    // Unix-only: relies on `sh`.
+    #[cfg(unix)]
     #[test]
     fn run_with_timeout_returns_status_of_finished_command() {
         let mut cmd = Command::new("sh");
