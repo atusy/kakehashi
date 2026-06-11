@@ -163,7 +163,19 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
         let Some(bridge_map) = lang_settings.bridge.as_ref() else {
             continue;
         };
-        for (injection_language, bridge_cfg) in bridge_map {
+        for injection_language in bridge_map.keys() {
+            // Resolve through the bridge-key wildcard merge so this warning
+            // path sees exactly what the runtime sees: priorities supplied by
+            // a `bridge._` entry must count for a `bridge.<lang>` that only
+            // sets the strategy. (For the literal `_` key this self-merges,
+            // which is idempotent for the field-level merge.)
+            let Some(bridge_cfg) = crate::config::resolve_with_wildcard(
+                bridge_map,
+                injection_language,
+                crate::config::merge_bridge_language_configs,
+            ) else {
+                continue;
+            };
             let agg = bridge_cfg.resolve_aggregation("textDocument/formatting");
             let has_explicit_name = agg
                 .priorities
@@ -198,7 +210,17 @@ pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)])
     }
     let listed = pairs
         .iter()
-        .map(|(host, injection)| format!("{}->{}", host, injection))
+        .map(|(host, injection)| {
+            // A `_` injection key is the wildcard template: it is not one
+            // request path but the default every injection language without
+            // its own override inherits — render it so the warning does not
+            // read as a literal language named "_".
+            if injection == crate::config::WILDCARD_KEY {
+                format!("{}->(any other injection)", host)
+            } else {
+                format!("{}->{}", host, injection)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
@@ -773,6 +795,57 @@ mod tests {
     }
 
     #[test]
+    fn concatenated_formatting_pairs_resolves_bridge_key_wildcard_inheritance() {
+        // Priorities supplied by the `bridge._` wildcard entry, strategy by
+        // the concrete `bridge.python` entry. The runtime merges the two
+        // (resolve_with_wildcard), so the warning path must too — flagging
+        // this valid configuration would be a false positive.
+        let mut python_agg = HashMap::new();
+        python_agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: None,
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut wildcard_agg = HashMap::new();
+        wildcard_agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec!["black".to_string()]),
+                strategy: None,
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(python_agg),
+            },
+        );
+        bridge.insert(
+            "_".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(wildcard_agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "priorities inherited from the bridge._ wildcard entry must count \
+             as a configured pipeline definition; got: {pairs:?}"
+        );
+    }
+
+    #[test]
     fn concatenated_formatting_pairs_excludes_explicit_empty_priorities() {
         // priorities = [] is the deliberate per-method kill switch
         // (aggregation-priorities-wildcard): the region runs nothing. That is
@@ -927,6 +1000,24 @@ mod tests {
         for needle in ["markdown->lua", "markdown->python", "rust->python"] {
             assert!(msg.contains(needle), "missing '{needle}' in: {msg}");
         }
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_renders_wildcard_injection_meaningfully() {
+        // A `_` injection key is the wildcard template every unlisted
+        // injection language inherits — the warning must not present it as a
+        // literal language named "_".
+        let msg =
+            format_concatenated_formatting_warning(&[("markdown".to_string(), "_".to_string())])
+                .expect("non-empty input must yield a message");
+        assert!(
+            msg.contains("markdown->(any other injection)"),
+            "wildcard pair must be rendered as a template, got: {msg}"
+        );
+        assert!(
+            !msg.contains("markdown->_"),
+            "raw '_' rendering must be replaced; got: {msg}"
+        );
     }
 
     #[test]
