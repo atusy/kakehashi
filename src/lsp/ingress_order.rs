@@ -12,15 +12,21 @@
 //! *before* buffering the returned futures, so this middleware can assign
 //! per-URI sequence tickets at `call` time:
 //!
-//! - **Writers** (`didOpen` / `didChange` / `didClose`) take the next ticket
-//!   and run only after the previous writer for the same document finished,
-//!   so edits and closes apply in strict wire order.
+//! - **Writers** (`didChange` / `didClose`) take the next ticket and run
+//!   only after the previous writer for the same document finished, so edits
+//!   and closes apply in strict wire order. `didOpen` is deliberately NOT a
+//!   writer: its handler can await downstream-server spawn/initialization,
+//!   which in turn can wait on upstream client interaction — ticketing it
+//!   deadlocks a client that blocks on a gated request (e.g. a readiness
+//!   poll via `textDocument/diagnostic`) while the server waits for that
+//!   same client. Handlers already tolerate open/edit reordering for
+//!   missing documents, the pre-gate status quo.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, and formatting requests, whose stale edits a client would apply
-//!   to newer text) snapshot the current tail ticket at `call` time and run
-//!   only once that ticket is done, so a request observes every edit that
-//!   preceded it on the wire — without serializing its computation against
-//!   later edits or other documents.
+//!   triple, the edit-producing formatting/rename requests, pull
+//!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
+//!   tail ticket at `call` time and run only once that ticket is done, so a
+//!   request observes every edit that preceded it on the wire — without
+//!   serializing its computation against later edits or other documents.
 //!
 //! Everything else passes through untouched.
 
@@ -64,10 +70,12 @@ impl DocCompletion {
     /// Record `ticket` as complete, advancing `done` only through
     /// consecutive completions and cascading any tickets that finished early.
     /// `send_if_modified` keeps an out-of-order completion (ledger insert,
-    /// `done` unchanged) from spuriously waking every waiter.
+    /// `done` unchanged) from spuriously waking every waiter; the ledger lock
+    /// lives inside the closure, so it is released before subscribers are
+    /// notified.
     fn complete(&self, ticket: u64) {
-        let mut early = self.early.lock().recover_poison("DocCompletion::complete");
         self.done.send_if_modified(|done| {
+            let mut early = self.early.lock().recover_poison("DocCompletion::complete");
             if ticket == *done + 1 {
                 *done = ticket;
                 while early.remove(&(*done + 1)) {
@@ -202,20 +210,28 @@ enum Role {
 
 /// Classify a request and extract its `textDocument.uri`, both synchronously.
 ///
-/// Readers are the tree-snapshotting request families: `semanticTokens`
+/// Readers are the document-snapshotting request families: `semanticTokens`
 /// (including `range`, which never had the in-handler `edit_lock` settle),
-/// the `kakehashi/captures` triple, which mirrors it, and the edit-producing
-/// requests (formatting, rename) — their edits are applied by the client to
+/// the `kakehashi/captures` triple, which mirrors it, the edit-producing
+/// requests (formatting, rename — their edits are applied by the client to
 /// its current text, so edits computed against a stale snapshot corrupt the
-/// document. `textDocument/codeAction` belongs in the same class once it is
+/// document), pull diagnostics, and `didSave` (its synthetic-diagnostic task
+/// snapshots the document, which must reflect every edit before the save).
+/// `textDocument/codeAction` belongs in the same class once it is
 /// implemented (#352). The `kakehashi/node/*` protocol stays unclassified on
 /// purpose: node ids carry their own staleness handling (`null` → client
 /// re-acquires), so gating those point lookups would add latency without
 /// changing observable behavior.
 fn classify(req: &Request) -> Option<Role> {
-    let close = match req.method() {
-        "textDocument/didOpen" | "textDocument/didChange" => false,
-        "textDocument/didClose" => true,
+    let method = req.method();
+    match method {
+        "textDocument/didChange" | "textDocument/didClose" => {
+            let uri = text_document_uri(req)?;
+            Some(Role::Writer {
+                uri,
+                close: method == "textDocument/didClose",
+            })
+        }
         "textDocument/semanticTokens/full"
         | "textDocument/semanticTokens/full/delta"
         | "textDocument/semanticTokens/range"
@@ -223,16 +239,16 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/rangeFormatting"
         | "textDocument/rename"
         | "textDocument/prepareRename"
+        | "textDocument/diagnostic"
+        | "textDocument/didSave"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
         | "kakehashi/captures/range" => {
             let uri = text_document_uri(req)?;
-            return Some(Role::Reader { uri });
+            Some(Role::Reader { uri })
         }
-        _ => return None,
-    };
-    let uri = text_document_uri(req)?;
-    Some(Role::Writer { uri, close })
+        _ => None,
+    }
 }
 
 /// Extract `params.textDocument.uri`, normalized through `Url` so spelling
@@ -482,8 +498,13 @@ mod tests {
         let close = classify(&notification("textDocument/didClose", URI));
         assert!(matches!(close, Some(Role::Writer { close: true, .. })));
 
-        let open = classify(&notification("textDocument/didOpen", URI));
-        assert!(matches!(open, Some(Role::Writer { close: false, .. })));
+        // didOpen passes through: its handler can await downstream spawn
+        // that itself waits on the client, so ticketing it deadlocks
+        // synchronous clients polling readiness behind the gate.
+        assert!(
+            classify(&notification("textDocument/didOpen", URI)).is_none(),
+            "didOpen must not be gated"
+        );
 
         for method in [
             "textDocument/semanticTokens/full",
@@ -493,6 +514,8 @@ mod tests {
             "textDocument/rangeFormatting",
             "textDocument/rename",
             "textDocument/prepareRename",
+            "textDocument/diagnostic",
+            "textDocument/didSave",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
             "kakehashi/captures/range",
