@@ -383,8 +383,9 @@ fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
         let is_openssh = ssh_command
             .split_whitespace()
             .next()
-            .and_then(|word| std::path::Path::new(word).file_name())
-            .is_some_and(|name| name == "ssh");
+            .and_then(|word| std::path::Path::new(word).file_stem())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("ssh"));
         if is_openssh {
             cmd.env("GIT_SSH_COMMAND", format!("{ssh_command} -oBatchMode=yes"));
         }
