@@ -2327,15 +2327,10 @@ mod tests {
         let tree = parser.parse(text, None).unwrap();
         let func = tree.root_node().named_child(0).expect("function_item");
 
-        let unclipped =
-            compute_included_ranges(&func, false).expect("named children produce gaps");
-        let clipped = compute_included_ranges_clipped(
-            &func,
-            false,
-            text,
-            func.start_byte()..func.end_byte(),
-        )
-        .expect("full window should produce the same gaps");
+        let unclipped = compute_included_ranges(&func, false).expect("named children produce gaps");
+        let clipped =
+            compute_included_ranges_clipped(&func, false, text, func.start_byte()..func.end_byte())
+                .expect("full window should produce the same gaps");
 
         assert_eq!(
             clipped, unclipped,
@@ -2360,8 +2355,14 @@ mod tests {
 
         assert_eq!(ranges.len(), 1);
         assert_eq!((ranges[0].start_byte, ranges[0].end_byte), (5, 6));
-        assert_eq!(ranges[0].start_point, tree_sitter::Point { row: 0, column: 5 });
-        assert_eq!(ranges[0].end_point, tree_sitter::Point { row: 0, column: 6 });
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 0, column: 5 }
+        );
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 0, column: 6 }
+        );
     }
 
     #[test]
@@ -2411,9 +2412,15 @@ mod tests {
         // Gap [9..10) relative to window start 6.
         assert_eq!((ranges[0].start_byte, ranges[0].end_byte), (3, 4));
         // Same row as window start: column is relative (4 - 1 = 3).
-        assert_eq!(ranges[0].start_point, tree_sitter::Point { row: 0, column: 3 });
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 0, column: 3 }
+        );
         // Next row: column stays absolute.
-        assert_eq!(ranges[0].end_point, tree_sitter::Point { row: 1, column: 0 });
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 1, column: 0 }
+        );
     }
 
     #[test]
