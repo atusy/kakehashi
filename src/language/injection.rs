@@ -606,14 +606,19 @@ fn extract_virtual_content_and_offsets(
     // Child-exclusion gaps restricted to the effective window (#186):
     // cacheable.byte_range already reflects any #offset! directive (applied
     // and char-boundary-aligned by from_region_info), so gaps are clipped to
-    // it and relativized to its start — without an offset the window equals
-    // the content node span and this matches compute_included_ranges.
-    let included_ranges = compute_included_ranges_clipped(
-        &region.content_node,
-        region.include_children,
-        text,
-        cacheable.byte_range.clone(),
-    );
+    // it and relativized to its start. Without an offset the window equals
+    // the content node span, so the node-anchored variant gives the same
+    // result while reusing tree-sitter's cached node Points (no text scan).
+    let included_ranges = if region.offset.is_some() {
+        compute_included_ranges_clipped(
+            &region.content_node,
+            region.include_children,
+            text,
+            cacheable.byte_range.clone(),
+        )
+    } else {
+        compute_included_ranges(&region.content_node, region.include_children)
+    };
     let virtual_content = extract_clean_content(
         text,
         cacheable.byte_range.clone(),
