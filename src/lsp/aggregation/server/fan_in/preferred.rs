@@ -298,6 +298,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preferred_pending_rest_group_blocks_buffered_demoted_server() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        // ["*", "zzz"]: zzz's win is already buffered, but a group member is
+        // still in flight — the walk must WAIT for the group, not hand the
+        // position to the demoted server.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged_named(&mut join_set, "zzz", Ok(Some(99)));
+        join_set.spawn(async move {
+            barrier_clone.wait().await;
+            TaggedResult {
+                server_name: "server_a".to_string(),
+                value: Ok(Some(1)),
+            }
+        });
+
+        let barrier_release = barrier.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            barrier_release.wait().await;
+        });
+
+        let entries = vec![rest(&["server_a"]), PriorityEntry::Server("zzz".into())];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
+
+        assert_eq!(
+            assert_done(result),
+            Some(1),
+            "the pending group member must win over the already-buffered demoted server"
+        );
+    }
+
+    #[tokio::test]
     async fn preferred_demoted_server_wins_when_rest_group_is_empty_results() {
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "zzz", Ok(Some(99)));

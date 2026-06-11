@@ -377,10 +377,11 @@ own features). The per-language `layers` map orders them per LSP method:
 | `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only; until host bridging ships, at most one layer produces edits, so both strategies currently yield that layer's result. |
 
 The key is the LSP method name or `_` for the method wildcard, like
-`aggregation`. Today only the `virt` layer produces results — `host` is
-reserved until host-document bridging ships, and bridged methods have no
-`native` counterpart — so the practical effect is per-method enabling and
-disabling of injection bridging.
+`aggregation`. `textDocument/rangeFormatting` shares the
+`textDocument/formatting` key (same convention as `aggregation`). Today only
+the `virt` layer produces results — `host` is reserved until host-document
+bridging ships, and bridged methods have no `native` counterpart — so the
+practical effect is per-method enabling and disabling of injection bridging.
 
 **Bridge Filter Semantics:**
 

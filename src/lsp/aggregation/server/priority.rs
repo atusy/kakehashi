@@ -48,7 +48,10 @@ pub(crate) fn expand_priorities(
     for name in priorities {
         if name == PRIORITIES_WILDCARD {
             if rest_index.is_some() {
-                log::warn!(
+                // debug, not warn: expansion runs on every dispatch
+                // (completion fires per keystroke), so a persistent config
+                // condition would flood the log.
+                log::debug!(
                     "aggregation priorities contain more than one '{}'; only the first is honored",
                     PRIORITIES_WILDCARD
                 );
@@ -57,9 +60,13 @@ pub(crate) fn expand_priorities(
             rest_index = Some(entries.len());
             entries.push(PriorityEntry::Rest(Vec::new()));
         } else if !configured.contains(name.as_str()) {
-            log::warn!(
-                "aggregation priorities name '{name}' matches no configured server; ignored \
-                 (priorities is an allowlist — check for a typo)"
+            // debug, not warn: an unmatched name here is routine, not only a
+            // typo — priorities inherited from a `bridge._` wildcard entry
+            // legitimately name servers that exist for other injection
+            // languages of the same host.
+            log::debug!(
+                "aggregation priorities name '{name}' matches no configured server for this \
+                 target; ignored (priorities is an allowlist)"
             );
         } else if seen.insert(name.as_str()) {
             entries.push(PriorityEntry::Server(name.clone()));

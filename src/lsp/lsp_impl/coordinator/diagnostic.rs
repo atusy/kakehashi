@@ -113,6 +113,26 @@ impl DiagnosticScheduler {
             (snapshot, language_name)
         };
 
+        // Layer gate (cross-layer-aggregation), keyed by the same method name
+        // as the aggregation config below. Returning an empty snapshot (not
+        // None) publishes an empty diagnostics list, clearing anything a
+        // previously-enabled configuration left in the editor.
+        let settings = self.settings_manager.load_settings();
+        if !crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+            &settings,
+            &language_name,
+            "textDocument/publishDiagnostics",
+        )
+        .allows(crate::config::settings::LayerSource::Virt)
+        {
+            log::debug!(
+                target: LOG_TARGET,
+                "virt layer disabled for {} via layers.order",
+                language_name
+            );
+            return Some(Vec::new());
+        }
+
         let injection_query = self.language.injection_query(&language_name)?;
 
         let all_regions = InjectionResolver::resolve_all(
@@ -129,7 +149,6 @@ impl DiagnosticScheduler {
         }
 
         let mut contexts = Vec::new();
-        let settings = self.settings_manager.load_settings();
         for resolved in all_regions {
             let configs = self.bridge.get_all_configs_for_language(
                 &settings,

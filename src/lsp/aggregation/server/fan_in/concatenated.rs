@@ -1,8 +1,10 @@
 //! Concatenated-strategy fan-in for concurrent bridge requests.
 //!
 //! [`concatenated()`] collects all successful results from a `JoinSet<TaggedResult<T>>`,
-//! returning `FanInResult<Vec<T>>`. When `priorities` is non-empty, results are
-//! ordered by priority, with unlisted servers appended in insertion order.
+//! returning `FanInResult<Vec<T>>`. Results are ordered by the caller's
+//! `priorities` list — dispatch passes the flattened priority expansion, which
+//! covers every spawned server (aggregation-priorities-wildcard), so the
+//! unlisted-server fallback below is defensive only.
 
 use indexmap::IndexMap;
 use tokio::task::JoinSet;
@@ -14,8 +16,9 @@ use crate::lsp::request_id::CancelReceiver;
 /// Reorder tagged results according to the priority list.
 ///
 /// Walks `priorities` in order, draining matching entries from the map.
-/// Remaining (unlisted) entries are appended in insertion order — consistent
-/// with the `IndexMap` convention used in `preferred.rs`.
+/// Remaining (unlisted) entries are appended in insertion order — unreachable
+/// via dispatch (the expansion names every spawned server) but kept so a
+/// stray result is surfaced rather than dropped.
 fn order_by_priority<T>(tagged: Vec<(String, T)>, priorities: &[String]) -> Vec<T> {
     if priorities.is_empty() {
         return tagged.into_iter().map(|(_, v)| v).collect();

@@ -71,11 +71,16 @@ priorities = ["foo", "bar", "*", "zzz"]
 | `["foo", "*"]` | the old `["foo"]` behavior: foo preferred, rest as fallback |
 | `[]` | empty allowlist — no fan-out; the method is disabled for this bridge target (BREAKING: was pure first-win) |
 
-- At most one `"*"` per list: duplicates trigger a warning; the first
-  occurrence is honored and the rest are ignored.
-- A name matching no configured server is logged at warn level (typo aid)
-  and is otherwise inert — under allowlist semantics a typo now *excludes*
-  the intended server, so silence would be costly.
+- At most one `"*"` per list: the first occurrence is honored and the rest
+  are ignored (logged at debug).
+- A name matching no configured server is dropped and logged at **debug**,
+  not warn: expansion runs on every dispatch (completion fires per
+  keystroke), and an unmatched name is routine rather than necessarily a
+  typo — priorities inherited from a `bridge._` wildcard entry legitimately
+  name servers that exist only for other injection languages of the same
+  host. A settings-apply-time typo validation (the
+  `concatenated_formatting_pairs` pattern) is the upgrade path if silent
+  exclusion proves costly in practice.
 - `max_fan_out` applies after `"*"` expansion. `max_fan_out = 0` now overlaps
   `priorities = []`; both are kept (no deprecation in this decision).
 
