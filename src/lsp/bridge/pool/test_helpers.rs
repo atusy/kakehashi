@@ -91,6 +91,14 @@ pub(in crate::lsp::bridge) fn test_host_uri(name: &str) -> Url {
 /// these are correctly classified as ServerRequest rather than Response,
 /// causing shutdown handshakes to hang.
 pub async fn create_handle_with_state(state: ConnectionState) -> Arc<ConnectionHandle> {
+    create_handle_with_state_and_pid(state).await.0
+}
+
+/// Like [`create_handle_with_state`], but also returns the sink child's pid
+/// so tests can assert the process actually dies (e.g. kill-on-timeout paths).
+pub async fn create_handle_with_state_and_pid(
+    state: ConnectionState,
+) -> (Arc<ConnectionHandle>, u32) {
     // Create a mock server process (sink — discards all input, no output)
     let mut conn = AsyncBridgeConnection::spawn(vec![
         "sh".to_string(),
@@ -102,10 +110,11 @@ pub async fn create_handle_with_state(state: ConnectionState) -> Arc<ConnectionH
 
     // Split connection and spawn reader task (new architecture)
     let (writer, reader) = conn.split();
+    let pid = writer.child_id().expect("sink child should have a pid");
     let router = Arc::new(ResponseRouter::new());
     let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
 
     let handle = Arc::new(ConnectionHandle::new(writer, router, reader_handle));
     handle.set_state(state);
-    handle
+    (handle, pid)
 }
