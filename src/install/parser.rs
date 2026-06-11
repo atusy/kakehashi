@@ -386,10 +386,19 @@ fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     if let Ok(ssh_command) = std::env::var("GIT_SSH_COMMAND")
         && !ssh_command.trim().is_empty()
     {
-        let is_openssh = ssh_command
-            .split_whitespace()
-            .next()
-            .and_then(|word| std::path::Path::new(word).file_stem())
+        // The command word may be a quoted path containing spaces (common on
+        // Windows: "C:\Program Files\...\ssh.exe" -i key); take the quoted
+        // token whole instead of splitting on its inner spaces.
+        let trimmed = ssh_command.trim_start();
+        let cmd_word = if let Some(rest) = trimmed.strip_prefix('"') {
+            rest.split('"').next().unwrap_or("")
+        } else if let Some(rest) = trimmed.strip_prefix('\'') {
+            rest.split('\'').next().unwrap_or("")
+        } else {
+            trimmed.split_whitespace().next().unwrap_or("")
+        };
+        let is_openssh = std::path::Path::new(cmd_word)
+            .file_stem()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case("ssh"));
         if is_openssh {
