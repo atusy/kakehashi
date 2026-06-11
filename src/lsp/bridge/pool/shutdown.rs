@@ -223,19 +223,8 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp::bridge::pool::test_helpers::create_handle_with_state_and_pid;
+    use crate::lsp::bridge::pool::test_helpers::{create_handle_with_state_and_pid, process_stat};
     use std::time::Duration;
-
-    /// `ps -o stat= -p` snapshot: `Some(state)` while the process exists
-    /// (zombies show as `Z…`), `None` once it is gone/reaped.
-    fn process_stat(pid: u32) -> Option<String> {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .expect("ps should run");
-        let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (!stat.is_empty()).then_some(stat)
-    }
 
     /// A sink server never answers the shutdown request, so its
     /// graceful_shutdown blocks forever on the response wait and force-kill

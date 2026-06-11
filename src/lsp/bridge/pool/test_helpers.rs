@@ -73,6 +73,18 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
     }
 }
 
+/// `ps -o stat= -p` snapshot: `Some(state)` while the process exists
+/// (zombies show as `Z…`), `None` once it is gone/reaped. For tests that
+/// assert a child process actually dies.
+pub(in crate::lsp::bridge) fn process_stat(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps should run");
+    let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!stat.is_empty()).then_some(stat)
+}
+
 /// Helper function to convert url::Url to tower_lsp_server::ls_types::Uri for tests.
 pub(in crate::lsp::bridge) fn url_to_uri(url: &Url) -> tower_lsp_server::ls_types::Uri {
     crate::lsp::lsp_impl::url_to_uri(url).expect("test URL should convert to URI")

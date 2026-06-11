@@ -111,6 +111,15 @@ pub(crate) fn spawn_writer_task(
     }
 }
 
+/// Fail every request still sitting in the outbound queue.
+fn fail_queued(rx: &mut mpsc::Receiver<OutboundMessage>, router: &ResponseRouter, reason: &str) {
+    while let Ok(msg) = rx.try_recv() {
+        if let OutboundMessage::Tracked { request_id, .. } = msg {
+            router.fail_request(request_id, reason);
+        }
+    }
+}
+
 /// The main writer loop - writes messages from queue to stdin.
 ///
 /// Handles four shutdown paths: graceful stop drains the queue and returns the
@@ -166,11 +175,7 @@ async fn writer_loop(
                     target: "kakehashi::bridge::writer",
                     "Writer stop channel closed, shutting down"
                 );
-                while let Ok(msg) = rx.try_recv() {
-                    if let OutboundMessage::Tracked { request_id, .. } = msg {
-                        router.fail_request(request_id, "connection closing");
-                    }
-                }
+                fail_queued(&mut rx, &router, "connection closing");
                 return;
             }
 
@@ -181,11 +186,7 @@ async fn writer_loop(
                     "Writer task cancelled, shutting down"
                 );
                 // Drain remaining queued requests and fail them
-                while let Ok(msg) = rx.try_recv() {
-                    if let OutboundMessage::Tracked { request_id, .. } = msg {
-                        router.fail_request(request_id, "connection closing");
-                    }
-                }
+                fail_queued(&mut rx, &router, "connection closing");
                 // Don't send idle/writer - caller is force-cancelling
                 return;
             }
