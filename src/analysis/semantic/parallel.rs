@@ -20,8 +20,8 @@ use crate::config::CaptureMappings;
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
     InjectionRegionInfo, MAX_INJECTION_DEPTH, compute_included_ranges,
-    effective_offset_for_pattern, has_combined_for_pattern, intersect_included_ranges,
-    parse_with_ranges, sub_select_included_ranges,
+    compute_included_ranges_clipped, effective_offset_for_pattern, has_combined_for_pattern,
+    intersect_included_ranges, parse_with_ranges, sub_select_included_ranges,
 };
 use crate::text::position::byte_to_utf16_col;
 
@@ -448,30 +448,35 @@ fn collect_injection_contexts_sync<'a>(
         // (e.g., block_continuation), we compute gap ranges so the injection parser
         // only sees actual code content.
         //
-        // Disabled when an offset directive is active: compute_included_ranges()
-        // returns ranges relative to content_node.start_byte(), but content_text
-        // starts at inj_start_byte (offset-adjusted). Passing misaligned ranges
-        // to the parser would produce incorrect results.
-        let included_ranges = if offset.is_some() {
-            None
+        // With an offset directive, content_text starts at inj_start_byte
+        // (offset-adjusted) rather than content_node.start_byte(), so gaps are
+        // clipped to the effective window and relativized to it (#186). The
+        // non-offset path keeps the node-anchored variant, which reuses the
+        // node's cached Points instead of rescanning text.
+        let from_children = if offset.is_some() {
+            compute_included_ranges_clipped(
+                &injection.content_node,
+                injection.include_children,
+                text,
+                inj_start_byte..inj_end_byte,
+            )
         } else {
-            let from_children =
-                compute_included_ranges(&injection.content_node, injection.include_children);
-            let from_parent = parent_included_ranges.and_then(|parent_ranges| {
-                sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
-            });
-            match (from_children, from_parent) {
-                (Some(child_ranges), Some(parent_ranges)) => {
-                    let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
-                    if intersected.is_empty() {
-                        None
-                    } else {
-                        Some(intersected)
-                    }
+            compute_included_ranges(&injection.content_node, injection.include_children)
+        };
+        let from_parent = parent_included_ranges.and_then(|parent_ranges| {
+            sub_select_included_ranges(parent_ranges, inj_start_byte, inj_end_byte)
+        });
+        let included_ranges = match (from_children, from_parent) {
+            (Some(child_ranges), Some(parent_ranges)) => {
+                let intersected = intersect_included_ranges(&child_ranges, &parent_ranges);
+                if intersected.is_empty() {
+                    None
+                } else {
+                    Some(intersected)
                 }
-                (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
-                (None, None) => None,
             }
+            (Some(ranges), None) | (None, Some(ranges)) => Some(ranges),
+            (None, None) => None,
         };
 
         // Record exclusion ranges for parent token suppression (Problem 2: host token leaking).
@@ -479,13 +484,12 @@ fn collect_injection_contexts_sync<'a>(
         // so that compute_active_injection_regions() produces per-line ActiveInjectionBounds values.
         // Otherwise, push the single full content range as before.
         if let Some(ref ranges) = included_ranges {
-            // compute_included_ranges returns ranges relative to content_node.start_byte().
-            // In this branch, offset.is_none(), so inj_start_byte == content_node.start_byte();
-            // we use content_node.start_byte() explicitly as the base for clarity.
-            let base_byte = content_node.start_byte();
+            // Gap ranges are relative to the effective window start: with an
+            // offset directive that is inj_start_byte; without one,
+            // inj_start_byte == content_node.start_byte().
             for r in ranges {
-                let abs_start = base_byte + r.start_byte;
-                let abs_end = base_byte + r.end_byte;
+                let abs_start = inj_start_byte + r.start_byte;
+                let abs_end = inj_start_byte + r.end_byte;
                 exclusion_ranges.push((abs_start, abs_end));
             }
         } else {
@@ -1286,6 +1290,111 @@ local x = 42
             has_local_keyword,
             "Should have 'local' keyword token at line 3, col 0. Got: {:?}",
             tokens
+        );
+    }
+
+    #[test]
+    fn test_collect_injection_tokens_offset_with_child_exclusion() {
+        use crate::config::WorkspaceSettings;
+
+        let coordinator = LanguageCoordinator::new();
+        let settings = WorkspaceSettings {
+            search_paths: vec![test_search_path()],
+            ..Default::default()
+        };
+        let _summary = coordinator.load_settings(&settings);
+
+        let md_result = coordinator.ensure_language_loaded("markdown");
+        let lua_result = coordinator.ensure_language_loaded("lua");
+        if !md_result.success || !lua_result.success {
+            eprintln!("Skipping: markdown or lua parser not available");
+            return;
+        }
+
+        // #186: #offset! WITHOUT injection.include-children. The row offset
+        // trims the first content line; blockquote `> ` prefixes
+        // (block_continuation children) must still be excluded within the
+        // remaining window.
+        let md_language = coordinator
+            .language_registry_for_parallel()
+            .get("markdown")
+            .expect("markdown language must be loaded");
+        let query = Query::new(
+            &md_language,
+            r#"
+            ((fenced_code_block
+               (info_string (language) @injection.language)
+               (code_fence_content) @injection.content)
+              (#offset! @injection.content 1 0 0 0))
+            "#,
+        )
+        .expect("valid offset injection query");
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), Arc::new(query));
+
+        // Line 0: > ```lua
+        // Line 1: > local a = 1   (trimmed by the offset)
+        // Line 2: > local b = 2   (only surviving content line)
+        // Line 3: > ```
+        let text = "> ```lua\n> local a = 1\n> local b = 2\n> ```\n";
+        let mut parser_pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = parser_pool.acquire("markdown") else {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        };
+        let Some(tree) = parser.parse(text, None) else {
+            eprintln!("Skipping: failed to parse document");
+            return;
+        };
+        parser_pool.release("markdown".to_string(), parser);
+
+        let host_lines: Vec<&str> = text.lines().collect();
+        let (tokens, regions) = collect_injection_tokens_parallel(
+            text,
+            &host_lines,
+            &build_line_start_bytes(text),
+            &tree,
+            Some("markdown"),
+            &coordinator,
+            None,
+            false,
+        );
+
+        // The surviving `local` keyword maps to host line 2, col 2 (after the
+        // stripped `> ` prefix).
+        let (keyword_type, keyword_mods) =
+            crate::analysis::semantic::legend::map_capture_to_token_type_and_modifiers("keyword")
+                .unwrap();
+        assert!(
+            tokens.iter().any(|t| {
+                t.line == 2
+                    && t.column == 2
+                    && t.kind
+                        == crate::analysis::semantic::token_collector::TokenKind::Mapped(
+                            keyword_type,
+                            keyword_mods,
+                        )
+            }),
+            "Should have 'local' keyword token at line 2, col 2. Got: {:?}",
+            tokens
+        );
+
+        // No injection token may land on the excluded `> ` prefix.
+        assert!(
+            tokens.iter().all(|t| !(t.line == 2 && t.column < 2)),
+            "No token may cover the excluded blockquote prefix. Got: {:?}",
+            tokens
+        );
+
+        // Active regions must start after the prefix, proving the exclusion
+        // ranges were clipped to the post-offset window rather than dropped.
+        assert!(
+            regions
+                .iter()
+                .any(|r| r.start_line == 2 && r.start_col == 2),
+            "Active region should start at line 2 col 2 (post-offset, post-prefix). Got: {:?}",
+            regions
         );
     }
 
