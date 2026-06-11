@@ -6,7 +6,7 @@
 //! `isMissing`, `startByte`, `endByte`, `byteRange`, `childCount`,
 //! `namedChildCount`, `descendantCount`, `toSexp`, `child`, `namedChild`,
 //! `namedChildren`, `nextSibling`, `prevSibling`, `nextNamedSibling`,
-//! `prevNamedSibling`, `firstChildForByte`, `descendantForByteRange`,
+//! `prevNamedSibling`, `childWithDescendant`, `firstChildForByte`, `descendantForByteRange`,
 //! `namedDescendantForByteRange`, `childByFieldName`, `childrenByFieldName`,
 //! `fieldNameForChild`, `fieldNameForNamedChild`, `range`, `startPosition`,
 //! `endPosition`, `descendantForPointRange`, `namedDescendantForPointRange`.
@@ -1063,4 +1063,190 @@ fn test_point_lookups_in_excluded_gap_are_null() {
             v
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// childWithDescendant (two-id, same-layer contract — issue #335)
+// ---------------------------------------------------------------------------
+
+/// `{ textDocument, id, descendantId }` request body for `childWithDescendant`.
+fn descendant_params(uri: &str, id: &str, descendant_id: &str) -> serde_json::Value {
+    json!({ "textDocument": { "uri": uri }, "id": id, "descendantId": descendant_id })
+}
+
+/// `childWithDescendant(self, descendant)` returns the immediate child of
+/// `self` on the path to `descendant` — for a grandchild that is the
+/// intermediate child, and for an immediate child it is the child itself
+/// (mirroring `Node::child_with_descendant`).
+#[test]
+fn test_child_with_descendant_returns_child_on_path() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_cwd_path.md";
+    open_markdown(&mut client, uri, DOC);
+    let root = root_id(&mut client, uri);
+
+    // Walk two levels down: child = children(root)[0], grandchild = children(child)[0].
+    let children = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &root),
+    );
+    let child = &children.as_array().expect("children array")[0];
+    let child_id = id_of(child);
+    let grandchildren = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &child_id),
+    );
+    let grandchild_id = id_of(&grandchildren.as_array().expect("grandchildren array")[0]);
+
+    // Grandchild: the immediate child on the path is `child` (same minted id).
+    let via_grandchild = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &root, &grandchild_id),
+    );
+    assert!(
+        !via_grandchild.is_null(),
+        "childWithDescendant(root, grandchild) must resolve"
+    );
+    assert_eq!(
+        id_of(&via_grandchild),
+        child_id,
+        "must return the immediate child containing the descendant"
+    );
+
+    // Immediate child: returns the child itself.
+    let via_child = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &root, &child_id),
+    );
+    assert!(!via_child.is_null());
+    assert_eq!(id_of(&via_child), child_id);
+}
+
+/// Degenerate relations collapse to `null`: `descendant == self` (no child
+/// contains the node itself), an inverted pair (root is not a descendant of
+/// its child), and a malformed `descendantId`.
+#[test]
+fn test_child_with_descendant_null_for_non_descendants() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_cwd_null.md";
+    open_markdown(&mut client, uri, DOC);
+    let root = root_id(&mut client, uri);
+
+    let children = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &root),
+    );
+    let child_id = id_of(&children.as_array().expect("children array")[0]);
+
+    let self_pair = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &root, &root),
+    );
+    assert!(self_pair.is_null(), "descendant == self must be null");
+
+    let inverted = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &child_id, &root),
+    );
+    assert!(
+        inverted.is_null(),
+        "an ancestor is not a descendant — must be null"
+    );
+
+    let malformed = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &root, "not-a-ulid"),
+    );
+    assert!(malformed.is_null(), "malformed descendantId must be null");
+}
+
+/// Both ids must have been minted in the **same** injection layer: pairing a
+/// markdown host node with a python injected-layer node collapses to `null`,
+/// even though the injected node's span lies inside the host node's span.
+#[test]
+fn test_child_with_descendant_rejects_cross_layer_pair() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_cwd_cross_layer.md";
+    open_markdown(&mut client, uri, BLOCKQUOTED_PYTHON);
+
+    let host_root = root_id(&mut client, uri);
+    let python_root = python_layer_root(&mut client, uri);
+
+    let cross = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &host_root, &python_root),
+    );
+    assert!(
+        cross.is_null(),
+        "host-layer self with injected-layer descendant must be null, got {:?}",
+        cross
+    );
+}
+
+/// The two-id contract also holds **inside** an injection layer: with both ids
+/// minted in the python layer (layer 1), the immediate child resolves through
+/// the pair path that rebuilds the injection stack, and `descendant == self`
+/// still collapses to `null` there.
+#[test]
+fn test_child_with_descendant_in_injection_layer() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_cwd_injection.md";
+    open_markdown(&mut client, uri, BLOCKQUOTED_PYTHON);
+
+    let python_root = python_layer_root(&mut client, uri);
+    let children = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &python_root),
+    );
+    let child = &children.as_array().expect("python children array")[0];
+    let child_id = id_of(child);
+    let grandchildren = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &child_id),
+    );
+    let grandchild_id = id_of(
+        &grandchildren
+            .as_array()
+            .expect("python grandchildren array")[0],
+    );
+
+    let via_grandchild = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &python_root, &grandchild_id),
+    );
+    assert!(
+        !via_grandchild.is_null(),
+        "childWithDescendant must resolve inside an injection layer"
+    );
+    assert_eq!(
+        id_of(&via_grandchild),
+        child_id,
+        "must return the immediate python-layer child containing the descendant"
+    );
+
+    let self_pair = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &python_root, &python_root),
+    );
+    assert!(
+        self_pair.is_null(),
+        "descendant == self must be null in an injection layer too"
+    );
 }
