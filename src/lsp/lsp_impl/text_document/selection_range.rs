@@ -54,11 +54,28 @@ impl Kakehashi {
                 })
                 .await;
 
-            if let Some(tree) = sync_parse_result {
-                self.documents
-                    .update_document(uri.clone(), text, Some(tree));
-            } else {
+            let Some(tree) = sync_parse_result else {
                 return Ok(None);
+            };
+
+            // Persist under the per-URI edit lock and only if the document is
+            // still alive with the text we parsed: a didClose racing the parse
+            // must not be undone by re-inserting the document, and a didChange
+            // must not be clobbered with the older text/tree. Block-scoped so
+            // the edit lock is released before the pool wait below.
+            {
+                let edit_lock = self.documents.edit_lock(&uri);
+                let _guard = edit_lock.lock().await;
+                let still_current = {
+                    let Some(doc) = self.documents.get(&uri) else {
+                        return Ok(None);
+                    };
+                    doc.text() == text
+                };
+                if still_current {
+                    self.documents
+                        .update_document(uri.clone(), text, Some(tree));
+                }
             }
         }
 
