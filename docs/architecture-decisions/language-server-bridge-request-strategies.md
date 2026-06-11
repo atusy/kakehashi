@@ -291,6 +291,10 @@ When multiple servers are configured for a language:
 | Diagnostics | Merge all, dedupe by range + message |
 | Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — full formatting only. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
 
+`priorities` lists follow the ordered-allowlist semantics of
+aggregation-priorities-wildcard: listed servers run in order, a `"*"` element
+stands for the unlisted rest, and absence of the list means `["*"]`.
+
 ## Consequences
 
 ### Positive
@@ -352,4 +356,5 @@ The original priority order (for reference):
 - [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How injections are represented as virtual documents
 - [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md): Multi-server formatting via a sequential pipeline (`strategy: "concatenated"`)
+- [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md): Ordered-allowlist semantics and the `"*"` element for `priorities` lists
 - [cross-layer-aggregation](cross-layer-aggregation.md): How native/host/virt layer results combine, one level above the per-target strategies defined here

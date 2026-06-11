@@ -2,16 +2,27 @@
 
 **Related Decisions**:
 - [host-document-bridge](host-document-bridge.md) — Host bridging schema (`bridge._self`); declared cross-layer combine logic out of scope, which this decision now covers
+- [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — The unified ordered-allowlist semantics that `order` follows
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method strategies and multi-server merging *within* a bridge target
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard merge machinery reused for the method-keyed map
 
 ## Implementation Status
 
-Not implemented. Depends on host-document-bridge (`bridge._self`), which is
-also not yet implemented. This decision fixes the configuration schema ahead
-of implementation so that host bridging and cross-layer aggregation can land
-against a stable config surface.
+Not implemented. Phased roadmap:
+
+1. **Allowlist `priorities` with `"*"`** (aggregation-priorities-wildcard) —
+   the list semantics `order` builds on; lands independently as a stage-1
+   change.
+2. **Layer dispatch, `preferred` only** — this decision's machinery with the
+   default `order`. Implementable before host bridging: the host layer is an
+   empty contributor until `bridge._self` exists and is enabled.
+3. **Layer-level `concatenated` for `textDocument/formatting` only** —
+   expected to follow the sequential-pipeline principles of
+   concatenated-formatting-pipeline (determinism, no overlapping edits);
+   detailed mechanics are deferred to that phase. Its observable value
+   arrives with host bridging (e.g. a host formatter running over the whole
+   document after virt regions are formatted).
 
 ## Context
 
@@ -53,10 +64,10 @@ violation that led host-document-bridge to reject its Alternative A
   `resolve_with_wildcard`, exactly like `bridge.<key>.aggregation`.
 - **Defaults preserve current behavior**: with no user config, requests behave
   as they do today (virt preferred where an injection exists, native
-  otherwise).
-- **Consistency with stage-1 semantics**: ordering is a *preference*, not an
-  allowlist — unlisted entries still participate, as in the `preferred`
-  fan-in.
+  otherwise; host inert until opted in).
+- **One list semantics**: `order` follows the same ordered-allowlist rule as
+  `priorities` (aggregation-priorities-wildcard), differing only in element
+  type.
 
 ## Decision Outcome
 
@@ -71,12 +82,14 @@ closed-enum layer order plus an optional strategy. Stage-1 types
 # ---- Built-in defaults (declared in code; not user-facing) ----
 [languages._.layers._]
 order = ["virt", "host", "native"]   # innermost-first; mirrors "deeper wins"
+# host is listed but contributes nothing until the user opts in via
+# bridge._self.enabled (host-document-bridge) — order ranks layers,
+# enabled flags decide whether a bridge target exists at all.
 # strategy: per-method default (concatenated for diagnostics, else preferred)
 
-# ---- User: markdown hover should prefer the host LS, and show both ----
+# ---- User: markdown hover should prefer the host LS, and drop native ----
 [languages.markdown.layers."textDocument/hover"]
-order = ["host", "virt", "native"]
-strategy = "concatenated"
+order = ["host", "virt"]             # allowlist: native does not run
 
 # ---- Stage 1 stays exactly as before: server names within one target ----
 [languages.markdown.bridge._self.aggregation."textDocument/hover"]
@@ -97,8 +110,10 @@ pub enum LayerSource {
 }
 
 pub struct LayerAggregationConfig {
-    /// Layer preference order, highest first. Omitted layers are appended
-    /// in default relative order (virt, host, native). NOT an allowlist.
+    /// Ordered allowlist, highest first: layers omitted from the list do
+    /// not participate for that method. The set is closed and three-valued,
+    /// so explicit enumeration replaces the `"*"` element used by server
+    /// `priorities` — "the rest" is always spellable by name.
     pub order: Option<Vec<LayerSource>>,
     /// Reuses the stage-1 strategy type; omit for the per-method default.
     pub strategy: Option<AggregationStrategy>,
@@ -120,21 +135,27 @@ Stage 1 (exists today)    each layer resolves its own servers into
 ```
 
 Each stage owns one namespace. Stage 1 orders **server names** within a
-bridge target; stage 2 orders **layers**. The `AggregationStrategy` *type* is
-shared (the "how to combine multiple responses" semantics are identical), but
-the configured *values* are independent — e.g., diagnostics can be
-`concatenated` across layers while `bridge.python.aggregation` keeps
-`preferred` among Python servers.
+bridge target; stage 2 orders **layers**. Both lists follow the
+ordered-allowlist rule of aggregation-priorities-wildcard. The
+`AggregationStrategy` *type* is shared (the "how to combine multiple
+responses" semantics are identical), but the configured *values* are
+independent — e.g., diagnostics can be `concatenated` across layers while
+`bridge.python.aggregation` keeps `preferred` among Python servers.
 
 ### Semantics
 
-- **`order` is a preference, not an allowlist.** Layers omitted from `order`
-  are appended in the built-in relative order. This matches the stage-1
-  `preferred` fan-in, where unprioritized servers still participate via
-  first-win fallback. Disabling a layer is done where it already lives:
-  `bridge._self.enabled` (host), `bridge.<inj>.enabled` (virt). Native has no
-  per-method off switch; with `preferred` it only fires when ordered layers
-  return nothing.
+- **`order` is an ordered allowlist.** Layers omitted from the list do not
+  participate for that method — `order = ["virt", "host"]` suppresses
+  native; `order = []` disables the method across all layers (mirroring
+  `priorities = []`). No `"*"` element is supported: with a closed
+  three-value set, "the rest" is always expressible by explicit enumeration,
+  so the enum stays pure.
+- **`order` ranks; `enabled` gates.** Host participation is additionally
+  gated by `bridge._self.enabled` (host-document-bridge), and per-injection
+  virt participation by `bridge.<inj>.enabled`. These are not a double
+  opt-in: the default `order` already lists host, so enabling
+  `bridge._self.enabled = true` is the *only* step a user takes to bring the
+  host layer in. A disabled target is simply an empty contributor.
 - **Empty contributors are skipped.** A layer with nothing to say — no native
   implementation for the method, host bridging disabled, no injection at the
   request position — is an empty contributor; `preferred` falls through to
@@ -142,9 +163,14 @@ the configured *values* are independent — e.g., diagnostics can be
 - **Resolution reuses wildcard machinery.** The method key resolves via
   `resolve_with_wildcard` (method-specific entry inherits unset fields from
   `_`), and the `layers` field participates in the outer language-level
-  wildcard/base merge like `bridge` does.
-- **Strategy defaults are per-method.** `default_aggregation_strategy_for_method`
-  applies unchanged: `concatenated` for diagnostics, `preferred` otherwise.
+  wildcard/base merge like `bridge` does. Note `order` is a single field: a
+  method-specific `order` replaces the wildcard's list wholesale, it does
+  not merge element-wise.
+- **Strategy is phased.** Phase 2 implements `preferred` only; every method
+  combines across layers by first-non-empty until then. Once layer-level
+  `concatenated` lands (formatting first, phase 3), the per-method defaults
+  of `default_aggregation_strategy_for_method` apply unchanged
+  (`concatenated` for diagnostics, `preferred` otherwise).
 - **Nested injections stay implicit.** When injections nest
   (markdown → python → sql), the virt layer resolves deepest-first,
   consistent with the semantic-token priority convention (deeper wins). Depth
@@ -164,8 +190,6 @@ the configured *values* are independent — e.g., diagnostics can be
   merge — native immediately, bridged tokens replacing them later — not an
   ordering. Semantic tokens stay outside this mechanism (native-only today);
   a future `merged`-style strategy may bring them in.
-- **Per-method native disable switch**: suppressing the native layer entirely
-  for a method is not provided. Revisit if a concrete need appears.
 
 ## Consequences
 
@@ -175,20 +199,27 @@ the configured *values* are independent — e.g., diagnostics can be
   layer names; the JSON schema enumerates the three values. No reserved-key
   collision with user language names is possible (unlike a
   `"_native"`-style string convention).
-- **Stage-1 schema untouched**: `AggregationConfig.priorities` remains purely
-  a server-name list; existing configs and resolution code are unaffected.
-- **Defaults preserve behavior**: `["virt", "host", "native"]` with per-method
-  strategy defaults reproduces today's routing for existing configs.
+- **Stage-1 schema untouched**: this decision adds no fields to
+  `AggregationConfig` or `BridgeLanguageConfig`; existing bridge configs
+  resolve as before.
+- **Defaults preserve behavior**: `["virt", "host", "native"]` with host
+  inert (opt-in off) and `preferred` reproduces today's routing exactly.
+- **Per-method layer suppression for free**: omitting a layer from `order`
+  (e.g. dropping native for hover) needs no dedicated disable switch —
+  a direct payoff of the allowlist semantics.
 - **Wildcard machinery reused**: no new resolver path; method-keyed map works
   like `bridge.<key>.aggregation`.
 
 ### Negative
 
+- **Allowlist override footgun**: writing `order = ["host"]` silently drops
+  virt and native for that method — a user promoting one layer must restate
+  the others. Mitigated by schema docs; inherent to allowlist semantics.
 - **Two similarly-shaped maps**: `languages.<lang>.layers.<method>` and
   `languages.<lang>.bridge.<key>.aggregation.<method>` are both method-keyed
-  aggregation-ish maps; users must learn which axis each controls. The
-  distinct field names (`order` of enums vs. `priorities` of server names)
-  are the guard rail.
+  ordered-allowlist configs; users must learn which axis each controls. The
+  distinct field names and element types (`order` of a closed enum vs.
+  `priorities` of open server names) are the guard rail.
 - **Jargon collision**: tree-sitter communities use "layer" for injection
   nesting depth (`LanguageTree` layers). Mitigated by the doc comment on
   `LayerSource` ("NOT injection nesting depth") and by the enum values making
@@ -197,12 +228,12 @@ the configured *values* are independent — e.g., diagnostics can be
 ### Neutral
 
 - **`strategy` type shared across stages**: one `AggregationStrategy` enum
-  serves both. A future stage-2-only strategy (e.g., temporal `merged`) would
+  serves both. A future stage-2-only strategy (e.g. temporal `merged`) would
   force either enum growth visible to stage 1 or a type split — acceptable
   deferred cost.
 - **Native participates without a catalog entry**: the native layer has no
-  `languageServers` entry and no `enabled` flag; it is simply last in the
-  default order.
+  `languageServers` entry and no `enabled` flag; its participation is
+  controlled solely by `order` membership.
 
 ## Alternatives Considered
 
@@ -253,3 +284,28 @@ Same structure as chosen, but named `aggregation`.
 **Rejected because**: "source" is at least as overloaded (source code, source
 files), and "layers" matches the mental model this decision is built on
 (three result layers). The collision is handled by one doc-comment line.
+
+### E. Preference order with implicit fallback (first draft of this decision)
+
+`order` as a pure preference: layers omitted from the list still participate,
+appended in default relative order — mirroring the *pre*-wildcard `preferred`
+fan-in.
+
+**Rejected because**: it cannot express per-method layer suppression (the
+native-for-hover case) and perpetuates exactly the dual list semantics that
+aggregation-priorities-wildcard retires. With the unified allowlist rule,
+"preference with fallback" remains spellable — list every layer — while
+exclusion becomes spellable too.
+
+### F. Default `order = ["virt", "native"]` with order as the host gate
+
+Exclude host from the default so that listing `"host"` in `order` *is* the
+host opt-in, making `bridge._self.enabled` redundant.
+
+**Rejected because**: it splits gating across two mechanisms asymmetrically —
+virt targets would gate via `bridge.<inj>.enabled` but host via `order`
+membership — and turning host on per-language would require restating the
+full layer order (allowlist override) instead of flipping one flag.
+Keeping host in the default order costs nothing: a disabled host layer is an
+empty contributor, and `enabled` remains the single opt-in switch defined by
+host-document-bridge.

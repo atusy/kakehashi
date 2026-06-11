@@ -85,7 +85,12 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
 2. **`priorities` is the pipeline definition.** When the pipeline is active,
    `priorities` is both the **membership list** and the **application order**.
    Servers configured for the language but **absent from `priorities` do not run**
-   for formatting — `priorities` acts as an allowlist plus order. An active
+   for formatting — `priorities` acts as an allowlist plus order. (Originally a
+   formatting-specific exception, this is now the general rule for all
+   `priorities` lists — see aggregation-priorities-wildcard. The pipeline adds
+   one restriction: the `"*"` wildcard element is rejected with a warning,
+   because "the rest" has no deterministic expansion order and a formatter
+   pipeline must be reproducible.) An active
    `concatenated` strategy with an empty `priorities` is a misconfiguration and
    falls back to `preferred` (with a warning), since order would otherwise be
    undefined.
@@ -326,6 +331,10 @@ change without affecting the config surface.
 - **`priorities` semantics overload**: for formatting, `priorities` becomes an
   allowlist+order (servers not listed do not run), unlike `preferred` where it is
   only a tie-break ordering. Documented, but a behavioral nuance.
+  *Retired*: aggregation-priorities-wildcard later unified all `priorities`
+  lists on the allowlist+order reading, so this is no longer an exception —
+  only the `"*"`-rejection restriction (Decision point 2) remains
+  pipeline-specific.
 
 ### Neutral
 
@@ -373,5 +382,6 @@ point 5), so this decision leaves it unchanged.
 ## Related Decisions
 
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Per-method bridge strategies, including formatting's edit handling
+- [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md): Generalizes this pipeline's allowlist+order reading of `priorities` to all strategies, with a `"*"` wildcard element (rejected by this pipeline)
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md): `AggregationStrategy` enum, fan-out/fan-in, and aggregation timeout rules
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How injection regions are represented as virtual documents
