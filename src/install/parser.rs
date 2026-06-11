@@ -346,14 +346,69 @@ fn archive_root_dir_name(repo_name: &str, revision: &str) -> String {
     format!("{}-{}", repo_name, clean_revision)
 }
 
+/// Upper bound for each git operation in the clone fallback.
+///
+/// The archive-download path bounds its HTTP calls (`ARCHIVE_HTTP_TIMEOUT`);
+/// git has none of its own, and the install runs inside a non-cancellable
+/// `spawn_blocking` task — an unbounded hang keeps the language's in-progress
+/// marker held for the whole session (every reopen skips parsing) and blocks
+/// process exit while the runtime drains blocking tasks.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Build a git command that can never prompt: stdin is nulled and
+/// `GIT_TERMINAL_PROMPT=0` set, so a private/renamed repository fails fast
+/// instead of waiting for credentials nobody can type.
+fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(dir) = current_dir {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
+/// Run a command to completion under a hard deadline, killing it on expiry.
+///
+/// Poll-based (`try_wait` + sleep) because this executes on a blocking
+/// thread; `context` names the operation in the error message.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    context: &str,
+) -> Result<std::process::ExitStatus, ParserInstallError> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ParserInstallError::GitError(format!("{}: {}", context, e)))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ParserInstallError::GitError(format!(
+                        "{} timed out after {:?}",
+                        context, timeout
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(ParserInstallError::GitError(format!("{}: {}", context, e)));
+            }
+        }
+    }
+}
+
 /// Clone a git repository at a specific revision.
 fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     // First, clone with depth 1 (we'll fetch the specific revision)
-    let status = Command::new("git")
-        .args(["clone", "--depth", "1", url])
-        .arg(dest)
-        .status()
-        .map_err(|e| ParserInstallError::GitError(e.to_string()))?;
+    let mut clone = git_command(&["clone", "--depth", "1", url], None);
+    clone.arg(dest);
+    let status = run_with_timeout(clone, GIT_COMMAND_TIMEOUT, "git clone")?;
 
     if !status.success() {
         return Err(ParserInstallError::GitError(format!(
@@ -363,11 +418,11 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     }
 
     // Fetch the specific revision
-    let status = Command::new("git")
-        .current_dir(dest)
-        .args(["fetch", "--depth", "1", "origin", revision])
-        .status()
-        .map_err(|e| ParserInstallError::GitError(e.to_string()))?;
+    let status = run_with_timeout(
+        git_command(&["fetch", "--depth", "1", "origin", revision], Some(dest)),
+        GIT_COMMAND_TIMEOUT,
+        "git fetch",
+    )?;
 
     if !status.success() {
         return Err(ParserInstallError::GitError(format!(
@@ -382,11 +437,11 @@ fn clone_repo(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstal
     //   but doesn't create a local tag ref, so `git checkout v0.25.0` fails
     // - For commits: FETCH_HEAD also works correctly
     // - FETCH_HEAD always contains what we just fetched
-    let status = Command::new("git")
-        .current_dir(dest)
-        .args(["checkout", "FETCH_HEAD"])
-        .status()
-        .map_err(|e| ParserInstallError::GitError(e.to_string()))?;
+    let status = run_with_timeout(
+        git_command(&["checkout", "FETCH_HEAD"], Some(dest)),
+        GIT_COMMAND_TIMEOUT,
+        "git checkout",
+    )?;
 
     if !status.success() {
         return Err(ParserInstallError::GitError(format!(
@@ -410,6 +465,39 @@ mod tests {
     fn test_dll_extension_is_valid() {
         let ext = std::env::consts::DLL_EXTENSION;
         assert!(ext == "so" || ext == "dylib" || ext == "dll");
+    }
+
+    #[test]
+    fn run_with_timeout_kills_stuck_command() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+
+        let started = std::time::Instant::now();
+        let result = run_with_timeout(cmd, Duration::from_millis(200), "test sleep");
+
+        match result {
+            Err(ParserInstallError::GitError(message)) => {
+                assert!(
+                    message.contains("timed out"),
+                    "expected timeout error, got: {message}"
+                );
+            }
+            other => panic!("expected GitError timeout, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stuck child must be killed promptly, not waited out"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_status_of_finished_command() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+
+        let status = run_with_timeout(cmd, Duration::from_secs(10), "test exit")
+            .expect("fast command should complete within the deadline");
+        assert!(status.success());
     }
 
     #[test]
