@@ -17,8 +17,9 @@ use super::injection_aware::{
 };
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::injection::{
-    self, compute_included_ranges_clipped, has_include_children_for_pattern,
-    parse_offset_directive_for_pattern, parse_with_ranges,
+    self, InjectionOffset, ceil_char_boundary, compute_included_ranges_clipped,
+    floor_char_boundary, has_include_children_for_pattern, parse_offset_directive_for_pattern,
+    parse_with_ranges,
 };
 use crate::text::PositionMapper;
 
@@ -86,6 +87,30 @@ pub fn build_from_node_in_injection(
     SelectionRange {
         range: adjust_range_to_host(node, content_start_byte, mapper),
         parent,
+    }
+}
+
+/// Effective (post-`#offset!`) window of `content_node` within `text`.
+///
+/// Offset deltas are byte counts and can land mid-codepoint, so the bounds
+/// are snapped inward to char boundaries (ceil the start, floor the end —
+/// matching the semantic and bridge paths) before callers slice `text` with
+/// them; a degenerate result collapses to an empty window instead of an
+/// inverted one. Without an offset the window is the content node span.
+fn effective_window_for(
+    text: &str,
+    content_node: &Node,
+    offset: Option<InjectionOffset>,
+) -> std::ops::Range<usize> {
+    match offset {
+        Some(off) => {
+            let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
+            let effective = calculate_effective_range(text, byte_range, off);
+            let start = ceil_char_boundary(text, effective.start);
+            let end = floor_char_boundary(text, effective.end);
+            start.min(end)..end
+        }
+        None => content_node.byte_range(),
     }
 }
 
@@ -177,13 +202,7 @@ pub fn build(
         return build_fallback();
     };
 
-    let effective_window = if let Some(offset) = offset_from_query {
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        let effective = calculate_effective_range(doc_ctx.text, byte_range, offset);
-        effective.start..effective.end
-    } else {
-        content_node.byte_range()
-    };
+    let effective_window = effective_window_for(doc_ctx.text, &content_node, offset_from_query);
     let content_text = &doc_ctx.text[effective_window.clone()];
     let effective_start_byte = effective_window.start;
 
@@ -304,15 +323,10 @@ fn build_nested_injection(
     }
 
     let offset = parse_offset_directive_for_pattern(injection_query, pattern_index);
-    let nested_window = if let Some(off) = offset {
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        let effective = calculate_effective_range(text, byte_range, off);
-        effective.start..effective.end
-    } else {
-        content_node.byte_range()
-    };
+    let nested_window = effective_window_for(text, &content_node, offset);
     let nested_text = &text[nested_window.clone()];
-    let nested_effective_start_byte = parent_start_byte + nested_window.start;
+    let nested_window_start = nested_window.start;
+    let nested_effective_start_byte = parent_start_byte + nested_window_start;
 
     let Some(mut nested_parser) = inj_ctx.acquire_parser(&nested_lang) else {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
@@ -333,13 +347,9 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
 
-    let nested_relative_byte = if let Some(off) = offset {
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        let effective = calculate_effective_range(text, byte_range, off);
-        cursor_byte.saturating_sub(effective.start)
-    } else {
-        cursor_byte.saturating_sub(content_node.start_byte())
-    };
+    // Relative to the snapped window start so it stays consistent with the
+    // sliced `nested_text`.
+    let nested_relative_byte = cursor_byte.saturating_sub(nested_window_start);
 
     let nested_root = nested_tree.root_node();
 
@@ -488,6 +498,47 @@ fn splice_effective_range_into_hierarchy(
 mod tests {
     use super::*;
     use crate::language::injection::collect_all_injections;
+
+    #[test]
+    fn effective_window_for_snaps_offset_to_char_boundaries() {
+        // Offsets are byte deltas; +1 into "あ" (3 bytes) lands mid-codepoint
+        // and would panic the `&text[window]` content slice without snapping.
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&rust_language)
+            .expect("set rust language");
+        let text = "let s = \"あい\";";
+        let tree = parser.parse(text, None).expect("parse rust");
+        let content = tree
+            .root_node()
+            .descendant_for_byte_range(9, 15)
+            .expect("string_content node");
+        assert_eq!(content.kind(), "string_content");
+        assert_eq!(content.byte_range(), 9..15);
+
+        let offset = InjectionOffset {
+            start_row: 0,
+            start_column: 1,
+            end_row: 0,
+            end_column: 0,
+        };
+        let window = effective_window_for(text, &content, Some(offset));
+        assert_eq!(window, 12..15, "start snaps forward past the mid-codepoint");
+        assert_eq!(&text[window], "い");
+
+        // Degenerate after snapping: both ends collapse into an empty window
+        // rather than an inverted (panicking) one.
+        let collapse = InjectionOffset {
+            start_row: 0,
+            start_column: 1,
+            end_row: 0,
+            end_column: -1,
+        };
+        let window = effective_window_for(text, &content, Some(collapse));
+        assert!(window.is_empty());
+        assert!(text.get(window).is_some(), "window must be sliceable");
+    }
 
     #[test]
     fn parse_with_included_ranges_strips_prefixes_inside_offset_window() {
