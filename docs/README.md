@@ -376,16 +376,20 @@ own features). The per-language `layers` map orders them per LSP method:
 | `order` | Ordered allowlist of layers, highest priority first. Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
 | `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only; until host bridging ships, at most one layer produces edits, so both strategies currently yield that layer's result. |
 
-The key is the LSP method name or `_` for the method wildcard, like
-`aggregation`. `textDocument/rangeFormatting` shares the
-`textDocument/formatting` key (same convention as `aggregation`). Diagnostics
-use two keys, mirroring their aggregation keying: pull diagnostics gate under
-`textDocument/diagnostic`, push diagnostics under
-`textDocument/publishDiagnostics` — disable both (or use `_`) to fully turn
-bridge diagnostics off. Today only the `virt` layer produces results —
-`host` is reserved until host-document bridging ships, and bridged methods
-have no `native` counterpart — so the practical effect is per-method
-enabling and disabling of injection bridging.
+Details:
+
+- **Key**: the LSP method name, or `_` for the method wildcard (same
+  convention as `aggregation`).
+- **Formatting**: `textDocument/rangeFormatting` shares the
+  `textDocument/formatting` key.
+- **Diagnostics**: two keys, mirroring their aggregation keying — pull
+  diagnostics gate under `textDocument/diagnostic`, push diagnostics under
+  `textDocument/publishDiagnostics`. Disable both (or use `_`) to fully turn
+  bridge diagnostics off.
+- **Current effect**: today only the `virt` layer produces results — `host`
+  is reserved until host-document bridging ships, and bridged methods have
+  no `native` counterpart — so the practical effect is per-method enabling
+  and disabling of injection bridging.
 
 **Bridge Filter Semantics:**
 

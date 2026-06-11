@@ -90,10 +90,13 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    `priorities` lists — see aggregation-priorities-wildcard. The pipeline adds
    one restriction: the `"*"` wildcard element is rejected with a warning,
    because "the rest" has no deterministic expansion order and a formatter
-   pipeline must be reproducible.) An active
-   `concatenated` strategy with an empty `priorities` is a misconfiguration and
-   falls back to `preferred` (with a warning), since order would otherwise be
-   undefined.
+   pipeline must be reproducible.) An active `concatenated` strategy whose
+   `priorities` carries **no explicit server name** — e.g. the resolved
+   default `["*"]` for an absent list — is a misconfiguration and falls back
+   to `preferred` (with a settings-apply warning), since the pipeline's order
+   would otherwise be undefined. An explicit `priorities = []` is *not* that
+   misconfiguration: under aggregation-priorities-wildcard it is the
+   deliberate per-method kill switch, and the region runs nothing.
 
 3. **Sequential application (single pass).** The pipeline seeds its initial region
    text from the host document **after parse completion** — never a half-parsed
