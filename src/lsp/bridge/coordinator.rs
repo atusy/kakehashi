@@ -51,9 +51,10 @@ pub(crate) struct ResolvedServerConfig {
 
 /// How a server's `languages` list matched an injection language.
 ///
-/// Ordered by specificity: `Exact` < `Wildcard`, so `Ord::min` selects the
-/// more specific match when one server lists the language explicitly and
-/// another relies on the `"_"` wildcard.
+/// The enum sorts from most- to least-specific: `Exact` orders before
+/// `Wildcard`, so taking the minimum selects the most specific match when
+/// one server lists the language explicitly and another relies on the `"_"`
+/// wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LanguageMatch {
     /// The injection language appears verbatim in `languages`.
