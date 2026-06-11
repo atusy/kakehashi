@@ -167,16 +167,16 @@ impl LivenessTimerState {
 
 /// RAII handle for a Reader task: dropping cancels and detaches the task.
 ///
-/// Drop semantics: cancelling the token unblocks the reader loop's `select!`;
-/// the JoinHandle is not awaited because async drop does not exist and the
-/// reader exits within one loop iteration on cancel/EOF/error. The shared
-/// token also lets a failing writer task cancel the reader (ls-bridge-message-ordering),
-/// avoiding CPU spin on orphaned channels.
+/// Drop semantics: dropping the guard cancels the token, which unblocks the
+/// reader loop's `select!`; the JoinHandle is not awaited because async drop
+/// does not exist and the reader exits within one loop iteration on
+/// cancel/EOF/error. On cancellation the loop fails all pending requests so
+/// waiters are not left hanging until the per-request timeout.
 pub(crate) struct ReaderTaskHandle {
     _join_handle: JoinHandle<()>,
 
-    /// Dropping cancels the token, signalling the reader loop to exit.
-    _cancel_token: CancellationToken,
+    /// Dropping the guard cancels the token, signalling the reader loop to exit.
+    _cancel_guard: tokio_util::sync::DropGuard,
 
     /// Notify reader when pending count goes 0→1 so it starts the liveness timer.
     liveness_start_tx: mpsc::Sender<()>,
@@ -323,7 +323,7 @@ pub(crate) fn spawn_reader_task_for_language(
 
     ReaderTaskHandle {
         _join_handle: join_handle,
-        _cancel_token: cancel_token,
+        _cancel_guard: cancel_token.drop_guard(),
         liveness_start_tx,
         liveness_stop_tx,
         liveness_failed_rx: std::sync::Mutex::new(Some(liveness_failed_rx)),
@@ -406,6 +406,10 @@ async fn reader_loop_with_liveness(
                     "{}Reader task cancelled, shutting down",
                     lang_prefix
                 );
+                // The router outlives this task (Arc-shared with ConnectionHandle),
+                // so pending waiters must be failed here or they hang until the
+                // per-request timeout.
+                router.fail_all("bridge: reader task cancelled");
                 break;
             }
 
@@ -871,6 +875,7 @@ mod tests {
         // Using `sleep` ensures the reader blocks waiting for input
         let mut child = Command::new("sleep")
             .arg("60")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -900,6 +905,105 @@ mod tests {
         );
 
         // Clean up
+        let _ = child.kill().await;
+    }
+
+    /// ReaderTaskHandle documents drop-cancels-the-task semantics. A plain
+    /// CancellationToken field does not deliver that: dropping a token never
+    /// cancels it, so the reader task (and its pending waiters) would leak
+    /// until child-process EOF.
+    #[tokio::test]
+    async fn dropping_reader_task_handle_cancels_reader_and_fails_pending() {
+        use crate::lsp::bridge::connection::BridgeReader;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        // Long-running process that never writes to stdout, so the loop can
+        // only exit via drop-triggered cancellation (not EOF).
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep should spawn");
+
+        let stdout = child.stdout.take().expect("stdout should be available");
+        let reader = BridgeReader::new(stdout);
+
+        let router = Arc::new(ResponseRouter::new());
+        let rx = router.register(RequestId::new(1)).unwrap();
+
+        let handle = spawn_reader_task(reader, Arc::clone(&router));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        drop(handle);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("pending request should fail promptly after handle drop")
+            .expect("should receive error response");
+        assert!(
+            response.get("error").is_some(),
+            "pending request should receive an error response when handle is dropped"
+        );
+
+        let _ = child.kill().await;
+    }
+
+    /// Pending requests must fail fast on cancellation: the ResponseRouter is
+    /// Arc-shared with ConnectionHandle, so reader exit alone does not drop the
+    /// pending oneshot senders — without fail_all, waiters hang until the
+    /// per-request timeout.
+    #[tokio::test]
+    async fn reader_loop_fails_all_on_cancellation() {
+        use crate::lsp::bridge::connection::BridgeReader;
+        use crate::lsp::bridge::protocol::RequestId;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        // Long-running process that never writes to stdout, so the loop can
+        // only exit via cancellation (not EOF).
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep should spawn");
+
+        let stdout = child.stdout.take().expect("stdout should be available");
+        let reader = BridgeReader::new(stdout);
+
+        let router = Arc::new(ResponseRouter::new());
+        let rx = router.register(RequestId::new(1)).unwrap();
+
+        let cancel_token = CancellationToken::new();
+        let token_clone = cancel_token.clone();
+
+        let handle = tokio::spawn(reader_loop(reader, Arc::clone(&router), token_clone));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        cancel_token.cancel();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            result.is_ok(),
+            "reader_loop should exit quickly after cancellation"
+        );
+
+        assert_eq!(
+            router.pending_count(),
+            0,
+            "cancellation should fail all pending requests"
+        );
+        let response = rx.await.expect("should receive error response");
+        assert!(
+            response.get("error").is_some(),
+            "pending request should receive an error response on cancellation"
+        );
+
         let _ = child.kill().await;
     }
 

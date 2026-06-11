@@ -113,9 +113,11 @@ pub(crate) fn spawn_writer_task(
 
 /// The main writer loop - writes messages from queue to stdin.
 ///
-/// Handles three shutdown paths: graceful stop drains the queue and returns the
-/// writer; cancellation drains and fails pending requests without returning the
-/// writer; channel close fails all pending and exits.
+/// Handles four shutdown paths: graceful stop drains the queue and returns the
+/// writer; a dropped stop sender (handle dropped without stop_and_reclaim)
+/// fails queued requests and exits; cancellation drains and fails pending
+/// requests without returning the writer; channel close fails all pending and
+/// exits.
 async fn writer_loop(
     mut writer: SplitConnectionWriter,
     mut rx: mpsc::Receiver<OutboundMessage>,
@@ -146,7 +148,7 @@ async fn writer_loop(
                             );
                             // Fail the request if write failed
                             if let OutboundMessage::Tracked { request_id, .. } = msg {
-                                router.fail_request(request_id, "bridge: write error during shutdown");
+                                router.fail_request(request_id, "write error during shutdown");
                             }
                         }
                     }
@@ -156,6 +158,20 @@ async fn writer_loop(
                     let _ = writer_tx.send(writer);
                     return;
                 }
+                // Err: stop sender dropped without a stop signal, i.e. the
+                // WriterTaskHandle was dropped without stop_and_reclaim().
+                // The completed oneshot must not be polled again (it panics),
+                // so treat this as forced shutdown like the cancellation arm.
+                log::debug!(
+                    target: "kakehashi::bridge::writer",
+                    "Writer stop channel closed, shutting down"
+                );
+                while let Ok(msg) = rx.try_recv() {
+                    if let OutboundMessage::Tracked { request_id, .. } = msg {
+                        router.fail_request(request_id, "connection closing");
+                    }
+                }
+                return;
             }
 
             // Priority 2: Check for cancellation
@@ -167,7 +183,7 @@ async fn writer_loop(
                 // Drain remaining queued requests and fail them
                 while let Ok(msg) = rx.try_recv() {
                     if let OutboundMessage::Tracked { request_id, .. } = msg {
-                        router.fail_request(request_id, "bridge: connection closing");
+                        router.fail_request(request_id, "connection closing");
                     }
                 }
                 // Don't send idle/writer - caller is force-cancelling
@@ -186,7 +202,7 @@ async fn writer_loop(
                             );
                             // Clean up request from router if write failed
                             if let OutboundMessage::Tracked { request_id, .. } = &outbound {
-                                router.fail_request(*request_id, "bridge: write error");
+                                router.fail_request(*request_id, "write error");
                             }
                             // Note: Connection will transition to Failed via reader task
                             // when it detects the write error (broken pipe, etc.)
@@ -293,6 +309,53 @@ mod tests {
         assert!(
             reclaimed.is_some(),
             "Should reclaim writer on graceful shutdown"
+        );
+    }
+
+    /// Dropping WriterTaskHandle without stop_and_reclaim() drops stop_tx,
+    /// completing stop_rx with Err. The loop must exit on that branch: a
+    /// completed oneshot panics if polled again on the next select! iteration.
+    #[tokio::test]
+    async fn writer_loop_exits_cleanly_when_stop_sender_dropped() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+
+        let (writer, _reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        // Keep tx alive so the loop cannot exit via the channel-closed path.
+        let (_tx, rx) = mpsc::channel(16);
+
+        let cancel_token = CancellationToken::new();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (idle_tx, _idle_rx) = oneshot::channel();
+        let (writer_tx, _writer_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(writer_loop(
+            writer,
+            rx,
+            Arc::clone(&router),
+            cancel_token,
+            stop_rx,
+            idle_tx,
+            writer_tx,
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Simulate handle drop without graceful shutdown: sender dropped
+        // without sending.
+        drop(stop_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let join = result.expect("writer_loop should exit promptly after stop sender drop");
+        assert!(
+            join.is_ok(),
+            "writer_loop must not panic when stop sender is dropped: {:?}",
+            join.err()
         );
     }
 
