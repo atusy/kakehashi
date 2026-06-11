@@ -18,9 +18,9 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, byte_to_point, ceil_char_boundary, collect_all_injections,
-    compute_included_ranges, compute_included_ranges_clipped, effective_offset_for_pattern,
-    floor_char_boundary, intersect_included_ranges,
+    MAX_INJECTION_DEPTH, byte_to_point, byte_to_point_anchored, ceil_char_boundary,
+    collect_all_injections, compute_included_ranges, compute_included_ranges_clipped,
+    effective_offset_for_pattern, floor_char_boundary, intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -563,17 +563,32 @@ fn build_effective_ranges(
             aligned_start..aligned_end,
         ) {
             Some(gaps) => {
-                let window_start_pos = byte_to_point(host_text, aligned_start);
+                let window_start_pos = byte_to_point_anchored(
+                    host_text,
+                    aligned_start,
+                    content_start,
+                    content_start_pos,
+                );
                 gaps.into_iter()
                     .map(|r| absolutize_range(r, aligned_start, window_start_pos))
                     .collect()
             }
-            None => vec![tree_sitter::Range {
-                start_byte: aligned_start,
-                end_byte: aligned_end,
-                start_point: byte_to_point(host_text, aligned_start),
-                end_point: byte_to_point(host_text, aligned_end),
-            }],
+            None => {
+                let start_point = byte_to_point_anchored(
+                    host_text,
+                    aligned_start,
+                    content_start,
+                    content_start_pos,
+                );
+                let end_point =
+                    byte_to_point_anchored(host_text, aligned_end, aligned_start, start_point);
+                vec![tree_sitter::Range {
+                    start_byte: aligned_start,
+                    end_byte: aligned_end,
+                    start_point,
+                    end_point,
+                }]
+            }
         }
     } else {
         match compute_included_ranges(&region.content_node, region.include_children) {

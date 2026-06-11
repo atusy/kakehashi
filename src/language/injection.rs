@@ -236,9 +236,8 @@ pub(crate) fn compute_included_ranges(
         content_node,
         include_children,
         content_node.start_byte(),
-        content_node.start_position(),
         content_node.end_byte(),
-        content_node.end_position(),
+        || (content_node.start_position(), content_node.end_position()),
     )
 }
 
@@ -263,23 +262,33 @@ pub(crate) fn compute_included_ranges_clipped(
         content_node,
         include_children,
         window.start,
-        byte_to_point(text, window.start),
         window.end,
-        byte_to_point(text, window.end),
+        || {
+            // Anchor the scans on the content node's cached position so we only
+            // walk the (typically small) span between the node start and the
+            // window edges, not the whole document prefix. Lazy: skipped entirely
+            // when the guards in the core return early.
+            let anchor_byte = content_node.start_byte();
+            let anchor_point = content_node.start_position();
+            let start = byte_to_point_anchored(text, window.start, anchor_byte, anchor_point);
+            let end = byte_to_point_anchored(text, window.end, window.start, start);
+            (start, end)
+        },
     )
 }
 
 /// Shared core of [`compute_included_ranges`] /
 /// [`compute_included_ranges_clipped`]: gaps between the content node's named
 /// children, restricted to `[window_start_byte, window_end_byte)` and
-/// relativized to the window start.
+/// relativized to the window start. `window_points` lazily supplies the
+/// window bounds' Points — it is only invoked once the guards have decided
+/// gaps actually need computing.
 fn compute_included_ranges_in_window(
     content_node: &tree_sitter::Node,
     include_children: bool,
     window_start_byte: usize,
-    window_start_point: tree_sitter::Point,
     window_end_byte: usize,
-    window_end_point: tree_sitter::Point,
+    window_points: impl FnOnce() -> (tree_sitter::Point, tree_sitter::Point),
 ) -> Option<Vec<tree_sitter::Range>> {
     if include_children || content_node.named_child_count() == 0 {
         return None;
@@ -298,6 +307,8 @@ fn compute_included_ranges_in_window(
     if !has_nonzero_children {
         return None;
     }
+
+    let (window_start_point, window_end_point) = window_points();
 
     // Helper to make a Point relative to the window's start.
     // Column is only adjusted when the point is on the same row as the window
@@ -802,6 +813,35 @@ pub(crate) fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
         None => clamped,
     };
     tree_sitter::Point { row, column }
+}
+
+/// Like [`byte_to_point`], but scans only the span between a known anchor
+/// and `byte` instead of the whole prefix of `text` — the anchor is
+/// typically a tree-sitter node's cached `start_position()`. Falls back to a
+/// full scan when `byte` precedes the anchor (e.g. a negative `#offset!`
+/// extending before the content node). `anchor_byte` must lie on a char
+/// boundary, with `anchor_point` its Point in `text`.
+pub(crate) fn byte_to_point_anchored(
+    text: &str,
+    byte: usize,
+    anchor_byte: usize,
+    anchor_point: tree_sitter::Point,
+) -> tree_sitter::Point {
+    let clamped = floor_char_boundary(text, byte);
+    if clamped < anchor_byte {
+        return byte_to_point(text, clamped);
+    }
+    let segment = &text[anchor_byte..clamped];
+    match segment.rfind('\n') {
+        Some(last_nl) => tree_sitter::Point {
+            row: anchor_point.row + segment.bytes().filter(|b| *b == b'\n').count(),
+            column: segment.len() - last_nl - 1,
+        },
+        None => tree_sitter::Point {
+            row: anchor_point.row,
+            column: anchor_point.column + segment.len(),
+        },
+    }
 }
 
 /// Snap `index` forward to the nearest char boundary (stable alternative to
@@ -2318,6 +2358,23 @@ mod tests {
             covered.iter().all(|&b| b),
             "Gaps + children should cover the entire node"
         );
+    }
+
+    #[test]
+    fn test_byte_to_point_anchored_matches_full_scan() {
+        // Exhaustive equivalence with the full-prefix scan, covering the
+        // before-anchor fallback, same-row and cross-row targets, and
+        // mid-codepoint clamping (bytes inside あ floor to its start).
+        let text = "abc\ndefあ\nghi";
+        let anchor_byte = 4; // start of "def"
+        let anchor_point = byte_to_point(text, anchor_byte);
+        for byte in 0..=text.len() {
+            assert_eq!(
+                byte_to_point_anchored(text, byte, anchor_byte, anchor_point),
+                byte_to_point(text, byte),
+                "anchored and full scans must agree at byte {byte}"
+            );
+        }
     }
 
     #[test]
