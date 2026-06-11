@@ -66,10 +66,7 @@ impl DocCompletion {
     /// `send_if_modified` keeps an out-of-order completion (ledger insert,
     /// `done` unchanged) from spuriously waking every waiter.
     fn complete(&self, ticket: u64) {
-        let mut early = self
-            .early
-            .lock()
-            .recover_poison("DocCompletion::complete");
+        let mut early = self.early.lock().recover_poison("DocCompletion::complete");
         self.done.send_if_modified(|done| {
             if ticket == *done + 1 {
                 *done = ticket;
@@ -207,13 +204,14 @@ enum Role {
 ///
 /// Readers are the tree-snapshotting request families: `semanticTokens`
 /// (including `range`, which never had the in-handler `edit_lock` settle),
-/// the `kakehashi/captures` triple, which mirrors it, and the formatting
-/// requests — their `TextEdit`s are applied by the client to its current
-/// text, so edits computed against a stale snapshot corrupt the document.
-/// The `kakehashi/node/*` protocol stays unclassified on purpose: node ids
-/// carry their own staleness handling (`null` → client re-acquires), so
-/// gating those point lookups would add latency without changing observable
-/// behavior.
+/// the `kakehashi/captures` triple, which mirrors it, and the edit-producing
+/// requests (formatting, rename) — their edits are applied by the client to
+/// its current text, so edits computed against a stale snapshot corrupt the
+/// document. `textDocument/codeAction` belongs in the same class once it is
+/// implemented (#352). The `kakehashi/node/*` protocol stays unclassified on
+/// purpose: node ids carry their own staleness handling (`null` → client
+/// re-acquires), so gating those point lookups would add latency without
+/// changing observable behavior.
 fn classify(req: &Request) -> Option<Role> {
     let close = match req.method() {
         "textDocument/didOpen" | "textDocument/didChange" => false,
@@ -223,6 +221,8 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/semanticTokens/range"
         | "textDocument/formatting"
         | "textDocument/rangeFormatting"
+        | "textDocument/rename"
+        | "textDocument/prepareRename"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
         | "kakehashi/captures/range" => {
@@ -491,6 +491,8 @@ mod tests {
             "textDocument/semanticTokens/range",
             "textDocument/formatting",
             "textDocument/rangeFormatting",
+            "textDocument/rename",
+            "textDocument/prepareRename",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
             "kakehashi/captures/range",
