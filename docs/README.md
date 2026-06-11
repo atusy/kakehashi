@@ -308,7 +308,7 @@ Configure language servers for bridging LSP requests in injection regions.
 | Field | Description |
 |-------|-------------|
 | `cmd` | Command and arguments to start the language server |
-| `languages` | Languages this server handles |
+| `languages` | Languages this server handles. Use `"_"` as a wildcard to match any injection language (e.g., `["_"]` for a generic formatter like efm-langserver). |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
 
 **Bridge Language Configuration:**

@@ -180,6 +180,20 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
+    /// Whether a server's `languages` list covers `injection_language`.
+    ///
+    /// `"_"` is a wildcard matching any injection language, consistent with
+    /// the wildcard convention used elsewhere in the config
+    /// (`languageServers._`, `languages._`). The host-language bridge filter
+    /// is enforced separately by the callers, so a wildcard server still
+    /// only sees languages the host allows.
+    fn server_handles_language(config: &BridgeServerConfig, injection_language: &str) -> bool {
+        config
+            .languages
+            .iter()
+            .any(|l| l == "_" || l == injection_language)
+    }
+
     /// Resolve `bridge.servers` for `injection_language`, returning the
     /// `ResolvedServerConfig` (server name for pooling + spawn config) or
     /// `None` when no server matches, or the host's bridge filter excludes
@@ -220,7 +234,7 @@ impl BridgeCoordinator {
 
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| Self::server_handles_language(c, injection_language))
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -270,7 +284,7 @@ impl BridgeCoordinator {
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| Self::server_handles_language(c, injection_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -691,6 +705,167 @@ mod tests {
         let resolved = result.unwrap();
         assert_eq!(resolved.server_name, "rust-analyzer");
         assert_eq!(resolved.config.cmd, vec!["rust-analyzer".to_string()]);
+    }
+
+    #[test]
+    fn test_get_config_wildcard_language_matches_any_injection_language() {
+        let coordinator = BridgeCoordinator::new();
+
+        // efm-langserver style: one server attached to every injection language
+        let mut servers = HashMap::new();
+        servers.insert(
+            "efm".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["efm-langserver".to_string()],
+                languages: vec!["_".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        for injection_language in ["rust", "python", "lua"] {
+            let result =
+                coordinator.get_config_for_language(&settings, "markdown", injection_language);
+            assert!(
+                result.is_some(),
+                "wildcard languages should match {injection_language}"
+            );
+            assert_eq!(result.unwrap().server_name, "efm");
+        }
+    }
+
+    #[test]
+    fn test_get_config_wildcard_mixed_with_exact_language_still_matches() {
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "efm".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["efm-langserver".to_string()],
+                languages: vec!["_".to_string(), "python".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        // exact entry still matches
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "python")
+                .is_some(),
+            "exact language listed alongside wildcard should match"
+        );
+        // wildcard entry matches everything else
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "rust")
+                .is_some(),
+            "wildcard listed alongside exact language should match other languages"
+        );
+    }
+
+    #[test]
+    fn test_get_all_configs_wildcard_server_included_with_exact_servers() {
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "pyright".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["pyright-langserver".to_string()],
+                languages: vec!["python".to_string()],
+                initialization_options: None,
+            },
+        );
+        servers.insert(
+            "efm".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["efm-langserver".to_string()],
+                languages: vec!["_".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        let result = coordinator.get_all_configs_for_language(&settings, "markdown", "python");
+        let names: Vec<&str> = result.iter().map(|r| r.server_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["efm", "pyright"],
+            "wildcard server should fan out together with exact-match servers"
+        );
+    }
+
+    #[test]
+    fn test_get_config_wildcard_language_still_respects_bridge_filter() {
+        let coordinator = BridgeCoordinator::new();
+
+        // markdown host only allows python bridging
+        let mut languages = HashMap::new();
+        let mut bridge_filter = HashMap::new();
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        );
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
+        );
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "efm".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["efm-langserver".to_string()],
+                languages: vec!["_".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "rust")
+                .is_none(),
+            "host bridge filter must still block languages even for wildcard servers"
+        );
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "python")
+                .is_some(),
+            "wildcard server should match languages allowed by the host bridge filter"
+        );
     }
 
     #[test]

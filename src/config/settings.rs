@@ -145,7 +145,9 @@ pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"]
     pub cmd: Vec<String>,
-    /// Languages this server handles (e.g., ["rust"], ["python"])
+    /// Languages this server handles (e.g., ["rust"], ["python"]).
+    /// Use "_" as a wildcard to match any injection language
+    /// (e.g., ["_"] for a generic formatter like efm-langserver).
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
     pub initialization_options: Option<Value>,
