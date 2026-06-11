@@ -9,6 +9,7 @@ mod synthetic_diagnostics;
 mod text_sync;
 
 mod aggregation;
+mod ingress_order;
 mod lsp_impl;
 mod progress;
 mod request_id;
@@ -16,6 +17,7 @@ mod semantic_request_tracker;
 mod settings;
 
 pub use bridge::LanguageServerPool;
+pub use ingress_order::IngressOrderGate;
 pub use lsp_impl::Kakehashi;
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
