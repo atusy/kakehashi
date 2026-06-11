@@ -1194,3 +1194,59 @@ fn test_child_with_descendant_rejects_cross_layer_pair() {
         cross
     );
 }
+
+/// The two-id contract also holds **inside** an injection layer: with both ids
+/// minted in the python layer (layer 1), the immediate child resolves through
+/// the pair path that rebuilds the injection stack, and `descendant == self`
+/// still collapses to `null` there.
+#[test]
+fn test_child_with_descendant_in_injection_layer() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_cwd_injection.md";
+    open_markdown(&mut client, uri, BLOCKQUOTED_PYTHON);
+
+    let python_root = python_layer_root(&mut client, uri);
+    let children = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &python_root),
+    );
+    let child = &children.as_array().expect("python children array")[0];
+    let child_id = id_of(child);
+    let grandchildren = call(
+        &mut client,
+        "kakehashi/node/children",
+        id_params(uri, &child_id),
+    );
+    let grandchild_id = id_of(
+        &grandchildren
+            .as_array()
+            .expect("python grandchildren array")[0],
+    );
+
+    let via_grandchild = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &python_root, &grandchild_id),
+    );
+    assert!(
+        !via_grandchild.is_null(),
+        "childWithDescendant must resolve inside an injection layer"
+    );
+    assert_eq!(
+        id_of(&via_grandchild),
+        child_id,
+        "must return the immediate python-layer child containing the descendant"
+    );
+
+    let self_pair = call(
+        &mut client,
+        "kakehashi/node/childWithDescendant",
+        descendant_params(uri, &python_root, &python_root),
+    );
+    assert!(
+        self_pair.is_null(),
+        "descendant == self must be null in an injection layer too"
+    );
+}

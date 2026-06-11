@@ -361,6 +361,18 @@ impl Kakehashi {
             return Value::Null;
         };
 
+        // Silent stale-range guard, mirroring the single-id prelude: an
+        // invalid tracked range can't name a real node and must collapse to
+        // null *without* the drift warning below — `with_resolved_node_pair`
+        // would also reject it, but through the warn-logging arm.
+        if start > end
+            || end > host_text.len()
+            || desc_start > desc_end
+            || desc_end > host_text.len()
+        {
+            return Value::Null;
+        }
+
         let Some(picked) = with_resolved_node_pair(
             &self.language,
             &host_language,
