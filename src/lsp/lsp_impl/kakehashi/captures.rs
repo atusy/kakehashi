@@ -304,9 +304,13 @@ impl Kakehashi {
         let uri = computed.uri;
         let edit_lock = self.documents.edit_lock(&uri);
         let _guard = edit_lock.lock().await;
-        if self.documents.get(&uri).is_some()
-            && self.documents.open_generation(&uri) == computed.open_generation
-        {
+        // Separate statement so the documents Ref (a shard read lock) drops
+        // before open_generation's entry() takes an open_generations shard
+        // write — holding a Ref across another map's write acquisition is
+        // the lock-order half of a latent ABBA inversion (see
+        // forget_open_generation_if_closed).
+        let document_is_open = self.documents.get(&uri).is_some();
+        if document_is_open && self.documents.open_generation(&uri) == computed.open_generation {
             let mut entry = self.captures_cache.entry((uri, kind)).or_default();
             entry[usize::from(injection)] = Some((result_id, computed.matches));
         }

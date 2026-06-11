@@ -122,6 +122,12 @@ pub(crate) struct SplitConnectionWriter {
 }
 
 impl SplitConnectionWriter {
+    /// Child process id, exposed so tests can assert the process really dies.
+    #[cfg(test)]
+    pub(crate) fn child_id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Write a JSON-RPC message to the child process stdin.
     pub(crate) async fn write_message(
         &mut self,

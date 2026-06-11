@@ -288,13 +288,20 @@ impl DocumentStore {
     /// have no document — the cleanup for an [`open_generation`](Self::open_generation)
     /// ask that raced a `didClose`. Safety does not depend on this (the
     /// counter is monotonic, so a pre-close generation can never equal any
-    /// later one); it only prevents entries accumulating for closed URIs. The
-    /// removal re-checks absence so a concurrent reopen's live entry is left
-    /// alone; losing that race merely hands the reopened document a fresh
-    /// number on its next ask, which is the conservative direction.
+    /// later one); it only prevents entries accumulating for closed URIs.
+    /// Check-then-remove rather than `remove_if`: the predicate would read
+    /// `documents` while holding the `open_generations` shard write lock,
+    /// inverting the documents → open_generations order taken by callers
+    /// that hold a document `Ref` while asking for the generation — a latent
+    /// ABBA deadlock under a writer-preferring shard lock. The TOCTOU this
+    /// opens (a reopen racing between check and removal loses its entry)
+    /// merely hands the reopened document a fresh number on its next ask,
+    /// which is the conservative direction.
     pub(crate) fn forget_open_generation_if_closed(&self, uri: &Url) {
-        self.open_generations
-            .remove_if(uri, |_, _| self.documents.get(uri).is_none());
+        if self.documents.get(uri).is_some() {
+            return;
+        }
+        self.open_generations.remove(uri);
     }
 }
 
@@ -305,6 +312,39 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[test]
+    fn forget_open_generation_keeps_live_document_entry() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///gen.rs").unwrap();
+        store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+        let generation = store.open_generation(&uri);
+
+        store.forget_open_generation_if_closed(&uri);
+
+        assert_eq!(
+            store.open_generation(&uri),
+            generation,
+            "cleanup must not disturb the generation of an open document"
+        );
+    }
+
+    #[test]
+    fn forget_open_generation_drops_entry_for_closed_document() {
+        let store = DocumentStore::new();
+        let uri = Url::parse("file:///gen.rs").unwrap();
+        // A generation asked while no document exists (request racing didClose)
+        let stale = store.open_generation(&uri);
+
+        store.forget_open_generation_if_closed(&uri);
+
+        store.insert(uri.clone(), "x".to_string(), Some("rust".to_string()), None);
+        assert_ne!(
+            store.open_generation(&uri),
+            stale,
+            "a closed URI's entry must be dropped so a reopen draws a fresh generation"
+        );
+    }
 
     #[test]
     fn test_concurrent_update_and_get_no_deadlock() {

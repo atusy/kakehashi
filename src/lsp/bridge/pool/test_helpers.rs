@@ -73,6 +73,29 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
     }
 }
 
+/// `ps -o stat= -p` snapshot: `Ok(Some(state))` while the process exists
+/// (zombies show as `Z…`), `Ok(None)` once it is gone/reaped. For tests that
+/// assert a child process actually dies. `Err` means `ps` itself could not
+/// run (sandboxed runners) — callers should skip rather than fail.
+#[cfg(unix)]
+pub(in crate::lsp::bridge) fn process_stat(pid: u32) -> std::io::Result<Option<String>> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()?;
+    let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stat.is_empty() {
+        return Ok(Some(stat));
+    }
+    // Empty stdout is ambiguous: a gone pid makes ps exit non-zero silently,
+    // while a restricted environment's failing ps reports on stderr. Surface
+    // the latter as Err so callers skip instead of vacuously passing.
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(std::io::Error::other(format!("ps failed: {stderr}")));
+    }
+    Ok(None)
+}
+
 /// Helper function to convert url::Url to tower_lsp_server::ls_types::Uri for tests.
 pub(in crate::lsp::bridge) fn url_to_uri(url: &Url) -> tower_lsp_server::ls_types::Uri {
     crate::lsp::lsp_impl::url_to_uri(url).expect("test URL should convert to URI")
@@ -91,6 +114,14 @@ pub(in crate::lsp::bridge) fn test_host_uri(name: &str) -> Url {
 /// these are correctly classified as ServerRequest rather than Response,
 /// causing shutdown handshakes to hang.
 pub async fn create_handle_with_state(state: ConnectionState) -> Arc<ConnectionHandle> {
+    create_handle_with_state_and_pid(state).await.0
+}
+
+/// Like [`create_handle_with_state`], but also returns the sink child's pid
+/// so tests can assert the process actually dies (e.g. kill-on-timeout paths).
+pub async fn create_handle_with_state_and_pid(
+    state: ConnectionState,
+) -> (Arc<ConnectionHandle>, u32) {
     // Create a mock server process (sink — discards all input, no output)
     let mut conn = AsyncBridgeConnection::spawn(vec![
         "sh".to_string(),
@@ -102,10 +133,11 @@ pub async fn create_handle_with_state(state: ConnectionState) -> Arc<ConnectionH
 
     // Split connection and spawn reader task (new architecture)
     let (writer, reader) = conn.split();
+    let pid = writer.child_id().expect("sink child should have a pid");
     let router = Arc::new(ResponseRouter::new());
     let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
 
     let handle = Arc::new(ConnectionHandle::new(writer, router, reader_handle));
     handle.set_state(state);
-    handle
+    (handle, pid)
 }

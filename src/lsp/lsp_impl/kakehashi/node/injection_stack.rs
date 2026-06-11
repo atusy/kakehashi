@@ -18,9 +18,9 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, byte_to_point, byte_to_point_anchored, ceil_char_boundary,
-    collect_all_injections, compute_included_ranges, compute_included_ranges_clipped,
-    effective_offset_for_pattern, floor_char_boundary, intersect_included_ranges,
+    MAX_INJECTION_DEPTH, byte_to_point, byte_to_point_anchored, collect_all_injections,
+    compute_included_ranges, compute_included_ranges_clipped, effective_offset_for_pattern,
+    intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -542,49 +542,30 @@ fn build_effective_ranges(
     let content_start = region.content_node.start_byte();
     let content_start_pos = region.content_node.start_position();
     let absolute_ranges: Vec<tree_sitter::Range> = if offset.is_some() {
-        // #offset! shifts are byte arithmetic over i32 deltas, so the effective
-        // bounds can land mid-codepoint. Snap inward to UTF-8 boundaries
-        // (ceil the start, floor the end — matching the semantic and bridge
-        // paths) before handing them to tree-sitter: a mid-char byte in
-        // set_included_ranges is UB / panic territory, and flooring the start
-        // would re-include bytes the offset meant to exclude.
-        let aligned_start = ceil_char_boundary(host_text, eff_start);
-        let aligned_end = floor_char_boundary(host_text, eff_end);
-        // The alignment could, in pathological cases, collapse the range
-        // (e.g. both ends fall inside the same multi-byte char). Guard so we
-        // never emit a zero/negative-width range to the parser.
-        if aligned_start >= aligned_end {
-            return Vec::new();
-        }
+        // calculate_effective_range already clamped, snapped inward to UTF-8
+        // boundaries, and normalized start <= end, so eff_start/eff_end are
+        // safe to hand to tree-sitter (a mid-char byte in set_included_ranges
+        // is UB / panic territory); the degenerate case returned above.
         match compute_included_ranges_clipped(
             &region.content_node,
             region.include_children,
             host_text,
-            aligned_start..aligned_end,
+            eff_start..eff_end,
         ) {
             Some(gaps) => {
-                let window_start_pos = byte_to_point_anchored(
-                    host_text,
-                    aligned_start,
-                    content_start,
-                    content_start_pos,
-                );
+                let window_start_pos =
+                    byte_to_point_anchored(host_text, eff_start, content_start, content_start_pos);
                 gaps.into_iter()
-                    .map(|r| absolutize_range(r, aligned_start, window_start_pos))
+                    .map(|r| absolutize_range(r, eff_start, window_start_pos))
                     .collect()
             }
             None => {
-                let start_point = byte_to_point_anchored(
-                    host_text,
-                    aligned_start,
-                    content_start,
-                    content_start_pos,
-                );
-                let end_point =
-                    byte_to_point_anchored(host_text, aligned_end, aligned_start, start_point);
+                let start_point =
+                    byte_to_point_anchored(host_text, eff_start, content_start, content_start_pos);
+                let end_point = byte_to_point_anchored(host_text, eff_end, eff_start, start_point);
                 vec![tree_sitter::Range {
-                    start_byte: aligned_start,
-                    end_byte: aligned_end,
+                    start_byte: eff_start,
+                    end_byte: eff_end,
                     start_point,
                     end_point,
                 }]

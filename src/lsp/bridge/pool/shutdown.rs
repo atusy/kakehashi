@@ -177,6 +177,7 @@ impl LanguageServerPool {
                 let handle_for_shutdown = Arc::clone(&handle);
                 let shutdown_task =
                     tokio::spawn(async move { handle_for_shutdown.graceful_shutdown().await });
+                let shutdown_abort = shutdown_task.abort_handle();
 
                 match tokio::time::timeout(FORCE_KILL_TIMEOUT, shutdown_task).await {
                     Ok(Ok(_)) => {
@@ -194,7 +195,15 @@ impl LanguageServerPool {
                         handle.complete_shutdown();
                     }
                     Err(_) => {
-                        // The graceful_shutdown task timed out.
+                        // The graceful_shutdown task timed out. Abort it:
+                        // graceful_shutdown has no internal timeout (its
+                        // response wait is unbounded by design), so dropping
+                        // the JoinHandle alone would leave it running detached
+                        // — still holding the reclaimed writer and thus the
+                        // child process — until runtime shutdown. Aborting
+                        // drops the future and the writer's Drop kills the
+                        // child, same as abort_all() in the first phase.
+                        shutdown_abort.abort();
                         log::warn!(
                             target: "kakehashi::bridge",
                             "Force-kill timeout for {} connection, marking as closed",
@@ -208,5 +217,57 @@ impl LanguageServerPool {
 
         // Wait for all force-kills to complete
         Self::drain_join_set(&mut join_set, "Force-kill task").await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::lsp::bridge::pool::test_helpers::{create_handle_with_state_and_pid, process_stat};
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    /// A sink server never answers the shutdown request, so its
+    /// graceful_shutdown blocks forever on the response wait and force-kill
+    /// hits the timeout arm. That arm must abort the still-running shutdown
+    /// task: aborting drops the reclaimed writer, whose Drop kills the child.
+    /// Without the abort the task lingers detached, the writer stays alive,
+    /// and the child survives until process exit.
+    ///
+    /// Unix-only: probes child liveness via `ps`, like the other shutdown
+    /// lifecycle tests.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_kill_timeout_aborts_shutdown_task_and_kills_child() {
+        let (handle, pid) = create_handle_with_state_and_pid(ConnectionState::Ready).await;
+        let pool = LanguageServerPool::new();
+        pool.connections
+            .lock()
+            .await
+            .insert("lua".to_string(), handle);
+
+        pool.force_kill_all().await;
+
+        // Dead means reaped (None) or zombie (Z…); allow a short grace for
+        // the kill to land after the abort.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_stat(pid) {
+                Err(e) => {
+                    eprintln!("Skipping child-liveness assertion: ps unavailable ({e})");
+                    return;
+                }
+                Ok(None) => break,
+                Ok(Some(stat)) if stat.starts_with('Z') => break,
+                Ok(Some(stat)) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "sink child {pid} still running (stat {stat}) after force_kill_all"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 }

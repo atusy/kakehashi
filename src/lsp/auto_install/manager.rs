@@ -118,6 +118,24 @@ impl std::fmt::Debug for AutoInstallManager {
     }
 }
 
+/// RAII marker for an in-flight install: clears the `InstallingLanguages`
+/// entry on drop. Manual `finish_install` calls would leak the marker if the
+/// calling future were dropped at an await, leaving the language stuck
+/// `AlreadyInstalling` (and, via `should_skip_parse`, never parsed) for the
+/// server's lifetime. For the install itself the guard moves into the
+/// spawned install task, so it tracks the blocking work's true lifetime
+/// rather than the caller's.
+struct InstallMarkerGuard {
+    installing: InstallingLanguages,
+    language: String,
+}
+
+impl Drop for InstallMarkerGuard {
+    fn drop(&mut self) {
+        self.installing.finish_install(&self.language);
+    }
+}
+
 impl AutoInstallManager {
     /// Create a new `AutoInstallManager`.
     pub fn new(
@@ -246,6 +264,10 @@ impl AutoInstallManager {
                 events,
             };
         }
+        let install_marker = InstallMarkerGuard {
+            installing: self.installing_languages.clone(),
+            language: language.to_string(),
+        };
 
         // Progress begin
         events.push(InstallEvent::ProgressBegin);
@@ -259,7 +281,6 @@ impl AutoInstallManager {
                     message: "Could not determine data directory for auto-install".to_string(),
                 });
                 events.push(InstallEvent::ProgressEnd { success: false });
-                self.installing_languages.finish_install(language);
                 return InstallResult {
                     outcome: InstallOutcome::NoDataDir,
                     events,
@@ -277,7 +298,6 @@ impl AutoInstallManager {
                 ),
             });
             events.push(InstallEvent::ProgressEnd { success: true });
-            self.installing_languages.finish_install(language);
             return InstallResult {
                 outcome: InstallOutcome::AlreadyExists {
                     data_dir: data_dir.clone(),
@@ -292,13 +312,33 @@ impl AutoInstallManager {
             message: format!("Auto-installing language '{}' in background...", language),
         });
 
-        // Run the actual installation
+        // Run the actual installation in its own task that owns the marker:
+        // the blocking install keeps running even if this caller is cancelled
+        // at the await, so clearing the marker on caller-drop would let a
+        // retry race the still-running install on the same parser/query
+        // paths. Owned by the task, the marker is held until the install
+        // truly finishes (the task itself is never cancelled).
         let lang = language.to_string();
-        let result =
-            crate::install::install_language_async(lang.clone(), data_dir.clone(), false).await;
-
-        // Mark installation as complete
-        self.installing_languages.finish_install(&lang);
+        let task_lang = lang.clone();
+        let task_data_dir = data_dir.clone();
+        let install_task = tokio::spawn(async move {
+            let _marker = install_marker;
+            crate::install::install_language_async(task_lang, task_data_dir, false).await
+        });
+        let result = match install_task.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                events.push(InstallEvent::ProgressEnd { success: false });
+                events.push(InstallEvent::Log {
+                    level: MessageType::ERROR,
+                    message: format!("Install task for '{}' failed: {}", lang, join_error),
+                });
+                return InstallResult {
+                    outcome: InstallOutcome::Failed,
+                    events,
+                };
+            }
+        };
 
         // Check if parser file exists after install attempt (even if queries failed)
         let parser_exists = crate::install::parser_file_exists(&lang, &data_dir).is_some();
@@ -397,6 +437,24 @@ mod tests {
 
         // Parser should not be marked as failed
         assert!(!manager.is_parser_failed("lua"));
+    }
+
+    #[test]
+    fn install_marker_guard_releases_on_drop() {
+        let installing = InstallingLanguages::new();
+        assert!(installing.try_start_install("lua"));
+
+        let guard = InstallMarkerGuard {
+            installing: installing.clone(),
+            language: "lua".to_string(),
+        };
+        drop(guard);
+
+        assert!(
+            installing.try_start_install("lua"),
+            "marker must be released when the guard drops, even if try_install \
+             is cancelled at its install await"
+        );
     }
 
     #[tokio::test]

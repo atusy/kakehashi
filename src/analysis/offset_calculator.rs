@@ -1,4 +1,4 @@
-use crate::language::injection::InjectionOffset;
+use crate::language::injection::{InjectionOffset, ceil_char_boundary, floor_char_boundary};
 
 /// Represents a byte range with start and end positions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +28,9 @@ impl EffectiveRange {
 
 /// Calculates the effective range by applying both row and column offsets
 ///
-/// This function clamps the resulting range to `[0, text.len()]` and ensures
+/// This function clamps the resulting range to `[0, text.len()]`, snaps both
+/// ends inward to char boundaries (column deltas are byte counts, so a
+/// misconfigured query can land inside a multi-byte character), and ensures
 /// `start <= end` to prevent panics when slicing. Malformed or malicious
 /// query offsets cannot crash the server.
 pub fn calculate_effective_range(
@@ -56,16 +58,16 @@ pub fn calculate_effective_range(
         (start, end)
     };
 
-    // Clamp to valid range [0, text.len()]
-    let clamped_start = raw_start.min(text_len);
-    let clamped_end = raw_end.min(text_len);
+    // Clamp to valid range [0, text.len()] and snap inward to char boundaries
+    let snapped_start = ceil_char_boundary(text, raw_start.min(text_len));
+    let snapped_end = floor_char_boundary(text, raw_end.min(text_len));
 
     // Ensure start <= end invariant
-    let (final_start, final_end) = if clamped_start <= clamped_end {
-        (clamped_start, clamped_end)
+    let (final_start, final_end) = if snapped_start <= snapped_end {
+        (snapped_start, snapped_end)
     } else {
-        // When start > end, return empty range at clamped_end
-        (clamped_end, clamped_end)
+        // When start > end, return empty range at snapped_end
+        (snapped_end, snapped_end)
     };
 
     EffectiveRange::new(final_start, final_end)
@@ -175,6 +177,20 @@ mod tests {
         ByteRange::new(0, 6),
         InjectionOffset { start_row: 0, start_column: 0, end_row: 5, end_column: 0 },
         "row offset moving end beyond last line"
+    )]
+    #[case::start_lands_mid_multibyte_char(
+        "aあいう",
+        ByteRange::new(0, 10),
+        InjectionOffset { start_row: 0, start_column: 2, end_row: 0, end_column: 0 },
+        "column offsets are byte counts; +2 lands inside あ (bytes 1..4) \
+         and must snap to a char boundary so slicing cannot panic"
+    )]
+    #[case::end_lands_mid_multibyte_char(
+        "あいう",
+        ByteRange::new(0, 9),
+        InjectionOffset { start_row: 0, start_column: 0, end_row: 0, end_column: -1 },
+        "column offsets are byte counts; -1 lands inside う (bytes 6..9) \
+         and must snap to a char boundary so slicing cannot panic"
     )]
     fn test_offset_clamping_edge_cases(
         #[case] text: &str,

@@ -32,16 +32,18 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        // Get document
-        let Some(doc) = self.documents.get(&uri) else {
-            return Ok(None);
+        // Take what the on-demand parse needs and drop the Ref at the block's
+        // end: a DashMap Ref held across an .await keeps the shard read-locked
+        // while this task is parked, stalling didOpen/didChange writers.
+        let unparsed_text = {
+            let Some(doc) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            doc.tree().is_none().then(|| doc.text().to_string())
         };
 
-        // Check if document has a tree, if not parse it on-demand
-        if doc.tree().is_none() {
-            let text = doc.text().to_string();
-            drop(doc); // Release lock before acquiring parser pool
-
+        // Parse on-demand if the document has no tree yet
+        if let Some(text) = unparsed_text {
             let text_clone = text.clone();
 
             let sync_parse_result = self
@@ -52,27 +54,43 @@ impl Kakehashi {
                 })
                 .await;
 
-            if let Some(tree) = sync_parse_result {
-                self.documents
-                    .update_document(uri.clone(), text, Some(tree));
-            } else {
-                return Ok(None);
-            }
-
-            // Re-acquire document after update
-            let Some(doc) = self.documents.get(&uri) else {
+            let Some(tree) = sync_parse_result else {
                 return Ok(None);
             };
 
-            // Use full injection parsing handler with coordinator and parser pool
-            let mut pool = self.parser_pool.lock().await;
-            let result = handle_selection_range(&doc, &positions, &self.language, &mut pool);
-
-            return Ok(Some(result));
+            // Persist under the per-URI edit lock and only if the document is
+            // still alive with the text we parsed: a didClose racing the parse
+            // must not be undone by re-inserting the document, and a didChange
+            // must not be clobbered with the older text/tree. Block-scoped so
+            // the edit lock is released before the pool wait below.
+            {
+                let edit_lock = self.documents.edit_lock(&uri);
+                let _guard = edit_lock.lock().await;
+                let still_current = {
+                    let Some(doc) = self.documents.get(&uri) else {
+                        // edit_lock() get-or-inserts; a didClose that raced the
+                        // parse already removed the entry, so drop the one we
+                        // just recreated rather than leaking it (same miss-path
+                        // cleanup as semantic_tokens).
+                        drop(_guard);
+                        self.documents.remove_edit_lock(&uri);
+                        return Ok(None);
+                    };
+                    doc.text() == text
+                };
+                if still_current {
+                    self.documents
+                        .update_document(uri.clone(), text, Some(tree));
+                }
+            }
         }
 
-        // Use full injection parsing handler with coordinator and parser pool
+        // Lock the pool before re-acquiring the document so the Ref is never
+        // held across an await, then run the full injection parsing handler.
         let mut pool = self.parser_pool.lock().await;
+        let Some(doc) = self.documents.get(&uri) else {
+            return Ok(None);
+        };
         let result = handle_selection_range(&doc, &positions, &self.language, &mut pool);
 
         Ok(Some(result))
