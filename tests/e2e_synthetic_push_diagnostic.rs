@@ -373,3 +373,71 @@ print(((
 
     shutdown_client(&mut client);
 }
+
+/// E2E test: layers.order without "virt" gates push diagnostics off
+/// (cross-layer-aggregation), publishing an EMPTY diagnostics list so that
+/// anything published before the config flip is cleared rather than frozen.
+///
+/// The gate fires before any downstream interaction, so the empty publish is
+/// deterministic — it does not depend on lua-language-server being installed
+/// or producing results.
+#[test]
+fn e2e_synthetic_push_respects_layers_gate() {
+    let (mut client, _config_dir) = create_lua_configured_client();
+
+    // Disable the virt layer for push diagnostics before opening anything.
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "languages": {
+                    "markdown": {
+                        "layers": {
+                            "textDocument/publishDiagnostics": { "order": ["native"] }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    // Invalid Lua that would normally yield diagnostics from lua-ls.
+    let markdown_content = "# Test\n\n```lua\nlocal x =\n```\n";
+    let markdown_uri = "file:///test_synthetic_push_layers_gate.md";
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": markdown_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": markdown_content
+            }
+        }),
+    );
+
+    let notification =
+        client.wait_for_notification("textDocument/publishDiagnostics", Duration::from_secs(10));
+
+    let params = notification.expect(
+        "the layers gate publishes an empty diagnostics list deterministically \
+         (no downstream dependency), so a notification must arrive",
+    );
+    assert_eq!(
+        params.get("uri").and_then(|u| u.as_str()),
+        Some(markdown_uri),
+        "publishDiagnostics should be for the opened document"
+    );
+    let diagnostics = params
+        .get("diagnostics")
+        .and_then(|d| d.as_array())
+        .expect("publishDiagnostics should have diagnostics array");
+    assert!(
+        diagnostics.is_empty(),
+        "virt layer is gated off via layers.order, so the publish must carry \
+         no bridge diagnostics; got: {diagnostics:?}"
+    );
+
+    shutdown_client(&mut client);
+}

@@ -378,10 +378,14 @@ own features). The per-language `layers` map orders them per LSP method:
 
 The key is the LSP method name or `_` for the method wildcard, like
 `aggregation`. `textDocument/rangeFormatting` shares the
-`textDocument/formatting` key (same convention as `aggregation`). Today only
-the `virt` layer produces results — `host` is reserved until host-document
-bridging ships, and bridged methods have no `native` counterpart — so the
-practical effect is per-method enabling and disabling of injection bridging.
+`textDocument/formatting` key (same convention as `aggregation`). Diagnostics
+use two keys, mirroring their aggregation keying: pull diagnostics gate under
+`textDocument/diagnostic`, push diagnostics under
+`textDocument/publishDiagnostics` — disable both (or use `_`) to fully turn
+bridge diagnostics off. Today only the `virt` layer produces results —
+`host` is reserved until host-document bridging ships, and bridged methods
+have no `native` counterpart — so the practical effect is per-method
+enabling and disabling of injection bridging.
 
 **Bridge Filter Semantics:**
 

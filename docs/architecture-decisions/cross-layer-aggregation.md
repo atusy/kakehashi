@@ -15,8 +15,11 @@ Phased roadmap:
    ✅ implemented (`src/lsp/aggregation/server/priority.rs`).
 2. **Layer dispatch, `preferred` only** — ✅ implemented: the
    `LanguageSettings.layers` schema, `resolve_layers` (wildcard merge), and
-   a virt-layer gate in every bridge entry point
-   (`Kakehashi::virt_layer_enabled`). Because host (`bridge._self`) is
+   a virt-layer gate in every bridge entry point — request handlers via
+   `Kakehashi::virt_layer_enabled`, the push-diagnostics scheduler via
+   `resolve_layer_config_from_settings` directly (it already holds a loaded
+   settings arc), keyed `textDocument/publishDiagnostics` to match its
+   aggregation config. Because host (`bridge._self`) is
    unimplemented and bridged methods have no native contributor, the
    stage-2 `preferred` walk degenerates to this gate — "first non-empty
    layer in order" with one possible contributor. A fuller walk arrives
