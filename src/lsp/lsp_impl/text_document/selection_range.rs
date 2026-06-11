@@ -68,6 +68,12 @@ impl Kakehashi {
                 let _guard = edit_lock.lock().await;
                 let still_current = {
                     let Some(doc) = self.documents.get(&uri) else {
+                        // edit_lock() get-or-inserts; a didClose that raced the
+                        // parse already removed the entry, so drop the one we
+                        // just recreated rather than leaking it (same miss-path
+                        // cleanup as semantic_tokens).
+                        drop(_guard);
+                        self.documents.remove_edit_lock(&uri);
                         return Ok(None);
                     };
                     doc.text() == text

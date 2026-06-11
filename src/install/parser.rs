@@ -365,13 +365,17 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// diagnostics go to stderr, which stays inherited for the logs.
 fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
+    // Extend rather than replace a user-provided GIT_SSH_COMMAND (custom keys,
+    // agents, wrappers): for OpenSSH the first -o value obtained wins, so the
+    // appended BatchMode only applies when the user didn't set one themselves.
+    let ssh_command = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "true")
         .env("SSH_ASKPASS", "true")
-        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+        .env("GIT_SSH_COMMAND", format!("{ssh_command} -oBatchMode=yes"));
     if let Some(dir) = current_dir {
         cmd.current_dir(dir);
     }
