@@ -722,6 +722,24 @@ fn position_of_byte(
     (row as u32, column)
 }
 
+/// Convert an absolute byte offset to a `tree_sitter::Point` (byte-based
+/// column). Used when an offset directive shifts the injection boundary away
+/// from a known node position, so we can't reuse the content node's
+/// start/end points.
+pub(crate) fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
+    // Align first — slicing `&text[..clamped]` on a mid-character byte would
+    // panic and crash the LSP server.
+    let clamped = floor_char_boundary(text, byte);
+    let prefix = &text[..clamped];
+    let row = prefix.bytes().filter(|b| *b == b'\n').count();
+    let last_nl = prefix.rfind('\n');
+    let column = match last_nl {
+        Some(idx) => clamped - idx - 1,
+        None => clamped,
+    };
+    tree_sitter::Point { row, column }
+}
+
 /// Snap `index` forward to the nearest char boundary (stable alternative to
 /// the unstable `str::ceil_char_boundary`).
 pub(crate) fn ceil_char_boundary(text: &str, mut index: usize) -> usize {

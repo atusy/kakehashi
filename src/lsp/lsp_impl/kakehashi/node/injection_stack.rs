@@ -18,8 +18,9 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, ceil_char_boundary, collect_all_injections, compute_included_ranges,
-    effective_offset_for_pattern, floor_char_boundary, intersect_included_ranges,
+    MAX_INJECTION_DEPTH, byte_to_point, ceil_char_boundary, collect_all_injections,
+    compute_included_ranges, effective_offset_for_pattern, floor_char_boundary,
+    intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 
@@ -892,19 +893,3 @@ fn discover_child_languages(
     }
 }
 
-/// Convert an absolute byte offset to a `tree_sitter::Point`. Used when an
-/// offset directive shifts the injection boundary away from a known node
-/// position, so we can't reuse the content node's start/end points.
-fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
-    // Align first — slicing `&text[..clamped]` on a mid-character byte would
-    // panic and crash the LSP server.
-    let clamped = floor_char_boundary(text, byte);
-    let prefix = &text[..clamped];
-    let row = prefix.bytes().filter(|b| *b == b'\n').count();
-    let last_nl = prefix.rfind('\n');
-    let column = match last_nl {
-        Some(idx) => clamped - idx - 1,
-        None => clamped,
-    };
-    tree_sitter::Point { row, column }
-}
