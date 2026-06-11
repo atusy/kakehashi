@@ -24,7 +24,7 @@ use crate::lsp::request_id::CancelReceiver;
 fn take_first_group_win<T>(buffered_wins: &mut IndexMap<String, T>, names: &[String]) -> Option<T> {
     let key = buffered_wins
         .keys()
-        .find(|key| names.iter().any(|name| name == *key))
+        .find(|key| names.contains(*key))
         .cloned()?;
     buffered_wins.shift_remove(&key)
 }

@@ -16,7 +16,7 @@ use crate::lsp::bridge::ResolvedServerConfig;
 use crate::lsp::bridge::UpstreamId;
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 
-use super::priority::{PriorityEntry, entry_names};
+use super::priority::PriorityEntry;
 
 /// Per-server arguments produced by [`fan_out()`].
 ///
@@ -62,8 +62,12 @@ pub(crate) fn select_servers(
         .map(|c| (c.server_name.as_str(), c))
         .collect();
 
-    entry_names(entries)
+    entries
         .iter()
+        .flat_map(|entry| match entry {
+            PriorityEntry::Server(name) => std::slice::from_ref(name),
+            PriorityEntry::Rest(names) => names.as_slice(),
+        })
         .filter_map(|name| config_map.get(name.as_str()).map(|cfg| (*cfg).clone()))
         .collect()
 }

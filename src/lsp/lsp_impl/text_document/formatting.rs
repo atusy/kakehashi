@@ -184,6 +184,7 @@ impl Kakehashi {
                 region_ctx.strategy,
                 &region_ctx.priorities,
                 &region_ctx.configs,
+                region_ctx.max_fan_out,
             ) {
                 RegionFormatPlan::Concatenated(servers) => {
                     // Capture the region's per-line host prefixes now, while
@@ -351,11 +352,14 @@ enum RegionFormatPlan {
 }
 
 /// Decide the [`RegionFormatPlan`] for a region from its aggregation `strategy`,
-/// `priorities`, and configured server `configs`.
+/// `priorities`, configured server `configs`, and `max_fan_out` cap.
 ///
 /// Mirrors concatenated-formatting-pipeline Decision points 1–2 under the
 /// aggregation-priorities-wildcard list semantics:
 /// - `priorities = []` → `Disabled` (the kill switch applies to every strategy);
+/// - `maxFanOut = 0` → `Disabled` ("disable fan-out entirely" holds for the
+///   sequential pipeline too; for `Preferred` the dispatch enforces the cap
+///   itself, this just short-circuits the region consistently);
 /// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins;
 ///   the `"*"` wildcard is honored by the preferred dispatch);
 /// - `concatenated` whose `priorities` carries no explicit name (only `"*"`,
@@ -363,17 +367,22 @@ enum RegionFormatPlan {
 ///   would be undefined — → `Preferred` (a once-per-config warning is emitted
 ///   at settings-apply time, see `format_concatenated_formatting_warning`);
 /// - `concatenated` with explicit names puts the allowlist in force: run the
-///   effective (configured ∩ explicit) servers as a pipeline, or — when none
-///   of the listed names are configured — `Skip`, since the allowlist forbids
-///   running the non-listed servers `preferred` would pick. A `"*"` mixed
-///   into the list is ignored (no deterministic expansion order for a
-///   sequential pipeline); the caller warns.
+///   effective (configured ∩ explicit) servers as a pipeline, capped to
+///   `max_fan_out` steps like the parallel paths cap servers queried, or —
+///   when none of the listed names are configured — `Skip`, since the
+///   allowlist forbids running the non-listed servers `preferred` would pick.
+///   A `"*"` mixed into the list is ignored (no deterministic expansion order
+///   for a sequential pipeline); the caller warns.
 fn plan_region_format(
     strategy: AggregationStrategy,
     priorities: &[String],
     configs: &[ResolvedServerConfig],
+    max_fan_out: Option<usize>,
 ) -> RegionFormatPlan {
     if priorities.is_empty() {
+        return RegionFormatPlan::Disabled;
+    }
+    if max_fan_out == Some(0) {
         return RegionFormatPlan::Disabled;
     }
     if strategy != AggregationStrategy::Concatenated {
@@ -387,12 +396,14 @@ fn plan_region_format(
     if explicit.is_empty() {
         return RegionFormatPlan::Preferred;
     }
-    let effective = effective_priorities_from(&explicit, configs);
+    let mut effective = effective_priorities_from(&explicit, configs);
     if effective.is_empty() {
-        RegionFormatPlan::Skip
-    } else {
-        RegionFormatPlan::Concatenated(effective)
+        return RegionFormatPlan::Skip;
     }
+    if let Some(cap) = max_fan_out {
+        effective.truncate(cap);
+    }
+    RegionFormatPlan::Concatenated(effective)
 }
 
 /// Whole-pipeline time budget for one region's concatenated formatting run.
@@ -1515,7 +1526,7 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["black".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Preferred, &priorities, &configs),
+            plan_region_format(AggregationStrategy::Preferred, &priorities, &configs, None),
             RegionFormatPlan::Preferred
         );
     }
@@ -1527,7 +1538,12 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["isort".to_string(), "black".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Concatenated(vec!["isort".to_string(), "black".to_string()])
         );
     }
@@ -1609,11 +1625,11 @@ mod tests {
         // to a wildcard-only list (see the test below).
         let configs = vec![config("black")];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &[], &configs),
+            plan_region_format(AggregationStrategy::Concatenated, &[], &configs, None),
             RegionFormatPlan::Disabled
         );
         assert_eq!(
-            plan_region_format(AggregationStrategy::Preferred, &[], &configs),
+            plan_region_format(AggregationStrategy::Preferred, &[], &configs, None),
             RegionFormatPlan::Disabled
         );
     }
@@ -1626,7 +1642,12 @@ mod tests {
         let configs = vec![config("black")];
         let priorities = vec![PRIORITIES_WILDCARD.to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Preferred
         );
     }
@@ -1638,8 +1659,55 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["black".to_string(), PRIORITIES_WILDCARD.to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Concatenated(vec!["black".to_string()])
+        );
+    }
+
+    #[test]
+    fn plan_max_fan_out_zero_disables_the_region_for_any_strategy() {
+        // maxFanOut = 0 documents "disable fan-out entirely" — the
+        // sequential pipeline must honor it like the parallel paths do.
+        let configs = vec![config("black")];
+        let priorities = vec!["black".to_string()];
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                Some(0)
+            ),
+            RegionFormatPlan::Disabled
+        );
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Preferred,
+                &priorities,
+                &configs,
+                Some(0)
+            ),
+            RegionFormatPlan::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_max_fan_out_caps_pipeline_length() {
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["black".to_string(), "isort".to_string()];
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                Some(1)
+            ),
+            RegionFormatPlan::Concatenated(vec!["black".to_string()]),
+            "a positive cap bounds the pipeline steps in priority order"
         );
     }
 
@@ -1653,7 +1721,12 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["blackk".to_string(), "ruff".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Skip
         );
     }
@@ -1665,7 +1738,12 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["ruff".to_string(), "black".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Concatenated(vec!["black".to_string()])
         );
     }

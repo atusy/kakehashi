@@ -92,8 +92,8 @@ pub(crate) fn expand_priorities(
 /// Cap the total number of servers across all entries to `max_fan_out`.
 ///
 /// Counts flattened names in walk order; a cap landing inside a
-/// [`PriorityEntry::Rest`] truncates the group, and entries past the cap are
-/// dropped (empty groups included).
+/// [`PriorityEntry::Rest`] truncates the group (a group truncated to empty
+/// is dropped), and entries past the cap are dropped.
 pub(crate) fn truncate_entries(
     entries: Vec<PriorityEntry>,
     max_fan_out: Option<usize>,

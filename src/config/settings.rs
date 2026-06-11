@@ -111,9 +111,11 @@ pub struct LayerAggregationConfig {
     /// `["virt", "host", "native"]` — innermost first).
     #[serde(default)]
     pub order: Option<Vec<LayerSource>>,
-    /// Cross-layer combine strategy. Only `preferred` (first non-empty
-    /// layer wins) is implemented at the layer level today; `concatenated`
-    /// is reserved (formatting first — cross-layer-aggregation phase 3).
+    /// Cross-layer combine strategy: `preferred` (first non-empty layer
+    /// wins) or `concatenated`. `concatenated` is honored for
+    /// `textDocument/formatting` only (cross-layer-aggregation phase 3);
+    /// other methods combine with `preferred` until a second layer can
+    /// produce results.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
 }
