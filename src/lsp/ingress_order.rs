@@ -106,6 +106,12 @@ pub(crate) struct DocumentSequencer {
 impl DocumentSequencer {
     /// Take the next writer ticket for `uri`.
     pub(crate) fn issue_writer_ticket(&self, uri: &str) -> WriterGate {
+        // Fast path: rapid didChange streams hit an existing entry, where
+        // `get_mut` borrows the key without allocating; only a miss pays for
+        // the owned key.
+        if let Some(mut entry) = self.docs.get_mut(uri) {
+            return Self::next_ticket(&mut entry);
+        }
         let mut entry = self.docs.entry(uri.to_string()).or_insert_with(|| DocSeq {
             tail: 0,
             completion: Arc::new(DocCompletion {
@@ -113,13 +119,16 @@ impl DocumentSequencer {
                 early: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             }),
         });
-        entry.tail += 1;
-        // Copy out and release the shard guard before building the gate so
-        // the map write lock spans only the ticket bump.
-        let ticket = entry.tail;
-        let rx = entry.completion.done.subscribe();
-        let completion = Arc::clone(&entry.completion);
-        drop(entry);
+        Self::next_ticket(&mut entry)
+    }
+
+    /// Bump `seq`'s tail and build the gate for the new ticket. Only copies
+    /// fields out, so callers' shard guards span just the bump.
+    fn next_ticket(seq: &mut DocSeq) -> WriterGate {
+        seq.tail += 1;
+        let ticket = seq.tail;
+        let rx = seq.completion.done.subscribe();
+        let completion = Arc::clone(&seq.completion);
         WriterGate {
             ticket,
             rx,
