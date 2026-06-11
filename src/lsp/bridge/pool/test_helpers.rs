@@ -82,7 +82,17 @@ pub(in crate::lsp::bridge) fn process_stat(pid: u32) -> std::io::Result<Option<S
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()?;
     let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!stat.is_empty()).then_some(stat))
+    if !stat.is_empty() {
+        return Ok(Some(stat));
+    }
+    // Empty stdout is ambiguous: a gone pid makes ps exit non-zero silently,
+    // while a restricted environment's failing ps reports on stderr. Surface
+    // the latter as Err so callers skip instead of vacuously passing.
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(std::io::Error::other(format!("ps failed: {stderr}")));
+    }
+    Ok(None)
 }
 
 /// Helper function to convert url::Url to tower_lsp_server::ls_types::Uri for tests.
