@@ -84,6 +84,18 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        // Layer gating keys off "textDocument/formatting", matching the
+        // aggregation config below: range formatting is the partial-document
+        // counterpart of full formatting and shares its configuration key.
+        if !self.virt_layer_enabled(&language_name, "textDocument/formatting") {
+            log::debug!(
+                target: "kakehashi::rangeFormatting",
+                "virt layer disabled for {} via layers.order",
+                language_name
+            );
+            return Ok(None);
+        }
+
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Ok(None);
         };

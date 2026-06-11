@@ -80,6 +80,77 @@ pub struct BridgeLanguageConfig {
     pub aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 
+/// One result layer that can answer an LSP request
+/// (cross-layer-aggregation). NOT injection nesting depth (tree-sitter
+/// "language layers").
+///
+/// The set is closed and three-valued, so layer order is expressed by
+/// explicit enumeration — no `"*"` element exists on this axis.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerSource {
+    /// kakehashi's own features (Tree-sitter based).
+    Native,
+    /// The host-document bridge (`bridge._self`). Reserved: an empty
+    /// contributor until host bridging (host-document-bridge) is implemented
+    /// and opted in via `bridge._self.enabled`.
+    Host,
+    /// The injection bridges (`bridge.<language>`).
+    Virt,
+}
+
+/// Per-method cross-layer aggregation configuration
+/// (cross-layer-aggregation). Lives in `LanguageSettings::layers`, keyed by
+/// LSP method name or `"_"` for the method wildcard.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerAggregationConfig {
+    /// Ordered allowlist of result layers, highest priority first: layers
+    /// omitted from the list do not participate for the method. `[]`
+    /// disables the method across all layers. `None` = inherit (default
+    /// `["virt", "host", "native"]` — innermost first).
+    #[serde(default)]
+    pub order: Option<Vec<LayerSource>>,
+    /// Cross-layer combine strategy. Only `preferred` (first non-empty
+    /// layer wins) is implemented at the layer level today; `concatenated`
+    /// is reserved (formatting first — cross-layer-aggregation phase 3).
+    #[serde(default)]
+    pub strategy: Option<AggregationStrategy>,
+}
+
+/// The built-in default layer order: virt, host, native — innermost first,
+/// mirroring the "deeper wins" semantic-token convention.
+fn default_layer_order() -> Vec<LayerSource> {
+    vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+}
+
+/// Fully resolved cross-layer settings for a single LSP method.
+///
+/// Produced by [`LanguageSettings::resolve_layers`]; all optional fields are
+/// resolved with their defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedLayerConfig {
+    pub(crate) order: Vec<LayerSource>,
+    #[allow(dead_code)] // consumed when layer-level `concatenated` lands (phase 3)
+    pub(crate) strategy: AggregationStrategy,
+}
+
+impl ResolvedLayerConfig {
+    /// Defaults for a method with no `layers` configuration: the built-in
+    /// order and the per-method strategy default.
+    pub(crate) fn with_defaults(method: &str) -> Self {
+        Self {
+            order: default_layer_order(),
+            strategy: default_aggregation_strategy_for_method(method),
+        }
+    }
+
+    /// Whether the given layer participates for this method.
+    pub(crate) fn allows(&self, layer: LayerSource) -> bool {
+        self.order.contains(&layer)
+    }
+}
+
 /// Fully resolved aggregation settings for a single LSP method.
 ///
 /// Produced by [`BridgeLanguageConfig::resolve_aggregation`]. Unlike
@@ -310,12 +381,43 @@ pub struct LanguageSettings {
     pub queries: Option<Vec<QueryItem>>,
     /// Omit to bridge all configured languages (default). Use an empty object `{}` to disable bridging. Use `{ "python": { "enabled": true } }` to bridge specific languages.
     pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
+    /// Per-method cross-layer aggregation (cross-layer-aggregation).
+    /// Key = LSP method name or `"_"` for the method wildcard; value orders
+    /// the result layers (`virt`/`host`/`native`) for that method.
+    /// Omit to use the default order `["virt", "host", "native"]`.
+    pub layers: Option<HashMap<String, LayerAggregationConfig>>,
     /// Deprecated: use `base` on the derived language instead.
     /// Alternative languageId values that should use this parser.
     pub aliases: Option<Vec<String>>,
 }
 
 impl LanguageSettings {
+    /// Resolve the cross-layer settings for an LSP method
+    /// (cross-layer-aggregation), with field-level wildcard merge over the
+    /// `"_"` method entry — the same machinery as
+    /// [`BridgeLanguageConfig::resolve_aggregation`].
+    ///
+    /// `order` is a single field: a method-specific `order` replaces the
+    /// wildcard's list wholesale, it does not merge element-wise.
+    pub(crate) fn resolve_layers(&self, method: &str) -> ResolvedLayerConfig {
+        let entry = self.layers.as_ref().and_then(|map| {
+            crate::config::resolve_with_wildcard(
+                map,
+                method,
+                crate::config::merge_layer_aggregation_configs,
+            )
+        });
+        match entry {
+            Some(cfg) => ResolvedLayerConfig {
+                order: cfg.order.unwrap_or_else(default_layer_order),
+                strategy: cfg
+                    .strategy
+                    .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
+            },
+            None => ResolvedLayerConfig::with_defaults(method),
+        }
+    }
+
     /// Check if a language is allowed for bridging based on the bridge filter.
     ///
     /// Returns:
@@ -1286,6 +1388,154 @@ kind = "injections""#;
         };
         let agg = config.resolve_aggregation("textDocument/completion");
         assert_eq!(agg.priorities, &["server_a".to_string()]);
+    }
+
+    // ==========================================================================
+    // Cross-layer aggregation (cross-layer-aggregation)
+    // ==========================================================================
+
+    #[test]
+    fn layer_source_deserializes_lowercase() {
+        let order: Vec<LayerSource> = serde_json::from_str(r#"["virt", "host", "native"]"#)
+            .expect("lowercase layer names must parse");
+        assert_eq!(
+            order,
+            vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+        );
+    }
+
+    #[test]
+    fn layer_source_rejects_unknown_names() {
+        // Closed enum: a typo is a deserialization error, not a server that
+        // never responds (contrast with stage-1 priorities strings).
+        let result: std::result::Result<Vec<LayerSource>, _> = serde_json::from_str(r#"["virtt"]"#);
+        assert!(result.is_err(), "unknown layer names must fail to parse");
+    }
+
+    #[test]
+    fn resolve_layers_defaults_to_virt_host_native() {
+        let settings = LanguageSettings::default();
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+        );
+        assert_eq!(resolved.strategy, AggregationStrategy::Preferred);
+    }
+
+    #[test]
+    fn resolve_layers_strategy_defaults_per_method() {
+        let settings = LanguageSettings::default();
+        let resolved = settings.resolve_layers("textDocument/diagnostic");
+        assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+    }
+
+    #[test]
+    fn resolve_layers_uses_method_specific_entry() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![LayerSource::Host, LayerSource::Virt]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(resolved.order, vec![LayerSource::Host, LayerSource::Virt]);
+        assert!(
+            !resolved.allows(LayerSource::Native),
+            "omitted layer is excluded"
+        );
+    }
+
+    #[test]
+    fn resolve_layers_method_entry_inherits_unset_fields_from_method_wildcard() {
+        // Field-level wildcard merge: the method entry sets strategy only,
+        // the "_" entry supplies order.
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native]),
+                        strategy: None,
+                    },
+                ),
+                (
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: None,
+                        strategy: Some(AggregationStrategy::Concatenated),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(resolved.order, vec![LayerSource::Native]);
+        assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+    }
+
+    #[test]
+    fn resolve_layers_method_order_replaces_wildcard_order_wholesale() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native, LayerSource::Host]),
+                        strategy: None,
+                    },
+                ),
+                (
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Virt]),
+                        strategy: None,
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt],
+            "order is a single field: the method entry replaces the wildcard list, no element merge"
+        );
+    }
+
+    #[test]
+    fn resolve_layers_empty_order_disables_all_layers() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert!(resolved.order.is_empty());
+        assert!(!resolved.allows(LayerSource::Virt));
+    }
+
+    #[test]
+    fn layer_aggregation_config_parses_from_toml() {
+        let toml_str = r#"
+            order = ["host", "virt"]
+            strategy = "preferred"
+        "#;
+        let config: LayerAggregationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.order,
+            Some(vec![LayerSource::Host, LayerSource::Virt])
+        );
+        assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));
     }
 
     #[test]

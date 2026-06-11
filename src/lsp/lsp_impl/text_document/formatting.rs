@@ -85,6 +85,15 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        if !self.virt_layer_enabled(&language_name, "textDocument/formatting") {
+            log::debug!(
+                target: "kakehashi::formatting",
+                "virt layer disabled for {} via layers.order",
+                language_name
+            );
+            return Ok(None);
+        }
+
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Ok(None);
         };

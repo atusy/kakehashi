@@ -83,6 +83,15 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        if !self.virt_layer_enabled(&language_name, method_name) {
+            log::debug!(
+                "{}: virt layer disabled for {} via layers.order",
+                method_name,
+                language_name
+            );
+            return Ok(None);
+        }
+
         // Get injection query to detect injection regions
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Ok(None);

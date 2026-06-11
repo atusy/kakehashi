@@ -8,9 +8,11 @@
 
 ## Implementation Status
 
-Not implemented. This is the first phase of the cross-layer-aggregation
-roadmap: land the unified `priorities` semantics before the layer dispatch
-builds on them.
+Implemented. Expansion lives in `src/lsp/aggregation/server/priority.rs`
+(`PriorityEntry`, `expand_priorities`); both fan-out and the `preferred`
+fan-in consume the same expansion. The formatting pipeline's `"*"` rejection
+and the no-explicit-names settings-apply warning live in
+`plan_region_format` / `concatenated_formatting_pairs`.
 
 ## Context
 

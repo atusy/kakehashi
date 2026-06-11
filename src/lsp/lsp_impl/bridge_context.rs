@@ -10,7 +10,8 @@ use url::Url;
 
 use crate::config::WorkspaceSettings;
 use crate::config::settings::{
-    AggregationStrategy, BridgeLanguageConfig, ResolvedAggregationConfig,
+    AggregationStrategy, BridgeLanguageConfig, LayerSource, ResolvedAggregationConfig,
+    ResolvedLayerConfig,
 };
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
@@ -103,6 +104,21 @@ fn resolve_bridge_language_config_from_settings(
                 crate::config::merge_bridge_language_configs,
             )
         })
+}
+
+/// Resolve the cross-layer config (cross-layer-aggregation) for a host
+/// language and method. Falls back to the built-in defaults — order
+/// `[virt, host, native]`, per-method strategy — when the host language has
+/// no settings entry at all.
+pub(crate) fn resolve_layer_config_from_settings(
+    settings: &WorkspaceSettings,
+    host_language: &str,
+    method_name: &str,
+) -> ResolvedLayerConfig {
+    settings
+        .resolve_host_language_settings(host_language)
+        .map(|lang_settings| lang_settings.resolve_layers(method_name))
+        .unwrap_or_else(|| ResolvedLayerConfig::with_defaults(method_name))
 }
 
 pub(crate) fn resolve_aggregation_config_from_settings(
@@ -329,6 +345,20 @@ impl Kakehashi {
         })
     }
 
+    /// Whether the virt layer participates for this host language and LSP
+    /// method (cross-layer-aggregation): when `"virt"` is absent from the
+    /// resolved `layers.order`, the bridge dispatch is skipped entirely.
+    ///
+    /// This gate is the whole of the stage-2 `preferred` walk for today's
+    /// contributor set — host (`bridge._self`) is unimplemented and the
+    /// bridged methods have no native contributor — so "first non-empty
+    /// layer in order" degenerates to "virt if allowed, else nothing".
+    pub(crate) fn virt_layer_enabled(&self, host_language: &str, method_name: &str) -> bool {
+        let settings = self.settings_manager.load_settings();
+        resolve_layer_config_from_settings(&settings, host_language, method_name)
+            .allows(LayerSource::Virt)
+    }
+
     /// Convert a preamble result into a `DocumentRequestContext` by looking up
     /// bridge server configs for the injection language.
     ///
@@ -341,6 +371,15 @@ impl Kakehashi {
         preamble: PreambleResult,
         method_name: &str,
     ) -> Option<DocumentRequestContext> {
+        if !self.virt_layer_enabled(&preamble.language_name, method_name) {
+            log::debug!(
+                "{}: virt layer disabled for {} via layers.order",
+                method_name,
+                preamble.language_name
+            );
+            return None;
+        }
+
         let configs = self.bridge_configs_for_injection_language(
             &preamble.language_name,
             &preamble.resolved.injection_language,
@@ -445,11 +484,8 @@ mod tests {
 
     fn lang_settings(bridge: HashMap<String, BridgeLanguageConfig>) -> LanguageSettings {
         LanguageSettings {
-            base: None,
-            parser: None,
-            queries: None,
             bridge: Some(bridge),
-            aliases: None,
+            ..Default::default()
         }
     }
 
@@ -470,6 +506,78 @@ mod tests {
             enabled: None,
             aggregation: Some(agg),
         }
+    }
+
+    // ==========================================================================
+    // resolve_layer_config_from_settings (cross-layer-aggregation)
+    // ==========================================================================
+
+    #[test]
+    fn resolve_layer_config_defaults_when_language_has_no_settings() {
+        let settings = settings_with(HashMap::new());
+        let resolved =
+            resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+        );
+    }
+
+    #[test]
+    fn resolve_layer_config_respects_language_entry() {
+        let mut langs = HashMap::new();
+        langs.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                layers: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    crate::config::settings::LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native]),
+                        strategy: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        let settings = settings_with(langs);
+
+        let hover = resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
+        assert_eq!(hover.order, vec![LayerSource::Native]);
+        assert!(!hover.allows(LayerSource::Virt));
+
+        let definition =
+            resolve_layer_config_from_settings(&settings, "markdown", "textDocument/definition");
+        assert!(
+            definition.allows(LayerSource::Virt),
+            "unconfigured methods keep the default order"
+        );
+    }
+
+    #[test]
+    fn resolve_layer_config_falls_back_to_language_wildcard_entry() {
+        // resolve_host_language_settings falls back to the "_" language for
+        // hosts without their own entry, so layers configured there apply.
+        let mut langs = HashMap::new();
+        langs.insert(
+            "_".to_string(),
+            LanguageSettings {
+                layers: Some(HashMap::from([(
+                    "_".to_string(),
+                    crate::config::settings::LayerAggregationConfig {
+                        order: Some(vec![]),
+                        strategy: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        let settings = settings_with(langs);
+        let resolved =
+            resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
+        assert!(
+            resolved.order.is_empty(),
+            "wildcard-language layers must apply to unconfigured hosts"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub(crate) mod user;
 pub use expand::{set_config_file_override, set_data_dir_override};
 pub(crate) use merge::{
     merge_aggregation_configs, merge_bridge_language_configs, merge_bridge_server_configs,
-    merge_workspace_settings, resolve_with_wildcard,
+    merge_layer_aggregation_configs, merge_workspace_settings, resolve_with_wildcard,
 };
 pub(crate) use settings::{CaptureMappings, QueryTypeMappings};
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};
@@ -122,6 +122,13 @@ fn strip_inherited_language_settings(
             .then(|| current.queries.clone())
             .flatten(),
         bridge: strip_inherited_bridge_map(inherited.bridge.as_ref(), current.bridge.as_ref()),
+        // Whole-field equality strip (like queries/aliases): a layers map
+        // that differs from the inherited one at all is kept verbatim. The
+        // per-key deep strip used for bridge is not mirrored here until the
+        // display duplication it avoids proves to matter for layers.
+        layers: (current.layers != inherited.layers)
+            .then(|| current.layers.clone())
+            .flatten(),
         aliases: (current.aliases != inherited.aliases)
             .then(|| current.aliases.clone())
             .flatten(),

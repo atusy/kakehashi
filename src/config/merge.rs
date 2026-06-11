@@ -1,5 +1,6 @@
 use super::settings::{
     AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
+    LayerAggregationConfig,
 };
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
@@ -97,6 +98,7 @@ pub(crate) fn merge_language_settings(
         parser: overlay.parser.clone().or_else(|| base.parser.clone()),
         queries: overlay.queries.clone().or_else(|| base.queries.clone()),
         bridge: merge_bridge_maps(base.bridge.as_ref(), overlay.bridge.as_ref()),
+        layers: merge_layers_maps(base.layers.as_ref(), overlay.layers.as_ref()),
         aliases: overlay.aliases.clone().or_else(|| base.aliases.clone()),
     }
 }
@@ -200,6 +202,51 @@ pub(crate) fn merge_aggregation_configs(
             .clone()
             .or_else(|| base.priorities.clone()),
         max_fan_out: overlay.max_fan_out.or(base.max_fan_out),
+    }
+}
+
+/// Merge two `LayerAggregationConfig`s field-by-field
+/// (cross-layer-aggregation).
+///
+/// - `order`: overlay wins if present, else inherits from base — the list
+///   replaces wholesale, never element-wise
+/// - `strategy`: overlay wins if set, else inherits from base
+pub(crate) fn merge_layer_aggregation_configs(
+    base: &LayerAggregationConfig,
+    overlay: &LayerAggregationConfig,
+) -> LayerAggregationConfig {
+    LayerAggregationConfig {
+        order: overlay.order.clone().or_else(|| base.order.clone()),
+        strategy: overlay.strategy.or(base.strategy),
+    }
+}
+
+/// Deep merge two optional `layers` HashMaps (cross-layer-aggregation).
+///
+/// Mirrors [`merge_bridge_maps`]: an empty overlay map (`Some({})`) clears
+/// the base (empty-means-clear); otherwise per-method entries merge at the
+/// field level via [`merge_layer_aggregation_configs`].
+fn merge_layers_maps(
+    base: Option<&HashMap<String, LayerAggregationConfig>>,
+    overlay: Option<&HashMap<String, LayerAggregationConfig>>,
+) -> Option<HashMap<String, LayerAggregationConfig>> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(_), Some(o)) if o.is_empty() => Some(HashMap::new()), // empty-means-clear
+        (Some(b), Some(o)) => {
+            let mut merged = b.clone();
+            for (method, overlay_config) in o {
+                merged
+                    .entry(method.clone())
+                    .and_modify(|base_config| {
+                        *base_config = merge_layer_aggregation_configs(base_config, overlay_config);
+                    })
+                    .or_insert_with(|| overlay_config.clone());
+            }
+            Some(merged)
+        }
     }
 }
 
@@ -2072,6 +2119,106 @@ mod tests {
         assert!(
             custom.bridge.is_none(),
             "custom_lang should not inherit '_'s bridge — chain stopped at _blank"
+        );
+    }
+
+    #[test]
+    fn merge_layer_aggregation_configs_overlay_fields_win() {
+        use crate::config::settings::{AggregationStrategy, LayerSource};
+        let base = LayerAggregationConfig {
+            order: Some(vec![LayerSource::Native]),
+            strategy: Some(AggregationStrategy::Preferred),
+        };
+        let overlay = LayerAggregationConfig {
+            order: Some(vec![LayerSource::Virt, LayerSource::Host]),
+            strategy: None,
+        };
+        let merged = merge_layer_aggregation_configs(&base, &overlay);
+        assert_eq!(
+            merged.order,
+            Some(vec![LayerSource::Virt, LayerSource::Host]),
+            "overlay order replaces base wholesale"
+        );
+        assert_eq!(
+            merged.strategy,
+            Some(AggregationStrategy::Preferred),
+            "unset overlay strategy inherits from base"
+        );
+    }
+
+    #[test]
+    fn merge_language_settings_merges_layers_per_method() {
+        use crate::config::settings::{AggregationStrategy, LayerSource};
+        let base = LanguageSettings {
+            layers: Some(HashMap::from([
+                (
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native]),
+                        strategy: Some(AggregationStrategy::Preferred),
+                    },
+                ),
+                (
+                    "textDocument/definition".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Virt]),
+                        strategy: None,
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let overlay = LanguageSettings {
+            layers: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![LayerSource::Host]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let merged = merge_language_settings(&base, &overlay);
+        let layers = merged.layers.expect("layers must survive the merge");
+        assert_eq!(
+            layers["textDocument/hover"].order,
+            Some(vec![LayerSource::Host]),
+            "overlay entry wins per field"
+        );
+        assert_eq!(
+            layers["textDocument/hover"].strategy,
+            Some(AggregationStrategy::Preferred),
+            "unset overlay field inherits from the base entry"
+        );
+        assert_eq!(
+            layers["textDocument/definition"].order,
+            Some(vec![LayerSource::Virt]),
+            "base-only entries are preserved"
+        );
+    }
+
+    #[test]
+    fn merge_language_settings_empty_layers_map_clears_base() {
+        use crate::config::settings::LayerSource;
+        let base = LanguageSettings {
+            layers: Some(HashMap::from([(
+                "_".to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![LayerSource::Native]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let overlay = LanguageSettings {
+            layers: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let merged = merge_language_settings(&base, &overlay);
+        assert_eq!(
+            merged.layers,
+            Some(HashMap::new()),
+            "Some({{}}) clears inherited layers (empty-means-clear, like bridge)"
         );
     }
 

@@ -326,9 +326,14 @@ When multiple language servers can handle the same injection language, `aggregat
 
 | Field | Description |
 |-------|-------------|
-| `priorities` | Ordered list of server names. The first server that returns a valid response wins. Empty list falls back to arrival-order (first-win) behavior. |
+| `priorities` | Ordered **allowlist** of server names: listed servers are queried in this order, and servers absent from the list do not run. A `"*"` element stands for every configured-but-unlisted server (first-win among themselves), so `["pyright", "*"]` means "prefer pyright, fall back to the rest" and `["*", "pylsp"]` demotes pylsp below everyone else. Omitted = `["*"]` (all servers, first-win). An explicit `[]` disables the method for this bridge entry. Note: the sequential `concatenated` formatting pipeline requires explicit names and ignores `"*"`. |
 | `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
 | `maxFanOut` | Maximum number of servers to query. `null` or omitted = no limit (default). `0` = disable fan-out entirely. Positive integer = cap at N servers. Priority servers are selected first when limiting. Negative values are treated as no limit. |
+
+> **Migration note**: `priorities` used to be a preference order only — unlisted
+> servers still participated as fallback. It is now an allowlist: `["pyright"]`
+> runs *only* pyright. Append `"*"` (`["pyright", "*"]`) to keep the old
+> fallback behavior.
 
 Example with per-method priorities, strategy, and maxFanOut:
 
@@ -338,13 +343,44 @@ Example with per-method priorities, strategy, and maxFanOut:
     "python": {
       "aggregation": {
         "textDocument/completion": { "priorities": ["pyright", "pylsp"], "maxFanOut": 1 },
-        "textDocument/diagnostic": { "strategy": "preferred", "priorities": ["pyright"] },
-        "_": { "priorities": ["pylsp"] }
+        "textDocument/diagnostic": { "strategy": "preferred", "priorities": ["pyright", "*"] },
+        "_": { "priorities": ["pylsp", "*"] }
       }
     }
   }
 }
 ```
+
+**Cross-Layer Aggregation (`layers`):**
+
+A request to kakehashi can in principle be answered by up to three *result
+layers*: `virt` (the injection bridges above), `host` (a host-document
+language server — reserved for a future release), and `native` (kakehashi's
+own features). The per-language `layers` map orders them per LSP method:
+
+```json
+{
+  "languages": {
+    "markdown": {
+      "layers": {
+        "textDocument/hover": { "order": ["virt", "native"] },
+        "_": { "order": ["virt", "host", "native"] }
+      }
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `order` | Ordered allowlist of layers, highest priority first. Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
+| `strategy` | Cross-layer combine strategy. Only `"preferred"` (first non-empty layer wins) is implemented today. |
+
+The key is the LSP method name or `_` for the method wildcard, like
+`aggregation`. Today only the `virt` layer produces results — `host` is
+reserved until host-document bridging ships, and bridged methods have no
+`native` counterpart — so the practical effect is per-method enabling and
+disabling of injection bridging.
 
 **Bridge Filter Semantics:**
 

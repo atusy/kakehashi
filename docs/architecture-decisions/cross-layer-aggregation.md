@@ -9,16 +9,20 @@
 
 ## Implementation Status
 
-Not implemented. Phased roadmap:
+Phased roadmap:
 
 1. **Allowlist `priorities` with `"*"`** (aggregation-priorities-wildcard) —
-   the list semantics `order` builds on; lands independently as a stage-1
-   change.
-2. **Layer dispatch, `preferred` only** — this decision's machinery with the
-   default `order`. Implementable before host bridging: the host layer is an
-   empty contributor until `bridge._self` exists and is enabled.
-3. **Layer-level `concatenated` for `textDocument/formatting` only** —
-   expected to follow the sequential-pipeline principles of
+   ✅ implemented (`src/lsp/aggregation/server/priority.rs`).
+2. **Layer dispatch, `preferred` only** — ✅ implemented: the
+   `LanguageSettings.layers` schema, `resolve_layers` (wildcard merge), and
+   a virt-layer gate in every bridge entry point
+   (`Kakehashi::virt_layer_enabled`). Because host (`bridge._self`) is
+   unimplemented and bridged methods have no native contributor, the
+   stage-2 `preferred` walk degenerates to this gate — "first non-empty
+   layer in order" with one possible contributor. A fuller walk arrives
+   with the second contributor.
+3. **Layer-level `concatenated` for `textDocument/formatting` only** — not
+   implemented; expected to follow the sequential-pipeline principles of
    concatenated-formatting-pipeline (determinism, no overlapping edits);
    detailed mechanics are deferred to that phase. Its observable value
    arrives with host bridging (e.g. a host formatter running over the whole
