@@ -383,12 +383,15 @@ impl Kakehashi {
             layer,
             f,
         ) else {
-            // A tracker hit that fails pair resolution mirrors the single-id
-            // drift warning: worth surfacing for diagnosis, still null on the
-            // wire.
-            log::warn!(
+            // Unlike the single-id drift warning, pair-resolution failure is
+            // an expected outcome, not just drift: ids minted at the same
+            // depth in *different* regions (two separate code blocks, or the
+            // #350 overlap caveat) legitimately fail to share a tree and
+            // collapse to the contract's null. debug, not warn — a normal
+            // cross-region query must not look like document drift in logs.
+            log::debug!(
                 target: "kakehashi::node",
-                "tracker hit but pair did not resolve in minting layer {} for uri={} self=[{},{}) {} descendant=[{},{}) {}",
+                "pair did not resolve in one minting-layer tree (layer {}) for uri={} self=[{},{}) {} descendant=[{},{}) {}",
                 layer, uri, start, end, kind, desc_start, desc_end, desc_kind
             );
             return Value::Null;
