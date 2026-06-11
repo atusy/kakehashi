@@ -34,6 +34,8 @@ use tokio::sync::watch;
 use tower::Service;
 use tower_lsp_server::jsonrpc::{Request, Response};
 
+use crate::error::LockResultExt;
+
 /// Per-document sequencing state.
 struct DocSeq {
     /// Last issued writer ticket (tickets start at 1; 0 = none issued).
@@ -67,7 +69,7 @@ impl DocCompletion {
         let mut early = self
             .early
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .recover_poison("DocCompletion::complete");
         self.done.send_if_modified(|done| {
             if ticket == *done + 1 {
                 *done = ticket;
@@ -106,13 +108,16 @@ impl DocumentSequencer {
             }),
         });
         entry.tail += 1;
+        // Copy out and release the shard guard before building the gate so
+        // the map write lock spans only the ticket bump.
+        let ticket = entry.tail;
+        let rx = entry.completion.done.subscribe();
+        let completion = Arc::clone(&entry.completion);
+        drop(entry);
         WriterGate {
-            ticket: entry.tail,
-            rx: entry.completion.done.subscribe(),
-            guard: CompletionGuard {
-                ticket: entry.tail,
-                completion: Arc::clone(&entry.completion),
-            },
+            ticket,
+            rx,
+            guard: CompletionGuard { ticket, completion },
         }
     }
 
@@ -124,10 +129,10 @@ impl DocumentSequencer {
         if *entry.completion.done.borrow() >= entry.tail {
             return None;
         }
-        Some(ReaderBarrier {
-            target: entry.tail,
-            rx: entry.completion.done.subscribe(),
-        })
+        let target = entry.tail;
+        let rx = entry.completion.done.subscribe();
+        drop(entry);
+        Some(ReaderBarrier { target, rx })
     }
 
     /// Drop `uri`'s sequencing state after a close completed, unless later
