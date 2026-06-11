@@ -15,10 +15,12 @@
 //! - **Writers** (`didOpen` / `didChange` / `didClose`) take the next ticket
 //!   and run only after the previous writer for the same document finished,
 //!   so edits and closes apply in strict wire order.
-//! - **Readers** (the `semanticTokens` family) snapshot the current tail
-//!   ticket at `call` time and run only once that ticket is done, so a
-//!   request observes every edit that preceded it on the wire — without
-//!   serializing token computation against later edits or other documents.
+//! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
+//!   triple, and formatting requests, whose stale edits a client would apply
+//!   to newer text) snapshot the current tail ticket at `call` time and run
+//!   only once that ticket is done, so a request observes every edit that
+//!   preceded it on the wire — without serializing its computation against
+//!   later edits or other documents.
 //!
 //! Everything else passes through untouched.
 
@@ -59,19 +61,25 @@ struct DocCompletion {
 impl DocCompletion {
     /// Record `ticket` as complete, advancing `done` only through
     /// consecutive completions and cascading any tickets that finished early.
+    /// `send_if_modified` keeps an out-of-order completion (ledger insert,
+    /// `done` unchanged) from spuriously waking every waiter.
     fn complete(&self, ticket: u64) {
         let mut early = self
             .early
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.done.send_modify(|done| {
+        self.done.send_if_modified(|done| {
             if ticket == *done + 1 {
                 *done = ticket;
                 while early.remove(&(*done + 1)) {
                     *done += 1;
                 }
-            } else if ticket > *done {
-                early.insert(ticket);
+                true
+            } else {
+                if ticket > *done {
+                    early.insert(ticket);
+                }
+                false
             }
         });
     }
@@ -193,11 +201,14 @@ enum Role {
 /// Classify a request and extract its `textDocument.uri`, both synchronously.
 ///
 /// Readers are the tree-snapshotting request families: `semanticTokens`
-/// (including `range`, which never had the in-handler `edit_lock` settle) and
-/// the `kakehashi/captures` triple, which mirrors it. The `kakehashi/node/*`
-/// protocol stays unclassified on purpose: node ids carry their own staleness
-/// handling (`null` → client re-acquires), so gating those point lookups
-/// would add latency without changing observable behavior.
+/// (including `range`, which never had the in-handler `edit_lock` settle),
+/// the `kakehashi/captures` triple, which mirrors it, and the formatting
+/// requests — their `TextEdit`s are applied by the client to its current
+/// text, so edits computed against a stale snapshot corrupt the document.
+/// The `kakehashi/node/*` protocol stays unclassified on purpose: node ids
+/// carry their own staleness handling (`null` → client re-acquires), so
+/// gating those point lookups would add latency without changing observable
+/// behavior.
 fn classify(req: &Request) -> Option<Role> {
     let close = match req.method() {
         "textDocument/didOpen" | "textDocument/didChange" => false,
@@ -205,6 +216,8 @@ fn classify(req: &Request) -> Option<Role> {
         "textDocument/semanticTokens/full"
         | "textDocument/semanticTokens/full/delta"
         | "textDocument/semanticTokens/range"
+        | "textDocument/formatting"
+        | "textDocument/rangeFormatting"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
         | "kakehashi/captures/range" => {
@@ -471,6 +484,8 @@ mod tests {
             "textDocument/semanticTokens/full",
             "textDocument/semanticTokens/full/delta",
             "textDocument/semanticTokens/range",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
             "kakehashi/captures/range",
