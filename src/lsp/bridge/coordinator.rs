@@ -207,13 +207,16 @@ impl BridgeCoordinator {
         config: &BridgeServerConfig,
         injection_language: &str,
     ) -> Option<LanguageMatch> {
-        if config.languages.iter().any(|l| l == injection_language) {
-            Some(LanguageMatch::Exact)
-        } else if config.languages.iter().any(|l| l == "_") {
-            Some(LanguageMatch::Wildcard)
-        } else {
-            None
+        let mut has_wildcard = false;
+        for lang in &config.languages {
+            if lang == injection_language {
+                return Some(LanguageMatch::Exact);
+            }
+            if lang == "_" {
+                has_wildcard = true;
+            }
         }
+        has_wildcard.then_some(LanguageMatch::Wildcard)
     }
 
     /// Resolve `bridge.servers` for `injection_language`, returning the
@@ -262,9 +265,7 @@ impl BridgeCoordinator {
                 let language_match = Self::language_match(&resolved_config, injection_language)?;
                 Some((language_match, server_name, resolved_config))
             })
-            .min_by(|(match_a, name_a, _), (match_b, name_b, _)| {
-                match_a.cmp(match_b).then_with(|| name_a.cmp(name_b))
-            })
+            .min_by_key(|&(language_match, server_name, _)| (language_match, server_name))
             .map(|(_, server_name, resolved_config)| ResolvedServerConfig {
                 server_name: server_name.clone(),
                 config: Arc::new(resolved_config),
