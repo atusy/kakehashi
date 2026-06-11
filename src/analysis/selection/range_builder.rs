@@ -17,9 +17,9 @@ use super::injection_aware::{
 };
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::injection::{
-    self, InjectionOffset, ceil_char_boundary, compute_included_ranges_clipped,
-    floor_char_boundary, has_include_children_for_pattern, parse_offset_directive_for_pattern,
-    parse_with_ranges,
+    self, InjectionOffset, ceil_char_boundary, compute_included_ranges,
+    compute_included_ranges_clipped, effective_offset_for_pattern, floor_char_boundary,
+    has_include_children_for_pattern, parse_with_ranges,
 };
 use crate::text::PositionMapper;
 
@@ -134,8 +134,14 @@ fn parse_with_included_ranges(
     include_children: bool,
     lang_name: &str,
 ) -> Option<Tree> {
-    let included_ranges =
-        compute_included_ranges_clipped(content_node, include_children, text, effective_window);
+    // The offset-free window equals the node span; the node-anchored variant
+    // then gives the same gaps while reusing tree-sitter's cached node Points
+    // instead of scanning text for the window's Points.
+    let included_ranges = if effective_window == content_node.byte_range() {
+        compute_included_ranges(content_node, include_children)
+    } else {
+        compute_included_ranges_clipped(content_node, include_children, text, effective_window)
+    };
 
     parse_with_ranges(
         parser,
@@ -177,7 +183,7 @@ pub fn build(
     }
 
     let offset_from_query =
-        injection_query_ref.and_then(|q| parse_offset_directive_for_pattern(q, pattern_index));
+        injection_query_ref.and_then(|q| effective_offset_for_pattern(q, pattern_index));
 
     if let Some(offset) = offset_from_query
         && !is_cursor_within_effective_range(doc_ctx.text, &content_node, cursor_byte, offset)
@@ -246,7 +252,7 @@ pub fn build(
             nested_injection_info
         {
             let nested_offset =
-                parse_offset_directive_for_pattern(nested_inj_query.as_ref(), nested_pattern_index);
+                effective_offset_for_pattern(nested_inj_query.as_ref(), nested_pattern_index);
 
             let cursor_in_nested = match nested_offset {
                 Some(offset) => is_cursor_within_effective_range(
@@ -322,7 +328,7 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
 
-    let offset = parse_offset_directive_for_pattern(injection_query, pattern_index);
+    let offset = effective_offset_for_pattern(injection_query, pattern_index);
     let nested_window = effective_window_for(text, &content_node, offset);
     let nested_text = &text[nested_window.clone()];
     let nested_window_start = nested_window.start;
@@ -576,7 +582,7 @@ mod tests {
         let content_node = regions[0].content_node;
         assert!(!regions[0].include_children);
 
-        let offset = parse_offset_directive_for_pattern(&query, regions[0].pattern_index)
+        let offset = effective_offset_for_pattern(&query, regions[0].pattern_index)
             .expect("offset directive");
         let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
         let effective = calculate_effective_range(text, byte_range, offset);
