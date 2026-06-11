@@ -890,22 +890,18 @@ impl CacheableInjectionRegion {
         let (start_byte, end_byte) = match info.offset {
             Some(offset) => {
                 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
+                // calculate_effective_range clamps, snaps inward to char
+                // boundaries, and normalizes start <= end, so slicing below
+                // cannot panic.
                 let effective = calculate_effective_range(
                     text,
                     ByteRange::new(node.start_byte(), node.end_byte()),
                     offset,
                 );
-                // Column deltas are byte counts; a misconfigured query could
-                // land inside a multi-byte character. Snap inward so slicing
-                // below cannot panic.
-                (
-                    ceil_char_boundary(text, effective.start),
-                    floor_char_boundary(text, effective.end),
-                )
+                (effective.start, effective.end)
             }
             None => (node.start_byte(), node.end_byte()),
         };
-        let (start_byte, end_byte) = (start_byte.min(end_byte), end_byte);
 
         let content = &text[start_byte..end_byte];
 
