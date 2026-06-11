@@ -17,8 +17,9 @@ use super::injection_aware::{
 };
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::injection::{
-    self, compute_included_ranges, has_include_children_for_pattern,
-    parse_offset_directive_for_pattern, parse_with_ranges,
+    self, InjectionOffset, ceil_char_boundary, compute_included_ranges,
+    compute_included_ranges_clipped, effective_offset_for_pattern, floor_char_boundary,
+    has_include_children_for_pattern, parse_with_ranges,
 };
 use crate::text::PositionMapper;
 
@@ -89,28 +90,57 @@ pub fn build_from_node_in_injection(
     }
 }
 
+/// Effective (post-`#offset!`) window of `content_node` within `text`.
+///
+/// Offset deltas are byte counts and can land mid-codepoint, so the bounds
+/// are snapped inward to char boundaries (ceil the start, floor the end —
+/// matching the semantic and bridge paths) before callers slice `text` with
+/// them; a degenerate result collapses to an empty window instead of an
+/// inverted one. Without an offset the window is the content node span.
+fn effective_window_for(
+    text: &str,
+    content_node: &Node,
+    offset: Option<InjectionOffset>,
+) -> std::ops::Range<usize> {
+    match offset {
+        Some(off) => {
+            let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
+            let effective = calculate_effective_range(text, byte_range, off);
+            let start = ceil_char_boundary(text, effective.start);
+            let end = floor_char_boundary(text, effective.end);
+            start.min(end)..end
+        }
+        None => content_node.byte_range(),
+    }
+}
+
 /// Parse injection content with included-range exclusion for named children.
 ///
 /// Computes included ranges to exclude named children (e.g., `block_continuation`
 /// nodes in blockquote code blocks), then delegates to [`parse_with_ranges`] for
-/// the set/parse/reset protocol. Skipped when an offset directive is active because
-/// `compute_included_ranges()` returns ranges relative to `content_node.start_byte()`,
-/// which would be misaligned with the offset-adjusted `content_text`.
+/// the set/parse/reset protocol. `effective_window` is the post-`#offset!`
+/// span of `content_text` within `text` (the coordinate space of
+/// `content_node`); gaps are clipped to it so child exclusion and offset
+/// directives compose (#186). Without an offset the window equals the content
+/// node span.
 ///
 /// Returns `None` if `set_included_ranges` fails (after logging a warning).
 fn parse_with_included_ranges(
     parser: &mut Parser,
+    text: &str,
     content_text: &str,
     content_node: &Node,
-    has_offset: bool,
+    effective_window: std::ops::Range<usize>,
     include_children: bool,
     lang_name: &str,
 ) -> Option<Tree> {
-    // Skip included ranges when offset directive is active (misaligned byte ranges)
-    let included_ranges = if has_offset {
-        None
-    } else {
+    // The offset-free window equals the node span; the node-anchored variant
+    // then gives the same gaps while reusing tree-sitter's cached node Points
+    // instead of scanning text for the window's Points.
+    let included_ranges = if effective_window == content_node.byte_range() {
         compute_included_ranges(content_node, include_children)
+    } else {
+        compute_included_ranges_clipped(content_node, include_children, text, effective_window)
     };
 
     parse_with_ranges(
@@ -153,7 +183,7 @@ pub fn build(
     }
 
     let offset_from_query =
-        injection_query_ref.and_then(|q| parse_offset_directive_for_pattern(q, pattern_index));
+        injection_query_ref.and_then(|q| effective_offset_for_pattern(q, pattern_index));
 
     if let Some(offset) = offset_from_query
         && !is_cursor_within_effective_range(doc_ctx.text, &content_node, cursor_byte, offset)
@@ -178,28 +208,19 @@ pub fn build(
         return build_fallback();
     };
 
-    let (content_text, effective_start_byte) = if let Some(offset) = offset_from_query {
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        let effective = calculate_effective_range(doc_ctx.text, byte_range, offset);
-        (
-            &doc_ctx.text[effective.start..effective.end],
-            effective.start,
-        )
-    } else {
-        (
-            &doc_ctx.text[content_node.byte_range()],
-            content_node.start_byte(),
-        )
-    };
+    let effective_window = effective_window_for(doc_ctx.text, &content_node, offset_from_query);
+    let content_text = &doc_ctx.text[effective_window.clone()];
+    let effective_start_byte = effective_window.start;
 
     let include_children =
         injection_query_ref.is_some_and(|q| has_include_children_for_pattern(q, pattern_index));
 
     let Some(injected_tree) = parse_with_included_ranges(
         &mut parser,
+        doc_ctx.text,
         content_text,
         &content_node,
-        offset_from_query.is_some(),
+        effective_window,
         include_children,
         injected_lang,
     ) else {
@@ -231,7 +252,7 @@ pub fn build(
             nested_injection_info
         {
             let nested_offset =
-                parse_offset_directive_for_pattern(nested_inj_query.as_ref(), nested_pattern_index);
+                effective_offset_for_pattern(nested_inj_query.as_ref(), nested_pattern_index);
 
             let cursor_in_nested = match nested_offset {
                 Some(offset) => is_cursor_within_effective_range(
@@ -307,20 +328,11 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     }
 
-    let offset = parse_offset_directive_for_pattern(injection_query, pattern_index);
-    let (nested_text, nested_effective_start_byte) = if let Some(off) = offset {
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        let effective = calculate_effective_range(text, byte_range, off);
-        (
-            &text[effective.start..effective.end],
-            parent_start_byte + effective.start,
-        )
-    } else {
-        (
-            &text[content_node.byte_range()],
-            parent_start_byte + content_node.start_byte(),
-        )
-    };
+    let offset = effective_offset_for_pattern(injection_query, pattern_index);
+    let nested_window = effective_window_for(text, &content_node, offset);
+    let nested_text = &text[nested_window.clone()];
+    let nested_window_start = nested_window.start;
+    let nested_effective_start_byte = parent_start_byte + nested_window_start;
 
     let Some(mut nested_parser) = inj_ctx.acquire_parser(&nested_lang) else {
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
@@ -330,9 +342,10 @@ fn build_nested_injection(
 
     let Some(nested_tree) = parse_with_included_ranges(
         &mut nested_parser,
+        text,
         nested_text,
         &content_node,
-        offset.is_some(),
+        nested_window,
         include_children,
         &nested_lang,
     ) else {
@@ -340,13 +353,9 @@ fn build_nested_injection(
         return build_from_node_in_injection(*node, parent_start_byte, doc_ctx.mapper);
     };
 
-    let nested_relative_byte = if let Some(off) = offset {
-        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
-        let effective = calculate_effective_range(text, byte_range, off);
-        cursor_byte.saturating_sub(effective.start)
-    } else {
-        cursor_byte.saturating_sub(content_node.start_byte())
-    };
+    // Relative to the snapped window start so it stays consistent with the
+    // sliced `nested_text`.
+    let nested_relative_byte = cursor_byte.saturating_sub(nested_window_start);
 
     let nested_root = nested_tree.root_node();
 
@@ -488,5 +497,131 @@ fn splice_effective_range_into_hierarchy(
     SelectionRange {
         range: selection.range,
         parent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::injection::collect_all_injections;
+
+    #[test]
+    fn effective_window_for_snaps_offset_to_char_boundaries() {
+        // Offsets are byte deltas; +1 into "あ" (3 bytes) lands mid-codepoint
+        // and would panic the `&text[window]` content slice without snapping.
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&rust_language)
+            .expect("set rust language");
+        let text = "let s = \"あい\";";
+        let tree = parser.parse(text, None).expect("parse rust");
+        let content = tree
+            .root_node()
+            .descendant_for_byte_range(9, 15)
+            .expect("string_content node");
+        assert_eq!(content.kind(), "string_content");
+        assert_eq!(content.byte_range(), 9..15);
+
+        let offset = InjectionOffset {
+            start_row: 0,
+            start_column: 1,
+            end_row: 0,
+            end_column: 0,
+        };
+        let window = effective_window_for(text, &content, Some(offset));
+        assert_eq!(window, 12..15, "start snaps forward past the mid-codepoint");
+        assert_eq!(&text[window], "い");
+
+        // Degenerate after snapping: both ends collapse into an empty window
+        // rather than an inverted (panicking) one.
+        let collapse = InjectionOffset {
+            start_row: 0,
+            start_column: 1,
+            end_row: 0,
+            end_column: -1,
+        };
+        let window = effective_window_for(text, &content, Some(collapse));
+        assert!(window.is_empty());
+        assert!(text.get(window).is_some(), "window must be sliceable");
+    }
+
+    #[test]
+    fn parse_with_included_ranges_strips_prefixes_inside_offset_window() {
+        // #186: #offset! WITHOUT injection.include-children. The selection
+        // path must still exclude blockquote `> ` prefixes when parsing the
+        // post-offset window.
+        //
+        // Byte map:
+        //   "> ```rust\n"      0..10
+        //   "> let a = 1;\n"  10..23   (trimmed by the offset)
+        //   "> let b = 2;\n"  23..36   (prefix at 23..25)
+        //   "> ```\n"         36..42
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut md_parser = Parser::new();
+        md_parser
+            .set_language(&md_language)
+            .expect("set md language");
+        let text = "> ```rust\n> let a = 1;\n> let b = 2;\n> ```\n";
+        let md_tree = md_parser.parse(text, None).expect("parse markdown");
+
+        let query = tree_sitter::Query::new(
+            &md_language,
+            r#"
+            ((fenced_code_block
+               (info_string (language) @injection.language)
+               (code_fence_content) @injection.content)
+              (#offset! @injection.content 1 0 0 0))
+            "#,
+        )
+        .expect("valid offset injection query");
+
+        let regions = collect_all_injections(&md_tree.root_node(), text, Some(&query))
+            .expect("should find injections");
+        assert_eq!(regions.len(), 1);
+        let content_node = regions[0].content_node;
+        assert!(!regions[0].include_children);
+
+        let offset = effective_offset_for_pattern(&query, regions[0].pattern_index)
+            .expect("offset directive");
+        let byte_range = ByteRange::new(content_node.start_byte(), content_node.end_byte());
+        let effective = calculate_effective_range(text, byte_range, offset);
+        let content_text = &text[effective.start..effective.end];
+
+        // Control: without child exclusion the parser sees the `> ` prefix
+        // and produces an erroneous tree — this is what the old gate did.
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut control_parser = Parser::new();
+        control_parser
+            .set_language(&rust_language)
+            .expect("set rust language");
+        let control_tree = control_parser
+            .parse(content_text, None)
+            .expect("parse control");
+        assert!(
+            control_tree.root_node().has_error(),
+            "control: prefix-polluted content must not parse cleanly"
+        );
+
+        let mut rust_parser = Parser::new();
+        rust_parser
+            .set_language(&rust_language)
+            .expect("set rust language");
+        let tree = parse_with_included_ranges(
+            &mut rust_parser,
+            text,
+            content_text,
+            &content_node,
+            effective.start..effective.end,
+            regions[0].include_children,
+            "rust",
+        )
+        .expect("parse injected content");
+
+        assert!(
+            !tree.root_node().has_error(),
+            "prefixes must be excluded inside the offset window; got tree: {}",
+            tree.root_node().to_sexp()
+        );
     }
 }

@@ -18,7 +18,8 @@
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::LanguageCoordinator;
 use crate::language::injection::{
-    MAX_INJECTION_DEPTH, ceil_char_boundary, collect_all_injections, compute_included_ranges,
+    MAX_INJECTION_DEPTH, byte_to_point, byte_to_point_anchored, ceil_char_boundary,
+    collect_all_injections, compute_included_ranges, compute_included_ranges_clipped,
     effective_offset_for_pattern, floor_char_boundary, intersect_included_ranges,
 };
 use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
@@ -504,12 +505,11 @@ fn parse_with_absolute_ranges(
 
 /// Compute the absolute byte-range list that the injection parser would see
 /// for `region` given the host's `@injection.content` node, any `#offset!`
-/// directive on the pattern, and `compute_included_ranges` gap exclusions.
+/// directive on the pattern, and child-exclusion gap ranges (clipped to the
+/// post-offset window when both are active, #186).
 ///
-/// Returns an empty `Vec` when:
-/// - the offset-adjusted range is degenerate (`start >= end`); or
-/// - `compute_included_ranges` returns gaps that all fall outside the
-///   offset-adjusted span (intersection is empty).
+/// Returns an empty `Vec` when the offset-adjusted range is degenerate
+/// (`start >= end`, including after char-boundary alignment).
 fn build_effective_ranges(
     region: &crate::language::injection::InjectionRegionInfo<'_>,
     host_text: &str,
@@ -535,16 +535,10 @@ fn build_effective_ranges(
         return Vec::new();
     }
 
-    // 2. Compute compute_included_ranges gap list (relative coords inside
-    // content_node) and shift to absolute. Intersect each gap with the
-    // offset-adjusted span so blockquote prefixes excluded by the gap list and
-    // bytes trimmed by the offset directive are both honoured.
-    //
-    // Skip the include-gap step when an offset directive is active: gaps from
-    // `compute_included_ranges` are relative to `content_node.start_byte()`,
-    // but the offset may have moved the effective start away from there, and
-    // mixing the two coordinate frames would yield wrong ranges. The semantic-
-    // tokens parallel collector takes the same trade-off (see parallel.rs).
+    // 2. Compute the child-exclusion gap list (relative coords inside the
+    // effective window) and shift to absolute, so blockquote prefixes excluded
+    // by the gap list and bytes trimmed by the offset directive are both
+    // honoured (#186).
     let content_start = region.content_node.start_byte();
     let content_start_pos = region.content_node.start_position();
     let absolute_ranges: Vec<tree_sitter::Range> = if offset.is_some() {
@@ -562,36 +556,45 @@ fn build_effective_ranges(
         if aligned_start >= aligned_end {
             return Vec::new();
         }
-        vec![tree_sitter::Range {
-            start_byte: aligned_start,
-            end_byte: aligned_end,
-            start_point: byte_to_point(host_text, aligned_start),
-            end_point: byte_to_point(host_text, aligned_end),
-        }]
+        match compute_included_ranges_clipped(
+            &region.content_node,
+            region.include_children,
+            host_text,
+            aligned_start..aligned_end,
+        ) {
+            Some(gaps) => {
+                let window_start_pos = byte_to_point_anchored(
+                    host_text,
+                    aligned_start,
+                    content_start,
+                    content_start_pos,
+                );
+                gaps.into_iter()
+                    .map(|r| absolutize_range(r, aligned_start, window_start_pos))
+                    .collect()
+            }
+            None => {
+                let start_point = byte_to_point_anchored(
+                    host_text,
+                    aligned_start,
+                    content_start,
+                    content_start_pos,
+                );
+                let end_point =
+                    byte_to_point_anchored(host_text, aligned_end, aligned_start, start_point);
+                vec![tree_sitter::Range {
+                    start_byte: aligned_start,
+                    end_byte: aligned_end,
+                    start_point,
+                    end_point,
+                }]
+            }
+        }
     } else {
         match compute_included_ranges(&region.content_node, region.include_children) {
             Some(gaps) => gaps
                 .into_iter()
-                .map(|r| tree_sitter::Range {
-                    start_byte: content_start + r.start_byte,
-                    end_byte: content_start + r.end_byte,
-                    start_point: tree_sitter::Point {
-                        row: content_start_pos.row + r.start_point.row,
-                        column: if r.start_point.row == 0 {
-                            content_start_pos.column + r.start_point.column
-                        } else {
-                            r.start_point.column
-                        },
-                    },
-                    end_point: tree_sitter::Point {
-                        row: content_start_pos.row + r.end_point.row,
-                        column: if r.end_point.row == 0 {
-                            content_start_pos.column + r.end_point.column
-                        } else {
-                            r.end_point.column
-                        },
-                    },
-                })
+                .map(|r| absolutize_range(r, content_start, content_start_pos))
                 .collect(),
             None => vec![tree_sitter::Range {
                 start_byte: region.content_node.start_byte(),
@@ -603,6 +606,32 @@ fn build_effective_ranges(
     };
 
     absolute_ranges
+}
+
+/// Shift a window-relative gap range (as produced by
+/// `compute_included_ranges` / `compute_included_ranges_clipped`) into
+/// absolute host coordinates anchored at `base_byte` / `base_pos`. Columns
+/// are only shifted on the window's first row — later rows already carry
+/// absolute columns.
+fn absolutize_range(
+    r: tree_sitter::Range,
+    base_byte: usize,
+    base_pos: tree_sitter::Point,
+) -> tree_sitter::Range {
+    let absolutize_point = |p: tree_sitter::Point| tree_sitter::Point {
+        row: base_pos.row + p.row,
+        column: if p.row == 0 {
+            base_pos.column + p.column
+        } else {
+            p.column
+        },
+    };
+    tree_sitter::Range {
+        start_byte: base_byte + r.start_byte,
+        end_byte: base_byte + r.end_byte,
+        start_point: absolutize_point(r.start_point),
+        end_point: absolutize_point(r.end_point),
+    }
 }
 
 /// Half-open containment over a list of disjoint ranges, with the node-reference-protocol decision's
@@ -892,19 +921,63 @@ fn discover_child_languages(
     }
 }
 
-/// Convert an absolute byte offset to a `tree_sitter::Point`. Used when an
-/// offset directive shifts the injection boundary away from a known node
-/// position, so we can't reuse the content node's start/end points.
-fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
-    // Align first — slicing `&text[..clamped]` on a mid-character byte would
-    // panic and crash the LSP server.
-    let clamped = floor_char_boundary(text, byte);
-    let prefix = &text[..clamped];
-    let row = prefix.bytes().filter(|b| *b == b'\n').count();
-    let last_nl = prefix.rfind('\n');
-    let column = match last_nl {
-        Some(idx) => clamped - idx - 1,
-        None => clamped,
-    };
-    tree_sitter::Point { row, column }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_effective_ranges_combines_offset_with_child_exclusion() {
+        // #186: #offset! WITHOUT injection.include-children. The row offset
+        // trims the first content line; blockquote `> ` prefixes
+        // (block_continuation children) must still be excluded within the
+        // remaining window.
+        //
+        // Byte map:
+        //   "> ```lua\n"       0..9
+        //   "> local a = 1\n"  9..23   (trimmed by the offset)
+        //   "> local b = 2\n" 23..37   (prefix at 23..25)
+        //   "> ```\n"         37..43
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "> ```lua\n> local a = 1\n> local b = 2\n> ```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query = tree_sitter::Query::new(
+            &md_language,
+            r#"
+            ((fenced_code_block
+               (info_string (language) @injection.language)
+               (code_fence_content) @injection.content)
+              (#offset! @injection.content 1 0 0 0))
+            "#,
+        )
+        .expect("valid offset injection query");
+
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query))
+            .expect("should find injections");
+        assert_eq!(regions.len(), 1);
+        assert!(
+            !regions[0].include_children,
+            "query must not set include-children for this scenario"
+        );
+
+        let ranges = build_effective_ranges(&regions[0], text, &query);
+
+        let bytes: Vec<(usize, usize)> =
+            ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect();
+        assert_eq!(
+            bytes,
+            vec![(25, 37)],
+            "only the post-offset code (sans `> ` prefix) should remain"
+        );
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 2, column: 2 }
+        );
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 3, column: 0 }
+        );
+    }
 }

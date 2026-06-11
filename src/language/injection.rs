@@ -232,6 +232,64 @@ pub(crate) fn compute_included_ranges(
     content_node: &tree_sitter::Node,
     include_children: bool,
 ) -> Option<Vec<tree_sitter::Range>> {
+    compute_included_ranges_in_window(
+        content_node,
+        include_children,
+        content_node.start_byte(),
+        content_node.end_byte(),
+        || (content_node.start_position(), content_node.end_position()),
+    )
+}
+
+/// Like [`compute_included_ranges`], but restricted to an effective byte
+/// window — the post-`#offset!` span (#186). Children outside the window are
+/// ignored; children straddling a window edge are clipped to it. Returned
+/// ranges are relative to `window.start`, matching the content slice handed
+/// to the injection parser.
+///
+/// `window` bounds must lie on char boundaries (callers snap with
+/// `ceil_char_boundary` / `floor_char_boundary` before slicing the content).
+pub(crate) fn compute_included_ranges_clipped(
+    content_node: &tree_sitter::Node,
+    include_children: bool,
+    text: &str,
+    window: std::ops::Range<usize>,
+) -> Option<Vec<tree_sitter::Range>> {
+    if window.start >= window.end {
+        return None;
+    }
+    compute_included_ranges_in_window(
+        content_node,
+        include_children,
+        window.start,
+        window.end,
+        || {
+            // Anchor the scans on the content node's cached position so we only
+            // walk the (typically small) span between the node start and the
+            // window edges, not the whole document prefix. Lazy: skipped entirely
+            // when the guards in the core return early.
+            let anchor_byte = content_node.start_byte();
+            let anchor_point = content_node.start_position();
+            let start = byte_to_point_anchored(text, window.start, anchor_byte, anchor_point);
+            let end = byte_to_point_anchored(text, window.end, window.start, start);
+            (start, end)
+        },
+    )
+}
+
+/// Shared core of [`compute_included_ranges`] /
+/// [`compute_included_ranges_clipped`]: gaps between the content node's named
+/// children, restricted to `[window_start_byte, window_end_byte)` and
+/// relativized to the window start. `window_points` lazily supplies the
+/// window bounds' Points — it is only invoked once the guards have decided
+/// gaps actually need computing.
+fn compute_included_ranges_in_window(
+    content_node: &tree_sitter::Node,
+    include_children: bool,
+    window_start_byte: usize,
+    window_end_byte: usize,
+    window_points: impl FnOnce() -> (tree_sitter::Point, tree_sitter::Point),
+) -> Option<Vec<tree_sitter::Range>> {
     if include_children || content_node.named_child_count() == 0 {
         return None;
     }
@@ -250,19 +308,17 @@ pub(crate) fn compute_included_ranges(
         return None;
     }
 
-    let node_start_byte = content_node.start_byte();
-    let node_start_pos = content_node.start_position();
-    let node_end_byte = content_node.end_byte();
-    let node_end_pos = content_node.end_position();
+    let (window_start_point, window_end_point) = window_points();
 
-    // Helper to make a Point relative to the content node's start.
-    // Column is only adjusted when the point is on the same row as the node start,
-    // because only that row has a non-zero column offset from the node origin.
+    // Helper to make a Point relative to the window's start.
+    // Column is only adjusted when the point is on the same row as the window
+    // start, because only that row has a non-zero column offset from the
+    // window origin.
     let relativize_point = |p: tree_sitter::Point| -> tree_sitter::Point {
         tree_sitter::Point {
-            row: p.row.saturating_sub(node_start_pos.row),
-            column: if p.row == node_start_pos.row {
-                p.column.saturating_sub(node_start_pos.column)
+            row: p.row.saturating_sub(window_start_point.row),
+            column: if p.row == window_start_point.row {
+                p.column.saturating_sub(window_start_point.column)
             } else {
                 p.column
             },
@@ -270,8 +326,8 @@ pub(crate) fn compute_included_ranges(
     };
 
     let mut ranges = Vec::new();
-    let mut cursor_byte = node_start_byte;
-    let mut cursor_point = node_start_pos;
+    let mut cursor_byte = window_start_byte;
+    let mut cursor_point = window_start_point;
 
     let mut tree_cursor = content_node.walk();
     for child in content_node.named_children(&mut tree_cursor) {
@@ -286,14 +342,33 @@ pub(crate) fn compute_included_ranges(
             continue;
         }
 
+        // Entirely before the window (or before an earlier child that already
+        // advanced the cursor): nothing to exclude here.
+        if child_end_byte <= cursor_byte {
+            continue;
+        }
+        // Children are in document order; the first one at/after the window
+        // end means no later child can affect the window either.
+        if child_start_byte >= window_end_byte {
+            break;
+        }
+
         // Gap before this child
         if cursor_byte < child_start_byte {
             ranges.push(tree_sitter::Range {
-                start_byte: cursor_byte - node_start_byte,
-                end_byte: child_start_byte - node_start_byte,
+                start_byte: cursor_byte - window_start_byte,
+                end_byte: child_start_byte - window_start_byte,
                 start_point: relativize_point(cursor_point),
                 end_point: relativize_point(child.start_position()),
             });
+        }
+
+        // A child running past the window end is clipped: the window's tail
+        // is covered, so no final gap remains.
+        if child_end_byte >= window_end_byte {
+            cursor_byte = window_end_byte;
+            cursor_point = window_end_point;
+            break;
         }
 
         cursor_byte = child_end_byte;
@@ -301,12 +376,12 @@ pub(crate) fn compute_included_ranges(
     }
 
     // Gap after last child
-    if cursor_byte < node_end_byte {
+    if cursor_byte < window_end_byte {
         ranges.push(tree_sitter::Range {
-            start_byte: cursor_byte - node_start_byte,
-            end_byte: node_end_byte - node_start_byte,
+            start_byte: cursor_byte - window_start_byte,
+            end_byte: window_end_byte - window_start_byte,
             start_point: relativize_point(cursor_point),
-            end_point: relativize_point(node_end_pos),
+            end_point: relativize_point(window_end_point),
         });
     }
 
@@ -528,14 +603,19 @@ fn extract_virtual_content_and_offsets(
     cacheable: &CacheableInjectionRegion,
     text: &str,
 ) -> (String, Vec<u32>) {
-    // Disabled when an offset directive is active: compute_included_ranges()
-    // returns ranges relative to content_node.start_byte(), but with #offset!
-    // the cacheable byte_range starts elsewhere — misaligned ranges would
-    // extract wrong content. Mirrors the semantic path (parallel.rs); the
-    // offset × child-exclusion interaction is tracked in #186 (every vendored
-    // #offset! query sets include-children, so nothing is lost today).
+    // Child-exclusion gaps restricted to the effective window (#186):
+    // cacheable.byte_range already reflects any #offset! directive (applied
+    // and char-boundary-aligned by from_region_info), so gaps are clipped to
+    // it and relativized to its start. Without an offset the window equals
+    // the content node span, so the node-anchored variant gives the same
+    // result while reusing tree-sitter's cached node Points (no text scan).
     let included_ranges = if region.offset.is_some() {
-        None
+        compute_included_ranges_clipped(
+            &region.content_node,
+            region.include_children,
+            text,
+            cacheable.byte_range.clone(),
+        )
     } else {
         compute_included_ranges(&region.content_node, region.include_children)
     };
@@ -720,6 +800,53 @@ fn position_of_byte(
     let line_start = text[..byte_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let column = text[line_start..byte_pos].encode_utf16().count() as u32;
     (row as u32, column)
+}
+
+/// Convert an absolute byte offset to a `tree_sitter::Point` (byte-based
+/// column). Used when an offset directive shifts the injection boundary away
+/// from a known node position, so we can't reuse the content node's
+/// start/end points.
+pub(crate) fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
+    // Align first — slicing `&text[..clamped]` on a mid-character byte would
+    // panic and crash the LSP server.
+    let clamped = floor_char_boundary(text, byte);
+    let prefix = &text[..clamped];
+    let row = prefix.bytes().filter(|b| *b == b'\n').count();
+    let last_nl = prefix.rfind('\n');
+    let column = match last_nl {
+        Some(idx) => clamped - idx - 1,
+        None => clamped,
+    };
+    tree_sitter::Point { row, column }
+}
+
+/// Like [`byte_to_point`], but scans only the span between a known anchor
+/// and `byte` instead of the whole prefix of `text` — the anchor is
+/// typically a tree-sitter node's cached `start_position()`. Falls back to a
+/// full scan when `byte` precedes the anchor (e.g. a negative `#offset!`
+/// extending before the content node). `anchor_byte` must lie on a char
+/// boundary, with `anchor_point` its Point in `text`.
+pub(crate) fn byte_to_point_anchored(
+    text: &str,
+    byte: usize,
+    anchor_byte: usize,
+    anchor_point: tree_sitter::Point,
+) -> tree_sitter::Point {
+    let clamped = floor_char_boundary(text, byte);
+    if clamped < anchor_byte {
+        return byte_to_point(text, clamped);
+    }
+    let segment = &text[anchor_byte..clamped];
+    match segment.rfind('\n') {
+        Some(last_nl) => tree_sitter::Point {
+            row: anchor_point.row + segment.bytes().filter(|b| *b == b'\n').count(),
+            column: segment.len() - last_nl - 1,
+        },
+        None => tree_sitter::Point {
+            row: anchor_point.row,
+            column: anchor_point.column + segment.len(),
+        },
+    }
 }
 
 /// Snap `index` forward to the nearest char boundary (stable alternative to
@@ -1590,6 +1717,39 @@ mod tests {
         assert_eq!(resolved[0].line_column_offsets, vec![0]);
     }
 
+    #[test]
+    fn test_resolved_virtual_content_combines_offset_with_child_exclusion() {
+        // #186: a query with #offset! but WITHOUT injection.include-children.
+        // Blockquote `> ` prefixes (block_continuation children) must still be
+        // stripped, restricted to the post-offset window — previously the
+        // child-exclusion step was skipped entirely whenever an offset was
+        // active, leaking prefixes into the virtual document.
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "> ```lua\n> local a = 1\n> local b = 2\n> ```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query_str = r#"
+            ((fenced_code_block
+               (info_string (language) @injection.language)
+               (code_fence_content) @injection.content)
+              (#offset! @injection.content 1 0 0 0))
+        "#;
+        let query = Query::new(&md_language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("offset_blockquote");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+        assert_eq!(resolved.len(), 1);
+        // The row offset trims the first content line; child exclusion strips
+        // the remaining `> ` prefixes.
+        assert_eq!(resolved[0].virtual_content, "local b = 2\n");
+    }
+
     // ============================================================
     // Tests for InjectionResolver region_id generation
     // ============================================================
@@ -2202,6 +2362,126 @@ mod tests {
         assert!(
             covered.iter().all(|&b| b),
             "Gaps + children should cover the entire node"
+        );
+    }
+
+    #[test]
+    fn test_byte_to_point_anchored_matches_full_scan() {
+        // Exhaustive equivalence with the full-prefix scan, covering the
+        // before-anchor fallback, same-row and cross-row targets, and
+        // mid-codepoint clamping (bytes inside あ floor to its start).
+        let text = "abc\ndefあ\nghi";
+        let anchor_byte = 4; // start of "def"
+        let anchor_point = byte_to_point(text, anchor_byte);
+        for byte in 0..=text.len() {
+            assert_eq!(
+                byte_to_point_anchored(text, byte, anchor_byte, anchor_point),
+                byte_to_point(text, byte),
+                "anchored and full scans must agree at byte {byte}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_full_window_matches_unclipped() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        let unclipped = compute_included_ranges(&func, false).expect("named children produce gaps");
+        let clipped =
+            compute_included_ranges_clipped(&func, false, text, func.start_byte()..func.end_byte())
+                .expect("full window should produce the same gaps");
+
+        assert_eq!(
+            clipped, unclipped,
+            "window covering the whole node must reproduce compute_included_ranges"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_drops_children_before_window() {
+        // "fn main() {}": named children of function_item are
+        // main(3..7), parameters(7..9), body(10..12); gaps are [0..3) and [9..10).
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        // Window starts inside `main` (3..7): the straddling child is clipped,
+        // the "fn " gap disappears, and only the " " gap [9..10) remains,
+        // relative to the window start.
+        let ranges = compute_included_ranges_clipped(&func, false, text, 4..12)
+            .expect("gap inside window should survive");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start_byte, ranges[0].end_byte), (5, 6));
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 0, column: 5 }
+        );
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 0, column: 6 }
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_truncates_at_window_end() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        // Window ends inside the body (10..12): both gaps survive, and no
+        // spurious gap is emitted after the clipped body.
+        let ranges = compute_included_ranges_clipped(&func, false, text, 0..11)
+            .expect("gaps inside window should survive");
+
+        let bytes: Vec<(usize, usize)> =
+            ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect();
+        assert_eq!(bytes, vec![(0, 3), (9, 10)]);
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_returns_none_when_children_cover_window() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        // Window [10..12) lies entirely inside the body child: no gaps.
+        assert!(
+            compute_included_ranges_clipped(&func, false, text, 10..12).is_none(),
+            "window fully covered by a child has no gaps"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_relativizes_points_to_window_start() {
+        // Two statements on separate lines; gaps are the newlines [4..5) and [9..10).
+        let mut parser = create_rust_parser();
+        let text = "a();\nb();\n";
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // Window starts at byte 6 = row 1, column 1 (inside `b();`).
+        let ranges = compute_included_ranges_clipped(&root, false, text, 6..10)
+            .expect("trailing newline gap should survive");
+
+        assert_eq!(ranges.len(), 1);
+        // Gap [9..10) relative to window start 6.
+        assert_eq!((ranges[0].start_byte, ranges[0].end_byte), (3, 4));
+        // Same row as window start: column is relative (4 - 1 = 3).
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 0, column: 3 }
+        );
+        // Next row: column stays absolute.
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 1, column: 0 }
         );
     }
 
