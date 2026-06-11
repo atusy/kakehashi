@@ -36,10 +36,45 @@ use tower_lsp_server::jsonrpc::{Request, Response};
 struct DocSeq {
     /// Last issued writer ticket (tickets start at 1; 0 = none issued).
     tail: u64,
-    /// Highest completed writer ticket. Waiters subscribe to this channel;
-    /// dropping the sender (entry removal after a close) wakes them with an
-    /// error, which they treat as "nothing left to wait for".
+    /// Completion channel + out-of-order ledger shared with issued guards.
+    completion: Arc<DocCompletion>,
+}
+
+/// Completion tracking shared between a document's entry and its in-flight
+/// writer guards.
+struct DocCompletion {
+    /// Highest **contiguously** completed writer ticket. Waiters subscribe to
+    /// this channel; dropping the sender (entry removal after a close) wakes
+    /// them with an error, which they treat as "nothing left to wait for".
     done: watch::Sender<u64>,
+    /// Tickets completed ahead of a still-running predecessor. `done` only
+    /// advances through consecutive tickets, so a hypothetical selectively
+    /// cancelled middle writer can never unblock its successor while an
+    /// earlier writer is still running — the guarantee holds locally instead
+    /// of leaning on the transport never dropping individual notification
+    /// futures.
+    early: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+impl DocCompletion {
+    /// Record `ticket` as complete, advancing `done` only through
+    /// consecutive completions and cascading any tickets that finished early.
+    fn complete(&self, ticket: u64) {
+        let mut early = self
+            .early
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.done.send_modify(|done| {
+            if ticket == *done + 1 {
+                *done = ticket;
+                while early.remove(&(*done + 1)) {
+                    *done += 1;
+                }
+            } else if ticket > *done {
+                early.insert(ticket);
+            }
+        });
+    }
 }
 
 /// Issues per-document writer tickets and reader barriers in wire order.
@@ -57,15 +92,18 @@ impl DocumentSequencer {
     pub(crate) fn issue_writer_ticket(&self, uri: &str) -> WriterGate {
         let mut entry = self.docs.entry(uri.to_string()).or_insert_with(|| DocSeq {
             tail: 0,
-            done: watch::Sender::new(0),
+            completion: Arc::new(DocCompletion {
+                done: watch::Sender::new(0),
+                early: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            }),
         });
         entry.tail += 1;
         WriterGate {
             ticket: entry.tail,
-            rx: entry.done.subscribe(),
+            rx: entry.completion.done.subscribe(),
             guard: CompletionGuard {
                 ticket: entry.tail,
-                tx: entry.done.clone(),
+                completion: Arc::clone(&entry.completion),
             },
         }
     }
@@ -75,12 +113,12 @@ impl DocumentSequencer {
     /// (no entry, or every issued ticket already completed).
     pub(crate) fn reader_barrier(&self, uri: &str) -> Option<ReaderBarrier> {
         let entry = self.docs.get(uri)?;
-        if *entry.done.borrow() >= entry.tail {
+        if *entry.completion.done.borrow() >= entry.tail {
             return None;
         }
         Some(ReaderBarrier {
             target: entry.tail,
-            rx: entry.done.subscribe(),
+            rx: entry.completion.done.subscribe(),
         })
     }
 
@@ -120,16 +158,12 @@ impl WriterGate {
 /// Marks a writer ticket complete on drop.
 struct CompletionGuard {
     ticket: u64,
-    tx: watch::Sender<u64>,
+    completion: Arc<DocCompletion>,
 }
 
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
-        self.tx.send_modify(|done| {
-            if self.ticket > *done {
-                *done = self.ticket;
-            }
-        });
+        self.completion.complete(self.ticket);
     }
 }
 
@@ -359,6 +393,30 @@ mod tests {
         drop(first);
 
         second.wait_turn().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_middle_writer_does_not_unblock_successor_prematurely() {
+        let seq = DocumentSequencer::default();
+        let first = seq.issue_writer_ticket(URI);
+        let second = seq.issue_writer_ticket(URI);
+        let mut third = seq.issue_writer_ticket(URI);
+
+        // The middle writer's future is dropped while the first is still
+        // running: `done` must stay contiguous, so the third writer keeps
+        // waiting for the first.
+        drop(second);
+        {
+            let mut third_wait = std::pin::pin!(third.wait_turn());
+            assert!(
+                pending(&mut third_wait),
+                "third writer must keep waiting for the first even after the second is cancelled"
+            );
+        }
+
+        // First completing cascades through the early-completed second.
+        drop(first);
+        third.wait_turn().await;
     }
 
     #[tokio::test]
