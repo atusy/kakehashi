@@ -190,7 +190,9 @@ fn classify(req: &Request) -> Option<Role> {
 /// wire string when it doesn't parse (such requests fail in handlers anyway;
 /// gating them consistently by spelling is harmless).
 fn text_document_uri(req: &Request) -> Option<String> {
-    let raw = req.params()?.get("textDocument")?.get("uri")?.as_str()?;
+    // Indexing a missing key or non-object yields Value::Null, whose as_str()
+    // returns None — same outcome as get() chains, less noise.
+    let raw = req.params()?["textDocument"]["uri"].as_str()?;
     Some(
         url::Url::parse(raw)
             .map(String::from)
