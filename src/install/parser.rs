@@ -397,6 +397,10 @@ fn run_with_timeout(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
+                // try_wait failing is practically unreachable, but don't
+                // leak a running child on that path either.
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(ParserInstallError::GitError(format!("{}: {}", context, e)));
             }
         }
