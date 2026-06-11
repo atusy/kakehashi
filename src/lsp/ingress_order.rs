@@ -442,8 +442,7 @@ mod tests {
             "textDocument/didChange",
             "file:///tmp/./a.md",
         ));
-        let (Some(Role::Writer { uri: uri_a, .. }), Some(Role::Writer { uri: uri_b, .. })) =
-            (a, b)
+        let (Some(Role::Writer { uri: uri_a, .. }), Some(Role::Writer { uri: uri_b, .. })) = (a, b)
         else {
             panic!("both must classify as writers");
         };
@@ -463,8 +462,7 @@ mod tests {
     impl Service<Request> for MockInner {
         type Response = Option<Response>;
         type Error = std::convert::Infallible;
-        type Future =
-            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
