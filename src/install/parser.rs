@@ -355,14 +355,23 @@ fn archive_root_dir_name(repo_name: &str, revision: &str) -> String {
 /// process exit while the runtime drains blocking tasks.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Build a git command that can never prompt: stdin is nulled and
-/// `GIT_TERMINAL_PROMPT=0` set, so a private/renamed repository fails fast
-/// instead of waiting for credentials nobody can type.
+/// Build a git command that can never prompt, so a private/renamed
+/// repository fails fast instead of waiting for credentials nobody can type:
+/// stdin is nulled, `GIT_TERMINAL_PROMPT=0` covers terminal prompts,
+/// `GIT_ASKPASS`/`SSH_ASKPASS` are pointed at `true` (immediately answers
+/// with an empty string), and ssh runs in BatchMode (fails instead of
+/// prompting). stdout is nulled too — when this runs inside the LSP server,
+/// stdout is the JSON-RPC channel and no child chatter may reach it; git's
+/// diagnostics go to stderr, which stays inherited for the logs.
 fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(args)
         .stdin(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .stdout(std::process::Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "true")
+        .env("SSH_ASKPASS", "true")
+        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
     if let Some(dir) = current_dir {
         cmd.current_dir(dir);
     }
@@ -473,8 +482,11 @@ mod tests {
 
     #[test]
     fn run_with_timeout_kills_stuck_command() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 30"]);
+        // Spawn `sleep` directly: with `sh -c` the kill would reach the
+        // shell, and reaching `sleep` would depend on the shell exec'ing
+        // single commands.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
 
         let started = std::time::Instant::now();
         let result = run_with_timeout(cmd, Duration::from_millis(200), "test sleep");

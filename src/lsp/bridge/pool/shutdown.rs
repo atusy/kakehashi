@@ -248,9 +248,13 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             match process_stat(pid) {
-                None => break,
-                Some(stat) if stat.starts_with('Z') => break,
-                Some(stat) => {
+                Err(e) => {
+                    eprintln!("Skipping child-liveness assertion: ps unavailable ({e})");
+                    return;
+                }
+                Ok(None) => break,
+                Ok(Some(stat)) if stat.starts_with('Z') => break,
+                Ok(Some(stat)) => {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "sink child {pid} still running (stat {stat}) after force_kill_all"
