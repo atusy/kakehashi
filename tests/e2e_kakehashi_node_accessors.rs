@@ -881,3 +881,186 @@ fn test_position_accessors_return_null_for_unknown_id() {
         "descendantForPointRange on unknown id must be null"
     );
 }
+
+// ============================================================
+// Excluded-gap coordinates in injected layers (#341)
+// ============================================================
+//
+// A blockquoted python fence parses the injected python layer with
+// non-contiguous included ranges: each line's code is included, the `> `
+// prefixes are excluded gaps. A coordinate landing in a gap is not real
+// injected content, so the coordinate accessors must return null — matching
+// the entry point (`kakehashi/node`), which never pushes an injection layer
+// for a gap byte.
+//
+// Byte map of the fixture (every line starts with a 2-byte `> ` prefix):
+//   line 0 `> ```python\n`  bytes  0..12   (prefix  0..2)
+//   line 1 `> x = 1\n`      bytes 12..20   (prefix 12..14, code 14..20)
+//   line 2 `> y = 2\n`      bytes 20..28   (prefix 20..22, code 22..28)
+//   line 3 `> ```\n`        bytes 28..34
+const BLOCKQUOTED_PYTHON: &str = "> ```python\n> x = 1\n> y = 2\n> ```\n";
+
+/// Resolve the injected python layer's root by entering the layer at a cursor
+/// at the `=` of `x = 1` (line 1, character 4 — past the `> ` prefix) and
+/// climbing parents;
+/// per-layer scope keeps the walk inside the python tree.
+fn python_layer_root(client: &mut LspClient, uri: &str) -> String {
+    let node = call(
+        client,
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 4 },
+            "injection": true,
+        }),
+    );
+    assert!(
+        !node.is_null(),
+        "expected an injected python node at the cursor"
+    );
+    let mut current = id_of(&node);
+    for _ in 0..32 {
+        let parent = call(client, "kakehashi/node/parent", id_params(uri, &current));
+        if parent.is_null() {
+            return current;
+        }
+        current = id_of(&parent);
+    }
+    panic!("did not reach the injected layer root within 32 hops");
+}
+
+/// The python root's contiguous span covers the line-2 `> ` prefix (an
+/// excluded gap), so this asserts the test premise: the gap bytes pass the
+/// node-span bound and only the included-ranges check can reject them.
+fn assert_gap_inside_root_span(client: &mut LspClient, uri: &str, root: &str) {
+    let range = call(client, "kakehashi/node/byteRange", id_params(uri, root));
+    let start = range
+        .get("startByte")
+        .and_then(Value::as_u64)
+        .expect("startByte");
+    let end = range
+        .get("endByte")
+        .and_then(Value::as_u64)
+        .expect("endByte");
+    assert!(
+        start <= 20 && 22 < end,
+        "fixture premise: python root span [{start}, {end}) must cover the \
+         line-2 `> ` prefix bytes 20..22"
+    );
+}
+
+#[test]
+fn test_byte_lookups_in_excluded_gap_are_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_gap_bytes.md";
+    open_markdown(&mut client, uri, BLOCKQUOTED_PYTHON);
+
+    let root = python_layer_root(&mut client, uri);
+    assert_gap_inside_root_span(&mut client, uri, &root);
+
+    // Control: a code byte (the `y` at byte 22) resolves normally.
+    let on_code = call(
+        &mut client,
+        "kakehashi/node/descendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "startByte": 22, "endByte": 23 }),
+    );
+    assert!(
+        !on_code.is_null(),
+        "descendantForByteRange on included code bytes must resolve"
+    );
+
+    // A range crossing the gap with both endpoints on real content resolves
+    // the spanning node: [14, 23) starts on `x` and its last queried byte is
+    // the `y` at 22.
+    let spanning = call(
+        &mut client,
+        "kakehashi/node/descendantForByteRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "startByte": 14, "endByte": 23 }),
+    );
+    assert!(
+        !spanning.is_null(),
+        "a gap-spanning range with both bounds on code must still resolve"
+    );
+
+    // The `> ` prefix bytes (20..22) are an excluded gap → null. This covers
+    // a range inside the gap (20..21) and a range whose exclusive end lands
+    // on the next block's start (14..22): its last queried byte (21) is gap
+    // content even though 22 itself starts an included range.
+    for (start, end) in [(20, 21), (14, 22)] {
+        for method in [
+            "kakehashi/node/descendantForByteRange",
+            "kakehashi/node/namedDescendantForByteRange",
+        ] {
+            let v = call(
+                &mut client,
+                method,
+                json!({ "textDocument": { "uri": uri }, "id": root,
+                        "startByte": start, "endByte": end }),
+            );
+            assert!(
+                v.is_null(),
+                "{} on [{start}, {end}) must return null (gap content), got {:?}",
+                method,
+                v
+            );
+        }
+    }
+
+    let v = call(
+        &mut client,
+        "kakehashi/node/firstChildForByte",
+        json!({ "textDocument": { "uri": uri }, "id": root, "byte": 20 }),
+    );
+    assert!(
+        v.is_null(),
+        "firstChildForByte on an excluded-gap byte must return null, got {:?}",
+        v
+    );
+}
+
+#[test]
+fn test_point_lookups_in_excluded_gap_are_null() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+    let uri = "file:///accessors_gap_points.md";
+    open_markdown(&mut client, uri, BLOCKQUOTED_PYTHON);
+
+    let root = python_layer_root(&mut client, uri);
+    assert_gap_inside_root_span(&mut client, uri, &root);
+
+    // Control: positions on the code (`y` at line 2, characters 2..3) resolve.
+    let on_code = call(
+        &mut client,
+        "kakehashi/node/descendantForPointRange",
+        json!({ "textDocument": { "uri": uri }, "id": root,
+                "start": { "line": 2, "character": 2 },
+                "end":   { "line": 2, "character": 3 } }),
+    );
+    assert!(
+        !on_code.is_null(),
+        "descendantForPointRange on included code must resolve"
+    );
+
+    // Positions on the line-2 `> ` prefix are an excluded gap → null.
+    for method in [
+        "kakehashi/node/descendantForPointRange",
+        "kakehashi/node/namedDescendantForPointRange",
+    ] {
+        let v = call(
+            &mut client,
+            method,
+            json!({ "textDocument": { "uri": uri }, "id": root,
+                    "start": { "line": 2, "character": 0 },
+                    "end":   { "line": 2, "character": 1 } }),
+        );
+        assert!(
+            v.is_null(),
+            "{} on an excluded-gap position must return null, got {:?}",
+            method,
+            v
+        );
+    }
+}
