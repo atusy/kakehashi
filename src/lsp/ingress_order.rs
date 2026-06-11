@@ -157,13 +157,23 @@ enum Role {
 }
 
 /// Classify a request and extract its `textDocument.uri`, both synchronously.
+///
+/// Readers are the tree-snapshotting request families: `semanticTokens`
+/// (including `range`, which never had the in-handler `edit_lock` settle) and
+/// the `kakehashi/captures` triple, which mirrors it. The `kakehashi/node/*`
+/// protocol stays unclassified on purpose: node ids carry their own staleness
+/// handling (`null` → client re-acquires), so gating those point lookups
+/// would add latency without changing observable behavior.
 fn classify(req: &Request) -> Option<Role> {
     let close = match req.method() {
         "textDocument/didOpen" | "textDocument/didChange" => false,
         "textDocument/didClose" => true,
         "textDocument/semanticTokens/full"
         | "textDocument/semanticTokens/full/delta"
-        | "textDocument/semanticTokens/range" => {
+        | "textDocument/semanticTokens/range"
+        | "kakehashi/captures/full"
+        | "kakehashi/captures/full/delta"
+        | "kakehashi/captures/range" => {
             let uri = text_document_uri(req)?;
             return Some(Role::Reader { uri });
         }
@@ -173,13 +183,18 @@ fn classify(req: &Request) -> Option<Role> {
     Some(Role::Writer { uri, close })
 }
 
+/// Extract `params.textDocument.uri`, normalized through `Url` so spelling
+/// variants of the same document (percent-encoding, default ports) sequence
+/// together — internal document state is keyed on parsed `Url`s, and the
+/// gate's keys must not be finer-grained than that. Falls back to the raw
+/// wire string when it doesn't parse (such requests fail in handlers anyway;
+/// gating them consistently by spelling is harmless).
 fn text_document_uri(req: &Request) -> Option<String> {
+    let raw = req.params()?.get("textDocument")?.get("uri")?.as_str()?;
     Some(
-        req.params()?
-            .get("textDocument")?
-            .get("uri")?
-            .as_str()?
-            .to_string(),
+        url::Url::parse(raw)
+            .map(String::from)
+            .unwrap_or_else(|_| raw.to_string()),
     )
 }
 
@@ -392,8 +407,20 @@ mod tests {
         let open = classify(&notification("textDocument/didOpen", URI));
         assert!(matches!(open, Some(Role::Writer { close: false, .. })));
 
-        let reader = classify(&notification("textDocument/semanticTokens/full", URI));
-        assert!(matches!(reader, Some(Role::Reader { .. })));
+        for method in [
+            "textDocument/semanticTokens/full",
+            "textDocument/semanticTokens/full/delta",
+            "textDocument/semanticTokens/range",
+            "kakehashi/captures/full",
+            "kakehashi/captures/full/delta",
+            "kakehashi/captures/range",
+        ] {
+            let reader = classify(&notification(method, URI));
+            assert!(
+                matches!(reader, Some(Role::Reader { .. })),
+                "{method} must be a reader"
+            );
+        }
 
         assert!(
             classify(&notification("textDocument/hover", URI)).is_none(),
@@ -403,5 +430,94 @@ mod tests {
             classify(&Request::build("textDocument/didChange").finish()).is_none(),
             "missing params pass through rather than panic"
         );
+    }
+
+    #[test]
+    fn classify_normalizes_uri_spellings() {
+        // Url::parse normalizes scheme casing and dot segments — the same
+        // normalization the internal document store applies when parsing, so
+        // these spellings must share one sequence.
+        let a = classify(&notification("textDocument/didChange", "FILE:///tmp/a.md"));
+        let b = classify(&notification(
+            "textDocument/didChange",
+            "file:///tmp/./a.md",
+        ));
+        let (Some(Role::Writer { uri: uri_a, .. }), Some(Role::Writer { uri: uri_b, .. })) =
+            (a, b)
+        else {
+            panic!("both must classify as writers");
+        };
+        assert_eq!(
+            uri_a, uri_b,
+            "spelling variants of one document must share a sequence"
+        );
+    }
+
+    /// Inner mock: the writer's future stalls on a oneshot; everything else
+    /// resolves immediately. Completion order lands in `log`.
+    struct MockInner {
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        writer_release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl Service<Request> for MockInner {
+        type Response = Option<Response>;
+        type Error = std::convert::Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request) -> Self::Future {
+            let log = Arc::clone(&self.log);
+            if req.method() == "textDocument/didChange" {
+                let release = self
+                    .writer_release
+                    .take()
+                    .expect("one writer call expected");
+                Box::pin(async move {
+                    let _ = release.await;
+                    log.lock().unwrap().push("writer");
+                    Ok(None)
+                })
+            } else {
+                Box::pin(async move {
+                    log.lock().unwrap().push("reader");
+                    Ok(None)
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_runs_reader_only_after_preceding_writer() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            writer_release: Some(release_rx),
+        });
+
+        // Wire order: didChange, then semanticTokens/full.
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let reader_fut = gate.call(notification("textDocument/semanticTokens/full", URI));
+
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut reader = tokio_test::task::spawn(reader_fut);
+
+        // The reader must not run while the earlier writer is in flight,
+        // regardless of poll order (this is the buffer_unordered reorder).
+        assert!(reader.poll().is_pending());
+        assert!(writer.poll().is_pending(), "writer stalls on the oneshot");
+        assert!(reader.poll().is_pending(), "reader still gated");
+
+        release_tx.send(()).expect("writer is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(reader.is_woken(), "writer completion must wake the reader");
+        assert!(reader.poll().is_ready());
+
+        assert_eq!(*log.lock().unwrap(), vec!["writer", "reader"]);
     }
 }
