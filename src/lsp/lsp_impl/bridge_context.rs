@@ -345,6 +345,17 @@ impl Kakehashi {
         })
     }
 
+    /// Resolve the cross-layer config (cross-layer-aggregation) for a host
+    /// language and LSP method from the current settings.
+    pub(crate) fn resolve_layer_config(
+        &self,
+        host_language: &str,
+        method_name: &str,
+    ) -> ResolvedLayerConfig {
+        let settings = self.settings_manager.load_settings();
+        resolve_layer_config_from_settings(&settings, host_language, method_name)
+    }
+
     /// Whether the virt layer participates for this host language and LSP
     /// method (cross-layer-aggregation): when `"virt"` is absent from the
     /// resolved `layers.order`, the bridge dispatch is skipped entirely.
@@ -353,9 +364,10 @@ impl Kakehashi {
     /// contributor set — host (`bridge._self`) is unimplemented and the
     /// bridged methods have no native contributor — so "first non-empty
     /// layer in order" degenerates to "virt if allowed, else nothing".
+    /// Formatting consumes the full config instead (it dispatches on the
+    /// layer strategy too — see `combine_layer_formatting_results`).
     pub(crate) fn virt_layer_enabled(&self, host_language: &str, method_name: &str) -> bool {
-        let settings = self.settings_manager.load_settings();
-        resolve_layer_config_from_settings(&settings, host_language, method_name)
+        self.resolve_layer_config(host_language, method_name)
             .allows(LayerSource::Virt)
     }
 

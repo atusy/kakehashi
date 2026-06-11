@@ -86,7 +86,7 @@ pub struct BridgeLanguageConfig {
 ///
 /// The set is closed and three-valued, so layer order is expressed by
 /// explicit enumeration — no `"*"` element exists on this axis.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LayerSource {
     /// kakehashi's own features (Tree-sitter based).
@@ -124,6 +124,15 @@ fn default_layer_order() -> Vec<LayerSource> {
     vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
 }
 
+/// Drop repeated layers, keeping the first occurrence (order preserved).
+fn dedup_layer_order(order: Vec<LayerSource>) -> Vec<LayerSource> {
+    let mut seen = std::collections::HashSet::new();
+    order
+        .into_iter()
+        .filter(|layer| seen.insert(*layer))
+        .collect()
+}
+
 /// Fully resolved cross-layer settings for a single LSP method.
 ///
 /// Produced by [`LanguageSettings::resolve_layers`]; all optional fields are
@@ -131,7 +140,6 @@ fn default_layer_order() -> Vec<LayerSource> {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLayerConfig {
     pub(crate) order: Vec<LayerSource>,
-    #[allow(dead_code)] // consumed when layer-level `concatenated` lands (phase 3)
     pub(crate) strategy: AggregationStrategy,
 }
 
@@ -409,7 +417,10 @@ impl LanguageSettings {
         });
         match entry {
             Some(cfg) => ResolvedLayerConfig {
-                order: cfg.order.unwrap_or_else(default_layer_order),
+                // Dedup defensively (first occurrence wins): a repeated layer
+                // in user config would otherwise make downstream walks visit
+                // it twice.
+                order: dedup_layer_order(cfg.order.unwrap_or_else(default_layer_order)),
                 strategy: cfg
                     .strategy
                     .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
@@ -1522,6 +1533,30 @@ kind = "injections""#;
         let resolved = settings.resolve_layers("textDocument/hover");
         assert!(resolved.order.is_empty());
         assert!(!resolved.allows(LayerSource::Virt));
+    }
+
+    #[test]
+    fn resolve_layers_dedups_repeated_layers_first_occurrence_wins() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![
+                        LayerSource::Virt,
+                        LayerSource::Native,
+                        LayerSource::Virt,
+                    ]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt, LayerSource::Native],
+            "a repeated layer must not be walked twice"
+        );
     }
 
     #[test]

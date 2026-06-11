@@ -374,7 +374,7 @@ own features). The per-language `layers` map orders them per LSP method:
 | Field | Description |
 |-------|-------------|
 | `order` | Ordered allowlist of layers, highest priority first. Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy. Only `"preferred"` (first non-empty layer wins) is implemented today. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only; until host bridging ships, at most one layer produces edits, so both strategies currently yield that layer's result. |
 
 The key is the LSP method name or `_` for the method wildcard, like
 `aggregation`. Today only the `virt` layer produces results — `host` is

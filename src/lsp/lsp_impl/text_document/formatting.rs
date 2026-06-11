@@ -34,7 +34,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
 
 use crate::config::settings::AggregationStrategy;
-use crate::config::settings::PRIORITIES_WILDCARD;
+use crate::config::settings::{LayerSource, PRIORITIES_WILDCARD};
 use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
@@ -85,7 +85,13 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        if !self.virt_layer_enabled(&language_name, "textDocument/formatting") {
+        // Formatting consumes the full layer config (order AND strategy):
+        // it is the first method with a layer-level `concatenated` dispatch
+        // (cross-layer-aggregation phase 3).
+        let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/formatting");
+        if !layer_cfg.allows(LayerSource::Virt) {
+            // Host and native contribute nothing today, so a virt-less order
+            // cannot produce edits under either strategy.
             log::debug!(
                 target: "kakehashi::formatting",
                 "virt layer disabled for {} via layers.order",
@@ -260,8 +266,64 @@ impl Kakehashi {
 
         let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
-        response
+
+        // Cross-layer combine (cross-layer-aggregation phase 3). The virt
+        // result is computed above; host and native are empty contributors,
+        // evaluated as None without cost.
+        let virt_edits = response?;
+        let layer_results: Vec<(LayerSource, Option<Vec<TextEdit>>)> = layer_cfg
+            .order
+            .iter()
+            .map(|layer| match layer {
+                LayerSource::Virt => (*layer, virt_edits.clone()),
+                LayerSource::Host | LayerSource::Native => (*layer, None),
+            })
+            .collect();
+        Ok(combine_layer_formatting_results(
+            layer_cfg.strategy,
+            layer_results,
+        ))
     }
+}
+
+/// Combine per-layer formatting results (cross-layer-aggregation phase 3).
+///
+/// `results` is in resolved `layers.order` (highest priority first); a layer
+/// "produces" when it returns `Some` with at least one edit.
+///
+/// - `preferred`: the first producing layer wins.
+/// - `concatenated`: meant as a sequential cross-layer pipeline (each layer
+///   formatting the previous layer's output, by analogy with
+///   concatenated-formatting-pipeline). With at most one producing layer —
+///   the only case reachable today, since host (`bridge._self`) is
+///   unimplemented and there is no native formatter — the pipeline
+///   degenerates to that layer's edits. Should two layers ever produce
+///   before the text-threading machinery exists, the highest-priority
+///   layer's edits are applied alone (never merged: naively concatenating
+///   two layers' edit lists could overlap, violating LSP) and a warning
+///   names the dropped layers.
+fn combine_layer_formatting_results(
+    strategy: AggregationStrategy,
+    results: Vec<(LayerSource, Option<Vec<TextEdit>>)>,
+) -> Option<Vec<TextEdit>> {
+    let mut producing = results
+        .into_iter()
+        .filter_map(|(layer, edits)| match edits {
+            Some(edits) if !edits.is_empty() => Some((layer, edits)),
+            _ => None,
+        });
+    let first = producing.next();
+    let dropped: Vec<LayerSource> = producing.map(|(layer, _)| layer).collect();
+    if !dropped.is_empty() && strategy == AggregationStrategy::Concatenated {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "cross-layer concatenated formatting with multiple producing layers \
+             is not yet implemented; applying {:?} and dropping {:?}",
+            first.as_ref().map(|(layer, _)| layer),
+            dropped,
+        );
+    }
+    first.map(|(_, edits)| edits)
 }
 
 /// How a single injection region should be formatted, derived from its resolved
@@ -1468,6 +1530,75 @@ mod tests {
             plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
             RegionFormatPlan::Concatenated(vec!["isort".to_string(), "black".to_string()])
         );
+    }
+
+    // ==========================================================================
+    // combine_layer_formatting_results (cross-layer-aggregation phase 3)
+    // ==========================================================================
+
+    fn layer_edit(text: &str) -> TextEdit {
+        edit(0, 0, text)
+    }
+
+    #[test]
+    fn combine_layers_preferred_picks_first_producing_layer() {
+        let results = vec![
+            (LayerSource::Virt, None),
+            (LayerSource::Host, Some(vec![layer_edit("host")])),
+            (LayerSource::Native, Some(vec![layer_edit("native")])),
+        ];
+        let combined =
+            combine_layer_formatting_results(AggregationStrategy::Preferred, results).unwrap();
+        assert_eq!(combined[0].new_text, "host");
+    }
+
+    #[test]
+    fn combine_layers_treats_empty_edit_list_as_non_producing() {
+        let results = vec![
+            (LayerSource::Virt, Some(vec![])),
+            (LayerSource::Native, Some(vec![layer_edit("native")])),
+        ];
+        let combined =
+            combine_layer_formatting_results(AggregationStrategy::Preferred, results).unwrap();
+        assert_eq!(combined[0].new_text, "native");
+    }
+
+    #[test]
+    fn combine_layers_returns_none_when_no_layer_produces() {
+        let results = vec![(LayerSource::Virt, None), (LayerSource::Host, Some(vec![]))];
+        assert!(
+            combine_layer_formatting_results(AggregationStrategy::Preferred, results).is_none()
+        );
+    }
+
+    #[test]
+    fn combine_layers_concatenated_single_producer_passes_through() {
+        let results = vec![
+            (LayerSource::Virt, Some(vec![layer_edit("virt")])),
+            (LayerSource::Host, None),
+            (LayerSource::Native, None),
+        ];
+        let combined =
+            combine_layer_formatting_results(AggregationStrategy::Concatenated, results).unwrap();
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].new_text, "virt");
+    }
+
+    #[test]
+    fn combine_layers_concatenated_multiple_producers_applies_highest_priority_only() {
+        // Unreachable today (host/native contribute nothing), but the
+        // fail-safe matters: naively concatenating two layers' edit lists
+        // could produce overlapping edits, violating LSP. The
+        // highest-priority layer wins alone until cross-layer text threading
+        // exists.
+        let results = vec![
+            (LayerSource::Virt, Some(vec![layer_edit("virt")])),
+            (LayerSource::Host, Some(vec![layer_edit("host")])),
+        ];
+        let combined =
+            combine_layer_formatting_results(AggregationStrategy::Concatenated, results).unwrap();
+        assert_eq!(combined.len(), 1, "edit lists must never be merged");
+        assert_eq!(combined[0].new_text, "virt");
     }
 
     #[test]

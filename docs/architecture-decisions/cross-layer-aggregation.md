@@ -21,12 +21,19 @@ Phased roadmap:
    stage-2 `preferred` walk degenerates to this gate — "first non-empty
    layer in order" with one possible contributor. A fuller walk arrives
    with the second contributor.
-3. **Layer-level `concatenated` for `textDocument/formatting` only** — not
-   implemented; expected to follow the sequential-pipeline principles of
-   concatenated-formatting-pipeline (determinism, no overlapping edits);
-   detailed mechanics are deferred to that phase. Its observable value
-   arrives with host bridging (e.g. a host formatter running over the whole
-   document after virt regions are formatted).
+3. **Layer-level `concatenated` for `textDocument/formatting` only** — ✅
+   implemented as `combine_layer_formatting_results`: formatting dispatches
+   on the resolved layer strategy. With at most one producing layer (the
+   only reachable case until host bridging ships), `concatenated`
+   degenerates to that layer's edits. Should two layers ever produce before
+   cross-layer text threading exists, the highest-priority layer's edits
+   apply alone with a warning — never merged, since naively concatenating
+   two layers' edit lists could overlap and violate LSP. The true
+   sequential pipeline (each layer formatting the previous layer's output,
+   per concatenated-formatting-pipeline principles) lands with host
+   bridging. Layer strategy applies to full formatting only;
+   `textDocument/rangeFormatting` stays on `preferred`, mirroring the
+   stage-1 rule.
 
 ## Context
 
