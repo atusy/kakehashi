@@ -34,6 +34,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
 
 use crate::config::settings::AggregationStrategy;
+use crate::config::settings::PRIORITIES_WILDCARD;
 use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
@@ -141,6 +142,29 @@ impl Kakehashi {
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
             // (concatenated-formatting-pipeline Decision point 2).
+            if region_ctx.strategy == AggregationStrategy::Concatenated
+                && region_ctx
+                    .priorities
+                    .iter()
+                    .any(|name| name == PRIORITIES_WILDCARD)
+                && region_ctx
+                    .priorities
+                    .iter()
+                    .any(|name| name != PRIORITIES_WILDCARD)
+            {
+                // ADR aggregation-priorities-wildcard: '*' has no deterministic
+                // expansion order, and a formatter pipeline must be
+                // reproducible — the element is dropped, explicit names run.
+                log::warn!(
+                    target: "kakehashi::formatting",
+                    "concatenated formatting for {}->{} lists '{}' in priorities; \
+                     the wildcard is ignored by the sequential pipeline (explicit \
+                     order required) and only the named servers run",
+                    language_name,
+                    region_ctx.resolved.injection_language,
+                    PRIORITIES_WILDCARD,
+                );
+            }
             let pipeline = match plan_region_format(
                 region_ctx.strategy,
                 &region_ctx.priorities,
@@ -184,6 +208,18 @@ impl Kakehashi {
                     );
                     continue;
                 }
+                RegionFormatPlan::Disabled => {
+                    // priorities = []: the per-method fan-out kill switch
+                    // (aggregation-priorities-wildcard). Deliberate config, so
+                    // no warning — just skip the region.
+                    log::debug!(
+                        target: "kakehashi::formatting",
+                        "formatting disabled for {}->{} (priorities = [])",
+                        language_name,
+                        region_ctx.resolved.injection_language,
+                    );
+                    continue;
+                }
             };
 
             let pool = Arc::clone(&pool);
@@ -224,43 +260,63 @@ impl Kakehashi {
 #[derive(Debug, PartialEq, Eq)]
 enum RegionFormatPlan {
     /// Run the sequential concatenated pipeline over these effective servers
-    /// (`priorities` filtered to configured servers, deduped, order preserved).
+    /// (explicit `priorities` names filtered to configured servers, deduped,
+    /// order preserved — the `"*"` wildcard is excluded, see
+    /// aggregation-priorities-wildcard).
     Concatenated(Vec<String>),
     /// Use the `preferred` first-non-empty-wins fan-out over the region's servers.
     Preferred,
-    /// Run nothing for this region. Reached only when `concatenated` is active
-    /// with a NON-empty `priorities` whose names are all unconfigured/typo'd, so
-    /// the effective list is empty: every configured server is *absent from the
-    /// allowlist*, and the allowlist (concatenated-formatting-pipeline Decision
-    /// point 2) forbids running any of them. Falling through to `preferred` here
-    /// would wrongly run exactly the servers the user's `priorities` excluded.
+    /// Run nothing for this region. Reached when `concatenated` is active with
+    /// explicit `priorities` names that are all unconfigured/typo'd: every
+    /// configured server is *absent from the allowlist*, and the allowlist
+    /// (concatenated-formatting-pipeline Decision point 2) forbids running
+    /// them. Falling through to `preferred` here would wrongly run exactly the
+    /// servers the user's `priorities` excluded.
     Skip,
+    /// `priorities = []`: the per-method fan-out kill switch
+    /// (aggregation-priorities-wildcard) — the region runs no servers at all,
+    /// regardless of strategy.
+    Disabled,
 }
 
 /// Decide the [`RegionFormatPlan`] for a region from its aggregation `strategy`,
 /// `priorities`, and configured server `configs`.
 ///
-/// Mirrors concatenated-formatting-pipeline Decision points 1–2:
-/// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins);
-/// - `concatenated` with an **empty** `priorities` is a misconfiguration (order
-///   would be undefined) → `Preferred` (a once-per-config warning is emitted at
-///   settings-apply time, see `format_concatenated_formatting_warning`);
-/// - `concatenated` with a **non-empty** `priorities` puts the allowlist in
-///   force: run the effective (configured ∩ `priorities`) servers as a pipeline,
-///   or — when none of the listed names are configured — `Skip`, since the
-///   allowlist forbids running the non-listed servers `preferred` would pick.
+/// Mirrors concatenated-formatting-pipeline Decision points 1–2 under the
+/// aggregation-priorities-wildcard list semantics:
+/// - `priorities = []` → `Disabled` (the kill switch applies to every strategy);
+/// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins;
+///   the `"*"` wildcard is honored by the preferred dispatch);
+/// - `concatenated` whose `priorities` carries no explicit name (only `"*"`,
+///   e.g. the resolved default) is a misconfiguration — the pipeline's order
+///   would be undefined — → `Preferred` (a once-per-config warning is emitted
+///   at settings-apply time, see `format_concatenated_formatting_warning`);
+/// - `concatenated` with explicit names puts the allowlist in force: run the
+///   effective (configured ∩ explicit) servers as a pipeline, or — when none
+///   of the listed names are configured — `Skip`, since the allowlist forbids
+///   running the non-listed servers `preferred` would pick. A `"*"` mixed
+///   into the list is ignored (no deterministic expansion order for a
+///   sequential pipeline); the caller warns.
 fn plan_region_format(
     strategy: AggregationStrategy,
     priorities: &[String],
     configs: &[ResolvedServerConfig],
 ) -> RegionFormatPlan {
+    if priorities.is_empty() {
+        return RegionFormatPlan::Disabled;
+    }
     if strategy != AggregationStrategy::Concatenated {
         return RegionFormatPlan::Preferred;
     }
-    if priorities.is_empty() {
+    let explicit: Vec<String> = priorities
+        .iter()
+        .filter(|name| name.as_str() != PRIORITIES_WILDCARD)
+        .cloned()
+        .collect();
+    if explicit.is_empty() {
         return RegionFormatPlan::Preferred;
     }
-    let effective = effective_priorities_from(priorities, configs);
+    let effective = effective_priorities_from(&explicit, configs);
     if effective.is_empty() {
         RegionFormatPlan::Skip
     } else {
@@ -1406,13 +1462,44 @@ mod tests {
     }
 
     #[test]
-    fn plan_concatenated_with_empty_priorities_falls_back_to_preferred() {
-        // ADR point 2: `concatenated` with an EMPTY `priorities` is a
-        // misconfiguration (order is undefined) and falls back to `preferred`.
+    fn plan_empty_priorities_disables_the_region_for_any_strategy() {
+        // priorities = [] is the per-method fan-out kill switch
+        // (aggregation-priorities-wildcard): nothing runs, regardless of
+        // strategy. It is NOT the misconfiguration fallback — that role moved
+        // to a wildcard-only list (see the test below).
         let configs = vec![config("black")];
         assert_eq!(
             plan_region_format(AggregationStrategy::Concatenated, &[], &configs),
+            RegionFormatPlan::Disabled
+        );
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Preferred, &[], &configs),
+            RegionFormatPlan::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_wildcard_only_priorities_falls_back_to_preferred() {
+        // ADR point 2: the pipeline needs explicit names for a deterministic
+        // order. The resolved default ["*"] (absent priorities) carries none,
+        // so the region falls back to `preferred`.
+        let configs = vec![config("black")];
+        let priorities = vec![PRIORITIES_WILDCARD.to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
             RegionFormatPlan::Preferred
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_ignores_wildcard_mixed_with_explicit_names() {
+        // ["black", "*"]: the wildcard has no deterministic expansion order
+        // for a sequential pipeline, so only the named servers run.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["black".to_string(), PRIORITIES_WILDCARD.to_string()];
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            RegionFormatPlan::Concatenated(vec!["black".to_string()])
         );
     }
 

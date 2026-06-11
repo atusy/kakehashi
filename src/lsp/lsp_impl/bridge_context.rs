@@ -36,9 +36,10 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
-    /// Server names in priority order for aggregation.
-    /// Resolved from the bridge language config's aggregation settings.
-    /// Empty means pure first-win behavior (no priority ordering).
+    /// Server names in priority order for aggregation — an ordered allowlist
+    /// (aggregation-priorities-wildcard). `"*"` stands for the unlisted rest
+    /// (first-win group); the resolved default is `["*"]` (all servers,
+    /// first-win). Empty means fan-out is disabled for this method.
     pub(crate) priorities: Vec<String>,
     /// Aggregation strategy for this region.
     ///
@@ -120,14 +121,17 @@ pub(crate) fn resolve_aggregation_config_from_settings(
 
 /// Find every (host_language, injection_language) pair whose configured
 /// aggregation for `textDocument/formatting` is the **misconfigured**
-/// `Concatenated`-with-empty-`priorities` combination.
+/// `Concatenated`-without-explicit-`priorities` combination.
 ///
 /// Since the concatenated formatting pipeline landed
-/// (concatenated-formatting-pipeline), `strategy = "concatenated"` with a
-/// non-empty `priorities` is a valid configuration that runs the sequential
-/// pipeline — only an empty `priorities` is a misconfiguration (the pipeline's
-/// order would be undefined, so the region falls back to `preferred`; ADR
-/// Decision point 2). We warn the user once at settings-apply time
+/// (concatenated-formatting-pipeline), `strategy = "concatenated"` with
+/// explicit server names in `priorities` is a valid configuration that runs
+/// the sequential pipeline. A `priorities` carrying no explicit name — only
+/// the `"*"` wildcard, e.g. the resolved default for an absent list — is a
+/// misconfiguration (the pipeline's order would be undefined, so the region
+/// falls back to `preferred`; ADR Decision point 2). An explicit `[]` is the
+/// deliberate per-method kill switch (aggregation-priorities-wildcard) and is
+/// NOT warned about. We warn the user once at settings-apply time
 /// (initialize + didChangeConfiguration) so the mistake surfaces immediately
 /// rather than silently degrading every format request.
 ///
@@ -136,7 +140,7 @@ pub(crate) fn resolve_aggregation_config_from_settings(
 /// wildcard merge the runtime uses — so priorities supplied via the `_`
 /// wildcard entry count as configured.
 pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec<(String, String)> {
-    use crate::config::settings::AggregationStrategy;
+    use crate::config::settings::{AggregationStrategy, PRIORITIES_WILDCARD};
 
     let mut pairs = Vec::new();
     for (host_language, lang_settings) in &settings.languages {
@@ -145,7 +149,14 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
         };
         for (injection_language, bridge_cfg) in bridge_map {
             let agg = bridge_cfg.resolve_aggregation("textDocument/formatting");
-            if agg.strategy == AggregationStrategy::Concatenated && agg.priorities.is_empty() {
+            let has_explicit_name = agg
+                .priorities
+                .iter()
+                .any(|name| name != PRIORITIES_WILDCARD);
+            if agg.strategy == AggregationStrategy::Concatenated
+                && !agg.priorities.is_empty()
+                && !has_explicit_name
+            {
                 pairs.push((host_language.clone(), injection_language.clone()));
             }
         }
@@ -176,10 +187,12 @@ pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)])
         .join(", ");
     Some(format!(
         "Bridge config sets aggregation strategy 'concatenated' for \
-         textDocument/formatting with an empty 'priorities' list on {} \
-         (host->injection) pair(s): {}. The concatenated formatting pipeline \
-         requires a non-empty 'priorities' (it defines which servers run and \
-         in what order); these pairs fall back to 'preferred'.",
+         textDocument/formatting with no explicit server names in \
+         'priorities' on {} (host->injection) pair(s): {}. The concatenated \
+         formatting pipeline requires explicitly named servers ('priorities' \
+         defines which servers run and in what order; '*' has no \
+         deterministic order and is ignored); these pairs fall back to \
+         'preferred'.",
         pairs.len(),
         listed
     ))
@@ -637,6 +650,71 @@ mod tests {
             !msg.contains("the configured strategy is ignored"),
             "stale 'strategy is ignored' phrasing must be retired; got: {msg}"
         );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_excludes_explicit_empty_priorities() {
+        // priorities = [] is the deliberate per-method kill switch
+        // (aggregation-priorities-wildcard): the region runs nothing. That is
+        // intended behavior, not a misconfiguration — no warning.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec![]),
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "an explicit [] disables the method deliberately and must not be warned about"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_flags_wildcard_only_priorities() {
+        // priorities = ["*"] (also the resolved default for an absent list)
+        // carries no explicit name: the pipeline's order is undefined, so the
+        // pair must be flagged for the settings-apply warning.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec![
+                    crate::config::settings::PRIORITIES_WILDCARD.to_string(),
+                ]),
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert_eq!(pairs, vec![("markdown".to_string(), "python".to_string())]);
     }
 
     #[test]

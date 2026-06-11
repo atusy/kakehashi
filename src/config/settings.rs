@@ -5,6 +5,20 @@ use std::collections::HashMap;
 
 pub(crate) type CaptureMapping = HashMap<String, String>;
 
+/// Reserved `priorities` element standing for "every configured server not
+/// named elsewhere in the list" (aggregation-priorities-wildcard).
+///
+/// Glob-like `*` rather than the `_` wildcard sigil: `_` keys carry
+/// field-level inheritance semantics, a rest-of-the-candidates list element
+/// does not.
+pub(crate) const PRIORITIES_WILDCARD: &str = "*";
+
+/// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
+/// every configured server with no ranking (first-win).
+fn default_priorities() -> Vec<String> {
+    vec![PRIORITIES_WILDCARD.to_string()]
+}
+
 /// Aggregation strategy for combining results from multiple bridge servers.
 ///
 /// - `Preferred`: Use the first non-empty response (priority-ordered).
@@ -21,15 +35,18 @@ pub enum AggregationStrategy {
 /// Per-method aggregation configuration.
 ///
 /// Controls how results from multiple bridge servers are aggregated for a
-/// specific LSP method. The `priorities` list determines server preference
-/// order — the first server in the list that returns a non-empty result wins.
-/// `Some(vec![])` degrades to first-win (arrival-order) behavior, while `None`
-/// means "inherit from wildcard/base".
+/// specific LSP method. The `priorities` list is an **ordered allowlist**
+/// (aggregation-priorities-wildcard): listed servers run in order, servers
+/// absent from the list do not run, and a `"*"` element stands for every
+/// configured-but-unlisted server (a first-win group at that position).
+/// `None` means "inherit from wildcard/base", resolving to `["*"]` when
+/// nothing is configured; `Some(vec![])` disables fan-out for the method.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregationConfig {
-    /// Server names in priority order (highest first).
-    /// `Some(vec![])` = pure first-win behavior, `None` = inherit.
+    /// Server names in priority order (highest first), as an ordered
+    /// allowlist. `"*"` = all unlisted servers; `Some(vec![])` = disable
+    /// fan-out for this method; `None` = inherit (default `["*"]`).
     #[serde(default)]
     pub priorities: Option<Vec<String>>,
     /// Aggregation strategy override.
@@ -76,11 +93,12 @@ pub(crate) struct ResolvedAggregationConfig {
 }
 
 impl ResolvedAggregationConfig {
-    /// Create a config with all fields at their defaults (`Preferred` strategy).
+    /// Create a config with all fields at their defaults (`Preferred`
+    /// strategy, `["*"]` priorities = all servers, first-win).
     pub(crate) fn with_defaults() -> Self {
         Self {
             strategy: AggregationStrategy::Preferred,
-            priorities: Vec::new(),
+            priorities: default_priorities(),
             max_fan_out: None,
         }
     }
@@ -123,12 +141,15 @@ impl BridgeLanguageConfig {
                 strategy: entry
                     .strategy
                     .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
-                priorities: entry.priorities.unwrap_or_default(),
+                // None (unset after merge) resolves to ["*"] — all servers,
+                // first-win. An explicit [] survives as the per-method
+                // fan-out kill switch (aggregation-priorities-wildcard).
+                priorities: entry.priorities.unwrap_or_else(default_priorities),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
             None => ResolvedAggregationConfig {
                 strategy: default_aggregation_strategy_for_method(method),
-                priorities: Vec::new(),
+                priorities: default_priorities(),
                 max_fan_out: None,
             },
         }
@@ -1284,8 +1305,29 @@ kind = "injections""#;
     }
 
     #[test]
-    fn should_resolve_aggregation_priorities_returns_empty_when_no_aggregation() {
+    fn should_resolve_aggregation_priorities_defaults_to_wildcard_when_no_aggregation() {
+        // Absent priorities resolve to ["*"] — all servers, first-win
+        // (aggregation-priorities-wildcard). NOT [] — that now disables
+        // fan-out for the method.
         let config = BridgeLanguageConfig::default();
+        let agg = config.resolve_aggregation("textDocument/hover");
+        assert_eq!(agg.priorities, vec![PRIORITIES_WILDCARD.to_string()]);
+    }
+
+    #[test]
+    fn should_resolve_aggregation_priorities_preserves_explicit_empty_list() {
+        // Some(vec![]) is the per-method fan-out kill switch and must survive
+        // resolution verbatim, not be replaced with the ["*"] default.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                AggregationConfig {
+                    priorities: Some(vec![]),
+                    ..Default::default()
+                },
+            )])),
+        };
         let agg = config.resolve_aggregation("textDocument/hover");
         assert!(agg.priorities.is_empty());
     }
@@ -1483,7 +1525,11 @@ kind = "injections""#;
     fn should_resolve_aggregation_with_defaults_returns_preferred() {
         let agg = ResolvedAggregationConfig::with_defaults();
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
-        assert!(agg.priorities.is_empty());
+        assert_eq!(
+            agg.priorities,
+            vec![PRIORITIES_WILDCARD.to_string()],
+            "default priorities must be [\"*\"] (all servers), not [] (disabled)"
+        );
         assert_eq!(agg.max_fan_out, None);
     }
 
@@ -1654,7 +1700,7 @@ kind = "injections""#;
         };
         let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
-        assert!(agg.priorities.is_empty());
+        assert_eq!(agg.priorities, vec![PRIORITIES_WILDCARD.to_string()]);
         assert_eq!(agg.max_fan_out, None);
     }
 
