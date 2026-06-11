@@ -616,7 +616,9 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
 #[tokio::main]
 async fn run_lsp_server() {
     use env_logger::Builder;
-    use kakehashi::lsp::{CancelForwarder, Kakehashi, LanguageServerPool, RequestIdCapture};
+    use kakehashi::lsp::{
+        CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
+    };
     use std::sync::Arc;
     use tokio::io::{stdin, stdout};
     use tower_lsp_server::{LspService, Server};
@@ -794,6 +796,11 @@ async fn run_lsp_server() {
     // 1. Capture upstream request IDs (for ls-bridge-server-pool-coordination bridge requests)
     // 2. Forward $/cancelRequest notifications to downstream servers
     let service = RequestIdCapture::with_cancel_forwarder(service, cancel_forwarder);
+
+    // Outermost: assign per-document sequence tickets in wire order so
+    // didChange/didClose apply strictly ordered and semanticTokens requests
+    // observe every edit that preceded them on the wire (#342).
+    let service = IngressOrderGate::new(service);
 
     Server::new(stdin, stdout, socket).serve(service).await;
 }
