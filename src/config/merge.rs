@@ -1250,7 +1250,7 @@ mod tests {
 
             if let Some(resolved_config) =
                 resolve_with_wildcard(&servers, server_name, merge_bridge_server_configs)
-                // Mirrors BridgeCoordinator::server_handles_language ("_" = any language)
+                // Mirrors BridgeCoordinator::language_match ("_" = any language)
                 && resolved_config
                     .languages
                     .iter()

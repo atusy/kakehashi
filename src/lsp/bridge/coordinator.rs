@@ -49,6 +49,19 @@ pub(crate) struct ResolvedServerConfig {
     pub(crate) config: Arc<BridgeServerConfig>,
 }
 
+/// How a server's `languages` list matched an injection language.
+///
+/// Ordered by specificity: `Exact` < `Wildcard`, so `Ord::min` selects the
+/// more specific match when one server lists the language explicitly and
+/// another relies on the `"_"` wildcard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LanguageMatch {
+    /// The injection language appears verbatim in `languages`.
+    Exact,
+    /// Matched only via the `"_"` wildcard entry.
+    Wildcard,
+}
+
 /// A batch of eager-open task handles with a generation counter.
 ///
 /// The generation counter enables detection of stale pushes: when a concurrent
@@ -180,18 +193,26 @@ impl BridgeCoordinator {
     // Config lookup (moved from Kakehashi)
     // ========================================
 
-    /// Whether a server's `languages` list covers `injection_language`.
+    /// How a server's `languages` list covers `injection_language`, if at all.
     ///
     /// `"_"` is a wildcard matching any injection language, consistent with
     /// the wildcard convention used elsewhere in the config
     /// (`languageServers._`, `languages._`). The host-language bridge filter
     /// is enforced separately by the callers, so a wildcard server still
-    /// only sees languages the host allows.
-    fn server_handles_language(config: &BridgeServerConfig, injection_language: &str) -> bool {
-        config
-            .languages
-            .iter()
-            .any(|l| l == "_" || l == injection_language)
+    /// only sees languages the host allows. An exact entry outranks the
+    /// wildcard so that single-server selection can prefer the more specific
+    /// config (see `get_config_for_language`).
+    fn language_match(
+        config: &BridgeServerConfig,
+        injection_language: &str,
+    ) -> Option<LanguageMatch> {
+        if config.languages.iter().any(|l| l == injection_language) {
+            Some(LanguageMatch::Exact)
+        } else if config.languages.iter().any(|l| l == "_") {
+            Some(LanguageMatch::Wildcard)
+        } else {
+            None
+        }
     }
 
     /// Resolve `bridge.servers` for `injection_language`, returning the
@@ -225,25 +246,28 @@ impl BridgeCoordinator {
         // Look for a server that handles this language
         // wildcard-config-inheritance: Resolve each server with wildcard BEFORE checking languages,
         // because languages list may be inherited from languageServers._
+        //
+        // HashMap iteration order is arbitrary, so pick the winner by
+        // (match specificity, server name): an exact `languages` entry beats
+        // the "_" wildcard, and names break ties for determinism.
         let servers = &settings.language_servers;
-        for server_name in servers.keys() {
+        servers
+            .keys()
             // Skip wildcard entry - we use it for inheritance, not direct lookup
-            if server_name == "_" {
-                continue;
-            }
-
-            if let Some(resolved_config) =
-                resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| Self::server_handles_language(c, injection_language))
-            {
-                return Some(ResolvedServerConfig {
-                    server_name: server_name.clone(),
-                    config: Arc::new(resolved_config),
-                });
-            }
-        }
-
-        None
+            .filter(|name| *name != "_")
+            .filter_map(|server_name| {
+                let resolved_config =
+                    resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)?;
+                let language_match = Self::language_match(&resolved_config, injection_language)?;
+                Some((language_match, server_name, resolved_config))
+            })
+            .min_by(|(match_a, name_a, _), (match_b, name_b, _)| {
+                match_a.cmp(match_b).then_with(|| name_a.cmp(name_b))
+            })
+            .map(|(_, server_name, resolved_config)| ResolvedServerConfig {
+                server_name: server_name.clone(),
+                config: Arc::new(resolved_config),
+            })
     }
 
     /// Get all bridge server configs for a given injection language from settings.
@@ -284,7 +308,7 @@ impl BridgeCoordinator {
             .filter(|name| *name != "_")
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| Self::server_handles_language(c, injection_language))
+                    .filter(|c| Self::language_match(c, injection_language).is_some())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -774,6 +798,78 @@ mod tests {
                 .get_config_for_language(&settings, "markdown", "rust")
                 .is_some(),
             "wildcard listed alongside exact language should match other languages"
+        );
+    }
+
+    #[test]
+    fn test_get_config_prefers_exact_match_over_wildcard_server() {
+        let coordinator = BridgeCoordinator::new();
+
+        // "a-efm" sorts before "pyright", so only the exact-over-wildcard
+        // preference (not name ordering) can make pyright win.
+        let mut servers = HashMap::new();
+        servers.insert(
+            "a-efm".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["efm-langserver".to_string()],
+                languages: vec!["_".to_string()],
+                initialization_options: None,
+            },
+        );
+        servers.insert(
+            "pyright".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["pyright-langserver".to_string()],
+                languages: vec!["python".to_string()],
+                initialization_options: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        let result = coordinator
+            .get_config_for_language(&settings, "markdown", "python")
+            .expect("python should match");
+        assert_eq!(
+            result.server_name, "pyright",
+            "exact-match server should win over wildcard server"
+        );
+    }
+
+    #[test]
+    fn test_get_config_breaks_ties_by_server_name() {
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        for name in ["b-linter", "a-linter"] {
+            servers.insert(
+                name.to_string(),
+                BridgeServerConfig {
+                    cmd: vec![name.to_string()],
+                    languages: vec!["_".to_string()],
+                    initialization_options: None,
+                },
+            );
+        }
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        let result = coordinator
+            .get_config_for_language(&settings, "markdown", "python")
+            .expect("wildcard should match");
+        assert_eq!(
+            result.server_name, "a-linter",
+            "ties between equally-specific servers should resolve by name for determinism"
         );
     }
 
