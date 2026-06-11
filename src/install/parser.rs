@@ -368,7 +368,10 @@ fn git_command(args: &[&str], current_dir: Option<&Path>) -> Command {
     // Extend rather than replace a user-provided GIT_SSH_COMMAND (custom keys,
     // agents, wrappers): for OpenSSH the first -o value obtained wins, so the
     // appended BatchMode only applies when the user didn't set one themselves.
-    let ssh_command = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
+    let ssh_command = std::env::var("GIT_SSH_COMMAND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "ssh".to_string());
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
