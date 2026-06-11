@@ -149,16 +149,32 @@ async fn writer_loop(
                     );
                     // Drain remaining messages (best-effort write)
                     while let Ok(msg) = rx.try_recv() {
-                        if let Err(e) = write_message(&mut writer, &msg).await {
-                            log::warn!(
-                                target: "kakehashi::bridge::writer",
-                                "Write error during drain: {}",
-                                e
-                            );
-                            // Fail the request if write failed
-                            if let OutboundMessage::Tracked { request_id, .. } = msg {
-                                router.fail_request(request_id, "write error during shutdown");
+                        match write_or_cancelled(&mut writer, &msg, &cancel_token).await {
+                            None => {
+                                log::debug!(
+                                    target: "kakehashi::bridge::writer",
+                                    "Writer task cancelled during shutdown drain"
+                                );
+                                if let OutboundMessage::Tracked { request_id, .. } = msg {
+                                    router.fail_request(request_id, "connection closing");
+                                }
+                                fail_queued(&mut rx, &router, "connection closing");
+                                // Don't send idle/writer: dropping the writer
+                                // kills the hung child.
+                                return;
                             }
+                            Some(Err(e)) => {
+                                log::warn!(
+                                    target: "kakehashi::bridge::writer",
+                                    "Write error during drain: {}",
+                                    e
+                                );
+                                // Fail the request if write failed
+                                if let OutboundMessage::Tracked { request_id, .. } = msg {
+                                    router.fail_request(request_id, "write error during shutdown");
+                                }
+                            }
+                            Some(Ok(())) => {}
                         }
                     }
                     // Signal idle (queue drained)
@@ -195,18 +211,34 @@ async fn writer_loop(
             msg = rx.recv() => {
                 match msg {
                     Some(outbound) => {
-                        if let Err(e) = write_message(&mut writer, &outbound).await {
-                            log::warn!(
-                                target: "kakehashi::bridge::writer",
-                                "Write error: {}, failing request",
-                                e
-                            );
-                            // Clean up request from router if write failed
-                            if let OutboundMessage::Tracked { request_id, .. } = &outbound {
-                                router.fail_request(*request_id, "write error");
+                        match write_or_cancelled(&mut writer, &outbound, &cancel_token).await {
+                            None => {
+                                log::debug!(
+                                    target: "kakehashi::bridge::writer",
+                                    "Writer task cancelled during write, shutting down"
+                                );
+                                if let OutboundMessage::Tracked { request_id, .. } = &outbound {
+                                    router.fail_request(*request_id, "connection closing");
+                                }
+                                fail_queued(&mut rx, &router, "connection closing");
+                                // Exiting drops the writer, whose Drop kills
+                                // the hung child.
+                                return;
                             }
-                            // Note: Connection will transition to Failed via reader task
-                            // when it detects the write error (broken pipe, etc.)
+                            Some(Err(e)) => {
+                                log::warn!(
+                                    target: "kakehashi::bridge::writer",
+                                    "Write error: {}, failing request",
+                                    e
+                                );
+                                // Clean up request from router if write failed
+                                if let OutboundMessage::Tracked { request_id, .. } = &outbound {
+                                    router.fail_request(*request_id, "write error");
+                                }
+                                // Note: Connection will transition to Failed via reader task
+                                // when it detects the write error (broken pipe, etc.)
+                            }
+                            Some(Ok(())) => {}
                         }
                     }
                     None => {
@@ -222,6 +254,26 @@ async fn writer_loop(
                 }
             }
         }
+    }
+}
+
+/// Race a write against the cancel token, returning `None` when cancelled.
+///
+/// A hung child that stops reading stdin leaves the kernel pipe buffer full
+/// and the write parked forever; the writer loop's select arms cannot preempt
+/// a write that already began, so the write itself must observe cancellation
+/// or a cancelled writer task leaks itself, the writer, and the child.
+/// Cancelling mid-frame may leave a partial message in the pipe — acceptable
+/// because every cancellation path tears the connection down.
+async fn write_or_cancelled(
+    writer: &mut SplitConnectionWriter,
+    msg: &OutboundMessage,
+    cancel_token: &CancellationToken,
+) -> Option<std::io::Result<()>> {
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        result = write_message(writer, msg) => Some(result),
     }
 }
 
@@ -243,6 +295,52 @@ mod tests {
     use crate::lsp::bridge::protocol::RequestId;
     use serde_json::json;
     use std::time::Duration;
+
+    /// A child that never reads stdin leaves the kernel pipe buffer full and
+    /// the in-flight write parked forever. The select arms can't preempt a
+    /// write that already began, so the write itself must race the cancel
+    /// token; exiting drops the writer, whose Drop kills the child. Without
+    /// that race a cancelled writer task leaks itself, the writer, and the
+    /// child process.
+    #[tokio::test]
+    async fn cancel_reclaims_writer_blocked_on_full_stdin_pipe() {
+        use crate::lsp::bridge::pool::test_helpers::process_stat;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sleep".to_string(), "30".to_string()])
+            .await
+            .expect("should spawn sleep process");
+        let (writer, _reader) = conn.split();
+        let pid = writer.child_id().expect("child should have a pid");
+        let router = Arc::new(ResponseRouter::new());
+        let (tx, rx) = mpsc::channel(16);
+        let handle = spawn_writer_task(writer, rx, Arc::clone(&router));
+
+        // Far larger than the kernel pipe buffer so the write parks mid-frame.
+        let huge = json!({"method": "blocked", "params": {"data": "x".repeat(4 * 1024 * 1024)}});
+        tx.send(OutboundMessage::Untracked(huge)).await.unwrap();
+
+        // Let the writer task pick the message up and block on the full pipe.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        handle.cancel();
+
+        // Dead means reaped (None) or zombie (Z…).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_stat(pid) {
+                None => break,
+                Some(stat) if stat.starts_with('Z') => break,
+                Some(stat) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child {pid} still alive (stat {stat}): cancelled writer task \
+                         failed to exit while blocked on a full stdin pipe"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
 
     /// Test that writer task maintains FIFO order.
     #[tokio::test]
