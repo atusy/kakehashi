@@ -185,6 +185,12 @@ fn install_queries_recursive(
 
     // Check if queries already exist
     if queries_dir.exists() && !force {
+        // Mark as installed BEFORE recursing into parents: an inheritance
+        // cycle among on-disk query files (self-inherit typo, A↔B) would
+        // otherwise recurse forever and overflow the stack. The download
+        // branch below already inserts before its parent loop.
+        installed.insert(language.to_string());
+
         // Even if skipping, we need to check for inherited dependencies
         let highlights_path = queries_dir.join("highlights.scm");
         if highlights_path.exists()
@@ -196,7 +202,6 @@ fn install_queries_recursive(
                 let _ = install_queries_recursive(&parent, data_dir, false, installed);
             }
         }
-        installed.insert(language.to_string());
         return Err(QueryInstallError::AlreadyExists(queries_dir));
     }
 
@@ -317,6 +322,39 @@ mod tests {
                     .contains(&"highlights.scm".to_string())
             );
         }
+    }
+
+    #[test]
+    fn install_with_dependencies_survives_inheritance_cycles_on_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+
+        // Self-cycle: a query file inheriting its own language (a one-word
+        // typo in a real highlights.scm). No network: both branches hit the
+        // already-exists path.
+        let a_dir = data_dir.join("queries").join("cyclic_a");
+        fs::create_dir_all(&a_dir).unwrap();
+        std::fs::write(a_dir.join("highlights.scm"), "; inherits: cyclic_a\n").unwrap();
+
+        let result = install_queries_with_dependencies("cyclic_a", &data_dir, false);
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(_))),
+            "self-inheriting installed queries must terminate with AlreadyExists"
+        );
+
+        // Mutual cycle between two installed languages.
+        let b_dir = data_dir.join("queries").join("cyclic_b");
+        let c_dir = data_dir.join("queries").join("cyclic_c");
+        fs::create_dir_all(&b_dir).unwrap();
+        fs::create_dir_all(&c_dir).unwrap();
+        std::fs::write(b_dir.join("highlights.scm"), "; inherits: cyclic_c\n").unwrap();
+        std::fs::write(c_dir.join("highlights.scm"), "; inherits: cyclic_b\n").unwrap();
+
+        let result = install_queries_with_dependencies("cyclic_b", &data_dir, false);
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(_))),
+            "mutually-inheriting installed queries must terminate with AlreadyExists"
+        );
     }
 
     #[test]
