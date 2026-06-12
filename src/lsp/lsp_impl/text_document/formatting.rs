@@ -125,7 +125,7 @@ impl Kakehashi {
                 );
                 let host = self.host_format_edits(&lsp_uri, &original, &options, &cancel_state);
                 crate::lsp::lsp_impl::bridge_context::race_layers_preferred(
-                    &layer_cfg.order,
+                    &layer_cfg.priorities,
                     virt,
                     host,
                     |edits: &Vec<TextEdit>| !edits.is_empty(),
@@ -144,14 +144,14 @@ impl Kakehashi {
                 let mut current = original.clone();
                 let mut producers = 0usize;
                 let mut sole_edits: Option<Vec<TextEdit>> = None;
-                for layer in &layer_cfg.order {
+                for layer in &layer_cfg.priorities {
                     let edits = match layer {
                         LayerSource::Virt => {
                             if current != original {
                                 log::warn!(
                                     target: "kakehashi::formatting",
                                     "cross-layer concatenated formatting: virt placed after a \
-                                     text-producing layer in layers.order; injection regions \
+                                     text-producing layer in layers.priorities; injection regions \
                                      cannot be re-resolved against modified text — skipping virt"
                                 );
                                 continue;

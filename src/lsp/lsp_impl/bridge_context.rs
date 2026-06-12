@@ -172,8 +172,8 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
 }
 
 /// Race the virt and host layer futures **concurrently** and decide by the
-/// resolved layer `order` (cross-layer-aggregation, `preferred` semantics) —
-/// the layer-level analogue of the stage-1 `preferred` fan-in:
+/// resolved layer `priorities` (cross-layer-aggregation, `preferred`
+/// semantics) — the layer-level analogue of the stage-1 `preferred` fan-in:
 ///
 /// - both layers' requests are in flight at once (latency = max, not sum);
 /// - a completed lower-priority result is buffered while a higher-priority
@@ -181,11 +181,11 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
 /// - a higher-priority layer that completes non-empty wins immediately and
 ///   the still-pending loser future is dropped (best-effort abandonment,
 ///   like the stage-1 `abort_all`);
-/// - layers absent from `order` are never polled (their future is created
-///   but async blocks are lazy);
+/// - layers absent from `priorities` are never polled (their future is
+///   created but async blocks are lazy);
 /// - native has no contributor and is skipped.
 pub(crate) async fn race_layers_preferred<R>(
-    order: &[LayerSource],
+    priorities: &[LayerSource],
     virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     is_nonempty: impl Fn(&R) -> bool,
@@ -193,17 +193,19 @@ pub(crate) async fn race_layers_preferred<R>(
     let mut virt_fut = std::pin::pin!(virt);
     let mut host_fut = std::pin::pin!(host);
     // `None` = still pending; `Some(result)` = completed. Layers not in
-    // `order` start as completed-empty so their guard never enables and the
-    // decision walk skips them.
-    let mut virt_state: Option<Option<R>> = (!order.contains(&LayerSource::Virt)).then_some(None);
-    let mut host_state: Option<Option<R>> = (!order.contains(&LayerSource::Host)).then_some(None);
+    // `priorities` start as completed-empty so their guard never enables and
+    // the decision walk skips them.
+    let mut virt_state: Option<Option<R>> =
+        (!priorities.contains(&LayerSource::Virt)).then_some(None);
+    let mut host_state: Option<Option<R>> =
+        (!priorities.contains(&LayerSource::Host)).then_some(None);
 
     loop {
         // Decision walk in priority order: a pending higher-priority layer
         // blocks; a completed empty one falls through; a completed non-empty
         // one wins.
         let mut blocked = false;
-        for layer in order {
+        for layer in priorities {
             let slot = match layer {
                 LayerSource::Virt => &mut virt_state,
                 LayerSource::Host => &mut host_state,
@@ -518,7 +520,7 @@ impl Kakehashi {
 
     /// Whether the virt layer participates for this host language and LSP
     /// method (cross-layer-aggregation): when `"virt"` is absent from the
-    /// resolved `layers.order`, the bridge dispatch is skipped entirely.
+    /// resolved `layers.priorities`, the bridge dispatch is skipped entirely.
     ///
     /// Used by entry points outside the [`Self::walk_layers`] race —
     /// notably the push-diagnostics scheduler and the virt-only handlers
@@ -719,10 +721,10 @@ impl Kakehashi {
     /// highest-priority non-empty result wins.
     ///
     /// - `virt` is the handler's existing injection-bridge future, polled
-    ///   only when the virt layer is in `order`.
+    ///   only when the virt layer is in `priorities`.
     /// - The host layer forwards `raw_params` verbatim
     ///   (host-document-bridge) and maps the raw result via `host_parse`.
-    /// - `layer_method` keys `layers.order` and the `_self` aggregation
+    /// - `layer_method` keys `layers.priorities` and the `_self` aggregation
     ///   (e.g. rangeFormatting shares `textDocument/formatting`);
     ///   `request_method` is what goes on the wire and gates capability.
     /// - Native has no contributor for bridged methods.
@@ -770,7 +772,7 @@ impl Kakehashi {
         // request there is no subscriber; a cancel landing there is only
         // forwarded downstream via the upstream-request registry.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let race = race_layers_preferred(&layer_cfg.order, virt, host, is_nonempty);
+        let race = race_layers_preferred(&layer_cfg.priorities, virt, host, is_nonempty);
         let result = match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
@@ -1021,7 +1023,7 @@ mod tests {
         let resolved =
             resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
         assert_eq!(
-            resolved.order,
+            resolved.priorities,
             vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
         );
     }
@@ -1036,7 +1038,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         crate::config::settings::LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Native]),
+                            priorities: Some(vec![LayerSource::Native]),
                             strategy: None,
                         },
                     )])),
@@ -1047,7 +1049,7 @@ mod tests {
         let settings = settings_with(langs);
 
         let hover = resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
-        assert_eq!(hover.order, vec![LayerSource::Native]);
+        assert_eq!(hover.priorities, vec![LayerSource::Native]);
         assert!(!hover.allows(LayerSource::Virt));
 
         let definition =
@@ -1070,7 +1072,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
                         crate::config::settings::LayerAggregationConfig {
-                            order: Some(vec![]),
+                            priorities: Some(vec![]),
                             strategy: None,
                         },
                     )])),
@@ -1082,7 +1084,7 @@ mod tests {
         let resolved =
             resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
         assert!(
-            resolved.order.is_empty(),
+            resolved.priorities.is_empty(),
             "wildcard-language layers must apply to unconfigured hosts"
         );
     }

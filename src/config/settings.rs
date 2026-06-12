@@ -131,7 +131,7 @@ pub struct LayerAggregationConfig {
     /// disables the method across all layers. `None` = inherit (default
     /// `["virt", "host", "native"]` — innermost first).
     #[serde(default)]
-    pub order: Option<Vec<LayerSource>>,
+    pub priorities: Option<Vec<LayerSource>>,
     /// Cross-layer combine strategy: `preferred` (first non-empty layer
     /// wins) or `concatenated`. `concatenated` is honored for
     /// `textDocument/formatting` only (cross-layer-aggregation phase 3);
@@ -141,16 +141,16 @@ pub struct LayerAggregationConfig {
     pub strategy: Option<AggregationStrategy>,
 }
 
-/// The built-in default layer order: virt, host, native — innermost first,
+/// The built-in default layer priorities: virt, host, native — innermost first,
 /// mirroring the "deeper wins" semantic-token convention.
-fn default_layer_order() -> Vec<LayerSource> {
+fn default_layer_priorities() -> Vec<LayerSource> {
     vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
 }
 
 /// Drop repeated layers, keeping the first occurrence (order preserved).
-fn dedup_layer_order(order: Vec<LayerSource>) -> Vec<LayerSource> {
+fn dedup_layer_priorities(priorities: Vec<LayerSource>) -> Vec<LayerSource> {
     let mut seen = std::collections::HashSet::new();
-    order
+    priorities
         .into_iter()
         .filter(|layer| seen.insert(*layer))
         .collect()
@@ -162,7 +162,7 @@ fn dedup_layer_order(order: Vec<LayerSource>) -> Vec<LayerSource> {
 /// resolved with their defaults.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLayerConfig {
-    pub(crate) order: Vec<LayerSource>,
+    pub(crate) priorities: Vec<LayerSource>,
     pub(crate) strategy: AggregationStrategy,
 }
 
@@ -171,14 +171,14 @@ impl ResolvedLayerConfig {
     /// order and the per-method strategy default.
     pub(crate) fn with_defaults(method: &str) -> Self {
         Self {
-            order: default_layer_order(),
+            priorities: default_layer_priorities(),
             strategy: default_aggregation_strategy_for_method(method),
         }
     }
 
     /// Whether the given layer participates for this method.
     pub(crate) fn allows(&self, layer: LayerSource) -> bool {
-        self.order.contains(&layer)
+        self.priorities.contains(&layer)
     }
 }
 
@@ -428,8 +428,9 @@ impl LanguageSettings {
     /// `"_"` method entry — the same machinery as
     /// [`BridgeLanguageConfig::resolve_aggregation`].
     ///
-    /// `order` is a single field: a method-specific `order` replaces the
-    /// wildcard's list wholesale, it does not merge element-wise.
+    /// `priorities` is a single field: a method-specific `priorities`
+    /// replaces the wildcard's list wholesale, it does not merge
+    /// element-wise.
     pub(crate) fn resolve_layers(&self, method: &str) -> ResolvedLayerConfig {
         let entry = self
             .layers
@@ -447,7 +448,9 @@ impl LanguageSettings {
                 // Dedup defensively (first occurrence wins): a repeated layer
                 // in user config would otherwise make downstream walks visit
                 // it twice.
-                order: dedup_layer_order(cfg.order.unwrap_or_else(default_layer_order)),
+                priorities: dedup_layer_priorities(
+                    cfg.priorities.unwrap_or_else(default_layer_priorities),
+                ),
                 strategy: cfg
                     .strategy
                     .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
@@ -1565,10 +1568,10 @@ kind = "injections""#;
 
     #[test]
     fn layer_source_deserializes_lowercase() {
-        let order: Vec<LayerSource> = serde_json::from_str(r#"["virt", "host", "native"]"#)
+        let priorities: Vec<LayerSource> = serde_json::from_str(r#"["virt", "host", "native"]"#)
             .expect("lowercase layer names must parse");
         assert_eq!(
-            order,
+            priorities,
             vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
         );
     }
@@ -1586,7 +1589,7 @@ kind = "injections""#;
         let settings = LanguageSettings::default();
         let resolved = settings.resolve_layers("textDocument/hover");
         assert_eq!(
-            resolved.order,
+            resolved.priorities,
             vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
         );
         assert_eq!(resolved.strategy, AggregationStrategy::Preferred);
@@ -1606,7 +1609,7 @@ kind = "injections""#;
                 aggregation: Some(HashMap::from([(
                     "textDocument/hover".to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Host, LayerSource::Virt]),
+                        priorities: Some(vec![LayerSource::Host, LayerSource::Virt]),
                         strategy: None,
                     },
                 )])),
@@ -1614,7 +1617,10 @@ kind = "injections""#;
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
-        assert_eq!(resolved.order, vec![LayerSource::Host, LayerSource::Virt]);
+        assert_eq!(
+            resolved.priorities,
+            vec![LayerSource::Host, LayerSource::Virt]
+        );
         assert!(
             !resolved.allows(LayerSource::Native),
             "omitted layer is excluded"
@@ -1631,14 +1637,14 @@ kind = "injections""#;
                     (
                         WILDCARD_KEY.to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Native]),
+                            priorities: Some(vec![LayerSource::Native]),
                             strategy: None,
                         },
                     ),
                     (
                         "textDocument/hover".to_string(),
                         LayerAggregationConfig {
-                            order: None,
+                            priorities: None,
                             strategy: Some(AggregationStrategy::Concatenated),
                         },
                     ),
@@ -1647,7 +1653,7 @@ kind = "injections""#;
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
-        assert_eq!(resolved.order, vec![LayerSource::Native]);
+        assert_eq!(resolved.priorities, vec![LayerSource::Native]);
         assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
     }
 
@@ -1659,14 +1665,14 @@ kind = "injections""#;
                     (
                         WILDCARD_KEY.to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Native, LayerSource::Host]),
+                            priorities: Some(vec![LayerSource::Native, LayerSource::Host]),
                             strategy: None,
                         },
                     ),
                     (
                         "textDocument/hover".to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Virt]),
+                            priorities: Some(vec![LayerSource::Virt]),
                             strategy: None,
                         },
                     ),
@@ -1676,7 +1682,7 @@ kind = "injections""#;
         };
         let resolved = settings.resolve_layers("textDocument/hover");
         assert_eq!(
-            resolved.order,
+            resolved.priorities,
             vec![LayerSource::Virt],
             "order is a single field: the method entry replaces the wildcard list, no element merge"
         );
@@ -1689,7 +1695,7 @@ kind = "injections""#;
                 aggregation: Some(HashMap::from([(
                     WILDCARD_KEY.to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![]),
+                        priorities: Some(vec![]),
                         strategy: None,
                     },
                 )])),
@@ -1697,7 +1703,7 @@ kind = "injections""#;
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
-        assert!(resolved.order.is_empty());
+        assert!(resolved.priorities.is_empty());
         assert!(!resolved.allows(LayerSource::Virt));
     }
 
@@ -1708,7 +1714,7 @@ kind = "injections""#;
                 aggregation: Some(HashMap::from([(
                     WILDCARD_KEY.to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![
+                        priorities: Some(vec![
                             LayerSource::Virt,
                             LayerSource::Native,
                             LayerSource::Virt,
@@ -1721,7 +1727,7 @@ kind = "injections""#;
         };
         let resolved = settings.resolve_layers("textDocument/hover");
         assert_eq!(
-            resolved.order,
+            resolved.priorities,
             vec![LayerSource::Virt, LayerSource::Native],
             "a repeated layer must not be walked twice"
         );
@@ -1730,12 +1736,12 @@ kind = "injections""#;
     #[test]
     fn layer_aggregation_config_parses_from_toml() {
         let toml_str = r#"
-            order = ["host", "virt"]
+            priorities = ["host", "virt"]
             strategy = "preferred"
         "#;
         let config: LayerAggregationConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(
-            config.order,
+            config.priorities,
             Some(vec![LayerSource::Host, LayerSource::Virt])
         );
         assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));

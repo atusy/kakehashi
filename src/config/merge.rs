@@ -208,15 +208,18 @@ pub(crate) fn merge_aggregation_configs(
 /// Merge two `LayerAggregationConfig`s field-by-field
 /// (cross-layer-aggregation).
 ///
-/// - `order`: overlay wins if present, else inherits from base — the list
-///   replaces wholesale, never element-wise
+/// - `priorities`: overlay wins if present, else inherits from base — the
+///   list replaces wholesale, never element-wise
 /// - `strategy`: overlay wins if set, else inherits from base
 pub(crate) fn merge_layer_aggregation_configs(
     base: &LayerAggregationConfig,
     overlay: &LayerAggregationConfig,
 ) -> LayerAggregationConfig {
     LayerAggregationConfig {
-        order: overlay.order.clone().or_else(|| base.order.clone()),
+        priorities: overlay
+            .priorities
+            .clone()
+            .or_else(|| base.priorities.clone()),
         strategy: overlay.strategy.or(base.strategy),
     }
 }
@@ -2146,16 +2149,16 @@ mod tests {
     fn merge_layer_aggregation_configs_overlay_fields_win() {
         use crate::config::settings::{AggregationStrategy, LayerSource};
         let base = LayerAggregationConfig {
-            order: Some(vec![LayerSource::Native]),
+            priorities: Some(vec![LayerSource::Native]),
             strategy: Some(AggregationStrategy::Preferred),
         };
         let overlay = LayerAggregationConfig {
-            order: Some(vec![LayerSource::Virt, LayerSource::Host]),
+            priorities: Some(vec![LayerSource::Virt, LayerSource::Host]),
             strategy: None,
         };
         let merged = merge_layer_aggregation_configs(&base, &overlay);
         assert_eq!(
-            merged.order,
+            merged.priorities,
             Some(vec![LayerSource::Virt, LayerSource::Host]),
             "overlay order replaces base wholesale"
         );
@@ -2175,14 +2178,14 @@ mod tests {
                     (
                         "textDocument/hover".to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Native]),
+                            priorities: Some(vec![LayerSource::Native]),
                             strategy: Some(AggregationStrategy::Preferred),
                         },
                     ),
                     (
                         "textDocument/definition".to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Virt]),
+                            priorities: Some(vec![LayerSource::Virt]),
                             strategy: None,
                         },
                     ),
@@ -2195,7 +2198,7 @@ mod tests {
                 aggregation: Some(HashMap::from([(
                     "textDocument/hover".to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Host]),
+                        priorities: Some(vec![LayerSource::Host]),
                         strategy: None,
                     },
                 )])),
@@ -2209,7 +2212,7 @@ mod tests {
             .aggregation
             .expect("aggregation must survive the merge");
         assert_eq!(
-            aggregation["textDocument/hover"].order,
+            aggregation["textDocument/hover"].priorities,
             Some(vec![LayerSource::Host]),
             "overlay entry wins per field"
         );
@@ -2219,7 +2222,7 @@ mod tests {
             "unset overlay field inherits from the base entry"
         );
         assert_eq!(
-            aggregation["textDocument/definition"].order,
+            aggregation["textDocument/definition"].priorities,
             Some(vec![LayerSource::Virt]),
             "base-only entries are preserved"
         );
@@ -2233,7 +2236,7 @@ mod tests {
                 aggregation: Some(HashMap::from([(
                     "_".to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Native]),
+                        priorities: Some(vec![LayerSource::Native]),
                         strategy: None,
                     },
                 )])),

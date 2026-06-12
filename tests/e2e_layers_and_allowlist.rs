@@ -153,7 +153,7 @@ fn e2e_priorities_allowlist_excludes_unlisted_servers() {
     shutdown(&mut client);
 }
 
-/// cross-layer-aggregation: omitting "virt" from `layers.order` disables
+/// cross-layer-aggregation: omitting "virt" from `layers.priorities` disables
 /// injection bridging for the method even though a working downstream server
 /// is configured.
 #[test]
@@ -169,7 +169,7 @@ fn e2e_layers_order_without_virt_disables_bridging() {
                     "markdown": {
                         "layers": {
                             "aggregation": {
-                                "textDocument/formatting": { "order": ["native"] }
+                                "textDocument/formatting": { "priorities": ["native"] }
                             }
                         }
                     }
@@ -180,7 +180,7 @@ fn e2e_layers_order_without_virt_disables_bridging() {
 
     wait_until_formatting_is_null(
         &mut client,
-        "layers.order = [\"native\"] must gate off the virt bridge for formatting",
+        "layers.priorities = [\"native\"] must gate off the virt bridge for formatting",
     );
     shutdown(&mut client);
 }

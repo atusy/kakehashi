@@ -185,7 +185,7 @@ fn e2e_host_bridge_is_opt_in() {
 
 #[test]
 fn e2e_host_bridge_respects_layers_order() {
-    // Omitting "host" from layers.order must gate the host layer off even
+    // Omitting "host" from layers.priorities must gate the host layer off even
     // though _self is enabled.
     let (mut client, _config_dir) = init_client(
         r#"
@@ -216,7 +216,7 @@ enabled = true
                     "markdown": {
                         "layers": {
                             "aggregation": {
-                                "textDocument/definition": { "order": ["virt", "native"] }
+                                "textDocument/definition": { "priorities": ["virt", "native"] }
                             }
                         }
                     }
@@ -235,7 +235,7 @@ enabled = true
     }
     assert!(
         went_null,
-        "layers.order without 'host' must gate the host layer off"
+        "layers.priorities without 'host' must gate the host layer off"
     );
 
     shutdown(&mut client);
