@@ -88,6 +88,10 @@ fn build_baseline_capabilities() -> ClientCapabilities {
             diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
                 refresh_support: Some(true),
             }),
+            // The bridge sends InitializeParams.workspaceFolders (upstream
+            // passthrough or the rootMarkers-derived folder), which LSP makes
+            // conditional on this capability.
+            workspace_folders: Some(true),
             ..Default::default()
         }),
         general: Some(GeneralClientCapabilities {
