@@ -475,6 +475,41 @@ impl LspClient {
         }
     }
 
+    /// Wait for the first notification whose method is in `methods` AND whose
+    /// params satisfy `predicate`, preserving arrival order across methods.
+    ///
+    /// Returns `(method, params)` for the first match, or None on timeout.
+    /// Unlike `wait_for_notification`, this can observe the ORDER of several
+    /// notification methods (e.g. prove a gated showMessage never arrived by
+    /// seeing a later logMessage first). Non-matching messages are skipped.
+    pub(crate) fn wait_for_notification_where(
+        &mut self,
+        methods: &[&str],
+        timeout: Duration,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Option<(String, Value)> {
+        let start_time = Instant::now();
+
+        loop {
+            let remaining = timeout.saturating_sub(start_time.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
+
+            if let Some(message) =
+                self.try_receive_message(remaining.min(Duration::from_millis(100)))
+                && message.get("id").is_none()
+                && let Some(method) = message.get("method").and_then(|m| m.as_str())
+                && methods.contains(&method)
+            {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                if predicate(&params) {
+                    return Some((method.to_string(), params));
+                }
+            }
+        }
+    }
+
     /// Try to receive a message with a timeout, returning None if no message available.
     ///
     /// # Known Limitation
