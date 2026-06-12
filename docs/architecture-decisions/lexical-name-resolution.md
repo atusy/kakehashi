@@ -79,7 +79,7 @@ silently by filename inference.
 |---|---|
 | `@scope` | A node that opens a lexical scope. The layer's document root is always an implicit root scope. |
 | `@definition` / `@definition.<label>` | A name-introducing node (the identifier itself, not the whole declaration). The optional `<label>` is an **opaque string**: the engine attaches no semantics to it. It serves as a property-targeting key within a pattern (below) and is surfaced in results for future use (e.g. `SymbolKind` mapping). |
-| `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references. |
+| `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references — the exclusion happens at collection, so a node registered as a definition site never enters the reference set. |
 
 ### Properties
 
@@ -94,10 +94,10 @@ carry no grammar of their own and no new property-key syntax is introduced.
 | Property | Values | Declares |
 |---|---|---|
 | `definition.scope` | `local` (default) / `parent` / `global` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, or the layer root. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. |
-| `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting, Python assignments). `after` = from the **end byte of the pattern's match** onward — in Lua's `local x = x` the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
+| `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting; Python assignments — a name assigned anywhere in a Python scope is local to the *entire* scope, so a pre-assignment reference binds locally rather than reading outward, mirroring UnboundLocalError instead of a silent outer-scope read). `after` = from the **end byte of the pattern's match** onward — in Lua's `local x = x` the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
 | `definition.namespace` | string, default `default` | The binding's namespace. |
 | `reference.namespace` | space-separated strings, default `default` | Namespaces this reference may bind to, searched in order within each scope. A type-position reference declares `"type"`; an ambiguous-position reference declares `"type default"`. Matching is by equality — an unannotated reference does **not** match an annotated definition, which is the conservative direction (silence over a wrong answer). |
-| `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable. |
+| `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable — provided those definitions declare the matching namespaces via `definition.namespace`. |
 | `scope.visible-to-nested` | `true` (default) / `false` | When `false`, this scope's bindings are skipped when the lookup walk arrives **from a nested scope**; references directly in the scope still see them. Expresses Python class bodies (methods and comprehensions inside the class do not see class-level names; statements in the body do). |
 
 ### Resolution algorithm (the engine's entire language model)
@@ -112,19 +112,22 @@ Per layer, per parsed version:
    exists in the registering scope does not create a second binding — it
    adds a **definition site** to the existing one, so re-assignment
    (`x = 1` … `x = 2`) yields one binding with two sites, never two
-   competing bindings. Each site records its label and its visibility
-   start: the **registering** scope's start byte for `scope` visibility,
-   the pattern-match end byte for `after`, the definition node's start
-   byte for `declaration`.
+   competing bindings. Each site records its label, the definition
+   node's range (what navigation reports), and its visibility start:
+   the **registering** scope's start byte for `scope` visibility, the
+   pattern-match end byte for `after`, the definition node's start byte
+   for `declaration`.
 3. For a `@reference` with name `N`, namespaces `NS`, at position `P`: walk
    scopes innermost → outermost. In each scope, for each namespace in `NS`
    order, look up the binding named `N` in that namespace; it is visible
    when at least one of its sites has visibility start **at or before**
    `P`. The first visible binding ends the walk (natural shadowing). The
-   definition site reported for it is the one with the latest start byte
-   at or before `P` (re-binding resolves to the nearest preceding site);
-   when every site starts after `P` — possible only under `scope`
-   visibility, i.e. hoisting — the earliest site is reported. Skip a
+   definition site reported for it is the one whose **definition node**
+   starts latest at or before `P` (re-binding resolves to the nearest
+   preceding site); when every site's node starts after `P` — possible
+   only when visibility came from a `scope` site, since an `after` or
+   `declaration` site visible at `P` necessarily starts at or before it
+   — the earliest site is reported (hoisting). Skip a
    scope's bindings when it has `visible-to-nested false` and is not the
    innermost scope containing `P`; stop the walk for a namespace once a
    scope's `inherits` setting excludes it (`false` excludes every
@@ -152,6 +155,10 @@ outcome the second design constraint forbids.
 | `textDocument/references` | All references in the layer that resolve to the same binding; the binding's definition sites included per `includeDeclaration`. |
 | `textDocument/documentHighlight` | The references set with the binding's definition sites always included (the request has no `includeDeclaration` parameter), kind `Text`. (`Read`/`Write` distinction would require knowing which syntactic positions write — expressible later as a `reference.write` property, not as engine knowledge.) |
 | `textDocument/rename` | **Included, best-effort.** Resolved binding → a `WorkspaceEdit` renaming every definition site and every reference resolving to it, layer-confined by construction. `prepareRename` answers only when the cursor's identifier resolves natively; otherwise it returns nothing and the bridge/aggregation path owns the request — so the native resolver never offers a rename it cannot ground. Clients without `prepareSupport` send `rename` directly; the same resolve-or-silence rule applies there, not only via the prepare gate. The residual risk is accepted and documented: an identifier the query failed to capture (or that binds dynamically) survives the rename, softening rename's all-or-nothing contract into best-effort — the same accuracy posture as every other feature here. |
+
+A cursor on a definition site identifies its binding directly; the
+references, documentHighlight, and rename rows then apply exactly as if a
+reference had resolved to that binding.
 
 How a native answer and a bridge answer for the same request combine (order,
 dedup, precedence) is governed by cross-layer-aggregation, not duplicated
