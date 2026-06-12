@@ -725,37 +725,20 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
-        // rootMarkers workspace-root detection: a marker hit near the
-        // triggering document overrides the client-supplied root (and becomes
-        // the sole workspace folder); otherwise both fall back to upstream.
-        let marker_root = super::root_markers::resolve_marker_root(
+        // rootMarkers workspace-root detection (root_markers module): a
+        // marker hit near the triggering document overrides the
+        // client-supplied root and folders; otherwise both fall back.
+        let (root_uri, workspace_folders) = super::root_markers::resolve_spawn_workspace(
             server_config.root_markers.as_deref(),
             document_uri,
+            || (self.root_uri(), self.workspace_folders()),
         );
-        let (root_uri, workspace_folders) = match marker_root {
-            Some(root) => {
-                log::debug!(
-                    target: "kakehashi::bridge::init",
-                    "[{}] rootMarkers resolved workspace root: {}",
-                    server_name,
-                    root
-                );
-                let folder = root.as_str().parse().ok().map(|uri| {
-                    vec![tower_lsp_server::ls_types::WorkspaceFolder {
-                        uri,
-                        name: root
-                            .to_file_path()
-                            .ok()
-                            .and_then(|path| {
-                                path.file_name().map(|n| n.to_string_lossy().into_owned())
-                            })
-                            .unwrap_or_default(),
-                    }]
-                });
-                (Some(root.to_string()), folder)
-            }
-            None => (self.root_uri(), self.workspace_folders()),
-        };
+        log::debug!(
+            target: "kakehashi::bridge::init",
+            "[{}] workspace root for spawn: {:?}",
+            server_name,
+            root_uri
+        );
         let client_capabilities = self.client_capabilities();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();

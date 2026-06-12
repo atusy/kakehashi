@@ -27,7 +27,7 @@ Partially implemented:
   real URI and real coordinates) and the result comes back untranslated —
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
-  `preferred` semantics): layers are tried lazily in `order` — by default
+  `preferred` semantics): layers are tried lazily in `priorities` — by default
   virt first, host as fallback. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,

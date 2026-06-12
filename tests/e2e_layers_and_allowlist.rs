@@ -157,7 +157,7 @@ fn e2e_priorities_allowlist_excludes_unlisted_servers() {
 /// injection bridging for the method even though a working downstream server
 /// is configured.
 #[test]
-fn e2e_layers_order_without_virt_disables_bridging() {
+fn e2e_layers_priorities_without_virt_disables_bridging() {
     let (mut client, _config_dir) = init_warm_client();
     wait_until_formatting_succeeds(&mut client);
 

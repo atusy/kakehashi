@@ -1093,6 +1093,48 @@ mod tests {
         );
     }
 
+    /// rootMarkers merges overlay-wins like other Option fields, and the
+    /// explicit `Some([])` kill switch must survive the merge — collapsing
+    /// it to "inherit" would silently re-enable the marker search a user
+    /// turned off per server.
+    #[test]
+    fn test_merge_bridge_server_configs_root_markers() {
+        use settings::BridgeServerConfig;
+
+        let base = BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: Some(vec![".git".to_string()]),
+        };
+
+        // Unset overlay inherits from base (wildcard default applies)
+        let inheriting = BridgeServerConfig {
+            cmd: vec!["rust-analyzer".to_string()],
+            languages: vec!["rust".to_string()],
+            initialization_options: None,
+            root_markers: None,
+        };
+        let merged = merge_bridge_server_configs(&base, &inheriting);
+        assert_eq!(merged.root_markers, Some(vec![".git".to_string()]));
+
+        // Set overlay wins over base
+        let overriding = BridgeServerConfig {
+            root_markers: Some(vec!["Cargo.toml".to_string()]),
+            ..inheriting.clone()
+        };
+        let merged = merge_bridge_server_configs(&base, &overriding);
+        assert_eq!(merged.root_markers, Some(vec!["Cargo.toml".to_string()]));
+
+        // Explicit [] survives as the per-server kill switch
+        let disabling = BridgeServerConfig {
+            root_markers: Some(vec![]),
+            ..inheriting
+        };
+        let merged = merge_bridge_server_configs(&base, &disabling);
+        assert_eq!(merged.root_markers, Some(vec![]));
+    }
+
     // Deep merge for initialization_options (configuration-merging-strategy)
 
     /// configuration-merging-strategy: initialization_options deep merge covers three behaviors:
@@ -2179,7 +2221,7 @@ mod tests {
         assert_eq!(
             merged.priorities,
             Some(vec![LayerSource::Virt, LayerSource::Host]),
-            "overlay order replaces base wholesale"
+            "overlay priorities replace base wholesale"
         );
         assert_eq!(
             merged.strategy,

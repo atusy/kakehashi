@@ -184,7 +184,7 @@ fn e2e_host_bridge_is_opt_in() {
 }
 
 #[test]
-fn e2e_host_bridge_respects_layers_order() {
+fn e2e_host_bridge_respects_layers_priorities() {
     // Omitting "host" from layers.priorities must gate the host layer off even
     // though _self is enabled.
     let (mut client, _config_dir) = init_client(
@@ -261,8 +261,10 @@ fn send_formatting(client: &mut LspClient, uri: &str) -> Value {
     response["result"].clone()
 }
 
-/// Host-only formatting under the default `preferred` layer order: no virt
-/// server is configured, so the host layer's whole-document edits win and
+/// Host-only formatting under an explicit `preferred` layer strategy (the
+/// default is `concatenated` since cross-layer formatting became a
+/// pipeline): no virt server is configured, so the lazy walk falls through
+/// the empty virt layer and the host layer's whole-document edits win and
 /// pass through verbatim.
 #[test]
 fn e2e_host_formatting_preferred_falls_through_to_host() {
@@ -273,6 +275,9 @@ fn e2e_host_formatting_preferred_falls_through_to_host() {
         r#"
 [languages.markdown.bridge._self]
 enabled = true
+
+[languages.markdown.layers.aggregation."textDocument/formatting"]
+strategy = "preferred"
 "#,
     )
     .expect("write config");

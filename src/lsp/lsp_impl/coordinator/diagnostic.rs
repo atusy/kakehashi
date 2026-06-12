@@ -127,7 +127,7 @@ impl DiagnosticScheduler {
         {
             log::debug!(
                 target: LOG_TARGET,
-                "virt layer disabled for {} via layers.aggregation order",
+                "virt layer disabled for {} via layers.aggregation priorities",
                 language_name
             );
             return Some(Vec::new());

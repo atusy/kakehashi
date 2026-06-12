@@ -103,7 +103,7 @@ impl Kakehashi {
         if !self.virt_layer_enabled(&language_name, "textDocument/diagnostic") {
             log::debug!(
                 target: "kakehashi::diagnostic",
-                "virt layer disabled for {} via layers.aggregation order",
+                "virt layer disabled for {} via layers.aggregation priorities",
                 language_name
             );
             return Ok(empty_diagnostic_report());

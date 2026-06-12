@@ -327,6 +327,47 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
     pairs
 }
 
+/// Names of concrete `languageServers` entries whose wildcard-resolved `cmd`
+/// is still empty — unspawnable, so every lookup silently skips them
+/// (wildcard-config-inheritance). Before cmd became optional (to allow a
+/// defaults-only `languageServers._` entry) this was a hard deserialization
+/// error; the warning restores that feedback at settings-apply time instead
+/// of leaving the user with a server that never runs.
+pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<String> {
+    let servers = &settings.language_servers;
+    let mut names: Vec<String> = servers
+        .keys()
+        .filter(|name| *name != crate::config::WILDCARD_KEY)
+        .filter(|name| {
+            crate::config::resolve_with_wildcard(
+                servers,
+                name,
+                crate::config::merge_bridge_server_configs,
+            )
+            .is_none_or(|config| config.cmd.is_empty())
+        })
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Render the single aggregated client-facing warning for unspawnable
+/// `languageServers` entries (empty resolved `cmd`). `None` when there is
+/// nothing to warn about.
+pub(crate) fn format_unspawnable_servers_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "languageServers entr{} with no 'cmd' (after merging the '_' \
+         wildcard defaults): {}. These servers cannot be spawned and are \
+         skipped by every request.",
+        if names.len() == 1 { "y" } else { "ies" },
+        names.join(", ")
+    ))
+}
+
 /// Render the single aggregated client-facing warning for misconfigured
 /// `textDocument/formatting` aggregation strategies.
 ///
@@ -545,7 +586,7 @@ impl Kakehashi {
     ) -> Option<DocumentRequestContext> {
         if !self.virt_layer_enabled(&preamble.language_name, method_name) {
             log::debug!(
-                "{}: virt layer disabled for {} via layers.aggregation order",
+                "{}: virt layer disabled for {} via layers.aggregation priorities",
                 method_name,
                 preamble.language_name
             );
@@ -848,6 +889,54 @@ mod tests {
             bridge: Some(bridge),
             ..Default::default()
         }
+    }
+
+    fn server(cmd: &[&str]) -> crate::config::settings::BridgeServerConfig {
+        crate::config::settings::BridgeServerConfig {
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            languages: vec!["lua".to_string()],
+            initialization_options: None,
+            root_markers: None,
+        }
+    }
+
+    #[test]
+    fn unspawnable_language_servers_flags_empty_cmd_but_not_wildcard() {
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&[])), // defaults-only entry: never flagged
+            ("good".to_string(), server(&["lua-language-server"])),
+            ("broken".to_string(), server(&[])),
+            ("also-broken".to_string(), server(&[])),
+        ]);
+
+        assert_eq!(
+            unspawnable_language_servers(&settings),
+            vec!["also-broken".to_string(), "broken".to_string()],
+        );
+    }
+
+    #[test]
+    fn unspawnable_language_servers_honors_cmd_inherited_from_wildcard() {
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&["shared-ls", "--stdio"])),
+            ("inherits-cmd".to_string(), server(&[])),
+        ]);
+
+        assert!(
+            unspawnable_language_servers(&settings).is_empty(),
+            "cmd supplied by the '_' wildcard makes the entry spawnable"
+        );
+    }
+
+    #[test]
+    fn format_unspawnable_servers_warning_lists_names_or_is_silent() {
+        assert_eq!(format_unspawnable_servers_warning(&[]), None);
+        let msg = format_unspawnable_servers_warning(&["broken".to_string()])
+            .expect("non-empty list warns");
+        assert!(msg.contains("broken"), "warning names the server: {msg}");
+        assert!(msg.contains("cmd"), "warning explains the cause: {msg}");
     }
 
     fn bridge_cfg_with_aggregation(

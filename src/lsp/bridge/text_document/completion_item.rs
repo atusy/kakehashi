@@ -74,6 +74,10 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
+        // No rootMarkers document hint: resolve params carry no textDocument.
+        // The origin server is normally already pooled by the completion
+        // request that produced the item; only if it died in between does
+        // this respawn — then with the client-supplied root.
         let handle = match self
             .get_or_create_connection(server_name, server_config, None)
             .await

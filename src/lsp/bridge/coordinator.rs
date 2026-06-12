@@ -791,8 +791,25 @@ mod tests {
             },
         );
 
+        // Host bridging opted in for rust, so the host lookup would select
+        // the server if the empty-cmd filter were missing there.
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "_self".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
         let settings = WorkspaceSettings {
-            languages: HashMap::new(),
+            languages,
             auto_install: false,
             language_servers: servers,
             ..Default::default()
@@ -809,6 +826,12 @@ mod tests {
                 .get_all_configs_for_language(&settings, "markdown", "rust")
                 .is_empty(),
             "fan-out must also skip servers with empty resolved cmd"
+        );
+        assert!(
+            coordinator
+                .get_host_configs_for_language(&settings, "rust")
+                .is_empty(),
+            "the host lookup must also skip servers with empty resolved cmd"
         );
     }
 

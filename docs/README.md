@@ -428,6 +428,14 @@ Details:
   Bridged methods have no `native` counterpart yet. Diagnostics and
   semantic tokens stay virt-only for now.
 
+> **Migration note**: this field was previously named `order` and lived at
+> `layers.<method>` (without the `aggregation` level). Old keys are silently
+> ignored — rewrite `layers.<method>.order` as
+> `layers.aggregation.<method>.priorities`. The default `strategy` for
+> `textDocument/formatting` also changed from `"preferred"` to
+> `"concatenated"`; set it back explicitly if you relied on
+> first-non-empty-layer-wins formatting with host bridging enabled.
+
 **Bridge Filter Semantics:**
 
 The `bridge` map in language configuration controls which injection languages are bridged:

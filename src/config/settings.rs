@@ -1737,7 +1737,7 @@ kind = "injections""#;
     }
 
     #[test]
-    fn resolve_layers_method_order_replaces_wildcard_order_wholesale() {
+    fn resolve_layers_method_priorities_replace_wildcard_priorities_wholesale() {
         let settings = LanguageSettings {
             layers: Some(LayersConfig {
                 aggregation: Some(HashMap::from([
@@ -1763,12 +1763,12 @@ kind = "injections""#;
         assert_eq!(
             resolved.priorities,
             vec![LayerSource::Virt],
-            "order is a single field: the method entry replaces the wildcard list, no element merge"
+            "priorities is a single field: the method entry replaces the wildcard list, no element merge"
         );
     }
 
     #[test]
-    fn resolve_layers_empty_order_disables_all_layers() {
+    fn resolve_layers_empty_priorities_disable_all_layers() {
         let settings = LanguageSettings {
             layers: Some(LayersConfig {
                 aggregation: Some(HashMap::from([(
