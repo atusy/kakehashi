@@ -205,10 +205,16 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   field: a method-specific `priorities` replaces the wildcard's list
   wholesale, it does not merge element-wise.
 - **Strategy is phased.** Phase 2 implements `preferred` only; every method
-  combines across layers by first-non-empty until then. Once layer-level
-  `concatenated` lands (formatting first, phase 3), the per-method defaults
-  of `default_aggregation_strategy_for_method` apply unchanged
-  (`concatenated` for diagnostics, `preferred` otherwise).
+  combines across layers by first-non-empty until then. With layer-level
+  `concatenated` landed (formatting first, phase 3), the layer defaults
+  come from `default_layer_strategy_for_method`: `concatenated` for
+  diagnostics *and* `textDocument/formatting`, `preferred` otherwise. The
+  formatting default diverges from the bridge level deliberately — the
+  cross-layer pipeline composes disjoint work (virt formats injection
+  regions, host formats the resulting text), whereas multiple servers of
+  one bridge target produce competing whole-document edits, so the bridge
+  default stays `preferred`. Host is opt-in, so the default still
+  reproduces single-layer behavior until `bridge._self.enabled = true`.
 - **Nested injections stay implicit.** When injections nest
   (markdown → python → sql), the virt layer resolves deepest-first,
   consistent with the semantic-token priority convention (deeper wins). Depth

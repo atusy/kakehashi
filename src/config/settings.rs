@@ -133,7 +133,9 @@ pub struct LayerAggregationConfig {
     #[serde(default)]
     pub priorities: Option<Vec<LayerSource>>,
     /// Cross-layer combine strategy: `preferred` (first non-empty layer
-    /// wins) or `concatenated`. `concatenated` is honored for
+    /// wins) or `concatenated`. `None` = inherit (default `concatenated`
+    /// for `textDocument/formatting` and the diagnostics methods,
+    /// `preferred` otherwise). `concatenated` is honored for
     /// `textDocument/formatting` only (cross-layer-aggregation phase 3);
     /// other methods combine with `preferred` until a second layer can
     /// produce results.
@@ -172,7 +174,7 @@ impl ResolvedLayerConfig {
     pub(crate) fn with_defaults(method: &str) -> Self {
         Self {
             priorities: default_layer_priorities(),
-            strategy: default_aggregation_strategy_for_method(method),
+            strategy: default_layer_strategy_for_method(method),
         }
     }
 
@@ -212,6 +214,19 @@ fn default_aggregation_strategy_for_method(method: &str) -> AggregationStrategy 
             AggregationStrategy::Concatenated
         }
         _ => AggregationStrategy::Preferred,
+    }
+}
+
+/// Layer-level default strategy (cross-layer-aggregation): formatting is
+/// `concatenated` in addition to the diagnostics defaults, because the
+/// cross-layer formatting pipeline composes disjoint work (virt formats
+/// injection regions, host formats the resulting text). At the bridge level
+/// the same method stays `preferred` — there, multiple servers of one
+/// target produce *competing* whole-document edits.
+fn default_layer_strategy_for_method(method: &str) -> AggregationStrategy {
+    match method {
+        "textDocument/formatting" => AggregationStrategy::Concatenated,
+        _ => default_aggregation_strategy_for_method(method),
     }
 }
 
@@ -453,7 +468,7 @@ impl LanguageSettings {
                 ),
                 strategy: cfg
                     .strategy
-                    .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
+                    .unwrap_or_else(|| default_layer_strategy_for_method(method)),
             },
             None => ResolvedLayerConfig::with_defaults(method),
         }
@@ -1600,6 +1615,25 @@ kind = "injections""#;
         let settings = LanguageSettings::default();
         let resolved = settings.resolve_layers("textDocument/diagnostic");
         assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+    }
+
+    #[test]
+    fn resolve_layers_formatting_defaults_to_concatenated() {
+        // Layer-level formatting is a sequential pipeline (virt regions
+        // first, then the host formatter) — every producing layer should
+        // contribute by default. Contrast with the bridge level, where
+        // concatenating whole-document edits from multiple servers of one
+        // target would conflict, so its default stays preferred.
+        let settings = LanguageSettings::default();
+        let resolved = settings.resolve_layers("textDocument/formatting");
+        assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+    }
+
+    #[test]
+    fn resolve_bridge_aggregation_formatting_stays_preferred() {
+        let config = BridgeLanguageConfig::default();
+        let agg = config.resolve_aggregation("textDocument/formatting");
+        assert_eq!(agg.strategy, AggregationStrategy::Preferred);
     }
 
     #[test]

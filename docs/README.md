@@ -404,7 +404,7 @@ the `bridge.<lang>.aggregation` nesting:
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only and runs the layers as a sequential pipeline: injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"` (the default for `textDocument/formatting` and the diagnostics methods). `"concatenated"` is honored for `textDocument/formatting` only and runs the layers as a sequential pipeline: injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit. |
 
 Details:
 
