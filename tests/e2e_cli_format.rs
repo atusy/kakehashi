@@ -163,10 +163,9 @@ fn e2e_fail_on_change_writes_and_exits_nonzero() {
     );
 }
 
-#[test]
-fn e2e_stdin_mode_prints_formatted_content() {
-    let ws = workspace_with(&[]);
-
+/// Run `kakehashi format --stdin-filename doc.md <extra args>` feeding
+/// `MARKDOWN` on stdin.
+fn run_format_stdin(workspace: &Path, extra_args: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args([
             "format",
@@ -175,7 +174,8 @@ fn e2e_stdin_mode_prints_formatted_content() {
             "--stdin-filename",
             "doc.md",
         ])
-        .current_dir(ws.path())
+        .args(extra_args)
+        .current_dir(workspace)
         .env("KAKEHASHI_DATA_DIR", data_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -188,7 +188,14 @@ fn e2e_stdin_mode_prints_formatted_content() {
         .expect("stdin piped")
         .write_all(MARKDOWN.as_bytes())
         .expect("write stdin");
-    let output = child.wait_with_output().expect("wait for kakehashi");
+    child.wait_with_output().expect("wait for kakehashi")
+}
+
+#[test]
+fn e2e_stdin_mode_prints_formatted_content() {
+    let ws = workspace_with(&[]);
+
+    let output = run_format_stdin(ws.path(), &[]);
 
     assert!(
         output.status.success(),
@@ -199,6 +206,48 @@ fn e2e_stdin_mode_prints_formatted_content() {
     assert!(
         stdout.contains("LOCAL X = 1"),
         "formatted content goes to stdout; got: {stdout:?}"
+    );
+}
+
+#[test]
+fn e2e_stdin_check_keeps_stdout_clean_and_exits_nonzero() {
+    let ws = workspace_with(&[]);
+
+    let output = run_format_stdin(ws.path(), &["--check"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--check on unformatted stdin must exit 1; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "--check must not write content to stdout; got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Would reformat"),
+        "--check should name the stdin file on stderr; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn e2e_stdin_fail_on_change_prints_content_and_exits_nonzero() {
+    let ws = workspace_with(&[]);
+
+    let output = run_format_stdin(ws.path(), &["--fail-on-change"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "--fail-on-change on changed stdin must exit 1; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("LOCAL X = 1"),
+        "--fail-on-change still prints the formatted content to stdout"
     );
 }
 
