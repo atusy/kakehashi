@@ -739,6 +739,25 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_named_hidden_directory_is_walked() {
+        // The walker's hidden-file filter applies to entries, not to the
+        // walk root: explicitly naming a hidden directory must format its
+        // (non-hidden) contents.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(".hidden/doc.md"), "x");
+
+        let files = collect_files(
+            tmp.path(),
+            &[tmp.path().join(".hidden")],
+            &[],
+            &markdown_only,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec![tmp.path().join(".hidden/doc.md")]);
+    }
+
+    #[test]
     fn gitignored_directory_contents_are_formatted_when_directory_is_explicit() {
         // "paths win over gitignore" extends to directories: walking an
         // explicitly named directory starts a fresh walk rooted there, so a
