@@ -5,9 +5,9 @@
 
 use super::WILDCARD_KEY;
 use super::settings::{
-    AggregationConfig, AggregationStrategy, BridgeLanguageConfig, CaptureMapping, CaptureMappings,
-    LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, QueryTypeMappings,
-    RawWorkspaceSettings,
+    AggregationConfig, AggregationStrategy, BridgeLanguageConfig, BridgeServerConfig,
+    CaptureMapping, CaptureMappings, LanguageSettings, LayerAggregationConfig, LayerSource,
+    LayersConfig, QueryTypeMappings, RawWorkspaceSettings,
 };
 use std::collections::HashMap;
 
@@ -20,8 +20,24 @@ pub fn default_settings() -> RawWorkspaceSettings {
         languages: default_languages(),
         capture_mappings: default_capture_mappings(),
         auto_install: Some(true),
-        language_servers: None,
+        language_servers: Some(default_language_servers()),
     }
+}
+
+/// Returns the default languageServers map: a defaults-only `_` wildcard
+/// entry documenting the built-in `rootMarkers` default that every concrete
+/// server inherits (wildcard-config-inheritance). Not spawnable itself —
+/// lookups skip the wildcard key and any server with an empty resolved cmd.
+fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
+    HashMap::from([(
+        WILDCARD_KEY.to_string(),
+        BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: Some(vec![".git".to_string()]),
+        },
+    )])
 }
 
 /// Returns the default languages map containing the wildcard `_` entry.
@@ -354,6 +370,31 @@ mod tests {
             bridge_wildcard.priorities,
             Some(vec!["*".to_string()]),
             "the '*' fan-out default should be visible in the template"
+        );
+    }
+
+    #[test]
+    fn default_settings_documents_root_markers_default() {
+        let settings = default_settings();
+        let servers = settings
+            .language_servers
+            .as_ref()
+            .expect("should have languageServers");
+        let wildcard = servers.get(WILDCARD_KEY).expect("should have '_' entry");
+        assert_eq!(wildcard.root_markers, Some(vec![".git".to_string()]));
+        assert!(
+            wildcard.cmd.is_empty() && wildcard.languages.is_empty(),
+            "the wildcard entry is defaults-only, not a spawnable server"
+        );
+
+        let toml_string = toml::to_string_pretty(&settings).expect("should serialize");
+        assert!(
+            toml_string.contains("[languageServers._]"),
+            "template should render the wildcard server entry. Got:\n{toml_string}"
+        );
+        assert!(
+            !toml_string.contains("cmd = []"),
+            "empty cmd/languages must not clutter the template. Got:\n{toml_string}"
         );
     }
 
