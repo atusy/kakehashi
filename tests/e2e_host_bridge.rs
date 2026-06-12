@@ -238,3 +238,169 @@ enabled = true
 
     shutdown(&mut client);
 }
+
+// ==========================================================================
+// Host formatting (host-document-bridge + cross-layer-aggregation phase 3)
+// ==========================================================================
+
+fn send_formatting(client: &mut LspClient, uri: &str) -> Value {
+    let response = client.send_request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 4, "insertSpaces": true },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "formatting must not surface a top-level error; got: {:?}",
+        response.get("error")
+    );
+    response["result"].clone()
+}
+
+/// Host-only formatting under the default `preferred` layer order: no virt
+/// server is configured, so the host layer's whole-document edits win and
+/// pass through verbatim.
+#[test]
+fn e2e_host_formatting_preferred_falls_through_to_host() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("host_fmt.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-upper": { "cmd": [mock_bin(), "upper"], "languages": ["markdown"] },
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_host_fmt_preferred.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "markdown", "version": 1,
+                              "text": "# title\n\nbody text\n" }
+        }),
+    );
+
+    let mut hit = None;
+    for _ in 0..300 {
+        let result = send_formatting(&mut client, uri);
+        if result.as_array().is_some_and(|a| !a.is_empty()) {
+            hit = Some(result);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let result = hit.expect("host formatting must produce edits");
+    let new_text = result[0]["newText"].as_str().expect("edit newText");
+    assert!(
+        new_text.contains("# TITLE"),
+        "host formatter's whole-document edit must pass through verbatim; got: {new_text:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+/// Cross-layer `concatenated` formatting: virt formats the lua fence first
+/// (appending a lowercase marker), then the host formatter runs ON THE VIRT
+/// OUTPUT (uppercasing everything). The marker arriving uppercased proves the
+/// serial virt → host threading; the response collapses into one
+/// whole-document replacement edit.
+#[test]
+fn e2e_host_formatting_concatenated_threads_virt_then_host() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("host_fmt_concat.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+
+[languages.markdown.layers."textDocument/formatting"]
+strategy = "concatenated"
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-upper": { "cmd": [mock_bin(), "upper"], "languages": ["markdown"] },
+                    "mock-virt-append": { "cmd": [mock_bin(), "append"], "languages": ["lua"] },
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_host_fmt_concat.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "markdown", "version": 1,
+                              "text": "# title\n\n```lua\nprint(1)\n```\n" }
+        }),
+    );
+
+    // Retry until BOTH layers have produced: the uppercased marker can only
+    // exist if the host formatter ran on the virt layer's output.
+    let mut final_text = None;
+    for _ in 0..300 {
+        let result = send_formatting(&mut client, uri);
+        if let Some(text) = result
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|e| e["newText"].as_str())
+            && text.contains("MOCK-MARKER")
+        {
+            final_text = Some(text.to_string());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let text = final_text
+        .expect("concatenated cross-layer formatting must thread virt output into the host layer");
+
+    assert!(
+        text.contains("# TITLE"),
+        "host layer must have formatted the whole document; got: {text:?}"
+    );
+    assert!(
+        !text.contains("mock-marker"),
+        "the marker must be uppercased — host ran AFTER virt, on virt's output; got: {text:?}"
+    );
+
+    shutdown(&mut client);
+}

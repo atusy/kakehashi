@@ -19,11 +19,17 @@ Partially implemented:
   not leak into `_self` (equivalent to the Wildcard Merge Safety reasoning
   below, without materializing built-in default entries). Aggregation fields
   DO wildcard-merge (`resolve_host_aggregation`).
-- **Dispatch**: implemented for `textDocument/definition` and
-  `textDocument/hover` (`src/lsp/bridge/text_document/host.rs`,
-  `dispatch_host_preferred`); other methods follow the same pattern as
-  needed. The layer walk in the handlers (cross-layer-aggregation) tries
-  layers in `order` — by default virt first, host as fallback.
+- **Dispatch**: implemented for `textDocument/definition`,
+  `textDocument/hover`, and `textDocument/formatting`
+  (`src/lsp/bridge/text_document/host.rs`, `dispatch_host_preferred`); other
+  methods follow the same pattern as needed. The layer walk in the handlers
+  (cross-layer-aggregation) tries layers in `order` — by default virt
+  first, host as fallback. Formatting additionally supports the cross-layer
+  `concatenated` pipeline: virt region edits apply first, the host
+  formatter formats the intermediate text, and the chain collapses into one
+  whole-document replacement edit. During that pipeline the host server's
+  document state is briefly speculative (it sees the virt-applied text);
+  the lazy fingerprint sync restores the editor text on the next request.
 - **Document sync deviation**: instead of forwarding `didChange` params
   verbatim, sync is *lazy*: `didOpen` with the full host text fires on the
   first request per `(uri, server)`, and a **full-text** `didChange` fires

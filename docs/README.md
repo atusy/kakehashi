@@ -325,10 +325,12 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` contains the **host** language, with the real URI and no
-coordinate translation. Currently `textDocument/definition` and
-`textDocument/hover` are wired; by default the host layer is tried after
-`virt` (see `layers` above), so injections keep winning inside code fences
-while the host server answers everywhere else.
+coordinate translation. Currently `textDocument/definition`,
+`textDocument/hover`, and `textDocument/formatting` are wired; by default
+the host layer is tried after `virt` (see `layers` above), so injections
+keep winning inside code fences while the host server answers everywhere
+else. For formatting, combine fence formatters with a whole-document
+formatter via `layers."textDocument/formatting".strategy = "concatenated"`.
 
 ```toml
 [languages.markdown.bridge._self]
@@ -398,7 +400,7 @@ own features). The per-language `layers` map orders them per LSP method:
 | Field | Description |
 |-------|-------------|
 | `order` | Ordered allowlist of layers, highest priority first. Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only; until host bridging ships, at most one layer produces edits, so both strategies currently yield that layer's result. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only and runs the layers as a sequential pipeline: injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit. |
 
 Details:
 
@@ -412,10 +414,11 @@ Details:
   bridge diagnostics off.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for
-  `textDocument/definition` and `textDocument/hover` when host bridging is
-  opted in (see `bridge._self` below). Bridged methods have no `native`
-  counterpart yet. For other methods the practical effect is per-method
-  enabling and disabling of injection bridging.
+  `textDocument/definition`, `textDocument/hover`, and
+  `textDocument/formatting` when host bridging is opted in (see
+  `bridge._self` below). Bridged methods have no `native` counterpart yet.
+  For other methods the practical effect is per-method enabling and
+  disabling of injection bridging.
 
 **Bridge Filter Semantics:**
 

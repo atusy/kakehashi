@@ -28,17 +28,22 @@ Phased roadmap:
    other methods keep the degenerate virt gate until they grow a second
    contributor.
 3. **Layer-level `concatenated` for `textDocument/formatting` only** — ✅
-   implemented as `combine_layer_formatting_results`: formatting dispatches
-   on the resolved layer strategy. With at most one producing layer (the
-   only reachable case until host bridging ships), `concatenated`
-   degenerates to that layer's edits. Should two layers ever produce before
-   cross-layer text threading exists, the highest-priority layer's edits
-   apply alone with a warning — never merged, since naively concatenating
-   two layers' edit lists could overlap and violate LSP. The true
-   sequential pipeline (each layer formatting the previous layer's output,
-   per concatenated-formatting-pipeline principles) lands with host
-   bridging. Layer strategy applies to full formatting only;
-   `textDocument/rangeFormatting` stays on `preferred`, mirroring the
+   implemented as a true sequential cross-layer pipeline in
+   `formatting_impl`: layers run in `order`, each formatting the previous
+   layer's output (virt region edits are applied to the host text, the host
+   formatter then formats that intermediate text). With one producing layer
+   the minimal edits pass through verbatim (they are against the original by
+   construction); with two or more the chain collapses into a single
+   whole-document replacement edit — the same overlap-free shape as the
+   within-region pipeline (concatenated-formatting-pipeline Decision
+   point 4), and `None` when the chain round-trips to the original.
+   Constraint: virt edits resolve against the parsed snapshot, so virt can
+   only run while the accumulated text still is the snapshot text — an
+   `order` placing virt after a producing layer skips virt with a warning.
+   The default order (virt before host) is unaffected. Under `preferred`
+   the walk stays lazy: the first layer producing edits wins and later
+   layers are never contacted. Layer strategy applies to full formatting
+   only; `textDocument/rangeFormatting` stays on `preferred`, mirroring the
    stage-1 rule.
 
 ## Context

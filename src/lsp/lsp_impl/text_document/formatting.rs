@@ -89,25 +89,131 @@ impl Kakehashi {
         // it is the first method with a layer-level `concatenated` dispatch
         // (cross-layer-aggregation phase 3).
         let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/formatting");
-        if !layer_cfg.allows(LayerSource::Virt) {
-            // Host and native contribute nothing today, so a virt-less order
-            // cannot produce edits under either strategy.
-            log::debug!(
-                target: "kakehashi::formatting",
-                "virt layer disabled for {} via layers.order",
-                language_name
-            );
-            return Ok(None);
-        }
 
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
+        let upstream_request_id = crate::lsp::current_upstream_id();
+        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
+        let original = snapshot.text().to_string();
+
+        let result = match layer_cfg.strategy {
+            AggregationStrategy::Preferred => {
+                // Lazy walk: the first layer producing edits wins; later
+                // layers are never contacted.
+                let mut winner = None;
+                for layer in &layer_cfg.order {
+                    let edits = match layer {
+                        LayerSource::Virt => {
+                            self.virt_format_edits(
+                                &uri,
+                                &snapshot,
+                                &language_name,
+                                &options,
+                                &upstream_request_id,
+                                &cancel_state,
+                            )
+                            .await?
+                        }
+                        LayerSource::Host => {
+                            self.host_format_edits(&lsp_uri, &original, &options, &cancel_state)
+                                .await?
+                        }
+                        // No native formatter: empty contributor.
+                        LayerSource::Native => None,
+                    };
+                    if let Some(edits) = edits
+                        && !edits.is_empty()
+                    {
+                        winner = Some(edits);
+                        break;
+                    }
+                }
+                winner
+            }
+            AggregationStrategy::Concatenated => {
+                // Sequential cross-layer pipeline (cross-layer-aggregation
+                // phase 3): each layer formats the previous layer's output.
+                // Virt edits are resolved against the parsed snapshot, so virt
+                // can only run while the accumulated text still IS the
+                // snapshot text — i.e. before any text-changing layer. The
+                // default order (virt before host) satisfies this; an order
+                // placing virt after a producing host is skipped with a
+                // warning rather than formatting against stale regions.
+                let mut current = original.clone();
+                let mut producers = 0usize;
+                let mut sole_edits: Option<Vec<TextEdit>> = None;
+                for layer in &layer_cfg.order {
+                    let edits = match layer {
+                        LayerSource::Virt => {
+                            if current != original {
+                                log::warn!(
+                                    target: "kakehashi::formatting",
+                                    "cross-layer concatenated formatting: virt placed after a \
+                                     text-producing layer in layers.order; injection regions \
+                                     cannot be re-resolved against modified text — skipping virt"
+                                );
+                                continue;
+                            }
+                            self.virt_format_edits(
+                                &uri,
+                                &snapshot,
+                                &language_name,
+                                &options,
+                                &upstream_request_id,
+                                &cancel_state,
+                            )
+                            .await?
+                        }
+                        LayerSource::Host => {
+                            self.host_format_edits(&lsp_uri, &current, &options, &cancel_state)
+                                .await?
+                        }
+                        LayerSource::Native => None,
+                    };
+                    if let Some(edits) = edits
+                        && !edits.is_empty()
+                    {
+                        current = crate::text::edit::apply_text_edits(&current, &edits);
+                        producers += 1;
+                        sole_edits = Some(edits);
+                    }
+                }
+                match producers {
+                    0 => None,
+                    // A single producing layer ran against the original text
+                    // (virt by the guard above; host because nothing before
+                    // it produced), so its minimal edits apply verbatim.
+                    1 => sole_edits,
+                    // Multiple producers: later layers' edits are relative to
+                    // intermediate text, so collapse the chain into one
+                    // whole-document replacement (the same overlap-free shape
+                    // as the within-region pipeline, concatenated-formatting-
+                    // pipeline Decision point 4).
+                    _ => whole_document_replacement(&original, &current),
+                }
+            }
+        };
+        Ok(result)
+    }
+
+    /// Format every injection region (the **virt** layer): resolve regions
+    /// from the parsed snapshot, format each one per its aggregation config,
+    /// and concatenate the per-region edits (disjoint spans).
+    async fn virt_format_edits(
+        &self,
+        uri: &url::Url,
+        snapshot: &crate::document::model::DocumentSnapshot,
+        language_name: &str,
+        options: &tower_lsp_server::ls_types::FormattingOptions,
+        upstream_request_id: &Option<UpstreamId>,
+        cancel_state: &FormattingCancelState<'_>,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let Some(injection_query) = self.language.injection_query(language_name) else {
             return Ok(None);
         };
 
         let all_regions = InjectionResolver::resolve_all(
             &self.language,
             self.bridge.node_tracker(),
-            &uri,
+            uri,
             snapshot.tree(),
             snapshot.text(),
             injection_query.as_ref(),
@@ -117,8 +223,6 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let upstream_request_id = crate::lsp::current_upstream_id();
-        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
@@ -131,16 +235,14 @@ impl Kakehashi {
         let mut host_mapper: Option<crate::text::PositionMapper> = None;
 
         for resolved in all_regions {
-            let configs = self.bridge_configs_for_injection_language(
-                &language_name,
-                &resolved.injection_language,
-            );
+            let configs = self
+                .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {
                 continue;
             }
 
             let agg = self.resolve_aggregation_config(
-                &language_name,
+                language_name,
                 &resolved.injection_language,
                 "textDocument/formatting",
             );
@@ -267,64 +369,87 @@ impl Kakehashi {
 
         let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
+        response
+    }
 
-        // Cross-layer combine (cross-layer-aggregation phase 3). The virt
-        // result is computed above; host and native are empty contributors,
-        // evaluated as None without cost.
-        let virt_edits = response?;
-        let layer_results: Vec<(LayerSource, Option<Vec<TextEdit>>)> = layer_cfg
-            .order
-            .iter()
-            .map(|layer| match layer {
-                LayerSource::Virt => (*layer, virt_edits.clone()),
-                LayerSource::Host | LayerSource::Native => (*layer, None),
-            })
-            .collect();
-        Ok(combine_layer_formatting_results(
-            layer_cfg.strategy,
-            layer_results,
-        ))
+    /// Format the host document itself (the **host** layer,
+    /// host-document-bridge): forward `text` with the real URI to the
+    /// host-capable servers and return their edits verbatim.
+    ///
+    /// `text` is the text to format — under the cross-layer `concatenated`
+    /// pipeline it may already carry the virt layer's edits, in which case
+    /// the host server's document state is temporarily speculative; the lazy
+    /// fingerprint sync restores it to the editor text on the next request.
+    async fn host_format_edits(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        text: &str,
+        options: &tower_lsp_server::ls_types::FormattingOptions,
+        cancel_state: &FormattingCancelState<'_>,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let Some(mut ctx) = self.resolve_host_bridge_context(lsp_uri, "textDocument/formatting")
+        else {
+            return Ok(None);
+        };
+        ctx.text = Arc::from(text);
+
+        let cancel_rx = cancel_state.derive_receiver();
+        let pool = self.bridge.pool_arc();
+        let options = options.clone();
+        let result = crate::lsp::aggregation::server::dispatch_host_preferred(
+            &ctx,
+            pool.clone(),
+            move |t| {
+                let options = options.clone();
+                async move {
+                    t.pool
+                        .send_host_formatting_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &crate::lsp::bridge::HostDocument {
+                                uri: &t.uri,
+                                language_id: &t.language_id,
+                                text: &t.text,
+                            },
+                            options,
+                            t.upstream_id,
+                        )
+                        .await
+                }
+            },
+            |opt| matches!(opt, Some(v) if !v.is_empty()),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        result.handle(&self.client, "formatting", None, Ok).await
     }
 }
 
-/// Combine per-layer formatting results (cross-layer-aggregation phase 3).
-///
-/// `results` is in resolved `layers.order` (highest priority first); a layer
-/// "produces" when it returns `Some` with at least one edit.
-///
-/// - `preferred`: the first producing layer wins.
-/// - `concatenated`: meant as a sequential cross-layer pipeline (each layer
-///   formatting the previous layer's output, by analogy with
-///   concatenated-formatting-pipeline). With at most one producing layer —
-///   the only case reachable today, since host (`bridge._self`) is
-///   unimplemented and there is no native formatter — the pipeline
-///   degenerates to that layer's edits. Should two layers ever produce
-///   before the text-threading machinery exists, the highest-priority
-///   layer's edits are applied alone (never merged: naively concatenating
-///   two layers' edit lists could overlap, violating LSP) and a warning
-///   names the dropped layers.
-fn combine_layer_formatting_results(
-    strategy: AggregationStrategy,
-    results: Vec<(LayerSource, Option<Vec<TextEdit>>)>,
-) -> Option<Vec<TextEdit>> {
-    let mut producing = results
-        .into_iter()
-        .filter_map(|(layer, edits)| match edits {
-            Some(edits) if !edits.is_empty() => Some((layer, edits)),
-            _ => None,
-        });
-    let first = producing.next();
-    let dropped: Vec<LayerSource> = producing.map(|(layer, _)| layer).collect();
-    if !dropped.is_empty() && strategy == AggregationStrategy::Concatenated {
-        log::warn!(
-            target: "kakehashi::formatting",
-            "cross-layer concatenated formatting with multiple producing layers \
-             is not yet implemented; applying {:?} and dropping {:?}",
-            first.as_ref().map(|(layer, _)| layer),
-            dropped,
-        );
+/// Collapse a formatted text into a single whole-document replacement edit
+/// against `original` (the same overlap-free output shape as the
+/// within-region pipeline, concatenated-formatting-pipeline Decision
+/// point 4). `None` when the chain round-tripped to the original text.
+fn whole_document_replacement(original: &str, formatted: &str) -> Option<Vec<TextEdit>> {
+    if original == formatted {
+        return None;
     }
-    first.map(|(_, edits)| edits)
+    let end_line = original.matches('\n').count() as u32;
+    let last_line_start = original.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end_character = original[last_line_start..].encode_utf16().count() as u32;
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: end_line,
+                character: end_character,
+            },
+        },
+        new_text: formatted.to_string(),
+    }])
 }
 
 /// How a single injection region should be formatted, derived from its resolved
@@ -1549,72 +1674,44 @@ mod tests {
     }
 
     // ==========================================================================
-    // combine_layer_formatting_results (cross-layer-aggregation phase 3)
+    // whole_document_replacement (cross-layer-aggregation phase 3)
     // ==========================================================================
 
-    fn layer_edit(text: &str) -> TextEdit {
-        edit(0, 0, text)
-    }
-
     #[test]
-    fn combine_layers_preferred_picks_first_producing_layer() {
-        let results = vec![
-            (LayerSource::Virt, None),
-            (LayerSource::Host, Some(vec![layer_edit("host")])),
-            (LayerSource::Native, Some(vec![layer_edit("native")])),
-        ];
-        let combined =
-            combine_layer_formatting_results(AggregationStrategy::Preferred, results).unwrap();
-        assert_eq!(combined[0].new_text, "host");
-    }
-
-    #[test]
-    fn combine_layers_treats_empty_edit_list_as_non_producing() {
-        let results = vec![
-            (LayerSource::Virt, Some(vec![])),
-            (LayerSource::Native, Some(vec![layer_edit("native")])),
-        ];
-        let combined =
-            combine_layer_formatting_results(AggregationStrategy::Preferred, results).unwrap();
-        assert_eq!(combined[0].new_text, "native");
-    }
-
-    #[test]
-    fn combine_layers_returns_none_when_no_layer_produces() {
-        let results = vec![(LayerSource::Virt, None), (LayerSource::Host, Some(vec![]))];
-        assert!(
-            combine_layer_formatting_results(AggregationStrategy::Preferred, results).is_none()
+    fn whole_document_replacement_covers_the_entire_original() {
+        let original = "line1\nline2";
+        let formatted = "LINE1\nLINE2\n";
+        let edits = whole_document_replacement(original, formatted).unwrap();
+        assert_eq!(edits.len(), 1, "one overlap-free replacement edit");
+        assert_eq!(edits[0].range.start, Position::new(0, 0));
+        assert_eq!(
+            edits[0].range.end,
+            Position::new(1, 5),
+            "end must be the original's last position (line 1, after 'line2')"
         );
+        assert_eq!(edits[0].new_text, formatted);
     }
 
     #[test]
-    fn combine_layers_concatenated_single_producer_passes_through() {
-        let results = vec![
-            (LayerSource::Virt, Some(vec![layer_edit("virt")])),
-            (LayerSource::Host, None),
-            (LayerSource::Native, None),
-        ];
-        let combined =
-            combine_layer_formatting_results(AggregationStrategy::Concatenated, results).unwrap();
-        assert_eq!(combined.len(), 1);
-        assert_eq!(combined[0].new_text, "virt");
+    fn whole_document_replacement_handles_trailing_newline() {
+        // With a trailing newline the last line is empty: end = (lines, 0).
+        let original = "a\nb\n";
+        let edits = whole_document_replacement(original, "c\n").unwrap();
+        assert_eq!(edits[0].range.end, Position::new(2, 0));
     }
 
     #[test]
-    fn combine_layers_concatenated_multiple_producers_applies_highest_priority_only() {
-        // Unreachable today (host/native contribute nothing), but the
-        // fail-safe matters: naively concatenating two layers' edit lists
-        // could produce overlapping edits, violating LSP. The
-        // highest-priority layer wins alone until cross-layer text threading
-        // exists.
-        let results = vec![
-            (LayerSource::Virt, Some(vec![layer_edit("virt")])),
-            (LayerSource::Host, Some(vec![layer_edit("host")])),
-        ];
-        let combined =
-            combine_layer_formatting_results(AggregationStrategy::Concatenated, results).unwrap();
-        assert_eq!(combined.len(), 1, "edit lists must never be merged");
-        assert_eq!(combined[0].new_text, "virt");
+    fn whole_document_replacement_counts_end_character_in_utf16() {
+        // 'é' is 1 UTF-16 unit but 2 UTF-8 bytes; '𠮷' is 2 UTF-16 units.
+        let original = "é𠮷";
+        let edits = whole_document_replacement(original, "x").unwrap();
+        assert_eq!(edits[0].range.end, Position::new(0, 3));
+    }
+
+    #[test]
+    fn whole_document_replacement_returns_none_for_round_trip() {
+        // A chain whose layers undo each other must produce no edit at all.
+        assert!(whole_document_replacement("same", "same").is_none());
     }
 
     #[test]

@@ -19,9 +19,10 @@ use std::io;
 use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover, LocationLink, Position,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    FormattingOptions, Hover, LocationLink, Position, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    VersionedTextDocumentIdentifier,
 };
 use url::Url;
 
@@ -252,6 +253,47 @@ impl LanguageServerPool {
         .await
     }
 
+    /// Send a formatting request for the host document itself
+    /// (host-document-bridge): the host text travels verbatim and the
+    /// returned edits are already in real-document coordinates.
+    pub(crate) async fn send_host_formatting_request(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        options: FormattingOptions,
+        upstream_request_id: Option<UpstreamId>,
+    ) -> io::Result<Option<Vec<TextEdit>>> {
+        let handle = self
+            .get_or_create_connection(server_name, server_config)
+            .await?;
+        if !handle.has_capability("textDocument/formatting") {
+            return Ok(None);
+        }
+        let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
+        self.execute_host_request(
+            handle,
+            server_name,
+            doc,
+            upstream_request_id,
+            |request_id| {
+                JsonRpcRequest::new(
+                    request_id.as_i64(),
+                    "textDocument/formatting",
+                    DocumentFormattingParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: uri_lsp.clone(),
+                        },
+                        options,
+                        work_done_progress_params: Default::default(),
+                    },
+                )
+            },
+            parse_host_formatting_response,
+        )
+        .await
+    }
+
     /// Send a hover request for the host document itself. Response verbatim.
     pub(crate) async fn send_host_hover_request(
         &self,
@@ -348,6 +390,27 @@ fn parse_host_goto_response(mut response: serde_json::Value) -> Option<Vec<Locat
         "host definition response did not match Location | Location[] | LocationLink[]"
     );
     None
+}
+
+/// Parse a formatting response verbatim (no range translation).
+fn parse_host_formatting_response(mut response: serde_json::Value) -> Option<Vec<TextEdit>> {
+    if response_has_jsonrpc_error(&response, "textDocument/formatting (host)") {
+        return None;
+    }
+    let result = response.get_mut("result")?.take();
+    if result.is_null() {
+        return None;
+    }
+    match serde_json::from_value::<Vec<TextEdit>>(result) {
+        Ok(edits) => Some(edits),
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "host formatting response failed to deserialize: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Parse a hover response verbatim (no range translation).
