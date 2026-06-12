@@ -29,6 +29,7 @@ Current bridge-backed requests include:
 - Rename / Prepare Rename
 - Document Highlight / Document Symbol / Document Link
 - Moniker / Inlay Hint
+- Code Lens (incl. `codeLens/resolve` routed back to the origin server; resolution fails soft when the region was edited since the lens was produced)
 - Pull Diagnostics
 
 The server does not currently advertise `textDocument/codeAction`.
