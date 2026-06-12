@@ -9,7 +9,7 @@ use super::http::agent_with_timeout;
 
 /// Base URL for nvim-treesitter query files on GitHub (main branch).
 /// Note: In the main branch, queries are under runtime/queries instead of queries.
-const NVIM_TREESITTER_QUERIES_URL: &str =
+pub(crate) const NVIM_TREESITTER_QUERIES_URL: &str =
     "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/main/runtime/queries";
 
 /// Query file types to download.
@@ -73,80 +73,37 @@ pub struct QueryInstallResult {
     pub files_downloaded: Vec<String>,
 }
 
-/// Download and install query files for a language.
-pub fn install_queries(
-    language: &str,
-    data_dir: &Path,
-    force: bool,
-) -> Result<QueryInstallResult, QueryInstallError> {
-    let queries_dir = data_dir.join("queries").join(language);
-
-    // Check if queries already exist
-    if queries_dir.exists() && !force {
-        return Err(QueryInstallError::AlreadyExists(queries_dir));
-    }
-
-    // Create the queries directory
-    fs::create_dir_all(&queries_dir)?;
-
-    let mut files_downloaded = Vec::new();
-    let mut any_success = false;
-
-    // Download each query file
-    for query_file in QUERY_FILES {
-        let url = format!(
-            "{}/{}/{}",
-            NVIM_TREESITTER_QUERIES_URL, language, query_file
-        );
-
-        match download_file(&url) {
-            Ok(content) => {
-                let file_path = queries_dir.join(query_file);
-                let mut file = fs::File::create(&file_path)?;
-                file.write_all(content.as_bytes())?;
-                files_downloaded.push(query_file.to_string());
-                any_success = true;
-            }
-            Err(e) => {
-                // highlights.scm is required, others are optional
-                if *query_file == "highlights.scm" {
-                    // Clean up the directory we created
-                    let _ = fs::remove_dir_all(&queries_dir);
-                    return Err(QueryInstallError::LanguageNotSupported(
-                        language.to_string(),
-                    ));
-                }
-                // Log but continue for optional files
-                eprintln!(
-                    "Note: {} not available for {} ({})",
-                    query_file, language, e
-                );
-            }
-        }
-    }
-
-    if !any_success {
-        let _ = fs::remove_dir_all(&queries_dir);
-        return Err(QueryInstallError::LanguageNotSupported(
-            language.to_string(),
-        ));
-    }
-
-    Ok(QueryInstallResult {
-        language: language.to_string(),
-        install_path: queries_dir,
-        files_downloaded,
-    })
+/// Whether a language name is safe to use as a path and URL segment.
+///
+/// Language names are used as path segments (`queries/<name>/`) and URL
+/// segments, so anything outside nvim-treesitter's `[a-z0-9_]+` naming is
+/// rejected: a name like `../../x` (from a caller or a `; inherits:` line in
+/// a compromised or custom query source) must not escape the data dir.
+pub(crate) fn is_safe_language_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// Parse the `; inherits: lang1,lang2` directive from query content.
-/// Returns the list of parent languages.
+/// Returns the list of parent languages, dropping unsafe names
+/// (see [`is_safe_language_name`]).
 fn parse_inherits_directive(content: &str) -> Vec<String> {
     let first_line = content.lines().next().unwrap_or("");
     if let Some(rest) = first_line.strip_prefix("; inherits:") {
         rest.split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .filter(|s| {
+                let safe = is_safe_language_name(s);
+                if !safe {
+                    // Debug-format: the name is untrusted input and could
+                    // smuggle ANSI escapes into the terminal if printed raw.
+                    eprintln!("Warning: ignoring unsafe inherited language name {:?}", s);
+                }
+                safe
+            })
             .collect()
     } else {
         Vec::new()
@@ -161,17 +118,39 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from(NVIM_TREESITTER_QUERIES_URL, language, data_dir, force)
+}
+
+/// Like [`install_queries_with_dependencies`] but downloading from `base_url`,
+/// so tests can serve query files from a local HTTP server.
+pub(crate) fn install_queries_with_dependencies_from(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
     let mut installed = std::collections::HashSet::new();
-    install_queries_recursive(language, data_dir, force, &mut installed)
+    install_queries_recursive(base_url, language, data_dir, force, &mut installed)
 }
 
 /// Internal recursive helper for installing queries with dependencies.
 fn install_queries_recursive(
+    base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
     installed: &mut std::collections::HashSet<String>,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    // The name becomes a path and URL segment below; reject anything that
+    // could escape the data dir (e.g. a caller-provided `../../x`).
+    // Escape the untrusted name: the error's Display is printed raw by
+    // the CLI, so control characters must not reach the terminal.
+    if !is_safe_language_name(language) {
+        return Err(QueryInstallError::LanguageNotSupported(
+            language.escape_default().to_string(),
+        ));
+    }
+
     // Skip if already installed in this session
     if installed.contains(language) {
         return Ok(QueryInstallResult {
@@ -199,7 +178,15 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                let _ = install_queries_recursive(&parent, data_dir, false, installed);
+                match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
+                    Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to install inherited queries '{}': {}",
+                            parent, e
+                        );
+                    }
+                }
             }
         }
         return Err(QueryInstallError::AlreadyExists(queries_dir));
@@ -214,10 +201,7 @@ fn install_queries_recursive(
 
     // Download each query file
     for query_file in QUERY_FILES {
-        let url = format!(
-            "{}/{}/{}",
-            NVIM_TREESITTER_QUERIES_URL, language, query_file
-        );
+        let url = format!("{}/{}/{}", base_url, language, query_file);
 
         match download_file(&url) {
             Ok(content) => {
@@ -263,7 +247,7 @@ fn install_queries_recursive(
     for parent in parents_to_install {
         eprintln!("Installing inherited queries: {}", parent);
         // Don't fail if parent already exists
-        match install_queries_recursive(&parent, data_dir, false, installed) {
+        match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
             Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
             Err(e) => {
                 eprintln!(
@@ -304,13 +288,53 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// The rejected name flows into the error's `Display` (printed raw by
+    /// the CLI), so control characters in an untrusted name must be escaped
+    /// before they reach terminal output.
+    #[test]
+    fn unsafe_language_name_error_escapes_control_characters() {
+        let temp = TempDir::new().unwrap();
+        let result = install_queries_with_dependencies_from(
+            "http://127.0.0.1:1",
+            "evil\u{1b}[31m",
+            temp.path(),
+            false,
+        );
+        match result {
+            Err(QueryInstallError::LanguageNotSupported(name)) => {
+                assert!(
+                    !name.contains('\u{1b}'),
+                    "stored name must not carry raw escape bytes: {:?}",
+                    name
+                );
+            }
+            other => panic!("expected LanguageNotSupported, got {:?}", other.err()),
+        }
+    }
+
+    /// Inherited language names become path segments (`queries/<name>/`) and
+    /// URL segments, so anything outside nvim-treesitter's `[a-z0-9_]+`
+    /// naming must be dropped — `; inherits: ../../x` from a compromised or
+    /// custom query source must not escape the data dir.
+    #[test]
+    fn parse_inherits_directive_drops_unsafe_language_names() {
+        let parents = parse_inherits_directive(
+            "; inherits: ../../evil, html_tags, UPPER, with-dash, c3\n(comment) @comment\n",
+        );
+        assert_eq!(
+            parents,
+            vec!["html_tags".to_string(), "c3".to_string()],
+            "only lowercase/digit/underscore names may survive"
+        );
+    }
+
     #[test]
     fn test_install_queries_creates_directory_structure() {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
 
         // This test requires network access - skip in CI if needed
-        let result = install_queries("lua", &data_dir, false);
+        let result = install_queries_with_dependencies("lua", &data_dir, false);
 
         // The test may fail due to network issues, but structure should be correct
         if let Ok(result) = result {
@@ -362,7 +386,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
 
-        let result = install_queries("nonexistent_language_xyz_123", &data_dir, false);
+        let result =
+            install_queries_with_dependencies("nonexistent_language_xyz_123", &data_dir, false);
 
         assert!(result.is_err());
         if let Err(QueryInstallError::LanguageNotSupported(lang)) = result {
@@ -381,7 +406,7 @@ mod tests {
         fs::write(queries_dir.join("highlights.scm"), "existing content").unwrap();
 
         // Without force, should error
-        let result = install_queries("lua", &data_dir, false);
+        let result = install_queries_with_dependencies("lua", &data_dir, false);
         assert!(matches!(result, Err(QueryInstallError::AlreadyExists(_))));
 
         // With force, should succeed (requires network)

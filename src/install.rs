@@ -137,7 +137,7 @@ pub mod test_support {
     /// every required install succeeded.
     ///
     /// Mirrors the install loop in `make deps/tree-sitter/.installed`.
-    /// Both `install_parser` and `install_queries` short-circuit when a
+    /// Both the parser and queries installs short-circuit when a
     /// language is up-to-date; any genuine failure is logged so tests
     /// depending on that language fail with a clearer error rather than
     /// the whole suite panicking in setup.
@@ -173,10 +173,13 @@ pub mod test_support {
                     all_ok = false;
                 }
             }
-            match queries::install_queries(lang, data_dir, false) {
+            match queries::install_queries_with_dependencies(lang, data_dir, false) {
                 Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
                 Err(e) => {
-                    eprintln!("[test setup] install_queries({}) failed: {}", lang, e);
+                    eprintln!(
+                        "[test setup] install_queries_with_dependencies({}) failed: {}",
+                        lang, e
+                    );
                     all_ok = false;
                 }
             }
@@ -221,6 +224,80 @@ impl InstallResult {
     }
 }
 
+/// Install a language synchronously (both parser and queries).
+///
+/// `queries_base_url` is injected so tests can serve query files from a
+/// local HTTP server; production callers pass
+/// [`queries::NVIM_TREESITTER_QUERIES_URL`].
+fn install_language_blocking(
+    language: &str,
+    data_dir: &std::path::Path,
+    force: bool,
+    queries_base_url: &str,
+) -> InstallResult {
+    let mut result = InstallResult {
+        parser_path: None,
+        queries_path: None,
+        parser_error: None,
+        queries_error: None,
+    };
+
+    // The queries installer re-checks names itself, but the parser
+    // installer also builds paths from the name (`parser/<name>.<ext>`),
+    // so reject traversal-capable names before touching either.
+    if !queries::is_safe_language_name(language) {
+        let reason = format!("Language name '{}' is unsafe", language.escape_default());
+        result.parser_error = Some(reason.clone());
+        result.queries_error = Some(reason);
+        return result;
+    }
+
+    // Install parser
+    // For async/auto-install, always use cache (background operation)
+    let parser_options = parser::InstallOptions {
+        data_dir: data_dir.to_path_buf(),
+        force,
+        verbose: false,
+        no_cache: false,
+    };
+
+    // AlreadyExists means the artifact is present and usable — success,
+    // not failure; treating it as an error made the auto-install manager
+    // degrade a fully-installed language to "installed but with warnings".
+    match parser::install_parser(language, &parser_options) {
+        Ok(parser_result) => {
+            result.parser_path = Some(parser_result.install_path);
+        }
+        Err(parser::ParserInstallError::AlreadyExists(path)) => {
+            result.parser_path = Some(path);
+        }
+        Err(e) => {
+            result.parser_error = Some(e.to_string());
+        }
+    }
+
+    // Install queries, following `; inherits:` so languages like html
+    // (which keeps its @comment capture in html_tags) highlight correctly.
+    match queries::install_queries_with_dependencies_from(
+        queries_base_url,
+        language,
+        data_dir,
+        force,
+    ) {
+        Ok(query_result) => {
+            result.queries_path = Some(query_result.install_path);
+        }
+        Err(queries::QueryInstallError::AlreadyExists(path)) => {
+            result.queries_path = Some(path);
+        }
+        Err(e) => {
+            result.queries_error = Some(e.to_string());
+        }
+    }
+
+    result
+}
+
 /// Install a language asynchronously (both parser and queries).
 ///
 /// Wraps the blocking install functions in `spawn_blocking` so it is safe to
@@ -230,47 +307,14 @@ pub(crate) async fn install_language_async(
     data_dir: PathBuf,
     force: bool,
 ) -> InstallResult {
-    let lang = language.clone();
-    let dir = data_dir.clone();
-
     // Run blocking install operations in a separate thread pool
     tokio::task::spawn_blocking(move || {
-        let mut result = InstallResult {
-            parser_path: None,
-            queries_path: None,
-            parser_error: None,
-            queries_error: None,
-        };
-
-        // Install parser
-        // For async/auto-install, always use cache (background operation)
-        let parser_options = parser::InstallOptions {
-            data_dir: dir.clone(),
+        install_language_blocking(
+            &language,
+            &data_dir,
             force,
-            verbose: false,
-            no_cache: false,
-        };
-
-        match parser::install_parser(&lang, &parser_options) {
-            Ok(parser_result) => {
-                result.parser_path = Some(parser_result.install_path);
-            }
-            Err(e) => {
-                result.parser_error = Some(e.to_string());
-            }
-        }
-
-        // Install queries
-        match queries::install_queries(&lang, &dir, force) {
-            Ok(query_result) => {
-                result.queries_path = Some(query_result.install_path);
-            }
-            Err(e) => {
-                result.queries_error = Some(e.to_string());
-            }
-        }
-
-        result
+            queries::NVIM_TREESITTER_QUERIES_URL,
+        )
     })
     .await
     .unwrap_or_else(|e| InstallResult {
@@ -324,6 +368,229 @@ mod tests {
         // Should use platform default (dirs::data_dir() + "kakehashi")
         assert!(dir.is_some());
         assert!(dir.unwrap().to_string_lossy().contains("kakehashi"));
+    }
+
+    /// Serve canned query files over HTTP from an OS-assigned local port.
+    ///
+    /// `routes` maps request paths (e.g. "/lang/highlights.scm") to bodies;
+    /// unknown paths get a 404, mirroring how raw.githubusercontent.com
+    /// responds for query files a language doesn't provide. Returns the
+    /// base URL. The serving thread lives until the test process exits.
+    fn spawn_query_file_server(routes: Vec<(&str, &str)>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let routes: Vec<(String, String)> = routes
+            .into_iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(&mut stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                // Drain headers so the client sees a clean request/response
+                // cycle; bail on EOF (Ok(0)) so a half-sent request can't
+                // spin this loop forever.
+                let mut header = String::new();
+                loop {
+                    header.clear();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header == "\r\n" || header == "\n" => break,
+                        Ok(_) => {}
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let response = match routes.iter().find(|(p, _)| p == path) {
+                    Some((_, body)) => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    ),
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        base_url
+    }
+
+    /// Auto-install must follow `; inherits:` in downloaded highlights.scm.
+    ///
+    /// Regression test: the LSP auto-install path installed only the
+    /// requested language's queries, so `html` arrived without `html_tags`
+    /// and its highlights query failed to load at runtime (the `@comment`
+    /// capture for `<!-- -->` lives in the inherited file).
+    #[test]
+    fn auto_install_installs_inherited_query_dependencies() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+
+        // Pre-create the parser artifact so install_parser short-circuits
+        // with AlreadyExists and the test never touches the network for it.
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("child_lang.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+
+        let base_url = spawn_query_file_server(vec![
+            (
+                "/child_lang/highlights.scm",
+                "; inherits: parent_lang\n(identifier) @variable\n",
+            ),
+            ("/parent_lang/highlights.scm", "(comment) @comment\n"),
+        ]);
+
+        let result = install_language_blocking("child_lang", data_dir, false, &base_url);
+
+        assert!(
+            result.queries_error.is_none(),
+            "queries install should succeed: {:?}",
+            result.queries_error
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join("child_lang")
+                .join("highlights.scm")
+                .exists(),
+            "requested language queries should be installed"
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join("parent_lang")
+                .join("highlights.scm")
+                .exists(),
+            "inherited parent queries should be installed alongside the child"
+        );
+    }
+
+    /// The top-level language name becomes a path segment
+    /// (`queries/<name>/`) and a URL segment, exactly like inherited names —
+    /// it must obey the same `[a-z0-9_]+` rule or installing `../../evil`
+    /// writes outside the data dir.
+    #[test]
+    fn install_rejects_unsafe_top_level_language_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Nest the data dir so an escape stays inside the TempDir.
+        let data_dir = temp.path().join("nest").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Serve highlights.scm under both the raw and the dot-segment-
+        // normalized path, so the download succeeds (and the escape would
+        // persist) no matter how the HTTP client treats `..` in URLs.
+        let body = "(comment) @comment\n";
+        let base_url = spawn_query_file_server(vec![
+            ("/evil/highlights.scm", body),
+            ("/../../evil/highlights.scm", body),
+        ]);
+
+        let result = queries::install_queries_with_dependencies_from(
+            &base_url,
+            "../../evil",
+            &data_dir,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(queries::QueryInstallError::LanguageNotSupported(_))
+            ),
+            "unsafe top-level language name must be rejected"
+        );
+        assert!(
+            !temp.path().join("nest").join("evil").exists(),
+            "install must not write outside the queries dir"
+        );
+    }
+
+    /// The queries installer validates names itself, but the parser
+    /// installer also builds paths from the language name
+    /// (`parser/<name>.<ext>`), so `install_language_blocking` must reject
+    /// unsafe names before touching either installer.
+    #[test]
+    fn install_language_blocking_rejects_unsafe_language_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("nest").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let result =
+            install_language_blocking("../../evil", &data_dir, false, "http://127.0.0.1:1");
+
+        assert!(!result.is_success(), "unsafe name must not install");
+        assert!(
+            result
+                .parser_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unsafe")),
+            "parser side must be blocked by the name guard, got {:?}",
+            result.parser_error
+        );
+        assert!(
+            result
+                .queries_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unsafe")),
+            "queries side must be blocked by the name guard, got {:?}",
+            result.queries_error
+        );
+        assert!(
+            !temp.path().join("nest").join("evil").exists(),
+            "nothing may be written outside the data dir"
+        );
+    }
+
+    /// A language whose parser and queries are already on disk is a
+    /// successful install, not a failure: reporting AlreadyExists as an
+    /// error made the auto-install manager degrade a fully-usable language
+    /// to "installed but with warnings".
+    #[test]
+    fn install_language_blocking_treats_already_installed_as_success() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("exists_lang.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+        let queries_dir = data_dir.join("queries").join("exists_lang");
+        std::fs::create_dir_all(&queries_dir).unwrap();
+        std::fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+
+        // Everything exists, so no download may happen — point the base URL
+        // at a closed port to fail loudly if one is attempted anyway.
+        let result =
+            install_language_blocking("exists_lang", data_dir, false, "http://127.0.0.1:1");
+
+        assert!(
+            result.is_success(),
+            "already-installed language must count as success: parser_error={:?} queries_error={:?}",
+            result.parser_error,
+            result.queries_error
+        );
+        assert_eq!(
+            result.parser_path,
+            Some(parser_dir.join(format!("exists_lang.{}", std::env::consts::DLL_EXTENSION)))
+        );
+        assert_eq!(result.queries_path, Some(queries_dir));
     }
 
     #[test]
