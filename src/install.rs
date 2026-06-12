@@ -137,7 +137,7 @@ pub mod test_support {
     /// every required install succeeded.
     ///
     /// Mirrors the install loop in `make deps/tree-sitter/.installed`.
-    /// Both `install_parser` and `install_queries` short-circuit when a
+    /// Both the parser and queries installs short-circuit when a
     /// language is up-to-date; any genuine failure is logged so tests
     /// depending on that language fail with a clearer error rather than
     /// the whole suite panicking in setup.
@@ -173,7 +173,7 @@ pub mod test_support {
                     all_ok = false;
                 }
             }
-            match queries::install_queries(lang, data_dir, false) {
+            match queries::install_queries_with_dependencies(lang, data_dir, false) {
                 Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
                 Err(e) => {
                     eprintln!("[test setup] install_queries({}) failed: {}", lang, e);

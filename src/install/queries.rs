@@ -73,82 +73,6 @@ pub struct QueryInstallResult {
     pub files_downloaded: Vec<String>,
 }
 
-/// Download and install query files for a language.
-pub fn install_queries(
-    language: &str,
-    data_dir: &Path,
-    force: bool,
-) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_from(NVIM_TREESITTER_QUERIES_URL, language, data_dir, force)
-}
-
-/// Download and install query files for a language from a specific base URL.
-///
-/// `base_url` is injected (rather than always using the nvim-treesitter
-/// constant) so tests can serve query files from a local HTTP server.
-pub(crate) fn install_queries_from(
-    base_url: &str,
-    language: &str,
-    data_dir: &Path,
-    force: bool,
-) -> Result<QueryInstallResult, QueryInstallError> {
-    let queries_dir = data_dir.join("queries").join(language);
-
-    // Check if queries already exist
-    if queries_dir.exists() && !force {
-        return Err(QueryInstallError::AlreadyExists(queries_dir));
-    }
-
-    // Create the queries directory
-    fs::create_dir_all(&queries_dir)?;
-
-    let mut files_downloaded = Vec::new();
-    let mut any_success = false;
-
-    // Download each query file
-    for query_file in QUERY_FILES {
-        let url = format!("{}/{}/{}", base_url, language, query_file);
-
-        match download_file(&url) {
-            Ok(content) => {
-                let file_path = queries_dir.join(query_file);
-                let mut file = fs::File::create(&file_path)?;
-                file.write_all(content.as_bytes())?;
-                files_downloaded.push(query_file.to_string());
-                any_success = true;
-            }
-            Err(e) => {
-                // highlights.scm is required, others are optional
-                if *query_file == "highlights.scm" {
-                    // Clean up the directory we created
-                    let _ = fs::remove_dir_all(&queries_dir);
-                    return Err(QueryInstallError::LanguageNotSupported(
-                        language.to_string(),
-                    ));
-                }
-                // Log but continue for optional files
-                eprintln!(
-                    "Note: {} not available for {} ({})",
-                    query_file, language, e
-                );
-            }
-        }
-    }
-
-    if !any_success {
-        let _ = fs::remove_dir_all(&queries_dir);
-        return Err(QueryInstallError::LanguageNotSupported(
-            language.to_string(),
-        ));
-    }
-
-    Ok(QueryInstallResult {
-        language: language.to_string(),
-        install_path: queries_dir,
-        files_downloaded,
-    })
-}
-
 /// Parse the `; inherits: lang1,lang2` directive from query content.
 /// Returns the list of parent languages.
 fn parse_inherits_directive(content: &str) -> Vec<String> {
@@ -329,7 +253,7 @@ mod tests {
         let data_dir = temp_dir.path().to_path_buf();
 
         // This test requires network access - skip in CI if needed
-        let result = install_queries("lua", &data_dir, false);
+        let result = install_queries_with_dependencies("lua", &data_dir, false);
 
         // The test may fail due to network issues, but structure should be correct
         if let Ok(result) = result {
@@ -381,7 +305,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let data_dir = temp_dir.path().to_path_buf();
 
-        let result = install_queries("nonexistent_language_xyz_123", &data_dir, false);
+        let result =
+            install_queries_with_dependencies("nonexistent_language_xyz_123", &data_dir, false);
 
         assert!(result.is_err());
         if let Err(QueryInstallError::LanguageNotSupported(lang)) = result {
@@ -400,7 +325,7 @@ mod tests {
         fs::write(queries_dir.join("highlights.scm"), "existing content").unwrap();
 
         // Without force, should error
-        let result = install_queries("lua", &data_dir, false);
+        let result = install_queries_with_dependencies("lua", &data_dir, false);
         assert!(matches!(result, Err(QueryInstallError::AlreadyExists(_))));
 
         // With force, should succeed (requires network)
