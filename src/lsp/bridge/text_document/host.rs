@@ -248,19 +248,38 @@ impl LanguageServerPool {
         // the request itself, making the server answer about different text
         // than the caller synced (fatal for the formatting pipeline's
         // speculative intermediate text). All sends are non-yielding queue
-        // writes, so holding the lock across them is cheap.
+        // writes, so holding the locks across them is cheap.
         //
-        // Known narrow window (shared with the virt document tracker): the
-        // `handle` above was fetched before this lock, so a concurrent
-        // respawn purge can run in between — this request then syncs onto
-        // the dying process's queue and records state the replacement never
-        // saw. Self-heals on the next respawn purge or upstream didClose;
-        // closing it fully would need generation-keyed sync state.
+        // The `connections` lock is held around the scope (consistent
+        // connections → host_documents order, matching the respawn purge in
+        // `pool.rs`) to verify `handle` is still the pool's LIVE connection:
+        // `handle` was fetched earlier, and a concurrent respawn could have
+        // replaced it and purged the sync state — syncing onto the dying
+        // process's queue would record state the replacement never saw,
+        // wedging the `(uri, server)` pair until the next purge. Holding
+        // `connections` here also excludes a purge from interleaving with
+        // this sync, closing the race entirely.
         {
+            let connections = self.connections().await;
+            if !connections
+                .get(server_name)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                drop(connections);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, server_name);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("connection to {server_name} was replaced during host sync"),
+                ));
+            }
+
             let mut docs = self.host_documents().await;
             let mut sender = ConnectionHandleSender(&handle);
             if let Err(e) = sync_host_document(&mut sender, &mut docs, doc, server_name).await {
                 drop(docs);
+                drop(connections);
                 if let Some(ref id) = upstream_request_id {
                     self.unregister_upstream_request(id, server_name);
                 }
@@ -269,6 +288,7 @@ impl LanguageServerPool {
 
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(docs);
+                drop(connections);
                 if let Some(ref id) = upstream_request_id {
                     self.unregister_upstream_request(id, server_name);
                 }
