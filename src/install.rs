@@ -221,6 +221,55 @@ impl InstallResult {
     }
 }
 
+/// Install a language synchronously (both parser and queries).
+///
+/// `queries_base_url` is injected so tests can serve query files from a
+/// local HTTP server; production callers pass
+/// [`queries::NVIM_TREESITTER_QUERIES_URL`].
+fn install_language_blocking(
+    language: &str,
+    data_dir: &std::path::Path,
+    force: bool,
+    queries_base_url: &str,
+) -> InstallResult {
+    let mut result = InstallResult {
+        parser_path: None,
+        queries_path: None,
+        parser_error: None,
+        queries_error: None,
+    };
+
+    // Install parser
+    // For async/auto-install, always use cache (background operation)
+    let parser_options = parser::InstallOptions {
+        data_dir: data_dir.to_path_buf(),
+        force,
+        verbose: false,
+        no_cache: false,
+    };
+
+    match parser::install_parser(language, &parser_options) {
+        Ok(parser_result) => {
+            result.parser_path = Some(parser_result.install_path);
+        }
+        Err(e) => {
+            result.parser_error = Some(e.to_string());
+        }
+    }
+
+    // Install queries
+    match queries::install_queries_from(queries_base_url, language, data_dir, force) {
+        Ok(query_result) => {
+            result.queries_path = Some(query_result.install_path);
+        }
+        Err(e) => {
+            result.queries_error = Some(e.to_string());
+        }
+    }
+
+    result
+}
+
 /// Install a language asynchronously (both parser and queries).
 ///
 /// Wraps the blocking install functions in `spawn_blocking` so it is safe to
@@ -230,47 +279,14 @@ pub(crate) async fn install_language_async(
     data_dir: PathBuf,
     force: bool,
 ) -> InstallResult {
-    let lang = language.clone();
-    let dir = data_dir.clone();
-
     // Run blocking install operations in a separate thread pool
     tokio::task::spawn_blocking(move || {
-        let mut result = InstallResult {
-            parser_path: None,
-            queries_path: None,
-            parser_error: None,
-            queries_error: None,
-        };
-
-        // Install parser
-        // For async/auto-install, always use cache (background operation)
-        let parser_options = parser::InstallOptions {
-            data_dir: dir.clone(),
+        install_language_blocking(
+            &language,
+            &data_dir,
             force,
-            verbose: false,
-            no_cache: false,
-        };
-
-        match parser::install_parser(&lang, &parser_options) {
-            Ok(parser_result) => {
-                result.parser_path = Some(parser_result.install_path);
-            }
-            Err(e) => {
-                result.parser_error = Some(e.to_string());
-            }
-        }
-
-        // Install queries
-        match queries::install_queries(&lang, &dir, force) {
-            Ok(query_result) => {
-                result.queries_path = Some(query_result.install_path);
-            }
-            Err(e) => {
-                result.queries_error = Some(e.to_string());
-            }
-        }
-
-        result
+            queries::NVIM_TREESITTER_QUERIES_URL,
+        )
     })
     .await
     .unwrap_or_else(|e| InstallResult {

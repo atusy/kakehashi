@@ -9,7 +9,7 @@ use super::http::agent_with_timeout;
 
 /// Base URL for nvim-treesitter query files on GitHub (main branch).
 /// Note: In the main branch, queries are under runtime/queries instead of queries.
-const NVIM_TREESITTER_QUERIES_URL: &str =
+pub(crate) const NVIM_TREESITTER_QUERIES_URL: &str =
     "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/main/runtime/queries";
 
 /// Query file types to download.
@@ -79,6 +79,19 @@ pub fn install_queries(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_from(NVIM_TREESITTER_QUERIES_URL, language, data_dir, force)
+}
+
+/// Download and install query files for a language from a specific base URL.
+///
+/// `base_url` is injected (rather than always using the nvim-treesitter
+/// constant) so tests can serve query files from a local HTTP server.
+pub(crate) fn install_queries_from(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
     let queries_dir = data_dir.join("queries").join(language);
 
     // Check if queries already exist
@@ -94,10 +107,7 @@ pub fn install_queries(
 
     // Download each query file
     for query_file in QUERY_FILES {
-        let url = format!(
-            "{}/{}/{}",
-            NVIM_TREESITTER_QUERIES_URL, language, query_file
-        );
+        let url = format!("{}/{}/{}", base_url, language, query_file);
 
         match download_file(&url) {
             Ok(content) => {
@@ -161,12 +171,24 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from(NVIM_TREESITTER_QUERIES_URL, language, data_dir, force)
+}
+
+/// Like [`install_queries_with_dependencies`] but downloading from `base_url`,
+/// so tests can serve query files from a local HTTP server.
+pub(crate) fn install_queries_with_dependencies_from(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
     let mut installed = std::collections::HashSet::new();
-    install_queries_recursive(language, data_dir, force, &mut installed)
+    install_queries_recursive(base_url, language, data_dir, force, &mut installed)
 }
 
 /// Internal recursive helper for installing queries with dependencies.
 fn install_queries_recursive(
+    base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
@@ -199,7 +221,7 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                let _ = install_queries_recursive(&parent, data_dir, false, installed);
+                let _ = install_queries_recursive(base_url, &parent, data_dir, false, installed);
             }
         }
         return Err(QueryInstallError::AlreadyExists(queries_dir));
@@ -214,10 +236,7 @@ fn install_queries_recursive(
 
     // Download each query file
     for query_file in QUERY_FILES {
-        let url = format!(
-            "{}/{}/{}",
-            NVIM_TREESITTER_QUERIES_URL, language, query_file
-        );
+        let url = format!("{}/{}/{}", base_url, language, query_file);
 
         match download_file(&url) {
             Ok(content) => {
@@ -263,7 +282,7 @@ fn install_queries_recursive(
     for parent in parents_to_install {
         eprintln!("Installing inherited queries: {}", parent);
         // Don't fail if parent already exists
-        match install_queries_recursive(&parent, data_dir, false, installed) {
+        match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
             Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
             Err(e) => {
                 eprintln!(
