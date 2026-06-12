@@ -79,7 +79,7 @@ pub struct QueryInstallResult {
 /// segments, so anything outside nvim-treesitter's `[a-z0-9_]+` naming is
 /// rejected: a name like `../../x` (from a caller or a `; inherits:` line in
 /// a compromised or custom query source) must not escape the data dir.
-fn is_safe_language_name(name: &str) -> bool {
+pub(crate) fn is_safe_language_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()

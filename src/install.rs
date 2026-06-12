@@ -242,6 +242,16 @@ fn install_language_blocking(
         queries_error: None,
     };
 
+    // The queries installer re-checks names itself, but the parser
+    // installer also builds paths from the name (`parser/<name>.<ext>`),
+    // so reject traversal-capable names before touching either.
+    if !queries::is_safe_language_name(language) {
+        let reason = format!("Language name {:?} is unsafe", language);
+        result.parser_error = Some(reason.clone());
+        result.queries_error = Some(reason);
+        return result;
+    }
+
     // Install parser
     // For async/auto-install, always use cache (background operation)
     let parser_options = parser::InstallOptions {
@@ -506,6 +516,42 @@ mod tests {
         assert!(
             !temp.path().join("nest").join("evil").exists(),
             "install must not write outside the queries dir"
+        );
+    }
+
+    /// The queries installer validates names itself, but the parser
+    /// installer also builds paths from the language name
+    /// (`parser/<name>.<ext>`), so `install_language_blocking` must reject
+    /// unsafe names before touching either installer.
+    #[test]
+    fn install_language_blocking_rejects_unsafe_language_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("nest").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let result =
+            install_language_blocking("../../evil", &data_dir, false, "http://127.0.0.1:1");
+
+        assert!(!result.is_success(), "unsafe name must not install");
+        assert!(
+            result
+                .parser_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unsafe")),
+            "parser side must be blocked by the name guard, got {:?}",
+            result.parser_error
+        );
+        assert!(
+            result
+                .queries_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unsafe")),
+            "queries side must be blocked by the name guard, got {:?}",
+            result.queries_error
+        );
+        assert!(
+            !temp.path().join("nest").join("evil").exists(),
+            "nothing may be written outside the data dir"
         );
     }
 
