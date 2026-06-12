@@ -176,7 +176,10 @@ pub mod test_support {
             match queries::install_queries_with_dependencies(lang, data_dir, false) {
                 Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
                 Err(e) => {
-                    eprintln!("[test setup] install_queries({}) failed: {}", lang, e);
+                    eprintln!(
+                        "[test setup] install_queries_with_dependencies({}) failed: {}",
+                        lang, e
+                    );
                     all_ok = false;
                 }
             }
@@ -372,10 +375,17 @@ mod tests {
                 if reader.read_line(&mut request_line).is_err() {
                     continue;
                 }
-                // Drain headers so the client sees a clean request/response cycle
+                // Drain headers so the client sees a clean request/response
+                // cycle; bail on EOF (Ok(0)) so a half-sent request can't
+                // spin this loop forever.
                 let mut header = String::new();
-                while reader.read_line(&mut header).is_ok() && header != "\r\n" {
+                loop {
                     header.clear();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {}
+                    }
                 }
                 let path = request_line.split_whitespace().nth(1).unwrap_or("");
                 let response = match routes.iter().find(|(p, _)| p == path) {
