@@ -19,14 +19,20 @@ Phased roadmap:
    `Kakehashi::virt_layer_enabled`, the push-diagnostics scheduler via
    `resolve_layer_config_from_settings` directly (it already holds a loaded
    settings arc), keyed `textDocument/publishDiagnostics` to match its
-   aggregation config. With host bridging (host-document-bridge) now
-   implemented for `textDocument/definition` and `textDocument/hover`,
-   those two handlers run the real stage-2 `preferred` walk
-   (`goto_definition_impl` / `hover_impl`): layers are tried lazily in
-   `order`, first non-empty wins — virt answers inside injections, host
-   answers on the host document when `bridge._self.enabled = true`. All
-   other methods keep the degenerate virt gate until they grow a second
-   contributor.
+   aggregation config. With host bridging (host-document-bridge)
+   implemented for every bridged request method, handlers run the real
+   stage-2 `preferred` walk (`Kakehashi::walk_layers` →
+   `race_layers_preferred`): the virt and host layers fan out
+   **concurrently** — the layer-level analogue of the stage-1 `preferred`
+   fan-in — and the highest-priority non-empty result wins. A buffered
+   lower-priority result waits on a still-pending higher layer (priority
+   decides, not arrival), the losing in-flight future is dropped
+   best-effort, and layers absent from `order` are never polled. The
+   latency cost of a layer answering empty is therefore `max`, not `sum`;
+   the trade-off is downstream load — the host server is queried even when
+   virt ends up winning, mirroring how stage-1 queries every server of a
+   target. Virt answers inside injections, host answers on the host
+   document when `bridge._self.enabled = true`.
 3. **Layer-level `concatenated` for `textDocument/formatting` only** — ✅
    implemented as a true sequential cross-layer pipeline in
    `formatting_impl`: layers run in `order`, each formatting the previous

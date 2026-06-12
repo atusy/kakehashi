@@ -96,37 +96,25 @@ impl Kakehashi {
 
         let result = match layer_cfg.strategy {
             AggregationStrategy::Preferred => {
-                // Lazy walk: the first layer producing edits wins; later
-                // layers are never contacted.
-                let mut winner = None;
-                for layer in &layer_cfg.order {
-                    let edits = match layer {
-                        LayerSource::Virt => {
-                            self.virt_format_edits(
-                                &uri,
-                                &snapshot,
-                                &language_name,
-                                &options,
-                                &upstream_request_id,
-                                &cancel_state,
-                            )
-                            .await?
-                        }
-                        LayerSource::Host => {
-                            self.host_format_edits(&lsp_uri, &original, &options, &cancel_state)
-                                .await?
-                        }
-                        // No native formatter: empty contributor.
-                        LayerSource::Native => None,
-                    };
-                    if let Some(edits) = edits
-                        && !edits.is_empty()
-                    {
-                        winner = Some(edits);
-                        break;
-                    }
-                }
-                winner
+                // Concurrent fan-out with priority decision
+                // (race_layers_preferred): both layers' requests are in
+                // flight at once; the highest-priority non-empty result wins.
+                let virt = self.virt_format_edits(
+                    &uri,
+                    &snapshot,
+                    &language_name,
+                    &options,
+                    &upstream_request_id,
+                    &cancel_state,
+                );
+                let host = self.host_format_edits(&lsp_uri, &original, &options, &cancel_state);
+                crate::lsp::lsp_impl::bridge_context::race_layers_preferred(
+                    &layer_cfg.order,
+                    virt,
+                    host,
+                    |edits: &Vec<TextEdit>| !edits.is_empty(),
+                )
+                .await?
             }
             AggregationStrategy::Concatenated => {
                 // Sequential cross-layer pipeline (cross-layer-aggregation

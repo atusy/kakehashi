@@ -58,9 +58,9 @@ pub(crate) struct DocumentRequestContext {
 /// verbatim, plus the servers selected for the host role and the `_self`
 /// aggregation settings.
 ///
-/// The layer strategy is not carried: host dispatch is `preferred`-only
-/// today (cross-layer `concatenated` is honored for formatting, which has no
-/// host path yet).
+/// The layer strategy is not carried: within the host layer, servers
+/// combine with `preferred` only. The cross-layer strategy lives in the
+/// caller (`walk_layers` / the formatting pipeline).
 pub(crate) struct HostRequestContext {
     /// The real client URI (forwarded verbatim — no virtual URI).
     pub(crate) uri: Url,
@@ -151,6 +151,71 @@ pub(crate) fn resolve_layer_config_from_settings(
 /// fan-in: `null` and `[]` are "no result"; any other value counts.
 pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
     value.is_null() || value.as_array().is_some_and(|items| items.is_empty())
+}
+
+/// Race the virt and host layer futures **concurrently** and decide by the
+/// resolved layer `order` (cross-layer-aggregation, `preferred` semantics) —
+/// the layer-level analogue of the stage-1 `preferred` fan-in:
+///
+/// - both layers' requests are in flight at once (latency = max, not sum);
+/// - a completed lower-priority result is buffered while a higher-priority
+///   layer is still pending — priority decides, not arrival order;
+/// - a higher-priority layer that completes non-empty wins immediately and
+///   the still-pending loser future is dropped (best-effort abandonment,
+///   like the stage-1 `abort_all`);
+/// - layers absent from `order` are never polled (their future is created
+///   but async blocks are lazy);
+/// - native has no contributor and is skipped.
+pub(crate) async fn race_layers_preferred<R>(
+    order: &[LayerSource],
+    virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    is_nonempty: impl Fn(&R) -> bool,
+) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+    let mut virt_fut = std::pin::pin!(virt);
+    let mut host_fut = std::pin::pin!(host);
+    // `None` = still pending; `Some(result)` = completed. Layers not in
+    // `order` start as completed-empty so their guard never enables and the
+    // decision walk skips them.
+    let mut virt_state: Option<Option<R>> = (!order.contains(&LayerSource::Virt)).then_some(None);
+    let mut host_state: Option<Option<R>> = (!order.contains(&LayerSource::Host)).then_some(None);
+
+    loop {
+        // Decision walk in priority order: a pending higher-priority layer
+        // blocks; a completed empty one falls through; a completed non-empty
+        // one wins.
+        let mut blocked = false;
+        for layer in order {
+            let slot = match layer {
+                LayerSource::Virt => &mut virt_state,
+                LayerSource::Host => &mut host_state,
+                LayerSource::Native => continue,
+            };
+            match slot {
+                None => {
+                    blocked = true;
+                    break;
+                }
+                Some(result) => {
+                    if result.as_ref().is_some_and(&is_nonempty) {
+                        return Ok(result.take());
+                    }
+                }
+            }
+        }
+        if !blocked {
+            return Ok(None);
+        }
+
+        tokio::select! {
+            result = &mut virt_fut, if virt_state.is_none() => {
+                virt_state = Some(result?);
+            }
+            result = &mut host_fut, if host_state.is_none() => {
+                host_state = Some(result?);
+            }
+        }
+    }
 }
 
 /// Deserialize a verbatim host-layer result into the handler's response
@@ -607,17 +672,23 @@ impl Kakehashi {
     }
 
     /// Walk the resolved layer order for a request method
-    /// (cross-layer-aggregation, `preferred` semantics): layers are tried
-    /// lazily in `order` and the first one producing a non-empty result wins.
+    /// (cross-layer-aggregation, `preferred` semantics): the virt and host
+    /// layers fan out **concurrently** ([`race_layers_preferred`]) and the
+    /// highest-priority non-empty result wins.
     ///
-    /// - `virt` is the handler's existing injection-bridge future, awaited
-    ///   only when (and if) the walk reaches the virt layer.
+    /// - `virt` is the handler's existing injection-bridge future, polled
+    ///   only when the virt layer is in `order`.
     /// - The host layer forwards `raw_params` verbatim
     ///   (host-document-bridge) and maps the raw result via `host_parse`.
     /// - `layer_method` keys `layers.order` and the `_self` aggregation
     ///   (e.g. rangeFormatting shares `textDocument/formatting`);
     ///   `request_method` is what goes on the wire and gates capability.
     /// - Native has no contributor for bridged methods.
+    ///
+    /// A losing in-flight future is dropped; its RAII guards clean up the
+    /// response router and cancel subscription, and the trailing
+    /// `unregister_all_for_upstream_id` sweeps any upstream-registry entries
+    /// the dropped future did not get to remove itself.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn walk_layers<R>(
         &self,
@@ -638,32 +709,24 @@ impl Kakehashi {
         };
         let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
 
-        let virt = std::pin::pin!(virt);
-        let mut virt = Some(virt);
-        for layer in &layer_cfg.order {
-            let result = match layer {
-                LayerSource::Virt => match virt.take() {
-                    Some(virt) => virt.await?,
-                    None => None,
-                },
-                LayerSource::Host => {
-                    match self.resolve_host_bridge_context(lsp_uri, layer_method) {
-                        Some(ctx) => self
-                            .host_layer_value_with_ctx(&ctx, request_method, raw_params.clone())
-                            .await?
-                            .and_then(&host_parse),
-                        None => None,
-                    }
-                }
-                LayerSource::Native => None,
-            };
-            if let Some(result) = result
-                && is_nonempty(&result)
-            {
-                return Ok(Some(result));
+        let host = async {
+            match self.resolve_host_bridge_context(lsp_uri, layer_method) {
+                Some(ctx) => Ok(self
+                    .host_layer_value_with_ctx(&ctx, request_method, raw_params.clone())
+                    .await?
+                    .and_then(&host_parse)),
+                None => Ok(None),
             }
-        }
-        Ok(None)
+        };
+
+        let result = race_layers_preferred(&layer_cfg.order, virt, host, is_nonempty).await;
+        // Sweep upstream-registry entries a dropped (losing) layer future did
+        // not get to unregister itself. Idempotent; the winning arm already
+        // cleaned up its own.
+        self.bridge
+            .pool_arc()
+            .unregister_all_for_upstream_id(current_upstream_id().as_ref());
+        result
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
@@ -741,6 +804,113 @@ mod tests {
             enabled: None,
             aggregation: Some(agg),
         }
+    }
+
+    // ==========================================================================
+    // race_layers_preferred (cross-layer-aggregation, parallel fan-out)
+    // ==========================================================================
+
+    const VHN: &[LayerSource] = &[LayerSource::Virt, LayerSource::Host, LayerSource::Native];
+
+    fn ok<R>(value: Option<R>) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn race_prefers_higher_layer_even_when_lower_arrives_first() {
+        // Host completes instantly with a result; virt completes later but
+        // non-empty. Priority decides, not arrival order.
+        let virt = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ok(Some("virt"))
+        };
+        let host = async { ok(Some("host")) };
+        let won = race_layers_preferred(VHN, virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, Some("virt"));
+    }
+
+    #[tokio::test]
+    async fn race_falls_back_to_host_when_virt_is_empty() {
+        let virt = async { ok(None) };
+        let host = async { ok(Some("host")) };
+        let won = race_layers_preferred(VHN, virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, Some("host"));
+    }
+
+    #[tokio::test]
+    async fn race_polls_layers_concurrently_not_serially() {
+        // The virt future only completes AFTER the host future completed
+        // (oneshot handshake). A serial walk (virt awaited to completion
+        // before host is even polled) would deadlock here; the concurrent
+        // race completes promptly.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let virt = async move {
+            let _ = rx.await;
+            ok(Some("virt"))
+        };
+        let host = async move {
+            let _ = tx.send(());
+            // Stay pending long enough that the race must keep polling virt.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ok(Some("host"))
+        };
+        let won = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            race_layers_preferred(VHN, virt, host, |_| true),
+        )
+        .await
+        .expect("layers must fan out concurrently — a serial walk deadlocks this handshake")
+        .unwrap();
+        assert_eq!(won, Some("virt"), "priority still decides");
+    }
+
+    #[tokio::test]
+    async fn race_never_polls_layers_absent_from_order() {
+        // An allowlist without virt must not poll the virt future at all.
+        let virt = async {
+            panic!("virt must not be polled when absent from order");
+            #[allow(unreachable_code)]
+            ok(Some("virt"))
+        };
+        let host = async { ok(Some("host")) };
+        let won = race_layers_preferred(&[LayerSource::Host], virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, Some("host"));
+    }
+
+    #[tokio::test]
+    async fn race_returns_none_when_all_layers_are_empty() {
+        let virt = async { ok(None) };
+        let host = async { ok(None) };
+        let won: Option<&str> = race_layers_preferred(VHN, virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, None);
+    }
+
+    #[tokio::test]
+    async fn race_treats_empty_results_via_is_nonempty() {
+        // A Some result that the emptiness check rejects falls through.
+        let virt = async { ok(Some(Vec::<i32>::new())) };
+        let host = async { ok(Some(vec![1])) };
+        let won = race_layers_preferred(VHN, virt, host, |v: &Vec<i32>| !v.is_empty())
+            .await
+            .unwrap();
+        assert_eq!(won, Some(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn race_propagates_errors() {
+        let virt =
+            async { Err::<Option<&str>, _>(tower_lsp_server::jsonrpc::Error::request_cancelled()) };
+        let host = async { ok(Some("host")) };
+        let result = race_layers_preferred(VHN, virt, host, |_| true).await;
+        assert!(result.is_err(), "a layer error must propagate");
     }
 
     // ==========================================================================
