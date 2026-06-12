@@ -23,6 +23,10 @@
 //!   it received via `didOpen`. Used by `tests/e2e_host_bridge.rs` to prove
 //!   the host bridge forwards the real client URI and returns the response
 //!   verbatim (host-document-bridge).
+//! - `options-echo` — advertises `documentFormattingProvider`; replaces the
+//!   text with a line echoing the received `FormattingOptions` (`tabSize`,
+//!   `insertSpaces`), so tests can assert the options a client sent actually
+//!   reach the downstream server (e.g. `kakehashi format --tab-size`).
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -136,11 +140,12 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/formatting" | "textDocument/rangeFormatting" => {
+                let options = message.pointer("/params/options").cloned();
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .and_then(|uri| documents.get(uri))
-                    .map(|text| whole_document_edit(text, &mode))
+                    .map(|text| whole_document_edit(text, &mode, options.as_ref()))
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
@@ -158,7 +163,7 @@ fn main() {
 /// Apply the mode's transformation and wrap it in a single whole-document
 /// `TextEdit[]`. The end position stays within the document's real line
 /// count (the bridge drops edits past the virtual EOF).
-fn whole_document_edit(text: &str, mode: &str) -> Value {
+fn whole_document_edit(text: &str, mode: &str, options: Option<&Value>) -> Value {
     let new_text = match mode {
         "append" => {
             // Keep the trailing newline shape so the host document's closing
@@ -167,6 +172,17 @@ fn whole_document_edit(text: &str, mode: &str) -> Value {
                 Some(stripped) => format!("{stripped}\n-- mock-marker\n"),
                 None => format!("{text}\n-- mock-marker"),
             }
+        }
+        "options-echo" => {
+            let tab_size = options
+                .and_then(|o| o.get("tabSize"))
+                .map(Value::to_string)
+                .unwrap_or_else(|| "missing".to_string());
+            let insert_spaces = options
+                .and_then(|o| o.get("insertSpaces"))
+                .map(Value::to_string)
+                .unwrap_or_else(|| "missing".to_string());
+            format!("-- tabSize={tab_size} insertSpaces={insert_spaces}\n")
         }
         // "upper" and "range-upper"
         _ => text.to_uppercase(),
