@@ -67,10 +67,13 @@ impl Kakehashi {
     /// Whether the path alone identifies a formattable language (loading the
     /// parser if installed but not yet loaded). Used to filter directory
     /// walks; explicit files skip this (content-based detection still
-    /// applies when they are opened).
+    /// applies when they are opened). Lossy conversion keeps non-UTF-8
+    /// paths eligible for extension matching, consistent with
+    /// [`Self::cli_format_text`].
     pub(crate) fn cli_can_format_path(&self, path: &Path) -> bool {
-        path.to_str()
-            .is_some_and(|p| self.language.loadable_language_for_path(p).is_some())
+        self.language
+            .loadable_language_for_path(&path.to_string_lossy())
+            .is_some()
     }
 
     /// Format `text` as if it were the document at absolute `path`.
