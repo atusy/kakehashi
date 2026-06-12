@@ -428,9 +428,11 @@ Details:
   Bridged methods have no `native` counterpart yet. Diagnostics and
   semantic tokens stay virt-only for now.
 
-> **Migration note**: this field was previously named `order` and lived at
-> `layers.<method>` (without the `aggregation` level). Old keys are silently
-> ignored — rewrite `layers.<method>.order` as
+> **Migration note**: the layer list was renamed `order` →
+> `priorities` (and, one change earlier, the method map moved under
+> `aggregation`: `layers.<method>` → `layers.aggregation.<method>`). Old
+> keys are silently ignored — rewrite `layers.aggregation.<method>.order`
+> (or the older `layers.<method>.order`) as
 > `layers.aggregation.<method>.priorities`. The default `strategy` for
 > `textDocument/formatting` also changed from `"preferred"` to
 > `"concatenated"`; set it back explicitly if you relied on
