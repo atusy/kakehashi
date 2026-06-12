@@ -302,6 +302,15 @@ impl LanguageServerPool {
                 // would need fresh past-EOF bounds checks (cf. formatting's
                 // guard) against a virtual document we no longer have.
                 resolved.range = lens.range;
+                // A downstream that omits `data` in its resolve response must
+                // not erase the original data from the envelope — a later
+                // resolve of the same lens would then send `data: null` to a
+                // server that expects its own payload back. A downstream that
+                // DOES return data is allowed to mutate it (the completion
+                // resolve precedent).
+                if resolved.data.is_none() {
+                    resolved.data = lens.data.take();
+                }
                 re_envelope_lens(&mut resolved, &envelope);
                 resolved
             }

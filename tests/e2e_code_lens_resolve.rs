@@ -148,7 +148,10 @@ fn e2e_code_lens_resolve_round_trips_to_origin_server() {
 
     // Staleness: insert a line above the fence (shifts the region down one
     // line) and resolve the OLD lens again — it must fail soft (come back
-    // unresolved) instead of translating with the stale offset.
+    // unresolved) instead of translating with the stale offset. No sleep:
+    // the ingress gate orders codeLens/resolve (a reader, keyed by the
+    // envelope's host_uri) behind the wire-preceding didChange, so the
+    // freshness check deterministically sees the post-edit tracker state.
     client.send_notification(
         "textDocument/didChange",
         json!({
@@ -162,7 +165,6 @@ fn e2e_code_lens_resolve_round_trips_to_origin_server() {
             }]
         }),
     );
-    std::thread::sleep(Duration::from_millis(500));
 
     let response = client.send_request("codeLens/resolve", lens.clone());
     assert!(response.get("error").is_none());
