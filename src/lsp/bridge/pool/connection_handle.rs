@@ -445,6 +445,11 @@ impl ConnectionHandle {
                 )
             ),
             "textDocument/codeLens" => caps.code_lens_provider.is_some(),
+            "codeLens/resolve" => caps
+                .code_lens_provider
+                .as_ref()
+                .and_then(|opts| opts.resolve_provider)
+                .unwrap_or(false),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
             "textDocument/foldingRange" => matches!(
                 caps.folding_range_provider,
@@ -1704,6 +1709,14 @@ mod tests {
                     ));
                 }),
             ),
+            (
+                "codeLens/resolve",
+                Box::new(|c| {
+                    c.code_lens_provider = Some(tower_lsp_server::ls_types::CodeLensOptions {
+                        resolve_provider: Some(true),
+                    });
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -1852,6 +1865,7 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
+            "codeLens/resolve",
         ];
         for method in methods {
             assert!(
