@@ -567,10 +567,12 @@ impl Kakehashi {
     /// method (cross-layer-aggregation): when `"virt"` is absent from the
     /// resolved `layers.priorities`, the bridge dispatch is skipped entirely.
     ///
-    /// Used by entry points outside the [`Self::walk_layers`] race —
-    /// notably the push-diagnostics scheduler and the virt-only handlers
-    /// (diagnostics, documentColor) that have no host contributor yet.
-    /// Handlers on the walk get layer membership from the race itself.
+    /// Used by entry points outside the [`Self::walk_layers`] race — the
+    /// shared bridge preamble and the virt-only handlers (rangeFormatting's
+    /// region pass, documentColor) that have no host contributor yet.
+    /// Handlers on the walk get layer membership from the race itself, and
+    /// the diagnostics paths resolve the full layer config directly (they
+    /// gate virt and host independently).
     pub(crate) fn virt_layer_enabled(&self, host_language: &str, method_name: &str) -> bool {
         self.resolve_layer_config(host_language, method_name)
             .allows(LayerSource::Virt)
@@ -729,6 +731,7 @@ impl Kakehashi {
                             request_method,
                             params,
                             t.upstream_id,
+                            crate::lsp::bridge::ConnectionReadiness::FailFast,
                         )
                         .await
                 }

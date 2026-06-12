@@ -224,8 +224,11 @@ impl Kakehashi {
         };
 
         // Clean up stale upstream registry entries once all layer tasks have
-        // completed (or been aborted via future drop), so cancel forwarding
-        // remains intact for all in-flight downstream requests until then.
+        // completed. On the cancel path above the sweep runs BEFORE the
+        // dropped futures unwind — safe because cancel forwarding
+        // captures its targets before notifying, and the pool tolerates
+        // entries unregistered out of order (see forward_cancel_by
+        // _upstream_id_with_notify).
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
 
         Ok(make_diagnostic_report(combine_layer_diagnostics(
@@ -286,6 +289,11 @@ pub(crate) async fn collect_host_diagnostics(
                 "textDocument/diagnostic",
                 serde_json::json!({ "textDocument": { "uri": t.uri.as_str() } }),
                 t.upstream_id,
+                // Same policy as the virt diagnostic path: wait through
+                // server initialization — the first didOpen-triggered pull
+                // would otherwise hit an Initializing server and silently
+                // lose the host layer. The outer timeout bounds the wait.
+                crate::lsp::bridge::ConnectionReadiness::WaitReady,
             ),
         )
         .await
@@ -326,9 +334,11 @@ pub(crate) async fn collect_host_diagnostics(
 }
 
 /// Parse a raw `textDocument/diagnostic` result from a host server into its
-/// diagnostic items: a `full` report yields its items; `unchanged` (which a
-/// server should not send — we never supply `previousResultId`) and `null` /
-/// unparsable results yield nothing.
+/// diagnostic items: a `full` report yields its items (`relatedDocuments`
+/// entries are dropped — diagnostics for OTHER documents have no place in
+/// this document's report); `unchanged` (which a server should not send —
+/// we never supply `previousResultId`) and `null` / unparsable results
+/// yield nothing.
 fn parse_host_diagnostic_report(result: Option<serde_json::Value>) -> Vec<Diagnostic> {
     let Some(value) = result else {
         return Vec::new();

@@ -54,6 +54,16 @@ use super::protocol::{
 /// server that doesn't respond within this window fails with a timeout error.
 pub(crate) const INIT_TIMEOUT_SECS: u64 = 30;
 
+/// How a request obtains its pooled connection: fail fast on an
+/// `Initializing` server (interactive requests — an initializing server is
+/// just an empty contributor for this request), or wait through the
+/// handshake (diagnostics, where waiting beats returning empty results).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ConnectionReadiness {
+    FailFast,
+    WaitReady,
+}
+
 use super::actor::{
     OUTBOUND_QUEUE_CAPACITY, ResponseRouter, UpstreamNotification, spawn_reader_task_for_language,
 };

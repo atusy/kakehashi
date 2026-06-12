@@ -332,8 +332,8 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` contains the **host** language, with the real URI and no
-coordinate translation. All bridged request methods are wired (diagnostics
-and semantic tokens excepted); by default the host layer is tried after
+coordinate translation. All bridged request methods are wired (semantic
+tokens excepted); by default the host layer is tried after
 `virt` (see `layers` above), so injections keep winning inside code fences
 while the host server answers everywhere else. For formatting, combine
 fence formatters with a whole-document formatter via
@@ -430,7 +430,7 @@ Details:
   the `host` layer answers on the host document itself for every bridged
   request method — including pull/push diagnostics — when host bridging is
   opted in (see `bridge._self` above). Bridged methods have no `native`
-  counterpart yet. Semantic tokens stay virt-only for now.
+  counterpart yet. Semantic tokens stay native-only for now.
 
 > **Migration note**: the layer list was renamed `order` →
 > `priorities` (and, one change earlier, the method map moved under

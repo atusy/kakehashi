@@ -23,6 +23,7 @@ mod text_document;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
+pub(crate) use pool::ConnectionReadiness;
 pub use pool::LanguageServerPool;
 pub(crate) use pool::UpstreamId;
 pub(crate) use protocol::RegionOffset;
