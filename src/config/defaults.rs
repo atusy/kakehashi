@@ -6,7 +6,8 @@
 use super::WILDCARD_KEY;
 use super::settings::{
     AggregationConfig, AggregationStrategy, BridgeLanguageConfig, CaptureMapping, CaptureMappings,
-    LanguageSettings, QueryTypeMappings, RawWorkspaceSettings,
+    LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, QueryTypeMappings,
+    RawWorkspaceSettings,
 };
 use std::collections::HashMap;
 
@@ -26,13 +27,54 @@ pub fn default_settings() -> RawWorkspaceSettings {
 /// Returns the default languages map containing the wildcard `_` entry.
 ///
 /// The wildcard language is the root of all base chains (base-language-inheritance).
-/// It provides default bridge settings: all bridging enabled, with
-/// `Preferred` strategy for most methods and `Concatenated` for diagnostics.
+/// It spells out the built-in defaults so the generated template is
+/// self-documenting — deleting any entry below never changes behavior:
+/// - `layers.aggregation` (cross-layer-aggregation): all three layers in
+///   `["virt", "host", "native"]` priority, `Preferred` strategy except for
+///   formatting and diagnostics, which combine layers by `Concatenated`.
+/// - `bridge` (per-target server aggregation): all bridging enabled, `["*"]`
+///   fan-out, `Preferred` strategy except diagnostics (`Concatenated`).
 fn default_languages() -> HashMap<String, LanguageSettings> {
     HashMap::from([(
         WILDCARD_KEY.to_string(),
         LanguageSettings {
             base: Some(WILDCARD_KEY.to_string()),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([
+                    (
+                        WILDCARD_KEY.to_string(),
+                        LayerAggregationConfig {
+                            priorities: Some(vec![
+                                LayerSource::Virt,
+                                LayerSource::Host,
+                                LayerSource::Native,
+                            ]),
+                            strategy: Some(AggregationStrategy::Preferred),
+                        },
+                    ),
+                    (
+                        "textDocument/formatting".to_string(),
+                        LayerAggregationConfig {
+                            priorities: None,
+                            strategy: Some(AggregationStrategy::Concatenated),
+                        },
+                    ),
+                    (
+                        "textDocument/diagnostic".to_string(),
+                        LayerAggregationConfig {
+                            priorities: None,
+                            strategy: Some(AggregationStrategy::Concatenated),
+                        },
+                    ),
+                    (
+                        "textDocument/publishDiagnostics".to_string(),
+                        LayerAggregationConfig {
+                            priorities: None,
+                            strategy: Some(AggregationStrategy::Concatenated),
+                        },
+                    ),
+                ])),
+            }),
             bridge: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
                 BridgeLanguageConfig {
@@ -41,6 +83,7 @@ fn default_languages() -> HashMap<String, LanguageSettings> {
                         (
                             WILDCARD_KEY.to_string(),
                             AggregationConfig {
+                                priorities: Some(vec!["*".to_string()]),
                                 strategy: Some(AggregationStrategy::Preferred),
                                 ..Default::default()
                             },
@@ -246,6 +289,71 @@ mod tests {
         assert_eq!(
             pub_diag_agg.strategy,
             Some(AggregationStrategy::Concatenated)
+        );
+    }
+
+    #[test]
+    fn default_settings_documents_builtin_layer_defaults() {
+        // The template mirrors the built-in runtime defaults so that the
+        // generated file is self-documenting and deleting an entry never
+        // changes behavior.
+        use crate::config::settings::LayerSource;
+
+        let settings = default_settings();
+        let wildcard = settings
+            .languages
+            .get(WILDCARD_KEY)
+            .expect("should have wildcard '_' language");
+
+        let layers = wildcard.layers.as_ref().expect("should have layers");
+        let agg = layers
+            .aggregation
+            .as_ref()
+            .expect("should have layers.aggregation");
+
+        let method_wildcard = agg.get(WILDCARD_KEY).expect("should have '_' entry");
+        assert_eq!(
+            method_wildcard.priorities,
+            Some(vec![
+                LayerSource::Virt,
+                LayerSource::Host,
+                LayerSource::Native
+            ]),
+        );
+        assert_eq!(
+            method_wildcard.strategy,
+            Some(AggregationStrategy::Preferred)
+        );
+
+        for method in [
+            "textDocument/formatting",
+            "textDocument/diagnostic",
+            "textDocument/publishDiagnostics",
+        ] {
+            let entry = agg
+                .get(method)
+                .unwrap_or_else(|| panic!("should have {method} entry"));
+            assert_eq!(
+                entry.strategy,
+                Some(AggregationStrategy::Concatenated),
+                "{method} should document the concatenated default"
+            );
+        }
+    }
+
+    #[test]
+    fn default_settings_documents_bridge_priorities_wildcard() {
+        let settings = default_settings();
+        let bridge_wildcard = settings.languages[WILDCARD_KEY].bridge.as_ref().unwrap()
+            [WILDCARD_KEY]
+            .aggregation
+            .as_ref()
+            .unwrap()[WILDCARD_KEY]
+            .clone();
+        assert_eq!(
+            bridge_wildcard.priorities,
+            Some(vec!["*".to_string()]),
+            "the '*' fan-out default should be visible in the template"
         );
     }
 
