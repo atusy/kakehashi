@@ -246,7 +246,7 @@ fn install_language_blocking(
     // installer also builds paths from the name (`parser/<name>.<ext>`),
     // so reject traversal-capable names before touching either.
     if !queries::is_safe_language_name(language) {
-        let reason = format!("Language name {:?} is unsafe", language);
+        let reason = format!("Language name '{}' is unsafe", language.escape_default());
         result.parser_error = Some(reason.clone());
         result.queries_error = Some(reason);
         return result;

@@ -143,13 +143,12 @@ fn install_queries_recursive(
 ) -> Result<QueryInstallResult, QueryInstallError> {
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
-    // Debug-format the untrusted name: the error's Display is printed raw
-    // by the CLI, so control characters must not reach the terminal.
+    // Escape the untrusted name: the error's Display is printed raw by
+    // the CLI, so control characters must not reach the terminal.
     if !is_safe_language_name(language) {
-        return Err(QueryInstallError::LanguageNotSupported(format!(
-            "{:?}",
-            language
-        )));
+        return Err(QueryInstallError::LanguageNotSupported(
+            language.escape_default().to_string(),
+        ));
     }
 
     // Skip if already installed in this session
