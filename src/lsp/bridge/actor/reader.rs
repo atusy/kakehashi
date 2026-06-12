@@ -35,6 +35,13 @@ use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 ///
 /// Reader tasks use this to signal events that require upstream Client interaction,
 /// keeping the bridge module decoupled from tower-lsp's Client type.
+///
+/// The channel carrying these is unbounded: the forwarding loop is normally
+/// faster than any conformant server's notification rate, and dropping a
+/// `DiagnosticRefresh` would silently stale the editor's diagnostics. A
+/// downstream server stuck in a tight logMessage loop can therefore grow the
+/// queue, but that failure mode is bounded by the same trust we extend to any
+/// user-configured local process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
@@ -118,12 +125,12 @@ impl LivenessTimerState {
     ///
     /// Called when pending count transitions 0->1.
     /// No-op if timeout is not configured.
-    fn start(&mut self, lang_prefix: &str) {
+    fn start(&mut self, server_prefix: &str) {
         if let Some(timeout) = self.timeout {
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Liveness timer started: {:?}",
-                lang_prefix,
+                server_prefix,
                 timeout
             );
             self.timer = Some(new_liveness_timer(timeout));
@@ -134,14 +141,14 @@ impl LivenessTimerState {
     ///
     /// Called on any message activity (response or notification).
     /// Only resets if timer is currently active.
-    fn reset(&mut self, lang_prefix: &str) {
+    fn reset(&mut self, server_prefix: &str) {
         if let Some(timeout) = self.timeout
             && self.timer.is_some()
         {
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Liveness timer reset on message activity",
-                lang_prefix
+                server_prefix
             );
             self.timer = Some(new_liveness_timer(timeout));
         }
@@ -151,12 +158,12 @@ impl LivenessTimerState {
     ///
     /// Called when pending count returns to 0 or shutdown begins.
     /// Only logs if timer was actually active.
-    fn stop(&mut self, lang_prefix: &str, reason: &str) {
+    fn stop(&mut self, server_prefix: &str, reason: &str) {
         if self.timer.take().is_some() {
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Liveness timer stopped: {}",
-                lang_prefix,
+                server_prefix,
                 reason
             );
         }
@@ -400,7 +407,7 @@ async fn reader_loop_with_liveness(
     } = liveness_params;
 
     // Server-name prefix for log messages (e.g., "[lua-ls] " or "")
-    let lang_prefix = server_request_deps
+    let server_prefix = server_request_deps
         .server_name
         .as_ref()
         .map(|l| format!("[{}] ", l))
@@ -418,7 +425,7 @@ async fn reader_loop_with_liveness(
                 debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Reader task cancelled, shutting down",
-                    lang_prefix
+                    server_prefix
                 );
                 // The router outlives this task (Arc-shared with ConnectionHandle),
                 // so pending waiters must be failed here or they hang until the
@@ -436,7 +443,7 @@ async fn reader_loop_with_liveness(
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Liveness timeout expired after {:?}, server appears hung - failing {} pending request(s)",
-                    lang_prefix,
+                    server_prefix,
                     liveness.timeout_duration(),
                     pending_count
                 );
@@ -448,12 +455,12 @@ async fn reader_loop_with_liveness(
 
             // Check for liveness timer start notification (pending 0->1)
             Some(()) = liveness_start_rx.recv() => {
-                liveness.start(&lang_prefix);
+                liveness.start(&server_prefix);
             }
 
             // Check for liveness timer stop notification (shutdown began - ls-bridge-timeout-hierarchy Phase 4)
             Some(()) = liveness_stop_rx.recv() => {
-                liveness.stop(&lang_prefix, "shutdown began");
+                liveness.stop(&server_prefix, "shutdown began");
             }
 
             // Try to read a message (lowest priority)
@@ -461,13 +468,13 @@ async fn reader_loop_with_liveness(
                 match result {
                     Ok(message) => {
                         // Reset liveness timer on any message activity (ls-bridge-async-connection)
-                        liveness.reset(&lang_prefix);
+                        liveness.reset(&server_prefix);
 
-                        handle_message(message, &router, &lang_prefix, &server_request_deps).await;
+                        handle_message(message, &router, &server_prefix, &server_request_deps).await;
 
                         // Check if pending count returned to 0 - stop timer
                         if liveness.is_active() && router.pending_count() == 0 {
-                            liveness.stop(&lang_prefix, "pending count is 0");
+                            liveness.stop(&server_prefix, "pending count is 0");
                         }
                     }
                     Err(e) => {
@@ -475,7 +482,7 @@ async fn reader_loop_with_liveness(
                         warn!(
                             target: "kakehashi::bridge::reader",
                             "{}Reader error: {}, failing pending requests",
-                            lang_prefix,
+                            server_prefix,
                             e
                         );
                         router.fail_all(&format!("bridge: reader error: {}", e));
@@ -517,7 +524,7 @@ fn classify_message(message: &serde_json::Value) -> MessageKind {
 async fn handle_message(
     message: serde_json::Value,
     router: &ResponseRouter,
-    lang_prefix: &str,
+    server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
     match classify_message(&message) {
@@ -534,7 +541,7 @@ async fn handle_message(
                     debug!(
                         target: "kakehashi::bridge::reader",
                         "{}Response for id={} arrived but receiver was dropped (requester cancelled)",
-                        lang_prefix,
+                        server_prefix,
                         id.unwrap_or(serde_json::Value::Null)
                     );
                 }
@@ -543,14 +550,14 @@ async fn handle_message(
                     debug!(
                         target: "kakehashi::bridge::reader",
                         "{}Response for unknown request id={}, dropping",
-                        lang_prefix,
+                        server_prefix,
                         id.unwrap_or(serde_json::Value::Null)
                     );
                 }
             }
         }
         MessageKind::ServerRequest => {
-            handle_server_request(message, lang_prefix, deps).await;
+            handle_server_request(message, server_prefix, deps).await;
         }
         MessageKind::Notification => {
             // `publishDiagnostics` targeting a pipeline *scratch* document is
@@ -563,17 +570,17 @@ async fn handle_message(
                 debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Discarding publishDiagnostics targeting a scratch virtual document",
-                    lang_prefix
+                    server_prefix
                 );
             } else {
-                forward_notification(&message, lang_prefix, deps);
+                forward_notification(&message, server_prefix, deps);
             }
         }
         MessageKind::Invalid => {
             warn!(
                 target: "kakehashi::bridge::reader",
                 "{}Invalid message from downstream (no id or method): {}",
-                lang_prefix,
+                server_prefix,
                 message
             );
         }
@@ -592,7 +599,11 @@ async fn handle_message(
 ///
 /// Everything else is still silently ignored ($/progress: #379, push-based
 /// publishDiagnostics: #380).
-fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &ServerRequestDeps) {
+fn forward_notification(
+    message: &serde_json::Value,
+    server_prefix: &str,
+    deps: &ServerRequestDeps,
+) {
     match message["method"].as_str() {
         Some("window/logMessage") => {
             match serde_json::from_value::<LogMessageParams>(message["params"].clone()) {
@@ -607,7 +618,7 @@ fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &S
                 Err(e) => debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Dropping window/logMessage with invalid params: {}",
-                    lang_prefix,
+                    server_prefix,
                     e
                 ),
             }
@@ -617,7 +628,7 @@ fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &S
                 debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Dropping window/showMessage (forwardShowMessage is disabled)",
-                    lang_prefix
+                    server_prefix
                 );
                 return;
             }
@@ -631,7 +642,7 @@ fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &S
                 Err(e) => debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Dropping window/showMessage with invalid params: {}",
-                    lang_prefix,
+                    server_prefix,
                     e
                 ),
             }
@@ -641,7 +652,9 @@ fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &S
 }
 
 /// `[kakehashi:<server>] <message>` — tells the user which downstream server
-/// a forwarded `window/*` notification came from (#378).
+/// a forwarded `window/*` notification came from (#378). Falls back to
+/// `[kakehashi] <message>` when the server name is absent (test-only spawns;
+/// production spawns always carry the name, see pool.rs).
 fn prefixed_message(server_name: Option<&str>, message: &str) -> String {
     match server_name {
         Some(name) => format!("[kakehashi:{name}] {message}"),
@@ -675,7 +688,7 @@ fn is_scratch_publish_diagnostics(message: &serde_json::Value) -> bool {
 /// request, so a server that can't handle one to its own request is buggy.
 async fn handle_server_request(
     message: serde_json::Value,
-    lang_prefix: &str,
+    server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
     let id: jsonrpc::Id = message
@@ -696,7 +709,7 @@ async fn handle_server_request(
                             debug!(
                                 target: "kakehashi::bridge::reader",
                                 "{}Registered dynamic capability: {} (id={})",
-                                lang_prefix, reg.method, reg.id
+                                server_prefix, reg.method, reg.id
                             );
                         }
                         deps.dynamic_capabilities.register(reg_params.registrations);
@@ -706,7 +719,7 @@ async fn handle_server_request(
                         warn!(
                             target: "kakehashi::bridge::reader",
                             "{}Failed to parse registerCapability params: {}",
-                            lang_prefix, e
+                            server_prefix, e
                         );
                         Err(jsonrpc::Error::invalid_params(format!(
                             "Invalid params: {e}"
@@ -717,7 +730,7 @@ async fn handle_server_request(
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Request 'client/registerCapability' is missing 'params' field",
-                    lang_prefix
+                    server_prefix
                 );
                 Err(jsonrpc::Error::invalid_params(
                     "Request 'client/registerCapability' is missing 'params' field",
@@ -734,7 +747,7 @@ async fn handle_server_request(
                             debug!(
                                 target: "kakehashi::bridge::reader",
                                 "{}Unregistered dynamic capability: {} (id={})",
-                                lang_prefix, unreg.method, unreg.id
+                                server_prefix, unreg.method, unreg.id
                             );
                         }
                         deps.dynamic_capabilities
@@ -745,7 +758,7 @@ async fn handle_server_request(
                         warn!(
                             target: "kakehashi::bridge::reader",
                             "{}Failed to parse unregisterCapability params: {}",
-                            lang_prefix, e
+                            server_prefix, e
                         );
                         Err(jsonrpc::Error::invalid_params(format!(
                             "Invalid params: {e}"
@@ -756,7 +769,7 @@ async fn handle_server_request(
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Request 'client/unregisterCapability' is missing 'params' field",
-                    lang_prefix
+                    server_prefix
                 );
                 Err(jsonrpc::Error::invalid_params(
                     "Request 'client/unregisterCapability' is missing 'params' field",
@@ -769,7 +782,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Acknowledged window/workDoneProgress/create",
-                lang_prefix
+                server_prefix
             );
             Ok(serde_json::Value::Null)
         }
@@ -779,7 +792,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Forwarding workspace/diagnostic/refresh upstream",
-                lang_prefix
+                server_prefix
             );
             let _ = deps
                 .upstream_tx
@@ -802,7 +815,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Unknown server request method: {}, responding with MethodNotFound",
-                lang_prefix, method
+                server_prefix, method
             );
             Err(jsonrpc::Error::method_not_found())
         }
@@ -813,7 +826,19 @@ async fn handle_server_request(
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
     // Response implements Serialize, so convert to Value for OutboundMessage.
-    let response = serde_json::to_value(response).expect("Response serialization is infallible");
+    // Serialization cannot fail in practice, but the project bans panics in
+    // production code; dropping the response is the only sane fallback here.
+    let response = match serde_json::to_value(response) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(
+                target: "kakehashi::bridge::reader",
+                "{}Failed to serialize response for server request '{}': {}",
+                server_prefix, method, e
+            );
+            return;
+        }
+    };
 
     // Send response via the writer channel.
     // We use OutboundMessage::Untracked because a server-initiated response has
@@ -837,7 +862,7 @@ async fn handle_server_request(
         warn!(
             target: "kakehashi::bridge::reader",
             "{}Failed to send response for server request '{}': {}",
-            lang_prefix, method, e
+            server_prefix, method, e
         );
     }
 }

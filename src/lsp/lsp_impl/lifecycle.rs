@@ -353,6 +353,11 @@ impl Kakehashi {
 ///   UI; the reader only emits this when the server's `forwardShowMessage`
 ///   config gate is enabled (#378).
 ///
+/// Each dispatch awaits tower-lsp's internal bounded channel, so a slow editor
+/// can stall the loop and delay events queued behind a notification burst
+/// (e.g. a `DiagnosticRefresh` behind spammed logMessages). Forwarding is
+/// best-effort by design; ordering across all variants is preserved.
+///
 /// Exits when:
 /// - The channel is closed (all senders dropped), OR
 /// - The `cancel_token` is cancelled (deterministic shutdown)

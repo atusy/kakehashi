@@ -74,6 +74,10 @@ fn shutdown(client: &mut LspClient) {
 
 /// Matches only notifications forwarded from the mock downstream server,
 /// ignoring kakehashi's own window/logMessage output.
+///
+/// Reliable because only the bridge's forwarding path prepends
+/// `[kakehashi:<server>]` (reader.rs `prefixed_message`); kakehashi's own
+/// log/show messages never contain that marker.
 fn from_mock(params: &Value) -> bool {
     params["message"]
         .as_str()
