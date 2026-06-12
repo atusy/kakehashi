@@ -210,11 +210,14 @@ impl LanguageServerPool {
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],
-    /// the response keeps formatting's LSP semantics: a `null` result from a
-    /// capable server is the authoritative "no edits needed" signal
-    /// (concatenated-formatting-pipeline) and comes back as `Some(vec![])`,
-    /// distinct from `None` = no capability / error / malformed — only the
-    /// latter should trigger fallback to a lower-priority server.
+    /// the response keeps formatting's LSP semantics, mirroring
+    /// [`Self::send_formatting_request`]: a `null` result from a capable
+    /// server is the authoritative "no edits needed" signal
+    /// (concatenated-formatting-pipeline) and comes back as `Ok(Some(vec![]))`;
+    /// `Ok(None)` means the server does not advertise the capability (the
+    /// only fallback-without-failure case); an error response, a success
+    /// without a `result` member, or a malformed payload is a counted
+    /// request failure (`Err`).
     pub(crate) async fn send_host_formatting_request(
         &self,
         server_name: &str,
