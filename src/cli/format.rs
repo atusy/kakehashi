@@ -215,13 +215,14 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     };
 
     let mut changed = 0usize;
-    let mut had_error = false;
+    let mut read_errors = 0usize;
+    let mut write_errors = 0usize;
     for file in &files {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
                 eprintln!("error: cannot read '{}': {e}", file.display());
-                had_error = true;
+                read_errors += 1;
                 continue;
             }
         };
@@ -248,30 +249,55 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         if options.check {
             eprintln!("Would reformat: {}", file.display());
         } else {
-            match std::fs::write(file, &formatted) {
+            match write_atomically(file, &formatted) {
                 Ok(()) => eprintln!("Reformatted: {}", file.display()),
                 Err(e) => {
                     eprintln!("error: cannot write '{}': {e}", file.display());
-                    had_error = true;
+                    write_errors += 1;
                 }
             }
         }
     }
 
-    let unchanged = files.len() - changed;
-    if options.check {
-        eprintln!("{changed} file(s) would be reformatted, {unchanged} already formatted");
+    // Unreadable files were never inspected by a formatter, so they belong in
+    // neither the changed nor the "already formatted" bucket. (Write-failed
+    // files stay in `changed` — the formatter did produce a change for them.)
+    let unchanged = files.len() - changed - read_errors;
+    let errors = read_errors + write_errors;
+    let error_suffix = if errors > 0 {
+        format!(", {errors} error(s)")
     } else {
-        eprintln!("{changed} file(s) reformatted, {unchanged} unchanged");
+        String::new()
+    };
+    if options.check {
+        eprintln!(
+            "{changed} file(s) would be reformatted, {unchanged} already formatted{error_suffix}"
+        );
+    } else {
+        eprintln!("{changed} file(s) reformatted, {unchanged} unchanged{error_suffix}");
     }
 
-    if had_error {
+    if errors > 0 {
         EXIT_ERROR
     } else if changed > 0 && (options.check || options.fail_on_change) {
         EXIT_CHANGED
     } else {
         EXIT_OK
     }
+}
+
+/// Replace `path`'s content via write-to-temp + atomic rename, so a crash
+/// mid-write (OOM kill, power loss) can never leave a truncated source file
+/// behind. The temp file lives in the target's directory: `persist` renames,
+/// and rename is only atomic within one filesystem.
+fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(Path::new(".")))?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 /// Build the `--excludes` matcher: gitignore-style patterns rooted at `base`

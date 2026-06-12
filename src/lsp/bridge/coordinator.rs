@@ -536,11 +536,6 @@ impl BridgeCoordinator {
         generation
     }
 
-    /// Push an abort handle into an existing entry, or abort it if stale/removed.
-    ///
-    /// Called immediately after each `tokio::spawn`. The handle is aborted (not
-    /// registered) if the entry was removed by a concurrent `cancel_eager_open`,
-    /// or its generation doesn't match (a concurrent `supersede` replaced it).
     /// Whether every eager-open task registered for `uri` has finished
     /// (no batch counts as finished).
     ///
@@ -557,6 +552,11 @@ impl BridgeCoordinator {
             .is_none_or(|batch| batch.handles.iter().all(|h| h.is_finished()))
     }
 
+    /// Push an abort handle into an existing entry, or abort it if stale/removed.
+    ///
+    /// Called immediately after each `tokio::spawn`. The handle is aborted (not
+    /// registered) if the entry was removed by a concurrent `cancel_eager_open`,
+    /// or its generation doesn't match (a concurrent `supersede` replaced it).
     fn push_or_abort_eager_open_handle(
         &self,
         uri: &Url,

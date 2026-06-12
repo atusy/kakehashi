@@ -674,7 +674,7 @@ fn run_format(options: kakehashi::cli::format::FormatOptions) -> Result<(), Exit
         .init();
 
     let code = kakehashi::cli::format::run(options);
-    if code == 0 {
+    if code == kakehashi::cli::format::EXIT_OK {
         Ok(())
     } else {
         Err(ExitCode::from(code))
