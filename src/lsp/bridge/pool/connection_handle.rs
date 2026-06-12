@@ -471,6 +471,7 @@ impl ConnectionHandle {
                     Some(OneOf::Left(true) | OneOf::Right(_))
                 )
             }
+            "textDocument/onTypeFormatting" => caps.document_on_type_formatting_provider.is_some(),
             "textDocument/documentSymbol" => {
                 matches!(
                     caps.document_symbol_provider,
