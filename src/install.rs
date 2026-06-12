@@ -392,7 +392,7 @@ mod tests {
                     header.clear();
                     match reader.read_line(&mut header) {
                         Ok(0) | Err(_) => break,
-                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) if header == "\r\n" || header == "\n" => break,
                         Ok(_) => {}
                     }
                 }
