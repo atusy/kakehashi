@@ -36,7 +36,7 @@ fn config_toml() -> String {
         r#"autoInstall = false
 
 [languageServers.mock-upper]
-cmd = ["{}", "upper"]
+cmd = ['{}', 'upper']
 languages = ["lua"]
 "#,
         env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -298,7 +298,7 @@ fn e2e_tab_size_and_insert_spaces_reach_the_downstream_server() {
             r#"autoInstall = false
 
 [languageServers.mock-echo]
-cmd = ["{}", "options-echo"]
+cmd = ['{}', 'options-echo']
 languages = ["lua"]
 "#,
             env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -384,7 +384,7 @@ fn e2e_request_time_server_failure_exits_with_error() {
             r#"autoInstall = false
 
 [languageServers.mock-fail]
-cmd = ["{}", "fail-request"]
+cmd = ['{}', 'fail-request']
 languages = ["lua"]
 "#,
             env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -427,11 +427,11 @@ fn e2e_failed_formatter_rescued_by_fallback_still_exits_with_error() {
 priorities = ["mock-fail", "mock-upper"]
 
 [languageServers.mock-fail]
-cmd = ["{bin}", "fail-request"]
+cmd = ['{bin}', 'fail-request']
 languages = ["lua"]
 
 [languageServers.mock-upper]
-cmd = ["{bin}", "upper"]
+cmd = ['{bin}', 'upper']
 languages = ["lua"]
 "#,
             bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -467,11 +467,11 @@ fn e2e_malformed_formatter_response_exits_with_error() {
 priorities = ["mock-malformed", "mock-upper"]
 
 [languageServers.mock-malformed]
-cmd = ["{bin}", "malformed"]
+cmd = ['{bin}', 'malformed']
 languages = ["lua"]
 
 [languageServers.mock-upper]
-cmd = ["{bin}", "upper"]
+cmd = ['{bin}', 'upper']
 languages = ["lua"]
 "#,
             bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -507,7 +507,7 @@ fn e2e_host_layer_request_failure_exits_with_error() {
 enabled = true
 
 [languageServers.mock-fail-host]
-cmd = ["{}", "fail-request"]
+cmd = ['{}', 'fail-request']
 languages = ["markdown"]
 "#,
             env!("CARGO_BIN_EXE_mock-lsp-formatter")

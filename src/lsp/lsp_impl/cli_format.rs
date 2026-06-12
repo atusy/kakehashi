@@ -134,7 +134,16 @@ impl Kakehashi {
         .await;
 
         let mut server_failures = self.wait_bridge_servers_ready(&url, ready_timeout).await;
-        self.wait_eager_open_finished(&url, ready_timeout).await;
+        if !self.wait_eager_open_finished(&url, ready_timeout).await {
+            // Formatting would race the still-pending didOpens (the
+            // downstream server may see an unknown URI and answer null =
+            // "no edits") — report instead of silently mis-reporting
+            // "unchanged".
+            server_failures.push(format!(
+                "eager-open tasks did not finish within {ready_timeout:?}; \
+                 formatting results would be unreliable"
+            ));
+        }
 
         // Counts requests that fail AFTER the server came up (crash, error
         // response, per-step timeout) — the ready-wait above cannot see
@@ -204,7 +213,11 @@ impl Kakehashi {
     /// one-shot CLI run must instead wait the tasks out: once finished,
     /// every `didOpen` is enqueued and the single-writer FIFO keeps the
     /// formatting request behind them.
-    async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) {
+    ///
+    /// Returns `false` when the deadline expired with tasks still pending —
+    /// the caller reports that as a failure rather than formatting into the
+    /// race.
+    async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while !self.bridge.eager_open_tasks_finished(uri) {
             if tokio::time::Instant::now() >= deadline {
@@ -213,10 +226,11 @@ impl Kakehashi {
                     "eager-open tasks for {uri} did not finish within {timeout:?}; \
                      formatting may race their didOpen"
                 );
-                return;
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        true
     }
 
     /// Wait (up to `timeout` per server) until every downstream server
