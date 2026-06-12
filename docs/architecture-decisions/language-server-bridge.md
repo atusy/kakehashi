@@ -182,6 +182,7 @@ The bridge requires knowing which server to use for each language. Language serv
 | `languageServers.*.languages` | Yes | Languages this server handles |
 | `languageServers.*.initializationOptions` | No | Passed to server's `initialize` request |
 | `languageServers.*.onTypeFormattingTriggers` | No | Trigger characters for bridged `textDocument/onTypeFormatting`; the sorted union is advertised at initialize, and requests are forwarded only when the downstream also declares the typed character (#354) |
+| `languageServers.*.forwardShowMessage` | No | Forward the server's `window/showMessage` to the editor, prefixed with `[kakehashi:<server>]` (default `false`; `window/logMessage` is always forwarded) |
 
 #### Per-Host Language Bridge Configuration
 
