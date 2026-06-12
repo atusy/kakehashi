@@ -453,6 +453,46 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_malformed_formatter_response_exits_with_error() {
+    // A protocol-invalid success (result is not TextEdit[]) is a request
+    // failure too: the fallback still formats the file, but the run must
+    // exit 2 so the broken formatter surfaces.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+priorities = ["mock-malformed", "mock-upper"]
+
+[languageServers.mock-malformed]
+cmd = ["{bin}", "malformed"]
+languages = ["lua"]
+
+[languageServers.mock-upper]
+cmd = ["{bin}", "upper"]
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write malformed+fallback config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a malformed formatter response must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        read(ws.path(), "doc.md").contains("LOCAL X = 1"),
+        "the fallback formatter's output is still written"
+    );
+}
+
+#[test]
 fn e2e_host_layer_request_failure_exits_with_error() {
     // Same request-time failure, but through the HOST layer
     // (bridge._self.enabled): the host fan-in must also count the error

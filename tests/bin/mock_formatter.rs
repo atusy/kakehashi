@@ -31,6 +31,10 @@
 //!   normally, then answers every formatting request with a JSON-RPC error.
 //!   Exercises the request-time failure path (vs. a server that never
 //!   starts), which `kakehashi format` must report instead of exiting 0.
+//! - `malformed` — advertises `documentFormattingProvider`, handshakes
+//!   normally, then answers formatting with a JSON-RPC *success* whose
+//!   `result` is not a `TextEdit[]`. Exercises the malformed-payload
+//!   request-failure path.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -149,6 +153,13 @@ fn main() {
                     // request-time failure path (vs. a server that never
                     // starts), which clients must not read as "no edits".
                     respond_error(&mut writer, id, -32603, "mock formatter request failure");
+                    continue;
+                }
+                if mode == "malformed" {
+                    // JSON-RPC success whose result is not TextEdit[]: a
+                    // protocol-invalid formatter that must count as a request
+                    // failure, not as "no edits".
+                    respond(&mut writer, id, json!("not-a-textedit-array"));
                     continue;
                 }
                 let options = message.pointer("/params/options").cloned();

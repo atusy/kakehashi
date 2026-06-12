@@ -78,22 +78,12 @@ impl LanguageServerPool {
             virtual_content,
             upstream_request_id,
             |virtual_uri, request_id| build_formatting_request(virtual_uri, options, request_id),
+            // The transform promotes error responses, missing results, and
+            // malformed payloads to `Err` (request failure) — only the
+            // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
-                // Promote a JSON-RPC error response to a request failure
-                // (`Err`) instead of collapsing it into the `None` that also
-                // means "no capability": the preferred fan-in counts `Err`s —
-                // CLI mode maps them onto its error exit code, and the editor
-                // path logs them at WARNING severity.
-                if response_has_jsonrpc_error(&response, "textDocument/formatting") {
-                    return Err(io::Error::other(
-                        "downstream server answered textDocument/formatting with an error response",
-                    ));
-                }
-                Ok(transform_formatting_response_to_host(
-                    response,
-                    ctx.offset,
-                    virtual_line_count,
-                ))
+                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
+                    .map(Some)
             },
             downstream_id_probe,
         )
@@ -159,11 +149,12 @@ fn build_formatting_request(
 ///
 /// LSP returns `TextEdit[] | null`. A `null` result from a server that handled
 /// the request is the authoritative "no changes / already formatted" signal and
-/// maps to `Some(vec![])`; only a genuinely missing result — a JSON-RPC error
-/// or malformed payload — collapses to `None`. Keeping the two apart is what
-/// lets the concatenated pipeline's capability-based fallback distinguish
-/// "capable server, nothing to change" from "no usable response"
-/// (concatenated-formatting-pipeline Decision point 3.2).
+/// maps to `Ok(vec![])`. A JSON-RPC error response, a success response with no
+/// `result` member (protocol violation), or a `result` that fails to
+/// deserialize as `TextEdit[]` is a request **failure** (`Err`): collapsing it
+/// into the same value as "no capability" would let a broken formatter pass as
+/// "nothing to format" — the fan-in counts `Err`s, which CLI mode maps onto
+/// its error exit code and the editor path logs at WARNING.
 ///
 /// Downstream formatters often emit edits past the virtual EOF (e.g. enforce a
 /// trailing newline) as if it were a real file; the host bytes immediately past
@@ -177,29 +168,35 @@ pub(super) fn transform_formatting_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     virtual_line_count: u32,
-) -> Option<Vec<TextEdit>> {
+) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, "formatting-style request") {
-        return None;
+        return Err(io::Error::other(
+            "downstream server answered the formatting request with an error response",
+        ));
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        return Err(io::Error::other(
+            "formatting response carries neither result nor error (protocol violation)",
+        ));
+    };
 
     if result.is_null() {
         // Authoritative "no changes / already formatted" — an empty edit list,
         // not a missing result (see function docs).
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
 
     // A non-null `result` that fails to deserialize as `Vec<TextEdit>` means
     // the downstream server returned a malformed `textDocument/formatting`
-    // payload (wrong shape, missing fields, etc.). Returning `None` is the
-    // right user-facing behavior — the bridge has no edits to apply — but
-    // silently swallowing the parse error makes this class of bug invisible.
-    // Log it so operators can spot the misbehaving downstream from the log.
+    // payload (wrong shape, missing fields, etc.) — a request failure; the
+    // log keeps the misbehaving downstream diagnosable.
     let mut edits: Vec<TextEdit> = match serde_json::from_value(result) {
         Ok(edits) => edits,
         Err(err) => {
             warn!(target: "kakehashi::bridge", "Failed to deserialize formatting-style result as TextEdit[]: {}", err);
-            return None;
+            return Err(io::Error::other(format!(
+                "malformed formatting result from downstream server: {err}"
+            )));
         }
     };
 
@@ -247,7 +244,7 @@ pub(super) fn transform_formatting_response_to_host(
         translate_virtual_range_to_host(&mut edit.range, offset);
     }
 
-    Some(edits)
+    Ok(edits)
 }
 
 #[cfg(test)]
@@ -398,31 +395,39 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_result_key(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::error_response(json!({"jsonrpc": "2.0", "id": 42, "error": {"code": -32600, "message": "Invalid Request"}}))]
+    #[case::missing_result(json!({"jsonrpc": "2.0", "id": 42}))]
     #[case::malformed_result(json!({"jsonrpc": "2.0", "id": 42, "result": "not_an_array"}))]
-    fn formatting_response_returns_none_for_invalid_response(#[case] response: serde_json::Value) {
+    fn formatting_response_is_a_request_failure_for_invalid_response(
+        #[case] response: serde_json::Value,
+    ) {
+        // Error / missing / malformed must be `Err` (request failure) — not
+        // the no-capability `None` — so the fan-in counts it and CLI mode
+        // can exit non-zero for a broken formatter.
         let transformed =
             transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED);
-        assert!(transformed.is_none());
+        assert!(transformed.is_err());
     }
 
     #[test]
     fn formatting_response_null_result_is_authoritative_empty_edit_list() {
         // Per LSP, `null` from a server that handled the request means
         // "no changes / already formatted" — an authoritative answer, not a
-        // missing one. It must come back as Some(vec![]) so callers can tell
-        // it apart from `None` ("no result": error or missing provider), which
-        // the concatenated pipeline's capability fallback depends on (ADR
+        // missing one. It must come back as Ok(vec![]) so callers can tell
+        // it apart from a request failure (`Err`) and from the caller-level
+        // "no capability" `None`, which the concatenated pipeline's
+        // capability fallback depends on (ADR
         // concatenated-formatting-pipeline Decision point 3.2).
         let response = json!({"jsonrpc": "2.0", "id": 42, "result": null});
 
         let transformed =
-            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED);
+            transform_formatting_response_to_host(response, &RegionOffset::new(5, 0), UNBOUNDED)
+                .expect("null result is a handled response, not a failure");
 
         assert_eq!(
             transformed,
-            Some(Vec::new()),
-            "null result must be an authoritative empty edit list, not None"
+            Vec::new(),
+            "null result must be an authoritative empty edit list"
         );
     }
 
