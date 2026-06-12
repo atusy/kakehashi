@@ -51,7 +51,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(host_uri))
             .await?;
         if !handle.has_capability("textDocument/onTypeFormatting") {
             return Ok(None);
@@ -102,11 +102,15 @@ impl LanguageServerPool {
                     request_id,
                 )
             },
+            // The transform promotes error responses, missing results, and
+            // malformed payloads to `Err` (request failure) — only the
+            // capability/trigger early returns above yield `Ok(None)`.
             |response, ctx| {
                 transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
+                    .map(Some)
             },
         )
-        .await
+        .await?
     }
 }
 
