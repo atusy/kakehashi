@@ -436,7 +436,14 @@ fn is_excluded(
     path: &Path,
     is_dir: bool,
 ) -> bool {
-    let relative = path.strip_prefix(base).unwrap_or(path);
+    // Patterns are defined relative to `base` (the current directory); a
+    // path outside it has no base-relative form, so no pattern can
+    // meaningfully match it — matching the absolute path instead would let
+    // directories above `base` (and unrelated absolute components) trigger
+    // patterns.
+    let Ok(relative) = path.strip_prefix(base) else {
+        return false;
+    };
     if matcher.matched(relative, is_dir).is_ignore() {
         return true;
     }
@@ -571,6 +578,27 @@ mod tests {
         .unwrap();
 
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn excludes_do_not_apply_to_paths_outside_the_base() {
+        // A pattern is cwd-relative; an explicit file outside the cwd has no
+        // cwd-relative form, so patterns (here one matching a component of
+        // its absolute path) must not exclude it.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("workspace");
+        std::fs::create_dir_all(&base).unwrap();
+        write(&tmp.path().join("outside/doc.md"), "x");
+
+        let files = collect_files(
+            &base,
+            &[tmp.path().join("outside/doc.md")],
+            &["outside/".to_string()],
+            &markdown_only,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec![tmp.path().join("outside/doc.md")]);
     }
 
     #[test]
