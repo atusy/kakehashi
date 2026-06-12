@@ -395,7 +395,7 @@ impl Kakehashi {
                 let params = params.clone();
                 async move {
                     t.pool
-                        .send_host_raw_request(
+                        .send_host_formatting_request(
                             &t.server_name,
                             &t.server_config,
                             &crate::lsp::bridge::HostDocument {
@@ -410,9 +410,11 @@ impl Kakehashi {
                         .await
                 }
             },
-            |opt| {
-                matches!(opt, Some(v) if !crate::lsp::lsp_impl::bridge_context::is_empty_layer_value(v))
-            },
+            // `Some(vec![])` (and a capable server's `null`, normalized to it)
+            // is the authoritative "no edits needed" — accept it instead of
+            // falling through to a lower-priority host formatter that might
+            // re-format the same text. Mirrors the virt preferred predicate.
+            |opt| opt.is_some(),
             cancel_rx,
         )
         .await;
@@ -420,8 +422,8 @@ impl Kakehashi {
         // Quiet on an all-empty host layer (the virt arm already emits the
         // client-visible LOG); only real host failures get surfaced —
         // mirroring `host_layer_value_with_ctx`.
-        let value = match result {
-            FanInResult::Done(value) => value,
+        match result {
+            FanInResult::Done(value) => Ok(value),
             FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.client
@@ -431,14 +433,10 @@ impl Kakehashi {
                         )
                         .await;
                 }
-                None
+                Ok(None)
             }
-            FanInResult::Cancelled => {
-                return Err(tower_lsp_server::jsonrpc::Error::request_cancelled());
-            }
-        };
-        Ok(value
-            .and_then(crate::lsp::lsp_impl::bridge_context::parse_host_verbatim::<Vec<TextEdit>>))
+            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+        }
     }
 }
 

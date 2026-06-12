@@ -76,8 +76,8 @@ pub(crate) fn expand_priorities(
     if let Some(index) = rest_index {
         let rest: Vec<String> = configs
             .iter()
+            .filter(|c| !seen.contains(c.server_name.as_str()))
             .map(|c| c.server_name.clone())
-            .filter(|name| !seen.contains(name.as_str()))
             .collect();
         if rest.is_empty() {
             entries.remove(index);

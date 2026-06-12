@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, Location, LocationLink,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, Uri,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextEdit, Uri,
     VersionedTextDocumentIdentifier,
 };
 use url::Url;
@@ -209,6 +209,38 @@ impl LanguageServerPool {
         .await
     }
 
+    /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],
+    /// the response keeps formatting's LSP semantics: a `null` result from a
+    /// capable server is the authoritative "no edits needed" signal
+    /// (concatenated-formatting-pipeline) and comes back as `Some(vec![])`,
+    /// distinct from `None` = no capability / error / malformed — only the
+    /// latter should trigger fallback to a lower-priority server.
+    pub(crate) async fn send_host_formatting_request(
+        &self,
+        server_name: &str,
+        server_config: &BridgeServerConfig,
+        doc: &HostDocument<'_>,
+        method: &'static str,
+        params: serde_json::Value,
+        upstream_request_id: Option<UpstreamId>,
+    ) -> io::Result<Option<Vec<TextEdit>>> {
+        let handle = self
+            .get_or_create_connection(server_name, server_config)
+            .await?;
+        if !handle.has_capability(method) {
+            return Ok(None);
+        }
+        self.execute_host_request(
+            handle,
+            server_name,
+            doc,
+            upstream_request_id,
+            |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
+            move |response| parse_host_formatting_response(response, method),
+        )
+        .await
+    }
+
     /// Drive a host bridge request end-to-end: register for cancel
     /// forwarding, sync the host document, send, await, transform.
     ///
@@ -344,6 +376,33 @@ fn parse_host_raw_response(
     if result.is_null() { None } else { Some(result) }
 }
 
+/// Parse a host formatting response with formatting's null semantics:
+/// `null` from a capable server = authoritative "no edits needed" →
+/// `Some(vec![])`; only an error / malformed payload yields `None`
+/// (fallback).
+fn parse_host_formatting_response(
+    mut response: serde_json::Value,
+    method: &'static str,
+) -> Option<Vec<TextEdit>> {
+    if response_has_jsonrpc_error(&response, method) {
+        return None;
+    }
+    let result = response.get_mut("result")?.take();
+    if result.is_null() {
+        return Some(Vec::new());
+    }
+    match serde_json::from_value::<Vec<TextEdit>>(result) {
+        Ok(edits) => Some(edits),
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "host formatting response failed to deserialize: {e}"
+            );
+            None
+        }
+    }
+}
+
 /// Normalize a goto result (`Location | Location[] | LocationLink[]`) to
 /// `Vec<LocationLink>` **without** any URI or range rewriting — host
 /// responses already speak real-document coordinates.
@@ -460,6 +519,46 @@ mod tests {
     fn fingerprint_distinguishes_changed_text() {
         assert_eq!(fingerprint("a"), fingerprint("a"));
         assert_ne!(fingerprint("a"), fingerprint("b"));
+    }
+
+    #[test]
+    fn formatting_response_null_is_authoritative_no_edits() {
+        // LSP formatting: a capable server's `null` means "no edits needed"
+        // (concatenated-formatting-pipeline) — it must NOT read as "no usable
+        // response", which would fall through to a lower-priority formatter.
+        let response = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null });
+        let edits = parse_host_formatting_response(response, "textDocument/formatting")
+            .expect("null must be an authoritative empty edit list");
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn formatting_response_edits_pass_through_verbatim() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [{
+                "range": { "start": { "line": 3, "character": 0 },
+                           "end": { "line": 3, "character": 5 } },
+                "newText": "fixed"
+            }]
+        });
+        let edits =
+            parse_host_formatting_response(response, "textDocument/formatting").expect("edits");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "fixed");
+        assert_eq!(edits[0].range.start.line, 3, "no translation");
+    }
+
+    #[test]
+    fn formatting_response_error_falls_through() {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32603, "message": "boom" }
+        });
+        assert!(
+            parse_host_formatting_response(response, "textDocument/formatting").is_none(),
+            "errors must trigger fallback, unlike null"
+        );
     }
 
     #[test]
