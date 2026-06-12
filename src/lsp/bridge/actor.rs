@@ -21,7 +21,8 @@ pub(crate) use reader::spawn_reader_task;
 #[cfg(test)]
 pub(crate) use reader::spawn_reader_task_with_liveness;
 pub(crate) use reader::{
-    ReaderTaskHandle, ServerRequestDeps, UpstreamNotification, spawn_reader_task_for_server,
+    ReaderTaskHandle, ServerRequestDeps, UpstreamNotification, WINDOW_NOTIFICATION_QUEUE_CAPACITY,
+    spawn_reader_task_for_server,
 };
 #[cfg(test)]
 pub(crate) use response_router::RouteResult;

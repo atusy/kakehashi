@@ -213,10 +213,14 @@ downstream ──notification──►  bridge  ──notification──►  ups
 per-server `forwardShowMessage` config gate (default off — showMessage
 surfaces directly in the user's UI, so noisy servers must opt in via config).
 Both are prefixed with `[kakehashi:<server>]` for distinguishability and need
-no coordinate translation. They travel over the same `UpstreamNotification`
-channel as `workspace/diagnostic/refresh`, keeping the bridge decoupled from
-the tower-lsp `Client`. Still not forwarded: `$/progress` (#379) and
-push-based `textDocument/publishDiagnostics` (#380).
+no coordinate translation. They reuse the `UpstreamNotification` decoupling
+(reader task -> forwarding loop -> tower-lsp `Client`) but travel on a
+**bounded** channel with drop-on-full, separate from the unbounded channel
+carrying `workspace/diagnostic/refresh`: a log-flooding downstream server must
+not grow memory without bound, and the forwarding loop's biased select drains
+the refresh channel first so a `window/*` burst cannot starve diagnostics.
+FIFO order is preserved within each channel. Still not forwarded: `$/progress`
+(#379) and push-based `textDocument/publishDiagnostics` (#380).
 
 ### Cancellation Propagation
 

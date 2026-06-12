@@ -297,14 +297,20 @@ impl Kakehashi {
         self.notifier().log_info("server is ready").await;
 
         // Forward downstream server notifications to upstream editor.
-        // When a downstream LS sends workspace/diagnostic/refresh, the reader
-        // task puts DiagnosticRefresh on this channel. We forward it to the
-        // editor via Client::workspace_diagnostic_refresh() so the editor
-        // triggers a fresh textDocument/diagnostic pull.
-        if let Some(upstream_rx) = self.bridge.take_upstream_rx() {
+        // The reader tasks feed two channels (loss-tolerance split, #378):
+        // unbounded for DiagnosticRefresh (must not be lost) and bounded for
+        // best-effort window/logMessage / window/showMessage forwarding.
+        if let Some(upstream_rx) = self.bridge.take_upstream_rx()
+            && let Some(window_rx) = self.bridge.take_window_rx()
+        {
             let client = self.client.clone();
             let token = self.shutdown_token.clone();
-            tokio::spawn(upstream_forwarding_loop(upstream_rx, client, token));
+            tokio::spawn(upstream_forwarding_loop(
+                upstream_rx,
+                window_rx,
+                client,
+                token,
+            ));
         }
     }
 
@@ -343,30 +349,31 @@ impl Kakehashi {
 
 /// Forward upstream notifications from downstream language servers to the editor.
 ///
-/// Consumes notifications from `upstream_rx` and dispatches them to the LSP client.
-/// Currently handles:
-/// - `DiagnosticRefresh`: forwards `workspace/diagnostic/refresh` to trigger a
-///   fresh diagnostic pull from the editor.
-/// - `LogMessage`: forwards a downstream `window/logMessage` (already prefixed
-///   with the originating server name) to the editor's log (#378).
-/// - `ShowMessage`: forwards a downstream `window/showMessage` to the editor's
-///   UI; the reader only emits this when the server's `forwardShowMessage`
-///   config gate is enabled (#378).
+/// Consumes notifications from two channels (loss-tolerance split, #378) and
+/// dispatches them to the LSP client:
+/// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
+///   `workspace/diagnostic/refresh` to trigger a fresh diagnostic pull.
+/// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` —
+///   downstream `window/*` notifications, already prefixed with the
+///   originating server name. `ShowMessage` only arrives when the server's
+///   `forwardShowMessage` config gate is enabled.
 ///
 /// Each dispatch awaits tower-lsp's internal bounded channel, so a slow editor
-/// can stall the loop and delay events queued behind a notification burst
-/// (e.g. a `DiagnosticRefresh` behind spammed logMessages). Forwarding is
-/// best-effort by design; ordering across all variants is preserved.
+/// stalls the loop — but the `biased` select drains `upstream_rx` first, so a
+/// `window/*` burst cannot starve `DiagnosticRefresh`, and the bounded window
+/// queue caps memory. FIFO order is preserved within each channel (the
+/// showMessage gating e2e relies on window-channel FIFO).
 ///
 /// Exits when:
-/// - The channel is closed (all senders dropped), OR
+/// - Either channel is closed (all senders dropped — both senders live in the
+///   pool, so they close together at shutdown), OR
 /// - The `cancel_token` is cancelled (deterministic shutdown)
 async fn upstream_forwarding_loop(
     mut upstream_rx: tokio::sync::mpsc::UnboundedReceiver<crate::lsp::bridge::UpstreamNotification>,
+    mut window_rx: tokio::sync::mpsc::Receiver<crate::lsp::bridge::UpstreamNotification>,
     client: Client,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
-    use crate::lsp::bridge::UpstreamNotification;
     loop {
         tokio::select! {
             biased;
@@ -381,21 +388,14 @@ async fn upstream_forwarding_loop(
 
             notification = upstream_rx.recv() => {
                 match notification {
-                    Some(UpstreamNotification::DiagnosticRefresh) => {
-                        if let Err(e) = client.workspace_diagnostic_refresh().await {
-                            log::debug!(
-                                target: "kakehashi::bridge",
-                                "workspace/diagnostic/refresh forwarding failed: {}",
-                                e
-                            );
-                        }
-                    }
-                    Some(UpstreamNotification::LogMessage { typ, message }) => {
-                        client.log_message(typ, message).await;
-                    }
-                    Some(UpstreamNotification::ShowMessage { typ, message }) => {
-                        client.show_message(typ, message).await;
-                    }
+                    Some(notification) => deliver_upstream_notification(&client, notification).await,
+                    None => break, // Channel closed
+                }
+            }
+
+            notification = window_rx.recv() => {
+                match notification {
+                    Some(notification) => deliver_upstream_notification(&client, notification).await,
                     None => break, // Channel closed
                 }
             }
@@ -403,13 +403,39 @@ async fn upstream_forwarding_loop(
     }
 }
 
+/// Dispatch one upstream notification to the editor client.
+async fn deliver_upstream_notification(
+    client: &Client,
+    notification: crate::lsp::bridge::UpstreamNotification,
+) {
+    use crate::lsp::bridge::UpstreamNotification;
+    match notification {
+        UpstreamNotification::DiagnosticRefresh => {
+            if let Err(e) = client.workspace_diagnostic_refresh().await {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "workspace/diagnostic/refresh forwarding failed: {}",
+                    e
+                );
+            }
+        }
+        UpstreamNotification::LogMessage { typ, message } => {
+            client.log_message(typ, message).await;
+        }
+        UpstreamNotification::ShowMessage { typ, message } => {
+            client.show_message(typ, message).await;
+        }
+    }
+}
+
 /// Cancellable upstream forwarding loop without a Client (for testing).
 ///
-/// Drains notifications from the channel and exits when the token is cancelled
-/// or the channel closes. Does not forward to any client.
+/// Drains notifications from both channels and exits when the token is
+/// cancelled or a channel closes. Does not forward to any client.
 #[cfg(test)]
 async fn upstream_forwarding_loop_with_cancel(
     mut upstream_rx: tokio::sync::mpsc::UnboundedReceiver<crate::lsp::bridge::UpstreamNotification>,
+    mut window_rx: tokio::sync::mpsc::Receiver<crate::lsp::bridge::UpstreamNotification>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
     loop {
@@ -423,6 +449,12 @@ async fn upstream_forwarding_loop_with_cancel(
                     break; // Channel closed
                 }
                 // Notification consumed but not forwarded (no client in test)
+            }
+
+            notification = window_rx.recv() => {
+                if notification.is_none() {
+                    break; // Channel closed
+                }
             }
         }
     }
@@ -441,14 +473,26 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (window_tx, window_rx) = tokio::sync::mpsc::channel(16);
         let token = CancellationToken::new();
 
-        // Send a notification before cancellation — it should be received/drained by the loop
+        // Send notifications on both channels before cancellation — they
+        // should be received/drained by the loop
         tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        window_tx
+            .try_send(UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::INFO,
+                message: "[kakehashi:test] hello".to_string(),
+            })
+            .unwrap();
 
-        // Spawn the loop with a cancellation token (channel stays open via `tx`)
+        // Spawn the loop with a cancellation token (channels stay open via the senders)
         let token_clone = token.clone();
-        let handle = tokio::spawn(upstream_forwarding_loop_with_cancel(rx, token_clone));
+        let handle = tokio::spawn(upstream_forwarding_loop_with_cancel(
+            rx,
+            window_rx,
+            token_clone,
+        ));
 
         // Give the loop time to process the notification
         tokio::time::sleep(Duration::from_millis(50)).await;

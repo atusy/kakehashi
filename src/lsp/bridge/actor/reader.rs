@@ -37,12 +37,16 @@ use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 /// Reader tasks use this to signal events that require upstream Client interaction,
 /// keeping the bridge module decoupled from tower-lsp's Client type.
 ///
-/// The channel carrying these is unbounded: the forwarding loop is normally
-/// faster than any conformant server's notification rate, and dropping a
-/// `DiagnosticRefresh` would silently stale the editor's diagnostics. A
-/// downstream server stuck in a tight logMessage loop can therefore grow the
-/// queue, but that failure mode is bounded by the same trust we extend to any
-/// user-configured local process.
+/// Two channels carry these, split by loss tolerance:
+/// - `DiagnosticRefresh` travels on an **unbounded** channel: dropping one
+///   would silently stale the editor's diagnostics, and its volume is tiny
+///   (one per downstream `workspace/diagnostic/refresh`).
+/// - `LogMessage`/`ShowMessage` travel on a **bounded** channel
+///   ([`WINDOW_NOTIFICATION_QUEUE_CAPACITY`]) with drop-on-full: a downstream
+///   server stuck in a tight logMessage loop must not grow memory without
+///   bound or starve `DiagnosticRefresh` behind a burst (the forwarding loop
+///   drains the unbounded channel first). Within the bounded channel FIFO
+///   order is preserved, which the showMessage gating e2e relies on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
@@ -56,6 +60,12 @@ pub(crate) enum UpstreamNotification {
     /// `message` is already prefixed with the originating server name.
     ShowMessage { typ: MessageType, message: String },
 }
+
+/// Capacity of the bounded `window/*` forwarding queue. Sized like the
+/// outbound queue (`OUTBOUND_QUEUE_CAPACITY`): large enough that drops require
+/// a downstream server flooding faster than the editor drains for a sustained
+/// burst.
+pub(crate) const WINDOW_NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 
 /// Liveness channel endpoints for the reader task.
 ///
@@ -74,7 +84,7 @@ struct LivenessParams {
 /// Groups the parameters that `handle_server_request` and
 /// `forward_notification` need: the downstream server name (for logging and
 /// message prefixes), the response channel, the dynamic capability registry,
-/// the upstream notification channel, the workspace folders this connection
+/// the upstream notification channels, the workspace folders this connection
 /// was initialized with (the bridge advertises the
 /// `workspace.workspaceFolders` capability, so servers may query them), and
 /// the per-server `forwardShowMessage` config gate (#378).
@@ -82,7 +92,10 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) server_name: Option<String>,
     pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
     pub(crate) dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+    /// Loss-intolerant notifications (`DiagnosticRefresh`); unbounded.
     pub(crate) upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    /// Best-effort `window/*` notifications; bounded, dropped when full.
+    pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
     pub(crate) workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
     /// Per-server config gate for forwarding `window/showMessage` (#378).
     pub(crate) forward_show_message: bool,
@@ -289,6 +302,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+    let (window_tx, _window_rx) = mpsc::channel(16);
     spawn_reader_task_for_server(
         reader,
         router,
@@ -299,6 +313,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         },
     )
@@ -369,6 +384,7 @@ async fn reader_loop(
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+    let (window_tx, _window_rx) = mpsc::channel(16);
     let liveness = LivenessParams {
         timeout: None,
         start_rx,
@@ -381,6 +397,7 @@ async fn reader_loop(
         dynamic_capabilities,
         upstream_tx,
         workspace_folders: Arc::new(None),
+        window_tx,
         forward_show_message: false,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
@@ -609,14 +626,15 @@ fn forward_notification(
         Some("window/logMessage") => {
             // Deserialize from a reference to avoid cloning the params value.
             match LogMessageParams::deserialize(&message["params"]) {
-                Ok(params) => {
-                    // Send failure means the forwarding loop is gone (server
-                    // shutdown) - nothing useful to do with the message then.
-                    let _ = deps.upstream_tx.send(UpstreamNotification::LogMessage {
+                Ok(params) => send_window_notification(
+                    deps,
+                    server_prefix,
+                    "window/logMessage",
+                    UpstreamNotification::LogMessage {
                         typ: params.typ,
                         message: prefixed_message(deps.server_name.as_deref(), &params.message),
-                    });
-                }
+                    },
+                ),
                 Err(e) => debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Dropping window/logMessage with invalid params: {}",
@@ -635,12 +653,15 @@ fn forward_notification(
                 return;
             }
             match ShowMessageParams::deserialize(&message["params"]) {
-                Ok(params) => {
-                    let _ = deps.upstream_tx.send(UpstreamNotification::ShowMessage {
+                Ok(params) => send_window_notification(
+                    deps,
+                    server_prefix,
+                    "window/showMessage",
+                    UpstreamNotification::ShowMessage {
                         typ: params.typ,
                         message: prefixed_message(deps.server_name.as_deref(), &params.message),
-                    });
-                }
+                    },
+                ),
                 Err(e) => debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Dropping window/showMessage with invalid params: {}",
@@ -650,6 +671,33 @@ fn forward_notification(
             }
         }
         _ => {}
+    }
+}
+
+/// Enqueue a `window/*` notification on the bounded best-effort channel.
+///
+/// `try_send` keeps the reader task non-blocking: a full queue (editor slower
+/// than a downstream notification flood) drops the message instead of growing
+/// memory or stalling stdout reads; a closed queue (shutdown) has no one left
+/// to deliver to. Both are deliberate per the loss-tolerance split documented
+/// on [`UpstreamNotification`].
+fn send_window_notification(
+    deps: &ServerRequestDeps,
+    server_prefix: &str,
+    method: &str,
+    notification: UpstreamNotification,
+) {
+    if let Err(e) = deps.window_tx.try_send(notification) {
+        debug!(
+            target: "kakehashi::bridge::reader",
+            "{}Dropping {} ({})",
+            server_prefix,
+            method,
+            match e {
+                mpsc::error::TrySendError::Full(_) => "window notification queue full",
+                mpsc::error::TrySendError::Closed(_) => "forwarding loop gone",
+            }
+        );
     }
 }
 
@@ -808,7 +856,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Answering workspace/workspaceFolders from initialize-time folders",
-                lang_prefix
+                server_prefix
             );
             Ok(serde_json::to_value(deps.workspace_folders.as_ref())
                 .unwrap_or(serde_json::Value::Null))
@@ -931,15 +979,17 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let caps = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
-        (deps, (rx, upstream_rx))
+        (deps, (rx, upstream_rx, window_rx))
     }
 
     #[tokio::test]
@@ -984,34 +1034,36 @@ mod tests {
         assert_eq!(router.pending_count(), 1);
     }
 
-    /// Deps wired with a server name, exposing the upstream receiver so tests
-    /// can assert what was (not) forwarded to the editor.
+    /// Deps wired with a server name, exposing the bounded window receiver so
+    /// tests can assert what was (not) forwarded to the editor.
     fn server_request_deps_for(
         server_name: Option<&str>,
         forward_show_message: bool,
     ) -> (
         ServerRequestDeps,
-        mpsc::UnboundedReceiver<UpstreamNotification>,
+        mpsc::Receiver<UpstreamNotification>,
         impl std::any::Any,
     ) {
         let (tx, rx) = mpsc::channel(16);
         let caps = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: server_name.map(String::from),
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message,
         };
-        (deps, upstream_rx, rx)
+        (deps, window_rx, (rx, upstream_rx))
     }
 
     #[tokio::test]
     async fn handle_message_forwards_window_log_message_upstream() {
         let router = ResponseRouter::new();
-        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -1021,7 +1073,7 @@ mod tests {
 
         handle_message(notification, &router, "", &deps).await;
 
-        let forwarded = upstream_rx
+        let forwarded = window_rx
             .try_recv()
             .expect("window/logMessage should be forwarded upstream");
         assert_eq!(
@@ -1036,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn handle_message_drops_window_log_message_with_invalid_params() {
         let router = ResponseRouter::new();
-        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -1047,7 +1099,7 @@ mod tests {
         handle_message(notification, &router, "", &deps).await;
 
         assert!(
-            upstream_rx.try_recv().is_err(),
+            window_rx.try_recv().is_err(),
             "window/logMessage with unparseable params must be dropped, not forwarded"
         );
     }
@@ -1055,7 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn handle_message_drops_window_show_message_when_gate_disabled() {
         let router = ResponseRouter::new();
-        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -1066,7 +1118,7 @@ mod tests {
         handle_message(notification, &router, "", &deps).await;
 
         assert!(
-            upstream_rx.try_recv().is_err(),
+            window_rx.try_recv().is_err(),
             "window/showMessage must not reach the editor unless forwardShowMessage is enabled"
         );
     }
@@ -1074,7 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn handle_message_forwards_window_show_message_when_gate_enabled() {
         let router = ResponseRouter::new();
-        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), true);
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"), true);
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -1084,7 +1136,7 @@ mod tests {
 
         handle_message(notification, &router, "", &deps).await;
 
-        let forwarded = upstream_rx
+        let forwarded = window_rx
             .try_recv()
             .expect("window/showMessage should be forwarded when the gate is enabled");
         assert_eq!(
@@ -1093,6 +1145,54 @@ mod tests {
                 typ: tower_lsp_server::ls_types::MessageType::ERROR,
                 message: "[kakehashi:mock-ls] important popup".to_string(),
             }
+        );
+    }
+
+    /// A full window queue drops the notification instead of blocking the
+    /// reader or growing memory (the loss-tolerance split documented on
+    /// UpstreamNotification).
+    #[tokio::test]
+    async fn handle_message_drops_window_log_message_when_queue_full() {
+        let router = ResponseRouter::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let caps = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, mut window_rx) = mpsc::channel(1);
+        let deps = ServerRequestDeps {
+            server_name: Some("mock-ls".to_string()),
+            response_tx: tx,
+            dynamic_capabilities: caps,
+            upstream_tx,
+            window_tx,
+            workspace_folders: Arc::new(None),
+            forward_show_message: false,
+        };
+
+        let notification = |text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "window/logMessage",
+                "params": { "type": 3, "message": text }
+            })
+        };
+
+        // Capacity 1: the first message fills the queue, the second must be
+        // dropped without blocking (this await completing IS the assertion
+        // that the reader path stays non-blocking on a full queue).
+        handle_message(notification("first"), &router, "", &deps).await;
+        handle_message(notification("second"), &router, "", &deps).await;
+
+        let forwarded = window_rx.try_recv().expect("first message is delivered");
+        assert_eq!(
+            forwarded,
+            UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::INFO,
+                message: "[kakehashi:mock-ls] first".to_string(),
+            }
+        );
+        assert!(
+            window_rx.try_recv().is_err(),
+            "second message must be dropped when the bounded queue is full"
         );
     }
 
@@ -1487,12 +1587,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1533,6 +1635,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // First register a capability
         dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
@@ -1548,6 +1651,7 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1588,12 +1692,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1630,12 +1736,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1676,6 +1784,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(1);
         let folders = vec![tower_lsp_server::ls_types::WorkspaceFolder {
             uri: "file:///repo".parse().unwrap(),
             name: "repo".to_string(),
@@ -1685,6 +1794,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            window_tx,
             workspace_folders: Arc::new(Some(folders)),
             forward_show_message: false,
         };
@@ -1718,11 +1828,13 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(1);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            window_tx,
             workspace_folders: Arc::new(None),
             forward_show_message: false,
         };
@@ -1756,12 +1868,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1831,12 +1945,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1865,12 +1981,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1906,6 +2024,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // Pre-register a capability so we can verify it's NOT removed
         dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
@@ -1920,6 +2039,7 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
@@ -1966,6 +2086,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(1);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // Fill the channel with a dummy message to create backpressure
         response_tx
@@ -1980,6 +2101,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
         let handle = tokio::spawn(async move {
@@ -2025,6 +2147,7 @@ mod tests {
         let (response_tx, response_rx) = mpsc::channel(1);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // Drop the receiver to simulate a closed channel
         drop(response_rx);
@@ -2035,6 +2158,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
             forward_show_message: false,
         };
 
