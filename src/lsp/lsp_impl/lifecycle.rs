@@ -347,6 +347,8 @@ impl Kakehashi {
 /// Currently handles:
 /// - `DiagnosticRefresh`: forwards `workspace/diagnostic/refresh` to trigger a
 ///   fresh diagnostic pull from the editor.
+/// - `LogMessage`: forwards a downstream `window/logMessage` (already prefixed
+///   with the originating server name) to the editor's log (#378).
 ///
 /// Exits when:
 /// - The channel is closed (all senders dropped), OR
@@ -379,6 +381,9 @@ async fn upstream_forwarding_loop(
                                 e
                             );
                         }
+                    }
+                    Some(UpstreamNotification::LogMessage { typ, message }) => {
+                        client.log_message(typ, message).await;
                     }
                     None => break, // Channel closed
                 }

@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
+use tower_lsp_server::ls_types::{LogMessageParams, MessageType};
 
 use super::super::connection::BridgeReader;
 use super::OutboundMessage;
@@ -39,6 +40,9 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
+    /// Forward a downstream `window/logMessage` to the editor.
+    /// `message` is already prefixed with the originating server name.
+    LogMessage { typ: MessageType, message: String },
 }
 
 /// Liveness channel endpoints for the reader task.
@@ -547,12 +551,12 @@ async fn handle_message(
             handle_server_request(message, lang_prefix, deps).await;
         }
         MessageKind::Notification => {
-            // Server-initiated notifications are not forwarded upstream today;
             // `publishDiagnostics` targeting a pipeline *scratch* document is
             // discarded EXPLICITLY (concatenated-formatting-pipeline Decision
             // point 7: scratch state is speculative and must never reach the
-            // editor) so the invariant survives if notification forwarding is
-            // ever implemented. Everything else is silently ignored.
+            // editor). The if/else makes the discard structural: notification
+            // forwarding lives on the else side, where a scratch-targeted
+            // publishDiagnostics can never reach it.
             if is_scratch_publish_diagnostics(&message) {
                 debug!(
                     target: "kakehashi::bridge::reader",
@@ -560,10 +564,7 @@ async fn handle_message(
                     lang_prefix
                 );
             } else {
-                // All other notifications are silently ignored. The if/else
-                // makes the scratch discard structural: any future
-                // notification forwarding belongs HERE, where a
-                // scratch-targeted publishDiagnostics can never reach it.
+                forward_notification(&message, lang_prefix, deps);
             }
         }
         MessageKind::Invalid => {
@@ -574,6 +575,46 @@ async fn handle_message(
                 message
             );
         }
+    }
+}
+
+/// Forward supported downstream notifications to the upstream editor.
+///
+/// `window/logMessage` is forwarded unconditionally: it is the lowest-risk
+/// notification (editors surface it in a log buffer, not the UI) and is often
+/// the only way to debug downstream servers that have no file-based logging.
+/// The message is prefixed with the originating server name so output from
+/// multiple bridged servers stays distinguishable.
+///
+/// Everything else is still silently ignored ($/progress: #379, push-based
+/// publishDiagnostics: #380).
+fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &ServerRequestDeps) {
+    if message["method"].as_str() == Some("window/logMessage") {
+        match serde_json::from_value::<LogMessageParams>(message["params"].clone()) {
+            Ok(params) => {
+                // Send failure means the forwarding loop is gone (server
+                // shutdown) - nothing useful to do with the message then.
+                let _ = deps.upstream_tx.send(UpstreamNotification::LogMessage {
+                    typ: params.typ,
+                    message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                });
+            }
+            Err(e) => debug!(
+                target: "kakehashi::bridge::reader",
+                "{}Dropping window/logMessage with invalid params: {}",
+                lang_prefix,
+                e
+            ),
+        }
+    }
+}
+
+/// `[kakehashi:<server>] <message>` — tells the user which downstream server
+/// a forwarded `window/*` notification came from (#378).
+fn prefixed_message(server_name: Option<&str>, message: &str) -> String {
+    match server_name {
+        Some(name) => format!("[kakehashi:{name}] {message}"),
+        None => format!("[kakehashi] {message}"),
     }
 }
 
@@ -882,6 +923,71 @@ mod tests {
 
         // Pending count should still be 1 (notification was ignored)
         assert_eq!(router.pending_count(), 1);
+    }
+
+    /// Deps wired with a server name, exposing the upstream receiver so tests
+    /// can assert what was (not) forwarded to the editor.
+    fn server_request_deps_for(
+        server_name: Option<&str>,
+    ) -> (
+        ServerRequestDeps,
+        mpsc::UnboundedReceiver<UpstreamNotification>,
+        impl std::any::Any,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let caps = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        let deps = ServerRequestDeps {
+            server_name: server_name.map(String::from),
+            response_tx: tx,
+            dynamic_capabilities: caps,
+            upstream_tx,
+        };
+        (deps, upstream_rx, rx)
+    }
+
+    #[tokio::test]
+    async fn handle_message_forwards_window_log_message_upstream() {
+        let router = ResponseRouter::new();
+        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/logMessage",
+            "params": { "type": 3, "message": "downstream says hi" }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        let forwarded = upstream_rx
+            .try_recv()
+            .expect("window/logMessage should be forwarded upstream");
+        assert_eq!(
+            forwarded,
+            UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::INFO,
+                message: "[kakehashi:mock-ls] downstream says hi".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_drops_window_log_message_with_invalid_params() {
+        let router = ResponseRouter::new();
+        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/logMessage",
+            "params": { "message": 42 }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "window/logMessage with unparseable params must be dropped, not forwarded"
+        );
     }
 
     #[tokio::test]
