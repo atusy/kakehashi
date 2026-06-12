@@ -14,9 +14,9 @@ but it leaves a gap: layers whose language has **no bridge server configured**
 (or none installed on the user's machine) get nothing, even though the
 tree-sitter tree already contains enough structure to answer most
 within-document lookups. A native, tree-sitter-only resolver can serve
-`textDocument/definition`, `references`, and `documentHighlight` for those
-layers — best-effort by design, since the bridge remains the 100%-accuracy
-path.
+`textDocument/definition`, `references`, `documentHighlight`, and
+best-effort `rename` for those layers — best-effort by design, since the
+bridge remains the 100%-accuracy path.
 
 Two constraints shape the design:
 
@@ -65,7 +65,13 @@ that asset, never by editing Rust.
 
 The existing `QueryKind::Locals` pipeline (loading, storage, auto-install of
 `locals.scm`) is **removed** in the same change — it is consumerless today,
-and its semantics are not ours to define.
+and its semantics are not ours to define. `bindings` joins the config-time
+`QueryKind` set in its place (`kind = "bindings"` in explicit query entries,
+filename inference for `bindings.scm`). An explicit `kind = "locals"` in
+user config becomes a hard deserialization error once the variant is gone —
+surfaced as-is rather than aliased, per the delete-on-supersede posture —
+while stale `locals.scm` paths without an explicit kind are already skipped
+silently by filename inference.
 
 ### Capture vocabulary
 
@@ -78,19 +84,20 @@ and its semantics are not ours to define.
 ### Properties
 
 All language semantics are declared with `#set!` (static, parsed once per
-pattern — the same machinery captures-protocol documents). A property key may
-be prefixed with a capture's full name suffix to target one capture in a
-multi-capture pattern: bare `definition.visibility` applies to every
-`@definition*` capture in the pattern; `definition.parameter.visibility`
-applies only to `@definition.parameter`.
+pattern — the same machinery captures-protocol documents). A bare
+`(#set! definition.visibility "after")` applies to every `@definition*`
+capture in the pattern; targeting one capture in a multi-capture pattern
+uses the capture-scoped form that machinery already parses,
+`(#set! @definition.parameter definition.visibility "after")` — so labels
+carry no grammar of their own and no new property-key syntax is introduced.
 
 | Property | Values | Declares |
 |---|---|---|
-| `definition.scope` | `local` (default) / `parent` / `global` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, or the layer root. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name. |
-| `definition.visibility` | `scope` (default) / `after` | When the binding becomes visible. `scope` = the whole scope (function hoisting, Python assignments). `after` = from the **end byte of the pattern's match** onward — so in Lua's `local x = x` the right-hand `x` precedes visibility and correctly resolves outward, while `local function f` patterns (where `f` is visible in its own body) simply keep `scope`. |
+| `definition.scope` | `local` (default) / `parent` / `global` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, or the layer root. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. |
+| `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting, Python assignments). `after` = from the **end byte of the pattern's match** onward — in Lua's `local x = x` the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
 | `definition.namespace` | string, default `default` | The binding's namespace. |
 | `reference.namespace` | space-separated strings, default `default` | Namespaces this reference may bind to, searched in order within each scope. A type-position reference declares `"type"`; an ambiguous-position reference declares `"type default"`. Matching is by equality — an unannotated reference does **not** match an annotated definition, which is the conservative direction (silence over a wrong answer). |
-| `scope.inherits` | `true` (default) / `false` | When `false`, lookups from inside this scope (and everything nested in it) stop here — they never see outer bindings. Expresses PHP-style functions that do not capture enclosing locals. |
+| `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable. |
 | `scope.visible-to-nested` | `true` (default) / `false` | When `false`, this scope's bindings are skipped when the lookup walk arrives **from a nested scope**; references directly in the scope still see them. Expresses Python class bodies (methods and comprehensions inside the class do not see class-level names; statements in the body do). |
 
 ### Resolution algorithm (the engine's entire language model)
@@ -100,19 +107,28 @@ Per layer, per parsed version:
 1. Run the layer language's `bindings.scm` over the layer tree. Build the
    scope tree from `@scope` captures (implicit root = the layer), nested by
    node containment.
-2. Register each `@definition` as a binding `(name text, namespace, label,
-   visibility start)` in its scope after applying the `definition.scope`
-   lift. `visibility start` is the scope start for `scope` visibility, the
-   pattern-match end byte for `after`.
+2. Register each `@definition` in its scope after applying the
+   `definition.scope` lift. A definition whose `(name, namespace)` already
+   exists in the registering scope does not create a second binding — it
+   adds a **definition site** to the existing one, so re-assignment
+   (`x = 1` … `x = 2`) yields one binding with two sites, never two
+   competing bindings. Each site records its label and its visibility
+   start: the **registering** scope's start byte for `scope` visibility,
+   the pattern-match end byte for `after`, the definition node's start
+   byte for `declaration`.
 3. For a `@reference` with name `N`, namespaces `NS`, at position `P`: walk
    scopes innermost → outermost. In each scope, for each namespace in `NS`
-   order, the candidates are bindings named `N` in that namespace. Pick the
-   candidate with the **latest visibility start that does not exceed `P`**
-   (natural shadowing and re-binding); if none precedes `P` but a
-   `scope`-visibility candidate exists, pick the first one (hoisting). Skip a
+   order, look up the binding named `N` in that namespace; it is visible
+   when at least one of its sites has visibility start **at or before**
+   `P`. The first visible binding ends the walk (natural shadowing). The
+   definition site reported for it is the one with the latest start byte
+   at or before `P` (re-binding resolves to the nearest preceding site);
+   when every site starts after `P` — possible only under `scope`
+   visibility, i.e. hoisting — the earliest site is reported. Skip a
    scope's bindings when it has `visible-to-nested false` and is not the
-   innermost scope containing `P`; stop the walk entirely after a scope with
-   `inherits false`.
+   innermost scope containing `P`; stop the walk for a namespace once a
+   scope's `inherits` setting excludes it (`false` excludes every
+   namespace).
 4. No candidate anywhere → the reference is **unresolved**. Unresolved is a
    first-class outcome, not an error.
 
@@ -132,14 +148,15 @@ outcome the second design constraint forbids.
 
 | Feature | Native behavior |
 |---|---|
-| `textDocument/definition` | Resolved binding → its definition node's range. On a definition node itself → that node. |
-| `textDocument/references` | All references in the layer that resolve to the same binding; the definition included per `includeDeclaration`. |
-| `textDocument/documentHighlight` | Same set as references, kind `Text`. (`Read`/`Write` distinction would require knowing which syntactic positions write — expressible later as a `reference.write` property, not as engine knowledge.) |
-| `textDocument/rename` | **Included, best-effort.** Resolved binding → a `WorkspaceEdit` renaming the definition node and every reference resolving to it, layer-confined by construction. `prepareRename` answers only when the cursor's identifier resolves natively; otherwise it returns nothing and the bridge/aggregation path owns the request — so the native resolver never offers a rename it cannot ground. The residual risk is accepted and documented: an identifier the query failed to capture (or that binds dynamically) survives the rename, softening rename's all-or-nothing contract into best-effort — the same accuracy posture as every other feature here. |
+| `textDocument/definition` | Resolved reference → the range of the definition site step 3 reports. On a definition node itself → that node. |
+| `textDocument/references` | All references in the layer that resolve to the same binding; the binding's definition sites included per `includeDeclaration`. |
+| `textDocument/documentHighlight` | The references set with the binding's definition sites always included (the request has no `includeDeclaration` parameter), kind `Text`. (`Read`/`Write` distinction would require knowing which syntactic positions write — expressible later as a `reference.write` property, not as engine knowledge.) |
+| `textDocument/rename` | **Included, best-effort.** Resolved binding → a `WorkspaceEdit` renaming every definition site and every reference resolving to it, layer-confined by construction. `prepareRename` answers only when the cursor's identifier resolves natively; otherwise it returns nothing and the bridge/aggregation path owns the request — so the native resolver never offers a rename it cannot ground. Clients without `prepareSupport` send `rename` directly; the same resolve-or-silence rule applies there, not only via the prepare gate. The residual risk is accepted and documented: an identifier the query failed to capture (or that binds dynamically) survives the rename, softening rename's all-or-nothing contract into best-effort — the same accuracy posture as every other feature here. |
 
 How a native answer and a bridge answer for the same request combine (order,
 dedup, precedence) is governed by cross-layer-aggregation, not duplicated
-here; the native resolver is one more per-layer producer.
+here; the native resolver is one more producer feeding that record's
+`native` result layer.
 
 ### Layering
 
@@ -164,7 +181,7 @@ statically, but unlike the above it has a sanctioned in-spec approximation
 
 ### A. Adopt the nvim-treesitter `locals.scm` vocabulary (compatibility superset)
 
-The ~200 existing ecosystem files would work day one. Rejected: the files
+The ~150 existing ecosystem files would work day one. Rejected: the files
 are explicitly legacy (the plugin itself no longer reads them), their
 vocabulary cannot carry visibility/namespace/inheritance semantics without
 contortions, and compatibility would freeze kakehashi to a spec whose
@@ -189,8 +206,9 @@ spirit as `scope.inherits`.
 
 ### D. `tags.scm`-style flat definition/reference pairs (GitHub code-nav)
 
-No scope tree at all; matching is document-global by text. That is precisely
-the fuzzy baseline this decision exists to beat. Rejected.
+No lexical resolution — its local-scope tracking exists only to *exclude*
+local names from the index; matching is document-global by text. That is
+precisely the fuzzy baseline this decision exists to beat. Rejected.
 
 ### E. Per-language resolution logic in Rust
 
@@ -201,9 +219,9 @@ engine, and so the engine's test surface is the property semantics alone.
 
 ### F. Concatenated virtual-document scope trees in v1
 
-Running resolution over the same concatenated region view the bridge's
-virtual documents use would give cross-block resolution in Markdown for
-free. Deferred, not rejected: per-layer trees are strictly simpler, and the
+Running resolution over the concatenated region view the bridge's
+virtual-document model specifies for `isolation=false` (not yet
+implemented) would give cross-block resolution in Markdown for free. Deferred, not rejected: per-layer trees are strictly simpler, and the
 concatenation model carries its own offset-mapping machinery that should be
 shared, not duplicated, when this is attempted.
 
@@ -242,8 +260,9 @@ posture because the definition *site* shown is still textually real.
 ### Positive
 
 * Languages without a configured bridge server get definition / references /
-  documentHighlight from the tree-sitter tree alone — and the path to better
-  accuracy is editing a `.scm` asset, with no Rust release.
+  documentHighlight / best-effort rename from the tree-sitter tree alone —
+  and the path to better accuracy is editing a `.scm` asset, with no Rust
+  release.
 * The engine's correctness surface is small and language-free: scope-tree
   construction plus six property semantics. It can be tested exhaustively
   with synthetic fixtures, while per-language assets are validated separately
@@ -271,6 +290,11 @@ posture because the definition *site* shown is still textually real.
   fails to capture survive a rename and must be found by the user (or a
   bridge server). The `prepareRename` gate bounds *when* a rename is offered,
   not *how complete* it is.
+* Removing `QueryKind::Locals` is a breaking config change: explicit
+  `kind = "locals"` query entries fail deserialization with an
+  unknown-variant error. No alias is kept; the migration is deleting the
+  entry (or authoring a `bindings.scm` replacement — the old asset's
+  vocabulary does not carry over).
 
 ### Neutral
 
@@ -281,6 +305,12 @@ posture because the definition *site* shown is still textually real.
 * Whether `bindings.scm` is added to the auto-install `QUERY_FILES` set is
   an install-source question (there is no upstream corpus to fetch — assets
   are kakehashi-authored), tracked with the install pipeline, not here.
+* Scope tree and bindings are pure functions of (layer tree, query) —
+  computed once per parsed version. `references`/`documentHighlight`
+  resolve every reference in the layer per request; whether those results
+  are cached alongside the tree or recomputed per request is an
+  implementation question (captures-protocol's recompute posture is the
+  precedent), not a spec one.
 
 ## Decision–Implementation Gap
 
