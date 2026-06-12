@@ -400,7 +400,7 @@ languages = ["lua"]
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("request(s) failed"),
+        String::from_utf8_lossy(&output.stderr).contains("operation(s) failed"),
         "stderr should report the failed request; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

@@ -199,9 +199,20 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         Some(f) if changed => f.as_str(),
         _ => text.as_str(),
     };
-    print!("{output}");
+    // SIGPIPE is ignored in format mode (the bridge needs BrokenPipe as a
+    // recoverable error), so a consumer that stops reading surfaces here as
+    // a write error instead of killing the process. A broken pipe is the
+    // consumer's normal early exit (`kakehashi format … | head`), not ours.
     use std::io::Write as _;
-    let _ = std::io::stdout().flush();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout
+        .write_all(output.as_bytes())
+        .and_then(|()| stdout.flush())
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        eprintln!("error: failed to write stdout: {e}");
+        return EXIT_ERROR;
+    }
 
     if !outcome.server_failures.is_empty() {
         EXIT_ERROR
@@ -340,6 +351,15 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     tmp.as_file()
         .set_permissions(std::fs::metadata(&target)?.permissions())?;
     tmp.persist(&target).map_err(|e| e.error)?;
+    // Best-effort directory fsync: on some filesystems the rename's
+    // directory-entry update is itself buffered, so without this a power
+    // loss could revert the name to the old inode. The data is already
+    // durable either way (sync_all above), so failure here is not an error.
+    if let Some(dir) = target.parent()
+        && let Ok(dir_handle) = std::fs::File::open(dir)
+    {
+        let _ = dir_handle.sync_all();
+    }
     Ok(())
 }
 

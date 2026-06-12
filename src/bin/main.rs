@@ -223,9 +223,14 @@ fn main() -> ExitCode {
     }
 
     // LSP server mode keeps SIGPIPE ignored so the bridge sees a closed
-    // downstream peer as a recoverable BrokenPipe error; subcommands keep the
+    // downstream peer as a recoverable BrokenPipe error. The format command
+    // drives the same bridge (it writes to downstream language-server
+    // stdin), so it needs the same disposition — otherwise a crashed
+    // downstream server would kill the CLI with SIGPIPE instead of exiting 2
+    // with a useful error; its own stdout writes handle BrokenPipe
+    // explicitly (see `cli::format::run_stdin`). Other subcommands keep the
     // default disposition restored above.
-    if cli.command.is_none() {
+    if matches!(cli.command, None | Some(Commands::Format { .. })) {
         ignore_sigpipe();
     }
 

@@ -173,8 +173,10 @@ impl Kakehashi {
 
         let request_errors = request_errors.load(std::sync::atomic::Ordering::Relaxed);
         if request_errors > 0 {
+            // "operation(s)": the counter also covers capability-probe
+            // failures and pipeline step timeouts, not just request errors.
             server_failures.push(format!(
-                "{request_errors} downstream formatting request(s) failed \
+                "{request_errors} downstream formatting operation(s) failed \
                  (run with RUST_LOG=kakehashi=warn for details)"
             ));
         }
