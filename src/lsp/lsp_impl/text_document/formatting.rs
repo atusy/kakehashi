@@ -477,6 +477,13 @@ impl Kakehashi {
 /// ready-wait. `None` in LSP mode, where failed requests are log-only
 /// because the editor retries; `Some` in CLI mode, where a one-shot run
 /// must map them onto a non-zero exit instead of "nothing changed".
+///
+/// Counts **observed** failures only, by design: a request abandoned
+/// because a racing layer or higher-priority server already won (its future
+/// dropped mid-flight by `race_layers_preferred` or the preferred fan-in)
+/// was *cancelled*, not failed — it never produced a verdict, and counting
+/// it would require draining every loser to completion, trading the race's
+/// latency win for accounting of requests whose outcome no longer matters.
 pub(crate) type RequestErrorSink = Option<Arc<std::sync::atomic::AtomicUsize>>;
 
 /// Add `n` request failures to the sink, if one is installed.

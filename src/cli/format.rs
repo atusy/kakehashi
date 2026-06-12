@@ -293,7 +293,10 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             "{changed} file(s) would be reformatted, {unchanged} already formatted{error_suffix}"
         );
     } else {
-        eprintln!("{changed} file(s) reformatted, {unchanged} unchanged{error_suffix}");
+        // Write failures stay in `changed` for exit-code purposes, but the
+        // summary must not claim a file was reformatted when its write failed.
+        let reformatted = changed - write_errors;
+        eprintln!("{reformatted} file(s) reformatted, {unchanged} unchanged{error_suffix}");
     }
 
     if errors > 0 {
