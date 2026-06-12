@@ -215,7 +215,9 @@ enabled = true
                 "languages": {
                     "markdown": {
                         "layers": {
-                            "textDocument/definition": { "order": ["virt", "native"] }
+                            "aggregation": {
+                                "textDocument/definition": { "order": ["virt", "native"] }
+                            }
                         }
                     }
                 }
@@ -338,7 +340,7 @@ fn e2e_host_formatting_concatenated_threads_virt_then_host() {
 [languages.markdown.bridge._self]
 enabled = true
 
-[languages.markdown.layers."textDocument/formatting"]
+[languages.markdown.layers.aggregation."textDocument/formatting"]
 strategy = "concatenated"
 "#,
     )

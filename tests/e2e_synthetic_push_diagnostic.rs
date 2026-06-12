@@ -393,7 +393,9 @@ fn e2e_synthetic_push_respects_layers_gate() {
                 "languages": {
                     "markdown": {
                         "layers": {
-                            "textDocument/publishDiagnostics": { "order": ["native"] }
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "order": ["native"] }
+                            }
                         }
                     }
                 }

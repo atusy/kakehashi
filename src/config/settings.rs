@@ -104,8 +104,24 @@ pub enum LayerSource {
     Virt,
 }
 
+/// Cross-layer configuration for one host language
+/// (cross-layer-aggregation). Lives at `languages.<lang>.layers`.
+///
+/// The per-method map sits under `aggregation`, mirroring
+/// `bridge.<key>.aggregation`: "aggregation" uniformly names the
+/// method-keyed map across the config, and `layers` keeps headroom for
+/// future layer-wide fields without colliding with method names.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LayersConfig {
+    /// Per-method cross-layer aggregation. Key = LSP method name (e.g.,
+    /// `textDocument/formatting`) or `"_"` for the method wildcard.
+    #[serde(default)]
+    pub aggregation: Option<HashMap<String, LayerAggregationConfig>>,
+}
+
 /// Per-method cross-layer aggregation configuration
-/// (cross-layer-aggregation). Lives in `LanguageSettings::layers`, keyed by
+/// (cross-layer-aggregation). Lives in `LayersConfig::aggregation`, keyed by
 /// LSP method name or `"_"` for the method wildcard.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -396,11 +412,11 @@ pub struct LanguageSettings {
     pub queries: Option<Vec<QueryItem>>,
     /// Omit to bridge all configured languages (default). Use an empty object `{}` to disable bridging. Use `{ "python": { "enabled": true } }` to bridge specific languages.
     pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
-    /// Per-method cross-layer aggregation (cross-layer-aggregation).
-    /// Key = LSP method name or `"_"` for the method wildcard; value orders
-    /// the result layers (`virt`/`host`/`native`) for that method.
+    /// Cross-layer configuration (cross-layer-aggregation): the
+    /// `aggregation` map under it orders the result layers
+    /// (`virt`/`host`/`native`) per LSP method (`"_"` = method wildcard).
     /// Omit to use the default order `["virt", "host", "native"]`.
-    pub layers: Option<HashMap<String, LayerAggregationConfig>>,
+    pub layers: Option<LayersConfig>,
     /// Deprecated: use `base` on the derived language instead.
     /// Alternative languageId values that should use this parser.
     pub aliases: Option<Vec<String>>,
@@ -415,13 +431,17 @@ impl LanguageSettings {
     /// `order` is a single field: a method-specific `order` replaces the
     /// wildcard's list wholesale, it does not merge element-wise.
     pub(crate) fn resolve_layers(&self, method: &str) -> ResolvedLayerConfig {
-        let entry = self.layers.as_ref().and_then(|map| {
-            crate::config::resolve_with_wildcard(
-                map,
-                method,
-                crate::config::merge_layer_aggregation_configs,
-            )
-        });
+        let entry = self
+            .layers
+            .as_ref()
+            .and_then(|layers| layers.aggregation.as_ref())
+            .and_then(|map| {
+                crate::config::resolve_with_wildcard(
+                    map,
+                    method,
+                    crate::config::merge_layer_aggregation_configs,
+                )
+            });
         match entry {
             Some(cfg) => ResolvedLayerConfig {
                 // Dedup defensively (first occurrence wins): a repeated layer
@@ -1582,13 +1602,15 @@ kind = "injections""#;
     #[test]
     fn resolve_layers_uses_method_specific_entry() {
         let settings = LanguageSettings {
-            layers: Some(HashMap::from([(
-                "textDocument/hover".to_string(),
-                LayerAggregationConfig {
-                    order: Some(vec![LayerSource::Host, LayerSource::Virt]),
-                    strategy: None,
-                },
-            )])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Host, LayerSource::Virt]),
+                        strategy: None,
+                    },
+                )])),
+            }),
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
@@ -1604,22 +1626,24 @@ kind = "injections""#;
         // Field-level wildcard merge: the method entry sets strategy only,
         // the "_" entry supplies order.
         let settings = LanguageSettings {
-            layers: Some(HashMap::from([
-                (
-                    WILDCARD_KEY.to_string(),
-                    LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Native]),
-                        strategy: None,
-                    },
-                ),
-                (
-                    "textDocument/hover".to_string(),
-                    LayerAggregationConfig {
-                        order: None,
-                        strategy: Some(AggregationStrategy::Concatenated),
-                    },
-                ),
-            ])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([
+                    (
+                        WILDCARD_KEY.to_string(),
+                        LayerAggregationConfig {
+                            order: Some(vec![LayerSource::Native]),
+                            strategy: None,
+                        },
+                    ),
+                    (
+                        "textDocument/hover".to_string(),
+                        LayerAggregationConfig {
+                            order: None,
+                            strategy: Some(AggregationStrategy::Concatenated),
+                        },
+                    ),
+                ])),
+            }),
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
@@ -1630,22 +1654,24 @@ kind = "injections""#;
     #[test]
     fn resolve_layers_method_order_replaces_wildcard_order_wholesale() {
         let settings = LanguageSettings {
-            layers: Some(HashMap::from([
-                (
-                    WILDCARD_KEY.to_string(),
-                    LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Native, LayerSource::Host]),
-                        strategy: None,
-                    },
-                ),
-                (
-                    "textDocument/hover".to_string(),
-                    LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Virt]),
-                        strategy: None,
-                    },
-                ),
-            ])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([
+                    (
+                        WILDCARD_KEY.to_string(),
+                        LayerAggregationConfig {
+                            order: Some(vec![LayerSource::Native, LayerSource::Host]),
+                            strategy: None,
+                        },
+                    ),
+                    (
+                        "textDocument/hover".to_string(),
+                        LayerAggregationConfig {
+                            order: Some(vec![LayerSource::Virt]),
+                            strategy: None,
+                        },
+                    ),
+                ])),
+            }),
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
@@ -1659,13 +1685,15 @@ kind = "injections""#;
     #[test]
     fn resolve_layers_empty_order_disables_all_layers() {
         let settings = LanguageSettings {
-            layers: Some(HashMap::from([(
-                WILDCARD_KEY.to_string(),
-                LayerAggregationConfig {
-                    order: Some(vec![]),
-                    strategy: None,
-                },
-            )])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([(
+                    WILDCARD_KEY.to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![]),
+                        strategy: None,
+                    },
+                )])),
+            }),
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");
@@ -1676,17 +1704,19 @@ kind = "injections""#;
     #[test]
     fn resolve_layers_dedups_repeated_layers_first_occurrence_wins() {
         let settings = LanguageSettings {
-            layers: Some(HashMap::from([(
-                WILDCARD_KEY.to_string(),
-                LayerAggregationConfig {
-                    order: Some(vec![
-                        LayerSource::Virt,
-                        LayerSource::Native,
-                        LayerSource::Virt,
-                    ]),
-                    strategy: None,
-                },
-            )])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([(
+                    WILDCARD_KEY.to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![
+                            LayerSource::Virt,
+                            LayerSource::Native,
+                            LayerSource::Virt,
+                        ]),
+                        strategy: None,
+                    },
+                )])),
+            }),
             ..Default::default()
         };
         let resolved = settings.resolve_layers("textDocument/hover");

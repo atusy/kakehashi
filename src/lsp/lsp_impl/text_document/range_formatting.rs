@@ -93,7 +93,7 @@ impl Kakehashi {
             if !self.virt_layer_enabled(&language_name, "textDocument/formatting") {
                 log::debug!(
                     target: "kakehashi::rangeFormatting",
-                    "virt layer disabled for {} via layers.order",
+                    "virt layer disabled for {} via layers.aggregation order",
                     language_name
                 );
                 return Ok(None);
