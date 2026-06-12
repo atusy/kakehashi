@@ -181,6 +181,7 @@ The bridge requires knowing which server to use for each language. Language serv
 | `languageServers.*.cmd` | Yes | Command array: first element is program, rest are arguments |
 | `languageServers.*.languages` | Yes | Languages this server handles |
 | `languageServers.*.initializationOptions` | No | Passed to server's `initialize` request |
+| `languageServers.*.onTypeFormattingTriggers` | No | Trigger characters for bridged `textDocument/onTypeFormatting`; the sorted union is advertised at initialize, and requests are forwarded only when the downstream also declares the typed character (#354) |
 
 #### Per-Host Language Bridge Configuration
 
