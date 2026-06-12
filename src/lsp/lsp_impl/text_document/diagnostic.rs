@@ -238,7 +238,7 @@ impl Kakehashi {
 /// (cross-layer-aggregation): `concatenated` merges every participating
 /// layer's items in `priorities` order; `preferred` returns the first
 /// layer with a non-empty result. Native has no diagnostics contributor.
-fn combine_layer_diagnostics(
+pub(crate) fn combine_layer_diagnostics(
     layer_cfg: &ResolvedLayerConfig,
     virt: Vec<Diagnostic>,
     host: Vec<Diagnostic>,

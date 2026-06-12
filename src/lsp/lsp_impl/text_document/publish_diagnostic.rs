@@ -1,61 +1,103 @@
 //! Shared fan-out/aggregation for proactive `textDocument/publishDiagnostics`
 //! pushes (pull-first-diagnostic-forwarding Phase 2). `DiagnosticScheduler` schedules and handles
 //! superseding (via `SyntheticDiagnosticsManager` / `DebouncedDiagnosticsManager`);
-//! this module just collects per-region diagnostics from a prepared snapshot
-//! using a `JoinSet`.
+//! this module just collects per-layer diagnostics from a prepared snapshot.
 
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
 use url::Url;
 
+use crate::config::settings::ResolvedLayerConfig;
 use crate::lsp::bridge::LanguageServerPool;
-use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
 
-use super::diagnostic::collect_region_diagnostics;
+use super::diagnostic::{
+    collect_host_diagnostics, collect_region_diagnostics, combine_layer_diagnostics,
+};
 
-/// Collect diagnostics from all regions using priority-aware aggregation.
+/// Everything a push-diagnostics task needs, captured at schedule time
+/// (cross-layer-aggregation): the virt layer's per-region contexts, the host
+/// layer's context when host bridging participates, and the resolved
+/// cross-layer config that combines them.
+pub(crate) struct DiagnosticSnapshot {
+    /// Per-region virt contexts; empty when the virt layer is gated off or
+    /// the document has no bridgeable injection regions.
+    pub(crate) virt_contexts: Vec<DocumentRequestContext>,
+    /// Host-layer context (host-document-bridge); `None` unless the host
+    /// layer is in `layers.aggregation` priorities AND `bridge._self` is
+    /// opted in with a capable server.
+    pub(crate) host: Option<HostRequestContext>,
+    /// Cross-layer combine config for `textDocument/publishDiagnostics`.
+    pub(crate) layer_cfg: ResolvedLayerConfig,
+}
+
+impl DiagnosticSnapshot {
+    /// Whether any layer can contribute diagnostics.
+    pub(crate) fn has_contributors(&self) -> bool {
+        !self.virt_contexts.is_empty() || self.host.is_some()
+    }
+}
+
+/// Collect diagnostics from every participating layer using priority-aware
+/// aggregation (cross-layer-aggregation).
 ///
 /// Shared logic for both immediate (didSave/didOpen) and debounced (didChange)
 /// push diagnostics. Returns `None` if there's no snapshot data, or
 /// `Some(diagnostics)` (possibly empty to clear previous diagnostics).
 pub(crate) async fn collect_push_diagnostics(
-    snapshot_data: Option<Vec<DocumentRequestContext>>,
+    snapshot_data: Option<DiagnosticSnapshot>,
     pool: &Arc<LanguageServerPool>,
     uri: &Url,
     log_target: &'static str,
 ) -> Option<Vec<tower_lsp_server::ls_types::Diagnostic>> {
-    let region_contexts = snapshot_data?;
+    let snapshot = snapshot_data?;
 
-    if region_contexts.is_empty() {
+    if !snapshot.has_contributors() {
         log::debug!(
             target: log_target,
-            "No injection regions or bridge configs found in {}",
+            "No diagnostic contributors (regions or host servers) for {}",
             uri
         );
         // Return empty to signal caller should clear diagnostics
         return Some(Vec::new());
     }
 
-    let mut join_set = JoinSet::new();
-    for region_ctx in region_contexts {
-        let pool = Arc::clone(pool);
-        join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
-    }
+    let virt_fut = async {
+        let mut join_set = JoinSet::new();
+        for region_ctx in snapshot.virt_contexts {
+            let pool = Arc::clone(pool);
+            join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
+        }
 
-    let mut all_diagnostics = Vec::new();
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(diags) => all_diagnostics.extend(diags),
-            Err(join_err) => {
-                log::warn!(
-                    target: log_target,
-                    "Diagnostic region task panicked: {}",
-                    join_err
-                );
+        let mut all_diagnostics = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(diags) => all_diagnostics.extend(diags),
+                Err(join_err) => {
+                    log::warn!(
+                        target: log_target,
+                        "Diagnostic region task panicked: {}",
+                        join_err
+                    );
+                }
             }
         }
-    }
+        all_diagnostics
+    };
 
-    Some(all_diagnostics)
+    let host_fut = async {
+        match &snapshot.host {
+            Some(ctx) => collect_host_diagnostics(ctx, Arc::clone(pool)).await,
+            None => Vec::new(),
+        }
+    };
+
+    let (virt_items, host_items) = tokio::join!(virt_fut, host_fut);
+
+    Some(combine_layer_diagnostics(
+        &snapshot.layer_cfg,
+        virt_items,
+        host_items,
+    ))
 }

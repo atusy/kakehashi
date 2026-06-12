@@ -18,8 +18,10 @@ use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use super::bridge::LanguageServerPool;
-use super::lsp_impl::bridge_context::DocumentRequestContext;
-use super::lsp_impl::text_document::publish_diagnostic::collect_push_diagnostics;
+
+use super::lsp_impl::text_document::publish_diagnostic::{
+    DiagnosticSnapshot, collect_push_diagnostics,
+};
 use super::synthetic_diagnostics::SyntheticDiagnosticsManager;
 
 /// Default debounce duration for `didChange` events (500ms).
@@ -43,7 +45,7 @@ struct DebouncedDiagnosticData {
     /// LSP client for publishing diagnostics
     client: Client,
     /// Pre-captured per-region contexts (None if document has no injections)
-    snapshot_data: Option<Vec<DocumentRequestContext>>,
+    snapshot_data: Option<DiagnosticSnapshot>,
     /// Bridge pool for sending diagnostic requests
     bridge_pool: Arc<LanguageServerPool>,
     /// Reference to synthetic diagnostics manager for task registration
@@ -94,7 +96,7 @@ impl DebouncedDiagnosticsManager {
         uri: Url,
         lsp_uri: Uri,
         client: Client,
-        snapshot_data: Option<Vec<DocumentRequestContext>>,
+        snapshot_data: Option<DiagnosticSnapshot>,
         bridge_pool: Arc<LanguageServerPool>,
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     ) {
