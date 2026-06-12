@@ -148,8 +148,13 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         .stdin_filename
         .as_ref()
         .expect("run_stdin requires stdin_filename");
-    if options.paths.iter().any(|p| p.as_os_str() != "-") {
-        eprintln!("error: --stdin-filename cannot be combined with file paths");
+    // Documented contract: with --stdin-filename, paths must be empty or
+    // exactly ["-"]; anything else (real paths, or repeated "-") is a usage
+    // error rather than a silently tolerated variant.
+    let stdin_paths_ok = options.paths.is_empty()
+        || (options.paths.len() == 1 && options.paths[0].as_os_str() == "-");
+    if !stdin_paths_ok {
+        eprintln!("error: --stdin-filename accepts no paths (optionally a single \"-\")");
         return EXIT_ERROR;
     }
 
@@ -374,12 +379,12 @@ fn collect_files(
         let metadata = std::fs::metadata(path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
         if metadata.is_dir() {
-            if is_excluded(&exclude_matcher, path, true) {
+            if is_excluded(&exclude_matcher, base, path, true) {
                 continue;
             }
             walk_directory(path, &exclude_matcher, is_formattable, &mut files);
         } else {
-            if is_excluded(&exclude_matcher, path, false) {
+            if is_excluded(&exclude_matcher, base, path, false) {
                 continue;
             }
             files.push(path.clone());
@@ -390,19 +395,32 @@ fn collect_files(
     Ok(files)
 }
 
-/// Whether `path` or any of its ancestor directories matches an `--excludes`
-/// pattern.
+/// Whether `path` or any of its ancestor directories *within `base`* matches
+/// an `--excludes` pattern.
 ///
 /// A directory-only pattern (`vendor/`) never matches a file path directly —
 /// during a walk it works by pruning the directory, but an explicitly listed
 /// file (`kakehashi format vendor/dep.md`) skips the walk, so its ancestors
 /// must be tested as directories too or the documented "excludes filter
 /// everything" contract breaks for exactly that pattern shape.
-fn is_excluded(matcher: &ignore::overrides::Override, path: &Path, is_dir: bool) -> bool {
-    if matcher.matched(path, is_dir).is_ignore() {
+///
+/// The path is made relative to `base` first: patterns are defined relative
+/// to the current directory, so ancestors *above* it must not participate —
+/// otherwise running from a directory whose own name matches a pattern
+/// (e.g. `--excludes vendor/` inside a checkout living under `…/vendor/…`)
+/// would exclude every file.
+fn is_excluded(
+    matcher: &ignore::overrides::Override,
+    base: &Path,
+    path: &Path,
+    is_dir: bool,
+) -> bool {
+    let relative = path.strip_prefix(base).unwrap_or(path);
+    if matcher.matched(relative, is_dir).is_ignore() {
         return true;
     }
-    path.ancestors()
+    relative
+        .ancestors()
         .skip(1)
         .take_while(|a| !a.as_os_str().is_empty())
         .any(|a| matcher.matched(a, true).is_ignore())
@@ -532,6 +550,26 @@ mod tests {
         .unwrap();
 
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn excludes_do_not_match_ancestors_above_the_base() {
+        // Patterns are relative to the current directory: a checkout living
+        // under a directory whose name matches a pattern (here the base is
+        // itself named "vendor") must not have everything excluded.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("vendor");
+        write(&base.join("kept.md"), "x");
+
+        let files = collect_files(
+            &base,
+            &[base.join("kept.md")],
+            &["vendor/".to_string()],
+            &markdown_only,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec![base.join("kept.md")]);
     }
 
     #[test]

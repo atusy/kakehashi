@@ -92,24 +92,32 @@ impl Kakehashi {
         formatting_options: FormattingOptions,
         ready_timeout: Duration,
     ) -> CliFormatOutcome {
-        let none = CliFormatOutcome {
+        // A path we cannot express as a URI cannot be opened as an LSP
+        // document at all — report it as a failure (the CLI maps it to its
+        // error exit code) instead of silently skipping the file.
+        let uri_failure = |what: &str| CliFormatOutcome {
             formatted: None,
-            server_failures: Vec::new(),
+            server_failures: vec![format!(
+                "cannot convert path '{}' to {what}",
+                path.display()
+            )],
         };
         let Ok(url) = Url::from_file_path(path) else {
-            return none;
+            return uri_failure("a file URL");
         };
         let Ok(lsp_uri) = url_to_uri(&url) else {
-            return none;
+            return uri_failure("an LSP URI");
         };
 
         // Path-based detection first, then first-line content detection —
         // both via the loading chain, because `detect_language`'s own stages
         // only accept parsers that are already loaded, and nothing is loaded
-        // before the first didOpen in CLI mode.
+        // before the first didOpen in CLI mode. Detect on the raw path, not
+        // `url.path()`: URL paths percent-encode special characters, which
+        // would break extension/filename matching for such files.
         let language_id = self
             .language
-            .loadable_language_for_document(url.path(), text)
+            .loadable_language_for_document(&path.to_string_lossy(), text)
             .unwrap_or_default();
 
         self.did_open_impl(DidOpenTextDocumentParams {
@@ -237,30 +245,39 @@ impl Kakehashi {
 
         let pool = self.bridge.pool_arc();
         let mut waited: HashSet<String> = HashSet::new();
-        let mut failures = Vec::new();
+        let mut ready_waits = Vec::new();
         for resolved in regions {
             for config in self
                 .bridge_configs_for_injection_language(&language_name, &resolved.injection_language)
             {
-                if waited.insert(config.server_name.clone())
-                    && let Err(e) = pool
-                        .get_or_create_connection_wait_ready(
-                            &config.server_name,
-                            &config.config,
-                            timeout,
-                        )
-                        .await
-                {
-                    log::warn!(
-                        target: "kakehashi::cli",
-                        "downstream server {} not ready: {e}",
-                        config.server_name
-                    );
-                    failures.push(format!(
-                        "downstream server '{}' failed to start: {e}",
-                        config.server_name
-                    ));
+                if waited.insert(config.server_name.clone()) {
+                    let pool = std::sync::Arc::clone(&pool);
+                    ready_waits.push(async move {
+                        let result = pool
+                            .get_or_create_connection_wait_ready(
+                                &config.server_name,
+                                &config.config,
+                                timeout,
+                            )
+                            .await;
+                        (config.server_name, result)
+                    });
                 }
+            }
+        }
+
+        // Wait concurrently so several broken servers cost one `timeout`
+        // total, not one each.
+        let mut failures = Vec::new();
+        for (server_name, result) in futures::future::join_all(ready_waits).await {
+            if let Err(e) = result {
+                log::warn!(
+                    target: "kakehashi::cli",
+                    "downstream server {server_name} not ready: {e}"
+                );
+                failures.push(format!(
+                    "downstream server '{server_name}' failed to start: {e}"
+                ));
             }
         }
         failures
