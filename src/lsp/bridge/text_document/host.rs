@@ -210,11 +210,14 @@ impl LanguageServerPool {
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],
-    /// the response keeps formatting's LSP semantics: a `null` result from a
-    /// capable server is the authoritative "no edits needed" signal
-    /// (concatenated-formatting-pipeline) and comes back as `Some(vec![])`,
-    /// distinct from `None` = no capability / error / malformed — only the
-    /// latter should trigger fallback to a lower-priority server.
+    /// the response keeps formatting's LSP semantics, mirroring
+    /// [`Self::send_formatting_request`]: a `null` result from a capable
+    /// server is the authoritative "no edits needed" signal
+    /// (concatenated-formatting-pipeline) and comes back as `Ok(Some(vec![]))`;
+    /// `Ok(None)` means the server does not advertise the capability (the
+    /// only fallback-without-failure case); an error response, a success
+    /// without a `result` member, or a malformed payload is a counted
+    /// request failure (`Err`).
     pub(crate) async fn send_host_formatting_request(
         &self,
         server_name: &str,
@@ -236,9 +239,14 @@ impl LanguageServerPool {
             doc,
             upstream_request_id,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-            move |response| parse_host_formatting_response(response, method),
+            // The parser promotes error responses, missing results, and
+            // malformed payloads to `Err` (request failure) — mirrors
+            // `send_formatting_request`: the fan-in counts `Err`s, which CLI
+            // mode maps onto its error exit code. Only the no-capability
+            // early return above yields `Ok(None)`.
+            move |response| parse_host_formatting_response(response, method).map(Some),
         )
-        .await
+        .await?
     }
 
     /// Drive a host bridge request end-to-end: register for cancel
@@ -378,27 +386,38 @@ fn parse_host_raw_response(
 
 /// Parse a host formatting response with formatting's null semantics:
 /// `null` from a capable server = authoritative "no edits needed" →
-/// `Some(vec![])`; only an error / malformed payload yields `None`
-/// (fallback).
+/// `Ok(vec![])`. An error response, a success response without a `result`
+/// member (protocol violation), or a malformed payload is a request failure
+/// (`Err`), mirroring `transform_formatting_response_to_host` — collapsing
+/// it into the no-capability value would let a broken host formatter pass
+/// as "nothing to format".
 fn parse_host_formatting_response(
     mut response: serde_json::Value,
     method: &'static str,
-) -> Option<Vec<TextEdit>> {
+) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, method) {
-        return None;
+        return Err(io::Error::other(format!(
+            "downstream server answered {method} with an error response"
+        )));
     }
-    let result = response.get_mut("result")?.take();
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        return Err(io::Error::other(format!(
+            "{method} response carries neither result nor error (protocol violation)"
+        )));
+    };
     if result.is_null() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
     match serde_json::from_value::<Vec<TextEdit>>(result) {
-        Ok(edits) => Some(edits),
+        Ok(edits) => Ok(edits),
         Err(e) => {
             log::warn!(
                 target: "kakehashi::bridge",
                 "host formatting response failed to deserialize: {e}"
             );
-            None
+            Err(io::Error::other(format!(
+                "malformed {method} result from downstream server: {e}"
+            )))
         }
     }
 }
@@ -561,14 +580,14 @@ mod tests {
     }
 
     #[test]
-    fn formatting_response_error_falls_through() {
+    fn formatting_response_error_is_a_request_failure() {
         let response = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
             "error": { "code": -32603, "message": "boom" }
         });
         assert!(
-            parse_host_formatting_response(response, "textDocument/formatting").is_none(),
-            "errors must trigger fallback, unlike null"
+            parse_host_formatting_response(response, "textDocument/formatting").is_err(),
+            "errors must be a counted request failure, unlike null"
         );
     }
 

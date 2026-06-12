@@ -56,6 +56,21 @@ impl Kakehashi {
         &self,
         params: DocumentFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
+        self.formatting_impl_with_error_sink(params, None).await
+    }
+
+    /// [`Self::formatting_impl`] with an optional request-failure counter.
+    ///
+    /// In LSP mode failed downstream requests are log-only — the editor
+    /// simply retries — so `formatting_impl` passes `None`. CLI mode is
+    /// one-shot: without the counter, a ready server that then fails its
+    /// formatting request (crash, error response, timeout) is
+    /// indistinguishable from "nothing to format" and would exit 0.
+    pub(crate) async fn formatting_impl_with_error_sink(
+        &self,
+        params: DocumentFormattingParams,
+        request_error_sink: RequestErrorSink,
+    ) -> Result<Option<Vec<TextEdit>>> {
         let lsp_uri = params.text_document.uri;
         let options = params.options;
 
@@ -91,7 +106,8 @@ impl Kakehashi {
         let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/formatting");
 
         let upstream_request_id = crate::lsp::current_upstream_id();
-        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
+        let mut cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
+        cancel_state.request_error_sink = request_error_sink;
         let original = snapshot.text().to_string();
 
         let result = match layer_cfg.strategy {
@@ -331,6 +347,7 @@ impl Kakehashi {
             let pool = Arc::clone(&pool);
             let options = options.clone();
             let region_cancel_rx = cancel_state.derive_receiver();
+            let request_error_sink = cancel_state.request_error_sink.clone();
 
             outer_join_set.spawn(async move {
                 if let Some((servers, host_line_prefixes)) = pipeline {
@@ -341,6 +358,7 @@ impl Kakehashi {
                         servers,
                         host_line_prefixes,
                         region_cancel_rx,
+                        request_error_sink,
                     )
                     .await
                 } else {
@@ -349,6 +367,7 @@ impl Kakehashi {
                         pool.clone(),
                         options,
                         region_cancel_rx,
+                        request_error_sink,
                     )
                     .await
                 }
@@ -388,13 +407,19 @@ impl Kakehashi {
 
         let cancel_rx = cancel_state.derive_receiver();
         let pool = self.bridge.pool_arc();
+        // Source-level error counting, mirroring the virt preferred dispatch:
+        // `Done` discards the fan-in's error count, so counting here is what
+        // keeps a failed-but-rescued host formatter visible to CLI mode.
+        let request_error_sink = cancel_state.request_error_sink.clone();
         let result = crate::lsp::aggregation::server::dispatch_host_preferred(
             &ctx,
             pool.clone(),
             move |t| {
                 let params = params.clone();
+                let request_error_sink = request_error_sink.clone();
                 async move {
-                    t.pool
+                    let result = t
+                        .pool
                         .send_host_formatting_request(
                             &t.server_name,
                             &t.server_config,
@@ -407,7 +432,11 @@ impl Kakehashi {
                             params,
                             t.upstream_id,
                         )
-                        .await
+                        .await;
+                    if result.is_err() {
+                        count_request_errors(&request_error_sink, 1);
+                    }
+                    result
                 }
             },
             // `Some(vec![])` (and a capable server's `null`, normalized to it)
@@ -425,6 +454,8 @@ impl Kakehashi {
         match result {
             FanInResult::Done(value) => Ok(value),
             FanInResult::NoResult { errors } => {
+                // Request errors were already counted at the source (the
+                // dispatch closure above); this arm only chooses log severity.
                 if errors > 0 {
                     self.client
                         .log_message(
@@ -437,6 +468,30 @@ impl Kakehashi {
             }
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
+    }
+}
+
+/// Optional counter for downstream formatting requests that failed at
+/// request time (I/O error, error response, per-step timeout) — as opposed
+/// to startup failures, which CLI mode detects separately via its
+/// ready-wait. `None` in LSP mode, where failed requests are log-only
+/// because the editor retries; `Some` in CLI mode, where a one-shot run
+/// must map them onto a non-zero exit instead of "nothing changed".
+///
+/// Counts **observed** failures only, by design: a request abandoned
+/// because a racing layer or higher-priority server already won (its future
+/// dropped mid-flight by `race_layers_preferred` or the preferred fan-in)
+/// was *cancelled*, not failed — it never produced a verdict, and counting
+/// it would require draining every loser to completion, trading the race's
+/// latency win for accounting of requests whose outcome no longer matters.
+pub(crate) type RequestErrorSink = Option<Arc<std::sync::atomic::AtomicUsize>>;
+
+/// Add `n` request failures to the sink, if one is installed.
+fn count_request_errors(sink: &RequestErrorSink, n: usize) {
+    if n > 0
+        && let Some(sink) = sink
+    {
+        sink.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -636,14 +691,22 @@ async fn dispatch_preferred_formatting(
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
     options: tower_lsp_server::ls_types::FormattingOptions,
     region_cancel_rx: Option<CancelReceiver>,
+    request_error_sink: RequestErrorSink,
 ) -> Option<Vec<TextEdit>> {
     let result = dispatch_preferred(
         region_ctx,
         pool,
         move |t| {
             let options = options.clone();
+            // Count request failures at the SOURCE, not from the fan-in
+            // verdict: `FanInResult::Done` discards the error count, so a
+            // failed higher-priority formatter rescued by a fallback server
+            // would otherwise go unreported and a CLI run would exit 0
+            // despite a broken configured formatter.
+            let request_error_sink = request_error_sink.clone();
             async move {
-                t.pool
+                let result = t
+                    .pool
                     .send_formatting_request(
                         &t.server_name,
                         &t.server_config,
@@ -656,7 +719,11 @@ async fn dispatch_preferred_formatting(
                         t.upstream_id,
                         None,
                     )
-                    .await
+                    .await;
+                if result.is_err() {
+                    count_request_errors(&request_error_sink, 1);
+                }
+                result
             }
         },
         // `Some(vec![])` is an authoritative "no edits needed" from the
@@ -735,6 +802,7 @@ async fn dispatch_concatenated_formatting(
     // point 4, `reapply_host_line_prefixes`).
     host_line_prefixes: Vec<String>,
     cancel_rx: Option<CancelReceiver>,
+    request_error_sink: RequestErrorSink,
 ) -> Option<Vec<TextEdit>> {
     let offset = RegionOffset::with_per_line_offsets(
         region_ctx.resolved.region.line_range.start,
@@ -827,6 +895,7 @@ async fn dispatch_concatenated_formatting(
             let budget_exhaustion_warned = Arc::clone(&budget_exhaustion_warned);
             let host_uri_lsp = host_uri_lsp.clone();
             let open_scratch = Arc::clone(&open_scratch);
+            let request_error_sink = request_error_sink.clone();
             async move {
                 // No config for this server name: skip-and-continue, handing the
                 // unchanged text back to the pipeline (ADR Decision point 6).
@@ -907,6 +976,7 @@ async fn dispatch_concatenated_formatting(
                                 server_name,
                                 e
                             );
+                            count_request_errors(&request_error_sink, 1);
                             return None;
                         }
                     };
@@ -1028,6 +1098,7 @@ async fn dispatch_concatenated_formatting(
                                 server_name,
                                 e
                             );
+                            count_request_errors(&request_error_sink, 1);
                             None
                         }
                     }
@@ -1058,6 +1129,7 @@ async fn dispatch_concatenated_formatting(
                             server_name,
                             step_budget
                         );
+                        count_request_errors(&request_error_sink, 1);
                         if let Some(downstream_id) = step_downstream_id.get().copied() {
                             let pool = Arc::clone(&pool);
                             let server_name = server_name.clone();
@@ -1542,6 +1614,11 @@ pub(super) struct FormattingCancelState<'a> {
     /// from the cancel forwarder. `None` when there is no upstream
     /// subscription to manage.
     _guard: Option<CancelSubscriptionGuard<'a>>,
+    /// CLI-mode counter for request-time downstream failures (see
+    /// [`RequestErrorSink`]); `None` in LSP mode. Carried here because it
+    /// shares the cancel state's lifecycle: one per formatting request,
+    /// cloned into every per-region dispatcher.
+    request_error_sink: RequestErrorSink,
 }
 
 impl<'a> FormattingCancelState<'a> {
@@ -1586,6 +1663,7 @@ impl Kakehashi {
         FormattingCancelState {
             token,
             _guard: guard,
+            request_error_sink: None,
         }
     }
 }

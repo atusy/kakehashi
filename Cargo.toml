@@ -56,6 +56,9 @@ serde_json = "1"
 shellexpand = "3"
 similar = "3"
 flate2 = "1"
+# Gitignore-respecting file walker for `kakehashi format <paths...>`; also
+# provides the gitignore-style Override matcher backing --excludes.
+ignore = "0.4"
 # Floor 0.4.46: RUSTSEC-2026-0067/0068 + GHSA-3pv8-6f4r-ffg2 — kakehashi
 # unpacks network-downloaded parser archives, so tar extraction CVEs apply.
 tar = "0.4.46"

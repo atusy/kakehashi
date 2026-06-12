@@ -13,8 +13,8 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
-    /// Config file(s) to use instead of default locations (LSP mode only).
-    /// Can be specified multiple times; files merge in order.
+    /// Config file(s) to use instead of default locations (LSP and format
+    /// modes). Can be specified multiple times; files merge in order.
     /// Skips ~/.config/kakehashi/kakehashi.toml and ./kakehashi.toml.
     #[arg(long, global = true)]
     config_file: Vec<PathBuf>,
@@ -34,6 +34,40 @@ enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Format files via the configured downstream language servers
+    ///
+    /// Directories are walked recursively respecting .gitignore; explicitly
+    /// listed files are formatted even when gitignored.
+    Format {
+        /// Files or directories to format ("-" for stdin with --stdin-filename)
+        paths: Vec<PathBuf>,
+
+        /// Don't write changes; exit 1 if any file would be reformatted
+        #[arg(long)]
+        check: bool,
+
+        /// Read from stdin, treat content as this file path, print result to stdout
+        #[arg(long)]
+        stdin_filename: Option<PathBuf>,
+
+        /// Exclude paths matching this gitignore-style pattern (repeatable)
+        #[arg(long = "excludes")]
+        excludes: Vec<String>,
+
+        /// Write changes, but exit 1 if any file was changed
+        #[arg(long)]
+        fail_on_change: bool,
+
+        /// Indentation-width hint sent to downstream servers
+        /// (LSP FormattingOptions.tabSize; servers may ignore it)
+        #[arg(long, default_value_t = 4)]
+        tab_size: u32,
+
+        /// Prefer-spaces-over-tabs hint sent to downstream servers
+        /// (LSP FormattingOptions.insertSpaces; servers may ignore it)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 1)]
+        insert_spaces: bool,
     },
 }
 
@@ -189,9 +223,14 @@ fn main() -> ExitCode {
     }
 
     // LSP server mode keeps SIGPIPE ignored so the bridge sees a closed
-    // downstream peer as a recoverable BrokenPipe error; subcommands keep the
+    // downstream peer as a recoverable BrokenPipe error. The format command
+    // drives the same bridge (it writes to downstream language-server
+    // stdin), so it needs the same disposition — otherwise a crashed
+    // downstream server would kill the CLI with SIGPIPE instead of exiting 2
+    // with a useful error; its own stdout writes handle BrokenPipe
+    // explicitly (see `cli::format::run_stdin`). Other subcommands keep the
     // default disposition restored above.
-    if cli.command.is_none() {
+    if matches!(cli.command, None | Some(Commands::Format { .. })) {
         ignore_sigpipe();
     }
 
@@ -215,6 +254,23 @@ fn main() -> ExitCode {
             ConfigAction::Init { output, force } => run_config_init(output, force),
             ConfigAction::Schema { output, force } => run_config_schema(output, force),
         },
+        Some(Commands::Format {
+            paths,
+            check,
+            stdin_filename,
+            excludes,
+            fail_on_change,
+            tab_size,
+            insert_spaces,
+        }) => run_format(kakehashi::cli::format::FormatOptions {
+            paths,
+            check,
+            stdin_filename,
+            excludes,
+            fail_on_change,
+            tab_size,
+            insert_spaces,
+        }),
         None => {
             // Start LSP server (backward compatible default behavior)
             // Only LSP mode needs a tokio runtime; CLI subcommands are synchronous
@@ -609,6 +665,24 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     } else {
         eprintln!("\nPartially installed '{}' language support.", language);
         Err(ExitCode::FAILURE)
+    }
+}
+
+/// Run the format command. Formatting goes through the same downstream
+/// language-server bridge as LSP mode, so it builds its own tokio runtime
+/// inside `cli::format::run`.
+fn run_format(options: kakehashi::cli::format::FormatOptions) -> Result<(), ExitCode> {
+    // Logging to stderr, configured via RUST_LOG — same posture as LSP mode
+    // (stdout carries formatted output in stdin mode).
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stderr)
+        .init();
+
+    let code = kakehashi::cli::format::run(options);
+    if code == kakehashi::cli::format::EXIT_OK {
+        Ok(())
+    } else {
+        Err(ExitCode::from(code))
     }
 }
 

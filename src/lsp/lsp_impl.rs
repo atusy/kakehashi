@@ -1,4 +1,5 @@
 pub(crate) mod bridge_context;
+mod cli_format;
 mod coordinator;
 mod kakehashi;
 mod lifecycle;

@@ -526,6 +526,46 @@ kakehashi config init --output ./kakehashi.toml --force
 
 `--force` only applies when `--output` is used.
 
+### Formatting
+
+`kakehashi format` formats files through the same downstream language servers
+the LSP bridge uses: each injection region (e.g. a fenced code block in
+Markdown) is sent to the servers configured for its language, and the edits
+are applied back to the host file. Configuration comes from the usual config
+files (`./kakehashi.toml` etc.) or `--config-file`.
+
+```bash
+# Format files in place
+kakehashi format README.md docs/
+
+# Directories are walked recursively, respecting .gitignore;
+# explicitly listed files are formatted even when gitignored
+kakehashi format .
+
+# Exclude paths (gitignore-style pattern, repeatable)
+kakehashi format . --excludes vendor/ --excludes "*.gen.md"
+
+# CI: don't write, exit 1 if anything would change
+kakehashi format . --check
+
+# Write changes but exit 1 if anything changed
+kakehashi format . --fail-on-change
+
+# Format stdin (result goes to stdout); the filename drives language detection
+cat README.md | kakehashi format --stdin-filename README.md
+
+# Indentation hints forwarded as LSP FormattingOptions (servers may ignore
+# them in favor of their own config; defaults: --tab-size 4 --insert-spaces true)
+kakehashi format . --tab-size 2 --insert-spaces false
+```
+
+Exit codes: `0` nothing to change (or changes written without
+`--fail-on-change`), `1` changes detected under `--check`/`--fail-on-change`,
+`2` usage error, I/O error, or downstream formatter failure (a configured
+server failed to start, errored on the request, timed out, or returned a
+protocol-invalid response — even when a fallback server still produced
+output).
+
 ## Editor Integration
 
 ### Neovim

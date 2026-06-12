@@ -87,12 +87,16 @@ impl LanguageServerPool {
                     request_id,
                 )
             },
+            // The transform promotes error responses, missing results, and
+            // malformed payloads to `Err` (request failure) — only the
+            // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
                 transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
+                    .map(Some)
             },
             downstream_id_probe,
         )
-        .await
+        .await?
     }
 }
 
