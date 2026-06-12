@@ -17,11 +17,12 @@ use std::io;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    DocumentOnTypeFormattingParams, FormattingOptions, Position, TextEdit,
+    DocumentOnTypeFormattingOptions, DocumentOnTypeFormattingParams, FormattingOptions, Position,
+    TextEdit,
 };
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
+use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_text_document_position_params,
@@ -55,7 +56,10 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/onTypeFormatting") {
             return Ok(None);
         }
-        if !downstream_declares_trigger(&handle, ch) {
+        let static_provider = handle
+            .server_capabilities()
+            .and_then(|caps| caps.document_on_type_formatting_provider.as_ref());
+        if !downstream_declares_trigger(static_provider, ch) {
             log::debug!(
                 target: "kakehashi::bridge",
                 "[{}] onTypeFormatting: downstream does not declare {:?} as a trigger; skipping",
@@ -97,16 +101,16 @@ impl LanguageServerPool {
 /// Whether the downstream's `documentOnTypeFormattingProvider` declares `ch`
 /// as a trigger character (the second half of the double filter).
 ///
-/// A server whose method support comes only from dynamic registration carries
-/// its trigger set in registration options the bridge does not parse; forward
-/// in that case and let the server answer (it may return null).
-fn downstream_declares_trigger(handle: &ConnectionHandle, ch: &str) -> bool {
-    let Some(provider) = handle
-        .server_capabilities()
-        .and_then(|caps| caps.document_on_type_formatting_provider.as_ref())
-    else {
-        // has_capability passed without a static provider → dynamic
-        // registration granted the method; trust it.
+/// `static_provider` is the provider from the initialize response, if any.
+/// `None` means the method support came only from dynamic registration, whose
+/// trigger set lives in registration options the bridge does not parse —
+/// forward in that case and let the server answer (it may return null). Only
+/// called after `has_capability` confirmed the method is supported.
+fn downstream_declares_trigger(
+    static_provider: Option<&DocumentOnTypeFormattingOptions>,
+    ch: &str,
+) -> bool {
+    let Some(provider) = static_provider else {
         return true;
     };
     provider.first_trigger_character == ch
@@ -165,6 +169,45 @@ mod tests {
         );
 
         assert_uses_virtual_uri(&request, "lua");
+    }
+
+    fn provider(first: &str, more: Option<Vec<&str>>) -> DocumentOnTypeFormattingOptions {
+        DocumentOnTypeFormattingOptions {
+            first_trigger_character: first.to_string(),
+            more_trigger_character: more.map(|m| m.into_iter().map(String::from).collect()),
+        }
+    }
+
+    #[test]
+    fn trigger_filter_accepts_first_trigger_character() {
+        let p = provider("}", Some(vec![";"]));
+        assert!(downstream_declares_trigger(Some(&p), "}"));
+    }
+
+    #[test]
+    fn trigger_filter_accepts_more_trigger_character() {
+        let p = provider("}", Some(vec![";"]));
+        assert!(downstream_declares_trigger(Some(&p), ";"));
+    }
+
+    #[test]
+    fn trigger_filter_rejects_undeclared_character() {
+        let p = provider("}", Some(vec![";"]));
+        assert!(!downstream_declares_trigger(Some(&p), "x"));
+
+        let no_more = provider("}", None);
+        assert!(
+            !downstream_declares_trigger(Some(&no_more), ";"),
+            "absent moreTriggerCharacter declares nothing beyond the first"
+        );
+    }
+
+    #[test]
+    fn trigger_filter_trusts_dynamic_only_registration() {
+        // No static provider = the method came from dynamic registration whose
+        // trigger set the bridge does not parse; forward and let the server
+        // answer (it may return null).
+        assert!(downstream_declares_trigger(None, "x"));
     }
 
     #[test]

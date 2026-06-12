@@ -1718,6 +1718,17 @@ mod tests {
                     });
                 }),
             ),
+            (
+                "textDocument/onTypeFormatting",
+                Box::new(|c| {
+                    c.document_on_type_formatting_provider = Some(
+                        tower_lsp_server::ls_types::DocumentOnTypeFormattingOptions {
+                            first_trigger_character: "}".to_string(),
+                            more_trigger_character: None,
+                        },
+                    );
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -1868,6 +1879,7 @@ mod tests {
             "textDocument/colorPresentation",
             "textDocument/codeLens",
             "codeLens/resolve",
+            "textDocument/onTypeFormatting",
         ];
         for method in methods {
             assert!(

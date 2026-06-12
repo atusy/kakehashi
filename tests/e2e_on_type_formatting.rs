@@ -83,8 +83,10 @@ fn on_type_formatting_params(ch: &str) -> Value {
 
 /// Issue `textDocument/onTypeFormatting`, retrying while the result is null
 /// (cold downstream servers are still handshaking when the first request
-/// arrives; a not-yet-ready server yields null).
-fn request_with_retry(client: &mut LspClient, ch: &str) -> Option<Vec<Value>> {
+/// arrives; a not-yet-ready server yields null). An authoritative empty edit
+/// list (`[]` — server ran, nothing to change) terminates immediately so a
+/// misbehaving path fails fast instead of spinning out the retry budget.
+fn request_with_retry(client: &mut LspClient, ch: &str) -> Vec<Value> {
     for _ in 0..300 {
         let response = client.send_request(
             "textDocument/onTypeFormatting",
@@ -95,14 +97,17 @@ fn request_with_retry(client: &mut LspClient, ch: &str) -> Option<Vec<Value>> {
             "kakehashi must not surface a top-level onTypeFormatting error; got: {:?}",
             response.get("error")
         );
-        if let Some(edits) = response.get("result").and_then(Value::as_array)
-            && !edits.is_empty()
-        {
-            return Some(edits.clone());
+        let result = &response["result"];
+        if result.is_null() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        return result
+            .as_array()
+            .cloned()
+            .expect("non-null onTypeFormatting result must be a TextEdit array");
     }
-    None
+    panic!("timed out waiting for a non-null onTypeFormatting result");
 }
 
 fn shutdown(client: &mut LspClient) {
@@ -137,8 +142,7 @@ fn e2e_on_type_formatting_advertises_sorted_trigger_union_and_translates_edits()
 
     // Declared trigger: the mock uppercases the virtual document; the edit
     // must come back in HOST coordinates (fence content is host line 3).
-    let edits = request_with_retry(&mut client, "}")
-        .expect("onTypeFormatting with a declared trigger should return edits");
+    let edits = request_with_retry(&mut client, "}");
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0]["newText"], "LOCAL X = 1\n");
     assert_eq!(
@@ -148,7 +152,10 @@ fn e2e_on_type_formatting_advertises_sorted_trigger_union_and_translates_edits()
 
     // Undeclared trigger: the downstream is warm now (previous request
     // succeeded) and would answer any character, so a null result proves the
-    // bridge filtered the request before it reached the server.
+    // bridge filtered the request before it reached the server. (Strictly,
+    // null could also mean the injection region failed to resolve — but the
+    // immediately preceding request resolved the same region and returned
+    // edits, so that alternative is ruled out for this sequence.)
     let response = client.send_request(
         "textDocument/onTypeFormatting",
         on_type_formatting_params("x"),

@@ -307,6 +307,14 @@ pub struct BridgeServerConfig {
     /// request is forwarded to a downstream server only when that server's
     /// own capabilities also declare the typed character. Unset or empty
     /// everywhere → the capability is not advertised (today's behavior).
+    ///
+    /// Note: this field feeds *only* the `initialize`-time capability
+    /// advertisement; it is never consulted when forwarding a request (that
+    /// filter uses the downstream server's own declared triggers). The
+    /// capability is negotiated once and frozen for the session, so updating
+    /// the triggers via `didChangeConfiguration` has no runtime effect at all
+    /// — neither re-advertising the capability nor changing forwarding. A
+    /// restart is required for new triggers to take effect.
     pub on_type_formatting_triggers: Option<Vec<String>>,
 }
 
@@ -315,8 +323,12 @@ pub struct BridgeServerConfig {
 ///
 /// Sorted and deduplicated so the advertisement is deterministic regardless of
 /// `HashMap` iteration order. Returns `None` when no server declares any
-/// trigger (capability stays unadvertised). Includes the wildcard `_` entry:
-/// its triggers apply to every concrete server through wildcard merging.
+/// trigger (capability stays unadvertised). A `_` wildcard key is treated like
+/// any other entry: its triggers join the union as-is (wildcard merging into
+/// concrete servers happens at request dispatch, not here). Known edge case: a
+/// concrete server overriding the wildcard with an explicit empty list still
+/// leaves the wildcard's triggers advertised; the bridge-side trigger filter
+/// keeps such requests from reaching servers that don't declare the character.
 pub(crate) fn on_type_formatting_trigger_union(
     servers: &HashMap<String, BridgeServerConfig>,
 ) -> Option<(String, Vec<String>)> {
@@ -1296,6 +1308,19 @@ mod tests {
         // Sorted + deduped: deterministic regardless of HashMap iteration order.
         assert_eq!(first, "\n");
         assert_eq!(more, vec![";".to_string(), "}".to_string()]);
+
+        // Same logical contents inserted in a different order must produce
+        // the identical advertisement.
+        let servers_reordered = HashMap::from([
+            ("c".to_string(), server(None)),
+            ("b".to_string(), server(Some(vec![";", "\n"]))),
+            ("a".to_string(), server(Some(vec!["}", ";"]))),
+        ]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers_reordered),
+            Some((first, more)),
+            "union must not depend on map construction order"
+        );
     }
 
     #[test]
