@@ -181,6 +181,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
         server.settings_manager.apply_settings(WorkspaceSettings {

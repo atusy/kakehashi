@@ -84,7 +84,8 @@ expression: result
         "lua"
       ],
       "initializationOptions": null,
-      "rootMarkers": null
+      "rootMarkers": null,
+      "onTypeFormattingTriggers": null
     },
     "pyright": {
       "cmd": [
@@ -95,7 +96,8 @@ expression: result
         "python"
       ],
       "initializationOptions": null,
-      "rootMarkers": null
+      "rootMarkers": null,
+      "onTypeFormattingTriggers": null
     },
     "rust-analyzer": {
       "cmd": [
@@ -110,7 +112,8 @@ expression: result
           "./Cargo.toml"
         ]
       },
-      "rootMarkers": null
+      "rootMarkers": null,
+      "onTypeFormattingTriggers": null
     }
   }
 }
