@@ -410,7 +410,7 @@ the `bridge.<lang>.aggregation` nesting:
 | Field | Description |
 |-------|-------------|
 | `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Only `textDocument/formatting` consumes the cross-layer strategy today; its default is `"concatenated"`, which runs the layers as a sequential pipeline: injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit. Every other method combines with `"preferred"` regardless of this field. The default for the diagnostics methods is also `"concatenated"`, but this currently has no effect: diagnostics are processed only from the `virt` layer, where `priorities` acts purely as a gate. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit) and by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead). Every other method combines with `"preferred"` regardless of this field. |
 
 Details:
 
@@ -419,14 +419,18 @@ Details:
 - **Formatting**: `textDocument/rangeFormatting` shares the
   `textDocument/formatting` key.
 - **Diagnostics**: two keys, mirroring their aggregation keying — pull
-  diagnostics gate under `textDocument/diagnostic`, push diagnostics under
-  `textDocument/publishDiagnostics`. Disable both (or use `_`) to fully turn
-  bridge diagnostics off.
+  diagnostics under `textDocument/diagnostic`, push diagnostics under
+  `textDocument/publishDiagnostics`. Each layer is gated independently by
+  `priorities` membership (host additionally by `bridge._self.enabled`);
+  omit both layers (or use `_` with `priorities = []`) to fully turn
+  bridge diagnostics off. With host bridging opted in, host servers are
+  pulled with the real document URI and their diagnostics merge with the
+  injection regions' per the layer `strategy`.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for every bridged
-  request method when host bridging is opted in (see `bridge._self` above).
-  Bridged methods have no `native` counterpart yet. Diagnostics and
-  semantic tokens stay virt-only for now.
+  request method — including pull/push diagnostics — when host bridging is
+  opted in (see `bridge._self` above). Bridged methods have no `native`
+  counterpart yet. Semantic tokens stay virt-only for now.
 
 > **Migration note**: the layer list was renamed `order` →
 > `priorities` (and, one change earlier, the method map moved under

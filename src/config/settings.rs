@@ -133,12 +133,11 @@ pub struct LayerAggregationConfig {
     #[serde(default)]
     pub priorities: Option<Vec<LayerSource>>,
     /// Cross-layer combine strategy: `preferred` (first non-empty layer
-    /// wins) or `concatenated`. Only `textDocument/formatting` consumes the
-    /// resolved strategy today (cross-layer-aggregation phase 3); its
-    /// inherited default is `concatenated` (the pipeline composes disjoint
-    /// work across layers). Every other method combines with `preferred`
-    /// regardless — the diagnostics methods resolve to `concatenated` by
-    /// default, reserved for when diagnostics join the layer walk.
+    /// wins) or `concatenated`. Consumed by `textDocument/formatting`
+    /// (default `concatenated`: the pipeline composes disjoint work across
+    /// layers) and the diagnostics methods (default `concatenated`: virt
+    /// region diagnostics and host-server diagnostics merge into one
+    /// report). Every other method combines with `preferred` regardless.
     #[serde(default)]
     pub strategy: Option<AggregationStrategy>,
 }

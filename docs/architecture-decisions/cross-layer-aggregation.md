@@ -51,6 +51,21 @@ Phased roadmap:
    layers are never contacted. Layer strategy applies to full formatting
    only; `textDocument/rangeFormatting` stays on `preferred`, mirroring the
    stage-1 rule.
+4. **Layer-level `concatenated` for diagnostics** — ✅ implemented for both
+   pull (`textDocument/diagnostic`) and synthetic push
+   (`textDocument/publishDiagnostics`): virt and host gate independently on
+   `priorities` membership (host additionally on `bridge._self.enabled`),
+   both layers fan out concurrently, and `combine_layer_diagnostics`
+   applies the resolved strategy — `concatenated` (the default) appends
+   items in `priorities` order, `preferred` returns the first non-empty
+   layer. The host layer is a `textDocument/diagnostic` pull with the real
+   URI (pull-first-diagnostic-forwarding extends to the host role — raw
+   downstream pushes remain unforwarded), combined within the layer per
+   `bridge._self.aggregation` via `dispatch_host_concatenated` /
+   `dispatch_host_preferred`. Diagnostics are joined rather than raced:
+   they are not latency-interactive and `concatenated` needs every layer
+   anyway, so one code path with a pure combine function replaces the
+   `race_layers_preferred` machinery here.
 
 ## Context
 
@@ -204,17 +219,17 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   wildcard/base merge like `bridge` does. Note `priorities` is a single
   field: a method-specific `priorities` replaces the wildcard's list
   wholesale, it does not merge element-wise.
-- **Strategy is phased.** Phase 2 implements `preferred` only; every method
-  combines across layers by first-non-empty until then. With layer-level
-  `concatenated` landed (formatting first, phase 3), the layer defaults
-  come from `default_layer_strategy_for_method`: `concatenated` for
-  diagnostics *and* `textDocument/formatting`, `preferred` otherwise. The
-  formatting default diverges from the bridge level deliberately — the
-  cross-layer pipeline composes disjoint work (virt formats injection
-  regions, host formats the resulting text), whereas multiple servers of
-  one bridge target produce competing whole-document edits, so the bridge
-  default stays `preferred`. Host is opt-in, so the default still
-  reproduces single-layer behavior until `bridge._self.enabled = true`.
+- **Strategy is phased.** Phase 2 implements `preferred` only; with
+  layer-level `concatenated` landed for formatting (phase 3) and
+  diagnostics (phase 4), the layer defaults come from
+  `default_layer_strategy_for_method`: `concatenated` for diagnostics
+  *and* `textDocument/formatting`, `preferred` otherwise. The formatting
+  default diverges from the bridge level deliberately — the cross-layer
+  pipeline composes disjoint work (virt formats injection regions, host
+  formats the resulting text), whereas multiple servers of one bridge
+  target produce competing whole-document edits, so the bridge default
+  stays `preferred`. Host is opt-in, so the defaults still reproduce
+  single-layer behavior until `bridge._self.enabled = true`.
 - **Nested injections stay implicit.** When injections nest
   (markdown → python → sql), the virt layer resolves deepest-first,
   consistent with the semantic-token priority convention (deeper wins). Depth

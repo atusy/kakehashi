@@ -33,8 +33,10 @@ Partially implemented:
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
   formatting, and rangeFormatting (which shares the formatting layer key).
-  Not covered: diagnostics (needs cross-layer `concatenated`; push/pull
-  stay virt-gated), semantic tokens (native-only), and the experimental
+  Diagnostics are covered with real cross-layer `concatenated` (the
+  cross-layer-aggregation diagnostics phase): pull and synthetic push both
+  merge host-server pulls (real URI) with the virt regions' results per the
+  layer strategy. Not covered: semantic tokens (native-only) and the experimental
   documentColor/colorPresentation pair. `completionItem/resolve` routes by
   the envelope the virt fan-out stamps into `CompletionItem.data`; host
   completion items carry no envelope and resolve falls back gracefully

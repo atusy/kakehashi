@@ -449,3 +449,161 @@ enabled = true
 
     shutdown(&mut client);
 }
+
+/// Cross-layer pull diagnostics (cross-layer-aggregation): with the default
+/// `concatenated` layers strategy and no virt servers, the host layer's
+/// diagnostics flow into the `textDocument/diagnostic` report — carrying the
+/// real URI, proving the host document was synced and the pull was answered
+/// by the host server.
+#[test]
+fn e2e_host_diagnostics_merge_into_pull_report() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("host_diag.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-diag": { "cmd": [mock_bin(), "diagnostics"], "languages": ["markdown"] },
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_host_diag.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "markdown", "version": 1,
+                              "text": "# title\n\nprose body\n" }
+        }),
+    );
+
+    let mut items = None;
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "diagnostic must not surface a top-level error; got: {:?}",
+            response.get("error")
+        );
+        if let Some(found) = response
+            .pointer("/result/items")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            items = Some(found.clone());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let items = items.expect("host diagnostics must reach the pull report");
+    let message = items[0]["message"].as_str().expect("diagnostic message");
+    assert_eq!(
+        message,
+        format!("mock-diagnostic:{uri}"),
+        "the host server must have been pulled with the real URI"
+    );
+
+    shutdown(&mut client);
+}
+
+/// Cross-layer push diagnostics: the synthetic publish triggered by didOpen
+/// must carry the host layer's diagnostics under the default `concatenated`
+/// layers strategy.
+#[test]
+fn e2e_host_diagnostics_merge_into_synthetic_push() {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("host_push_diag.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .build();
+    let _init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host-diag": { "cmd": [mock_bin(), "diagnostics"], "languages": ["markdown"] },
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = "file:///test_host_push_diag.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "markdown", "version": 1,
+                              "text": "# title\n\nprose body\n" }
+        }),
+    );
+
+    // The first publish may be empty (cold host server answered nothing
+    // within its window) — didSave retriggers the synthetic push, so keep
+    // saving until a non-empty publish arrives.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut hit = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(params) = client.wait_for_notification(
+            "textDocument/publishDiagnostics",
+            std::time::Duration::from_secs(2),
+        ) {
+            let diagnostics = params["diagnostics"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if params["uri"].as_str() == Some(uri) && !diagnostics.is_empty() {
+                hit = Some(diagnostics);
+                break;
+            }
+        }
+        client.send_notification(
+            "textDocument/didSave",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+    }
+    let diagnostics = hit.expect("synthetic push must carry the host layer's diagnostics");
+    assert_eq!(
+        diagnostics[0]["message"].as_str(),
+        Some(format!("mock-diagnostic:{uri}").as_str()),
+        "the host server must have been pulled with the real URI"
+    );
+
+    shutdown(&mut client);
+}

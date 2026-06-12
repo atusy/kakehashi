@@ -39,6 +39,11 @@
 //!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
 //!   `codeLens/resolve` by materializing a command that echoes the lens data.
 //!   Used by `tests/e2e_code_lens_resolve.rs` (#355).
+//! - `diagnostics` — advertises `diagnosticProvider`; answers
+//!   `textDocument/diagnostic` with a full report carrying one diagnostic
+//!   that echoes the requested URI, but only for documents it received via
+//!   `didOpen`. Used to prove cross-layer diagnostic aggregation merges the
+//!   host layer in (cross-layer-aggregation).
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -78,6 +83,13 @@ fn main() {
                     }),
                     "code-lens" => json!({
                         "codeLensProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "diagnostics" => json!({
+                        "diagnosticProvider": {
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false
+                        },
                         "textDocumentSync": 1
                     }),
                     _ => json!({
@@ -171,6 +183,31 @@ fn main() {
                             },
                             "data": { "mock": "lens-1" }
                         }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/diagnostic" => {
+                // One deterministic diagnostic echoing the requested URI —
+                // but only for documents this server actually received via
+                // didOpen, so the test also proves the host document was
+                // synced before the pull.
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!({
+                            "kind": "full",
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                },
+                                "severity": 2,
+                                "message": format!("mock-diagnostic:{uri}")
+                            }]
+                        })
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
