@@ -17,9 +17,9 @@ use crate::lsp::bridge::{LanguageServerPool, UpstreamId};
 use crate::lsp::lsp_impl::bridge_context::HostRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
-use super::fan_in::{FanInResult, preferred};
+use super::fan_in::{FanInResult, concatenated, preferred};
 use super::fan_out::TaggedResult;
-use super::priority::{expand_priorities, truncate_entries};
+use super::priority::{entry_names, expand_priorities, truncate_entries};
 
 /// Per-server arguments for a host bridge request.
 ///
@@ -51,6 +51,46 @@ where
     F: Fn(HostFanOutTask) -> Fut,
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
+    let (mut join_set, entries) = host_fan_out(ctx, pool, f);
+    preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await
+}
+
+/// Host-bridge aggregation entry point using the concatenated strategy
+/// (cross-layer-aggregation diagnostics): every selected host server's
+/// result is collected, ordered by the priority walk. The host counterpart
+/// of [`super::dispatch::dispatch_concatenated`].
+pub(crate) async fn dispatch_host_concatenated<T, F, Fut>(
+    ctx: &HostRequestContext,
+    pool: Arc<LanguageServerPool>,
+    f: F,
+    cancel_rx: Option<CancelReceiver>,
+    log_target: Option<&str>,
+) -> FanInResult<Vec<T>>
+where
+    T: Send + 'static,
+    F: Fn(HostFanOutTask) -> Fut,
+    Fut: Future<Output = io::Result<T>> + Send + 'static,
+{
+    let (mut join_set, entries) = host_fan_out(ctx, pool, f);
+    let ordering = entry_names(&entries);
+    concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target).await
+}
+
+/// Shared host fan-out: allowlist + `"*"` expansion against `ctx.configs`,
+/// one spawned task per selected server.
+fn host_fan_out<T, F, Fut>(
+    ctx: &HostRequestContext,
+    pool: Arc<LanguageServerPool>,
+    f: F,
+) -> (
+    JoinSet<TaggedResult<T>>,
+    Vec<super::priority::PriorityEntry>,
+)
+where
+    T: Send + 'static,
+    F: Fn(HostFanOutTask) -> Fut,
+    Fut: Future<Output = io::Result<T>> + Send + 'static,
+{
     let entries = truncate_entries(
         expand_priorities(&ctx.priorities, &ctx.configs),
         ctx.max_fan_out,
@@ -77,6 +117,5 @@ where
             }
         });
     }
-
-    preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await
+    (join_set, entries)
 }

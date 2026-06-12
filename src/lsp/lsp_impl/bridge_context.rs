@@ -58,9 +58,12 @@ pub(crate) struct DocumentRequestContext {
 /// verbatim, plus the servers selected for the host role and the `_self`
 /// aggregation settings.
 ///
-/// The layer strategy is not carried: within the host layer, servers
-/// combine with `preferred` only. The cross-layer strategy lives in the
-/// caller (`walk_layers` / the formatting pipeline).
+/// `strategy` is the *within-host-layer* combine from
+/// `bridge._self.aggregation` — consumed by diagnostics (concatenated
+/// across host servers by default); the verbatim raw-request path combines
+/// with `preferred` regardless. The *cross-layer* strategy lives in the
+/// caller (`walk_layers` / the formatting pipeline / the diagnostics
+/// layer merge).
 pub(crate) struct HostRequestContext {
     /// The real client URI (forwarded verbatim — no virtual URI).
     pub(crate) uri: Url,
@@ -73,6 +76,8 @@ pub(crate) struct HostRequestContext {
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// Ordered allowlist from `bridge._self.aggregation` (wildcard-merged).
     pub(crate) priorities: Vec<String>,
+    /// Within-host-layer combine strategy from `bridge._self.aggregation`.
+    pub(crate) strategy: AggregationStrategy,
     /// Fan-out cap from `bridge._self.aggregation`.
     pub(crate) max_fan_out: Option<usize>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
@@ -689,6 +694,7 @@ impl Kakehashi {
             language_id: language_name,
             configs,
             priorities: agg.priorities,
+            strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             upstream_request_id: current_upstream_id(),
         })
