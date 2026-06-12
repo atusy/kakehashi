@@ -75,12 +75,26 @@ pub struct QueryInstallResult {
 
 /// Parse the `; inherits: lang1,lang2` directive from query content.
 /// Returns the list of parent languages.
+///
+/// Names are used as path segments (`queries/<name>/`) and URL segments,
+/// so anything outside nvim-treesitter's `[a-z0-9_]+` naming is dropped:
+/// a `; inherits: ../../x` from a compromised or custom query source must
+/// not escape the data dir.
 fn parse_inherits_directive(content: &str) -> Vec<String> {
     let first_line = content.lines().next().unwrap_or("");
     if let Some(rest) = first_line.strip_prefix("; inherits:") {
         rest.split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .filter(|s| {
+                let safe = s
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                if !safe {
+                    eprintln!("Warning: ignoring unsafe inherited language name '{}'", s);
+                }
+                safe
+            })
             .collect()
     } else {
         Vec::new()
@@ -145,7 +159,15 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                let _ = install_queries_recursive(base_url, &parent, data_dir, false, installed);
+                match install_queries_recursive(base_url, &parent, data_dir, false, installed) {
+                    Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to install inherited queries '{}': {}",
+                            parent, e
+                        );
+                    }
+                }
             }
         }
         return Err(QueryInstallError::AlreadyExists(queries_dir));
@@ -246,6 +268,22 @@ fn download_file(url: &str) -> Result<String, QueryInstallError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Inherited language names become path segments (`queries/<name>/`) and
+    /// URL segments, so anything outside nvim-treesitter's `[a-z0-9_]+`
+    /// naming must be dropped — `; inherits: ../../x` from a compromised or
+    /// custom query source must not escape the data dir.
+    #[test]
+    fn parse_inherits_directive_drops_unsafe_language_names() {
+        let parents = parse_inherits_directive(
+            "; inherits: ../../evil, html_tags, UPPER, with-dash, c3\n(comment) @comment\n",
+        );
+        assert_eq!(
+            parents,
+            vec!["html_tags".to_string(), "c3".to_string()],
+            "only lowercase/digit/underscore names may survive"
+        );
+    }
 
     #[test]
     fn test_install_queries_creates_directory_structure() {
