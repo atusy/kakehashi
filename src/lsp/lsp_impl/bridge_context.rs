@@ -360,10 +360,9 @@ pub(crate) fn format_unspawnable_servers_warning(names: &[String]) -> Option<Str
         return None;
     }
     Some(format!(
-        "languageServers entr{} with no 'cmd' (after merging the '_' \
-         wildcard defaults): {}. These servers cannot be spawned and are \
-         skipped by every request.",
-        if names.len() == 1 { "y" } else { "ies" },
+        "languageServers with no 'cmd' (after merging the '_' wildcard \
+         defaults): {}. Such servers cannot be spawned and are skipped by \
+         every request.",
         names.join(", ")
     ))
 }
