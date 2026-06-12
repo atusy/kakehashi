@@ -16,8 +16,8 @@ and the no-explicit-names settings-apply warning live in
 
 ## Context
 
-`AggregationConfig.priorities` currently has **two semantics depending on the
-strategy**:
+`AggregationConfig.priorities` currently has **two semantics** depending on
+the strategy:
 
 - Under `preferred` (the common case), it is a *preference order only*:
   servers absent from the list still participate via first-win fallback
