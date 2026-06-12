@@ -407,6 +407,17 @@ fn parse_host_formatting_response(
 /// `Vec<LocationLink>` **without** any URI or range rewriting — host
 /// responses already speak real-document coordinates.
 pub(crate) fn normalize_host_goto_result(result: serde_json::Value) -> Option<Vec<LocationLink>> {
+    /// The three goto result shapes the LSP spec allows, deserialized in a
+    /// single pass. `Links` must come first: a `LocationLink` array would
+    /// also *partially* match the laxer shapes below.
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum GotoResult {
+        Links(Vec<LocationLink>),
+        Locations(Vec<Location>),
+        Single(Location),
+    }
+
     fn location_to_link(location: Location) -> LocationLink {
         LocationLink {
             origin_selection_range: None,
@@ -416,20 +427,20 @@ pub(crate) fn normalize_host_goto_result(result: serde_json::Value) -> Option<Ve
         }
     }
 
-    if let Ok(links) = serde_json::from_value::<Vec<LocationLink>>(result.clone()) {
-        return Some(links);
+    match serde_json::from_value::<GotoResult>(result) {
+        Ok(GotoResult::Links(links)) => Some(links),
+        Ok(GotoResult::Locations(locations)) => {
+            Some(locations.into_iter().map(location_to_link).collect())
+        }
+        Ok(GotoResult::Single(location)) => Some(vec![location_to_link(location)]),
+        Err(_) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "host goto response did not match Location | Location[] | LocationLink[]"
+            );
+            None
+        }
     }
-    if let Ok(locations) = serde_json::from_value::<Vec<Location>>(result.clone()) {
-        return Some(locations.into_iter().map(location_to_link).collect());
-    }
-    if let Ok(location) = serde_json::from_value::<Location>(result) {
-        return Some(vec![location_to_link(location)]);
-    }
-    log::warn!(
-        target: "kakehashi::bridge",
-        "host goto response did not match Location | Location[] | LocationLink[]"
-    );
-    None
 }
 
 #[cfg(test)]
