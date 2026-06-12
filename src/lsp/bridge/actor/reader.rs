@@ -57,12 +57,15 @@ struct LivenessParams {
 ///
 /// Groups the parameters that `handle_server_request` needs: the language
 /// identifier (for logging), the response channel, the dynamic capability
-/// registry, and the upstream notification channel.
+/// registry, the upstream notification channel, and the workspace folders
+/// this connection was initialized with (the bridge advertises the
+/// `workspace.workspaceFolders` capability, so servers may query them).
 struct ServerRequestDeps {
     language: Option<String>,
     response_tx: mpsc::Sender<OutboundMessage>,
     dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
 }
 
 /// Type alias for the pinned liveness timer future.
@@ -274,11 +277,13 @@ pub(crate) fn spawn_reader_task_with_liveness(
         response_tx,
         dynamic_capabilities,
         upstream_tx,
+        Arc::new(None),
     )
 }
 
 /// Spawn a reader task with liveness timeout (ls-bridge-async-connection) and language identifier
 /// for structured logging.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_reader_task_for_language(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
@@ -287,6 +292,7 @@ pub(crate) fn spawn_reader_task_for_language(
     response_tx: mpsc::Sender<OutboundMessage>,
     dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
 ) -> ReaderTaskHandle {
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
@@ -311,6 +317,7 @@ pub(crate) fn spawn_reader_task_for_language(
         response_tx,
         dynamic_capabilities,
         upstream_tx,
+        workspace_folders,
     };
 
     let join_handle = tokio::spawn(reader_loop_with_liveness(
@@ -360,6 +367,7 @@ async fn reader_loop(
         response_tx,
         dynamic_capabilities,
         upstream_tx,
+        workspace_folders: Arc::new(None),
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -605,9 +613,7 @@ async fn handle_server_request(
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
-    let ok_response = || jsonrpc::Response::from_ok(id.clone(), serde_json::Value::Null);
-
-    let body: jsonrpc::Result<()> = match method {
+    let body: jsonrpc::Result<serde_json::Value> = match method {
         "client/registerCapability" => {
             if let Some(params) = message.get("params") {
                 match serde_json::from_value::<tower_lsp_server::ls_types::RegistrationParams>(
@@ -622,7 +628,7 @@ async fn handle_server_request(
                             );
                         }
                         deps.dynamic_capabilities.register(reg_params.registrations);
-                        Ok(())
+                        Ok(serde_json::Value::Null)
                     }
                     Err(e) => {
                         warn!(
@@ -661,7 +667,7 @@ async fn handle_server_request(
                         }
                         deps.dynamic_capabilities
                             .unregister(unreg_params.unregisterations);
-                        Ok(())
+                        Ok(serde_json::Value::Null)
                     }
                     Err(e) => {
                         warn!(
@@ -693,7 +699,7 @@ async fn handle_server_request(
                 "{}Acknowledged window/workDoneProgress/create",
                 lang_prefix
             );
-            Ok(())
+            Ok(serde_json::Value::Null)
         }
         "workspace/diagnostic/refresh" => {
             // Downstream server is requesting that the client re-pull diagnostics.
@@ -706,7 +712,19 @@ async fn handle_server_request(
             let _ = deps
                 .upstream_tx
                 .send(UpstreamNotification::DiagnosticRefresh);
-            Ok(())
+            Ok(serde_json::Value::Null)
+        }
+        "workspace/workspaceFolders" => {
+            // The bridge advertises workspace.workspaceFolders, so answer
+            // with the folders this connection was initialized with
+            // (WorkspaceFolder[] | null).
+            debug!(
+                target: "kakehashi::bridge::reader",
+                "{}Answering workspace/workspaceFolders from initialize-time folders",
+                lang_prefix
+            );
+            Ok(serde_json::to_value(deps.workspace_folders.as_ref())
+                .unwrap_or(serde_json::Value::Null))
         }
         _ => {
             debug!(
@@ -719,7 +737,7 @@ async fn handle_server_request(
     };
 
     let response = match body {
-        Ok(()) => ok_response(),
+        Ok(result) => jsonrpc::Response::from_ok(id.clone(), result),
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
     // Response implements Serialize, so convert to Value for OutboundMessage.
@@ -819,6 +837,7 @@ mod tests {
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
         (deps, (rx, upstream_rx))
     }
@@ -1261,6 +1280,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         let message = json!({
@@ -1314,6 +1334,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         // Then unregister it
@@ -1358,6 +1379,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         let message = json!({
@@ -1398,6 +1420,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         let message = json!({
@@ -1427,6 +1450,85 @@ mod tests {
         }
     }
 
+    /// workspace/workspaceFolders must be answered with the folders the
+    /// connection was initialized with — the bridge advertises the
+    /// workspace.workspaceFolders capability, so MethodNotFound would break
+    /// servers that re-query their folders.
+    #[tokio::test]
+    async fn handle_message_answers_workspace_folders_query() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let folders = vec![tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///repo".parse().unwrap(),
+            name: "repo".to_string(),
+        }];
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(Some(folders)),
+        };
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "workspace/workspaceFolders",
+            "params": null
+        });
+
+        handle_message(message, &router, "", &deps).await;
+
+        let response = response_rx.try_recv().expect("should have response");
+        match response {
+            OutboundMessage::Untracked(val) => {
+                assert_eq!(val["id"], 11);
+                assert!(val.get("error").is_none(), "Should not be MethodNotFound");
+                assert_eq!(val["result"][0]["uri"], "file:///repo");
+                assert_eq!(val["result"][0]["name"], "repo");
+            }
+            _ => panic!("Expected Untracked variant"),
+        }
+    }
+
+    /// With no folders recorded (e.g. upstream supplied none), the query
+    /// answers `null` — still a success response, not MethodNotFound.
+    #[tokio::test]
+    async fn handle_message_answers_null_workspace_folders_without_folders() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+        };
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "workspace/workspaceFolders",
+            "params": null
+        });
+
+        handle_message(message, &router, "", &deps).await;
+
+        let response = response_rx.try_recv().expect("should have response");
+        match response {
+            OutboundMessage::Untracked(val) => {
+                assert_eq!(val["id"], 12);
+                assert!(val.get("error").is_none(), "Should not be MethodNotFound");
+                assert!(val["result"].is_null());
+            }
+            _ => panic!("Expected Untracked variant"),
+        }
+    }
+
     /// Scratch-targeted publishDiagnostics must be dropped on the floor:
     /// nothing forwarded upstream, nothing written back downstream
     /// (concatenated-formatting-pipeline Decision point 7).
@@ -1441,6 +1543,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         let message = json!({
@@ -1514,6 +1617,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         let message = json!({
@@ -1546,6 +1650,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         // client/registerCapability with no params field at all
@@ -1593,6 +1698,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         // client/unregisterCapability with no params field at all
@@ -1651,6 +1757,7 @@ mod tests {
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -1704,6 +1811,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            workspace_folders: Arc::new(None),
         };
 
         let message = json!({

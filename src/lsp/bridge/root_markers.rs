@@ -71,11 +71,13 @@ pub(crate) fn resolve_spawn_workspace(
         // `WorkspaceFolder.uri` is `ls_types::Uri`, not `url::Url` — the
         // string parse IS the type conversion, not a redundant round-trip.
         let uri = root.as_str().parse().ok()?;
+        // Basename of the root dir; a root with no basename (e.g. `/`) falls
+        // back to the URI string rather than an empty name.
         let name = root
             .to_file_path()
             .ok()
             .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_default();
+            .unwrap_or_else(|| root.as_str().to_string());
         Some((
             Some(String::from(root)),
             Some(vec![WorkspaceFolder { uri, name }]),

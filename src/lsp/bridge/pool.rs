@@ -686,6 +686,24 @@ impl LanguageServerPool {
         // Create dynamic capability registry (shared between reader and connection handle)
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
 
+        // rootMarkers workspace-root detection (root_markers module): a
+        // marker hit near the triggering document overrides the
+        // client-supplied root and folders; otherwise both fall back.
+        // Resolved before the reader task spawns because the reader answers
+        // downstream `workspace/workspaceFolders` queries with these folders.
+        let (root_uri, workspace_folders) = super::root_markers::resolve_spawn_workspace(
+            server_config.root_markers.as_deref(),
+            document_uri,
+            || (self.root_uri(), self.workspace_folders()),
+        );
+        log::debug!(
+            target: "kakehashi::bridge::init",
+            "[{}] workspace root for spawn: {:?}",
+            server_name,
+            root_uri
+        );
+        let workspace_folders = Arc::new(workspace_folders);
+
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
         // Server name is passed for structured logging (observability improvement)
@@ -698,6 +716,7 @@ impl LanguageServerPool {
             tx.clone(),
             Arc::clone(&dynamic_capabilities),
             self.upstream_tx.clone(),
+            Arc::clone(&workspace_folders),
         );
 
         // Create handle in Initializing state (fast-fail for concurrent requests)
@@ -727,20 +746,6 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
-        // rootMarkers workspace-root detection (root_markers module): a
-        // marker hit near the triggering document overrides the
-        // client-supplied root and folders; otherwise both fall back.
-        let (root_uri, workspace_folders) = super::root_markers::resolve_spawn_workspace(
-            server_config.root_markers.as_deref(),
-            document_uri,
-            || (self.root_uri(), self.workspace_folders()),
-        );
-        log::debug!(
-            target: "kakehashi::bridge::init",
-            "[{}] workspace root for spawn: {:?}",
-            server_name,
-            root_uri
-        );
         let client_capabilities = self.client_capabilities();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
@@ -753,7 +758,7 @@ impl LanguageServerPool {
                     init_response_rx,
                     init_options,
                     root_uri,
-                    workspace_folders,
+                    workspace_folders.as_ref().clone(),
                     client_capabilities,
                 ),
             )
