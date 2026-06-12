@@ -19,11 +19,14 @@ Phased roadmap:
    `Kakehashi::virt_layer_enabled`, the push-diagnostics scheduler via
    `resolve_layer_config_from_settings` directly (it already holds a loaded
    settings arc), keyed `textDocument/publishDiagnostics` to match its
-   aggregation config. Because host (`bridge._self`) is
-   unimplemented and bridged methods have no native contributor, the
-   stage-2 `preferred` walk degenerates to this gate — "first non-empty
-   layer in order" with one possible contributor. A fuller walk arrives
-   with the second contributor.
+   aggregation config. With host bridging (host-document-bridge) now
+   implemented for `textDocument/definition` and `textDocument/hover`,
+   those two handlers run the real stage-2 `preferred` walk
+   (`goto_definition_impl` / `hover_impl`): layers are tried lazily in
+   `order`, first non-empty wins — virt answers inside injections, host
+   answers on the host document when `bridge._self.enabled = true`. All
+   other methods keep the degenerate virt gate until they grow a second
+   contributor.
 3. **Layer-level `concatenated` for `textDocument/formatting` only** — ✅
    implemented as `combine_layer_formatting_results`: formatting dispatches
    on the resolved layer strategy. With at most one producing layer (the

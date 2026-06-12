@@ -8,6 +8,33 @@
 - [pull-first-diagnostic-forwarding](pull-first-diagnostic-forwarding.md) — Diagnostic forwarding
 - [cross-layer-aggregation](cross-layer-aggregation.md) — Cross-layer (native/host/virt) result aggregation; covers what this decision scopes out
 
+## Implementation Status
+
+Partially implemented:
+
+- **Schema & gate**: the `_self` reserved key is live. Opt-in is the explicit
+  `bridge._self.enabled = true` (`LanguageSettings::is_host_bridging_enabled`);
+  the built-in `_self.enabled = false` default is implemented as an
+  explicit-only rule — the `_` wildcard's `enabled = true` deliberately does
+  not leak into `_self` (equivalent to the Wildcard Merge Safety reasoning
+  below, without materializing built-in default entries). Aggregation fields
+  DO wildcard-merge (`resolve_host_aggregation`).
+- **Dispatch**: implemented for `textDocument/definition` and
+  `textDocument/hover` (`src/lsp/bridge/text_document/host.rs`,
+  `dispatch_host_preferred`); other methods follow the same pattern as
+  needed. The layer walk in the handlers (cross-layer-aggregation) tries
+  layers in `order` — by default virt first, host as fallback.
+- **Document sync deviation**: instead of forwarding `didChange` params
+  verbatim, sync is *lazy*: `didOpen` with the full host text fires on the
+  first request per `(uri, server)`, and a **full-text** `didChange` fires
+  when the host text's fingerprint changed since the last request. This
+  matches the virt path's full-content `didChange` forwarding and avoids
+  hooking the concurrent upstream `didChange` stream; verbatim forwarding
+  remains the target if eager sync proves necessary.
+- **Not implemented**: `publishDiagnostics` pass-through from host servers
+  (downstream notifications are not forwarded upstream today on either
+  path), and host participation in the formatting pipeline.
+
 ## Context
 
 Today kakehashi bridges LSP requests only to **injection regions** (virtual documents): a Python LS handles the Python code blocks inside a Markdown file, an SQL LS handles SQL inside a Rust string, etc. The host document itself — the Markdown, the Rust file as a whole — is parsed by kakehashi but receives no support from a *host* language server. Operations that require whole-document semantics (e.g., marksman on `.md`, or a Markdown-aware formatter) cannot be wired through kakehashi.

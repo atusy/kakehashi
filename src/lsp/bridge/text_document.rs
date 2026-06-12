@@ -23,6 +23,7 @@ mod document_link;
 mod document_symbol;
 mod folding_range;
 mod formatting;
+pub(super) mod host;
 mod hover;
 mod implementation;
 mod inlay_hint;

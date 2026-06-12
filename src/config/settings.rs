@@ -5,6 +5,11 @@ use std::collections::HashMap;
 
 pub(crate) type CaptureMapping = HashMap<String, String>;
 
+/// Reserved key in the `bridge` map for the host language acting as its own
+/// bridge target (host-document-bridge): requests for the host document are
+/// forwarded with the real URI and no coordinate translation.
+pub(crate) const HOST_BRIDGE_KEY: &str = "_self";
+
 /// Reserved `priorities` element standing for "every configured server not
 /// named elsewhere in the list" (aggregation-priorities-wildcard).
 ///
@@ -429,6 +434,41 @@ impl LanguageSettings {
             },
             None => ResolvedLayerConfig::with_defaults(method),
         }
+    }
+
+    /// Whether host bridging (`bridge._self`, host-document-bridge) is
+    /// enabled for this language.
+    ///
+    /// Host bridging is **opt-in**: it requires an explicit
+    /// `bridge._self.enabled = true`. Unlike injection entries, the `enabled`
+    /// field deliberately does NOT inherit from the `_` wildcard entry —
+    /// that implements the ADR's built-in `languages._.bridge._self.enabled
+    /// = false` default, which must beat the wildcard's `enabled = true`
+    /// virt default (key-specific wins). Aggregation fields DO inherit from
+    /// `_` via [`Self::resolve_host_aggregation`].
+    pub(crate) fn is_host_bridging_enabled(&self) -> bool {
+        self.bridge
+            .as_ref()
+            .and_then(|map| map.get(HOST_BRIDGE_KEY))
+            .and_then(|cfg| cfg.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Resolve the per-method aggregation config for the host bridge target
+    /// (`bridge._self`), with the same field-level wildcard merge as any
+    /// other bridge key: an unset `_self` field inherits from `_`.
+    pub(crate) fn resolve_host_aggregation(&self, method: &str) -> ResolvedAggregationConfig {
+        self.bridge
+            .as_ref()
+            .and_then(|map| {
+                crate::config::resolve_with_wildcard(
+                    map,
+                    HOST_BRIDGE_KEY,
+                    crate::config::merge_bridge_language_configs,
+                )
+            })
+            .map(|cfg| cfg.resolve_aggregation(method))
+            .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
     }
 
     /// Check if a language is allowed for bridging based on the bridge filter.
@@ -1401,6 +1441,102 @@ kind = "injections""#;
         };
         let agg = config.resolve_aggregation("textDocument/completion");
         assert_eq!(agg.priorities, &["server_a".to_string()]);
+    }
+
+    // ==========================================================================
+    // Host bridging (host-document-bridge)
+    // ==========================================================================
+
+    #[test]
+    fn host_bridging_is_disabled_by_default() {
+        assert!(!LanguageSettings::default().is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_bridging_enabled_by_explicit_self_entry() {
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(settings.is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_bridging_not_enabled_by_bridge_wildcard() {
+        // The `_` wildcard's enabled = true is the VIRT default; it must not
+        // silently turn host bridging on (host-document-bridge: the built-in
+        // `_self.enabled = false` default is key-specific and wins).
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(!settings.is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_bridging_explicit_false_stays_off() {
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(false),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(!settings.is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_aggregation_inherits_from_bridge_wildcard() {
+        // Aggregation fields (unlike `enabled`) DO inherit from `_`.
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: None,
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(HashMap::from([(
+                            "_".to_string(),
+                            AggregationConfig {
+                                priorities: Some(vec!["marksman".to_string()]),
+                                ..Default::default()
+                            },
+                        )])),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let agg = settings.resolve_host_aggregation("textDocument/definition");
+        assert_eq!(agg.priorities, vec!["marksman".to_string()]);
+    }
+
+    #[test]
+    fn host_aggregation_defaults_to_wildcard_priorities_when_unconfigured() {
+        let settings = LanguageSettings::default();
+        let agg = settings.resolve_host_aggregation("textDocument/definition");
+        assert_eq!(agg.priorities, vec![PRIORITIES_WILDCARD.to_string()]);
     }
 
     // ==========================================================================

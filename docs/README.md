@@ -320,6 +320,30 @@ Each entry in the `bridge` map configures bridging for one injection language:
 | `enabled` | Whether bridging is enabled (`true`/`false`). Omit to inherit from the `_` wildcard (defaults to `true`). |
 | `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. |
 
+**Host bridging (`bridge._self`):**
+
+The reserved `_self` key makes the host language its own bridge target: with
+it enabled, requests on the host document are forwarded to servers whose
+`languages` contains the **host** language, with the real URI and no
+coordinate translation. Currently `textDocument/definition` and
+`textDocument/hover` are wired; by default the host layer is tried after
+`virt` (see `layers` above), so injections keep winning inside code fences
+while the host server answers everywhere else.
+
+```toml
+[languages.markdown.bridge._self]
+enabled = true                       # opt-in: REQUIRED, never inherited from `_`
+
+[languageServers.marksman]
+cmd = ["marksman", "server"]
+languages = ["markdown"]             # host candidate for markdown documents
+```
+
+Unlike injection entries, `_self.enabled` does **not** inherit from the `_`
+wildcard — a server listing the host language is a *capability*, not consent
+to use it. `_self.aggregation` (priorities/strategy/maxFanOut) inherits from
+`_` as usual.
+
 **Aggregation Configuration:**
 
 When multiple language servers can handle the same injection language, `aggregation` controls which server's response is preferred. Each entry contains:
@@ -386,10 +410,12 @@ Details:
   diagnostics gate under `textDocument/diagnostic`, push diagnostics under
   `textDocument/publishDiagnostics`. Disable both (or use `_`) to fully turn
   bridge diagnostics off.
-- **Current effect**: today only the `virt` layer produces results — `host`
-  is reserved until host-document bridging ships, and bridged methods have
-  no `native` counterpart — so the practical effect is per-method enabling
-  and disabling of injection bridging.
+- **Current effect**: the `virt` layer answers inside injection regions, and
+  the `host` layer answers on the host document itself for
+  `textDocument/definition` and `textDocument/hover` when host bridging is
+  opted in (see `bridge._self` below). Bridged methods have no `native`
+  counterpart yet. For other methods the practical effect is per-method
+  enabling and disabling of injection bridging.
 
 **Bridge Filter Semantics:**
 

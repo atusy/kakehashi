@@ -283,6 +283,46 @@ impl BridgeCoordinator {
         results
     }
 
+    /// Get every server config that can act as a **host** bridge for the
+    /// given host language (host-document-bridge).
+    ///
+    /// Selection mirrors [`Self::get_all_configs_for_language`] with the
+    /// host-path matching rule: servers whose `languages` contains the
+    /// *host* language itself. Gated on the explicit `bridge._self.enabled =
+    /// true` opt-in ([`LanguageSettings::is_host_bridging_enabled`]) — a
+    /// candidate server alone is not consent to use it.
+    pub(crate) fn get_host_configs_for_language(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+    ) -> Vec<ResolvedServerConfig> {
+        let enabled = settings
+            .resolve_host_language_settings(host_language)
+            .is_some_and(|host_settings| host_settings.is_host_bridging_enabled());
+        if !enabled {
+            return Vec::new();
+        }
+
+        let servers = &settings.language_servers;
+
+        let mut results: Vec<ResolvedServerConfig> = servers
+            .keys()
+            .filter(|name| *name != "_")
+            .filter_map(|server_name| {
+                resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
+                    .filter(|c| c.languages.iter().any(|l| l == host_language))
+                    .map(|config| ResolvedServerConfig {
+                        server_name: server_name.clone(),
+                        config: Arc::new(config),
+                    })
+            })
+            .collect();
+
+        // Sort by server name for deterministic ordering
+        results.sort_by(|a, b| a.server_name.cmp(&b.server_name));
+        results
+    }
+
     // ========================================
     // Node tracker management (delegate to tracker)
     // ========================================

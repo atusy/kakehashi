@@ -53,6 +53,32 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) max_fan_out: Option<usize>,
 }
 
+/// All resolved context needed to send a **host** bridge request
+/// (host-document-bridge): the real URI, the host language and text
+/// verbatim, plus the servers selected for the host role and the `_self`
+/// aggregation settings.
+///
+/// The layer strategy is not carried: host dispatch is `preferred`-only
+/// today (cross-layer `concatenated` is honored for formatting, which has no
+/// host path yet).
+pub(crate) struct HostRequestContext {
+    /// The real client URI (forwarded verbatim — no virtual URI).
+    pub(crate) uri: Url,
+    /// The host language, used as the downstream `languageId`.
+    pub(crate) language_id: String,
+    /// The current host text, shared across per-server tasks.
+    pub(crate) text: std::sync::Arc<str>,
+    /// Host-capable server configs (`languages` contains the host language),
+    /// gated on the explicit `bridge._self.enabled = true` opt-in.
+    pub(crate) configs: Vec<ResolvedServerConfig>,
+    /// Ordered allowlist from `bridge._self.aggregation` (wildcard-merged).
+    pub(crate) priorities: Vec<String>,
+    /// Fan-out cap from `bridge._self.aggregation`.
+    pub(crate) max_fan_out: Option<usize>,
+    /// The upstream JSON-RPC request ID for cancel forwarding.
+    pub(crate) upstream_request_id: Option<UpstreamId>,
+}
+
 /// Document context plus a cursor position.
 ///
 /// Used by position-based handlers (definition, hover, completion, etc.).
@@ -463,6 +489,57 @@ impl Kakehashi {
             injection_language,
             method_name,
         )
+    }
+
+    /// Resolve the context for a **host** bridge request
+    /// (host-document-bridge): the host language's own servers, gated on the
+    /// explicit `bridge._self.enabled = true` opt-in.
+    ///
+    /// Returns `None` when the document is missing, host bridging is not
+    /// opted in, or no configured server lists the host language.
+    pub(crate) fn resolve_host_bridge_context(
+        &self,
+        lsp_uri: &Uri,
+        method_name: &str,
+    ) -> Option<HostRequestContext> {
+        let uri = uri_to_url(lsp_uri).ok()?;
+        let snapshot = self.documents.get(&uri)?.snapshot()?;
+        let language_name = self.document_language(&uri)?;
+
+        let settings = self.settings_manager.load_settings();
+        let lang_settings = settings.resolve_host_language_settings(&language_name)?;
+        if !lang_settings.is_host_bridging_enabled() {
+            log::debug!(
+                "{}: host bridging not opted in for {} (bridge._self.enabled)",
+                method_name,
+                language_name
+            );
+            return None;
+        }
+
+        let configs = self
+            .bridge
+            .get_host_configs_for_language(&settings, &language_name);
+        if configs.is_empty() {
+            log::debug!(
+                "{}: no host-capable server configured for {}",
+                method_name,
+                language_name
+            );
+            return None;
+        }
+
+        let agg = lang_settings.resolve_host_aggregation(method_name);
+
+        Some(HostRequestContext {
+            uri,
+            text: std::sync::Arc::from(snapshot.text()),
+            language_id: language_name,
+            configs,
+            priorities: agg.priorities,
+            max_fan_out: agg.max_fan_out,
+            upstream_request_id: current_upstream_id(),
+        })
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
