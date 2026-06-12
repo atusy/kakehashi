@@ -208,6 +208,16 @@ downstream ──notification──►  bridge  ──notification──►  ups
                                └─ ...
 ```
 
+**Implemented: `window/*` forwarding (#378).** The reader task forwards
+`window/logMessage` unconditionally and `window/showMessage` behind the
+per-server `forwardShowMessage` config gate (default off — showMessage
+surfaces directly in the user's UI, so noisy servers must opt in via config).
+Both are prefixed with `[kakehashi:<server>]` for distinguishability and need
+no coordinate translation. They travel over the same `UpstreamNotification`
+channel as `workspace/diagnostic/refresh`, keeping the bridge decoupled from
+the tower-lsp `Client`. Still not forwarded: `$/progress` (#379) and
+push-based `textDocument/publishDiagnostics` (#380).
+
 ### Cancellation Propagation
 
 See ls-bridge-message-ordering § Cancellation Forwarding for single-connection cancellation semantics.
