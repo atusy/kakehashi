@@ -349,6 +349,9 @@ impl Kakehashi {
 ///   fresh diagnostic pull from the editor.
 /// - `LogMessage`: forwards a downstream `window/logMessage` (already prefixed
 ///   with the originating server name) to the editor's log (#378).
+/// - `ShowMessage`: forwards a downstream `window/showMessage` to the editor's
+///   UI; the reader only emits this when the server's `forwardShowMessage`
+///   config gate is enabled (#378).
 ///
 /// Exits when:
 /// - The channel is closed (all senders dropped), OR
@@ -384,6 +387,9 @@ async fn upstream_forwarding_loop(
                     }
                     Some(UpstreamNotification::LogMessage { typ, message }) => {
                         client.log_message(typ, message).await;
+                    }
+                    Some(UpstreamNotification::ShowMessage { typ, message }) => {
+                        client.show_message(typ, message).await;
                     }
                     None => break, // Channel closed
                 }

@@ -344,6 +344,10 @@ pub struct BridgeServerConfig {
     /// — neither re-advertising the capability nor changing forwarding. A
     /// restart is required for new triggers to take effect.
     pub on_type_formatting_triggers: Option<Vec<String>>,
+    /// Forward `window/showMessage` notifications from this server to the
+    /// editor (default: false). Off by default so noisy downstream servers
+    /// cannot spam user-facing popups; `window/logMessage` is always forwarded.
+    pub forward_show_message: Option<bool>,
 }
 
 /// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
@@ -1316,6 +1320,35 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_forward_show_message() {
+        let config_json = r#"{
+            "languageServers": {
+                "lua-ls": {
+                    "cmd": ["lua-language-server"],
+                    "languages": ["lua"],
+                    "forwardShowMessage": true
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["lua-ls"].forward_show_message,
+            Some(true),
+            "explicit forwardShowMessage: true is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].forward_show_message, None,
+            "absent forwardShowMessage parses as None (resolves to disabled)"
+        );
+    }
+
+    #[test]
     fn on_type_formatting_trigger_union_is_sorted_and_deduped() {
         let server = |triggers: Option<Vec<&str>>| BridgeServerConfig {
             cmd: vec!["x".to_string()],
@@ -1324,6 +1357,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
+            forward_show_message: None,
         };
         let servers = HashMap::from([
             ("a".to_string(), server(Some(vec!["}", ";"]))),
@@ -1361,6 +1395,7 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
+                forward_show_message: None,
             },
         )]);
         assert_eq!(

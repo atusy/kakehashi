@@ -906,6 +906,7 @@ mod tests {
             initialization_options: None,
             root_markers: None,
             on_type_formatting_triggers: None,
+            forward_show_message: None,
         }
     }
 

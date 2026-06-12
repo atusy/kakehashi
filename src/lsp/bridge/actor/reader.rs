@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
-use tower_lsp_server::ls_types::{LogMessageParams, MessageType};
+use tower_lsp_server::ls_types::{LogMessageParams, MessageType, ShowMessageParams};
 
 use super::super::connection::BridgeReader;
 use super::OutboundMessage;
@@ -43,6 +43,10 @@ pub(crate) enum UpstreamNotification {
     /// Forward a downstream `window/logMessage` to the editor.
     /// `message` is already prefixed with the originating server name.
     LogMessage { typ: MessageType, message: String },
+    /// Forward a downstream `window/showMessage` to the editor (only sent when
+    /// the server's `forwardShowMessage` config gate is enabled).
+    /// `message` is already prefixed with the originating server name.
+    ShowMessage { typ: MessageType, message: String },
 }
 
 /// Liveness channel endpoints for the reader task.
@@ -57,19 +61,23 @@ struct LivenessParams {
     failed_tx: oneshot::Sender<()>,
 }
 
-/// Dependencies for handling server-initiated requests.
+/// Dependencies for handling server-initiated requests and notifications.
 ///
-/// Groups the parameters that `handle_server_request` needs: the downstream
-/// server name (for logging), the response channel, the dynamic capability
-/// registry, the upstream notification channel, and the workspace folders
-/// this connection was initialized with (the bridge advertises the
-/// `workspace.workspaceFolders` capability, so servers may query them).
-struct ServerRequestDeps {
-    server_name: Option<String>,
-    response_tx: mpsc::Sender<OutboundMessage>,
-    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
-    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+/// Groups the parameters that `handle_server_request` and
+/// `forward_notification` need: the downstream server name (for logging and
+/// message prefixes), the response channel, the dynamic capability registry,
+/// the upstream notification channel, the workspace folders this connection
+/// was initialized with (the bridge advertises the
+/// `workspace.workspaceFolders` capability, so servers may query them), and
+/// the per-server `forwardShowMessage` config gate (#378).
+pub(crate) struct ServerRequestDeps {
+    pub(crate) server_name: Option<String>,
+    pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
+    pub(crate) dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+    pub(crate) upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    pub(crate) workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    /// Per-server config gate for forwarding `window/showMessage` (#378).
+    pub(crate) forward_show_message: bool,
 }
 
 /// Type alias for the pinned liveness timer future.
@@ -277,26 +285,27 @@ pub(crate) fn spawn_reader_task_with_liveness(
         reader,
         router,
         liveness_timeout,
-        None,
-        response_tx,
-        dynamic_capabilities,
-        upstream_tx,
-        Arc::new(None),
+        ServerRequestDeps {
+            server_name: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            forward_show_message: false,
+        },
     )
 }
 
-/// Spawn a reader task with liveness timeout (ls-bridge-async-connection) and downstream
-/// server name for structured logging.
-#[allow(clippy::too_many_arguments)]
+/// Spawn a reader task with liveness timeout (ls-bridge-async-connection).
+///
+/// `deps` carries the per-server context (name, channels, capability registry,
+/// workspace folders, `forwardShowMessage` gate), snapshotted at spawn time
+/// like the rest of the server config (#378).
 pub(crate) fn spawn_reader_task_for_server(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
     liveness_timeout: Option<Duration>,
-    server_name: Option<String>,
-    response_tx: mpsc::Sender<OutboundMessage>,
-    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
-    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    deps: ServerRequestDeps,
 ) -> ReaderTaskHandle {
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
@@ -316,20 +325,12 @@ pub(crate) fn spawn_reader_task_for_server(
         stop_rx: liveness_stop_rx,
         failed_tx: liveness_failed_tx,
     };
-    let server_request_deps = ServerRequestDeps {
-        server_name,
-        response_tx,
-        dynamic_capabilities,
-        upstream_tx,
-        workspace_folders,
-    };
-
     let join_handle = tokio::spawn(reader_loop_with_liveness(
         reader,
         router,
         token_clone,
         liveness,
-        server_request_deps,
+        deps,
     ));
 
     ReaderTaskHandle {
@@ -372,6 +373,7 @@ async fn reader_loop(
         dynamic_capabilities,
         upstream_tx,
         workspace_folders: Arc::new(None),
+        forward_show_message: false,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -583,29 +585,58 @@ async fn handle_message(
 /// `window/logMessage` is forwarded unconditionally: it is the lowest-risk
 /// notification (editors surface it in a log buffer, not the UI) and is often
 /// the only way to debug downstream servers that have no file-based logging.
-/// The message is prefixed with the originating server name so output from
-/// multiple bridged servers stays distinguishable.
+/// `window/showMessage` reaches the user directly, so it is forwarded only
+/// when the server's `forwardShowMessage` config gate is enabled. Both are
+/// prefixed with the originating server name so output from multiple bridged
+/// servers stays distinguishable.
 ///
 /// Everything else is still silently ignored ($/progress: #379, push-based
 /// publishDiagnostics: #380).
 fn forward_notification(message: &serde_json::Value, lang_prefix: &str, deps: &ServerRequestDeps) {
-    if message["method"].as_str() == Some("window/logMessage") {
-        match serde_json::from_value::<LogMessageParams>(message["params"].clone()) {
-            Ok(params) => {
-                // Send failure means the forwarding loop is gone (server
-                // shutdown) - nothing useful to do with the message then.
-                let _ = deps.upstream_tx.send(UpstreamNotification::LogMessage {
-                    typ: params.typ,
-                    message: prefixed_message(deps.server_name.as_deref(), &params.message),
-                });
+    match message["method"].as_str() {
+        Some("window/logMessage") => {
+            match serde_json::from_value::<LogMessageParams>(message["params"].clone()) {
+                Ok(params) => {
+                    // Send failure means the forwarding loop is gone (server
+                    // shutdown) - nothing useful to do with the message then.
+                    let _ = deps.upstream_tx.send(UpstreamNotification::LogMessage {
+                        typ: params.typ,
+                        message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                    });
+                }
+                Err(e) => debug!(
+                    target: "kakehashi::bridge::reader",
+                    "{}Dropping window/logMessage with invalid params: {}",
+                    lang_prefix,
+                    e
+                ),
             }
-            Err(e) => debug!(
-                target: "kakehashi::bridge::reader",
-                "{}Dropping window/logMessage with invalid params: {}",
-                lang_prefix,
-                e
-            ),
         }
+        Some("window/showMessage") => {
+            if !deps.forward_show_message {
+                debug!(
+                    target: "kakehashi::bridge::reader",
+                    "{}Dropping window/showMessage (forwardShowMessage is disabled)",
+                    lang_prefix
+                );
+                return;
+            }
+            match serde_json::from_value::<ShowMessageParams>(message["params"].clone()) {
+                Ok(params) => {
+                    let _ = deps.upstream_tx.send(UpstreamNotification::ShowMessage {
+                        typ: params.typ,
+                        message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                    });
+                }
+                Err(e) => debug!(
+                    target: "kakehashi::bridge::reader",
+                    "{}Dropping window/showMessage with invalid params: {}",
+                    lang_prefix,
+                    e
+                ),
+            }
+        }
+        _ => {}
     }
 }
 
@@ -879,6 +910,7 @@ mod tests {
             dynamic_capabilities: caps,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
         (deps, (rx, upstream_rx))
     }
@@ -929,6 +961,7 @@ mod tests {
     /// can assert what was (not) forwarded to the editor.
     fn server_request_deps_for(
         server_name: Option<&str>,
+        forward_show_message: bool,
     ) -> (
         ServerRequestDeps,
         mpsc::UnboundedReceiver<UpstreamNotification>,
@@ -942,6 +975,8 @@ mod tests {
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
+            workspace_folders: Arc::new(None),
+            forward_show_message,
         };
         (deps, upstream_rx, rx)
     }
@@ -949,7 +984,7 @@ mod tests {
     #[tokio::test]
     async fn handle_message_forwards_window_log_message_upstream() {
         let router = ResponseRouter::new();
-        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -974,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn handle_message_drops_window_log_message_with_invalid_params() {
         let router = ResponseRouter::new();
-        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -987,6 +1022,50 @@ mod tests {
         assert!(
             upstream_rx.try_recv().is_err(),
             "window/logMessage with unparseable params must be dropped, not forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_drops_window_show_message_when_gate_disabled() {
+        let router = ResponseRouter::new();
+        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), false);
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/showMessage",
+            "params": { "type": 1, "message": "noisy popup" }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "window/showMessage must not reach the editor unless forwardShowMessage is enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_forwards_window_show_message_when_gate_enabled() {
+        let router = ResponseRouter::new();
+        let (deps, mut upstream_rx, _keep) = server_request_deps_for(Some("mock-ls"), true);
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/showMessage",
+            "params": { "type": 1, "message": "important popup" }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        let forwarded = upstream_rx
+            .try_recv()
+            .expect("window/showMessage should be forwarded when the gate is enabled");
+        assert_eq!(
+            forwarded,
+            UpstreamNotification::ShowMessage {
+                typ: tower_lsp_server::ls_types::MessageType::ERROR,
+                message: "[kakehashi:mock-ls] important popup".to_string(),
+            }
         );
     }
 
@@ -1387,6 +1466,7 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1441,6 +1521,7 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         // Then unregister it
@@ -1486,6 +1567,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1527,6 +1609,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1571,11 +1654,12 @@ mod tests {
             name: "repo".to_string(),
         }];
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(Some(folders)),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1608,11 +1692,12 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1650,6 +1735,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1724,6 +1810,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({
@@ -1757,6 +1844,7 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         // client/registerCapability with no params field at all
@@ -1805,6 +1893,7 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         // client/unregisterCapability with no params field at all
@@ -1864,6 +1953,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -1918,6 +2008,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            forward_show_message: false,
         };
 
         let message = json!({

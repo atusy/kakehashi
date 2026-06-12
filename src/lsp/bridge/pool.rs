@@ -70,7 +70,8 @@ pub(crate) enum ConnectionReadiness {
 }
 
 use super::actor::{
-    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, UpstreamNotification, spawn_reader_task_for_server,
+    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, ServerRequestDeps, UpstreamNotification,
+    spawn_reader_task_for_server,
 };
 use super::connection::AsyncBridgeConnection;
 
@@ -834,17 +835,20 @@ impl LanguageServerPool {
 
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
-        // Server name is passed for structured logging (observability improvement)
+        // Server name is passed for structured logging and notification prefixes
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
         let reader_handle = spawn_reader_task_for_server(
             reader,
             Arc::clone(&router),
             Some(liveness_timeout.as_duration()),
-            Some(server_name.to_string()),
-            tx.clone(),
-            Arc::clone(&dynamic_capabilities),
-            self.upstream_tx.clone(),
-            Arc::clone(&workspace_folders),
+            ServerRequestDeps {
+                server_name: Some(server_name.to_string()),
+                response_tx: tx.clone(),
+                dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+                upstream_tx: self.upstream_tx.clone(),
+                workspace_folders: Arc::clone(&workspace_folders),
+                forward_show_message: server_config.forward_show_message.unwrap_or(false),
+            },
         );
 
         // Create handle in Initializing state (fast-fail for concurrent requests)
@@ -1861,6 +1865,7 @@ mod tests {
             initialization_options: None,
             root_markers: None,
             on_type_formatting_triggers: None,
+            forward_show_message: None,
         };
 
         let result = pool
