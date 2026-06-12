@@ -24,6 +24,19 @@ use crate::language::InjectionResolver;
 
 use super::{Kakehashi, url_to_uri};
 
+/// Result of one CLI formatting attempt ([`Kakehashi::cli_format_text`]).
+pub(crate) struct CliFormatOutcome {
+    /// The full formatted text when formatting produced edits; `None` when
+    /// nothing applied (unknown language, no regions, no servers, no edits).
+    pub(crate) formatted: Option<String>,
+    /// Human-readable descriptions of configured downstream servers that
+    /// failed to spawn or initialize within the ready timeout. Non-empty
+    /// means the document's formatting is incomplete or unverifiable — the
+    /// CLI maps this to its error exit code instead of reporting the file
+    /// as "unchanged".
+    pub(crate) server_failures: Vec<String>,
+}
+
 impl Kakehashi {
     /// Run the LSP initialize/initialized lifecycle for CLI mode, loading
     /// configuration from `root` (typically the current directory) exactly
@@ -60,10 +73,13 @@ impl Kakehashi {
             .is_some_and(|p| self.language.loadable_language_for_path(p).is_some())
     }
 
-    /// Format `text` as if it were the document at absolute `path`, returning
-    /// the formatted text — or `None` when no formatting applies (unknown
-    /// language, no injection regions, no configured servers, or the
-    /// formatters returned no edits).
+    /// Format `text` as if it were the document at absolute `path`.
+    ///
+    /// `formatted` is `None` when no formatting applies (unknown language,
+    /// no injection regions, no configured servers, or the formatters
+    /// returned no edits); `server_failures` lists configured downstream
+    /// servers that failed to come up, so the caller can distinguish
+    /// "nothing to do" from "the formatter is broken".
     ///
     /// Downstream servers are spawned cold on the first file; the explicit
     /// ready-wait (bounded by `ready_timeout` per server) keeps a cold start
@@ -75,17 +91,25 @@ impl Kakehashi {
         text: &str,
         formatting_options: FormattingOptions,
         ready_timeout: Duration,
-    ) -> Option<String> {
-        let url = Url::from_file_path(path).ok()?;
-        let lsp_uri = url_to_uri(&url).ok()?;
+    ) -> CliFormatOutcome {
+        let none = CliFormatOutcome {
+            formatted: None,
+            server_failures: Vec::new(),
+        };
+        let Ok(url) = Url::from_file_path(path) else {
+            return none;
+        };
+        let Ok(lsp_uri) = url_to_uri(&url) else {
+            return none;
+        };
 
-        // Path-based detection first: it loads an installed-but-unloaded
-        // parser, which the content-based chain (used second, for shebangs
-        // and mode lines) requires to already be loaded.
+        // Path-based detection first, then first-line content detection —
+        // both via the loading chain, because `detect_language`'s own stages
+        // only accept parsers that are already loaded, and nothing is loaded
+        // before the first didOpen in CLI mode.
         let language_id = self
             .language
-            .loadable_language_for_path(url.path())
-            .or_else(|| self.language.detect_language(url.path(), text, None, None))
+            .loadable_language_for_document(url.path(), text)
             .unwrap_or_default();
 
         self.did_open_impl(DidOpenTextDocumentParams {
@@ -98,7 +122,7 @@ impl Kakehashi {
         })
         .await;
 
-        self.wait_bridge_servers_ready(&url, ready_timeout).await;
+        let server_failures = self.wait_bridge_servers_ready(&url, ready_timeout).await;
         self.wait_eager_open_finished(&url, ready_timeout).await;
 
         let result = self
@@ -120,16 +144,18 @@ impl Kakehashi {
         // (it only signals upstream cancellation, and there is no upstream
         // request id here) — but if a future code path introduces one, a
         // silent "no change" would hide it, so surface it in the log.
-        let edits = result
+        let formatted = result
             .inspect_err(|e| {
                 log::warn!(target: "kakehashi::cli", "formatting failed for {url}: {e}");
             })
             .ok()
-            .flatten()?;
-        if edits.is_empty() {
-            return None;
+            .flatten()
+            .filter(|edits| !edits.is_empty())
+            .map(|edits| crate::text::edit::apply_text_edits(text, &edits));
+        CliFormatOutcome {
+            formatted,
+            server_failures,
         }
-        Some(crate::text::edit::apply_text_edits(text, &edits))
     }
 
     /// Gracefully shut down downstream language servers (LSP shutdown/exit
@@ -166,22 +192,23 @@ impl Kakehashi {
     }
 
     /// Wait (up to `timeout` per server) until every downstream server
-    /// configured for the document's injection regions is Ready.
+    /// configured for the document's injection regions is Ready, returning a
+    /// description of each server that failed to come up.
     ///
     /// `formatting_impl` treats a not-yet-ready server as a failed step and
     /// skips it — correct for an editor where the next request retries, but a
     /// one-shot CLI run would silently produce no edits. Spawning is
     /// idempotent (`get_or_create_connection_wait_ready`), so this overlaps
     /// with the eager-open `didOpen` triggered.
-    async fn wait_bridge_servers_ready(&self, uri: &Url, timeout: Duration) {
+    async fn wait_bridge_servers_ready(&self, uri: &Url, timeout: Duration) -> Vec<String> {
         let Some(language_name) = self.document_language(uri) else {
-            return;
+            return Vec::new();
         };
         let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return;
+            return Vec::new();
         };
         let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot()) else {
-            return;
+            return Vec::new();
         };
 
         let regions = InjectionResolver::resolve_all(
@@ -195,6 +222,7 @@ impl Kakehashi {
 
         let pool = self.bridge.pool_arc();
         let mut waited: HashSet<String> = HashSet::new();
+        let mut failures = Vec::new();
         for resolved in regions {
             for config in self
                 .bridge_configs_for_injection_language(&language_name, &resolved.injection_language)
@@ -213,8 +241,13 @@ impl Kakehashi {
                         "downstream server {} not ready: {e}",
                         config.server_name
                     );
+                    failures.push(format!(
+                        "downstream server '{}' failed to start: {e}",
+                        config.server_name
+                    ));
                 }
             }
         }
+        failures
     }
 }

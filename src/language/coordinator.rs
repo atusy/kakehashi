@@ -772,6 +772,30 @@ impl LanguageCoordinator {
             Some(super::heuristic::detect_from_token(token).unwrap_or_else(|| token.to_string()))
         })?;
 
+        self.load_candidate_or_base(candidate)
+    }
+
+    /// Like [`Self::loadable_language_for_path`], but falls back to
+    /// first-line content detection (shebang, mode line) for extensionless
+    /// files. `detect_language`'s own first-line stage only accepts
+    /// already-loaded parsers, so an explicit CLI path like a
+    /// `#!/usr/bin/env lua` script would otherwise silently fail detection
+    /// before anything had a chance to load the lua parser.
+    pub(crate) fn loadable_language_for_document(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Option<String> {
+        if let Some(lang) = self.loadable_language_for_path(path) {
+            return Some(lang);
+        }
+        let candidate = super::heuristic::detect_from_first_line(content)?;
+        self.load_candidate_or_base(candidate)
+    }
+
+    /// Load `candidate` (or its configured base) from the search paths,
+    /// returning the name that actually loaded.
+    fn load_candidate_or_base(&self, candidate: String) -> Option<String> {
         if self.ensure_language_loaded(&candidate).success {
             return Some(candidate);
         }

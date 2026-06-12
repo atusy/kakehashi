@@ -339,6 +339,65 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_broken_downstream_server_exits_with_error() {
+    // A configured-but-unstartable formatter must surface as exit 2, not as
+    // a silent "0 file(s) reformatted" success (docs: I/O errors exit 2).
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        r#"autoInstall = false
+
+[languageServers.broken]
+cmd = ["/nonexistent/kakehashi-test-formatter"]
+languages = ["lua"]
+"#,
+    )
+    .expect("write broken-server config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a broken configured server must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to start"),
+        "stderr should name the broken server; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        MARKDOWN,
+        "the file must be left untouched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_format_preserves_file_permissions() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    let path = ws.path().join("doc.md");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o754))
+        .expect("set permissions");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert!(
+        output.status.success(),
+        "format should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(read(ws.path(), "doc.md").contains("LOCAL X = 1"));
+    let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o754,
+        "atomic write must carry the original permissions over"
+    );
+}
+
+#[test]
 fn e2e_excludes_filters_directory_walk() {
     let ws = workspace_with(&[("kept.md", MARKDOWN), ("vendor/dep.md", MARKDOWN)]);
 

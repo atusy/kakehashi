@@ -164,7 +164,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     } else {
         cwd.join(name)
     };
-    let formatted = server
+    let outcome = server
         .cli_format_text(
             &absolute,
             &text,
@@ -172,9 +172,15 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             SERVER_READY_TIMEOUT,
         )
         .await;
-    let changed = formatted.as_deref().is_some_and(|f| f != text);
+    for failure in &outcome.server_failures {
+        eprintln!("error: {failure}");
+    }
+    let changed = outcome.formatted.as_deref().is_some_and(|f| f != text);
 
     if options.check {
+        if !outcome.server_failures.is_empty() {
+            return EXIT_ERROR;
+        }
         if changed {
             eprintln!("Would reformat: {}", name.display());
             return EXIT_CHANGED;
@@ -182,7 +188,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         return EXIT_OK;
     }
 
-    let output = match &formatted {
+    let output = match &outcome.formatted {
         Some(f) if changed => f.as_str(),
         _ => text.as_str(),
     };
@@ -190,7 +196,9 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
-    if changed && options.fail_on_change {
+    if !outcome.server_failures.is_empty() {
+        EXIT_ERROR
+    } else if changed && options.fail_on_change {
         EXIT_CHANGED
     } else {
         EXIT_OK
@@ -215,8 +223,10 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     };
 
     let mut changed = 0usize;
+    let mut unchanged = 0usize;
     let mut read_errors = 0usize;
     let mut write_errors = 0usize;
+    let mut server_errors = 0usize;
     for file in &files {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
@@ -231,39 +241,48 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         } else {
             cwd.join(file)
         };
-        let Some(formatted) = server
+        let outcome = server
             .cli_format_text(
                 &absolute,
                 &text,
                 options.formatting_options(),
                 SERVER_READY_TIMEOUT,
             )
-            .await
-        else {
-            continue;
-        };
-        if formatted == text {
-            continue;
+            .await;
+        // A configured-but-broken downstream server means this file's
+        // formatting is incomplete or unverifiable — an error, not
+        // "unchanged" (docs: I/O errors exit 2). Any partial output another
+        // server produced is still applied below.
+        for failure in &outcome.server_failures {
+            eprintln!("error: {}: {failure}", file.display());
         }
-        changed += 1;
-        if options.check {
-            eprintln!("Would reformat: {}", file.display());
-        } else {
-            match write_atomically(file, &formatted) {
-                Ok(()) => eprintln!("Reformatted: {}", file.display()),
-                Err(e) => {
-                    eprintln!("error: cannot write '{}': {e}", file.display());
-                    write_errors += 1;
+        let server_failed = !outcome.server_failures.is_empty();
+        if server_failed {
+            server_errors += 1;
+        }
+        match outcome.formatted {
+            Some(formatted) if formatted != text => {
+                changed += 1;
+                if options.check {
+                    eprintln!("Would reformat: {}", file.display());
+                } else {
+                    match write_atomically(file, &formatted) {
+                        Ok(()) => eprintln!("Reformatted: {}", file.display()),
+                        Err(e) => {
+                            eprintln!("error: cannot write '{}': {e}", file.display());
+                            write_errors += 1;
+                        }
+                    }
                 }
             }
+            // A server-failed file is not "already formatted" — it was never
+            // (fully) inspected; it is reported via server_errors instead.
+            _ if server_failed => {}
+            _ => unchanged += 1,
         }
     }
 
-    // Unreadable files were never inspected by a formatter, so they belong in
-    // neither the changed nor the "already formatted" bucket. (Write-failed
-    // files stay in `changed` — the formatter did produce a change for them.)
-    let unchanged = files.len() - changed - read_errors;
-    let errors = read_errors + write_errors;
+    let errors = read_errors + write_errors + server_errors;
     let error_suffix = if errors > 0 {
         format!(", {errors} error(s)")
     } else {
@@ -301,6 +320,12 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(Path::new(".")))?;
     tmp.write_all(content.as_bytes())?;
+    // The temp file is created with restrictive default permissions (0600 on
+    // Unix); rename would impose those on the target, silently stripping
+    // group/other bits or the executable bit. Carry the target's own mode
+    // over — after writing, so a read-only target mode can't block the write.
+    tmp.as_file()
+        .set_permissions(std::fs::metadata(&target)?.permissions())?;
     tmp.persist(&target).map_err(|e| e.error)?;
     Ok(())
 }
@@ -346,12 +371,12 @@ fn collect_files(
         let metadata = std::fs::metadata(path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
         if metadata.is_dir() {
-            if exclude_matcher.matched(path, true).is_ignore() {
+            if is_excluded(&exclude_matcher, path, true) {
                 continue;
             }
             walk_directory(path, &exclude_matcher, is_formattable, &mut files);
         } else {
-            if exclude_matcher.matched(path, false).is_ignore() {
+            if is_excluded(&exclude_matcher, path, false) {
                 continue;
             }
             files.push(path.clone());
@@ -360,6 +385,24 @@ fn collect_files(
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// Whether `path` or any of its ancestor directories matches an `--excludes`
+/// pattern.
+///
+/// A directory-only pattern (`vendor/`) never matches a file path directly —
+/// during a walk it works by pruning the directory, but an explicitly listed
+/// file (`kakehashi format vendor/dep.md`) skips the walk, so its ancestors
+/// must be tested as directories too or the documented "excludes filter
+/// everything" contract breaks for exactly that pattern shape.
+fn is_excluded(matcher: &ignore::overrides::Override, path: &Path, is_dir: bool) -> bool {
+    if matcher.matched(path, is_dir).is_ignore() {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .take_while(|a| !a.as_os_str().is_empty())
+        .any(|a| matcher.matched(a, true).is_ignore())
 }
 
 /// Walk `dir` respecting `.gitignore` and `--excludes`, appending every
@@ -463,6 +506,24 @@ mod tests {
             tmp.path(),
             &[tmp.path().join("dropped.md")],
             &["dropped.md".to_string()],
+            &markdown_only,
+        )
+        .unwrap();
+
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn excludes_directory_pattern_filters_explicit_file_inside() {
+        // "vendor/" is a directory-only pattern: a walk prunes the directory,
+        // but an explicit file skips the walk, so its ancestors must match.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("vendor/dep.md"), "x");
+
+        let files = collect_files(
+            tmp.path(),
+            &[tmp.path().join("vendor/dep.md")],
+            &["vendor/".to_string()],
             &markdown_only,
         )
         .unwrap();
