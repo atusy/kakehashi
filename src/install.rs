@@ -469,6 +469,46 @@ mod tests {
         );
     }
 
+    /// The top-level language name becomes a path segment
+    /// (`queries/<name>/`) and a URL segment, exactly like inherited names —
+    /// it must obey the same `[a-z0-9_]+` rule or installing `../../evil`
+    /// writes outside the data dir.
+    #[test]
+    fn install_rejects_unsafe_top_level_language_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Nest the data dir so an escape stays inside the TempDir.
+        let data_dir = temp.path().join("nest").join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Serve highlights.scm under both the raw and the dot-segment-
+        // normalized path, so the download succeeds (and the escape would
+        // persist) no matter how the HTTP client treats `..` in URLs.
+        let body = "(comment) @comment\n";
+        let base_url = spawn_query_file_server(vec![
+            ("/evil/highlights.scm", body),
+            ("/../../evil/highlights.scm", body),
+        ]);
+
+        let result = queries::install_queries_with_dependencies_from(
+            &base_url,
+            "../../evil",
+            &data_dir,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(queries::QueryInstallError::LanguageNotSupported(_))
+            ),
+            "unsafe top-level language name must be rejected"
+        );
+        assert!(
+            !temp.path().join("nest").join("evil").exists(),
+            "install must not write outside the queries dir"
+        );
+    }
+
     /// A language whose parser and queries are already on disk is a
     /// successful install, not a failure: reporting AlreadyExists as an
     /// error made the auto-install manager degrade a fully-usable language
@@ -491,7 +531,8 @@ mod tests {
 
         // Everything exists, so no download may happen — point the base URL
         // at a closed port to fail loudly if one is attempted anyway.
-        let result = install_language_blocking("exists_lang", data_dir, false, "http://127.0.0.1:1");
+        let result =
+            install_language_blocking("exists_lang", data_dir, false, "http://127.0.0.1:1");
 
         assert!(
             result.is_success(),

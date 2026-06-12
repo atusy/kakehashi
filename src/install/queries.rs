@@ -73,13 +73,22 @@ pub struct QueryInstallResult {
     pub files_downloaded: Vec<String>,
 }
 
-/// Parse the `; inherits: lang1,lang2` directive from query content.
-/// Returns the list of parent languages.
+/// Whether a language name is safe to use as a path and URL segment.
 ///
-/// Names are used as path segments (`queries/<name>/`) and URL segments,
-/// so anything outside nvim-treesitter's `[a-z0-9_]+` naming is dropped:
-/// a `; inherits: ../../x` from a compromised or custom query source must
-/// not escape the data dir.
+/// Language names are used as path segments (`queries/<name>/`) and URL
+/// segments, so anything outside nvim-treesitter's `[a-z0-9_]+` naming is
+/// rejected: a name like `../../x` (from a caller or a `; inherits:` line in
+/// a compromised or custom query source) must not escape the data dir.
+fn is_safe_language_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Parse the `; inherits: lang1,lang2` directive from query content.
+/// Returns the list of parent languages, dropping unsafe names
+/// (see [`is_safe_language_name`]).
 fn parse_inherits_directive(content: &str) -> Vec<String> {
     let first_line = content.lines().next().unwrap_or("");
     if let Some(rest) = first_line.strip_prefix("; inherits:") {
@@ -87,9 +96,7 @@ fn parse_inherits_directive(content: &str) -> Vec<String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .filter(|s| {
-                let safe = s
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                let safe = is_safe_language_name(s);
                 if !safe {
                     eprintln!("Warning: ignoring unsafe inherited language name '{}'", s);
                 }
@@ -132,6 +139,14 @@ fn install_queries_recursive(
     force: bool,
     installed: &mut std::collections::HashSet<String>,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    // The name becomes a path and URL segment below; reject anything that
+    // could escape the data dir (e.g. a caller-provided `../../x`).
+    if !is_safe_language_name(language) {
+        return Err(QueryInstallError::LanguageNotSupported(
+            language.to_string(),
+        ));
+    }
+
     // Skip if already installed in this session
     if installed.contains(language) {
         return Ok(QueryInstallResult {
