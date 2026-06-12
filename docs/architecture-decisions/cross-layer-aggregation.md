@@ -73,8 +73,8 @@ choose a combine strategy (first-non-empty vs. merge).
 
 ### Why the existing `priorities` field cannot express this
 
-`AggregationConfig.priorities` is a `Vec<String>` of **language server
-names** — an open, user-defined namespace scoped to a single bridge target.
+`AggregationConfig.priorities` is a `Vec<String>` of **language server names**
+— an open, user-defined namespace scoped to a single bridge target.
 Layers are a different axis: a **closed set of exactly three kinds**, sitting
 *above* the per-target aggregation. Mixing layer identifiers into a
 server-name list would conflate two namespaces in one field — the same

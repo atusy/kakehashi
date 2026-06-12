@@ -379,9 +379,9 @@ Example with per-method priorities, strategy, and maxFanOut:
 
 **Cross-Layer Aggregation (`layers`):**
 
-A request to kakehashi can in principle be answered by up to three *result
-layers*: `virt` (the injection bridges above), `host` (a host-document
-language server — reserved for a future release), and `native` (kakehashi's
+A request to kakehashi can be answered by up to three *result layers*:
+`virt` (the injection bridges above), `host` (a host-document language
+server — opt-in via `bridge._self` above), and `native` (kakehashi's
 own features). The per-language `layers` map orders them per LSP method:
 
 ```json

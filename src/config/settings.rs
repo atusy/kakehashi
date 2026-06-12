@@ -96,9 +96,9 @@ pub struct BridgeLanguageConfig {
 pub enum LayerSource {
     /// kakehashi's own features (Tree-sitter based).
     Native,
-    /// The host-document bridge (`bridge._self`). Reserved: an empty
-    /// contributor until host bridging (host-document-bridge) is implemented
-    /// and opted in via `bridge._self.enabled`.
+    /// The host-document bridge (`bridge._self`, host-document-bridge):
+    /// servers handling the host document itself with the real URI. An
+    /// empty contributor until opted in via `bridge._self.enabled = true`.
     Host,
     /// The injection bridges (`bridge.<language>`).
     Virt,
