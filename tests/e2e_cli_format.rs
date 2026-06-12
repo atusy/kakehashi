@@ -19,8 +19,9 @@ fn data_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     let dir = DIR.get_or_init(|| {
         let dir = kakehashi::install::test_support::test_data_dir_path();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = kakehashi::install::test_support::ensure_test_languages_installed(&dir);
+        std::fs::create_dir_all(&dir).expect("create shared test data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&dir)
+            .expect("install test parsers into the shared data dir");
         dir
     });
     // Clear crash-recovery state before every spawn so an earlier test's
