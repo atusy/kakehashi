@@ -143,10 +143,13 @@ fn install_queries_recursive(
 ) -> Result<QueryInstallResult, QueryInstallError> {
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
+    // Debug-format the untrusted name: the error's Display is printed raw
+    // by the CLI, so control characters must not reach the terminal.
     if !is_safe_language_name(language) {
-        return Err(QueryInstallError::LanguageNotSupported(
-            language.to_string(),
-        ));
+        return Err(QueryInstallError::LanguageNotSupported(format!(
+            "{:?}",
+            language
+        )));
     }
 
     // Skip if already installed in this session
@@ -285,6 +288,30 @@ fn download_file(url: &str) -> Result<String, QueryInstallError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The rejected name flows into the error's `Display` (printed raw by
+    /// the CLI), so control characters in an untrusted name must be escaped
+    /// before they reach terminal output.
+    #[test]
+    fn unsafe_language_name_error_escapes_control_characters() {
+        let temp = TempDir::new().unwrap();
+        let result = install_queries_with_dependencies_from(
+            "http://127.0.0.1:1",
+            "evil\u{1b}[31m",
+            temp.path(),
+            false,
+        );
+        match result {
+            Err(QueryInstallError::LanguageNotSupported(name)) => {
+                assert!(
+                    !name.contains('\u{1b}'),
+                    "stored name must not carry raw escape bytes: {:?}",
+                    name
+                );
+            }
+            other => panic!("expected LanguageNotSupported, got {:?}", other.err()),
+        }
+    }
 
     /// Inherited language names become path segments (`queries/<name>/`) and
     /// URL segments, so anything outside nvim-treesitter's `[a-z0-9_]+`
