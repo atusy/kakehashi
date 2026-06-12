@@ -77,7 +77,7 @@ silently by filename inference.
 
 | Capture | Meaning |
 |---|---|
-| `@scope` | A node that opens a lexical scope. The layer's document root is always an implicit root scope. |
+| `@scope` | A node that opens a lexical scope. The layer root is always an implicit scope. |
 | `@definition` / `@definition.<label>` | A name-introducing node (the identifier itself, not the whole declaration). The optional `<label>` is an **opaque string**: the engine attaches no semantics to it. It serves as a property-targeting key within a pattern (below) and is surfaced in results for future use (e.g. `SymbolKind` mapping). |
 | `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references — the exclusion happens at collection, so a node registered as a definition site never enters the reference set. |
 
@@ -105,8 +105,8 @@ carry no grammar of their own and no new property-key syntax is introduced.
 Per layer, per parsed version:
 
 1. Run the layer language's `bindings.scm` over the layer tree. Build the
-   scope tree from `@scope` captures (implicit root = the layer), nested by
-   node containment.
+   scope tree from `@scope` captures (implicit root scope = the layer
+   root), nested by node containment.
 2. Register each `@definition` in its scope after applying the
    `definition.scope` lift. A definition whose `(name, namespace)` already
    exists in the registering scope does not create a second binding — it
@@ -131,7 +131,8 @@ Per layer, per parsed version:
    scope's bindings when it has `visible-to-nested false` and is not the
    innermost scope containing `P`; stop the walk for a namespace once a
    scope's `inherits` setting excludes it (`false` excludes every
-   namespace).
+   namespace). The two checks are independent: a scope whose bindings
+   were skipped still applies its `inherits` gate.
 4. No candidate anywhere → the reference is **unresolved**. Unresolved is a
    first-class outcome, not an error.
 
