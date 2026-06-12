@@ -147,6 +147,29 @@ pub(crate) fn resolve_layer_config_from_settings(
         .unwrap_or_else(|| ResolvedLayerConfig::with_defaults(method_name))
 }
 
+/// Generic emptiness check for raw host-layer results in the `preferred`
+/// fan-in: `null` and `[]` are "no result"; any other value counts.
+pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
+    value.is_null() || value.as_array().is_some_and(|items| items.is_empty())
+}
+
+/// Deserialize a verbatim host-layer result into the handler's response
+/// type, logging (not erroring) on shape mismatch.
+pub(crate) fn parse_host_verbatim<R: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Option<R> {
+    match serde_json::from_value::<R>(value) {
+        Ok(parsed) => Some(parsed),
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "host response failed to deserialize: {e}"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn resolve_aggregation_config_from_settings(
     settings: &WorkspaceSettings,
     host_language: &str,
@@ -540,6 +563,107 @@ impl Kakehashi {
             max_fan_out: agg.max_fan_out,
             upstream_request_id: current_upstream_id(),
         })
+    }
+
+    /// Dispatch a host bridge request over a resolved [`HostRequestContext`]:
+    /// the upstream `params` are forwarded verbatim (real URI, real
+    /// coordinates) and the raw `result` value comes back untranslated.
+    pub(crate) async fn host_layer_value_with_ctx(
+        &self,
+        ctx: &HostRequestContext,
+        request_method: &'static str,
+        params: serde_json::Value,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let pool = self.bridge.pool_arc();
+        let result = crate::lsp::aggregation::server::dispatch_host_preferred(
+            ctx,
+            pool.clone(),
+            move |t| {
+                let params = params.clone();
+                async move {
+                    t.pool
+                        .send_host_raw_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &crate::lsp::bridge::HostDocument {
+                                uri: &t.uri,
+                                language_id: &t.language_id,
+                                text: &t.text,
+                            },
+                            request_method,
+                            params,
+                            t.upstream_id,
+                        )
+                        .await
+                }
+            },
+            |opt| matches!(opt, Some(v) if !is_empty_layer_value(v)),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        result.handle(&self.client, request_method, None, Ok).await
+    }
+
+    /// Walk the resolved layer order for a request method
+    /// (cross-layer-aggregation, `preferred` semantics): layers are tried
+    /// lazily in `order` and the first one producing a non-empty result wins.
+    ///
+    /// - `virt` is the handler's existing injection-bridge future, awaited
+    ///   only when (and if) the walk reaches the virt layer.
+    /// - The host layer forwards `raw_params` verbatim
+    ///   (host-document-bridge) and maps the raw result via `host_parse`.
+    /// - `layer_method` keys `layers.order` and the `_self` aggregation
+    ///   (e.g. rangeFormatting shares `textDocument/formatting`);
+    ///   `request_method` is what goes on the wire and gates capability.
+    /// - Native has no contributor for bridged methods.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layers<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        raw_params: serde_json::Value,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host_parse: impl Fn(serde_json::Value) -> Option<R>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+
+        let virt = std::pin::pin!(virt);
+        let mut virt = Some(virt);
+        for layer in &layer_cfg.order {
+            let result = match layer {
+                LayerSource::Virt => match virt.take() {
+                    Some(virt) => virt.await?,
+                    None => None,
+                },
+                LayerSource::Host => {
+                    match self.resolve_host_bridge_context(lsp_uri, layer_method) {
+                        Some(ctx) => self
+                            .host_layer_value_with_ctx(&ctx, request_method, raw_params.clone())
+                            .await?
+                            .and_then(&host_parse),
+                        None => None,
+                    }
+                }
+                LayerSource::Native => None,
+            };
+            if let Some(result) = result
+                && is_nonempty(&result)
+            {
+                return Ok(Some(result));
+            }
+        }
+        Ok(None)
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).

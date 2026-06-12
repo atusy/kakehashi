@@ -393,17 +393,21 @@ impl Kakehashi {
         };
         ctx.text = Arc::from(text);
 
+        let params = serde_json::json!({
+            "textDocument": { "uri": lsp_uri.as_str() },
+            "options": options,
+        });
+
         let cancel_rx = cancel_state.derive_receiver();
         let pool = self.bridge.pool_arc();
-        let options = options.clone();
         let result = crate::lsp::aggregation::server::dispatch_host_preferred(
             &ctx,
             pool.clone(),
             move |t| {
-                let options = options.clone();
+                let params = params.clone();
                 async move {
                     t.pool
-                        .send_host_formatting_request(
+                        .send_host_raw_request(
                             &t.server_name,
                             &t.server_config,
                             &crate::lsp::bridge::HostDocument {
@@ -411,18 +415,23 @@ impl Kakehashi {
                                 language_id: &t.language_id,
                                 text: &t.text,
                             },
-                            options,
+                            "textDocument/formatting",
+                            params,
                             t.upstream_id,
                         )
                         .await
                 }
             },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
+            |opt| {
+                matches!(opt, Some(v) if !crate::lsp::lsp_impl::bridge_context::is_empty_layer_value(v))
+            },
             cancel_rx,
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
-        result.handle(&self.client, "formatting", None, Ok).await
+        let value = result.handle(&self.client, "formatting", None, Ok).await?;
+        Ok(value
+            .and_then(crate::lsp::lsp_impl::bridge_context::parse_host_verbatim::<Vec<TextEdit>>))
     }
 }
 

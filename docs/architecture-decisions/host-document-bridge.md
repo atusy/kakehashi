@@ -19,12 +19,26 @@ Partially implemented:
   not leak into `_self` (equivalent to the Wildcard Merge Safety reasoning
   below, without materializing built-in default entries). Aggregation fields
   DO wildcard-merge (`resolve_host_aggregation`).
-- **Dispatch**: implemented for `textDocument/definition`,
-  `textDocument/hover`, and `textDocument/formatting`
-  (`src/lsp/bridge/text_document/host.rs`, `dispatch_host_preferred`); other
-  methods follow the same pattern as needed. The layer walk in the handlers
-  (cross-layer-aggregation) tries layers in `order` — by default virt
-  first, host as fallback. Formatting additionally supports the cross-layer
+- **Dispatch**: implemented for every bridged request method. Because the
+  host path needs no URI synthesis or coordinate translation, all methods
+  share one generic forwarder
+  (`LanguageServerPool::send_host_raw_request`): the upstream request's
+  params are forwarded **verbatim** as raw JSON (they already reference the
+  real URI and real coordinates) and the result comes back untranslated —
+  no per-method request builders or response transformers. Handlers run the
+  layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
+  `preferred` semantics): layers are tried lazily in `order` — by default
+  virt first, host as fallback. Covered: definition, hover, declaration,
+  typeDefinition, implementation, references, completion, signatureHelp,
+  documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
+  inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
+  formatting, and rangeFormatting (which shares the formatting layer key).
+  Not covered: diagnostics (needs cross-layer `concatenated`; push/pull
+  stay virt-gated), semantic tokens (native-only), and the experimental
+  documentColor/colorPresentation pair. `completionItem/resolve` routes by
+  the envelope the virt fan-out stamps into `CompletionItem.data`; host
+  completion items carry no envelope and resolve falls back gracefully
+  (item returned unresolved). Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
   whole-document replacement edit. During that pipeline the host server's

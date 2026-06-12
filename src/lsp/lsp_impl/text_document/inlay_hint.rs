@@ -1,22 +1,49 @@
 //! Inlay hint method for Kakehashi.
+//!
+//! Walks the resolved layer order (cross-layer-aggregation): the virt layer
+//! bridges the injection region under the requested range, the host layer
+//! (host-document-bridge) bridges the host document itself with the real URI
+//! and the response verbatim. The first layer producing a non-empty result
+//! wins (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{InlayHint, InlayHintParams};
+use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, Range, Uri};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+
+const METHOD: &str = "textDocument/inlayHint";
 
 impl Kakehashi {
     pub(crate) async fn inlay_hint_impl(
         &self,
         params: InlayHintParams,
     ) -> Result<Option<Vec<InlayHint>>> {
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
-        let Some(ctx) =
-            self.resolve_bridge_contexts_for_range(&lsp_uri, range, "textDocument/inlayHint")
-        else {
+        let virt = self.inlay_hint_virt_layer(&lsp_uri, range);
+        self.walk_layers(
+            &lsp_uri,
+            METHOD,
+            METHOD,
+            raw_params,
+            virt,
+            parse_host_verbatim::<Vec<InlayHint>>,
+            |hints: &Vec<InlayHint>| !hints.is_empty(),
+        )
+        .await
+    }
+
+    /// Virt layer: bridge the injection region under the requested range.
+    async fn inlay_hint_virt_layer(
+        &self,
+        lsp_uri: &Uri,
+        range: Range,
+    ) -> Result<Option<Vec<InlayHint>>> {
+        let Some(ctx) = self.resolve_bridge_contexts_for_range(lsp_uri, range, METHOD) else {
             return Ok(None);
         };
 

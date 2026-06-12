@@ -1,25 +1,53 @@
 //! Goto type definition method for Kakehashi.
+//!
+//! Walks the resolved layer order (cross-layer-aggregation): the virt layer
+//! bridges the injection region under the cursor, the host layer
+//! (host-document-bridge) bridges the host document itself with the real URI
+//! and no coordinate translation. The first layer producing a non-empty
+//! result wins (`preferred`).
 
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::Location;
 use tower_lsp_server::ls_types::request::{GotoTypeDefinitionParams, GotoTypeDefinitionResponse};
+use tower_lsp_server::ls_types::{Location, LocationLink, Position, Uri};
 
-use crate::lsp::bridge::location_link_to_location;
+use crate::lsp::bridge::{location_link_to_location, normalize_host_goto_result};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
+
+const METHOD: &str = "textDocument/typeDefinition";
 
 impl Kakehashi {
     pub(crate) async fn goto_type_definition_impl(
         &self,
         params: GotoTypeDefinitionParams,
     ) -> Result<Option<GotoTypeDefinitionResponse>> {
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let Some(ctx) =
-            self.resolve_bridge_contexts(&lsp_uri, position, "textDocument/typeDefinition")
-        else {
+        let virt = self.type_definition_virt_layer(&lsp_uri, position);
+        let links = self
+            .walk_layers(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                raw_params,
+                virt,
+                normalize_host_goto_result,
+                |links: &Vec<LocationLink>| !links.is_empty(),
+            )
+            .await?;
+        Ok(links.map(|links| self.type_definition_response(links)))
+    }
+
+    /// Virt layer: bridge the injection region under the cursor.
+    async fn type_definition_virt_layer(
+        &self,
+        lsp_uri: &Uri,
+        position: Position,
+    ) -> Result<Option<Vec<LocationLink>>> {
+        let Some(ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
             return Ok(None);
         };
 
@@ -52,20 +80,19 @@ impl Kakehashi {
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
-
         result
-            .handle(&self.client, "type definition", None, |value| match value {
-                Some(links) => {
-                    if self.settings_manager.supports_type_definition_link() {
-                        Ok(Some(GotoTypeDefinitionResponse::Link(links)))
-                    } else {
-                        let locations: Vec<Location> =
-                            links.into_iter().map(location_link_to_location).collect();
-                        Ok(Some(GotoTypeDefinitionResponse::Array(locations)))
-                    }
-                }
-                None => Ok(None),
-            })
+            .handle(&self.client, "type definition", None, Ok)
             .await
+    }
+
+    /// Shape the winning links per the client's `LocationLink` support.
+    fn type_definition_response(&self, links: Vec<LocationLink>) -> GotoTypeDefinitionResponse {
+        if self.settings_manager.supports_type_definition_link() {
+            GotoTypeDefinitionResponse::Link(links)
+        } else {
+            let locations: Vec<Location> =
+                links.into_iter().map(location_link_to_location).collect();
+            GotoTypeDefinitionResponse::Array(locations)
+        }
     }
 }

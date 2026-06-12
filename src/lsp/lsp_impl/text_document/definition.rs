@@ -11,11 +11,10 @@ use tower_lsp_server::ls_types::{
     GotoDefinitionParams, GotoDefinitionResponse, Location, LocationLink, Position, Uri,
 };
 
-use crate::config::settings::LayerSource;
-use crate::lsp::bridge::location_link_to_location;
+use crate::lsp::bridge::{location_link_to_location, normalize_host_goto_result};
 
-use super::super::{Kakehashi, uri_to_url};
-use crate::lsp::aggregation::server::{dispatch_host_preferred, dispatch_preferred};
+use super::super::Kakehashi;
+use crate::lsp::aggregation::server::dispatch_preferred;
 
 const METHOD: &str = "textDocument/definition";
 
@@ -24,32 +23,23 @@ impl Kakehashi {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
-            log::warn!("Invalid URI in definition: {}", lsp_uri.as_str());
-            return Ok(None);
-        };
-        let Some(host_language) = self.document_language(&uri) else {
-            return Ok(None);
-        };
-
-        let layer_cfg = self.resolve_layer_config(&host_language, METHOD);
-        for layer in &layer_cfg.order {
-            let links = match layer {
-                LayerSource::Virt => self.definition_virt_layer(&lsp_uri, position).await?,
-                LayerSource::Host => self.definition_host_layer(&lsp_uri, position).await?,
-                // No native definition implementation: empty contributor.
-                LayerSource::Native => None,
-            };
-            if let Some(links) = links
-                && !links.is_empty()
-            {
-                return Ok(Some(self.definition_response(links)));
-            }
-        }
-        Ok(None)
+        let virt = self.definition_virt_layer(&lsp_uri, position);
+        let links = self
+            .walk_layers(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                raw_params,
+                virt,
+                normalize_host_goto_result,
+                |links: &Vec<LocationLink>| !links.is_empty(),
+            )
+            .await?;
+        Ok(links.map(|links| self.definition_response(links)))
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -90,46 +80,6 @@ impl Kakehashi {
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.document.upstream_request_id.as_ref());
-        result.handle(&self.client, "definition", None, Ok).await
-    }
-
-    /// Host layer: bridge the host document itself (real URI, responses
-    /// verbatim — host-document-bridge).
-    async fn definition_host_layer(
-        &self,
-        lsp_uri: &Uri,
-        position: Position,
-    ) -> Result<Option<Vec<LocationLink>>> {
-        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
-            return Ok(None);
-        };
-
-        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
-
-        let pool = self.bridge.pool_arc();
-        let result = dispatch_host_preferred(
-            &ctx,
-            pool.clone(),
-            |t| async move {
-                t.pool
-                    .send_host_definition_request(
-                        &t.server_name,
-                        &t.server_config,
-                        &crate::lsp::bridge::HostDocument {
-                            uri: &t.uri,
-                            language_id: &t.language_id,
-                            text: &t.text,
-                        },
-                        position,
-                        t.upstream_id,
-                    )
-                    .await
-            },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
-        )
-        .await;
-        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
         result.handle(&self.client, "definition", None, Ok).await
     }
 

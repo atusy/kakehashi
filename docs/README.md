@@ -325,12 +325,12 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` contains the **host** language, with the real URI and no
-coordinate translation. Currently `textDocument/definition`,
-`textDocument/hover`, and `textDocument/formatting` are wired; by default
-the host layer is tried after `virt` (see `layers` above), so injections
-keep winning inside code fences while the host server answers everywhere
-else. For formatting, combine fence formatters with a whole-document
-formatter via `layers."textDocument/formatting".strategy = "concatenated"`.
+coordinate translation. All bridged request methods are wired (diagnostics
+and semantic tokens excepted); by default the host layer is tried after
+`virt` (see `layers` above), so injections keep winning inside code fences
+while the host server answers everywhere else. For formatting, combine
+fence formatters with a whole-document formatter via
+`layers."textDocument/formatting".strategy = "concatenated"`.
 
 ```toml
 [languages.markdown.bridge._self]
@@ -413,12 +413,10 @@ Details:
   `textDocument/publishDiagnostics`. Disable both (or use `_`) to fully turn
   bridge diagnostics off.
 - **Current effect**: the `virt` layer answers inside injection regions, and
-  the `host` layer answers on the host document itself for
-  `textDocument/definition`, `textDocument/hover`, and
-  `textDocument/formatting` when host bridging is opted in (see
-  `bridge._self` below). Bridged methods have no `native` counterpart yet.
-  For other methods the practical effect is per-method enabling and
-  disabling of injection bridging.
+  the `host` layer answers on the host document itself for every bridged
+  request method when host bridging is opted in (see `bridge._self` below).
+  Bridged methods have no `native` counterpart yet. Diagnostics and
+  semantic tokens stay virt-only for now.
 
 **Bridge Filter Semantics:**
 

@@ -404,3 +404,41 @@ strategy = "concatenated"
 
     shutdown(&mut client);
 }
+
+/// The generic raw-forward path serves the other methods too: hover on the
+/// host document round-trips verbatim (the mock echoes the requested URI in
+/// its hover contents — a virtual URI would betray a translation).
+#[test]
+fn e2e_host_bridge_hover_round_trips_verbatim() {
+    let (mut client, _config_dir) = init_client(
+        r#"
+[languages.markdown.bridge._self]
+enabled = true
+"#,
+    );
+
+    let mut hover_contents = None;
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": MARKDOWN_URI },
+                "position": { "line": 2, "character": 6 },
+            }),
+        );
+        assert!(response.get("error").is_none(), "hover must not error");
+        if let Some(contents) = response.pointer("/result/contents").and_then(Value::as_str) {
+            hover_contents = Some(contents.to_string());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let contents = hover_contents.expect("host hover must produce a result");
+    assert_eq!(
+        contents,
+        format!("mock-hover:{MARKDOWN_URI}"),
+        "hover must carry the real URI to the server and return verbatim"
+    );
+
+    shutdown(&mut client);
+}

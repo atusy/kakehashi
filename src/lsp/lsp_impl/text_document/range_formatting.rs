@@ -30,7 +30,7 @@ use tower_lsp_server::ls_types::{DocumentRangeFormattingParams, Range, TextEdit}
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_verbatim};
 use crate::text::PositionMapper;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -41,240 +41,261 @@ impl Kakehashi {
         &self,
         params: DocumentRangeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
-        let lsp_uri = params.text_document.uri;
-        let options = params.options;
-        let host_range = params.range;
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
+        let lsp_uri = params.text_document.uri.clone();
+        let virt = async {
+            let lsp_uri = params.text_document.uri;
+            let options = params.options;
+            let host_range = params.range;
 
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
-            log::warn!("Invalid URI in rangeFormatting: {}", lsp_uri.as_str());
-            return Ok(None);
-        };
-
-        log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
-
-        // Tower-LSP runs requests concurrently, so a rangeFormatting call can
-        // arrive before didOpen/didChange has finished parsing. Wait briefly
-        // for any in-flight parse to land a tree before snapshotting, matching
-        // the read-handler pattern (semantic tokens, node lookups); otherwise
-        // an otherwise-valid request would degrade to `Ok(None)` purely due to
-        // a parse race.
-        self.documents
-            .wait_for_parse_completion(&uri, Duration::from_millis(200))
-            .await;
-
-        let snapshot = match self.documents.get(&uri) {
-            None => {
-                log::debug!("rangeFormatting: No document found for {}", uri);
+            let Ok(uri) = uri_to_url(&lsp_uri) else {
+                log::warn!("Invalid URI in rangeFormatting: {}", lsp_uri.as_str());
                 return Ok(None);
-            }
-            Some(doc) => match doc.snapshot() {
+            };
+
+            log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
+
+            // Tower-LSP runs requests concurrently, so a rangeFormatting call can
+            // arrive before didOpen/didChange has finished parsing. Wait briefly
+            // for any in-flight parse to land a tree before snapshotting, matching
+            // the read-handler pattern (semantic tokens, node lookups); otherwise
+            // an otherwise-valid request would degrade to `Ok(None)` purely due to
+            // a parse race.
+            self.documents
+                .wait_for_parse_completion(&uri, Duration::from_millis(200))
+                .await;
+
+            let snapshot = match self.documents.get(&uri) {
                 None => {
-                    log::debug!(
-                        "rangeFormatting: Document not fully initialized for {}",
-                        uri
-                    );
+                    log::debug!("rangeFormatting: No document found for {}", uri);
                     return Ok(None);
                 }
-                Some(snapshot) => snapshot,
-            },
-        };
-
-        let Some(language_name) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::rangeFormatting", "No language detected");
-            return Ok(None);
-        };
-
-        // Layer gating keys off "textDocument/formatting", matching the
-        // aggregation config below: range formatting is the partial-document
-        // counterpart of full formatting and shares its configuration key.
-        if !self.virt_layer_enabled(&language_name, "textDocument/formatting") {
-            log::debug!(
-                target: "kakehashi::rangeFormatting",
-                "virt layer disabled for {} via layers.order",
-                language_name
-            );
-            return Ok(None);
-        }
-
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return Ok(None);
-        };
-
-        let all_regions = InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            &uri,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
-        );
-
-        if all_regions.is_empty() {
-            return Ok(None);
-        }
-
-        let upstream_request_id = crate::lsp::current_upstream_id();
-        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
-        let pool = self.bridge.pool_arc();
-
-        // Clip the request to each region's actual byte bounds (not just
-        // its line span). Line-only clipping is incorrect for two cases
-        // that matter for inline injections (`start_column > 0`):
-        //
-        // 1. Request shares a line with the injection but lies entirely
-        //    before/after the injected content. Byte intersection
-        //    correctly skips the region; line-only would mis-overlap.
-        // 2. Request straddles an injection boundary (e.g., starts before
-        //    the injection's opening column, ends past its closing
-        //    column on the same line). Byte intersection clips the
-        //    endpoints to the injected content; line-only would pass the
-        //    out-of-bounds columns to `translate_host_range_to_virtual`,
-        //    where `saturating_sub` produces a virtual range past the
-        //    virtual document's actual columns and the downstream
-        //    formatter may error or format more than the user selected.
-        //
-        // Multi-line code-fence injections (`start_column == 0`) are
-        // unchanged because their line and byte bounds are equivalent.
-        let mapper = PositionMapper::new(snapshot.text());
-        let request_bytes = clamp_request_to_document(&mapper, host_range);
-
-        let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
-
-        for resolved in all_regions {
-            // A covering request (its byte span encloses the whole region)
-            // prefers full formatting; a partial request range-formats the
-            // clipped span. Either way we compute the clipped+content-clamped
-            // host range: the partial path sends it, and the covering path
-            // keeps it as a fallback for servers that support `rangeFormatting`
-            // but not `formatting`. For a covering request, clipping against
-            // the region yields the whole region.
-            let is_covering = request_covers_region(&request_bytes, &resolved.region.byte_range);
-
-            let Some(clipped) =
-                clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
-            else {
-                continue;
-            };
-            // The byte-range clip can still leave an endpoint inside a stripped
-            // per-line prefix (e.g. blockquoted code's `> `); pull both
-            // endpoints onto the actual injected content. A partial selection
-            // lying entirely in prefix bytes collapses and the region is
-            // skipped (a covering selection spans real content, so it never
-            // collapses).
-            let Some(clipped_host_range) = clamp_range_to_content_columns(
-                clipped,
-                resolved.region.line_range.start,
-                &resolved.line_column_offsets,
-            ) else {
-                continue;
+                Some(doc) => match doc.snapshot() {
+                    None => {
+                        log::debug!(
+                            "rangeFormatting: Document not fully initialized for {}",
+                            uri
+                        );
+                        return Ok(None);
+                    }
+                    Some(snapshot) => snapshot,
+                },
             };
 
-            let configs = self.bridge_configs_for_injection_language(
-                &language_name,
-                &resolved.injection_language,
-            );
-            if configs.is_empty() {
-                continue;
+            let Some(language_name) = self.document_language(&uri) else {
+                log::debug!(target: "kakehashi::rangeFormatting", "No language detected");
+                return Ok(None);
+            };
+
+            // Layer gating keys off "textDocument/formatting", matching the
+            // aggregation config below: range formatting is the partial-document
+            // counterpart of full formatting and shares its configuration key.
+            if !self.virt_layer_enabled(&language_name, "textDocument/formatting") {
+                log::debug!(
+                    target: "kakehashi::rangeFormatting",
+                    "virt layer disabled for {} via layers.order",
+                    language_name
+                );
+                return Ok(None);
             }
 
-            // Resolve aggregation under "textDocument/formatting", not
-            // "textDocument/rangeFormatting". Range formatting is the
-            // partial-document counterpart of full formatting and shares its
-            // server priorities and strategy (see language-server-bridge-request-strategies, which groups the
-            // two). There is no separate rangeFormatting config key, and
-            // `resolve_aggregation_entry` only falls back method → `_`
-            // wildcard — never formatting → rangeFormatting — so keying off
-            // "textDocument/rangeFormatting" would silently ignore a user's
-            // "textDocument/formatting" configuration.
-            let agg = self.resolve_aggregation_config(
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/formatting",
-            );
-            let region_ctx = DocumentRequestContext {
-                uri: uri.clone(),
-                resolved,
-                configs,
-                upstream_request_id: upstream_request_id.clone(),
-                priorities: agg.priorities,
-                strategy: agg.strategy,
-                max_fan_out: agg.max_fan_out,
+            let Some(injection_query) = self.language.injection_query(&language_name) else {
+                return Ok(None);
             };
-            let pool = Arc::clone(&pool);
-            let options = options.clone();
-            let region_cancel_rx = cancel_state.derive_receiver();
 
-            outer_join_set.spawn(async move {
-                let result = dispatch_preferred(
-                    &region_ctx,
-                    pool.clone(),
-                    move |t| {
-                        let options = options.clone();
-                        async move {
-                            // Covering request: prefer full formatting, but fall
-                            // back to rangeFormatting over the whole region when
-                            // the server has no `documentFormattingProvider`
-                            // (`Ok(None)`) — otherwise a range-only server would
-                            // format nothing. Errors propagate (no fallback);
-                            // `Ok(Some(_))` (incl. an empty edit list) is an
-                            // authoritative result.
-                            if is_covering {
-                                match t
-                                    .pool
-                                    .send_formatting_request(
+            let all_regions = InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                &uri,
+                snapshot.tree(),
+                snapshot.text(),
+                injection_query.as_ref(),
+            );
+
+            if all_regions.is_empty() {
+                return Ok(None);
+            }
+
+            let upstream_request_id = crate::lsp::current_upstream_id();
+            let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
+            let pool = self.bridge.pool_arc();
+
+            // Clip the request to each region's actual byte bounds (not just
+            // its line span). Line-only clipping is incorrect for two cases
+            // that matter for inline injections (`start_column > 0`):
+            //
+            // 1. Request shares a line with the injection but lies entirely
+            //    before/after the injected content. Byte intersection
+            //    correctly skips the region; line-only would mis-overlap.
+            // 2. Request straddles an injection boundary (e.g., starts before
+            //    the injection's opening column, ends past its closing
+            //    column on the same line). Byte intersection clips the
+            //    endpoints to the injected content; line-only would pass the
+            //    out-of-bounds columns to `translate_host_range_to_virtual`,
+            //    where `saturating_sub` produces a virtual range past the
+            //    virtual document's actual columns and the downstream
+            //    formatter may error or format more than the user selected.
+            //
+            // Multi-line code-fence injections (`start_column == 0`) are
+            // unchanged because their line and byte bounds are equivalent.
+            let mapper = PositionMapper::new(snapshot.text());
+            let request_bytes = clamp_request_to_document(&mapper, host_range);
+
+            let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
+
+            for resolved in all_regions {
+                // A covering request (its byte span encloses the whole region)
+                // prefers full formatting; a partial request range-formats the
+                // clipped span. Either way we compute the clipped+content-clamped
+                // host range: the partial path sends it, and the covering path
+                // keeps it as a fallback for servers that support `rangeFormatting`
+                // but not `formatting`. For a covering request, clipping against
+                // the region yields the whole region.
+                let is_covering =
+                    request_covers_region(&request_bytes, &resolved.region.byte_range);
+
+                let Some(clipped) =
+                    clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
+                else {
+                    continue;
+                };
+                // The byte-range clip can still leave an endpoint inside a stripped
+                // per-line prefix (e.g. blockquoted code's `> `); pull both
+                // endpoints onto the actual injected content. A partial selection
+                // lying entirely in prefix bytes collapses and the region is
+                // skipped (a covering selection spans real content, so it never
+                // collapses).
+                let Some(clipped_host_range) = clamp_range_to_content_columns(
+                    clipped,
+                    resolved.region.line_range.start,
+                    &resolved.line_column_offsets,
+                ) else {
+                    continue;
+                };
+
+                let configs = self.bridge_configs_for_injection_language(
+                    &language_name,
+                    &resolved.injection_language,
+                );
+                if configs.is_empty() {
+                    continue;
+                }
+
+                // Resolve aggregation under "textDocument/formatting", not
+                // "textDocument/rangeFormatting". Range formatting is the
+                // partial-document counterpart of full formatting and shares its
+                // server priorities and strategy (see language-server-bridge-request-strategies, which groups the
+                // two). There is no separate rangeFormatting config key, and
+                // `resolve_aggregation_entry` only falls back method → `_`
+                // wildcard — never formatting → rangeFormatting — so keying off
+                // "textDocument/rangeFormatting" would silently ignore a user's
+                // "textDocument/formatting" configuration.
+                let agg = self.resolve_aggregation_config(
+                    &language_name,
+                    &resolved.injection_language,
+                    "textDocument/formatting",
+                );
+                let region_ctx = DocumentRequestContext {
+                    uri: uri.clone(),
+                    resolved,
+                    configs,
+                    upstream_request_id: upstream_request_id.clone(),
+                    priorities: agg.priorities,
+                    strategy: agg.strategy,
+                    max_fan_out: agg.max_fan_out,
+                };
+                let pool = Arc::clone(&pool);
+                let options = options.clone();
+                let region_cancel_rx = cancel_state.derive_receiver();
+
+                outer_join_set.spawn(async move {
+                    let result = dispatch_preferred(
+                        &region_ctx,
+                        pool.clone(),
+                        move |t| {
+                            let options = options.clone();
+                            async move {
+                                // Covering request: prefer full formatting, but fall
+                                // back to rangeFormatting over the whole region when
+                                // the server has no `documentFormattingProvider`
+                                // (`Ok(None)`) — otherwise a range-only server would
+                                // format nothing. Errors propagate (no fallback);
+                                // `Ok(Some(_))` (incl. an empty edit list) is an
+                                // authoritative result.
+                                if is_covering {
+                                    match t
+                                        .pool
+                                        .send_formatting_request(
+                                            &t.server_name,
+                                            &t.server_config,
+                                            &t.uri,
+                                            &t.injection_language,
+                                            &t.region_id,
+                                            t.offset.clone(),
+                                            &t.virtual_content,
+                                            options.clone(),
+                                            t.upstream_id.clone(),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(None) => {} // fall through to rangeFormatting
+                                        other => return other,
+                                    }
+                                }
+                                t.pool
+                                    .send_range_formatting_request(
                                         &t.server_name,
                                         &t.server_config,
                                         &t.uri,
                                         &t.injection_language,
                                         &t.region_id,
-                                        t.offset.clone(),
+                                        t.offset,
                                         &t.virtual_content,
-                                        options.clone(),
-                                        t.upstream_id.clone(),
+                                        clipped_host_range,
+                                        options,
+                                        t.upstream_id,
                                         None,
                                     )
                                     .await
-                                {
-                                    Ok(None) => {} // fall through to rangeFormatting
-                                    other => return other,
-                                }
                             }
-                            t.pool
-                                .send_range_formatting_request(
-                                    &t.server_name,
-                                    &t.server_config,
-                                    &t.uri,
-                                    &t.injection_language,
-                                    &t.region_id,
-                                    t.offset,
-                                    &t.virtual_content,
-                                    clipped_host_range,
-                                    options,
-                                    t.upstream_id,
-                                    None,
-                                )
-                                .await
-                        }
-                    },
-                    // Same semantics as full formatting: `Some(vec![])` is
-                    // an authoritative "no edits needed" (e.g., the range is
-                    // already perfectly formatted) — keep it and stop. `None`
-                    // means "no response" and falls through to lower-priority
-                    // servers.
-                    |opt| opt.is_some(),
-                    region_cancel_rx,
-                )
-                .await;
-                match result {
-                    FanInResult::Done(edits) => edits,
-                    FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
-                }
-            });
-        }
+                        },
+                        // Same semantics as full formatting: `Some(vec![])` is
+                        // an authoritative "no edits needed" (e.g., the range is
+                        // already perfectly formatted) — keep it and stop. `None`
+                        // means "no response" and falls through to lower-priority
+                        // servers.
+                        |opt| opt.is_some(),
+                        region_cancel_rx,
+                    )
+                    .await;
+                    match result {
+                        FanInResult::Done(edits) => edits,
+                        FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
+                    }
+                });
+            }
 
-        let response = finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
-        pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
-        response
+            let response =
+                finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;
+            pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
+            response
+        };
+
+        // layer_method keys off "textDocument/formatting" ON PURPOSE: range
+        // formatting is the partial-document counterpart of full formatting
+        // and shares its layer order and aggregation key. request_method is
+        // what goes on the wire to host-capable servers.
+        self.walk_layers(
+            &lsp_uri,
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+            raw_params,
+            virt,
+            parse_host_verbatim::<Vec<TextEdit>>,
+            |edits: &Vec<TextEdit>| !edits.is_empty(),
+        )
+        .await
     }
 }
 
