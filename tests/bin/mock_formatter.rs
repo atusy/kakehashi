@@ -17,6 +17,12 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
+//! - `definition` — advertises `definitionProvider` + `hoverProvider`;
+//!   answers definition with a fixed Location that **echoes the requested
+//!   URI** (and hover with the URI in the contents), but only for documents
+//!   it received via `didOpen`. Used by `tests/e2e_host_bridge.rs` to prove
+//!   the host bridge forwards the real client URI and returns the response
+//!   verbatim (host-document-bridge).
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -44,16 +50,20 @@ fn main() {
 
         match method {
             "initialize" => {
-                let capabilities = if mode == "range-upper" {
-                    json!({
+                let capabilities = match mode.as_str() {
+                    "range-upper" => json!({
                         "documentRangeFormattingProvider": true,
                         "textDocumentSync": 1
-                    })
-                } else {
-                    json!({
+                    }),
+                    "definition" => json!({
+                        "definitionProvider": true,
+                        "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    _ => json!({
                         "documentFormattingProvider": true,
                         "textDocumentSync": 1
-                    })
+                    }),
                 };
                 respond(&mut writer, id, json!({ "capabilities": capabilities }));
             }
@@ -95,6 +105,35 @@ fn main() {
                 {
                     documents.remove(uri);
                 }
+            }
+            "textDocument/definition" => {
+                // Echo the requested URI back in a fixed Location — but only
+                // for documents this server actually received via didOpen,
+                // so the test also proves the host document was synced.
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!({
+                            "uri": uri,
+                            "range": {
+                                "start": { "line": 1, "character": 0 },
+                                "end": { "line": 1, "character": 4 }
+                            }
+                        })
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "textDocument/hover" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| json!({ "contents": format!("mock-hover:{uri}") }))
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
             }
             "textDocument/formatting" | "textDocument/rangeFormatting" => {
                 let result = message

@@ -221,10 +221,10 @@ Rename can affect multiple files. For injections, only same-document renames are
 | Output | TextEdit[] |
 | Cross-file | N/A (single document) |
 | Position mapping | All edit ranges |
-| Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run; planned, not yet implemented). `textDocument/rangeFormatting`: `preferred` only |
+| Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run). `textDocument/rangeFormatting`: `preferred` only |
 
 Single-server formatting is simple—all edits are within the virtual document.
-For multiple servers, the **planned** (not yet implemented) `concatenated`
+For multiple servers, the `concatenated`
 behavior does **not** concatenate edit lists (that would overlap); it runs a
 sequential formatter pipeline over `priorities`, which is both the
 **membership allowlist** (servers not listed do not run) and the application order. This
@@ -289,7 +289,11 @@ When multiple servers are configured for a language:
 | Completion | Merge completion lists from all servers |
 | Hover | Concatenate hover content with separator |
 | Diagnostics | Merge all, dedupe by range + message |
-| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — planned, full formatting only, not yet implemented. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
+| Formatting | `preferred` (first non-empty) by default; `concatenated` runs a sequential pipeline over `priorities` (which is also the membership allowlist — servers not listed do not run) — full formatting only. `textDocument/rangeFormatting` stays on `preferred` (concatenated-formatting-pipeline) |
+
+`priorities` lists follow the ordered-allowlist semantics of
+aggregation-priorities-wildcard: listed servers run in order, a `"*"` element
+stands for the unlisted rest, and absence of the list means `["*"]`.
 
 ## Consequences
 
@@ -352,3 +356,5 @@ The original priority order (for reference):
 - [language-server-bridge](language-server-bridge.md): Core LSP bridge architecture
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How injections are represented as virtual documents
 - [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md): Multi-server formatting via a sequential pipeline (`strategy: "concatenated"`)
+- [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md): Ordered-allowlist semantics and the `"*"` element for `priorities` lists
+- [cross-layer-aggregation](cross-layer-aggregation.md): How native/host/virt layer results combine, one level above the per-target strategies defined here

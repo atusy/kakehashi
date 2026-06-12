@@ -29,7 +29,7 @@ pub(crate) use connection_state::ConnectionState;
 use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
-pub(crate) use message_sender::ConnectionHandleSender;
+pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 use std::collections::HashMap;
@@ -161,11 +161,24 @@ impl CancelForwardingMetrics {
 ///
 /// `pub` so a shared pool can be wired into the cancel forwarding middleware;
 /// normal usage should go through `BridgeCoordinator`.
+/// Sync state of one host document on one downstream server
+/// (host-document-bridge): the version sent in the last `didOpen`/`didChange`
+/// and a fingerprint of the synced text for cheap change detection.
+pub(super) struct HostDocSyncState {
+    pub(super) version: i32,
+    pub(super) fingerprint: u64,
+}
+
 pub struct LanguageServerPool {
     /// Map of server_name -> connection handle (wraps connection with its state)
     connections: Mutex<HashMap<String, Arc<ConnectionHandle>>>,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
     document_tracker: DocumentTracker,
+    /// Host-document sync state per `(uri, server_name)`
+    /// (host-document-bridge): the real-URI documents opened on downstream
+    /// servers via `bridge._self`, with their version and content
+    /// fingerprint for lazy full-text re-sync.
+    host_documents: Mutex<HashMap<(String, String), HostDocSyncState>>,
     /// Upstream request ID → set of downstream servers, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple servers can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
@@ -228,6 +241,7 @@ impl LanguageServerPool {
         Self {
             connections: Mutex::new(HashMap::new()),
             document_tracker: DocumentTracker::new(),
+            host_documents: Mutex::new(HashMap::new()),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
@@ -311,6 +325,14 @@ impl LanguageServerPool {
         &self,
     ) -> tokio::sync::MutexGuard<'_, HashMap<String, Arc<ConnectionHandle>>> {
         self.connections.lock().await
+    }
+
+    /// Host-document sync state (host-document-bridge). Used by the host
+    /// request path in `text_document/host.rs`.
+    pub(super) async fn host_documents(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), HostDocSyncState>> {
+        self.host_documents.lock().await
     }
 
     /// Insert a pre-created connection handle for testing.
@@ -616,6 +638,16 @@ impl LanguageServerPool {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
                     connections.remove(server_name);
+                    // Drop host-document sync state with it: the replacement
+                    // process has no documents open, so the lazy host sync
+                    // must re-send didOpen instead of trusting stale entries
+                    // (host-document-bridge). Lock order: connections →
+                    // host_documents, consistent with
+                    // close_host_bridge_document's prefetch.
+                    self.host_documents
+                        .lock()
+                        .await
+                        .retain(|(_, server), _| server != server_name);
                 }
             }
         }

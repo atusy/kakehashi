@@ -34,6 +34,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{DocumentFormattingParams, Position, Range, TextEdit};
 
 use crate::config::settings::AggregationStrategy;
+use crate::config::settings::{LayerSource, PRIORITIES_WILDCARD};
 use crate::error::LockResultExt;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::region::collect_region_results_with_cancel;
@@ -84,14 +85,123 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
+        // Formatting consumes the full layer config (order AND strategy):
+        // it is the first method with a layer-level `concatenated` dispatch
+        // (cross-layer-aggregation phase 3).
+        let layer_cfg = self.resolve_layer_config(&language_name, "textDocument/formatting");
+
+        let upstream_request_id = crate::lsp::current_upstream_id();
+        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
+        let original = snapshot.text().to_string();
+
+        let result = match layer_cfg.strategy {
+            AggregationStrategy::Preferred => {
+                // Concurrent fan-out with priority decision
+                // (race_layers_preferred): both layers' requests are in
+                // flight at once; the highest-priority non-empty result wins.
+                let virt = self.virt_format_edits(
+                    &uri,
+                    &snapshot,
+                    &language_name,
+                    &options,
+                    &upstream_request_id,
+                    &cancel_state,
+                );
+                let host = self.host_format_edits(&lsp_uri, &original, &options, &cancel_state);
+                crate::lsp::lsp_impl::bridge_context::race_layers_preferred(
+                    &layer_cfg.order,
+                    virt,
+                    host,
+                    |edits: &Vec<TextEdit>| !edits.is_empty(),
+                )
+                .await?
+            }
+            AggregationStrategy::Concatenated => {
+                // Sequential cross-layer pipeline (cross-layer-aggregation
+                // phase 3): each layer formats the previous layer's output.
+                // Virt edits are resolved against the parsed snapshot, so virt
+                // can only run while the accumulated text still IS the
+                // snapshot text — i.e. before any text-changing layer. The
+                // default order (virt before host) satisfies this; an order
+                // placing virt after a producing host is skipped with a
+                // warning rather than formatting against stale regions.
+                let mut current = original.clone();
+                let mut producers = 0usize;
+                let mut sole_edits: Option<Vec<TextEdit>> = None;
+                for layer in &layer_cfg.order {
+                    let edits = match layer {
+                        LayerSource::Virt => {
+                            if current != original {
+                                log::warn!(
+                                    target: "kakehashi::formatting",
+                                    "cross-layer concatenated formatting: virt placed after a \
+                                     text-producing layer in layers.order; injection regions \
+                                     cannot be re-resolved against modified text — skipping virt"
+                                );
+                                continue;
+                            }
+                            self.virt_format_edits(
+                                &uri,
+                                &snapshot,
+                                &language_name,
+                                &options,
+                                &upstream_request_id,
+                                &cancel_state,
+                            )
+                            .await?
+                        }
+                        LayerSource::Host => {
+                            self.host_format_edits(&lsp_uri, &current, &options, &cancel_state)
+                                .await?
+                        }
+                        LayerSource::Native => None,
+                    };
+                    if let Some(edits) = edits
+                        && !edits.is_empty()
+                    {
+                        current = crate::text::edit::apply_text_edits(&current, &edits);
+                        producers += 1;
+                        sole_edits = Some(edits);
+                    }
+                }
+                match producers {
+                    0 => None,
+                    // A single producing layer ran against the original text
+                    // (virt by the guard above; host because nothing before
+                    // it produced), so its minimal edits apply verbatim.
+                    1 => sole_edits,
+                    // Multiple producers: later layers' edits are relative to
+                    // intermediate text, so collapse the chain into one
+                    // whole-document replacement (the same overlap-free shape
+                    // as the within-region pipeline, concatenated-formatting-
+                    // pipeline Decision point 4).
+                    _ => whole_document_replacement(&original, &current),
+                }
+            }
+        };
+        Ok(result)
+    }
+
+    /// Format every injection region (the **virt** layer): resolve regions
+    /// from the parsed snapshot, format each one per its aggregation config,
+    /// and concatenate the per-region edits (disjoint spans).
+    async fn virt_format_edits(
+        &self,
+        uri: &url::Url,
+        snapshot: &crate::document::model::DocumentSnapshot,
+        language_name: &str,
+        options: &tower_lsp_server::ls_types::FormattingOptions,
+        upstream_request_id: &Option<UpstreamId>,
+        cancel_state: &FormattingCancelState<'_>,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let Some(injection_query) = self.language.injection_query(language_name) else {
             return Ok(None);
         };
 
         let all_regions = InjectionResolver::resolve_all(
             &self.language,
             self.bridge.node_tracker(),
-            &uri,
+            uri,
             snapshot.tree(),
             snapshot.text(),
             injection_query.as_ref(),
@@ -101,8 +211,6 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let upstream_request_id = crate::lsp::current_upstream_id();
-        let cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
@@ -115,16 +223,14 @@ impl Kakehashi {
         let mut host_mapper: Option<crate::text::PositionMapper> = None;
 
         for resolved in all_regions {
-            let configs = self.bridge_configs_for_injection_language(
-                &language_name,
-                &resolved.injection_language,
-            );
+            let configs = self
+                .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {
                 continue;
             }
 
             let agg = self.resolve_aggregation_config(
-                &language_name,
+                language_name,
                 &resolved.injection_language,
                 "textDocument/formatting",
             );
@@ -141,10 +247,34 @@ impl Kakehashi {
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
             // (concatenated-formatting-pipeline Decision point 2).
+            if region_ctx.strategy == AggregationStrategy::Concatenated
+                && region_ctx
+                    .priorities
+                    .iter()
+                    .any(|name| name == PRIORITIES_WILDCARD)
+                && region_ctx
+                    .priorities
+                    .iter()
+                    .any(|name| name != PRIORITIES_WILDCARD)
+            {
+                // ADR aggregation-priorities-wildcard: '*' has no deterministic
+                // expansion order, and a formatter pipeline must be
+                // reproducible — the element is dropped, explicit names run.
+                log::warn!(
+                    target: "kakehashi::formatting",
+                    "concatenated formatting for {}->{} lists '{}' in priorities; \
+                     the wildcard is ignored by the sequential pipeline (explicit \
+                     order required) and only the named servers run",
+                    language_name,
+                    region_ctx.resolved.injection_language,
+                    PRIORITIES_WILDCARD,
+                );
+            }
             let pipeline = match plan_region_format(
                 region_ctx.strategy,
                 &region_ctx.priorities,
                 &region_ctx.configs,
+                region_ctx.max_fan_out,
             ) {
                 RegionFormatPlan::Concatenated(servers) => {
                     // Capture the region's per-line host prefixes now, while
@@ -184,6 +314,18 @@ impl Kakehashi {
                     );
                     continue;
                 }
+                RegionFormatPlan::Disabled => {
+                    // priorities = []: the per-method fan-out kill switch
+                    // (aggregation-priorities-wildcard). Deliberate config, so
+                    // no warning — just skip the region.
+                    log::debug!(
+                        target: "kakehashi::formatting",
+                        "formatting disabled for {}->{} (priorities = [])",
+                        language_name,
+                        region_ctx.resolved.injection_language,
+                    );
+                    continue;
+                }
             };
 
             let pool = Arc::clone(&pool);
@@ -217,6 +359,116 @@ impl Kakehashi {
         pool.unregister_all_for_upstream_id(upstream_request_id.as_ref());
         response
     }
+
+    /// Format the host document itself (the **host** layer,
+    /// host-document-bridge): forward `text` with the real URI to the
+    /// host-capable servers and return their edits verbatim.
+    ///
+    /// `text` is the text to format — under the cross-layer `concatenated`
+    /// pipeline it may already carry the virt layer's edits, in which case
+    /// the host server's document state is temporarily speculative; the lazy
+    /// fingerprint sync restores it to the editor text on the next request.
+    async fn host_format_edits(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        text: &str,
+        options: &tower_lsp_server::ls_types::FormattingOptions,
+        cancel_state: &FormattingCancelState<'_>,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let Some(mut ctx) = self.resolve_host_bridge_context(lsp_uri, "textDocument/formatting")
+        else {
+            return Ok(None);
+        };
+        ctx.text = Arc::from(text);
+
+        let params = serde_json::json!({
+            "textDocument": { "uri": lsp_uri.as_str() },
+            "options": options,
+        });
+
+        let cancel_rx = cancel_state.derive_receiver();
+        let pool = self.bridge.pool_arc();
+        let result = crate::lsp::aggregation::server::dispatch_host_preferred(
+            &ctx,
+            pool.clone(),
+            move |t| {
+                let params = params.clone();
+                async move {
+                    t.pool
+                        .send_host_formatting_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &crate::lsp::bridge::HostDocument {
+                                uri: &t.uri,
+                                language_id: &t.language_id,
+                                text: &t.text,
+                            },
+                            "textDocument/formatting",
+                            params,
+                            t.upstream_id,
+                        )
+                        .await
+                }
+            },
+            // `Some(vec![])` (and a capable server's `null`, normalized to it)
+            // is the authoritative "no edits needed" — accept it instead of
+            // falling through to a lower-priority host formatter that might
+            // re-format the same text. Mirrors the virt preferred predicate.
+            |opt| opt.is_some(),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        // Quiet on an all-empty host layer (the virt arm already emits the
+        // client-visible LOG); only real host failures get surfaced —
+        // mirroring `host_layer_value_with_ctx`.
+        match result {
+            FanInResult::Done(value) => Ok(value),
+            FanInResult::NoResult { errors } => {
+                if errors > 0 {
+                    self.client
+                        .log_message(
+                            tower_lsp_server::ls_types::MessageType::WARNING,
+                            "No textDocument/formatting response from any host bridge server",
+                        )
+                        .await;
+                }
+                Ok(None)
+            }
+            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+        }
+    }
+}
+
+/// Collapse a formatted text into a single whole-document replacement edit
+/// against `original` (the same overlap-free output shape as the
+/// within-region pipeline, concatenated-formatting-pipeline Decision
+/// point 4). `None` when the chain round-tripped to the original text.
+///
+/// Line counting treats `\n` as the only line break: a document using bare
+/// `\r` separators (which LSP also recognizes) would get an end position on
+/// the wrong line. Tree-sitter parsing upstream shares the `\n` assumption,
+/// so such documents do not reach this path in practice.
+fn whole_document_replacement(original: &str, formatted: &str) -> Option<Vec<TextEdit>> {
+    if original == formatted {
+        return None;
+    }
+    let end_line = original.matches('\n').count() as u32;
+    let last_line_start = original.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end_character = original[last_line_start..].encode_utf16().count() as u32;
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: end_line,
+                character: end_character,
+            },
+        },
+        new_text: formatted.to_string(),
+    }])
 }
 
 /// How a single injection region should be formatted, derived from its resolved
@@ -224,48 +476,78 @@ impl Kakehashi {
 #[derive(Debug, PartialEq, Eq)]
 enum RegionFormatPlan {
     /// Run the sequential concatenated pipeline over these effective servers
-    /// (`priorities` filtered to configured servers, deduped, order preserved).
+    /// (explicit `priorities` names filtered to configured servers, deduped,
+    /// order preserved — the `"*"` wildcard is excluded, see
+    /// aggregation-priorities-wildcard).
     Concatenated(Vec<String>),
     /// Use the `preferred` first-non-empty-wins fan-out over the region's servers.
     Preferred,
-    /// Run nothing for this region. Reached only when `concatenated` is active
-    /// with a NON-empty `priorities` whose names are all unconfigured/typo'd, so
-    /// the effective list is empty: every configured server is *absent from the
-    /// allowlist*, and the allowlist (concatenated-formatting-pipeline Decision
-    /// point 2) forbids running any of them. Falling through to `preferred` here
-    /// would wrongly run exactly the servers the user's `priorities` excluded.
+    /// Run nothing for this region. Reached when `concatenated` is active with
+    /// explicit `priorities` names that are all unconfigured/typo'd: every
+    /// configured server is *absent from the allowlist*, and the allowlist
+    /// (concatenated-formatting-pipeline Decision point 2) forbids running
+    /// them. Falling through to `preferred` here would wrongly run exactly the
+    /// servers the user's `priorities` excluded.
     Skip,
+    /// `priorities = []`: the per-method fan-out kill switch
+    /// (aggregation-priorities-wildcard) — the region runs no servers at all,
+    /// regardless of strategy.
+    Disabled,
 }
 
 /// Decide the [`RegionFormatPlan`] for a region from its aggregation `strategy`,
-/// `priorities`, and configured server `configs`.
+/// `priorities`, configured server `configs`, and `max_fan_out` cap.
 ///
-/// Mirrors concatenated-formatting-pipeline Decision points 1–2:
-/// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins);
-/// - `concatenated` with an **empty** `priorities` is a misconfiguration (order
-///   would be undefined) → `Preferred` (a once-per-config warning is emitted at
-///   settings-apply time, see `format_concatenated_formatting_warning`);
-/// - `concatenated` with a **non-empty** `priorities` puts the allowlist in
-///   force: run the effective (configured ∩ `priorities`) servers as a pipeline,
-///   or — when none of the listed names are configured — `Skip`, since the
+/// Mirrors concatenated-formatting-pipeline Decision points 1–2 under the
+/// aggregation-priorities-wildcard list semantics:
+/// - `priorities = []` → `Disabled` (the kill switch applies to every strategy);
+/// - `maxFanOut = 0` → `Disabled` ("disable fan-out entirely" holds for the
+///   sequential pipeline too; for `Preferred` the dispatch enforces the cap
+///   itself, this just short-circuits the region consistently);
+/// - any non-`concatenated` strategy → `Preferred` (first-non-empty-wins;
+///   the `"*"` wildcard is honored by the preferred dispatch);
+/// - `concatenated` whose `priorities` carries no explicit name (only `"*"`,
+///   e.g. the resolved default) is a misconfiguration — the pipeline's order
+///   would be undefined — → `Preferred` (a once-per-config warning is emitted
+///   at settings-apply time, see `format_concatenated_formatting_warning`);
+/// - `concatenated` with explicit names puts the allowlist in force: run the
+///   effective (configured ∩ explicit) servers as a pipeline, capped to
+///   `max_fan_out` steps like the parallel paths cap servers queried, or —
+///   when none of the listed names are configured — `Skip`, since the
 ///   allowlist forbids running the non-listed servers `preferred` would pick.
+///   A `"*"` mixed into the list is ignored (no deterministic expansion order
+///   for a sequential pipeline); the caller warns.
 fn plan_region_format(
     strategy: AggregationStrategy,
     priorities: &[String],
     configs: &[ResolvedServerConfig],
+    max_fan_out: Option<usize>,
 ) -> RegionFormatPlan {
+    if priorities.is_empty() {
+        return RegionFormatPlan::Disabled;
+    }
+    if max_fan_out == Some(0) {
+        return RegionFormatPlan::Disabled;
+    }
     if strategy != AggregationStrategy::Concatenated {
         return RegionFormatPlan::Preferred;
     }
-    if priorities.is_empty() {
+    let explicit: Vec<String> = priorities
+        .iter()
+        .filter(|name| name.as_str() != PRIORITIES_WILDCARD)
+        .cloned()
+        .collect();
+    if explicit.is_empty() {
         return RegionFormatPlan::Preferred;
     }
-    let effective = effective_priorities_from(priorities, configs);
+    let mut effective = effective_priorities_from(&explicit, configs);
     if effective.is_empty() {
-        RegionFormatPlan::Skip
-    } else {
-        RegionFormatPlan::Concatenated(effective)
+        return RegionFormatPlan::Skip;
     }
+    if let Some(cap) = max_fan_out {
+        effective.truncate(cap);
+    }
+    RegionFormatPlan::Concatenated(effective)
 }
 
 /// Whole-pipeline time budget for one region's concatenated formatting run.
@@ -1388,7 +1670,7 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["black".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Preferred, &priorities, &configs),
+            plan_region_format(AggregationStrategy::Preferred, &priorities, &configs, None),
             RegionFormatPlan::Preferred
         );
     }
@@ -1400,19 +1682,148 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["isort".to_string(), "black".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Concatenated(vec!["isort".to_string(), "black".to_string()])
         );
     }
 
+    // ==========================================================================
+    // whole_document_replacement (cross-layer-aggregation phase 3)
+    // ==========================================================================
+
     #[test]
-    fn plan_concatenated_with_empty_priorities_falls_back_to_preferred() {
-        // ADR point 2: `concatenated` with an EMPTY `priorities` is a
-        // misconfiguration (order is undefined) and falls back to `preferred`.
+    fn whole_document_replacement_covers_the_entire_original() {
+        let original = "line1\nline2";
+        let formatted = "LINE1\nLINE2\n";
+        let edits = whole_document_replacement(original, formatted).unwrap();
+        assert_eq!(edits.len(), 1, "one overlap-free replacement edit");
+        assert_eq!(edits[0].range.start, Position::new(0, 0));
+        assert_eq!(
+            edits[0].range.end,
+            Position::new(1, 5),
+            "end must be the original's last position (line 1, after 'line2')"
+        );
+        assert_eq!(edits[0].new_text, formatted);
+    }
+
+    #[test]
+    fn whole_document_replacement_handles_trailing_newline() {
+        // With a trailing newline the last line is empty: end = (lines, 0).
+        let original = "a\nb\n";
+        let edits = whole_document_replacement(original, "c\n").unwrap();
+        assert_eq!(edits[0].range.end, Position::new(2, 0));
+    }
+
+    #[test]
+    fn whole_document_replacement_counts_end_character_in_utf16() {
+        // 'é' is 1 UTF-16 unit but 2 UTF-8 bytes; '𠮷' is 2 UTF-16 units.
+        let original = "é𠮷";
+        let edits = whole_document_replacement(original, "x").unwrap();
+        assert_eq!(edits[0].range.end, Position::new(0, 3));
+    }
+
+    #[test]
+    fn whole_document_replacement_returns_none_for_round_trip() {
+        // A chain whose layers undo each other must produce no edit at all.
+        assert!(whole_document_replacement("same", "same").is_none());
+    }
+
+    #[test]
+    fn plan_empty_priorities_disables_the_region_for_any_strategy() {
+        // priorities = [] is the per-method fan-out kill switch
+        // (aggregation-priorities-wildcard): nothing runs, regardless of
+        // strategy. It is NOT the misconfiguration fallback — that role moved
+        // to a wildcard-only list (see the test below).
         let configs = vec![config("black")];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &[], &configs),
+            plan_region_format(AggregationStrategy::Concatenated, &[], &configs, None),
+            RegionFormatPlan::Disabled
+        );
+        assert_eq!(
+            plan_region_format(AggregationStrategy::Preferred, &[], &configs, None),
+            RegionFormatPlan::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_with_wildcard_only_priorities_falls_back_to_preferred() {
+        // ADR point 2: the pipeline needs explicit names for a deterministic
+        // order. The resolved default ["*"] (absent priorities) carries none,
+        // so the region falls back to `preferred`.
+        let configs = vec![config("black")];
+        let priorities = vec![PRIORITIES_WILDCARD.to_string()];
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Preferred
+        );
+    }
+
+    #[test]
+    fn plan_concatenated_ignores_wildcard_mixed_with_explicit_names() {
+        // ["black", "*"]: the wildcard has no deterministic expansion order
+        // for a sequential pipeline, so only the named servers run.
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["black".to_string(), PRIORITIES_WILDCARD.to_string()];
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
+            RegionFormatPlan::Concatenated(vec!["black".to_string()])
+        );
+    }
+
+    #[test]
+    fn plan_max_fan_out_zero_disables_the_region_for_any_strategy() {
+        // maxFanOut = 0 documents "disable fan-out entirely" — the
+        // sequential pipeline must honor it like the parallel paths do.
+        let configs = vec![config("black")];
+        let priorities = vec!["black".to_string()];
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                Some(0)
+            ),
+            RegionFormatPlan::Disabled
+        );
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Preferred,
+                &priorities,
+                &configs,
+                Some(0)
+            ),
+            RegionFormatPlan::Disabled
+        );
+    }
+
+    #[test]
+    fn plan_max_fan_out_caps_pipeline_length() {
+        let configs = vec![config("black"), config("isort")];
+        let priorities = vec!["black".to_string(), "isort".to_string()];
+        assert_eq!(
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                Some(1)
+            ),
+            RegionFormatPlan::Concatenated(vec!["black".to_string()]),
+            "a positive cap bounds the pipeline steps in priority order"
         );
     }
 
@@ -1426,7 +1837,12 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["blackk".to_string(), "ruff".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Skip
         );
     }
@@ -1438,7 +1854,12 @@ mod tests {
         let configs = vec![config("black"), config("isort")];
         let priorities = vec!["ruff".to_string(), "black".to_string()];
         assert_eq!(
-            plan_region_format(AggregationStrategy::Concatenated, &priorities, &configs),
+            plan_region_format(
+                AggregationStrategy::Concatenated,
+                &priorities,
+                &configs,
+                None
+            ),
             RegionFormatPlan::Concatenated(vec!["black".to_string()])
         );
     }

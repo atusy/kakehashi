@@ -10,9 +10,11 @@ impl Kakehashi {
         &self,
         params: CodeLensParams,
     ) -> Result<Option<Vec<CodeLens>>> {
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         self.whole_document_preferred_fan_out(
             &params.text_document.uri,
             "textDocument/codeLens",
+            raw_params,
             |t| async move {
                 t.pool
                     .send_code_lens_request(

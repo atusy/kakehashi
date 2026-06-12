@@ -60,11 +60,13 @@ method (`strategy` in the bridge configuration):
 | Strategy | Behavior |
 |----------|----------|
 | `preferred` | Uses the first non-empty response, in your configured `priorities` order. **Default for every feature except diagnostics.** |
-| `concatenated` | Merges the responses from all servers. **Default for diagnostics.** |
+| `concatenated` | Merges the responses from all servers. **Default for diagnostics.** For full formatting it instead runs a sequential formatter pipeline over `priorities` (see [Formatting](#formatting)). |
 
-`maxFanOut` limits how many servers are queried. Formatting always uses `preferred`
-regardless of configuration (merging independent formatting results would produce
-conflicting edits).
+`priorities` is an ordered **allowlist**: servers absent from the list do not
+run, and a `"*"` element stands for the unlisted rest (see the
+[configuration reference](README.md) for details, including the `layers`
+setting that orders result layers per method). `maxFanOut` limits how many
+servers are queried.
 
 ---
 
@@ -175,9 +177,14 @@ snippet, renames are confined to that block. Default combine strategy: `preferre
 
 [`textDocument/formatting`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_formatting)
 
-Formats every embedded block in the document. When multiple servers are configured,
-the first one in `priorities` is used (formatting always uses `preferred`; merging
-multiple formatters would conflict).
+Formats every embedded block in the document. When multiple servers are
+configured, the default `preferred` strategy uses the first server in
+`priorities` that returns edits. Setting `strategy = "concatenated"` on the
+`textDocument/formatting` key instead runs a **sequential formatter pipeline**:
+the servers named in `priorities` format the block one after another, each
+seeing the previous formatter's output (e.g. `black` then `isort`). The
+pipeline requires explicitly named servers — `"*"` is ignored there, since a
+reproducible pipeline needs a deterministic order.
 
 ### Range formatting
 

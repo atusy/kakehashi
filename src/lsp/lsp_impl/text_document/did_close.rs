@@ -66,6 +66,13 @@ impl Kakehashi {
             );
         }
 
+        // Close the host document itself on any servers it was opened on via
+        // the host bridge (host-document-bridge).
+        self.bridge
+            .pool_arc()
+            .close_host_bridge_document(&uri)
+            .await;
+
         self.notifier().log_info("file closed!").await;
     }
 }

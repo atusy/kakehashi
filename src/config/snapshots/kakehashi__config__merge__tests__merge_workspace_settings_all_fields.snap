@@ -12,6 +12,7 @@ expression: result
       "parser": "/base/lua.so",
       "queries": null,
       "bridge": null,
+      "layers": null,
       "aliases": null
     },
     "python": {
@@ -29,6 +30,7 @@ expression: result
           "aggregation": null
         }
       },
+      "layers": null,
       "aliases": [
         "py3"
       ]
@@ -38,6 +40,7 @@ expression: result
       "parser": "/overlay/rust.so",
       "queries": null,
       "bridge": null,
+      "layers": null,
       "aliases": null
     }
   },

@@ -320,15 +320,46 @@ Each entry in the `bridge` map configures bridging for one injection language:
 | `enabled` | Whether bridging is enabled (`true`/`false`). Omit to inherit from the `_` wildcard (defaults to `true`). |
 | `aggregation` | Per-method aggregation config. Key = LSP method name (e.g., `textDocument/completion`) or `_` for default. |
 
+**Host bridging (`bridge._self`):**
+
+The reserved `_self` key makes the host language its own bridge target: with
+it enabled, requests on the host document are forwarded to servers whose
+`languages` contains the **host** language, with the real URI and no
+coordinate translation. All bridged request methods are wired (diagnostics
+and semantic tokens excepted); by default the host layer is tried after
+`virt` (see `layers` above), so injections keep winning inside code fences
+while the host server answers everywhere else. For formatting, combine
+fence formatters with a whole-document formatter via
+`layers."textDocument/formatting".strategy = "concatenated"`.
+
+```toml
+[languages.markdown.bridge._self]
+enabled = true                       # opt-in: REQUIRED, never inherited from `_`
+
+[languageServers.marksman]
+cmd = ["marksman", "server"]
+languages = ["markdown"]             # host candidate for markdown documents
+```
+
+Unlike injection entries, `_self.enabled` does **not** inherit from the `_`
+wildcard — a server listing the host language is a *capability*, not consent
+to use it. `_self.aggregation` (priorities/strategy/maxFanOut) inherits from
+`_` as usual.
+
 **Aggregation Configuration:**
 
 When multiple language servers can handle the same injection language, `aggregation` controls which server's response is preferred. Each entry contains:
 
 | Field | Description |
 |-------|-------------|
-| `priorities` | Ordered list of server names. The first server that returns a valid response wins. Empty list falls back to arrival-order (first-win) behavior. |
+| `priorities` | Ordered **allowlist** of server names: listed servers are queried in this order, and servers absent from the list do not run. A `"*"` element stands for every configured-but-unlisted server (first-win among themselves), so `["pyright", "*"]` means "prefer pyright, fall back to the rest" and `["*", "pylsp"]` demotes pylsp below everyone else. Omitted = `["*"]` (all servers, first-win). An explicit `[]` disables the method for this bridge entry. Note: the sequential `concatenated` formatting pipeline requires explicit names and ignores `"*"`. |
 | `strategy` | `"preferred"` or `"concatenated"`. Default depends on the LSP method: `"concatenated"` for `textDocument/diagnostic`, `"preferred"` for everything else. `"preferred"` uses the first non-empty response; `"concatenated"` collects and merges responses from all servers. |
 | `maxFanOut` | Maximum number of servers to query. `null` or omitted = no limit (default). `0` = disable fan-out entirely. Positive integer = cap at N servers. Priority servers are selected first when limiting. Negative values are treated as no limit. |
+
+> **Migration note**: `priorities` used to be a preference order only — unlisted
+> servers still participated as fallback. It is now an allowlist: `["pyright"]`
+> runs *only* pyright. Append `"*"` (`["pyright", "*"]`) to keep the old
+> fallback behavior.
 
 Example with per-method priorities, strategy, and maxFanOut:
 
@@ -338,13 +369,54 @@ Example with per-method priorities, strategy, and maxFanOut:
     "python": {
       "aggregation": {
         "textDocument/completion": { "priorities": ["pyright", "pylsp"], "maxFanOut": 1 },
-        "textDocument/diagnostic": { "strategy": "preferred", "priorities": ["pyright"] },
-        "_": { "priorities": ["pylsp"] }
+        "textDocument/diagnostic": { "strategy": "preferred", "priorities": ["pyright", "*"] },
+        "_": { "priorities": ["pylsp", "*"] }
       }
     }
   }
 }
 ```
+
+**Cross-Layer Aggregation (`layers`):**
+
+A request to kakehashi can be answered by up to three *result layers*:
+`virt` (the injection bridges above), `host` (a host-document language
+server — opt-in via `bridge._self` above), and `native` (kakehashi's
+own features). The per-language `layers` map orders them per LSP method:
+
+```json
+{
+  "languages": {
+    "markdown": {
+      "layers": {
+        "textDocument/hover": { "order": ["virt", "native"] },
+        "_": { "order": ["virt", "host", "native"] }
+      }
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `order` | Ordered allowlist of layers, highest priority first. Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only and runs the layers as a sequential pipeline: injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit. |
+
+Details:
+
+- **Key**: the LSP method name, or `_` for the method wildcard (same
+  convention as `aggregation`).
+- **Formatting**: `textDocument/rangeFormatting` shares the
+  `textDocument/formatting` key.
+- **Diagnostics**: two keys, mirroring their aggregation keying — pull
+  diagnostics gate under `textDocument/diagnostic`, push diagnostics under
+  `textDocument/publishDiagnostics`. Disable both (or use `_`) to fully turn
+  bridge diagnostics off.
+- **Current effect**: the `virt` layer answers inside injection regions, and
+  the `host` layer answers on the host document itself for every bridged
+  request method when host bridging is opted in (see `bridge._self` above).
+  Bridged methods have no `native` counterpart yet. Diagnostics and
+  semantic tokens stay virt-only for now.
 
 **Bridge Filter Semantics:**
 

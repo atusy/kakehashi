@@ -1013,6 +1013,18 @@ fn run_with_broken_stdout_pipe(args: &[&str]) -> std::process::Output {
     use std::process::Stdio;
 
     let (read_fd, write_fd): (OwnedFd, OwnedFd) = nix::unistd::pipe().expect("create pipe");
+    // Mark both ends CLOEXEC immediately: `pipe()` creates inheritable fds,
+    // and tests run in parallel threads — a concurrently spawned child of
+    // ANOTHER test could inherit our read end and keep it open, in which
+    // case the child under test writes into a live pipe and exits 0 instead
+    // of dying by SIGPIPE (the historical flake in these tests). CLOEXEC
+    // stops the leak; `Stdio::from(write_fd)` still works because std dup2s
+    // stdio fds for the child, which clears CLOEXEC on the duplicate.
+    // (macOS has no `pipe2`, so the flags are set in a second syscall; the
+    // remaining pipe()-to-fcntl window is a few instructions wide.)
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    fcntl(&read_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("set CLOEXEC on read end");
+    fcntl(&write_fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).expect("set CLOEXEC on write end");
     // Close the read end before spawning: the child gets only the write end, so
     // there is no reader and the first write hits EPIPE.
     drop(read_fd);

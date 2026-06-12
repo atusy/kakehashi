@@ -50,6 +50,15 @@ impl Kakehashi {
             return Ok(Vec::new());
         };
 
+        if !self.virt_layer_enabled(&language_name, "textDocument/documentColor") {
+            log::debug!(
+                target: "kakehashi::document_color",
+                "virt layer disabled for {} via layers.order",
+                language_name
+            );
+            return Ok(Vec::new());
+        }
+
         // Get injection query to detect injection regions
         let Some(injection_query) = self.language.injection_query(&language_name) else {
             return Ok(Vec::new());

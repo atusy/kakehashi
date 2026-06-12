@@ -10,7 +10,8 @@ use url::Url;
 
 use crate::config::WorkspaceSettings;
 use crate::config::settings::{
-    AggregationStrategy, BridgeLanguageConfig, ResolvedAggregationConfig,
+    AggregationStrategy, BridgeLanguageConfig, LayerSource, ResolvedAggregationConfig,
+    ResolvedLayerConfig,
 };
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId};
@@ -36,9 +37,10 @@ pub(crate) struct DocumentRequestContext {
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
     pub(crate) upstream_request_id: Option<UpstreamId>,
-    /// Server names in priority order for aggregation.
-    /// Resolved from the bridge language config's aggregation settings.
-    /// Empty means pure first-win behavior (no priority ordering).
+    /// Server names in priority order for aggregation — an ordered allowlist
+    /// (aggregation-priorities-wildcard). `"*"` stands for the unlisted rest
+    /// (first-win group); the resolved default is `["*"]` (all servers,
+    /// first-win). Empty means fan-out is disabled for this method.
     pub(crate) priorities: Vec<String>,
     /// Aggregation strategy for this region.
     ///
@@ -49,6 +51,32 @@ pub(crate) struct DocumentRequestContext {
     /// Maximum number of servers to fan out to.
     /// `None` = no limit, `Some(0)` = disable fan-out.
     pub(crate) max_fan_out: Option<usize>,
+}
+
+/// All resolved context needed to send a **host** bridge request
+/// (host-document-bridge): the real URI, the host language and text
+/// verbatim, plus the servers selected for the host role and the `_self`
+/// aggregation settings.
+///
+/// The layer strategy is not carried: within the host layer, servers
+/// combine with `preferred` only. The cross-layer strategy lives in the
+/// caller (`walk_layers` / the formatting pipeline).
+pub(crate) struct HostRequestContext {
+    /// The real client URI (forwarded verbatim — no virtual URI).
+    pub(crate) uri: Url,
+    /// The host language, used as the downstream `languageId`.
+    pub(crate) language_id: String,
+    /// The current host text, shared across per-server tasks.
+    pub(crate) text: std::sync::Arc<str>,
+    /// Host-capable server configs (`languages` contains the host language),
+    /// gated on the explicit `bridge._self.enabled = true` opt-in.
+    pub(crate) configs: Vec<ResolvedServerConfig>,
+    /// Ordered allowlist from `bridge._self.aggregation` (wildcard-merged).
+    pub(crate) priorities: Vec<String>,
+    /// Fan-out cap from `bridge._self.aggregation`.
+    pub(crate) max_fan_out: Option<usize>,
+    /// The upstream JSON-RPC request ID for cancel forwarding.
+    pub(crate) upstream_request_id: Option<UpstreamId>,
 }
 
 /// Document context plus a cursor position.
@@ -104,6 +132,127 @@ fn resolve_bridge_language_config_from_settings(
         })
 }
 
+/// Resolve the cross-layer config (cross-layer-aggregation) for a host
+/// language and method. Falls back to the built-in defaults — order
+/// `[virt, host, native]`, per-method strategy — when the host language has
+/// no settings entry at all.
+pub(crate) fn resolve_layer_config_from_settings(
+    settings: &WorkspaceSettings,
+    host_language: &str,
+    method_name: &str,
+) -> ResolvedLayerConfig {
+    settings
+        .resolve_host_language_settings(host_language)
+        .map(|lang_settings| lang_settings.resolve_layers(method_name))
+        .unwrap_or_else(|| ResolvedLayerConfig::with_defaults(method_name))
+}
+
+/// Generic emptiness check for raw host-layer results in the `preferred`
+/// fan-in: `null` and `[]` are "no result", as are the object-shaped
+/// "empty but valid" responses whose single canonical list field is empty —
+/// `CompletionList.items`, `SignatureHelp.signatures`,
+/// `LinkedEditingRanges.ranges`. Without the object shapes, a
+/// higher-priority host server's empty list would prematurely win the
+/// fan-in over a lower-priority server with actual results.
+pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    if let Some(items) = value.as_array() {
+        return items.is_empty();
+    }
+    if let Some(object) = value.as_object() {
+        for key in ["items", "signatures", "ranges"] {
+            if let Some(list) = object.get(key).and_then(serde_json::Value::as_array) {
+                return list.is_empty();
+            }
+        }
+    }
+    false
+}
+
+/// Race the virt and host layer futures **concurrently** and decide by the
+/// resolved layer `order` (cross-layer-aggregation, `preferred` semantics) —
+/// the layer-level analogue of the stage-1 `preferred` fan-in:
+///
+/// - both layers' requests are in flight at once (latency = max, not sum);
+/// - a completed lower-priority result is buffered while a higher-priority
+///   layer is still pending — priority decides, not arrival order;
+/// - a higher-priority layer that completes non-empty wins immediately and
+///   the still-pending loser future is dropped (best-effort abandonment,
+///   like the stage-1 `abort_all`);
+/// - layers absent from `order` are never polled (their future is created
+///   but async blocks are lazy);
+/// - native has no contributor and is skipped.
+pub(crate) async fn race_layers_preferred<R>(
+    order: &[LayerSource],
+    virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+    is_nonempty: impl Fn(&R) -> bool,
+) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+    let mut virt_fut = std::pin::pin!(virt);
+    let mut host_fut = std::pin::pin!(host);
+    // `None` = still pending; `Some(result)` = completed. Layers not in
+    // `order` start as completed-empty so their guard never enables and the
+    // decision walk skips them.
+    let mut virt_state: Option<Option<R>> = (!order.contains(&LayerSource::Virt)).then_some(None);
+    let mut host_state: Option<Option<R>> = (!order.contains(&LayerSource::Host)).then_some(None);
+
+    loop {
+        // Decision walk in priority order: a pending higher-priority layer
+        // blocks; a completed empty one falls through; a completed non-empty
+        // one wins.
+        let mut blocked = false;
+        for layer in order {
+            let slot = match layer {
+                LayerSource::Virt => &mut virt_state,
+                LayerSource::Host => &mut host_state,
+                LayerSource::Native => continue,
+            };
+            match slot {
+                None => {
+                    blocked = true;
+                    break;
+                }
+                Some(result) => {
+                    if result.as_ref().is_some_and(&is_nonempty) {
+                        return Ok(result.take());
+                    }
+                }
+            }
+        }
+        if !blocked {
+            return Ok(None);
+        }
+
+        tokio::select! {
+            result = &mut virt_fut, if virt_state.is_none() => {
+                virt_state = Some(result?);
+            }
+            result = &mut host_fut, if host_state.is_none() => {
+                host_state = Some(result?);
+            }
+        }
+    }
+}
+
+/// Deserialize a verbatim host-layer result into the handler's response
+/// type, logging (not erroring) on shape mismatch.
+pub(crate) fn parse_host_verbatim<R: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> Option<R> {
+    match serde_json::from_value::<R>(value) {
+        Ok(parsed) => Some(parsed),
+        Err(e) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "host response failed to deserialize: {e}"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn resolve_aggregation_config_from_settings(
     settings: &WorkspaceSettings,
     host_language: &str,
@@ -120,14 +269,17 @@ pub(crate) fn resolve_aggregation_config_from_settings(
 
 /// Find every (host_language, injection_language) pair whose configured
 /// aggregation for `textDocument/formatting` is the **misconfigured**
-/// `Concatenated`-with-empty-`priorities` combination.
+/// `Concatenated`-without-explicit-`priorities` combination.
 ///
 /// Since the concatenated formatting pipeline landed
-/// (concatenated-formatting-pipeline), `strategy = "concatenated"` with a
-/// non-empty `priorities` is a valid configuration that runs the sequential
-/// pipeline — only an empty `priorities` is a misconfiguration (the pipeline's
-/// order would be undefined, so the region falls back to `preferred`; ADR
-/// Decision point 2). We warn the user once at settings-apply time
+/// (concatenated-formatting-pipeline), `strategy = "concatenated"` with
+/// explicit server names in `priorities` is a valid configuration that runs
+/// the sequential pipeline. A `priorities` carrying no explicit name — only
+/// the `"*"` wildcard, e.g. the resolved default for an absent list — is a
+/// misconfiguration (the pipeline's order would be undefined, so the region
+/// falls back to `preferred`; ADR Decision point 2). An explicit `[]` is the
+/// deliberate per-method kill switch (aggregation-priorities-wildcard) and is
+/// NOT warned about. We warn the user once at settings-apply time
 /// (initialize + didChangeConfiguration) so the mistake surfaces immediately
 /// rather than silently degrading every format request.
 ///
@@ -136,16 +288,35 @@ pub(crate) fn resolve_aggregation_config_from_settings(
 /// wildcard merge the runtime uses — so priorities supplied via the `_`
 /// wildcard entry count as configured.
 pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec<(String, String)> {
-    use crate::config::settings::AggregationStrategy;
+    use crate::config::settings::{AggregationStrategy, PRIORITIES_WILDCARD};
 
     let mut pairs = Vec::new();
     for (host_language, lang_settings) in &settings.languages {
         let Some(bridge_map) = lang_settings.bridge.as_ref() else {
             continue;
         };
-        for (injection_language, bridge_cfg) in bridge_map {
+        for injection_language in bridge_map.keys() {
+            // Resolve through the bridge-key wildcard merge so this warning
+            // path sees exactly what the runtime sees: priorities supplied by
+            // a `bridge._` entry must count for a `bridge.<lang>` that only
+            // sets the strategy. (For the literal `_` key this self-merges,
+            // which is idempotent for the field-level merge.)
+            let Some(bridge_cfg) = crate::config::resolve_with_wildcard(
+                bridge_map,
+                injection_language,
+                crate::config::merge_bridge_language_configs,
+            ) else {
+                continue;
+            };
             let agg = bridge_cfg.resolve_aggregation("textDocument/formatting");
-            if agg.strategy == AggregationStrategy::Concatenated && agg.priorities.is_empty() {
+            let has_explicit_name = agg
+                .priorities
+                .iter()
+                .any(|name| name != PRIORITIES_WILDCARD);
+            if agg.strategy == AggregationStrategy::Concatenated
+                && !agg.priorities.is_empty()
+                && !has_explicit_name
+            {
                 pairs.push((host_language.clone(), injection_language.clone()));
             }
         }
@@ -171,15 +342,27 @@ pub(crate) fn format_concatenated_formatting_warning(pairs: &[(String, String)])
     }
     let listed = pairs
         .iter()
-        .map(|(host, injection)| format!("{}->{}", host, injection))
+        .map(|(host, injection)| {
+            // A `_` injection key is the wildcard template: it is not one
+            // request path but the default every injection language without
+            // its own override inherits — render it so the warning does not
+            // read as a literal language named "_".
+            if injection == crate::config::WILDCARD_KEY {
+                format!("{}->(any other injection)", host)
+            } else {
+                format!("{}->{}", host, injection)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
         "Bridge config sets aggregation strategy 'concatenated' for \
-         textDocument/formatting with an empty 'priorities' list on {} \
-         (host->injection) pair(s): {}. The concatenated formatting pipeline \
-         requires a non-empty 'priorities' (it defines which servers run and \
-         in what order); these pairs fall back to 'preferred'.",
+         textDocument/formatting with no explicit server names in \
+         'priorities' on {} (host->injection) pair(s): {}. The concatenated \
+         formatting pipeline requires explicitly named servers ('priorities' \
+         defines which servers run and in what order; '*' has no \
+         deterministic order and is ignored); these pairs fall back to \
+         'preferred'.",
         pairs.len(),
         listed
     ))
@@ -216,9 +399,15 @@ impl Kakehashi {
                 (Some(rx), Some(guard))
             }
             Err(e) => {
-                log::error!(
-                    "Cancel subscribe failed for {}: already subscribed. \
-                     Proceeding without cancel.",
+                // Expected under concurrent layer fan-out: `walk_layers`
+                // subscribes for the whole walk, so the virt/host arms'
+                // own subscribe attempts find the id taken. The arm runs
+                // without a local receiver; prompt cancellation is provided
+                // by the walk-level select (and downstream forwarding by the
+                // upstream-request registry, which is independent of this).
+                log::debug!(
+                    "Cancel subscribe for {}: already subscribed (another \
+                     layer holds it); proceeding without a local receiver",
                     e.0
                 );
                 (None, None)
@@ -316,6 +505,30 @@ impl Kakehashi {
         })
     }
 
+    /// Resolve the cross-layer config (cross-layer-aggregation) for a host
+    /// language and LSP method from the current settings.
+    pub(crate) fn resolve_layer_config(
+        &self,
+        host_language: &str,
+        method_name: &str,
+    ) -> ResolvedLayerConfig {
+        let settings = self.settings_manager.load_settings();
+        resolve_layer_config_from_settings(&settings, host_language, method_name)
+    }
+
+    /// Whether the virt layer participates for this host language and LSP
+    /// method (cross-layer-aggregation): when `"virt"` is absent from the
+    /// resolved `layers.order`, the bridge dispatch is skipped entirely.
+    ///
+    /// Used by entry points outside the [`Self::walk_layers`] race —
+    /// notably the push-diagnostics scheduler and the virt-only handlers
+    /// (diagnostics, documentColor) that have no host contributor yet.
+    /// Handlers on the walk get layer membership from the race itself.
+    pub(crate) fn virt_layer_enabled(&self, host_language: &str, method_name: &str) -> bool {
+        self.resolve_layer_config(host_language, method_name)
+            .allows(LayerSource::Virt)
+    }
+
     /// Convert a preamble result into a `DocumentRequestContext` by looking up
     /// bridge server configs for the injection language.
     ///
@@ -328,6 +541,15 @@ impl Kakehashi {
         preamble: PreambleResult,
         method_name: &str,
     ) -> Option<DocumentRequestContext> {
+        if !self.virt_layer_enabled(&preamble.language_name, method_name) {
+            log::debug!(
+                "{}: virt layer disabled for {} via layers.order",
+                method_name,
+                preamble.language_name
+            );
+            return None;
+        }
+
         let configs = self.bridge_configs_for_injection_language(
             &preamble.language_name,
             &preamble.resolved.injection_language,
@@ -377,6 +599,195 @@ impl Kakehashi {
             injection_language,
             method_name,
         )
+    }
+
+    /// Resolve the context for a **host** bridge request
+    /// (host-document-bridge): the host language's own servers, gated on the
+    /// explicit `bridge._self.enabled = true` opt-in.
+    ///
+    /// Returns `None` when the document is missing, host bridging is not
+    /// opted in, or no configured server lists the host language.
+    pub(crate) fn resolve_host_bridge_context(
+        &self,
+        lsp_uri: &Uri,
+        method_name: &str,
+    ) -> Option<HostRequestContext> {
+        let uri = uri_to_url(lsp_uri).ok()?;
+        let snapshot = self.documents.get(&uri)?.snapshot()?;
+        let language_name = self.document_language(&uri)?;
+
+        let settings = self.settings_manager.load_settings();
+        let lang_settings = settings.resolve_host_language_settings(&language_name)?;
+        if !lang_settings.is_host_bridging_enabled() {
+            log::debug!(
+                "{}: host bridging not opted in for {} (bridge._self.enabled)",
+                method_name,
+                language_name
+            );
+            return None;
+        }
+
+        let configs = self
+            .bridge
+            .get_host_configs_for_language(&settings, &language_name);
+        if configs.is_empty() {
+            log::debug!(
+                "{}: no host-capable server configured for {}",
+                method_name,
+                language_name
+            );
+            return None;
+        }
+
+        let agg = lang_settings.resolve_host_aggregation(method_name);
+
+        Some(HostRequestContext {
+            uri,
+            text: std::sync::Arc::from(snapshot.text()),
+            language_id: language_name,
+            configs,
+            priorities: agg.priorities,
+            max_fan_out: agg.max_fan_out,
+            upstream_request_id: current_upstream_id(),
+        })
+    }
+
+    /// Dispatch a host bridge request over a resolved [`HostRequestContext`]:
+    /// the upstream `params` are forwarded verbatim (real URI, real
+    /// coordinates) and the raw `result` value comes back untranslated.
+    pub(crate) async fn host_layer_value_with_ctx(
+        &self,
+        ctx: &HostRequestContext,
+        request_method: &'static str,
+        params: serde_json::Value,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<serde_json::Value>> {
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let pool = self.bridge.pool_arc();
+        let result = crate::lsp::aggregation::server::dispatch_host_preferred(
+            ctx,
+            pool.clone(),
+            move |t| {
+                let params = params.clone();
+                async move {
+                    t.pool
+                        .send_host_raw_request(
+                            &t.server_name,
+                            &t.server_config,
+                            &crate::lsp::bridge::HostDocument {
+                                uri: &t.uri,
+                                language_id: &t.language_id,
+                                text: &t.text,
+                            },
+                            request_method,
+                            params,
+                            t.upstream_id,
+                        )
+                        .await
+                }
+            },
+            |opt| matches!(opt, Some(v) if !is_empty_layer_value(v)),
+            cancel_rx,
+        )
+        .await;
+        pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
+        // Quieter than `FanInResult::handle`: an all-empty host layer is the
+        // normal outcome whenever virt answers, and the virt arm already
+        // emits the client-visible "no response" LOG — only real host
+        // failures get surfaced here.
+        match result {
+            crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(value),
+            crate::lsp::aggregation::server::FanInResult::NoResult { errors } => {
+                if errors > 0 {
+                    self.client
+                        .log_message(
+                            tower_lsp_server::ls_types::MessageType::WARNING,
+                            format!("No {request_method} response from any host bridge server"),
+                        )
+                        .await;
+                }
+                Ok(None)
+            }
+            crate::lsp::aggregation::server::FanInResult::Cancelled => {
+                Err(tower_lsp_server::jsonrpc::Error::request_cancelled())
+            }
+        }
+    }
+
+    /// Walk the resolved layer order for a request method
+    /// (cross-layer-aggregation, `preferred` semantics): the virt and host
+    /// layers fan out **concurrently** ([`race_layers_preferred`]) and the
+    /// highest-priority non-empty result wins.
+    ///
+    /// - `virt` is the handler's existing injection-bridge future, polled
+    ///   only when the virt layer is in `order`.
+    /// - The host layer forwards `raw_params` verbatim
+    ///   (host-document-bridge) and maps the raw result via `host_parse`.
+    /// - `layer_method` keys `layers.order` and the `_self` aggregation
+    ///   (e.g. rangeFormatting shares `textDocument/formatting`);
+    ///   `request_method` is what goes on the wire and gates capability.
+    /// - Native has no contributor for bridged methods.
+    ///
+    /// A losing in-flight future is dropped; its RAII guards clean up the
+    /// response router and cancel subscription, and the trailing
+    /// `unregister_all_for_upstream_id` sweeps any upstream-registry entries
+    /// the dropped future did not get to remove itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layers<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        raw_params: serde_json::Value,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host_parse: impl Fn(serde_json::Value) -> Option<R>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok(None);
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return Ok(None);
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+
+        let host = async {
+            match self.resolve_host_bridge_context(lsp_uri, layer_method) {
+                Some(ctx) => Ok(self
+                    .host_layer_value_with_ctx(&ctx, request_method, raw_params.clone())
+                    .await?
+                    .and_then(&host_parse)),
+                None => Ok(None),
+            }
+        };
+
+        // Subscribe for the WHOLE walk before either arm runs: the arms'
+        // own subscribe attempts then find the id taken and proceed without
+        // a local receiver (logged at debug), and this select cancels the
+        // race — dropping both in-flight arms — the moment `$/cancelRequest`
+        // arrives, regardless of which arm would have held the subscription.
+        // Best-effort gap: between the race's completion and the next
+        // request there is no subscriber; a cancel landing there is only
+        // forwarded downstream via the upstream-request registry.
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
+        let race = race_layers_preferred(&layer_cfg.order, virt, host, is_nonempty);
+        let result = match cancel_rx {
+            Some(mut cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                    result = race => result,
+                }
+            }
+            None => race.await,
+        };
+        // Sweep upstream-registry entries a dropped (losing or cancelled)
+        // layer future did not get to unregister itself. Idempotent; a
+        // completed arm already cleaned up its own.
+        self.bridge
+            .pool_arc()
+            .unregister_all_for_upstream_id(current_upstream_id().as_ref());
+        result
     }
 
     /// Resolve injection context for a bridge endpoint request (all matching servers).
@@ -432,11 +843,8 @@ mod tests {
 
     fn lang_settings(bridge: HashMap<String, BridgeLanguageConfig>) -> LanguageSettings {
         LanguageSettings {
-            base: None,
-            parser: None,
-            queries: None,
             bridge: Some(bridge),
-            aliases: None,
+            ..Default::default()
         }
     }
 
@@ -457,6 +865,222 @@ mod tests {
             enabled: None,
             aggregation: Some(agg),
         }
+    }
+
+    // ==========================================================================
+    // is_empty_layer_value (host-layer fan-in emptiness)
+    // ==========================================================================
+
+    #[test]
+    fn empty_layer_value_recognizes_null_and_empty_array() {
+        assert!(is_empty_layer_value(&serde_json::Value::Null));
+        assert!(is_empty_layer_value(&serde_json::json!([])));
+        assert!(!is_empty_layer_value(&serde_json::json!([1])));
+    }
+
+    #[test]
+    fn empty_layer_value_recognizes_object_shaped_empties() {
+        // CompletionList / SignatureHelp / LinkedEditingRanges with empty
+        // canonical lists are "empty but valid" — they must not win the
+        // host fan-in over a server with actual results.
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "isIncomplete": false, "items": []
+        })));
+        assert!(is_empty_layer_value(
+            &serde_json::json!({ "signatures": [] })
+        ));
+        assert!(is_empty_layer_value(&serde_json::json!({ "ranges": [] })));
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "isIncomplete": false, "items": [{ "label": "x" }]
+        })));
+    }
+
+    #[test]
+    fn empty_layer_value_treats_other_objects_as_results() {
+        // Hover and friends: object results without a canonical list field
+        // count as results.
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "contents": "docs"
+        })));
+    }
+
+    // ==========================================================================
+    // race_layers_preferred (cross-layer-aggregation, parallel fan-out)
+    // ==========================================================================
+
+    const VHN: &[LayerSource] = &[LayerSource::Virt, LayerSource::Host, LayerSource::Native];
+
+    fn ok<R>(value: Option<R>) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
+        Ok(value)
+    }
+
+    #[tokio::test]
+    async fn race_prefers_higher_layer_even_when_lower_arrives_first() {
+        // Host completes instantly with a result; virt completes later but
+        // non-empty. Priority decides, not arrival order.
+        let virt = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ok(Some("virt"))
+        };
+        let host = async { ok(Some("host")) };
+        let won = race_layers_preferred(VHN, virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, Some("virt"));
+    }
+
+    #[tokio::test]
+    async fn race_falls_back_to_host_when_virt_is_empty() {
+        let virt = async { ok(None) };
+        let host = async { ok(Some("host")) };
+        let won = race_layers_preferred(VHN, virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, Some("host"));
+    }
+
+    #[tokio::test]
+    async fn race_polls_layers_concurrently_not_serially() {
+        // The virt future only completes AFTER the host future completed
+        // (oneshot handshake). A serial walk (virt awaited to completion
+        // before host is even polled) would deadlock here; the concurrent
+        // race completes promptly.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let virt = async move {
+            let _ = rx.await;
+            ok(Some("virt"))
+        };
+        let host = async move {
+            let _ = tx.send(());
+            // Stay pending long enough that the race must keep polling virt.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            ok(Some("host"))
+        };
+        let won = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            race_layers_preferred(VHN, virt, host, |_| true),
+        )
+        .await
+        .expect("layers must fan out concurrently — a serial walk deadlocks this handshake")
+        .unwrap();
+        assert_eq!(won, Some("virt"), "priority still decides");
+    }
+
+    #[tokio::test]
+    async fn race_never_polls_layers_absent_from_order() {
+        // An allowlist without virt must not poll the virt future at all.
+        let virt = async {
+            panic!("virt must not be polled when absent from order");
+            #[allow(unreachable_code)]
+            ok(Some("virt"))
+        };
+        let host = async { ok(Some("host")) };
+        let won = race_layers_preferred(&[LayerSource::Host], virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, Some("host"));
+    }
+
+    #[tokio::test]
+    async fn race_returns_none_when_all_layers_are_empty() {
+        let virt = async { ok(None) };
+        let host = async { ok(None) };
+        let won: Option<&str> = race_layers_preferred(VHN, virt, host, |_| true)
+            .await
+            .unwrap();
+        assert_eq!(won, None);
+    }
+
+    #[tokio::test]
+    async fn race_treats_empty_results_via_is_nonempty() {
+        // A Some result that the emptiness check rejects falls through.
+        let virt = async { ok(Some(Vec::<i32>::new())) };
+        let host = async { ok(Some(vec![1])) };
+        let won = race_layers_preferred(VHN, virt, host, |v: &Vec<i32>| !v.is_empty())
+            .await
+            .unwrap();
+        assert_eq!(won, Some(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn race_propagates_errors() {
+        let virt =
+            async { Err::<Option<&str>, _>(tower_lsp_server::jsonrpc::Error::request_cancelled()) };
+        let host = async { ok(Some("host")) };
+        let result = race_layers_preferred(VHN, virt, host, |_| true).await;
+        assert!(result.is_err(), "a layer error must propagate");
+    }
+
+    // ==========================================================================
+    // resolve_layer_config_from_settings (cross-layer-aggregation)
+    // ==========================================================================
+
+    #[test]
+    fn resolve_layer_config_defaults_when_language_has_no_settings() {
+        let settings = settings_with(HashMap::new());
+        let resolved =
+            resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+        );
+    }
+
+    #[test]
+    fn resolve_layer_config_respects_language_entry() {
+        let mut langs = HashMap::new();
+        langs.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                layers: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    crate::config::settings::LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native]),
+                        strategy: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        let settings = settings_with(langs);
+
+        let hover = resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
+        assert_eq!(hover.order, vec![LayerSource::Native]);
+        assert!(!hover.allows(LayerSource::Virt));
+
+        let definition =
+            resolve_layer_config_from_settings(&settings, "markdown", "textDocument/definition");
+        assert!(
+            definition.allows(LayerSource::Virt),
+            "unconfigured methods keep the default order"
+        );
+    }
+
+    #[test]
+    fn resolve_layer_config_falls_back_to_language_wildcard_entry() {
+        // resolve_host_language_settings falls back to the "_" language for
+        // hosts without their own entry, so layers configured there apply.
+        let mut langs = HashMap::new();
+        langs.insert(
+            "_".to_string(),
+            LanguageSettings {
+                layers: Some(HashMap::from([(
+                    "_".to_string(),
+                    crate::config::settings::LayerAggregationConfig {
+                        order: Some(vec![]),
+                        strategy: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        let settings = settings_with(langs);
+        let resolved =
+            resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
+        assert!(
+            resolved.order.is_empty(),
+            "wildcard-language layers must apply to unconfigured hosts"
+        );
     }
 
     #[test]
@@ -640,6 +1264,122 @@ mod tests {
     }
 
     #[test]
+    fn concatenated_formatting_pairs_resolves_bridge_key_wildcard_inheritance() {
+        // Priorities supplied by the `bridge._` wildcard entry, strategy by
+        // the concrete `bridge.python` entry. The runtime merges the two
+        // (resolve_with_wildcard), so the warning path must too — flagging
+        // this valid configuration would be a false positive.
+        let mut python_agg = HashMap::new();
+        python_agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: None,
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut wildcard_agg = HashMap::new();
+        wildcard_agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec!["black".to_string()]),
+                strategy: None,
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(python_agg),
+            },
+        );
+        bridge.insert(
+            "_".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(wildcard_agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "priorities inherited from the bridge._ wildcard entry must count \
+             as a configured pipeline definition; got: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_excludes_explicit_empty_priorities() {
+        // priorities = [] is the deliberate per-method kill switch
+        // (aggregation-priorities-wildcard): the region runs nothing. That is
+        // intended behavior, not a misconfiguration — no warning.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec![]),
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert!(
+            pairs.is_empty(),
+            "an explicit [] disables the method deliberately and must not be warned about"
+        );
+    }
+
+    #[test]
+    fn concatenated_formatting_pairs_flags_wildcard_only_priorities() {
+        // priorities = ["*"] (also the resolved default for an absent list)
+        // carries no explicit name: the pipeline's order is undefined, so the
+        // pair must be flagged for the settings-apply warning.
+        let mut agg = HashMap::new();
+        agg.insert(
+            "textDocument/formatting".to_string(),
+            AggregationConfig {
+                priorities: Some(vec![
+                    crate::config::settings::PRIORITIES_WILDCARD.to_string(),
+                ]),
+                strategy: Some(AggregationStrategy::Concatenated),
+                max_fan_out: None,
+            },
+        );
+        let mut bridge = HashMap::new();
+        bridge.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: None,
+                aggregation: Some(agg),
+            },
+        );
+        let mut langs = HashMap::new();
+        langs.insert("markdown".to_string(), lang_settings(bridge));
+
+        let pairs = concatenated_formatting_pairs(&settings_with(langs));
+
+        assert_eq!(pairs, vec![("markdown".to_string(), "python".to_string())]);
+    }
+
+    #[test]
     fn concatenated_formatting_pairs_returns_empty_for_preferred() {
         let mut bridge = HashMap::new();
         bridge.insert(
@@ -729,6 +1469,24 @@ mod tests {
         for needle in ["markdown->lua", "markdown->python", "rust->python"] {
             assert!(msg.contains(needle), "missing '{needle}' in: {msg}");
         }
+    }
+
+    #[test]
+    fn format_concatenated_formatting_warning_renders_wildcard_injection_meaningfully() {
+        // A `_` injection key is the wildcard template every unlisted
+        // injection language inherits — the warning must not present it as a
+        // literal language named "_".
+        let msg =
+            format_concatenated_formatting_warning(&[("markdown".to_string(), "_".to_string())])
+                .expect("non-empty input must yield a message");
+        assert!(
+            msg.contains("markdown->(any other injection)"),
+            "wildcard pair must be rendered as a template, got: {msg}"
+        );
+        assert!(
+            !msg.contains("markdown->_"),
+            "raw '_' rendering must be replaced; got: {msg}"
+        );
     }
 
     #[test]

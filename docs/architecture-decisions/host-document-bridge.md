@@ -6,6 +6,54 @@
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method bridge strategies
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard config inheritance (foundation for `_self` resolution)
 - [pull-first-diagnostic-forwarding](pull-first-diagnostic-forwarding.md) — Diagnostic forwarding
+- [cross-layer-aggregation](cross-layer-aggregation.md) — Cross-layer (native/host/virt) result aggregation; covers what this decision scopes out
+
+## Implementation Status
+
+Partially implemented:
+
+- **Schema & gate**: the `_self` reserved key is live. Opt-in is the explicit
+  `bridge._self.enabled = true` (`LanguageSettings::is_host_bridging_enabled`);
+  the built-in `_self.enabled = false` default is implemented as an
+  explicit-only rule — the `_` wildcard's `enabled = true` deliberately does
+  not leak into `_self` (equivalent to the Wildcard Merge Safety reasoning
+  below, without materializing built-in default entries). Aggregation fields
+  DO wildcard-merge (`resolve_host_aggregation`).
+- **Dispatch**: implemented for every bridged request method. Because the
+  host path needs no URI synthesis or coordinate translation, all methods
+  share one generic forwarder
+  (`LanguageServerPool::send_host_raw_request`): the upstream request's
+  params are forwarded **verbatim** as raw JSON (they already reference the
+  real URI and real coordinates) and the result comes back untranslated —
+  no per-method request builders or response transformers. Handlers run the
+  layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
+  `preferred` semantics): layers are tried lazily in `order` — by default
+  virt first, host as fallback. Covered: definition, hover, declaration,
+  typeDefinition, implementation, references, completion, signatureHelp,
+  documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
+  inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
+  formatting, and rangeFormatting (which shares the formatting layer key).
+  Not covered: diagnostics (needs cross-layer `concatenated`; push/pull
+  stay virt-gated), semantic tokens (native-only), and the experimental
+  documentColor/colorPresentation pair. `completionItem/resolve` routes by
+  the envelope the virt fan-out stamps into `CompletionItem.data`; host
+  completion items carry no envelope and resolve falls back gracefully
+  (item returned unresolved). Formatting additionally supports the cross-layer
+  `concatenated` pipeline: virt region edits apply first, the host
+  formatter formats the intermediate text, and the chain collapses into one
+  whole-document replacement edit. During that pipeline the host server's
+  document state is briefly speculative (it sees the virt-applied text);
+  the lazy fingerprint sync restores the editor text on the next request.
+- **Document sync deviation**: instead of forwarding `didChange` params
+  verbatim, sync is *lazy*: `didOpen` with the full host text fires on the
+  first request per `(uri, server)`, and a **full-text** `didChange` fires
+  when the host text's fingerprint changed since the last request. This
+  matches the virt path's full-content `didChange` forwarding and avoids
+  hooking the concurrent upstream `didChange` stream; verbatim forwarding
+  remains the target if eager sync proves necessary.
+- **Not implemented**: `publishDiagnostics` pass-through from host servers
+  (downstream notifications are not forwarded upstream today on either
+  path).
 
 ## Context
 
@@ -141,7 +189,7 @@ Practical consequences:
 
 ### Out of Scope
 
-- **Combine logic for host/virt responses at request time**: this decision defines only the schema for declaring host and virt bridges. How responses from both roles are ordered, merged, or routed per method is a separate concern decided at dispatch time, not encoded in the configuration shape.
+- **Combine logic for host/virt responses at request time**: this decision defines only the schema for declaring host and virt bridges. How responses from both roles are ordered, merged, or routed per method is a separate concern decided at dispatch time, not encoded in the configuration shape — since decided in cross-layer-aggregation (the `layers` field on `LanguageSettings`).
 - **Editor connecting to the same LS directly**: if the user's editor talks to marksman in parallel with kakehashi, marksman sees duplicate `didOpen` events. Resolving this is the user's responsibility (route only through kakehashi). Kakehashi does not attempt to detect or mediate.
 - **Cross-language priority mixing in `priorities` entries**: the `priorities` field remains a `Vec<String>` of LS names within a single bridge target (`bridge.<inj>` or `bridge._self`). Mixing names from different bridge targets in one list is not supported by this schema.
 

@@ -10,9 +10,11 @@ impl Kakehashi {
         &self,
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         self.whole_document_preferred_fan_out(
             &params.text_document.uri,
             "textDocument/foldingRange",
+            raw_params,
             |t| async move {
                 t.pool
                     .send_folding_range_request(

@@ -5,6 +5,25 @@ use std::collections::HashMap;
 
 pub(crate) type CaptureMapping = HashMap<String, String>;
 
+/// Reserved key in the `bridge` map for the host language acting as its own
+/// bridge target (host-document-bridge): requests for the host document are
+/// forwarded with the real URI and no coordinate translation.
+pub(crate) const HOST_BRIDGE_KEY: &str = "_self";
+
+/// Reserved `priorities` element standing for "every configured server not
+/// named elsewhere in the list" (aggregation-priorities-wildcard).
+///
+/// Glob-like `*` rather than the `_` wildcard sigil: `_` keys carry
+/// field-level inheritance semantics, a rest-of-the-candidates list element
+/// does not.
+pub(crate) const PRIORITIES_WILDCARD: &str = "*";
+
+/// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
+/// every configured server with no ranking (first-win).
+fn default_priorities() -> Vec<String> {
+    vec![PRIORITIES_WILDCARD.to_string()]
+}
+
 /// Aggregation strategy for combining results from multiple bridge servers.
 ///
 /// - `Preferred`: Use the first non-empty response (priority-ordered).
@@ -21,15 +40,18 @@ pub enum AggregationStrategy {
 /// Per-method aggregation configuration.
 ///
 /// Controls how results from multiple bridge servers are aggregated for a
-/// specific LSP method. The `priorities` list determines server preference
-/// order — the first server in the list that returns a non-empty result wins.
-/// `Some(vec![])` degrades to first-win (arrival-order) behavior, while `None`
-/// means "inherit from wildcard/base".
+/// specific LSP method. The `priorities` list is an **ordered allowlist**
+/// (aggregation-priorities-wildcard): listed servers run in order, servers
+/// absent from the list do not run, and a `"*"` element stands for every
+/// configured-but-unlisted server (a first-win group at that position).
+/// `None` means "inherit from wildcard/base", resolving to `["*"]` when
+/// nothing is configured; `Some(vec![])` disables fan-out for the method.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregationConfig {
-    /// Server names in priority order (highest first).
-    /// `Some(vec![])` = pure first-win behavior, `None` = inherit.
+    /// Server names in priority order (highest first), as an ordered
+    /// allowlist. `"*"` = all unlisted servers; `Some(vec![])` = disable
+    /// fan-out for this method; `None` = inherit (default `["*"]`).
     #[serde(default)]
     pub priorities: Option<Vec<String>>,
     /// Aggregation strategy override.
@@ -63,6 +85,87 @@ pub struct BridgeLanguageConfig {
     pub aggregation: Option<HashMap<String, AggregationConfig>>,
 }
 
+/// One result layer that can answer an LSP request
+/// (cross-layer-aggregation). NOT injection nesting depth (tree-sitter
+/// "language layers").
+///
+/// The set is closed and three-valued, so layer order is expressed by
+/// explicit enumeration — no `"*"` element exists on this axis.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerSource {
+    /// kakehashi's own features (Tree-sitter based).
+    Native,
+    /// The host-document bridge (`bridge._self`, host-document-bridge):
+    /// servers handling the host document itself with the real URI. An
+    /// empty contributor until opted in via `bridge._self.enabled = true`.
+    Host,
+    /// The injection bridges (`bridge.<language>`).
+    Virt,
+}
+
+/// Per-method cross-layer aggregation configuration
+/// (cross-layer-aggregation). Lives in `LanguageSettings::layers`, keyed by
+/// LSP method name or `"_"` for the method wildcard.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerAggregationConfig {
+    /// Ordered allowlist of result layers, highest priority first: layers
+    /// omitted from the list do not participate for the method. `[]`
+    /// disables the method across all layers. `None` = inherit (default
+    /// `["virt", "host", "native"]` — innermost first).
+    #[serde(default)]
+    pub order: Option<Vec<LayerSource>>,
+    /// Cross-layer combine strategy: `preferred` (first non-empty layer
+    /// wins) or `concatenated`. `concatenated` is honored for
+    /// `textDocument/formatting` only (cross-layer-aggregation phase 3);
+    /// other methods combine with `preferred` until a second layer can
+    /// produce results.
+    #[serde(default)]
+    pub strategy: Option<AggregationStrategy>,
+}
+
+/// The built-in default layer order: virt, host, native — innermost first,
+/// mirroring the "deeper wins" semantic-token convention.
+fn default_layer_order() -> Vec<LayerSource> {
+    vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+}
+
+/// Drop repeated layers, keeping the first occurrence (order preserved).
+fn dedup_layer_order(order: Vec<LayerSource>) -> Vec<LayerSource> {
+    let mut seen = std::collections::HashSet::new();
+    order
+        .into_iter()
+        .filter(|layer| seen.insert(*layer))
+        .collect()
+}
+
+/// Fully resolved cross-layer settings for a single LSP method.
+///
+/// Produced by [`LanguageSettings::resolve_layers`]; all optional fields are
+/// resolved with their defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedLayerConfig {
+    pub(crate) order: Vec<LayerSource>,
+    pub(crate) strategy: AggregationStrategy,
+}
+
+impl ResolvedLayerConfig {
+    /// Defaults for a method with no `layers` configuration: the built-in
+    /// order and the per-method strategy default.
+    pub(crate) fn with_defaults(method: &str) -> Self {
+        Self {
+            order: default_layer_order(),
+            strategy: default_aggregation_strategy_for_method(method),
+        }
+    }
+
+    /// Whether the given layer participates for this method.
+    pub(crate) fn allows(&self, layer: LayerSource) -> bool {
+        self.order.contains(&layer)
+    }
+}
+
 /// Fully resolved aggregation settings for a single LSP method.
 ///
 /// Produced by [`BridgeLanguageConfig::resolve_aggregation`]. Unlike
@@ -76,11 +179,12 @@ pub(crate) struct ResolvedAggregationConfig {
 }
 
 impl ResolvedAggregationConfig {
-    /// Create a config with all fields at their defaults (`Preferred` strategy).
+    /// Create a config with all fields at their defaults (`Preferred`
+    /// strategy, `["*"]` priorities = all servers, first-win).
     pub(crate) fn with_defaults() -> Self {
         Self {
             strategy: AggregationStrategy::Preferred,
-            priorities: Vec::new(),
+            priorities: default_priorities(),
             max_fan_out: None,
         }
     }
@@ -123,12 +227,15 @@ impl BridgeLanguageConfig {
                 strategy: entry
                     .strategy
                     .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
-                priorities: entry.priorities.unwrap_or_default(),
+                // None (unset after merge) resolves to ["*"] — all servers,
+                // first-win. An explicit [] survives as the per-method
+                // fan-out kill switch (aggregation-priorities-wildcard).
+                priorities: entry.priorities.unwrap_or_else(default_priorities),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
             },
             None => ResolvedAggregationConfig {
                 strategy: default_aggregation_strategy_for_method(method),
-                priorities: Vec::new(),
+                priorities: default_priorities(),
                 max_fan_out: None,
             },
         }
@@ -289,12 +396,81 @@ pub struct LanguageSettings {
     pub queries: Option<Vec<QueryItem>>,
     /// Omit to bridge all configured languages (default). Use an empty object `{}` to disable bridging. Use `{ "python": { "enabled": true } }` to bridge specific languages.
     pub bridge: Option<HashMap<String, BridgeLanguageConfig>>,
+    /// Per-method cross-layer aggregation (cross-layer-aggregation).
+    /// Key = LSP method name or `"_"` for the method wildcard; value orders
+    /// the result layers (`virt`/`host`/`native`) for that method.
+    /// Omit to use the default order `["virt", "host", "native"]`.
+    pub layers: Option<HashMap<String, LayerAggregationConfig>>,
     /// Deprecated: use `base` on the derived language instead.
     /// Alternative languageId values that should use this parser.
     pub aliases: Option<Vec<String>>,
 }
 
 impl LanguageSettings {
+    /// Resolve the cross-layer settings for an LSP method
+    /// (cross-layer-aggregation), with field-level wildcard merge over the
+    /// `"_"` method entry — the same machinery as
+    /// [`BridgeLanguageConfig::resolve_aggregation`].
+    ///
+    /// `order` is a single field: a method-specific `order` replaces the
+    /// wildcard's list wholesale, it does not merge element-wise.
+    pub(crate) fn resolve_layers(&self, method: &str) -> ResolvedLayerConfig {
+        let entry = self.layers.as_ref().and_then(|map| {
+            crate::config::resolve_with_wildcard(
+                map,
+                method,
+                crate::config::merge_layer_aggregation_configs,
+            )
+        });
+        match entry {
+            Some(cfg) => ResolvedLayerConfig {
+                // Dedup defensively (first occurrence wins): a repeated layer
+                // in user config would otherwise make downstream walks visit
+                // it twice.
+                order: dedup_layer_order(cfg.order.unwrap_or_else(default_layer_order)),
+                strategy: cfg
+                    .strategy
+                    .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
+            },
+            None => ResolvedLayerConfig::with_defaults(method),
+        }
+    }
+
+    /// Whether host bridging (`bridge._self`, host-document-bridge) is
+    /// enabled for this language.
+    ///
+    /// Host bridging is **opt-in**: it requires an explicit
+    /// `bridge._self.enabled = true`. Unlike injection entries, the `enabled`
+    /// field deliberately does NOT inherit from the `_` wildcard entry —
+    /// that implements the ADR's built-in `languages._.bridge._self.enabled
+    /// = false` default, which must beat the wildcard's `enabled = true`
+    /// virt default (key-specific wins). Aggregation fields DO inherit from
+    /// `_` via [`Self::resolve_host_aggregation`].
+    pub(crate) fn is_host_bridging_enabled(&self) -> bool {
+        self.bridge
+            .as_ref()
+            .and_then(|map| map.get(HOST_BRIDGE_KEY))
+            .and_then(|cfg| cfg.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Resolve the per-method aggregation config for the host bridge target
+    /// (`bridge._self`), with the same field-level wildcard merge as any
+    /// other bridge key: an unset `_self` field inherits from `_`.
+    pub(crate) fn resolve_host_aggregation(&self, method: &str) -> ResolvedAggregationConfig {
+        self.bridge
+            .as_ref()
+            .and_then(|map| {
+                crate::config::resolve_with_wildcard(
+                    map,
+                    HOST_BRIDGE_KEY,
+                    crate::config::merge_bridge_language_configs,
+                )
+            })
+            .map(|cfg| cfg.resolve_aggregation(method))
+            .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
+    }
+
     /// Check if a language is allowed for bridging based on the bridge filter.
     ///
     /// Returns:
@@ -1267,6 +1443,274 @@ kind = "injections""#;
         assert_eq!(agg.priorities, &["server_a".to_string()]);
     }
 
+    // ==========================================================================
+    // Host bridging (host-document-bridge)
+    // ==========================================================================
+
+    #[test]
+    fn host_bridging_is_disabled_by_default() {
+        assert!(!LanguageSettings::default().is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_bridging_enabled_by_explicit_self_entry() {
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(settings.is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_bridging_not_enabled_by_bridge_wildcard() {
+        // The `_` wildcard's enabled = true is the VIRT default; it must not
+        // silently turn host bridging on (host-document-bridge: the built-in
+        // `_self.enabled = false` default is key-specific and wins).
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(true),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(!settings.is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_bridging_explicit_false_stays_off() {
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(false),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        assert!(!settings.is_host_bridging_enabled());
+    }
+
+    #[test]
+    fn host_aggregation_inherits_from_bridge_wildcard() {
+        // Aggregation fields (unlike `enabled`) DO inherit from `_`.
+        let settings = LanguageSettings {
+            bridge: Some(HashMap::from([
+                (
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: None,
+                    },
+                ),
+                (
+                    WILDCARD_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: None,
+                        aggregation: Some(HashMap::from([(
+                            "_".to_string(),
+                            AggregationConfig {
+                                priorities: Some(vec!["marksman".to_string()]),
+                                ..Default::default()
+                            },
+                        )])),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let agg = settings.resolve_host_aggregation("textDocument/definition");
+        assert_eq!(agg.priorities, vec!["marksman".to_string()]);
+    }
+
+    #[test]
+    fn host_aggregation_defaults_to_wildcard_priorities_when_unconfigured() {
+        let settings = LanguageSettings::default();
+        let agg = settings.resolve_host_aggregation("textDocument/definition");
+        assert_eq!(agg.priorities, vec![PRIORITIES_WILDCARD.to_string()]);
+    }
+
+    // ==========================================================================
+    // Cross-layer aggregation (cross-layer-aggregation)
+    // ==========================================================================
+
+    #[test]
+    fn layer_source_deserializes_lowercase() {
+        let order: Vec<LayerSource> = serde_json::from_str(r#"["virt", "host", "native"]"#)
+            .expect("lowercase layer names must parse");
+        assert_eq!(
+            order,
+            vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+        );
+    }
+
+    #[test]
+    fn layer_source_rejects_unknown_names() {
+        // Closed enum: a typo is a deserialization error, not a server that
+        // never responds (contrast with stage-1 priorities strings).
+        let result: std::result::Result<Vec<LayerSource>, _> = serde_json::from_str(r#"["virtt"]"#);
+        assert!(result.is_err(), "unknown layer names must fail to parse");
+    }
+
+    #[test]
+    fn resolve_layers_defaults_to_virt_host_native() {
+        let settings = LanguageSettings::default();
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
+        );
+        assert_eq!(resolved.strategy, AggregationStrategy::Preferred);
+    }
+
+    #[test]
+    fn resolve_layers_strategy_defaults_per_method() {
+        let settings = LanguageSettings::default();
+        let resolved = settings.resolve_layers("textDocument/diagnostic");
+        assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+    }
+
+    #[test]
+    fn resolve_layers_uses_method_specific_entry() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![LayerSource::Host, LayerSource::Virt]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(resolved.order, vec![LayerSource::Host, LayerSource::Virt]);
+        assert!(
+            !resolved.allows(LayerSource::Native),
+            "omitted layer is excluded"
+        );
+    }
+
+    #[test]
+    fn resolve_layers_method_entry_inherits_unset_fields_from_method_wildcard() {
+        // Field-level wildcard merge: the method entry sets strategy only,
+        // the "_" entry supplies order.
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native]),
+                        strategy: None,
+                    },
+                ),
+                (
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: None,
+                        strategy: Some(AggregationStrategy::Concatenated),
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(resolved.order, vec![LayerSource::Native]);
+        assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+    }
+
+    #[test]
+    fn resolve_layers_method_order_replaces_wildcard_order_wholesale() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native, LayerSource::Host]),
+                        strategy: None,
+                    },
+                ),
+                (
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Virt]),
+                        strategy: None,
+                    },
+                ),
+            ])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt],
+            "order is a single field: the method entry replaces the wildcard list, no element merge"
+        );
+    }
+
+    #[test]
+    fn resolve_layers_empty_order_disables_all_layers() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert!(resolved.order.is_empty());
+        assert!(!resolved.allows(LayerSource::Virt));
+    }
+
+    #[test]
+    fn resolve_layers_dedups_repeated_layers_first_occurrence_wins() {
+        let settings = LanguageSettings {
+            layers: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                LayerAggregationConfig {
+                    order: Some(vec![
+                        LayerSource::Virt,
+                        LayerSource::Native,
+                        LayerSource::Virt,
+                    ]),
+                    strategy: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        let resolved = settings.resolve_layers("textDocument/hover");
+        assert_eq!(
+            resolved.order,
+            vec![LayerSource::Virt, LayerSource::Native],
+            "a repeated layer must not be walked twice"
+        );
+    }
+
+    #[test]
+    fn layer_aggregation_config_parses_from_toml() {
+        let toml_str = r#"
+            order = ["host", "virt"]
+            strategy = "preferred"
+        "#;
+        let config: LayerAggregationConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.order,
+            Some(vec![LayerSource::Host, LayerSource::Virt])
+        );
+        assert_eq!(config.strategy, Some(AggregationStrategy::Preferred));
+    }
+
     #[test]
     fn should_resolve_aggregation_priorities_falls_back_to_wildcard() {
         let config = BridgeLanguageConfig {
@@ -1284,8 +1728,29 @@ kind = "injections""#;
     }
 
     #[test]
-    fn should_resolve_aggregation_priorities_returns_empty_when_no_aggregation() {
+    fn should_resolve_aggregation_priorities_defaults_to_wildcard_when_no_aggregation() {
+        // Absent priorities resolve to ["*"] — all servers, first-win
+        // (aggregation-priorities-wildcard). NOT [] — that now disables
+        // fan-out for the method.
         let config = BridgeLanguageConfig::default();
+        let agg = config.resolve_aggregation("textDocument/hover");
+        assert_eq!(agg.priorities, vec![PRIORITIES_WILDCARD.to_string()]);
+    }
+
+    #[test]
+    fn should_resolve_aggregation_priorities_preserves_explicit_empty_list() {
+        // Some(vec![]) is the per-method fan-out kill switch and must survive
+        // resolution verbatim, not be replaced with the ["*"] default.
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "textDocument/hover".to_string(),
+                AggregationConfig {
+                    priorities: Some(vec![]),
+                    ..Default::default()
+                },
+            )])),
+        };
         let agg = config.resolve_aggregation("textDocument/hover");
         assert!(agg.priorities.is_empty());
     }
@@ -1483,7 +1948,11 @@ kind = "injections""#;
     fn should_resolve_aggregation_with_defaults_returns_preferred() {
         let agg = ResolvedAggregationConfig::with_defaults();
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
-        assert!(agg.priorities.is_empty());
+        assert_eq!(
+            agg.priorities,
+            vec![PRIORITIES_WILDCARD.to_string()],
+            "default priorities must be [\"*\"] (all servers), not [] (disabled)"
+        );
         assert_eq!(agg.max_fan_out, None);
     }
 
@@ -1654,7 +2123,7 @@ kind = "injections""#;
         };
         let agg = config.resolve_aggregation("textDocument/hover");
         assert_eq!(agg.strategy, AggregationStrategy::Preferred);
-        assert!(agg.priorities.is_empty());
+        assert_eq!(agg.priorities, vec![PRIORITIES_WILDCARD.to_string()]);
         assert_eq!(agg.max_fan_out, None);
     }
 

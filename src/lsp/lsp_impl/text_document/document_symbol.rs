@@ -1,4 +1,10 @@
 //! Document symbol method for Kakehashi.
+//!
+//! Walks the resolved layer order (cross-layer-aggregation): the virt layer
+//! bridges every injection region and concatenates the per-region symbols,
+//! the host layer (host-document-bridge) bridges the host document itself
+//! with the real URI and the response verbatim. The first layer producing a
+//! non-empty result wins (`preferred`).
 
 use std::sync::Arc;
 
@@ -11,19 +17,43 @@ use tower_lsp_server::ls_types::{
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_verbatim};
 
 use super::super::{Kakehashi, uri_to_url};
+
+const METHOD: &str = "textDocument/documentSymbol";
 
 impl Kakehashi {
     pub(crate) async fn document_symbol_impl(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
 
+        let virt = self.document_symbol_virt_layer(&lsp_uri);
+        self.walk_layers(
+            &lsp_uri,
+            METHOD,
+            METHOD,
+            raw_params,
+            virt,
+            parse_host_verbatim::<DocumentSymbolResponse>,
+            |resp: &DocumentSymbolResponse| match resp {
+                DocumentSymbolResponse::Flat(symbols) => !symbols.is_empty(),
+                DocumentSymbolResponse::Nested(symbols) => !symbols.is_empty(),
+            },
+        )
+        .await
+    }
+
+    /// Virt layer: bridge every injection region and concatenate symbols.
+    async fn document_symbol_virt_layer(
+        &self,
+        lsp_uri: &Uri,
+    ) -> Result<Option<DocumentSymbolResponse>> {
         // Convert ls_types::Uri to url::Url for internal use
-        let Ok(uri) = uri_to_url(&lsp_uri) else {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
             log::warn!("Invalid URI in documentSymbol: {}", lsp_uri.as_str());
             return Ok(None);
         };
@@ -96,7 +126,7 @@ impl Kakehashi {
             let agg = self.resolve_aggregation_config(
                 &language_name,
                 &resolved.injection_language,
-                "textDocument/documentSymbol",
+                METHOD,
             );
             let region_ctx = DocumentRequestContext {
                 uri: uri.clone(),
@@ -155,7 +185,7 @@ impl Kakehashi {
 
         Ok(format_document_symbol_response(
             all_symbols,
-            &lsp_uri,
+            lsp_uri,
             self.settings_manager
                 .supports_hierarchical_document_symbol(),
         ))

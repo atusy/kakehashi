@@ -1,8 +1,10 @@
 //! Preferred fan-in strategy for concurrent bridge requests.
 //!
-//! [`preferred()`] implements priority-aware collection: results from higher-priority
-//! servers are preferred over lower-priority ones, with fallback to first-win for
-//! unprioritized servers. When `priorities` is empty, degrades to pure first-win.
+//! [`preferred()`] implements priority-aware collection over the expanded
+//! [`PriorityEntry`] walk (aggregation-priorities-wildcard): named entries
+//! are strict priority positions, and a [`PriorityEntry::Rest`] group (the
+//! `"*"` element) is first-win — the earliest non-empty arrival among its
+//! members wins the position.
 
 use std::collections::HashSet;
 
@@ -12,36 +14,59 @@ use tokio::task::JoinSet;
 
 use super::FanInResult;
 use crate::lsp::aggregation::server::fan_out::TaggedResult;
+use crate::lsp::aggregation::server::priority::PriorityEntry;
 use crate::lsp::request_id::CancelReceiver;
 
-/// Pick the best result from buffered wins, respecting priority order.
+/// Take the earliest-arrived buffered win belonging to `names`, if any.
 ///
-/// Walks the priority list first; if no priority server has a buffered result,
-/// falls back to any unprioritized server.
+/// `buffered_wins` is insertion-ordered (`IndexMap`), so the first matching
+/// key is the earliest arrival — the "first win" of the group.
+fn take_first_group_win<T>(buffered_wins: &mut IndexMap<String, T>, names: &[String]) -> Option<T> {
+    let key = buffered_wins
+        .keys()
+        .find(|key| names.contains(*key))
+        .cloned()?;
+    buffered_wins.shift_remove(&key)
+}
+
+/// Pick the best result from buffered wins after the JoinSet drained,
+/// walking the entries in priority order.
+///
+/// The trailing index-0 fallback covers a buffered win from a server outside
+/// every entry — unreachable via dispatch (fan-out spawns only entry
+/// members), kept as defense in depth.
 fn pick_best_buffered<T>(
     buffered_wins: &mut IndexMap<String, T>,
-    priorities: &[String],
+    entries: &[PriorityEntry],
 ) -> Option<T> {
-    for name in priorities {
-        if let Some(value) = buffered_wins.shift_remove(name.as_str()) {
-            return Some(value);
+    for entry in entries {
+        let win = match entry {
+            PriorityEntry::Server(name) => buffered_wins.shift_remove(name.as_str()),
+            PriorityEntry::Rest(names) => take_first_group_win(buffered_wins, names),
+        };
+        if win.is_some() {
+            return win;
         }
     }
     buffered_wins.shift_remove_index(0).map(|(_, v)| v)
 }
 
 /// Priority-aware fan-in: buffer results by server name, and on each arrival
-/// walk `priorities` highest-first — return the first non-empty buffered
+/// walk the entries highest-first — return the first non-empty buffered
 /// result, skipping servers that failed/returned empty, and waiting on
-/// servers that haven't responded yet. When all prioritized servers are
-/// exhausted, fall back to first-win among unprioritized servers.
+/// servers that haven't responded yet. A [`PriorityEntry::Rest`] group is
+/// decided first-win: any buffered member wins the position immediately,
+/// without waiting for the other members.
+///
+/// Empty `entries` (the `priorities = []` kill switch) pairs with an empty
+/// JoinSet from fan-out and yields `NoResult { errors: 0 }`.
 ///
 /// `JoinError` can't be attributed to a server, so a panicked prioritized
 /// server stays "pending" until the JoinSet drains, then is treated as failed.
 pub(crate) async fn preferred<T: Send + 'static>(
     join_set: &mut JoinSet<TaggedResult<T>>,
     is_nonempty: impl Fn(&T) -> bool,
-    priorities: &[String],
+    entries: &[PriorityEntry],
     cancel_rx: Option<CancelReceiver>,
 ) -> FanInResult<T> {
     let mut buffered_wins: IndexMap<String, T> = IndexMap::new();
@@ -51,19 +76,36 @@ pub(crate) async fn preferred<T: Send + 'static>(
     // Helper closure to check if we can make a decision
     let try_decide =
         |buffered_wins: &mut IndexMap<String, T>, failed_servers: &HashSet<String>| -> Option<T> {
-            // Walk priority list in order
-            for name in priorities {
-                if let Some(value) = buffered_wins.shift_remove(name.as_str()) {
-                    return Some(value);
+            for entry in entries {
+                match entry {
+                    PriorityEntry::Server(name) => {
+                        if let Some(value) = buffered_wins.shift_remove(name.as_str()) {
+                            return Some(value);
+                        }
+                        if failed_servers.contains(name.as_str()) {
+                            continue; // This priority server failed, try next
+                        }
+                        // This priority server hasn't responded yet — can't decide
+                        return None;
+                    }
+                    PriorityEntry::Rest(names) => {
+                        // First-win group: any buffered member wins now.
+                        if let Some(value) = take_first_group_win(buffered_wins, names) {
+                            return Some(value);
+                        }
+                        if names
+                            .iter()
+                            .all(|name| failed_servers.contains(name.as_str()))
+                        {
+                            continue; // Whole group failed, try next entry
+                        }
+                        // A group member is still pending — can't decide
+                        return None;
+                    }
                 }
-                if failed_servers.contains(name.as_str()) {
-                    continue; // This priority server failed, try next
-                }
-                // This priority server hasn't responded yet — can't decide
-                return None;
             }
-            // All priority servers exhausted (failed or absent) — check unprioritized buffer
-            // Return first buffered win from any unprioritized server
+            // All entries exhausted (failed or absent). Defensive fallback for
+            // a buffered win outside every entry (unreachable via dispatch).
             let first_key = buffered_wins.keys().next().cloned();
             first_key.and_then(|k| buffered_wins.shift_remove(&k))
         };
@@ -105,8 +147,8 @@ pub(crate) async fn preferred<T: Send + 'static>(
             result = join_set.join_next() => {
                 match result {
                     None => {
-                        // JoinSet drained — walk priorities for best buffered result.
-                        if let Some(value) = pick_best_buffered(&mut buffered_wins, priorities) {
+                        // JoinSet drained — walk entries for best buffered result.
+                        if let Some(value) = pick_best_buffered(&mut buffered_wins, entries) {
                             return FanInResult::Done(value);
                         }
                         return FanInResult::NoResult { errors };
@@ -135,13 +177,25 @@ mod tests {
     use super::*;
     use crate::lsp::aggregation::server::fan_in::test_helpers::*;
 
+    fn servers(names: &[&str]) -> Vec<PriorityEntry> {
+        names
+            .iter()
+            .map(|n| PriorityEntry::Server(n.to_string()))
+            .collect()
+    }
+
+    fn rest(names: &[&str]) -> PriorityEntry {
+        PriorityEntry::Rest(names.iter().map(|n| n.to_string()).collect())
+    }
+
     #[tokio::test]
-    async fn preferred_skips_empty_results_with_no_priorities() {
+    async fn preferred_skips_empty_results_in_rest_group() {
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_a", Ok(None));
         spawn_tagged_named(&mut join_set, "server_b", Ok(Some(42)));
 
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &[], None).await;
+        let entries = vec![rest(&["server_a", "server_b"])];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_done(result), Some(42));
     }
@@ -154,8 +208,8 @@ mod tests {
         spawn_tagged_named(&mut join_set, "server_a", Ok(Some(1)));
         spawn_tagged_named(&mut join_set, "server_b", Ok(Some(2)));
 
-        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let entries = servers(&["server_a", "server_b"]);
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_done(result), Some(1));
     }
@@ -189,7 +243,7 @@ mod tests {
             }
         });
 
-        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
+        let entries = servers(&["server_a", "server_b"]);
 
         // Release server_a after a brief moment
         let barrier_release = barrier.clone();
@@ -198,10 +252,98 @@ mod tests {
             barrier_release.wait().await;
         });
 
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         // server_a should win even though server_b arrived first
         assert_eq!(assert_done(result), Some(1));
+    }
+
+    #[tokio::test]
+    async fn preferred_rest_group_is_first_win_without_waiting_for_members() {
+        // Both members are in one '*' group: the earliest non-empty arrival
+        // wins immediately, even while the other member is still pending.
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged_named(&mut join_set, "server_fast", Ok(Some(1)));
+        join_set.spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            TaggedResult {
+                server_name: "server_slow".to_string(),
+                value: Ok(Some(2)),
+            }
+        });
+
+        let entries = vec![rest(&["server_fast", "server_slow"])];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            preferred(&mut join_set, |opt| opt.is_some(), &entries, None),
+        )
+        .await
+        .expect("group first-win must not wait for the slow member");
+
+        assert_eq!(assert_done(result), Some(1));
+    }
+
+    #[tokio::test]
+    async fn preferred_server_listed_after_rest_is_demoted_below_the_group() {
+        // ["*", "zzz"]: the rest group outranks zzz — zzz only wins when the
+        // whole group comes up empty.
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged_named(&mut join_set, "zzz", Ok(Some(99)));
+        spawn_tagged_named(&mut join_set, "server_a", Ok(Some(1)));
+
+        let entries = vec![rest(&["server_a"]), PriorityEntry::Server("zzz".into())];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
+
+        assert_eq!(assert_done(result), Some(1));
+    }
+
+    #[tokio::test]
+    async fn preferred_pending_rest_group_blocks_buffered_demoted_server() {
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        // ["*", "zzz"]: zzz's win is already buffered, but a group member is
+        // still in flight — the walk must WAIT for the group, not hand the
+        // position to the demoted server.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged_named(&mut join_set, "zzz", Ok(Some(99)));
+        join_set.spawn(async move {
+            barrier_clone.wait().await;
+            TaggedResult {
+                server_name: "server_a".to_string(),
+                value: Ok(Some(1)),
+            }
+        });
+
+        let barrier_release = barrier.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            barrier_release.wait().await;
+        });
+
+        let entries = vec![rest(&["server_a"]), PriorityEntry::Server("zzz".into())];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
+
+        assert_eq!(
+            assert_done(result),
+            Some(1),
+            "the pending group member must win over the already-buffered demoted server"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_demoted_server_wins_when_rest_group_is_empty_results() {
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        spawn_tagged_named(&mut join_set, "zzz", Ok(Some(99)));
+        spawn_tagged_named(&mut join_set, "server_a", Ok(None));
+
+        let entries = vec![rest(&["server_a"]), PriorityEntry::Server("zzz".into())];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
+
+        assert_eq!(assert_done(result), Some(99));
     }
 
     #[tokio::test]
@@ -211,22 +353,23 @@ mod tests {
         spawn_tagged_named(&mut join_set, "server_a", Err(io::Error::other("fail")));
         spawn_tagged_named(&mut join_set, "server_b", Ok(Some(42)));
 
-        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let entries = servers(&["server_a", "server_b"]);
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_done(result), Some(42));
     }
 
     #[tokio::test]
-    async fn preferred_falls_back_to_first_win_when_all_priority_servers_fail() {
-        // Both priority servers fail, unprioritized server_c succeeds
+    async fn preferred_falls_back_to_rest_group_when_all_priority_servers_fail() {
+        // Both named servers fail, the trailing '*' group's server_c succeeds
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_a", Err(io::Error::other("fail a")));
         spawn_tagged_named(&mut join_set, "server_b", Err(io::Error::other("fail b")));
         spawn_tagged_named(&mut join_set, "server_c", Ok(Some(99)));
 
-        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let mut entries = servers(&["server_a", "server_b"]);
+        entries.push(rest(&["server_c"]));
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_done(result), Some(99));
     }
@@ -243,9 +386,10 @@ mod tests {
             }
         });
 
+        let entries = vec![rest(&["slow"])];
         tx.send(()).unwrap();
 
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &[], Some(rx)).await;
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, Some(rx)).await;
 
         assert_cancelled(result);
     }
@@ -273,8 +417,8 @@ mod tests {
 
         tx.send(()).unwrap();
 
-        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, Some(rx)).await;
+        let entries = servers(&["server_a", "server_b"]);
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, Some(rx)).await;
 
         assert_cancelled(result);
     }
@@ -285,34 +429,48 @@ mod tests {
         spawn_tagged_named(&mut join_set, "server_a", Err(io::Error::other("fail a")));
         spawn_tagged_named(&mut join_set, "server_b", Err(io::Error::other("fail b")));
 
-        let priorities = vec!["server_a".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let entries = vec![
+            PriorityEntry::Server("server_a".into()),
+            rest(&["server_b"]),
+        ];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_no_result(result), 2);
+    }
+
+    #[tokio::test]
+    async fn preferred_returns_no_result_for_empty_entries_and_join_set() {
+        // priorities = [] (the kill switch): fan-out spawns nothing, fan-in
+        // reports NoResult with zero errors.
+        let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &[], None).await;
+        assert_eq!(assert_no_result(result), 0);
     }
 
     #[tokio::test]
     async fn preferred_falls_back_when_priority_server_panics() {
         // A priority server panics (JoinError) — can't be attributed to a name.
         // The algorithm keeps it as "pending" until the JoinSet drains, then
-        // falls back to the unprioritized server_b's buffered result.
+        // falls back to the rest group's buffered result.
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         join_set.spawn(async {
             panic!("simulated panic in priority server");
         });
         spawn_tagged_named(&mut join_set, "server_b", Ok(Some(42)));
 
-        let priorities = vec!["server_a".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let entries = vec![
+            PriorityEntry::Server("server_a".into()),
+            rest(&["server_b"]),
+        ];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_done(result), Some(42));
     }
 
     #[tokio::test]
     async fn preferred_respects_priority_in_buffered_wins_after_panic_drain() {
-        // server_a (priority 1) panics, server_b (priority 2) and server_c (unprioritized) succeed.
-        // After drain, server_b should win over server_c because it's higher in the priority list.
-        // Without the fix, HashMap iteration order could return server_c instead.
+        // server_a (priority 1) panics, server_b (priority 2) and server_c (rest) succeed.
+        // After drain, server_b should win over server_c because it's higher in the walk.
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         join_set.spawn(async {
             panic!("simulated panic in priority server");
@@ -320,22 +478,26 @@ mod tests {
         spawn_tagged_named(&mut join_set, "server_b", Ok(Some(2)));
         spawn_tagged_named(&mut join_set, "server_c", Ok(Some(3)));
 
-        let priorities = vec!["server_a".to_string(), "server_b".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let mut entries = servers(&["server_a", "server_b"]);
+        entries.push(rest(&["server_c"]));
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
-        // server_b must win — it's in the priority list and server_a (higher priority) panicked
+        // server_b must win — it's named and server_a (higher priority) panicked
         assert_eq!(assert_done(result), Some(2));
     }
 
     #[tokio::test]
-    async fn preferred_treats_unlisted_servers_as_lowest_priority() {
-        // server_a is prioritized and fails; server_b is not listed (lowest priority) and succeeds
+    async fn preferred_treats_rest_group_as_lowest_priority() {
+        // server_a is named and fails; server_b sits in the trailing '*' group
         let mut join_set: JoinSet<TaggedResult<Option<i32>>> = JoinSet::new();
         spawn_tagged_named(&mut join_set, "server_a", Err(io::Error::other("fail")));
         spawn_tagged_named(&mut join_set, "server_b", Ok(Some(77)));
 
-        let priorities = vec!["server_a".to_string()];
-        let result = preferred(&mut join_set, |opt| opt.is_some(), &priorities, None).await;
+        let entries = vec![
+            PriorityEntry::Server("server_a".into()),
+            rest(&["server_b"]),
+        ];
+        let result = preferred(&mut join_set, |opt| opt.is_some(), &entries, None).await;
 
         assert_eq!(assert_done(result), Some(77));
     }
