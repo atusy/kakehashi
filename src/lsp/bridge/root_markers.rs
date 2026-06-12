@@ -68,6 +68,8 @@ pub(crate) fn resolve_spawn_workspace(
     fallback: impl FnOnce() -> (Option<String>, Option<Vec<WorkspaceFolder>>),
 ) -> (Option<String>, Option<Vec<WorkspaceFolder>>) {
     let marker_workspace = resolve_marker_root(root_markers, document_uri).and_then(|root| {
+        // `WorkspaceFolder.uri` is `ls_types::Uri`, not `url::Url` — the
+        // string parse IS the type conversion, not a redundant round-trip.
         let uri = root.as_str().parse().ok()?;
         let name = root
             .to_file_path()
@@ -75,7 +77,7 @@ pub(crate) fn resolve_spawn_workspace(
             .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
         Some((
-            Some(root.to_string()),
+            Some(String::from(root)),
             Some(vec![WorkspaceFolder { uri, name }]),
         ))
     });
