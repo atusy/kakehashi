@@ -412,6 +412,47 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_failed_formatter_rescued_by_fallback_still_exits_with_error() {
+    // Preferred fan-out: the priority server errors, the fallback formats.
+    // The file gets the fallback's output, but the broken configured
+    // formatter must still surface as exit 2 — otherwise CI never learns
+    // the primary formatter is broken.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+priorities = ["mock-fail", "mock-upper"]
+
+[languageServers.mock-fail]
+cmd = ["{bin}", "fail-request"]
+languages = ["lua"]
+
+[languageServers.mock-upper]
+cmd = ["{bin}", "upper"]
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write fail+fallback config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a failed formatter must exit 2 even when a fallback rescued the file; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        read(ws.path(), "doc.md").contains("LOCAL X = 1"),
+        "the fallback formatter's output is still written"
+    );
+}
+
+#[test]
 fn e2e_host_layer_request_failure_exits_with_error() {
     // Same request-time failure, but through the HOST layer
     // (bridge._self.enabled): the host fan-in must also count the error

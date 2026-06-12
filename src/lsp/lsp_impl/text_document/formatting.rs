@@ -407,13 +407,19 @@ impl Kakehashi {
 
         let cancel_rx = cancel_state.derive_receiver();
         let pool = self.bridge.pool_arc();
+        // Source-level error counting, mirroring the virt preferred dispatch:
+        // `Done` discards the fan-in's error count, so counting here is what
+        // keeps a failed-but-rescued host formatter visible to CLI mode.
+        let request_error_sink = cancel_state.request_error_sink.clone();
         let result = crate::lsp::aggregation::server::dispatch_host_preferred(
             &ctx,
             pool.clone(),
             move |t| {
                 let params = params.clone();
+                let request_error_sink = request_error_sink.clone();
                 async move {
-                    t.pool
+                    let result = t
+                        .pool
                         .send_host_formatting_request(
                             &t.server_name,
                             &t.server_config,
@@ -426,7 +432,11 @@ impl Kakehashi {
                             params,
                             t.upstream_id,
                         )
-                        .await
+                        .await;
+                    if result.is_err() {
+                        count_request_errors(&request_error_sink, 1);
+                    }
+                    result
                 }
             },
             // `Some(vec![])` (and a capable server's `null`, normalized to it)
@@ -444,8 +454,9 @@ impl Kakehashi {
         match result {
             FanInResult::Done(value) => Ok(value),
             FanInResult::NoResult { errors } => {
+                // Request errors were already counted at the source (the
+                // dispatch closure above); this arm only chooses log severity.
                 if errors > 0 {
-                    count_request_errors(&cancel_state.request_error_sink, errors);
                     self.client
                         .log_message(
                             tower_lsp_server::ls_types::MessageType::WARNING,
@@ -680,8 +691,15 @@ async fn dispatch_preferred_formatting(
         pool,
         move |t| {
             let options = options.clone();
+            // Count request failures at the SOURCE, not from the fan-in
+            // verdict: `FanInResult::Done` discards the error count, so a
+            // failed higher-priority formatter rescued by a fallback server
+            // would otherwise go unreported and a CLI run would exit 0
+            // despite a broken configured formatter.
+            let request_error_sink = request_error_sink.clone();
             async move {
-                t.pool
+                let result = t
+                    .pool
                     .send_formatting_request(
                         &t.server_name,
                         &t.server_config,
@@ -694,7 +712,11 @@ async fn dispatch_preferred_formatting(
                         t.upstream_id,
                         None,
                     )
-                    .await
+                    .await;
+                if result.is_err() {
+                    count_request_errors(&request_error_sink, 1);
+                }
+                result
             }
         },
         // `Some(vec![])` is an authoritative "no edits needed" from the
@@ -710,11 +732,7 @@ async fn dispatch_preferred_formatting(
     .await;
     match result {
         FanInResult::Done(edits) => edits,
-        FanInResult::NoResult { errors } => {
-            count_request_errors(&request_error_sink, errors);
-            None
-        }
-        FanInResult::Cancelled => None,
+        FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
     }
 }
 
