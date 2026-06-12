@@ -414,7 +414,7 @@ Details:
   bridge diagnostics off.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for every bridged
-  request method when host bridging is opted in (see `bridge._self` below).
+  request method when host bridging is opted in (see `bridge._self` above).
   Bridged methods have no `native` counterpart yet. Diagnostics and
   semantic tokens stay virt-only for now.
 

@@ -638,6 +638,16 @@ impl LanguageServerPool {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
                     connections.remove(server_name);
+                    // Drop host-document sync state with it: the replacement
+                    // process has no documents open, so the lazy host sync
+                    // must re-send didOpen instead of trusting stale entries
+                    // (host-document-bridge). Lock order: connections →
+                    // host_documents, consistent with
+                    // close_host_bridge_document's prefetch.
+                    self.host_documents
+                        .lock()
+                        .await
+                        .retain(|(_, server), _| server != server_name);
                 }
             }
         }

@@ -53,7 +53,7 @@ Partially implemented:
   remains the target if eager sync proves necessary.
 - **Not implemented**: `publishDiagnostics` pass-through from host servers
   (downstream notifications are not forwarded upstream today on either
-  path), and host participation in the formatting pipeline.
+  path).
 
 ## Context
 

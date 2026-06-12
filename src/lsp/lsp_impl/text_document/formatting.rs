@@ -427,6 +427,11 @@ impl Kakehashi {
 /// against `original` (the same overlap-free output shape as the
 /// within-region pipeline, concatenated-formatting-pipeline Decision
 /// point 4). `None` when the chain round-tripped to the original text.
+///
+/// Line counting treats `\n` as the only line break: a document using bare
+/// `\r` separators (which LSP also recognizes) would get an end position on
+/// the wrong line. Tree-sitter parsing upstream shares the `\n` assumption,
+/// so such documents do not reach this path in practice.
 fn whole_document_replacement(original: &str, formatted: &str) -> Option<Vec<TextEdit>> {
     if original == formatted {
         return None;

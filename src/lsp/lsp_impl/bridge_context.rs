@@ -381,9 +381,15 @@ impl Kakehashi {
                 (Some(rx), Some(guard))
             }
             Err(e) => {
-                log::error!(
-                    "Cancel subscribe failed for {}: already subscribed. \
-                     Proceeding without cancel.",
+                // Expected under concurrent layer fan-out: `walk_layers`
+                // subscribes for the whole walk, so the virt/host arms'
+                // own subscribe attempts find the id taken. The arm runs
+                // without a local receiver; prompt cancellation is provided
+                // by the walk-level select (and downstream forwarding by the
+                // upstream-request registry, which is independent of this).
+                log::debug!(
+                    "Cancel subscribe for {}: already subscribed (another \
+                     layer holds it); proceeding without a local receiver",
                     e.0
                 );
                 (None, None)
@@ -496,12 +502,10 @@ impl Kakehashi {
     /// method (cross-layer-aggregation): when `"virt"` is absent from the
     /// resolved `layers.order`, the bridge dispatch is skipped entirely.
     ///
-    /// This gate is the whole of the stage-2 `preferred` walk for today's
-    /// contributor set — host (`bridge._self`) is unimplemented and the
-    /// bridged methods have no native contributor — so "first non-empty
-    /// layer in order" degenerates to "virt if allowed, else nothing".
-    /// Formatting consumes the full config instead (it dispatches on the
-    /// layer strategy too — see `combine_layer_formatting_results`).
+    /// Used by entry points outside the [`Self::walk_layers`] race —
+    /// notably the push-diagnostics scheduler and the virt-only handlers
+    /// (diagnostics, documentColor) that have no host contributor yet.
+    /// Handlers on the walk get layer membership from the race itself.
     pub(crate) fn virt_layer_enabled(&self, host_language: &str, method_name: &str) -> bool {
         self.resolve_layer_config(host_language, method_name)
             .allows(LayerSource::Virt)
@@ -668,7 +672,27 @@ impl Kakehashi {
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
-        result.handle(&self.client, request_method, None, Ok).await
+        // Quieter than `FanInResult::handle`: an all-empty host layer is the
+        // normal outcome whenever virt answers, and the virt arm already
+        // emits the client-visible "no response" LOG — only real host
+        // failures get surfaced here.
+        match result {
+            crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(value),
+            crate::lsp::aggregation::server::FanInResult::NoResult { errors } => {
+                if errors > 0 {
+                    self.client
+                        .log_message(
+                            tower_lsp_server::ls_types::MessageType::WARNING,
+                            format!("No {request_method} response from any host bridge server"),
+                        )
+                        .await;
+                }
+                Ok(None)
+            }
+            crate::lsp::aggregation::server::FanInResult::Cancelled => {
+                Err(tower_lsp_server::jsonrpc::Error::request_cancelled())
+            }
+        }
     }
 
     /// Walk the resolved layer order for a request method
@@ -719,10 +743,29 @@ impl Kakehashi {
             }
         };
 
-        let result = race_layers_preferred(&layer_cfg.order, virt, host, is_nonempty).await;
-        // Sweep upstream-registry entries a dropped (losing) layer future did
-        // not get to unregister itself. Idempotent; the winning arm already
-        // cleaned up its own.
+        // Subscribe for the WHOLE walk before either arm runs: the arms'
+        // own subscribe attempts then find the id taken and proceed without
+        // a local receiver (logged at debug), and this select cancels the
+        // race — dropping both in-flight arms — the moment `$/cancelRequest`
+        // arrives, regardless of which arm would have held the subscription.
+        // Best-effort gap: between the race's completion and the next
+        // request there is no subscriber; a cancel landing there is only
+        // forwarded downstream via the upstream-request registry.
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
+        let race = race_layers_preferred(&layer_cfg.order, virt, host, is_nonempty);
+        let result = match cancel_rx {
+            Some(mut cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                    result = race => result,
+                }
+            }
+            None => race.await,
+        };
+        // Sweep upstream-registry entries a dropped (losing or cancelled)
+        // layer future did not get to unregister itself. Idempotent; a
+        // completed arm already cleaned up its own.
         self.bridge
             .pool_arc()
             .unregister_all_for_upstream_id(current_upstream_id().as_ref());

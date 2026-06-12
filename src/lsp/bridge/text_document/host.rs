@@ -53,77 +53,89 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
-impl LanguageServerPool {
-    /// Open or re-sync the host document on a downstream server.
-    ///
-    /// - First request for `(uri, server)`: send `didOpen` with the real URI,
-    ///   the host language id, and the full host text.
-    /// - Host text changed since the last sync: send a full-text `didChange`
-    ///   with an incremented version.
-    /// - Unchanged: no-op.
-    ///
-    /// The map lock is held across the queueing so concurrent requests cannot
-    /// double-open; the single-writer loop (ls-bridge-message-ordering)
-    /// guarantees the notification reaches the wire before the request that
-    /// follows it.
-    async fn ensure_host_document_synced(
-        &self,
-        handle: &Arc<ConnectionHandle>,
-        doc: &HostDocument<'_>,
-        server_name: &str,
-    ) -> io::Result<()> {
-        let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
-        let key = (doc.uri.to_string(), server_name.to_string());
-        let fp = fingerprint(doc.text);
+/// Open or re-sync the host document on a downstream server, mutating the
+/// pool's sync-state map in place.
+///
+/// - First request for `(uri, server)`: send `didOpen` with the real URI,
+///   the host language id, and the full host text.
+/// - Host text changed since the last sync: send a full-text `didChange`
+///   with an incremented version.
+/// - Unchanged: no-op.
+///
+/// The caller holds the `host_documents` lock across this call (and across
+/// the request enqueue that follows it), so concurrent requests cannot
+/// double-open and cannot interleave a different text between a sync and the
+/// request that relies on it; the single-writer loop
+/// (ls-bridge-message-ordering) guarantees wire order matches enqueue order.
+/// Generic over [`MessageSender`] so tests can observe the notifications via
+/// a channel.
+async fn sync_host_document<S: MessageSender>(
+    sender: &mut S,
+    docs: &mut std::collections::HashMap<(String, String), HostDocSyncState>,
+    doc: &HostDocument<'_>,
+    server_name: &str,
+) -> io::Result<()> {
+    let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
+    let key = (doc.uri.to_string(), server_name.to_string());
+    let fp = fingerprint(doc.text);
 
-        let mut sender = ConnectionHandleSender(handle);
-        let mut docs = self.host_documents().await;
-        match docs.entry(key) {
-            Entry::Vacant(entry) => {
+    match docs.entry(key) {
+        Entry::Vacant(entry) => {
+            let notification = JsonRpcNotification::new(
+                "textDocument/didOpen",
+                DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem::new(
+                        uri_lsp,
+                        doc.language_id.to_string(),
+                        1,
+                        doc.text.to_string(),
+                    ),
+                },
+            );
+            sender.send_notification(notification).await?;
+            entry.insert(HostDocSyncState {
+                version: 1,
+                fingerprint: fp,
+            });
+        }
+        Entry::Occupied(mut entry) => {
+            if entry.get().fingerprint != fp {
+                let version = entry.get().version + 1;
                 let notification = JsonRpcNotification::new(
-                    "textDocument/didOpen",
-                    DidOpenTextDocumentParams {
-                        text_document: TextDocumentItem::new(
-                            uri_lsp,
-                            doc.language_id.to_string(),
-                            1,
-                            doc.text.to_string(),
-                        ),
+                    "textDocument/didChange",
+                    DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier::new(uri_lsp, version),
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: doc.text.to_string(),
+                        }],
                     },
                 );
                 sender.send_notification(notification).await?;
-                entry.insert(HostDocSyncState {
-                    version: 1,
+                *entry.get_mut() = HostDocSyncState {
+                    version,
                     fingerprint: fp,
-                });
-            }
-            Entry::Occupied(mut entry) => {
-                if entry.get().fingerprint != fp {
-                    let version = entry.get().version + 1;
-                    let notification = JsonRpcNotification::new(
-                        "textDocument/didChange",
-                        DidChangeTextDocumentParams {
-                            text_document: VersionedTextDocumentIdentifier::new(uri_lsp, version),
-                            content_changes: vec![TextDocumentContentChangeEvent {
-                                range: None,
-                                range_length: None,
-                                text: doc.text.to_string(),
-                            }],
-                        },
-                    );
-                    sender.send_notification(notification).await?;
-                    *entry.get_mut() = HostDocSyncState {
-                        version,
-                        fingerprint: fp,
-                    };
-                }
+                };
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
+impl LanguageServerPool {
     /// Send `didClose` for the host document to every server that has it
     /// open via the host bridge, and drop the sync state.
+    ///
+    /// Connection handles are pre-fetched before taking the `host_documents`
+    /// lock (consistent `connections` → `host_documents` ordering with the
+    /// respawn purge in `pool.rs`), and the `didClose`s are queued while the
+    /// lock is held: a concurrent request either re-opens before this runs —
+    /// its `didOpen` precedes our `didClose` on the wire and its state entry
+    /// is removed here — or after, sending a fresh `didOpen`. Either
+    /// interleaving leaves the map and the server consistent; sending after
+    /// releasing the lock could close a document another request had just
+    /// re-opened while its state survives, wedging the pair.
     ///
     /// Mirrors the virt path's `close_host_document`; called from the
     /// upstream `didClose` handler.
@@ -132,31 +144,31 @@ impl LanguageServerPool {
             return;
         };
         let uri_string = uri.to_string();
-        let server_names: Vec<String> = {
-            let mut docs = self.host_documents().await;
-            let names = docs
-                .keys()
-                .filter(|(doc_uri, _)| *doc_uri == uri_string)
-                .map(|(_, server)| server.clone())
-                .collect::<Vec<_>>();
-            docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
-            names
+
+        let handles: Vec<(String, Arc<ConnectionHandle>)> = {
+            let connections = self.connections().await;
+            connections
+                .iter()
+                .map(|(name, handle)| (name.clone(), Arc::clone(handle)))
+                .collect()
         };
 
-        for server_name in server_names {
-            let connections = self.connections().await;
-            if let Some(handle) = connections.get(&server_name) {
-                let notification = JsonRpcNotification::new(
-                    "textDocument/didClose",
-                    DocumentIdentifierParams {
-                        text_document: TextDocumentIdentifier {
-                            uri: uri_lsp.clone(),
-                        },
-                    },
-                );
-                handle.send_notification(notification);
+        let mut docs = self.host_documents().await;
+        for (server_name, handle) in &handles {
+            if !docs.contains_key(&(uri_string.clone(), server_name.clone())) {
+                continue;
             }
+            let notification = JsonRpcNotification::new(
+                "textDocument/didClose",
+                DocumentIdentifierParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: uri_lsp.clone(),
+                    },
+                },
+            );
+            handle.send_notification(notification);
         }
+        docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
     }
 
     /// Send a host bridge request with the upstream params forwarded
@@ -164,15 +176,22 @@ impl LanguageServerPool {
     /// real URI and real coordinates, so no per-method request shaping is
     /// needed. Returns the raw `result` value, or `None` for a `null`
     /// result, a JSON-RPC error, or a missing capability.
+    ///
+    /// One exception to verbatim: the progress tokens are stripped. The
+    /// bridge discards downstream notifications, so a server honoring
+    /// `partialResultToken` would stream its results into the void and could
+    /// legally return an empty final result; `workDoneToken` would likewise
+    /// report progress nowhere.
     pub(crate) async fn send_host_raw_request(
         &self,
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
         method: &'static str,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<serde_json::Value>> {
+        strip_progress_tokens(&mut params);
         let handle = self
             .get_or_create_connection(server_name, server_config)
             .await?;
@@ -223,21 +242,31 @@ impl LanguageServerPool {
         let request = build_request(request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        if let Err(e) = self
-            .ensure_host_document_synced(&handle, doc, server_name)
-            .await
+        // Sync the document and enqueue the request under ONE lock scope:
+        // with the lock released in between, a concurrent host request could
+        // slide its own full-text didChange between this request's sync and
+        // the request itself, making the server answer about different text
+        // than the caller synced (fatal for the formatting pipeline's
+        // speculative intermediate text). All sends are non-yielding queue
+        // writes, so holding the lock across them is cheap.
         {
-            if let Some(ref id) = upstream_request_id {
-                self.unregister_upstream_request(id, server_name);
+            let mut docs = self.host_documents().await;
+            let mut sender = ConnectionHandleSender(&handle);
+            if let Err(e) = sync_host_document(&mut sender, &mut docs, doc, server_name).await {
+                drop(docs);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, server_name);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
 
-        if let Err(e) = handle.send_request(request, request_id) {
-            if let Some(ref id) = upstream_request_id {
-                self.unregister_upstream_request(id, server_name);
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(docs);
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, server_name);
+                }
+                return Err(e.into());
             }
-            return Err(e.into());
         }
 
         let response = handle.wait_for_response(request_id, response_rx).await;
@@ -257,6 +286,17 @@ impl LanguageServerPool {
 #[serde(rename_all = "camelCase")]
 struct DocumentIdentifierParams {
     text_document: TextDocumentIdentifier,
+}
+
+/// Remove the LSP progress tokens from forwarded params: the bridge discards
+/// downstream notifications, so honoring `partialResultToken` downstream
+/// would stream results into the void (and possibly return an empty final
+/// result), and `workDoneToken` would report progress nowhere.
+fn strip_progress_tokens(params: &mut serde_json::Value) {
+    if let Some(object) = params.as_object_mut() {
+        object.remove("workDoneToken");
+        object.remove("partialResultToken");
+    }
 }
 
 fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
@@ -393,5 +433,113 @@ mod tests {
     fn fingerprint_distinguishes_changed_text() {
         assert_eq!(fingerprint("a"), fingerprint("a"));
         assert_ne!(fingerprint("a"), fingerprint("b"));
+    }
+
+    #[test]
+    fn strip_progress_tokens_removes_only_the_tokens() {
+        let mut params = serde_json::json!({
+            "textDocument": { "uri": "file:///doc.md" },
+            "position": { "line": 1, "character": 2 },
+            "workDoneToken": "wd-1",
+            "partialResultToken": "pr-1",
+        });
+        strip_progress_tokens(&mut params);
+        assert!(params.get("workDoneToken").is_none());
+        assert!(params.get("partialResultToken").is_none());
+        assert_eq!(params["textDocument"]["uri"], "file:///doc.md");
+        assert_eq!(params["position"]["line"], 1);
+    }
+
+    fn host_doc<'a>(uri: &'a Url, text: &'a str) -> HostDocument<'a> {
+        HostDocument {
+            uri,
+            language_id: "markdown",
+            text,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_sends_didopen_once_then_versioned_didchange_on_drift() {
+        use crate::lsp::bridge::actor::OutboundMessage;
+
+        let mut docs = std::collections::HashMap::new();
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(16);
+        let uri = Url::parse("file:///test/host.md").unwrap();
+
+        // First sync: didOpen with the full text, version 1.
+        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v1"), "srv")
+            .await
+            .unwrap();
+        let msg = rx.try_recv().expect("didOpen must be queued");
+        let OutboundMessage::Untracked(payload) = msg else {
+            panic!("expected a notification");
+        };
+        assert_eq!(payload["method"], "textDocument/didOpen");
+        assert_eq!(payload["params"]["textDocument"]["text"], "v1");
+        assert_eq!(payload["params"]["textDocument"]["version"], 1);
+
+        // Unchanged text: no notification at all.
+        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v1"), "srv")
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "unchanged text must be a no-op");
+
+        // Drifted text: full-text didChange with version 2.
+        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v2"), "srv")
+            .await
+            .unwrap();
+        let OutboundMessage::Untracked(payload) = rx.try_recv().expect("didChange must be queued")
+        else {
+            panic!("expected a notification");
+        };
+        assert_eq!(payload["method"], "textDocument/didChange");
+        assert_eq!(payload["params"]["textDocument"]["version"], 2);
+        assert_eq!(payload["params"]["contentChanges"][0]["text"], "v2");
+
+        // Drift again: version keeps increasing monotonically.
+        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v3"), "srv")
+            .await
+            .unwrap();
+        let OutboundMessage::Untracked(payload) = rx.try_recv().expect("didChange must be queued")
+        else {
+            panic!("expected a notification");
+        };
+        assert_eq!(payload["params"]["textDocument"]["version"], 3);
+    }
+
+    #[tokio::test]
+    async fn close_host_bridge_document_drops_only_that_uri() {
+        let pool = LanguageServerPool::new();
+        let uri_a = Url::parse("file:///test/a.md").unwrap();
+        let uri_b = Url::parse("file:///test/b.md").unwrap();
+        {
+            let mut docs = pool.host_documents().await;
+            docs.insert(
+                (uri_a.to_string(), "srv".to_string()),
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: 1,
+                },
+            );
+            docs.insert(
+                (uri_b.to_string(), "srv".to_string()),
+                HostDocSyncState {
+                    version: 1,
+                    fingerprint: 2,
+                },
+            );
+        }
+
+        pool.close_host_bridge_document(&uri_a).await;
+
+        let docs = pool.host_documents().await;
+        assert!(
+            !docs.contains_key(&(uri_a.to_string(), "srv".to_string())),
+            "closed uri's state must be dropped"
+        );
+        assert!(
+            docs.contains_key(&(uri_b.to_string(), "srv".to_string())),
+            "other documents must be untouched"
+        );
     }
 }
