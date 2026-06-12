@@ -75,9 +75,9 @@ percent-encoding = "2"
 rayon = "1"
 futures = "0.3.31"
 
-# Unix-only dependencies (signal handling)
+# Unix-only dependencies (signal handling; "fs" for FD_CLOEXEC in tests)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process", "fs"] }
 
 [features]
 e2e = []

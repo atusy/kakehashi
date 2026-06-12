@@ -417,7 +417,26 @@ impl Kakehashi {
         )
         .await;
         pool.unregister_all_for_upstream_id(ctx.upstream_request_id.as_ref());
-        let value = result.handle(&self.client, "formatting", None, Ok).await?;
+        // Quiet on an all-empty host layer (the virt arm already emits the
+        // client-visible LOG); only real host failures get surfaced —
+        // mirroring `host_layer_value_with_ctx`.
+        let value = match result {
+            FanInResult::Done(value) => value,
+            FanInResult::NoResult { errors } => {
+                if errors > 0 {
+                    self.client
+                        .log_message(
+                            tower_lsp_server::ls_types::MessageType::WARNING,
+                            "No textDocument/formatting response from any host bridge server",
+                        )
+                        .await;
+                }
+                None
+            }
+            FanInResult::Cancelled => {
+                return Err(tower_lsp_server::jsonrpc::Error::request_cancelled());
+            }
+        };
         Ok(value
             .and_then(crate::lsp::lsp_impl::bridge_context::parse_host_verbatim::<Vec<TextEdit>>))
     }

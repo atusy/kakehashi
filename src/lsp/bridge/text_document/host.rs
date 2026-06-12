@@ -249,6 +249,13 @@ impl LanguageServerPool {
         // than the caller synced (fatal for the formatting pipeline's
         // speculative intermediate text). All sends are non-yielding queue
         // writes, so holding the lock across them is cheap.
+        //
+        // Known narrow window (shared with the virt document tracker): the
+        // `handle` above was fetched before this lock, so a concurrent
+        // respawn purge can run in between — this request then syncs onto
+        // the dying process's queue and records state the replacement never
+        // saw. Self-heals on the next respawn purge or upstream didClose;
+        // closing it fully would need generation-keyed sync state.
         {
             let mut docs = self.host_documents().await;
             let mut sender = ConnectionHandleSender(&handle);
