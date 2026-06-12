@@ -752,6 +752,33 @@ impl LanguageCoordinator {
         self.filetype_resolver.language_for_path(path)
     }
 
+    /// Path-only language detection for CLI directory walks
+    /// (`kakehashi format <dir>`), loading the parser on first sight.
+    ///
+    /// [`Self::detect_language`] only accepts a candidate whose parser is
+    /// already **loaded**, which works in LSP mode because `didOpen` loads
+    /// parsers before anything queries the chain — but a directory walk
+    /// filters paths before any document is opened, when the registry is
+    /// still empty. This variant tries to load the candidate (and its
+    /// configured base) from the search paths, so "installed but not yet
+    /// loaded" counts as formattable. Auto-install is never triggered:
+    /// a language whose parser is not installed is silently skipped.
+    pub(crate) fn loadable_language_for_path(&self, path: &str) -> Option<String> {
+        let candidate = self.language_for_path(path).or_else(|| {
+            let token = super::heuristic::extract_token_from_path(path)?;
+            // Normalize via syntect ("md" → "markdown"); fall back to the
+            // raw token for extensions syntect doesn't know but a config
+            // entry (possibly via `base`) might.
+            Some(super::heuristic::detect_from_token(token).unwrap_or_else(|| token.to_string()))
+        })?;
+
+        if self.ensure_language_loaded(&candidate).success {
+            return Some(candidate);
+        }
+        let base = self.resolve_base(&candidate)?;
+        self.ensure_language_loaded(&base).success.then_some(base)
+    }
+
     /// Check if a parser is available for a given language name.
     ///
     /// Used by the detection fallback chain (language-detection-fallback-chain) to determine whether

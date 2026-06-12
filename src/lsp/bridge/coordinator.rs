@@ -541,6 +541,22 @@ impl BridgeCoordinator {
     /// Called immediately after each `tokio::spawn`. The handle is aborted (not
     /// registered) if the entry was removed by a concurrent `cancel_eager_open`,
     /// or its generation doesn't match (a concurrent `supersede` replaced it).
+    /// Whether every eager-open task registered for `uri` has finished
+    /// (no batch counts as finished).
+    ///
+    /// Used by CLI-mode formatting to serialize with eager opens: an
+    /// eager-open task claims each virtual document BEFORE its `didOpen`
+    /// reaches the writer queue (`is_document_opened` is true pre-send), so
+    /// a formatting request issued in that window skips its own `didOpen`
+    /// and overtakes the eager one on the wire. Once the tasks are finished,
+    /// every `didOpen` is enqueued and the single-writer FIFO
+    /// (ls-bridge-message-ordering) keeps later requests behind them.
+    pub(crate) fn eager_open_tasks_finished(&self, uri: &Url) -> bool {
+        self.eager_open_tasks
+            .get(uri)
+            .is_none_or(|batch| batch.handles.iter().all(|h| h.is_finished()))
+    }
+
     fn push_or_abort_eager_open_handle(
         &self,
         uri: &Url,

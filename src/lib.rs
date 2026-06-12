@@ -1,4 +1,5 @@
 pub(crate) mod analysis;
+pub mod cli;
 pub mod config;
 pub(crate) mod document;
 pub(crate) mod error;
