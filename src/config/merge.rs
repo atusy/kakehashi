@@ -83,6 +83,10 @@ pub(crate) fn merge_bridge_server_configs(
                 .clone()
                 .or(base.initialization_options.clone()),
         },
+        root_markers: overlay
+            .root_markers
+            .clone()
+            .or_else(|| base.root_markers.clone()),
     }
 }
 
@@ -497,6 +501,7 @@ mod tests {
                         cmd: vec!["rust-analyzer".to_string()],
                         languages: vec!["rust".to_string()],
                         initialization_options: Some(json!({"checkOnSave": true})),
+                        root_markers: None,
                     },
                 ),
                 (
@@ -505,6 +510,7 @@ mod tests {
                         cmd: vec!["lua-language-server".to_string()],
                         languages: vec!["lua".to_string()],
                         initialization_options: None,
+                        root_markers: None,
                     },
                 ),
             ])),
@@ -572,6 +578,7 @@ mod tests {
                         cmd: vec![],
                         languages: vec![],
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                        root_markers: None,
                     },
                 ),
                 (
@@ -581,6 +588,7 @@ mod tests {
                         cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
                         languages: vec!["python".to_string()],
                         initialization_options: None,
+                        root_markers: None,
                     },
                 ),
             ])),
@@ -645,6 +653,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec!["rust".to_string()],
                     initialization_options: None,
+                    root_markers: None,
                 },
             )])),
             ..Default::default()
@@ -1031,6 +1040,7 @@ mod tests {
                 cmd: vec!["default-lsp".to_string()],
                 languages: vec!["any".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1044,6 +1054,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1058,6 +1069,7 @@ mod tests {
                     cmd: vec!["default-lsp".to_string()],
                     languages: vec!["any".to_string()],
                     initialization_options: Some(json!({"defaultOption": true})),
+                    root_markers: None,
                 },
             ),
             (
@@ -1066,6 +1078,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec![],
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                    root_markers: None,
                 },
             ),
         ]);
@@ -1099,6 +1112,7 @@ mod tests {
                 "shared_opt": "base",
                 "nested": { "base_only": 1, "shared": "base" }
             })),
+            root_markers: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
@@ -1108,6 +1122,7 @@ mod tests {
                 "shared_opt": "overlay",
                 "nested": { "overlay_only": 2, "shared": "overlay" }
             })),
+            root_markers: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1250,6 +1265,7 @@ mod tests {
                     cmd: vec![],
                     languages: vec![],
                     initialization_options: Some(json!({ "checkOnSave": true })),
+                    root_markers: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1259,6 +1275,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec!["rust".to_string()],
                     initialization_options: None, // Should inherit from wildcard
+                    root_markers: None,
                 },
             ),
         ]);
@@ -1295,6 +1312,7 @@ mod tests {
                     cmd: vec!["default-lsp".to_string()],
                     languages: vec!["rust".to_string(), "python".to_string()],
                     initialization_options: None,
+                    root_markers: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1304,6 +1322,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec![], // Empty - should inherit from wildcard
                     initialization_options: None,
+                    root_markers: None,
                 },
             ),
         ]);

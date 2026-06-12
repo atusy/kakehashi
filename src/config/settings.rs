@@ -281,12 +281,25 @@ impl BridgeLanguageConfig {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
-    /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"]
+    /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"].
+    /// Optional so a wildcard `_` entry can carry defaults only; a concrete
+    /// server whose resolved cmd is still empty is skipped at lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cmd: Vec<String>,
-    /// Languages this server handles (e.g., ["rust"], ["python"])
+    /// Languages this server handles (e.g., ["rust"], ["python"]).
+    /// Optional for the same wildcard-defaults reason as `cmd`; a server
+    /// with no languages never matches a lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
     pub initialization_options: Option<Value>,
+    /// Marker files/directories that locate the workspace root for this
+    /// server: ancestors of the document are searched nearest-first and the
+    /// first directory containing any marker becomes the server's rootUri.
+    /// `None` = inherit (built-in default `[".git"]`); an explicit `[]`
+    /// disables the search (the client-supplied root is forwarded as-is).
+    /// When no marker matches, the client-supplied root is the fallback.
+    pub root_markers: Option<Vec<String>>,
 }
 
 /// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
@@ -1212,6 +1225,38 @@ mod tests {
 
         assert!(settings.language_servers.is_some());
         assert!(settings.language_servers.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn should_parse_defaults_only_language_server_entry() {
+        // A wildcard `_` entry exists to supply defaults (e.g. rootMarkers)
+        // to concrete servers, so cmd/languages must be optional in TOML.
+        let toml_str = r#"
+            [languageServers._]
+            rootMarkers = [".git"]
+        "#;
+
+        let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
+        let servers = settings.language_servers.unwrap();
+        let wildcard = &servers["_"];
+        assert!(wildcard.cmd.is_empty());
+        assert!(wildcard.languages.is_empty());
+        assert_eq!(wildcard.root_markers, Some(vec![".git".to_string()]));
+    }
+
+    #[test]
+    fn should_parse_language_server_root_markers_camel_case() {
+        let config_json = r#"{
+            "cmd": ["rust-analyzer"],
+            "languages": ["rust"],
+            "rootMarkers": [".git", "Cargo.toml"]
+        }"#;
+
+        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
+        assert_eq!(
+            config.root_markers,
+            Some(vec![".git".to_string(), "Cargo.toml".to_string()])
+        );
     }
 
     #[test]

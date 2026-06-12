@@ -221,6 +221,7 @@ impl BridgeCoordinator {
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| !c.cmd.is_empty())
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -271,6 +272,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| !c.cmd.is_empty())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -311,6 +313,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == host_language))
+                    .filter(|c| !c.cmd.is_empty())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -705,6 +708,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -738,6 +742,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -760,6 +765,54 @@ mod tests {
     }
 
     #[test]
+    fn test_get_config_skips_server_with_empty_resolved_cmd() {
+        // A concrete entry can inherit everything except cmd from the `_`
+        // wildcard (e.g. the user listed a server name but forgot cmd).
+        // Such a server is unspawnable and must not be selected.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                root_markers: Some(vec![".git".to_string()]),
+            },
+        );
+        servers.insert(
+            "broken".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                root_markers: None,
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "rust")
+                .is_none(),
+            "a server whose resolved cmd is empty must be skipped"
+        );
+        assert!(
+            coordinator
+                .get_all_configs_for_language(&settings, "markdown", "rust")
+                .is_empty(),
+            "fan-out must also skip servers with empty resolved cmd"
+        );
+    }
+
+    #[test]
     fn test_get_all_configs_returns_multiple_servers_for_same_language() {
         let coordinator = BridgeCoordinator::new();
 
@@ -774,6 +827,7 @@ mod tests {
                 cmd: vec!["pyright-langserver".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
         servers.insert(
@@ -782,6 +836,7 @@ mod tests {
                 cmd: vec!["ruff".to_string(), "server".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -832,6 +887,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -865,6 +921,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -977,6 +1034,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -1195,6 +1253,7 @@ mod tests {
                 cmd: vec!["lua-language-server".to_string()],
                 languages: vec!["lua".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
