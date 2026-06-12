@@ -70,7 +70,7 @@ pub(crate) enum ConnectionReadiness {
 }
 
 use super::actor::{
-    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, UpstreamNotification, spawn_reader_task_for_language,
+    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, UpstreamNotification, spawn_reader_task_for_server,
 };
 use super::connection::AsyncBridgeConnection;
 
@@ -836,7 +836,7 @@ impl LanguageServerPool {
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
         // Server name is passed for structured logging (observability improvement)
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
-        let reader_handle = spawn_reader_task_for_language(
+        let reader_handle = spawn_reader_task_for_server(
             reader,
             Arc::clone(&router),
             Some(liveness_timeout.as_duration()),

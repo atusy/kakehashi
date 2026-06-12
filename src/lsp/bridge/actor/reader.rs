@@ -55,13 +55,13 @@ struct LivenessParams {
 
 /// Dependencies for handling server-initiated requests.
 ///
-/// Groups the parameters that `handle_server_request` needs: the language
-/// identifier (for logging), the response channel, the dynamic capability
+/// Groups the parameters that `handle_server_request` needs: the downstream
+/// server name (for logging), the response channel, the dynamic capability
 /// registry, the upstream notification channel, and the workspace folders
 /// this connection was initialized with (the bridge advertises the
 /// `workspace.workspaceFolders` capability, so servers may query them).
 struct ServerRequestDeps {
-    language: Option<String>,
+    server_name: Option<String>,
     response_tx: mpsc::Sender<OutboundMessage>,
     dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
@@ -255,11 +255,11 @@ pub(crate) fn spawn_reader_task(
     spawn_reader_task_with_liveness(reader, router, None)
 }
 
-/// Spawn a reader task with optional liveness timeout (no language context).
+/// Spawn a reader task with optional liveness timeout (no server context).
 ///
 /// Convenience wrapper for tests that don't need structured logging with
-/// language identifiers (ls-bridge-async-connection liveness timeout); production code should use
-/// `spawn_reader_task_for_language`.
+/// server names (ls-bridge-async-connection liveness timeout); production code should use
+/// `spawn_reader_task_for_server`.
 #[cfg(test)]
 pub(crate) fn spawn_reader_task_with_liveness(
     reader: BridgeReader,
@@ -269,7 +269,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
-    spawn_reader_task_for_language(
+    spawn_reader_task_for_server(
         reader,
         router,
         liveness_timeout,
@@ -281,14 +281,14 @@ pub(crate) fn spawn_reader_task_with_liveness(
     )
 }
 
-/// Spawn a reader task with liveness timeout (ls-bridge-async-connection) and language identifier
-/// for structured logging.
+/// Spawn a reader task with liveness timeout (ls-bridge-async-connection) and downstream
+/// server name for structured logging.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_reader_task_for_language(
+pub(crate) fn spawn_reader_task_for_server(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
     liveness_timeout: Option<Duration>,
-    language: Option<String>,
+    server_name: Option<String>,
     response_tx: mpsc::Sender<OutboundMessage>,
     dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
@@ -313,7 +313,7 @@ pub(crate) fn spawn_reader_task_for_language(
         failed_tx: liveness_failed_tx,
     };
     let server_request_deps = ServerRequestDeps {
-        language,
+        server_name,
         response_tx,
         dynamic_capabilities,
         upstream_tx,
@@ -363,7 +363,7 @@ async fn reader_loop(
         failed_tx,
     };
     let server_request_deps = ServerRequestDeps {
-        language: None,
+        server_name: None,
         response_tx,
         dynamic_capabilities,
         upstream_tx,
@@ -393,9 +393,9 @@ async fn reader_loop_with_liveness(
         failed_tx: liveness_failed_tx,
     } = liveness_params;
 
-    // Language prefix for log messages (e.g., "[lua] " or "")
+    // Server-name prefix for log messages (e.g., "[lua-ls] " or "")
     let lang_prefix = server_request_deps
-        .language
+        .server_name
         .as_ref()
         .map(|l| format!("[{}] ", l))
         .unwrap_or_default();
@@ -833,7 +833,7 @@ mod tests {
         let caps = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
@@ -1276,7 +1276,7 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -1330,7 +1330,7 @@ mod tests {
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -1375,7 +1375,7 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -1416,7 +1416,7 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -1539,7 +1539,7 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -1613,7 +1613,7 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
@@ -1646,7 +1646,7 @@ mod tests {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -1694,7 +1694,7 @@ mod tests {
         }]);
 
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
@@ -1753,7 +1753,7 @@ mod tests {
 
         // Spawn handle_server_request in a separate task (it needs to await)
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
@@ -1807,7 +1807,7 @@ mod tests {
         drop(response_rx);
 
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,

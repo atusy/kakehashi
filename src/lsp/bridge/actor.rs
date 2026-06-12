@@ -20,7 +20,7 @@ pub(crate) use outbound_message::OutboundMessage;
 pub(crate) use reader::spawn_reader_task;
 #[cfg(test)]
 pub(crate) use reader::spawn_reader_task_with_liveness;
-pub(crate) use reader::{ReaderTaskHandle, UpstreamNotification, spawn_reader_task_for_language};
+pub(crate) use reader::{ReaderTaskHandle, UpstreamNotification, spawn_reader_task_for_server};
 #[cfg(test)]
 pub(crate) use response_router::RouteResult;
 pub(crate) use response_router::{ResponseRouter, RouterCleanupGuard};
