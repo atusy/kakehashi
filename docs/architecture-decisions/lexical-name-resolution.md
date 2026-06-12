@@ -81,6 +81,11 @@ silently by filename inference.
 | `@definition` / `@definition.<label>` | A name-introducing node (the identifier itself, not the whole declaration). The optional `<label>` is an **opaque string**: the engine attaches no semantics to it. It serves as a property-targeting key within a pattern (below) and is surfaced in results for future use (e.g. `SymbolKind` mapping). |
 | `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references — the exclusion happens at collection, so a node registered as a definition site never enters the reference set. |
 
+Captures outside this vocabulary are ignored by the engine but still count
+toward the pattern match's extent — capturing an enclosing statement under a
+throwaway name (`@_decl`) is the sanctioned way to widen a match for the
+`after` visibility below.
+
 ### Properties
 
 All language semantics are declared with `#set!` (static, parsed once per
@@ -94,7 +99,7 @@ carry no grammar of their own and no new property-key syntax is introduced.
 | Property | Values | Declares |
 |---|---|---|
 | `definition.scope` | `local` (default) / `parent` / `global` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, or the layer root. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. |
-| `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting; Python assignments — a name assigned anywhere in a Python scope is local to the *entire* scope, so a pre-assignment reference binds locally rather than reading outward, mirroring UnboundLocalError instead of a silent outer-scope read). `after` = from the **end byte of the pattern's match** onward — in Lua's `local x = x` the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
+| `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting; Python assignments — a name assigned anywhere in a Python scope is local to the *entire* scope, so a pre-assignment reference binds locally rather than reading outward, mirroring UnboundLocalError instead of a silent outer-scope read). `after` = from the **end byte of the pattern's match** onward, defined as the largest end byte among all nodes the match captured (vocabulary and `@_`-prefixed captures alike) — in Lua's `local x = x` the pattern captures the whole declaration statement, so the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
 | `definition.namespace` | string, default `default` | The binding's namespace. |
 | `reference.namespace` | space-separated strings, default `default` | Namespaces this reference may bind to, searched in order within each scope. A type-position reference declares `"type"`; an ambiguous-position reference declares `"type default"`. Matching is by equality — an unannotated reference does **not** match an annotated definition, which is the conservative direction (silence over a wrong answer). |
 | `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable — provided those definitions declare the matching namespaces via `definition.namespace`. |
@@ -117,8 +122,9 @@ Per layer, per parsed version:
    the **registering** scope's start byte for `scope` visibility, the
    pattern-match end byte for `after`, the definition node's start byte
    for `declaration`.
-3. For a `@reference` with name `N`, namespaces `NS`, at position `P`: walk
-   scopes innermost → outermost. In each scope, for each namespace in `NS`
+3. For a `@reference` — recorded at collection with its node range, name
+   text `N`, and namespace list `NS` — at position `P`: walk scopes
+   innermost → outermost. In each scope, for each namespace in `NS`
    order, look up the binding named `N` in that namespace; it is visible
    when at least one of its sites has visibility start **at or before**
    `P`. The first visible binding ends the walk (natural shadowing). The
