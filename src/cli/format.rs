@@ -67,7 +67,9 @@ pub const EXIT_OK: u8 = 0;
 /// At least one file changed (with `--fail-on-change`) or would change
 /// (with `--check`).
 pub const EXIT_CHANGED: u8 = 1;
-/// Usage or I/O error.
+/// Usage error, I/O error, or downstream formatter failure (a configured
+/// server failed to start, errored on the request, timed out, or returned a
+/// protocol-invalid response).
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers. Spawning
@@ -233,22 +235,20 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     let mut write_errors = 0usize;
     let mut server_errors = 0usize;
     for file in &files {
+        // Collected paths are absolute (normalize_path); report them
+        // cwd-relative so the output stays readable in deep trees.
+        let display = file.strip_prefix(cwd).unwrap_or(file).display();
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
-                eprintln!("error: cannot read '{}': {e}", file.display());
+                eprintln!("error: cannot read '{display}': {e}");
                 read_errors += 1;
                 continue;
             }
         };
-        let absolute = if file.is_absolute() {
-            file.clone()
-        } else {
-            cwd.join(file)
-        };
         let outcome = server
             .cli_format_text(
-                &absolute,
+                file,
                 &text,
                 options.formatting_options(),
                 SERVER_READY_TIMEOUT,
@@ -259,7 +259,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         // "unchanged" (docs: I/O errors exit 2). Any partial output another
         // server produced is still applied below.
         for failure in &outcome.server_failures {
-            eprintln!("error: {}: {failure}", file.display());
+            eprintln!("error: {display}: {failure}");
         }
         let server_failed = !outcome.server_failures.is_empty();
         if server_failed {
@@ -269,12 +269,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             Some(formatted) if formatted != text => {
                 changed += 1;
                 if options.check {
-                    eprintln!("Would reformat: {}", file.display());
+                    eprintln!("Would reformat: {display}");
                 } else {
                     match write_atomically(file, &formatted) {
-                        Ok(()) => eprintln!("Reformatted: {}", file.display()),
+                        Ok(()) => eprintln!("Reformatted: {display}"),
                         Err(e) => {
-                            eprintln!("error: cannot write '{}': {e}", file.display());
+                            eprintln!("error: cannot write '{display}': {e}");
                             write_errors += 1;
                         }
                     }
@@ -381,9 +381,11 @@ fn collect_files(
 
     let mut files = Vec::new();
     for path in paths {
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
+        // Normalize before stat: a relative path must resolve against
+        // `base`, not against whatever the process cwd happens to be.
         let path = normalize_path(base, path);
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
         if metadata.is_dir() {
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;

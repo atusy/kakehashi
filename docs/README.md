@@ -558,7 +558,10 @@ kakehashi format . --tab-size 2 --insert-spaces false
 
 Exit codes: `0` nothing to change (or changes written without
 `--fail-on-change`), `1` changes detected under `--check`/`--fail-on-change`,
-`2` usage or I/O error.
+`2` usage error, I/O error, or downstream formatter failure (a configured
+server failed to start, errored on the request, timed out, or returned a
+protocol-invalid response — even when a fallback server still produced
+output).
 
 ## Editor Integration
 
