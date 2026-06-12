@@ -236,9 +236,20 @@ impl LanguageServerPool {
             doc,
             upstream_request_id,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-            move |response| parse_host_formatting_response(response, method),
+            // Promote a JSON-RPC error response to a request failure (`Err`)
+            // instead of collapsing it into the `None` that also means "no
+            // capability" — mirrors `send_formatting_request`: the fan-in
+            // counts `Err`s, which CLI mode maps onto its error exit code.
+            move |response| {
+                if response_has_jsonrpc_error(&response, method) {
+                    return Err(io::Error::other(format!(
+                        "downstream server answered {method} with an error response"
+                    )));
+                }
+                Ok(parse_host_formatting_response(response, method))
+            },
         )
-        .await
+        .await?
     }
 
     /// Drive a host bridge request end-to-end: register for cancel

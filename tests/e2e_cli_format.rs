@@ -411,6 +411,43 @@ languages = ["lua"]
     );
 }
 
+#[test]
+fn e2e_host_layer_request_failure_exits_with_error() {
+    // Same request-time failure, but through the HOST layer
+    // (bridge._self.enabled): the host fan-in must also count the error
+    // response so the CLI exits 2.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge._self]
+enabled = true
+
+[languageServers.mock-fail-host]
+cmd = ["{}", "fail-request"]
+languages = ["markdown"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write host fail-request config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a host-layer request failure must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        MARKDOWN,
+        "the file must be left untouched"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_format_preserves_file_permissions() {
