@@ -378,21 +378,35 @@ fn collect_files(
     for path in paths {
         let metadata = std::fs::metadata(path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
+        let path = normalize_path(base, path);
         if metadata.is_dir() {
-            if is_excluded(&exclude_matcher, base, path, true) {
+            if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
             }
-            walk_directory(path, &exclude_matcher, is_formattable, &mut files);
+            walk_directory(&path, &exclude_matcher, is_formattable, &mut files);
         } else {
-            if is_excluded(&exclude_matcher, base, path, false) {
+            if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
-            files.push(path.clone());
+            files.push(path);
         }
     }
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+/// Absolutize `path` against `base` and clean `.`/`..` components, so the
+/// same file always collects to one canonical form — without this, passing
+/// `doc.md` and `/abs/to/doc.md` (or `sub/../doc.md`) together would defeat
+/// `dedup()` and format the file twice.
+fn normalize_path(base: &Path, path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    path_clean::clean(absolute)
 }
 
 /// Whether `path` or any of its ancestor directories *within `base`* matches
@@ -639,6 +653,28 @@ mod tests {
         let files = collect_files(
             tmp.path(),
             &[tmp.path().join("doc.md"), tmp.path().to_path_buf()],
+            &[],
+            &markdown_only,
+        )
+        .unwrap();
+
+        assert_eq!(files, vec![tmp.path().join("doc.md")]);
+    }
+
+    #[test]
+    fn duplicates_under_different_spellings_are_deduplicated() {
+        // The same file via a clean path and a `sub/..`-detour must collapse
+        // to one entry, or it would be formatted (and rewritten) twice.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("doc.md"), "x");
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+
+        let files = collect_files(
+            tmp.path(),
+            &[
+                tmp.path().join("doc.md"),
+                tmp.path().join("sub").join("..").join("doc.md"),
+            ],
             &[],
             &markdown_only,
         )

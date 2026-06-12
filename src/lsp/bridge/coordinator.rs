@@ -546,6 +546,16 @@ impl BridgeCoordinator {
     /// and overtakes the eager one on the wire. Once the tasks are finished,
     /// every `didOpen` is enqueued and the single-writer FIFO
     /// (ls-bridge-message-ordering) keeps later requests behind them.
+    ///
+    /// Precondition: the `didOpen` that triggered the eager spawn has been
+    /// **awaited to completion** (CLI mode awaits `did_open_impl`, which
+    /// registers every handle before returning). `supersede` inserts an
+    /// empty placeholder batch before the handles are pushed, so a caller
+    /// polling *concurrently with registration* could observe a zero-handle
+    /// batch as "finished"; conversely an empty batch must stay "finished"
+    /// here, because documents with no bridge-capable injections keep zero
+    /// handles forever and treating that as pending would stall them for
+    /// the caller's whole timeout.
     pub(crate) fn eager_open_tasks_finished(&self, uri: &Url) -> bool {
         self.eager_open_tasks
             .get(uri)
