@@ -543,7 +543,7 @@ impl Kakehashi {
     ) -> Option<DocumentRequestContext> {
         if !self.virt_layer_enabled(&preamble.language_name, method_name) {
             log::debug!(
-                "{}: virt layer disabled for {} via layers.order",
+                "{}: virt layer disabled for {} via layers.aggregation order",
                 method_name,
                 preamble.language_name
             );
@@ -1032,13 +1032,15 @@ mod tests {
         langs.insert(
             "markdown".to_string(),
             LanguageSettings {
-                layers: Some(HashMap::from([(
-                    "textDocument/hover".to_string(),
-                    crate::config::settings::LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Native]),
-                        strategy: None,
-                    },
-                )])),
+                layers: Some(crate::config::settings::LayersConfig {
+                    aggregation: Some(HashMap::from([(
+                        "textDocument/hover".to_string(),
+                        crate::config::settings::LayerAggregationConfig {
+                            order: Some(vec![LayerSource::Native]),
+                            strategy: None,
+                        },
+                    )])),
+                }),
                 ..Default::default()
             },
         );
@@ -1064,13 +1066,15 @@ mod tests {
         langs.insert(
             "_".to_string(),
             LanguageSettings {
-                layers: Some(HashMap::from([(
-                    "_".to_string(),
-                    crate::config::settings::LayerAggregationConfig {
-                        order: Some(vec![]),
-                        strategy: None,
-                    },
-                )])),
+                layers: Some(crate::config::settings::LayersConfig {
+                    aggregation: Some(HashMap::from([(
+                        "_".to_string(),
+                        crate::config::settings::LayerAggregationConfig {
+                            order: Some(vec![]),
+                            strategy: None,
+                        },
+                    )])),
+                }),
                 ..Default::default()
             },
         );

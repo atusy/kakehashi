@@ -168,7 +168,9 @@ fn e2e_layers_order_without_virt_disables_bridging() {
                 "languages": {
                     "markdown": {
                         "layers": {
-                            "textDocument/formatting": { "order": ["native"] }
+                            "aggregation": {
+                                "textDocument/formatting": { "order": ["native"] }
+                            }
                         }
                     }
                 }

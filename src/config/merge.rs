@@ -1,6 +1,6 @@
 use super::settings::{
     AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
-    LayerAggregationConfig,
+    LayerAggregationConfig, LayersConfig,
 };
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
@@ -98,7 +98,7 @@ pub(crate) fn merge_language_settings(
         parser: overlay.parser.clone().or_else(|| base.parser.clone()),
         queries: overlay.queries.clone().or_else(|| base.queries.clone()),
         bridge: merge_bridge_maps(base.bridge.as_ref(), overlay.bridge.as_ref()),
-        layers: merge_layers_maps(base.layers.as_ref(), overlay.layers.as_ref()),
+        layers: merge_layers_configs(base.layers.as_ref(), overlay.layers.as_ref()),
         aliases: overlay.aliases.clone().or_else(|| base.aliases.clone()),
     }
 }
@@ -221,12 +221,32 @@ pub(crate) fn merge_layer_aggregation_configs(
     }
 }
 
-/// Deep merge two optional `layers` HashMaps (cross-layer-aggregation).
+/// Field-level merge of two optional `layers` configs
+/// (cross-layer-aggregation).
+fn merge_layers_configs(
+    base: Option<&LayersConfig>,
+    overlay: Option<&LayersConfig>,
+) -> Option<LayersConfig> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(b), Some(o)) => Some(LayersConfig {
+            aggregation: merge_layers_aggregation_maps(
+                b.aggregation.as_ref(),
+                o.aggregation.as_ref(),
+            ),
+        }),
+    }
+}
+
+/// Deep merge two optional `layers.aggregation` HashMaps
+/// (cross-layer-aggregation).
 ///
 /// Mirrors [`merge_bridge_maps`]: an empty overlay map (`Some({})`) clears
 /// the base (empty-means-clear); otherwise per-method entries merge at the
 /// field level via [`merge_layer_aggregation_configs`].
-fn merge_layers_maps(
+fn merge_layers_aggregation_maps(
     base: Option<&HashMap<String, LayerAggregationConfig>>,
     overlay: Option<&HashMap<String, LayerAggregationConfig>>,
 ) -> Option<HashMap<String, LayerAggregationConfig>> {
@@ -2150,48 +2170,56 @@ mod tests {
     fn merge_language_settings_merges_layers_per_method() {
         use crate::config::settings::{AggregationStrategy, LayerSource};
         let base = LanguageSettings {
-            layers: Some(HashMap::from([
-                (
-                    "textDocument/hover".to_string(),
-                    LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Native]),
-                        strategy: Some(AggregationStrategy::Preferred),
-                    },
-                ),
-                (
-                    "textDocument/definition".to_string(),
-                    LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Virt]),
-                        strategy: None,
-                    },
-                ),
-            ])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([
+                    (
+                        "textDocument/hover".to_string(),
+                        LayerAggregationConfig {
+                            order: Some(vec![LayerSource::Native]),
+                            strategy: Some(AggregationStrategy::Preferred),
+                        },
+                    ),
+                    (
+                        "textDocument/definition".to_string(),
+                        LayerAggregationConfig {
+                            order: Some(vec![LayerSource::Virt]),
+                            strategy: None,
+                        },
+                    ),
+                ])),
+            }),
             ..Default::default()
         };
         let overlay = LanguageSettings {
-            layers: Some(HashMap::from([(
-                "textDocument/hover".to_string(),
-                LayerAggregationConfig {
-                    order: Some(vec![LayerSource::Host]),
-                    strategy: None,
-                },
-            )])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([(
+                    "textDocument/hover".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Host]),
+                        strategy: None,
+                    },
+                )])),
+            }),
             ..Default::default()
         };
         let merged = merge_language_settings(&base, &overlay);
-        let layers = merged.layers.expect("layers must survive the merge");
+        let aggregation = merged
+            .layers
+            .expect("layers must survive the merge")
+            .aggregation
+            .expect("aggregation must survive the merge");
         assert_eq!(
-            layers["textDocument/hover"].order,
+            aggregation["textDocument/hover"].order,
             Some(vec![LayerSource::Host]),
             "overlay entry wins per field"
         );
         assert_eq!(
-            layers["textDocument/hover"].strategy,
+            aggregation["textDocument/hover"].strategy,
             Some(AggregationStrategy::Preferred),
             "unset overlay field inherits from the base entry"
         );
         assert_eq!(
-            layers["textDocument/definition"].order,
+            aggregation["textDocument/definition"].order,
             Some(vec![LayerSource::Virt]),
             "base-only entries are preserved"
         );
@@ -2201,24 +2229,30 @@ mod tests {
     fn merge_language_settings_empty_layers_map_clears_base() {
         use crate::config::settings::LayerSource;
         let base = LanguageSettings {
-            layers: Some(HashMap::from([(
-                "_".to_string(),
-                LayerAggregationConfig {
-                    order: Some(vec![LayerSource::Native]),
-                    strategy: None,
-                },
-            )])),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::from([(
+                    "_".to_string(),
+                    LayerAggregationConfig {
+                        order: Some(vec![LayerSource::Native]),
+                        strategy: None,
+                    },
+                )])),
+            }),
             ..Default::default()
         };
         let overlay = LanguageSettings {
-            layers: Some(HashMap::new()),
+            layers: Some(LayersConfig {
+                aggregation: Some(HashMap::new()),
+            }),
             ..Default::default()
         };
         let merged = merge_language_settings(&base, &overlay);
         assert_eq!(
             merged.layers,
-            Some(HashMap::new()),
-            "Some({{}}) clears inherited layers (empty-means-clear, like bridge)"
+            Some(LayersConfig {
+                aggregation: Some(HashMap::new()),
+            }),
+            "aggregation = {{}} clears inherited entries (empty-means-clear, like bridge)"
         );
     }
 

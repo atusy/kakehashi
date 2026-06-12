@@ -31,7 +31,7 @@ the strategy:
 Two problems with keeping the dual semantics:
 
 1. **Inconsistency compounds.** cross-layer-aggregation introduces a second
-   ordered list (`layers.<method>.order`). Every new list must pick a side,
+   ordered list (`layers.aggregation.<method>.order`). Every new list must pick a side,
    and users must remember which list means which.
 2. **Exclusion and demotion are inexpressible under `preferred`.** A user
    cannot say "only foo" (fallback always re-admits the rest), nor "foo

@@ -330,7 +330,7 @@ and semantic tokens excepted); by default the host layer is tried after
 `virt` (see `layers` above), so injections keep winning inside code fences
 while the host server answers everywhere else. For formatting, combine
 fence formatters with a whole-document formatter via
-`layers."textDocument/formatting".strategy = "concatenated"`.
+`layers.aggregation."textDocument/formatting".strategy = "concatenated"`.
 
 ```toml
 [languages.markdown.bridge._self]
@@ -382,15 +382,18 @@ Example with per-method priorities, strategy, and maxFanOut:
 A request to kakehashi can be answered by up to three *result layers*:
 `virt` (the injection bridges above), `host` (a host-document language
 server — opt-in via `bridge._self` above), and `native` (kakehashi's
-own features). The per-language `layers` map orders them per LSP method:
+own features). `layers.aggregation` orders them per LSP method, mirroring
+the `bridge.<lang>.aggregation` nesting:
 
 ```json
 {
   "languages": {
     "markdown": {
       "layers": {
-        "textDocument/hover": { "order": ["virt", "native"] },
-        "_": { "order": ["virt", "host", "native"] }
+        "aggregation": {
+          "textDocument/hover": { "order": ["virt", "native"] },
+          "_": { "order": ["virt", "host", "native"] }
+        }
       }
     }
   }
@@ -404,8 +407,8 @@ own features). The per-language `layers` map orders them per LSP method:
 
 Details:
 
-- **Key**: the LSP method name, or `_` for the method wildcard (same
-  convention as `aggregation`).
+- **Key**: under `aggregation`, the LSP method name or `_` for the method
+  wildcard (same convention as `bridge.<lang>.aggregation`).
 - **Formatting**: `textDocument/rangeFormatting` shares the
   `textDocument/formatting` key.
 - **Diagnostics**: two keys, mirroring their aggregation keying — pull

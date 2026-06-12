@@ -99,16 +99,19 @@ violation that led host-document-bridge to reject its Alternative A
 
 ## Decision Outcome
 
-**Chosen approach**: add a `layers` field to `LanguageSettings` — a
-method-keyed map (LSP method name or `_` wildcard) whose values hold a
-closed-enum layer order plus an optional strategy. Stage-1 types
-(`AggregationConfig`, `BridgeLanguageConfig`) are untouched.
+**Chosen approach**: add a `layers` field to `LanguageSettings` whose
+`aggregation` member is a method-keyed map (LSP method name or `_`
+wildcard) of closed-enum layer orders plus an optional strategy. The
+nesting mirrors `bridge.<key>.aggregation` — "aggregation" uniformly names
+the method-keyed map across the config — and keeps headroom for future
+layer-wide fields on `layers` without colliding with method names.
+Stage-1 types (`AggregationConfig`, `BridgeLanguageConfig`) are untouched.
 
 ### Schema
 
 ```toml
 # ---- Built-in defaults (declared in code; not user-facing) ----
-[languages._.layers._]
+[languages._.layers.aggregation._]
 order = ["virt", "host", "native"]   # innermost-first; mirrors "deeper wins"
 # host is listed but contributes nothing until the user opts in via
 # bridge._self.enabled (host-document-bridge) — order ranks layers,
@@ -116,7 +119,7 @@ order = ["virt", "host", "native"]   # innermost-first; mirrors "deeper wins"
 # strategy: per-method default (concatenated for diagnostics, else preferred)
 
 # ---- User: markdown hover should prefer the host LS, and drop native ----
-[languages.markdown.layers."textDocument/hover"]
+[languages.markdown.layers.aggregation."textDocument/hover"]
 order = ["host", "virt"]             # allowlist: native does not run
 
 # ---- Stage 1 stays exactly as before: server names within one target ----
@@ -147,14 +150,19 @@ pub struct LayerAggregationConfig {
     pub strategy: Option<AggregationStrategy>,
 }
 
+pub struct LayersConfig {
+    /// Per-method map, keyed by LSP method name or "_" (wildcard).
+    pub aggregation: Option<HashMap<String, LayerAggregationConfig>>,
+}
+
 // On LanguageSettings, beside `bridge`:
-pub layers: Option<HashMap<String, LayerAggregationConfig>>,
+pub layers: Option<LayersConfig>,
 ```
 
 ### Two-Stage Aggregation
 
 ```
-Stage 2 (this decision)   layers.order = [virt, host, native]   ← LayerSource enum
+Stage 2 (this decision)   layers.aggregation.<m>.order = [virt, host, native]   ← LayerSource enum
                              │      │      └ native handler result
                              │      └ bridge._self.aggregation.priorities  ← LS names
                              └ bridge.<inj>.aggregation.priorities         ← LS names
@@ -243,7 +251,7 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 - **Allowlist override footgun**: writing `order = ["host"]` silently drops
   virt and native for that method — a user promoting one layer must restate
   the others. Mitigated by schema docs; inherent to allowlist semantics.
-- **Two similarly-shaped maps**: `languages.<lang>.layers.<method>` and
+- **Two similarly-shaped maps**: `languages.<lang>.layers.aggregation.<method>` and
   `languages.<lang>.bridge.<key>.aggregation.<method>` are both method-keyed
   ordered-allowlist configs; users must learn which axis each controls. The
   distinct field names and element types (`order` of a closed enum vs.
