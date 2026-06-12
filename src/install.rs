@@ -257,8 +257,14 @@ fn install_language_blocking(
         }
     }
 
-    // Install queries
-    match queries::install_queries_from(queries_base_url, language, data_dir, force) {
+    // Install queries, following `; inherits:` so languages like html
+    // (which keeps its @comment capture in html_tags) highlight correctly.
+    match queries::install_queries_with_dependencies_from(
+        queries_base_url,
+        language,
+        data_dir,
+        force,
+    ) {
         Ok(query_result) => {
             result.queries_path = Some(query_result.install_path);
         }
@@ -340,6 +346,108 @@ mod tests {
         // Should use platform default (dirs::data_dir() + "kakehashi")
         assert!(dir.is_some());
         assert!(dir.unwrap().to_string_lossy().contains("kakehashi"));
+    }
+
+    /// Serve canned query files over HTTP from an OS-assigned local port.
+    ///
+    /// `routes` maps request paths (e.g. "/lang/highlights.scm") to bodies;
+    /// unknown paths get a 404, mirroring how raw.githubusercontent.com
+    /// responds for query files a language doesn't provide. Returns the
+    /// base URL. The serving thread lives until the test process exits.
+    fn spawn_query_file_server(routes: Vec<(&str, &str)>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let routes: Vec<(String, String)> = routes
+            .into_iter()
+            .map(|(p, b)| (p.to_string(), b.to_string()))
+            .collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(&mut stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                // Drain headers so the client sees a clean request/response cycle
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok() && header != "\r\n" {
+                    header.clear();
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let response = match routes.iter().find(|(p, _)| p == path) {
+                    Some((_, body)) => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    ),
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        base_url
+    }
+
+    /// Auto-install must follow `; inherits:` in downloaded highlights.scm.
+    ///
+    /// Regression test: the LSP auto-install path installed only the
+    /// requested language's queries, so `html` arrived without `html_tags`
+    /// and its highlights query failed to load at runtime (the `@comment`
+    /// capture for `<!-- -->` lives in the inherited file).
+    #[test]
+    fn auto_install_installs_inherited_query_dependencies() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+
+        // Pre-create the parser artifact so install_parser short-circuits
+        // with AlreadyExists and the test never touches the network for it.
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("child_lang.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+
+        let base_url = spawn_query_file_server(vec![
+            (
+                "/child_lang/highlights.scm",
+                "; inherits: parent_lang\n(identifier) @variable\n",
+            ),
+            ("/parent_lang/highlights.scm", "(comment) @comment\n"),
+        ]);
+
+        let result = install_language_blocking("child_lang", data_dir, false, &base_url);
+
+        assert!(
+            result.queries_error.is_none(),
+            "queries install should succeed: {:?}",
+            result.queries_error
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join("child_lang")
+                .join("highlights.scm")
+                .exists(),
+            "requested language queries should be installed"
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join("parent_lang")
+                .join("highlights.scm")
+                .exists(),
+            "inherited parent queries should be installed alongside the child"
+        );
     }
 
     #[test]
