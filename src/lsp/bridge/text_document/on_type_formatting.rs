@@ -56,9 +56,21 @@ impl LanguageServerPool {
         if !handle.has_capability("textDocument/onTypeFormatting") {
             return Ok(None);
         }
-        let static_provider = handle
-            .server_capabilities()
-            .and_then(|caps| caps.document_on_type_formatting_provider.as_ref());
+        // A dynamic registration's trigger set lives in registration options
+        // the bridge does not parse, and it may legitimately differ from (or
+        // extend) the static provider. Whenever one exists, bypass the static
+        // trigger filter entirely and let the server answer — filtering by the
+        // static set could drop dynamically-registered triggers.
+        let static_provider = if handle
+            .dynamic_capabilities()
+            .has_registration("textDocument/onTypeFormatting")
+        {
+            None
+        } else {
+            handle
+                .server_capabilities()
+                .and_then(|caps| caps.document_on_type_formatting_provider.as_ref())
+        };
         if !downstream_declares_trigger(static_provider, ch) {
             log::debug!(
                 target: "kakehashi::bridge",
