@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, warn};
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use tokio::task::JoinHandle;
@@ -606,7 +607,8 @@ fn forward_notification(
 ) {
     match message["method"].as_str() {
         Some("window/logMessage") => {
-            match serde_json::from_value::<LogMessageParams>(message["params"].clone()) {
+            // Deserialize from a reference to avoid cloning the params value.
+            match LogMessageParams::deserialize(&message["params"]) {
                 Ok(params) => {
                     // Send failure means the forwarding loop is gone (server
                     // shutdown) - nothing useful to do with the message then.
@@ -632,7 +634,7 @@ fn forward_notification(
                 );
                 return;
             }
-            match serde_json::from_value::<ShowMessageParams>(message["params"].clone()) {
+            match ShowMessageParams::deserialize(&message["params"]) {
                 Ok(params) => {
                     let _ = deps.upstream_tx.send(UpstreamNotification::ShowMessage {
                         typ: params.typ,
