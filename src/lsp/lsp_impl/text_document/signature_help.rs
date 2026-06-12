@@ -32,7 +32,10 @@ impl Kakehashi {
             raw_params,
             virt,
             parse_host_verbatim::<SignatureHelp>,
-            |_| true,
+            // An empty-but-shaped response ({ signatures: [] }) is "nothing
+            // here" — fall through to the next layer instead of letting it
+            // win, consistent with the host fan-in's empty-shape handling.
+            |help: &SignatureHelp| !help.signatures.is_empty(),
         )
         .await
     }
