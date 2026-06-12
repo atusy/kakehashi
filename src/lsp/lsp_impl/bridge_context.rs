@@ -148,9 +148,27 @@ pub(crate) fn resolve_layer_config_from_settings(
 }
 
 /// Generic emptiness check for raw host-layer results in the `preferred`
-/// fan-in: `null` and `[]` are "no result"; any other value counts.
+/// fan-in: `null` and `[]` are "no result", as are the object-shaped
+/// "empty but valid" responses whose single canonical list field is empty —
+/// `CompletionList.items`, `SignatureHelp.signatures`,
+/// `LinkedEditingRanges.ranges`. Without the object shapes, a
+/// higher-priority host server's empty list would prematurely win the
+/// fan-in over a lower-priority server with actual results.
 pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
-    value.is_null() || value.as_array().is_some_and(|items| items.is_empty())
+    if value.is_null() {
+        return true;
+    }
+    if let Some(items) = value.as_array() {
+        return items.is_empty();
+    }
+    if let Some(object) = value.as_object() {
+        for key in ["items", "signatures", "ranges"] {
+            if let Some(list) = object.get(key).and_then(serde_json::Value::as_array) {
+                return list.is_empty();
+            }
+        }
+    }
+    false
 }
 
 /// Race the virt and host layer futures **concurrently** and decide by the
@@ -847,6 +865,43 @@ mod tests {
             enabled: None,
             aggregation: Some(agg),
         }
+    }
+
+    // ==========================================================================
+    // is_empty_layer_value (host-layer fan-in emptiness)
+    // ==========================================================================
+
+    #[test]
+    fn empty_layer_value_recognizes_null_and_empty_array() {
+        assert!(is_empty_layer_value(&serde_json::Value::Null));
+        assert!(is_empty_layer_value(&serde_json::json!([])));
+        assert!(!is_empty_layer_value(&serde_json::json!([1])));
+    }
+
+    #[test]
+    fn empty_layer_value_recognizes_object_shaped_empties() {
+        // CompletionList / SignatureHelp / LinkedEditingRanges with empty
+        // canonical lists are "empty but valid" — they must not win the
+        // host fan-in over a server with actual results.
+        assert!(is_empty_layer_value(&serde_json::json!({
+            "isIncomplete": false, "items": []
+        })));
+        assert!(is_empty_layer_value(
+            &serde_json::json!({ "signatures": [] })
+        ));
+        assert!(is_empty_layer_value(&serde_json::json!({ "ranges": [] })));
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "isIncomplete": false, "items": [{ "label": "x" }]
+        })));
+    }
+
+    #[test]
+    fn empty_layer_value_treats_other_objects_as_results() {
+        // Hover and friends: object results without a canonical list field
+        // count as results.
+        assert!(!is_empty_layer_value(&serde_json::json!({
+            "contents": "docs"
+        })));
     }
 
     // ==========================================================================
