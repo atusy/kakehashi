@@ -98,7 +98,9 @@ fn parse_inherits_directive(content: &str) -> Vec<String> {
             .filter(|s| {
                 let safe = is_safe_language_name(s);
                 if !safe {
-                    eprintln!("Warning: ignoring unsafe inherited language name '{}'", s);
+                    // Debug-format: the name is untrusted input and could
+                    // smuggle ANSI escapes into the terminal if printed raw.
+                    eprintln!("Warning: ignoring unsafe inherited language name {:?}", s);
                 }
                 safe
             })
