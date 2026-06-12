@@ -18,25 +18,34 @@ use url::Url;
 /// pins the template side.
 const DEFAULT_ROOT_MARKERS: &[&str] = &[".git"];
 
-/// A marker is a plain relative name to join onto candidate directories.
-/// Absolute markers would make `Path::join` *replace* the candidate (every
-/// ancestor "matches"), and `..` components would match outside it.
+/// A marker must consist solely of normal path components to join onto
+/// candidate directories. Everything else defeats the ancestor walk into an
+/// always-match: absolute / Windows drive-or-root prefixed markers make
+/// `Path::join` *replace* the candidate, `..` matches outside it, and `""` /
+/// `"."` exist for every directory.
 fn is_valid_marker(marker: &str) -> bool {
     let path = Path::new(marker);
-    path.is_relative()
-        && !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+    let mut components = path.components();
+    components
+        .next()
+        .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+        && components.all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// Find the nearest ancestor directory of `document_path` that contains any
 /// of `markers` (as a file or a directory). Returns `None` when no ancestor
 /// matches or `markers` is empty (the explicit `[]` kill switch).
 fn find_marker_root(document_path: &Path, markers: &[String]) -> Option<PathBuf> {
-    let markers: Vec<&String> = markers
-        .iter()
-        .filter(|marker| is_valid_marker(marker))
-        .collect();
+    let (markers, invalid): (Vec<&String>, Vec<&String>) =
+        markers.iter().partition(|marker| is_valid_marker(marker));
+    if !invalid.is_empty() {
+        // Spawn-time only (not per request), so a plain warn does not flood.
+        log::warn!(
+            target: "kakehashi::bridge::init",
+            "ignoring invalid rootMarkers entries (must be plain relative names): {:?}",
+            invalid
+        );
+    }
     if markers.is_empty() {
         return None;
     }
@@ -191,9 +200,14 @@ mod tests {
         let doc = project.join("main.rs");
 
         // "/" exists for every ancestor when joined absolutely; ".." matches
-        // outside the candidate. Both must be ignored, not "always match".
+        // outside the candidate; "" and "." exist for every directory.
+        // All must be ignored, not "always match".
         assert_eq!(find_marker_root(&doc, &markers(&["/"])), None);
         assert_eq!(find_marker_root(&doc, &markers(&["../project"])), None);
+        assert_eq!(find_marker_root(&doc, &markers(&[""])), None);
+        assert_eq!(find_marker_root(&doc, &markers(&["."])), None);
+        // Multi-component relative markers stay valid (e.g. ".github/workflows").
+        assert!(is_valid_marker("nested/marker.txt"));
     }
 
     #[test]
