@@ -507,7 +507,9 @@ impl LanguageServerPool {
     /// `document_uri` is the document that triggered the call; on a spawn it
     /// seeds the `rootMarkers` workspace-root search (root_markers module).
     /// It is ignored for an already-pooled connection — the first spawn
-    /// decides the root for the server's lifetime.
+    /// decides the root for the server's lifetime, so documents under a
+    /// *different* marker root reuse a process rooted elsewhere. Per-root
+    /// pooling (key = server + root) is tracked in issue #382.
     pub(super) async fn get_or_create_connection(
         &self,
         server_name: &str,
