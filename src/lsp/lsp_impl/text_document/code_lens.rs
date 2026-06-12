@@ -1,9 +1,14 @@
-//! Code lens method for Kakehashi.
+//! Code lens methods for Kakehashi: the whole-document fan-out and the
+//! `codeLens/resolve` round-trip (#355).
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{CodeLens, CodeLensParams};
+use ulid::Ulid;
+use url::Url;
 
 use super::super::Kakehashi;
+use crate::lsp::bridge::{CodeLensEnvelope, extract_code_lens_envelope};
+use crate::text::PositionMapper;
 
 impl Kakehashi {
     pub(crate) async fn code_lens_impl(
@@ -31,5 +36,68 @@ impl Kakehashi {
             },
         )
         .await
+    }
+
+    /// `codeLens/resolve`: route the lens back to the downstream server that
+    /// produced it, identified by the envelope in `lens.data` (#355).
+    ///
+    /// Fails soft at every step: a lens without an envelope (host-layer or
+    /// foreign) passes through unchanged, and a stale region returns the lens
+    /// unresolved with its envelope intact — clients re-request lenses on
+    /// change, so the staleness window is short.
+    pub(crate) async fn code_lens_resolve_impl(&self, lens: CodeLens) -> Result<CodeLens> {
+        let Some(envelope) = extract_code_lens_envelope(&lens) else {
+            return Ok(lens);
+        };
+
+        // Fail-soft staleness gate: resolving against a moved or invalidated
+        // region would translate coordinates with a stale offset and bind the
+        // lens to content the user has since edited.
+        if !self.code_lens_region_is_fresh(&envelope) {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeLens/resolve: region {} is stale; returning lens unresolved",
+                envelope.region_id
+            );
+            return Ok(lens);
+        }
+
+        let settings = self.settings_manager.load_settings();
+        let upstream_id = crate::lsp::current_upstream_id();
+        let pool = self.bridge.pool_arc();
+        Ok(pool
+            .dispatch_code_lens_resolve(lens, &settings, upstream_id)
+            .await)
+    }
+
+    /// Whether the envelope's injection region still exists at the position it
+    /// had when the lens was minted.
+    ///
+    /// The node tracker's edit-adjusted lookup answers "does the region still
+    /// exist" (a `None` covers invalidation, close, and unknown ULIDs alike);
+    /// comparing the region's CURRENT start position against the envelope's
+    /// offset snapshot additionally catches regions that survived an edit but
+    /// moved — the lens coordinates (and the snapshot offset) are stale then,
+    /// so resolution must fail soft rather than translate wrongly.
+    fn code_lens_region_is_fresh(&self, envelope: &CodeLensEnvelope) -> bool {
+        let Ok(uri) = Url::parse(&envelope.host_uri) else {
+            return false;
+        };
+        let Ok(ulid) = envelope.region_id.parse::<Ulid>() else {
+            return false;
+        };
+        let Some((start_byte, _end, _kind)) =
+            self.bridge.node_tracker().lookup_position(&uri, &ulid)
+        else {
+            return false;
+        };
+        let Some(doc) = self.documents.get(&uri) else {
+            return false;
+        };
+        let mapper = PositionMapper::new(doc.text());
+        let Some(position) = mapper.byte_to_position(start_byte) else {
+            return false;
+        };
+        position.line == envelope.offset.line && position.character == envelope.offset.column
     }
 }
