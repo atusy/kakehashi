@@ -251,9 +251,15 @@ fn install_language_blocking(
         no_cache: false,
     };
 
+    // AlreadyExists means the artifact is present and usable — success,
+    // not failure; treating it as an error made the auto-install manager
+    // degrade a fully-installed language to "installed but with warnings".
     match parser::install_parser(language, &parser_options) {
         Ok(parser_result) => {
             result.parser_path = Some(parser_result.install_path);
+        }
+        Err(parser::ParserInstallError::AlreadyExists(path)) => {
+            result.parser_path = Some(path);
         }
         Err(e) => {
             result.parser_error = Some(e.to_string());
@@ -270,6 +276,9 @@ fn install_language_blocking(
     ) {
         Ok(query_result) => {
             result.queries_path = Some(query_result.install_path);
+        }
+        Err(queries::QueryInstallError::AlreadyExists(path)) => {
+            result.queries_path = Some(path);
         }
         Err(e) => {
             result.queries_error = Some(e.to_string());
@@ -458,6 +467,43 @@ mod tests {
                 .exists(),
             "inherited parent queries should be installed alongside the child"
         );
+    }
+
+    /// A language whose parser and queries are already on disk is a
+    /// successful install, not a failure: reporting AlreadyExists as an
+    /// error made the auto-install manager degrade a fully-usable language
+    /// to "installed but with warnings".
+    #[test]
+    fn install_language_blocking_treats_already_installed_as_success() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("exists_lang.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+        let queries_dir = data_dir.join("queries").join("exists_lang");
+        std::fs::create_dir_all(&queries_dir).unwrap();
+        std::fs::write(queries_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+
+        // Everything exists, so no download may happen — point the base URL
+        // at a closed port to fail loudly if one is attempted anyway.
+        let result = install_language_blocking("exists_lang", data_dir, false, "http://127.0.0.1:1");
+
+        assert!(
+            result.is_success(),
+            "already-installed language must count as success: parser_error={:?} queries_error={:?}",
+            result.parser_error,
+            result.queries_error
+        );
+        assert_eq!(
+            result.parser_path,
+            Some(parser_dir.join(format!("exists_lang.{}", std::env::consts::DLL_EXTENSION)))
+        );
+        assert_eq!(result.queries_path, Some(queries_dir));
     }
 
     #[test]
