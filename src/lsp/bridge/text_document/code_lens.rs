@@ -1,8 +1,9 @@
 //! Code lens request handling for bridge connections, with host/virtual
 //! coordinate transformation and `codeLens/resolve` routing (#355).
 //!
-//! Like document link requests, code lens requests operate on the entire
-//! document — they take no position parameter.
+//! The `textDocument/codeLens` request operates on the entire document (no
+//! position parameter, like document link); `codeLens/resolve` takes a single
+//! lens as its complete params — see `dispatch_code_lens_resolve`.
 //!
 //! Every bridged lens gets a routing envelope in `lens.data` (the
 //! `completionItem/resolve` pattern) so a later `codeLens/resolve` can be sent
@@ -50,25 +51,25 @@ const ENVELOPE_KEY: &str = "kakehashi";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CodeLensEnvelope {
     /// Server name identifying which downstream produced the lens.
-    pub origin: String,
+    pub(crate) origin: String,
     /// Host document URI the lens belongs to (resolve params carry no
     /// textDocument, so the envelope must).
-    pub host_uri: String,
+    pub(crate) host_uri: String,
     /// ULID of the injection region the lens came from; resolve-time staleness
     /// checks look it up in the node tracker (fail-soft when invalidated).
-    pub region_id: String,
+    pub(crate) region_id: String,
     /// Region offset snapshot for coordinate translation at resolve time.
-    pub offset: EnvelopeOffset,
+    pub(crate) offset: EnvelopeOffset,
     /// The downstream server's original `data` value (preserved verbatim).
-    pub inner: Option<Value>,
+    pub(crate) inner: Option<Value>,
 }
 
 /// Context needed to create envelopes during code lens response processing.
-pub(crate) struct CodeLensEnvelopeContext<'a> {
-    pub server_name: &'a str,
-    pub host_uri: &'a str,
-    pub region_id: &'a str,
-    pub offset: &'a RegionOffset,
+struct CodeLensEnvelopeContext<'a> {
+    server_name: &'a str,
+    host_uri: &'a str,
+    region_id: &'a str,
+    offset: &'a RegionOffset,
 }
 
 /// Wrap `lens.data` in a Kakehashi envelope for origin tracking.
@@ -294,7 +295,13 @@ impl LanguageServerPool {
 
         match parse_code_lens_resolve_response(response) {
             Some(mut resolved) => {
-                translate_virtual_range_to_host(&mut resolved.range, &offset);
+                // Keep the ORIGINAL host range: resolve fills in lazy
+                // properties (command), it does not relocate the lens, and the
+                // original range was already validated/translated when the
+                // lens was minted. Trusting a downstream-returned range here
+                // would need fresh past-EOF bounds checks (cf. formatting's
+                // guard) against a virtual document we no longer have.
+                resolved.range = lens.range;
                 re_envelope_lens(&mut resolved, &envelope);
                 resolved
             }

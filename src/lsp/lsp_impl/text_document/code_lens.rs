@@ -79,6 +79,15 @@ impl Kakehashi {
     /// offset snapshot additionally catches regions that survived an edit but
     /// moved — the lens coordinates (and the snapshot offset) are stale then,
     /// so resolution must fail soft rather than translate wrongly.
+    ///
+    /// Known limitation: for injections whose queries apply `#offset!` (today
+    /// only YAML/TOML frontmatter in the bundled markdown queries), the
+    /// envelope offset is `#offset!`-adjusted while the tracker stores the raw
+    /// content-node position, so this comparison never matches and resolve
+    /// always fails soft for those regions. That errs in the safe direction
+    /// (lenses stay unresolved — still strictly better than the pre-#355
+    /// behavior of dropping them) and frontmatter code lenses have no known
+    /// real-world producer; revisit if one appears.
     fn code_lens_region_is_fresh(&self, envelope: &CodeLensEnvelope) -> bool {
         let Ok(uri) = Url::parse(&envelope.host_uri) else {
             return false;

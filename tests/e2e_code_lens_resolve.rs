@@ -171,6 +171,12 @@ fn e2e_code_lens_resolve_round_trips_to_origin_server() {
         stale.get("command").is_none() || stale["command"].is_null(),
         "resolve against a shifted region must fail soft (stay unresolved); got: {stale:?}"
     );
+    // The routing envelope must survive the fail-soft path intact — this
+    // distinguishes the fail-soft return from any other command-less shape.
+    assert_eq!(
+        stale["data"]["kakehashi"]["origin"], "mock-codelens",
+        "fail-soft must return the lens with its routing envelope intact; got: {stale:?}"
+    );
 
     shutdown(&mut client);
 }
