@@ -79,11 +79,25 @@ impl LanguageServerPool {
             upstream_request_id,
             |virtual_uri, request_id| build_formatting_request(virtual_uri, options, request_id),
             |response, ctx| {
-                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
+                // Promote a JSON-RPC error response to a request failure
+                // (`Err`) instead of collapsing it into the `None` that also
+                // means "no capability": the preferred fan-in counts `Err`s —
+                // CLI mode maps them onto its error exit code, and the editor
+                // path logs them at WARNING severity.
+                if response_has_jsonrpc_error(&response, "textDocument/formatting") {
+                    return Err(io::Error::other(
+                        "downstream server answered textDocument/formatting with an error response",
+                    ));
+                }
+                Ok(transform_formatting_response_to_host(
+                    response,
+                    ctx.offset,
+                    virtual_line_count,
+                ))
             },
             downstream_id_probe,
         )
-        .await
+        .await?
     }
 }
 

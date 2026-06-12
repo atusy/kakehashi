@@ -27,6 +27,10 @@
 //!   text with a line echoing the received `FormattingOptions` (`tabSize`,
 //!   `insertSpaces`), so tests can assert the options a client sent actually
 //!   reach the downstream server (e.g. `kakehashi format --tab-size`).
+//! - `fail-request` — advertises `documentFormattingProvider`, handshakes
+//!   normally, then answers every formatting request with a JSON-RPC error.
+//!   Exercises the request-time failure path (vs. a server that never
+//!   starts), which `kakehashi format` must report instead of exiting 0.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -140,6 +144,13 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/formatting" | "textDocument/rangeFormatting" => {
+                if mode == "fail-request" {
+                    // Healthy handshake, broken request: exercises the
+                    // request-time failure path (vs. a server that never
+                    // starts), which clients must not read as "no edits".
+                    respond_error(&mut writer, id, -32603, "mock formatter request failure");
+                    continue;
+                }
                 let options = message.pointer("/params/options").cloned();
                 let result = message
                     .pointer("/params/textDocument/uri")
@@ -229,6 +240,21 @@ fn respond<W: Write>(writer: &mut W, id: Option<Value>, result: Value) {
         return;
     };
     let body = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+    let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
+    let _ = writer.flush();
+}
+
+/// Send a JSON-RPC error response (`fail-request` mode).
+fn respond_error<W: Write>(writer: &mut W, id: Option<Value>, code: i64, message: &str) {
+    let Some(id) = id else {
+        return;
+    };
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    })
+    .to_string();
     let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
     let _ = writer.flush();
 }

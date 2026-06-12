@@ -373,6 +373,44 @@ languages = ["lua"]
     );
 }
 
+#[test]
+fn e2e_request_time_server_failure_exits_with_error() {
+    // The server handshakes fine but errors on the formatting request —
+    // distinct from never starting; must also exit 2, not "unchanged"/0.
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languageServers.mock-fail]
+cmd = ["{}", "fail-request"]
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write fail-request config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a request-time downstream failure must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("request(s) failed"),
+        "stderr should report the failed request; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        MARKDOWN,
+        "the file must be left untouched"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_format_preserves_file_permissions() {

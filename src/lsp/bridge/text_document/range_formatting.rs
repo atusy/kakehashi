@@ -28,7 +28,8 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, translate_host_range_to_virtual,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
+    translate_host_range_to_virtual,
 };
 use super::formatting::{count_lines, transform_formatting_response_to_host};
 
@@ -88,11 +89,24 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                transform_formatting_response_to_host(response, ctx.offset, virtual_line_count)
+                // Same error-response promotion as `send_formatting_request`:
+                // an error reply is a request failure (`Err`), not the `None`
+                // that also means "no capability".
+                if response_has_jsonrpc_error(&response, "textDocument/rangeFormatting") {
+                    return Err(io::Error::other(
+                        "downstream server answered textDocument/rangeFormatting \
+                         with an error response",
+                    ));
+                }
+                Ok(transform_formatting_response_to_host(
+                    response,
+                    ctx.offset,
+                    virtual_line_count,
+                ))
             },
             downstream_id_probe,
         )
-        .await
+        .await?
     }
 }
 

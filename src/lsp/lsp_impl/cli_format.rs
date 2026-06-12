@@ -122,17 +122,24 @@ impl Kakehashi {
         })
         .await;
 
-        let server_failures = self.wait_bridge_servers_ready(&url, ready_timeout).await;
+        let mut server_failures = self.wait_bridge_servers_ready(&url, ready_timeout).await;
         self.wait_eager_open_finished(&url, ready_timeout).await;
 
+        // Counts requests that fail AFTER the server came up (crash, error
+        // response, per-step timeout) — the ready-wait above cannot see
+        // those, and without the counter they collapse into "no edits".
+        let request_errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let result = self
-            .formatting_impl(DocumentFormattingParams {
-                text_document: TextDocumentIdentifier {
-                    uri: lsp_uri.clone(),
+            .formatting_impl_with_error_sink(
+                DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: lsp_uri.clone(),
+                    },
+                    options: formatting_options,
+                    work_done_progress_params: Default::default(),
                 },
-                options: formatting_options,
-                work_done_progress_params: Default::default(),
-            })
+                Some(std::sync::Arc::clone(&request_errors)),
+            )
             .await;
 
         self.did_close_impl(DidCloseTextDocumentParams {
@@ -152,6 +159,14 @@ impl Kakehashi {
             .flatten()
             .filter(|edits| !edits.is_empty())
             .map(|edits| crate::text::edit::apply_text_edits(text, &edits));
+
+        let request_errors = request_errors.load(std::sync::atomic::Ordering::Relaxed);
+        if request_errors > 0 {
+            server_failures.push(format!(
+                "{request_errors} downstream formatting request(s) failed \
+                 (run with RUST_LOG=kakehashi=warn for details)"
+            ));
+        }
         CliFormatOutcome {
             formatted,
             server_failures,
