@@ -55,6 +55,7 @@ impl LanguageServerPool {
             .get_or_create_connection_wait_ready(
                 server_name,
                 server_config,
+                Some(host_uri),
                 Duration::from_secs(INIT_TIMEOUT_SECS),
             )
             .await?;

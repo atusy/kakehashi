@@ -16,6 +16,7 @@ mod connection;
 pub(crate) mod coordinator;
 mod pool;
 mod protocol;
+mod root_markers;
 mod text_document;
 
 // Re-export public types

@@ -311,6 +311,12 @@ Configure language servers for bridging LSP requests in injection regions.
 | `cmd` | Command and arguments to start the language server |
 | `languages` | Languages this server handles |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
+| `rootMarkers` | Marker files/directories (e.g. `[".git", "Cargo.toml"]`) locating the workspace root the server is initialized with: ancestors of the document that triggered the spawn are searched nearest-first, and the first directory containing any marker becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The first spawn decides the root for the server's lifetime. |
+
+A `languageServers._` wildcard entry supplies defaults that every server
+inherits field-by-field (wildcard-config-inheritance) — e.g. set
+`rootMarkers` once for all servers. A wildcard-only entry is never spawned
+itself, and a concrete server whose merged `cmd` is still empty is skipped.
 
 **Bridge Language Configuration:**
 

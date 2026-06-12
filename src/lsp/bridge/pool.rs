@@ -503,14 +503,21 @@ impl LanguageServerPool {
 
     /// Get or create a connection for the specified server, spawning the server
     /// and running the LSP handshake with the default timeout on a miss.
+    ///
+    /// `document_uri` is the document that triggered the call; on a spawn it
+    /// seeds the `rootMarkers` workspace-root search (root_markers module).
+    /// It is ignored for an already-pooled connection — the first spawn
+    /// decides the root for the server's lifetime.
     pub(super) async fn get_or_create_connection(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
     ) -> io::Result<Arc<ConnectionHandle>> {
         self.get_or_create_connection_with_timeout(
             server_name,
             server_config,
+            document_uri,
             Duration::from_secs(INIT_TIMEOUT_SECS),
         )
         .await
@@ -533,6 +540,7 @@ impl LanguageServerPool {
             .get_or_create_connection_with_timeout(
                 server_name,
                 server_config,
+                None,
                 Duration::from_secs(INIT_TIMEOUT_SECS),
             )
             .await;
@@ -545,11 +553,12 @@ impl LanguageServerPool {
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
         // First, try to get or create the connection
         match self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, document_uri)
             .await
         {
             Ok(handle) => {
@@ -599,6 +608,7 @@ impl LanguageServerPool {
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
@@ -715,8 +725,37 @@ impl LanguageServerPool {
         // - If this function's caller is cancelled, only the JoinHandle await is dropped
         // - The spawned handshake task continues to completion
         let init_options = server_config.initialization_options.clone();
-        let root_uri = self.root_uri();
-        let workspace_folders = self.workspace_folders();
+        // rootMarkers workspace-root detection: a marker hit near the
+        // triggering document overrides the client-supplied root (and becomes
+        // the sole workspace folder); otherwise both fall back to upstream.
+        let marker_root = super::root_markers::resolve_marker_root(
+            server_config.root_markers.as_deref(),
+            document_uri,
+        );
+        let (root_uri, workspace_folders) = match marker_root {
+            Some(root) => {
+                log::debug!(
+                    target: "kakehashi::bridge::init",
+                    "[{}] rootMarkers resolved workspace root: {}",
+                    server_name,
+                    root
+                );
+                let folder = root.as_str().parse().ok().map(|uri| {
+                    vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                        uri,
+                        name: root
+                            .to_file_path()
+                            .ok()
+                            .and_then(|path| {
+                                path.file_name().map(|n| n.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or_default(),
+                    }]
+                });
+                (Some(root.to_string()), folder)
+            }
+            None => (self.root_uri(), self.workspace_folders()),
+        };
         let client_capabilities = self.client_capabilities();
         let handle_for_handshake = Arc::clone(&handle);
         let server_name_for_log = server_name.to_string();
@@ -1391,7 +1430,12 @@ mod tests {
 
         // Attempt connection with short timeout (will fail)
         let result = pool
-            .get_or_create_connection_with_timeout("test", &config, Duration::from_millis(100))
+            .get_or_create_connection_with_timeout(
+                "test",
+                &config,
+                None,
+                Duration::from_millis(100),
+            )
             .await;
 
         // Should return timeout error with correct kind and descriptive message
@@ -1436,7 +1480,12 @@ mod tests {
 
         // Use get_or_create_connection_with_timeout for testing with short timeout
         let result = pool
-            .get_or_create_connection_with_timeout("test", &config, Duration::from_millis(100))
+            .get_or_create_connection_with_timeout(
+                "test",
+                &config,
+                None,
+                Duration::from_millis(100),
+            )
             .await;
 
         let elapsed = start.elapsed();
@@ -1486,7 +1535,7 @@ mod tests {
         let config = lua_ls_config();
 
         let result = pool
-            .get_or_create_connection_with_timeout("lua", &config, Duration::from_secs(30))
+            .get_or_create_connection_with_timeout("lua", &config, None, Duration::from_secs(30))
             .await;
 
         // Should succeed with a new Ready connection
@@ -1549,6 +1598,7 @@ mod tests {
             .get_or_create_connection_with_timeout(
                 "lua",
                 &unresponsive_config,
+                None,
                 Duration::from_millis(100),
             )
             .await;
@@ -1576,7 +1626,12 @@ mod tests {
         let working_config = lua_ls_config();
 
         let result = pool
-            .get_or_create_connection_with_timeout("lua", &working_config, Duration::from_secs(30))
+            .get_or_create_connection_with_timeout(
+                "lua",
+                &working_config,
+                None,
+                Duration::from_secs(30),
+            )
             .await;
 
         // Should succeed - retry removed failed entry and spawned new server
@@ -2026,7 +2081,7 @@ mod tests {
 
         // First, establish a Ready connection
         let handle = pool
-            .get_or_create_connection("lua", &config)
+            .get_or_create_connection("lua", &config, None)
             .await
             .expect("should establish connection");
 
@@ -2260,7 +2315,7 @@ mod tests {
 
         // Step 1: Establish a Ready connection
         let handle = pool
-            .get_or_create_connection("lua", &config)
+            .get_or_create_connection("lua", &config, None)
             .await
             .expect("should establish connection");
 
@@ -3199,7 +3254,7 @@ mod tests {
 
         // Spawn server (ignoring errors like ensure_server_ready does)
         let _ = pool
-            .get_or_create_connection_with_timeout("test-server", &config, short_timeout)
+            .get_or_create_connection_with_timeout("test-server", &config, None, short_timeout)
             .await;
 
         // After: connection entry exists (state may be Initializing or Failed)
@@ -3231,10 +3286,10 @@ mod tests {
 
         // Call twice (ignoring errors like ensure_server_ready does)
         let _ = pool
-            .get_or_create_connection_with_timeout("test-server", &config, short_timeout)
+            .get_or_create_connection_with_timeout("test-server", &config, None, short_timeout)
             .await;
         let _ = pool
-            .get_or_create_connection_with_timeout("test-server", &config, short_timeout)
+            .get_or_create_connection_with_timeout("test-server", &config, None, short_timeout)
             .await;
 
         // Should still have exactly one connection
@@ -3306,7 +3361,12 @@ mod tests {
 
         // Call get_or_create_connection_wait_ready - should wait and succeed
         let result = pool
-            .get_or_create_connection_wait_ready("test-server", &config, Duration::from_secs(1))
+            .get_or_create_connection_wait_ready(
+                "test-server",
+                &config,
+                None,
+                Duration::from_secs(1),
+            )
             .await;
 
         // Should succeed after waiting for Ready state
@@ -3348,7 +3408,12 @@ mod tests {
 
         // Call get_or_create_connection_wait_ready - should fail
         let result = pool
-            .get_or_create_connection_wait_ready("test-server", &config, Duration::from_secs(1))
+            .get_or_create_connection_wait_ready(
+                "test-server",
+                &config,
+                None,
+                Duration::from_secs(1),
+            )
             .await;
 
         // Should fail due to Failed state transition
@@ -3379,7 +3444,12 @@ mod tests {
 
         // Call with short timeout - should timeout
         let result = pool
-            .get_or_create_connection_wait_ready("test-server", &config, Duration::from_millis(50))
+            .get_or_create_connection_wait_ready(
+                "test-server",
+                &config,
+                None,
+                Duration::from_millis(50),
+            )
             .await;
 
         // Should fail with timeout
@@ -3404,7 +3474,7 @@ mod tests {
 
         // First call establishes Ready connection
         let handle1 = pool
-            .get_or_create_connection("lua", &config)
+            .get_or_create_connection("lua", &config, None)
             .await
             .expect("should establish connection");
         assert_eq!(handle1.state(), ConnectionState::Ready);
@@ -3412,7 +3482,7 @@ mod tests {
         // Second call via wait_ready should return immediately
         let start = std::time::Instant::now();
         let handle2 = pool
-            .get_or_create_connection_wait_ready("lua", &config, Duration::from_secs(1))
+            .get_or_create_connection_wait_ready("lua", &config, None, Duration::from_secs(1))
             .await
             .expect("should return Ready connection");
         assert!(

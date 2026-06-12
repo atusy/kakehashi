@@ -193,7 +193,7 @@ impl LanguageServerPool {
     ) -> io::Result<Option<serde_json::Value>> {
         strip_progress_tokens(&mut params);
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(doc.uri))
             .await?;
         if !handle.has_capability(method) {
             return Ok(None);
@@ -228,7 +228,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(doc.uri))
             .await?;
         if !handle.has_capability(method) {
             return Ok(None);

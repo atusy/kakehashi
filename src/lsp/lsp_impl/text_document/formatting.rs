@@ -674,10 +674,11 @@ async fn pipeline_step_request_kind(
     pool: &crate::lsp::bridge::LanguageServerPool,
     server_name: &str,
     server_config: &crate::config::settings::BridgeServerConfig,
+    document_uri: Option<&url::Url>,
     timeout: std::time::Duration,
 ) -> std::io::Result<PipelineStepRequest> {
     let handle = pool
-        .get_or_create_connection_wait_ready(server_name, server_config, timeout)
+        .get_or_create_connection_wait_ready(server_name, server_config, document_uri, timeout)
         .await?;
     let supports_full = handle.has_capability("textDocument/formatting");
     let supports_range = handle.has_capability("textDocument/rangeFormatting");
@@ -963,6 +964,7 @@ async fn dispatch_concatenated_formatting(
                         &pool,
                         &server_name,
                         &server_config,
+                        Some(&uri),
                         step_budget,
                     )
                     .await

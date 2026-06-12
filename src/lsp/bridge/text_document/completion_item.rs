@@ -75,7 +75,7 @@ impl LanguageServerPool {
     ) -> CompletionItem {
         let server_name = &envelope.origin;
         let handle = match self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, None)
             .await
         {
             Ok(h) => h,
