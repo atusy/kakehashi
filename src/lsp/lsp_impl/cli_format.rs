@@ -215,54 +215,66 @@ impl Kakehashi {
     }
 
     /// Wait (up to `timeout` per server) until every downstream server
-    /// configured for the document's injection regions is Ready, returning a
-    /// description of each server that failed to come up.
+    /// configured for the document — injection-region (virt) servers and,
+    /// when `bridge._self.enabled`, host-layer servers — is Ready, returning
+    /// a description of each server that failed to come up.
     ///
     /// `formatting_impl` treats a not-yet-ready server as a failed step and
     /// skips it — correct for an editor where the next request retries, but a
-    /// one-shot CLI run would silently produce no edits. Spawning is
-    /// idempotent (`get_or_create_connection_wait_ready`), so this overlaps
-    /// with the eager-open `didOpen` triggered.
+    /// one-shot CLI run would silently produce no edits. Host requests do
+    /// run their own handshake wait inside `get_or_create_connection`, but
+    /// that time is spent inside the request's own budget — pre-warming here
+    /// keeps a slow cold host server from surfacing as a spurious request
+    /// failure. Spawning is idempotent
+    /// (`get_or_create_connection_wait_ready`), so this overlaps with the
+    /// eager-open `didOpen` triggered.
     async fn wait_bridge_servers_ready(&self, uri: &Url, timeout: Duration) -> Vec<String> {
-        let Some(language_name) = self.document_language(uri) else {
-            return Vec::new();
-        };
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return Vec::new();
-        };
-        let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot()) else {
-            return Vec::new();
-        };
+        let mut configs = Vec::new();
 
-        let regions = InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            uri,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
-        );
+        // Virt layer: servers configured for the document's injection regions.
+        if let Some(language_name) = self.document_language(uri)
+            && let Some(injection_query) = self.language.injection_query(&language_name)
+            && let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot())
+        {
+            let regions = InjectionResolver::resolve_all(
+                &self.language,
+                self.bridge.node_tracker(),
+                uri,
+                snapshot.tree(),
+                snapshot.text(),
+                injection_query.as_ref(),
+            );
+            for resolved in regions {
+                configs.extend(self.bridge_configs_for_injection_language(
+                    &language_name,
+                    &resolved.injection_language,
+                ));
+            }
+        }
+
+        // Host layer (bridge._self): resolves to nothing unless opted in.
+        if let Ok(lsp_uri) = url_to_uri(uri)
+            && let Some(ctx) = self.resolve_host_bridge_context(&lsp_uri, "textDocument/formatting")
+        {
+            configs.extend(ctx.configs);
+        }
 
         let pool = self.bridge.pool_arc();
         let mut waited: HashSet<String> = HashSet::new();
         let mut ready_waits = Vec::new();
-        for resolved in regions {
-            for config in self
-                .bridge_configs_for_injection_language(&language_name, &resolved.injection_language)
-            {
-                if waited.insert(config.server_name.clone()) {
-                    let pool = std::sync::Arc::clone(&pool);
-                    ready_waits.push(async move {
-                        let result = pool
-                            .get_or_create_connection_wait_ready(
-                                &config.server_name,
-                                &config.config,
-                                timeout,
-                            )
-                            .await;
-                        (config.server_name, result)
-                    });
-                }
+        for config in configs {
+            if waited.insert(config.server_name.clone()) {
+                let pool = std::sync::Arc::clone(&pool);
+                ready_waits.push(async move {
+                    let result = pool
+                        .get_or_create_connection_wait_ready(
+                            &config.server_name,
+                            &config.config,
+                            timeout,
+                        )
+                        .await;
+                    (config.server_name, result)
+                });
             }
         }
 

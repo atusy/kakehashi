@@ -328,6 +328,11 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(Path::new(".")))?;
     tmp.write_all(content.as_bytes())?;
+    // Flush file data to disk before the rename: rename atomicity only
+    // guarantees which *name* maps to which inode — without the fsync, a
+    // power loss shortly after the rename could leave the new name pointing
+    // at not-yet-flushed (truncated) data, defeating the crash-safety goal.
+    tmp.as_file().sync_all()?;
     // The temp file is created with restrictive default permissions (0600 on
     // Unix); rename would impose those on the target, silently stripping
     // group/other bits or the executable bit. Carry the target's own mode
