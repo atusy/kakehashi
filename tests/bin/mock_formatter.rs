@@ -44,6 +44,10 @@
 //!   that echoes the requested URI, but only for documents it received via
 //!   `didOpen`. Used to prove cross-layer diagnostic aggregation merges the
 //!   host layer in (cross-layer-aggregation).
+//! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
+//!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
+//!   uppercasing whole-document edit for ANY typed character (bridge-side
+//!   trigger filtering is what `tests/e2e_on_type_formatting.rs` proves).
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -89,6 +93,13 @@ fn main() {
                         "diagnosticProvider": {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
+                        },
+                        "textDocumentSync": 1
+                    }),
+                    "on-type" => json!({
+                        "documentOnTypeFormattingProvider": {
+                            "firstTriggerCharacter": "}",
+                            "moreTriggerCharacter": [";"]
                         },
                         "textDocumentSync": 1
                     }),
@@ -236,6 +247,21 @@ fn main() {
                         "data": data
                     }),
                 );
+            }
+            "textDocument/onTypeFormatting" => {
+                // Answer with the whole-document transformation REGARDLESS of
+                // the typed character: the bridge is supposed to filter
+                // undeclared triggers before the request ever reaches this
+                // server, so a null upstream result for an undeclared char
+                // proves bridge-side filtering, not mock refusal.
+                let options = message.pointer("/params/options").cloned();
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| documents.get(uri))
+                    .map(|text| whole_document_edit(text, &mode, options.as_ref()))
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
             }
             "textDocument/formatting" | "textDocument/rangeFormatting" => {
                 if mode == "fail-request" {
