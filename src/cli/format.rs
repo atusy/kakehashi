@@ -290,13 +290,18 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
 /// mid-write (OOM kill, power loss) can never leave a truncated source file
 /// behind. The temp file lives in the target's directory: `persist` renames,
 /// and rename is only atomic within one filesystem.
+///
+/// The path is canonicalized first so a symlinked source file keeps being a
+/// symlink — renaming over the link itself would silently replace it with a
+/// regular file and leave the link's target stale (chezmoi/stow setups).
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let target = std::fs::canonicalize(path)?;
+    let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(Path::new(".")))?;
     tmp.write_all(content.as_bytes())?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    tmp.persist(&target).map_err(|e| e.error)?;
     Ok(())
 }
 
