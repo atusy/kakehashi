@@ -438,8 +438,9 @@ fn host_url_to_lsp_uri(uri: &Url) -> io::Result<Uri> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// Strip the JSON-RPC envelope: `None` for an error response or a `null`
-/// result, the bare `result` value otherwise.
+/// Strip the JSON-RPC envelope: `Err` for an error response (a request
+/// failure), `Ok(None)` for a `null` or absent result, and `Ok(Some(result))`
+/// with the bare `result` value otherwise.
 fn parse_host_raw_response(
     mut response: serde_json::Value,
     method: &'static str,

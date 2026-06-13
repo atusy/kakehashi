@@ -372,10 +372,10 @@ fn one_line(message: &str) -> String {
 fn severity_word(severity: Option<DiagnosticSeverity>) -> &'static str {
     match severity {
         None => "error",
-        Some(s) if s == DiagnosticSeverity::ERROR => "error",
-        Some(s) if s == DiagnosticSeverity::WARNING => "warning",
-        Some(s) if s == DiagnosticSeverity::INFORMATION => "info",
-        Some(s) if s == DiagnosticSeverity::HINT => "hint",
+        Some(DiagnosticSeverity::ERROR) => "error",
+        Some(DiagnosticSeverity::WARNING) => "warning",
+        Some(DiagnosticSeverity::INFORMATION) => "info",
+        Some(DiagnosticSeverity::HINT) => "hint",
         Some(_) => "unknown",
     }
 }
@@ -416,10 +416,10 @@ type CodeSortKey<'a> = (u8, i32, Option<&'a str>);
 fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, CodeSortKey<'_>, &str) {
     let severity_rank = match diagnostic.severity {
         None => 1,
-        Some(s) if s == DiagnosticSeverity::ERROR => 1,
-        Some(s) if s == DiagnosticSeverity::WARNING => 2,
-        Some(s) if s == DiagnosticSeverity::INFORMATION => 3,
-        Some(s) if s == DiagnosticSeverity::HINT => 4,
+        Some(DiagnosticSeverity::ERROR) => 1,
+        Some(DiagnosticSeverity::WARNING) => 2,
+        Some(DiagnosticSeverity::INFORMATION) => 3,
+        Some(DiagnosticSeverity::HINT) => 4,
         Some(_) => 5,
     };
     let code_key = match &diagnostic.code {
