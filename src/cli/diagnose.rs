@@ -472,14 +472,20 @@ fn meets_threshold(diagnostic: &Diagnostic, threshold: Threshold) -> bool {
 /// lexically), strings by text. Borrows from the diagnostic, so allocation-free.
 type CodeSortKey<'a> = (u8, i32, Option<&'a str>);
 
-/// A total-order key for stable output. Ordering: position, then severity
-/// (most severe first), source, code, and message — so a diagnostic with no
-/// severity (ranked as error) and one out-of-spec severity still sort
-/// deterministically.
+/// The full range as an order key: `(start.line, start.char, end.line,
+/// end.char)`, so two diagnostics sharing a start but differing only in their
+/// end still sort deterministically.
+type RangeSortKey = (u32, u32, u32, u32);
+
+/// A total-order key for stable output. Ordering: range, then severity (most
+/// severe first), source, code, and message — so a diagnostic with no severity
+/// (ranked as error) and one out-of-spec severity still sort deterministically,
+/// and every field of two otherwise-identical-but-distinct diagnostics
+/// participates in the order.
 ///
 /// Allocation-free (it borrows from `diagnostic`): `sort_key` is evaluated
 /// twice per comparison across an `O(N log N)` sort, so it must not allocate.
-fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, CodeSortKey<'_>, &str) {
+fn sort_key(diagnostic: &Diagnostic) -> (RangeSortKey, u8, Option<&str>, CodeSortKey<'_>, &str) {
     let severity_rank = match diagnostic.severity {
         None => 1,
         Some(DiagnosticSeverity::ERROR) => 1,
@@ -493,9 +499,14 @@ fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, CodeSortKey
         Some(NumberOrString::Number(n)) => (1, *n, None),
         Some(NumberOrString::String(s)) => (2, 0, Some(s.as_str())),
     };
-    (
+    let range = (
         diagnostic.range.start.line,
         diagnostic.range.start.character,
+        diagnostic.range.end.line,
+        diagnostic.range.end.character,
+    );
+    (
+        range,
         severity_rank,
         diagnostic.source.as_deref(),
         code_key,
@@ -695,6 +706,24 @@ mod tests {
         let mut ten = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
         ten.code = Some(NumberOrString::Number(10));
         assert!(sort_key(&nine) < sort_key(&ten));
+    }
+
+    #[test]
+    fn sort_key_tie_breaks_on_end_position() {
+        // Same start, severity, source, code, message — only the end differs.
+        let short = Diagnostic {
+            range: Range::new(Position::new(1, 0), Position::new(1, 3)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "m".to_string(),
+            ..Default::default()
+        };
+        let long = Diagnostic {
+            range: Range::new(Position::new(1, 0), Position::new(1, 9)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "m".to_string(),
+            ..Default::default()
+        };
+        assert!(sort_key(&short) < sort_key(&long));
     }
 
     #[test]

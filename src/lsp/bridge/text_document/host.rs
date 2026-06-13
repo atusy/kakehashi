@@ -221,8 +221,10 @@ impl LanguageServerPool {
     /// Send a host bridge request with the upstream params forwarded
     /// **verbatim** (host-document-bridge): the params already reference the
     /// real URI and real coordinates, so no per-method request shaping is
-    /// needed. Returns the raw `result` value, or `None` for a `null`
-    /// result, a JSON-RPC error, or a missing capability.
+    /// needed. Returns the raw `result` value, `Ok(None)` for a `null`/absent
+    /// result or a missing capability, and `Err` for a transport failure or a
+    /// downstream JSON-RPC error response (a request failure, so a sink can
+    /// count it).
     ///
     /// One exception to verbatim: the progress tokens are stripped. The
     /// bridge discards downstream notifications, so a server honoring

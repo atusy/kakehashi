@@ -437,4 +437,19 @@ fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
         !stdout.contains("ignored.md:"),
         "gitignored file is skipped by the walk; got: {stdout:?}"
     );
+
+    // Explicitly naming the gitignored file diagnoses it anyway — naming a path
+    // is a stronger signal than a .gitignore entry.
+    let output = run_diagnose(ws.path(), &["ignored.md", "--threshold", "warning"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "explicit gitignored path is diagnosed; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("ignored.md:4:1:"),
+        "explicitly named path wins over gitignore; got: {}",
+        stdout_of(&output)
+    );
 }
