@@ -74,7 +74,11 @@ user config becomes a hard deserialization error once the variant is gone —
 surfaced as-is rather than aliased, per the delete-on-supersede posture —
 while stale `locals.scm` paths without an explicit kind stop being inferred
 once the kind is gone — filename inference yields nothing for an unknown
-filename, so they degrade to silently skipped rather than erroring.
+filename, so they degrade to silently skipped rather than erroring. The
+`captureMappings.locals` table goes with the pipeline (it is equally
+consumerless — the semantic-token legend consults only `.highlights`); no
+`bindings` counterpart appears, because the bindings vocabulary is fixed by
+this spec, not user-mapped.
 
 ### Capture vocabulary
 
@@ -323,16 +327,18 @@ the miss policy keeps the resolver silent.
   can read as "feature doesn't work".
 * Accuracy is bounded by lexical scoping: dynamic constructs (Python
   `globals()`, Lua `_ENV`, JS `with`) and anything member- or type-shaped
-  stay unresolved by design.
+  stay unresolved by design. This is distinct from dynamic *scoping*
+  (Considered Options H), which has the sanctioned global-registration
+  approximation — reflection-style constructs have none.
 * Native rename is best-effort, not all-or-nothing: occurrences the query
   fails to capture survive a rename and must be found by the user (or a
   bridge server). The `prepareRename` gate bounds *when* a rename is offered,
   not *how complete* it is.
 * Same-scope redeclaration (Lua's repeated `local x` in one block) coalesces
   with the original binding: navigation still reports the right site via
-  per-site visibility, but references and rename span every site of the
-  name — a best-effort flattening accepted alongside the other lexical
-  approximations.
+  per-site visibility, but references, documentHighlight, and rename span
+  every site of the name — a best-effort flattening accepted alongside the
+  other lexical approximations.
 * Removing `QueryKind::Locals` is a breaking config change: explicit
   `kind = "locals"` query entries fail deserialization with an
   unknown-variant error. No alias is kept; the migration is deleting the
