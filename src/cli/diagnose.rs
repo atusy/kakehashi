@@ -21,7 +21,6 @@
 //!
 //! File selection mirrors `format` (see [`crate::cli::files`]).
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -205,7 +204,14 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     };
 
     let mut report = Report::default();
-    let mut output = String::new();
+    // Stream per file: a single reused buffer holds one file's rendered
+    // diagnostics, so peak memory is bounded by the noisiest file rather than
+    // the whole run. Every file is still scanned (the exit code depends on
+    // whether ANY diagnostic across the set meets --threshold), so a closed
+    // consumer only stops further writes — it can't shortcut the scan.
+    let mut stdout = std::io::stdout().lock();
+    let mut buf = String::new();
+    let mut pipe_closed = false;
     for file in &files {
         // Collected paths are absolute; report them cwd-relative so the output
         // stays readable (and editor-openable) in deep trees.
@@ -225,16 +231,30 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             eprintln!("error: {display}: {failure}");
             report.operational_error = true;
         }
+        buf.clear();
         report.record_file(
             &display,
             outcome.diagnostics,
             options.output_format,
             options.threshold,
-            &mut output,
+            &mut buf,
         );
+        if !pipe_closed && !buf.is_empty() {
+            match write_chunk(&mut stdout, &buf) {
+                WriteState::Open => {}
+                // Consumer closed the pipe (`… | head`): stop writing, but keep
+                // scanning so the exit code stays correct.
+                WriteState::PipeClosed => pipe_closed = true,
+                WriteState::Failed => {
+                    report.operational_error = true;
+                    pipe_closed = true;
+                }
+            }
+        }
     }
+    drop(stdout);
 
-    finish(&output, &report, files.len(), options)
+    summarize(&report, files.len(), options)
 }
 
 /// Stdin mode: diagnose stdin as if it were `--stdin-filename`.
@@ -273,35 +293,58 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         eprintln!("error: {display}: {failure}");
         report.operational_error = true;
     }
-    let mut output = String::new();
+    let mut buf = String::new();
     report.record_file(
         &display,
         outcome.diagnostics,
         options.output_format,
         options.threshold,
-        &mut output,
+        &mut buf,
     );
-
-    finish(&output, &report, 1, options)
-}
-
-/// Write the buffered diagnostics to stdout, print the summary (unless
-/// `--quiet`), and return the exit code.
-fn finish(output: &str, report: &Report, file_count: usize, options: &DiagnoseOptions) -> u8 {
-    // SIGPIPE is ignored in diagnose mode (the bridge needs BrokenPipe as a
-    // recoverable error), so a consumer that stops reading (`… | head`)
-    // surfaces here as a write error rather than killing the process — its
-    // early exit is normal, not ours.
-    let mut stdout = std::io::stdout().lock();
-    if let Err(e) = stdout
-        .write_all(output.as_bytes())
-        .and_then(|()| stdout.flush())
-        && e.kind() != std::io::ErrorKind::BrokenPipe
-    {
-        eprintln!("error: failed to write stdout: {e}");
-        return EXIT_ERROR;
+    if !buf.is_empty() {
+        let mut stdout = std::io::stdout().lock();
+        // A closed consumer (`… | head`) is its normal early exit, not ours;
+        // only a real write error is operational.
+        if let WriteState::Failed = write_chunk(&mut stdout, &buf) {
+            report.operational_error = true;
+        }
     }
 
+    summarize(&report, 1, options)
+}
+
+/// Outcome of a streaming write to stdout.
+enum WriteState {
+    /// The chunk was written; keep streaming.
+    Open,
+    /// The consumer closed the pipe (e.g. `… | head`) — its normal early exit,
+    /// not ours. Stop writing.
+    PipeClosed,
+    /// A real stdout write error — an operational failure (exit 2).
+    Failed,
+}
+
+/// Write one already-rendered chunk to stdout and flush it, so the bytes stream
+/// and a closed pipe is detected promptly (rather than after a full block
+/// buffer fills). SIGPIPE is ignored in diagnose mode (the bridge needs
+/// BrokenPipe as a recoverable error), so a closed consumer surfaces here as a
+/// `BrokenPipe` write error instead of killing the process.
+fn write_chunk(stdout: &mut impl std::io::Write, chunk: &str) -> WriteState {
+    match stdout
+        .write_all(chunk.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => WriteState::Open,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => WriteState::PipeClosed,
+        Err(e) => {
+            eprintln!("error: failed to write stdout: {e}");
+            WriteState::Failed
+        }
+    }
+}
+
+/// Print the run summary (unless `--quiet`) to stderr and return the exit code.
+fn summarize(report: &Report, file_count: usize, options: &DiagnoseOptions) -> u8 {
     if !options.quiet {
         let file_label = if file_count == 1 { "file" } else { "files" };
         let diag_label = if report.total == 1 {
@@ -364,9 +407,17 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
 }
 
 /// Collapse a (possibly multi-line) diagnostic message onto one line so it
-/// stays parseable in the line-oriented grep/quickfix formats.
+/// stays parseable in the line-oriented grep/quickfix formats. Single-pass: no
+/// intermediate `Vec` of words.
 fn one_line(message: &str) -> String {
-    message.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(message.len());
+    for word in message.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 /// The lower-case severity word. A diagnostic with no severity is treated as
