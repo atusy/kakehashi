@@ -67,7 +67,9 @@ The existing `QueryKind::Locals` pipeline (loading, storage, auto-install of
 `locals.scm`) is **removed** in the same change — it is consumerless today,
 and its semantics are not ours to define. `bindings` joins the config-time
 `QueryKind` set in its place (`kind = "bindings"` in explicit query entries,
-filename inference for `bindings.scm`). An explicit `kind = "locals"` in
+filename inference for `bindings.scm`) — an engine-consumed kind like
+`highlights`, resolved at load time; captures-protocol's request-time kinds
+stay file-defined and un-enumerated, unaffected by this. An explicit `kind = "locals"` in
 user config becomes a hard deserialization error once the variant is gone —
 surfaced as-is rather than aliased, per the delete-on-supersede posture —
 while stale `locals.scm` paths without an explicit kind are already skipped
@@ -105,6 +107,13 @@ carry no grammar of their own and no new property-key syntax is introduced.
 | `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable — provided those definitions declare the matching namespaces via `definition.namespace`. |
 | `scope.visible-to-nested` | `true` (default) / `false` | When `false`, this scope's bindings are skipped when the lookup walk arrives **from a nested scope**; references directly in the scope still see them. Expresses Python class bodies (methods and comprehensions inside the class do not see class-level names; statements in the body do). |
 
+Which visibility a construct declares is the query author's accuracy
+tradeoff, not an engine concern: JS `let` can declare `scope` to mirror
+temporal-dead-zone shadowing (pre-declaration references bind to the inner
+declaration, as the runtime's error semantics imply), where Lua's
+`local x = x` declares `after` because its right-hand side really does read
+the outer binding.
+
 ### Resolution algorithm (the engine's entire language model)
 
 Per layer, per parsed version:
@@ -123,17 +132,22 @@ Per layer, per parsed version:
    pattern-match end byte for `after`, the definition node's start byte
    for `declaration`.
 3. For a `@reference` — recorded at collection with its node range, name
-   text `N`, and namespace list `NS` — at position `P`: walk scopes
-   innermost → outermost. In each scope, for each namespace in `NS`
-   order, look up the binding named `N` in that namespace; it is visible
-   when at least one of its sites has visibility start **at or before**
-   `P`. The first visible binding ends the walk (natural shadowing). The
-   definition site reported for it is the one whose **definition node**
-   starts latest at or before `P` (re-binding resolves to the nearest
-   preceding site); when every site's node starts after `P` — possible
-   only when visibility came from a `scope` site, since an `after` or
-   `declaration` site visible at `P` necessarily starts at or before it
-   — the earliest site is reported (hoisting). Skip a
+   text `N`, and namespace list `NS` — at position `P`, the reference
+   node's start byte (a cursor anywhere within the node identifies the
+   reference): walk scopes innermost → outermost. In each scope, for
+   each namespace in `NS` order, look up the binding named `N` in that
+   namespace; it is visible when at least one of its sites has
+   visibility start **at or before** `P`. The first visible binding ends
+   the walk (natural shadowing). The definition site reported for it is
+   chosen among the sites **themselves visible at `P`**: the one whose
+   definition node starts latest at or before `P` (re-binding resolves
+   to the nearest preceding site, and a later same-scope redeclaration
+   whose visibility has not started yet — Lua's `local x = 1;
+   local x = x` — cannot capture the reference); when every visible
+   site's node starts after `P` — possible only when visibility came
+   from a `scope` site, since an `after` or `declaration` site visible
+   at `P` necessarily starts at or before it — the earliest one is
+   reported (hoisting). Skip a
    scope's bindings when it has `visible-to-nested false` and is not the
    innermost scope containing `P`; stop the walk for a namespace once a
    scope's `inherits` setting excludes it (`false` excludes every
@@ -304,6 +318,11 @@ posture because the definition *site* shown is still textually real.
   fails to capture survive a rename and must be found by the user (or a
   bridge server). The `prepareRename` gate bounds *when* a rename is offered,
   not *how complete* it is.
+* Same-scope redeclaration (Lua's repeated `local x` in one block) coalesces
+  with the original binding: navigation still reports the right site via
+  per-site visibility, but references and rename span every site of the
+  name — a best-effort flattening accepted alongside the other lexical
+  approximations.
 * Removing `QueryKind::Locals` is a breaking config change: explicit
   `kind = "locals"` query entries fail deserialization with an
   unknown-variant error. No alias is kept; the migration is deleting the
