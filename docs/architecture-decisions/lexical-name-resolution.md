@@ -111,6 +111,7 @@ scopes, definitions, references, and extent alike.
 |---|---|---|
 | `definition.scope` | `local` (default) / `parent` / `global` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, or the layer root. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. |
 | `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting; Python assignments — a name assigned anywhere in a Python scope is local to the *entire* scope, so a pre-assignment reference binds locally rather than reading outward, mirroring UnboundLocalError instead of a silent outer-scope read). `after` = from the **end byte of the pattern's match** onward, defined as the largest end byte among all nodes the match captured (vocabulary and `@_`-prefixed captures alike) — in Lua's `local x = x` the pattern captures the whole declaration statement, so the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
+| `definition.rebind` | `merge` (default) / `fresh` | What happens when a definition's `(name, namespace)` already exists in the registering scope. `merge` adds a site to the existing binding — `x = 1` then `x = 2` is one variable (Python/JS re-assignment). `fresh` starts a **new** binding that shadows the previous one from its own visibility start onward — each Rust/ML `let x = …` is a distinct variable, so `let x = x + 1` reads the prior `x` yet rename/references on either never cross the shadow boundary. Any number of `fresh` rebinds may stack; resolution orders them by visibility start (pairing `fresh` with `after`/`declaration` derives each rebind's start from its own declaration — the match end or the definition-node start — so distinct declarations order textually). |
 | `definition.namespace` | string, default `default` | The binding's namespace. |
 | `reference.namespace` | space-separated strings, default `default` | Namespaces this reference may bind to, searched in order within each scope. A type-position reference declares `"type"`; an ambiguous-position reference declares `"type default"`. Matching is by equality — an unannotated reference does **not** match an annotated definition, which is the conservative direction (silence over a wrong answer). |
 | `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable — provided those definitions declare the matching namespaces via `definition.namespace`. |
@@ -131,32 +132,44 @@ Per layer, per parsed version:
    scope tree from `@scope` captures (implicit root scope = the layer
    root), nested by node containment.
 2. Register each `@definition` in its scope after applying the
-   `definition.scope` lift. A definition whose `(name, namespace)` already
-   exists in the registering scope does not create a second binding — it
-   adds a **definition site** to the existing one, so re-assignment
-   (`x = 1` … `x = 2`) yields one binding with two sites, never two
-   competing bindings. Each site records its label, the definition
-   node's range (what navigation reports), and its visibility start:
-   the **registering** scope's start byte for `scope` visibility, the
+   `definition.scope` lift. When a definition's `(name, namespace)`
+   already exists in the registering scope, `definition.rebind` decides
+   what happens: the default `merge` adds a **definition site** to the
+   most recent existing binding, so re-assignment (`x = 1` … `x = 2`)
+   yields one binding with two sites, never two competing bindings;
+   `fresh` instead starts a new binding, so each Rust `let x = …` shadow
+   is its own binding with its own reference set. Either way a scope may
+   hold several bindings for one `(name, namespace)`, ordered by
+   visibility start. Each site records its label, the definition node's
+   range (what navigation reports), and its visibility start: the
+   **registering** scope's start byte for `scope` visibility, the
    pattern-match end byte for `after`, the definition node's start byte
    for `declaration`.
 3. For a `@reference` — recorded at collection with its node range, name
    text `N`, and namespace list `NS` — at position `P`, the reference
    node's start byte (a cursor anywhere within the node identifies the
    reference): walk scopes innermost → outermost. In each scope, for
-   each namespace in `NS` order, look up the binding named `N` in that
-   namespace; it is visible when at least one of its sites has
-   visibility start **at or before** `P`. The first visible binding ends
-   the walk (natural shadowing). The definition site reported for it is
-   chosen among the sites **themselves visible at `P`**: the one whose
-   definition node starts latest at or before `P` (re-binding resolves
-   to the nearest preceding site, and a later same-scope redeclaration
-   whose visibility has not started yet — Lua's `local x = 1;
-   local x = x` — cannot capture the reference); when every visible
-   site's node starts after `P` — possible only when visibility came
-   from a `scope` site, since an `after` or `declaration` site visible
-   at `P` necessarily starts at or before it — the earliest one is
-   reported (hoisting). Skip a
+   each namespace in `NS` order, consider the bindings named `N` in that
+   namespace; a binding is visible when at least one of its sites has
+   visibility start **at or before** `P`. If any are visible, the one
+   with the latest such visibility start wins and ends the walk — one
+   rule for both kinds of shadowing: an inner scope beats an outer one,
+   and within a scope a later `fresh` rebind beats an earlier one (so a
+   reference resolves to the most recent shadow in scope, never to one
+   it shadows). A tie in visibility start — when two same-name bindings
+   share one (`fresh` with `scope` visibility shares the scope start
+   byte; two definitions from a single match share the match end) — is
+   broken by the later definition node, so selection stays deterministic.
+   The definition site reported for the winning binding is
+   chosen among **its** sites visible at `P`: the one whose definition
+   node starts latest at or before `P` (`merge` re-binding resolves to
+   the nearest preceding site, and a later same-scope site whose
+   visibility has not started yet — Lua's `local x = 1; local x = x` —
+   cannot capture the reference); when every visible site's node starts
+   after `P` — possible only when visibility came from a `scope` site,
+   since an `after` or `declaration` site visible at `P` necessarily
+   starts at or before it — the earliest one is reported (hoisting).
+   Skip a
    scope's bindings when it has `visible-to-nested false` and is not the
    innermost scope containing `P`; stop the walk for a namespace once a
    scope's `inherits` setting excludes it (`false` excludes every
@@ -308,7 +321,7 @@ the miss policy keeps the resolver silent.
   and the path to better accuracy is editing a `.scm` asset, with no Rust
   release.
 * The engine's correctness surface is small and language-free: scope-tree
-  construction plus six property semantics. It can be tested exhaustively
+  construction plus seven property semantics. It can be tested exhaustively
   with synthetic fixtures, while per-language assets are validated separately
   with fixture documents and expected definition↔reference pairs — adding a
   language adds no Rust tests.
@@ -336,11 +349,14 @@ the miss policy keeps the resolver silent.
   fails to capture survive a rename and must be found by the user (or a
   bridge server). The `prepareRename` gate bounds *when* a rename is offered,
   not *how complete* it is.
-* Same-scope redeclaration (Lua's repeated `local x` in one block) coalesces
-  with the original binding: navigation still reports the right site via
-  per-site visibility, but references, documentHighlight, and rename span
-  every site of the name — a best-effort flattening accepted alongside the
-  other lexical approximations.
+* Same-scope redeclaration is the query author's call via
+  `definition.rebind`: `fresh` (Rust/ML `let` shadowing) keeps each
+  redeclaration a distinct binding, so rename and references stop at the
+  shadow boundary and never touch a variable the cursor's binding shadows;
+  the default `merge` (re-assignment, Lua's repeated `local x`) coalesces
+  them, so references / documentHighlight / rename span every site of the
+  name — a best-effort flattening for languages where the redeclaration is
+  the same variable or the distinction does not warrant separate bindings.
 * Removing `QueryKind::Locals` is a breaking config change: explicit
   `kind = "locals"` query entries fail deserialization with an
   unknown-variant error. No alias is kept; the migration is deleting the
