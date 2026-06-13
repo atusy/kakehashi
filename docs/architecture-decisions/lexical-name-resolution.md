@@ -79,7 +79,7 @@ silently by filename inference.
 
 | Capture | Meaning |
 |---|---|
-| `@scope` | A node that opens a lexical scope. The layer root is always an implicit scope. |
+| `@scope` | A node that opens a lexical scope. The layer root — the layer tree's root node, spanning the region the injection occupies (the whole document for the top layer) — is always an implicit scope; its start byte, the anchor for top-level `scope` visibility, is the layer's first byte. |
 | `@definition` / `@definition.<label>` | A name-introducing node (the identifier itself, not the whole declaration). The optional `<label>` is an **opaque string**: the engine attaches no semantics to it. It serves as a property-targeting key within a pattern (below) and is surfaced in results for future use (e.g. `SymbolKind` mapping). |
 | `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references — the exclusion happens at collection, so a node registered as a definition site never enters the reference set. |
 
@@ -282,6 +282,12 @@ What this approximation gets wrong is call-path-dependent shadowing
 it); those references resolve to the global site instead of staying
 unresolved, an accepted deviation from the strict silence-over-guessing
 posture because the definition *site* shown is still textually real.
+The same flattening propagates into rename and references: with every
+definition of the name registered at the layer root, they operate on one
+coalesced binding — effectively a document-wide textual rename for that
+name, which is what editors offer for such languages anyway. An author who
+considers that too coarse for a construct simply leaves it uncaptured, and
+the miss policy keeps the resolver silent.
 
 ## Consequences
 
