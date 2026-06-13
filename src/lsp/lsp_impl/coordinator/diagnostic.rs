@@ -3,13 +3,15 @@ use crate::language::InjectionResolver;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
-use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings;
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
 use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
-use crate::lsp::lsp_impl::text_document::publish_diagnostic::collect_push_diagnostics;
+use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
+    DiagnosticSnapshot, collect_push_diagnostics,
+};
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
 use tower_lsp_server::Client;
@@ -89,18 +91,16 @@ impl DiagnosticScheduler {
             .register_task(uri, task.abort_handle());
     }
 
-    /// Prepare per-region diagnostic contexts for a background task.
+    /// Prepare the per-layer diagnostic snapshot for a background task
+    /// (cross-layer-aggregation).
     ///
     /// Extracts all data synchronously before spawning to avoid lifetime issues
-    /// with `self` references in async tasks. The three return states are
-    /// distinct: `None` (document missing, no snapshot, or no
-    /// language/injection config), `Some(Vec::new())` (no injection regions —
-    /// caller should clear diagnostics), and `Some(vec![...])` (regions ready
-    /// for requests).
-    pub(crate) fn prepare_diagnostic_snapshot(
-        &self,
-        uri: &Url,
-    ) -> Option<Vec<DocumentRequestContext>> {
+    /// with `self` references in async tasks. Return states: `None` (document
+    /// missing, no snapshot, no language, or nothing that could ever
+    /// contribute — skip publishing), `Some(snapshot)` with no contributors
+    /// (caller publishes empty to clear), and `Some(snapshot)` with
+    /// virt regions and/or a host context ready for requests.
+    pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
         let (snapshot, language_name) = {
             let doc = self.documents.get(uri)?;
             let snapshot = doc.snapshot()?;
@@ -113,71 +113,117 @@ impl DiagnosticScheduler {
             (snapshot, language_name)
         };
 
-        // Layer gate (cross-layer-aggregation), keyed by the same method name
-        // as the aggregation config below. Returning an empty snapshot (not
-        // None) publishes an empty diagnostics list, clearing anything a
-        // previously-enabled configuration left in the editor.
+        // Cross-layer gating, keyed by the same method name as the
+        // aggregation configs below. A layer gated off still yields a
+        // snapshot (with that layer absent) so that publishing an empty list
+        // clears anything a previously-enabled configuration left behind.
         let settings = self.settings_manager.load_settings();
-        if !crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+        let layer_cfg = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
             &settings,
             &language_name,
             "textDocument/publishDiagnostics",
-        )
-        .allows(crate::config::settings::LayerSource::Virt)
-        {
-            log::debug!(
-                target: LOG_TARGET,
-                "virt layer disabled for {} via layers.aggregation order",
-                language_name
-            );
-            return Some(Vec::new());
-        }
-
-        let injection_query = self.language.injection_query(&language_name)?;
-
-        let all_regions = InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            uri,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
         );
 
-        if all_regions.is_empty() {
-            return Some(Vec::new());
-        }
+        // Virt layer: `None` = the document can never have virt diagnostics
+        // (no injection query), distinct from `Some(vec![])` = gated off or
+        // currently no regions (publish-empty-to-clear).
+        let virt_contexts: Option<Vec<DocumentRequestContext>> =
+            if !layer_cfg.allows(crate::config::settings::LayerSource::Virt) {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "virt layer disabled for {} via layers.aggregation priorities",
+                    language_name
+                );
+                Some(Vec::new())
+            } else {
+                self.language
+                    .injection_query(&language_name)
+                    .map(|injection_query| {
+                        let all_regions = InjectionResolver::resolve_all(
+                            &self.language,
+                            self.bridge.node_tracker(),
+                            uri,
+                            snapshot.tree(),
+                            snapshot.text(),
+                            injection_query.as_ref(),
+                        );
 
-        let mut contexts = Vec::new();
-        for resolved in all_regions {
-            let configs = self.bridge.get_all_configs_for_language(
-                &settings,
-                &language_name,
-                &resolved.injection_language,
-            );
-            if configs.is_empty() {
-                continue;
-            }
+                        let mut contexts = Vec::new();
+                        for resolved in all_regions {
+                            let configs = self.bridge.get_all_configs_for_language(
+                                &settings,
+                                &language_name,
+                                &resolved.injection_language,
+                            );
+                            if configs.is_empty() {
+                                continue;
+                            }
 
-            let agg = resolve_aggregation_config_from_settings(
-                &settings,
-                &language_name,
-                &resolved.injection_language,
-                "textDocument/publishDiagnostics",
-            );
+                            let agg = resolve_aggregation_config_from_settings(
+                                &settings,
+                                &language_name,
+                                &resolved.injection_language,
+                                "textDocument/publishDiagnostics",
+                            );
 
-            contexts.push(DocumentRequestContext {
-                uri: uri.clone(),
-                resolved,
-                configs,
-                upstream_request_id: None,
-                priorities: agg.priorities,
-                strategy: agg.strategy,
-                max_fan_out: agg.max_fan_out,
-            });
-        }
+                            contexts.push(DocumentRequestContext {
+                                uri: uri.clone(),
+                                resolved,
+                                configs,
+                                upstream_request_id: None,
+                                priorities: agg.priorities,
+                                strategy: agg.strategy,
+                                max_fan_out: agg.max_fan_out,
+                            });
+                        }
+                        contexts
+                    })
+            };
 
-        Some(contexts)
+        // Host layer (host-document-bridge): participates when listed in the
+        // layer priorities AND opted in via bridge._self.enabled with a
+        // host-capable server. No upstream request id — push tasks are not
+        // tied to a client request.
+        let host = if layer_cfg.allows(crate::config::settings::LayerSource::Host) {
+            settings
+                .resolve_host_language_settings(&language_name)
+                .filter(|lang_settings| lang_settings.is_host_bridging_enabled())
+                .and_then(|lang_settings| {
+                    let configs = self
+                        .bridge
+                        .get_host_configs_for_language(&settings, &language_name);
+                    if configs.is_empty() {
+                        return None;
+                    }
+                    let agg =
+                        lang_settings.resolve_host_aggregation("textDocument/publishDiagnostics");
+                    Some(HostRequestContext {
+                        uri: uri.clone(),
+                        language_id: language_name.clone(),
+                        text: std::sync::Arc::from(snapshot.text()),
+                        configs,
+                        priorities: agg.priorities,
+                        strategy: agg.strategy,
+                        max_fan_out: agg.max_fan_out,
+                        upstream_request_id: None,
+                    })
+                })
+        } else {
+            None
+        };
+
+        // A document that can never contribute (no injection query, no host
+        // participation) keeps the old skip-publishing behavior.
+        let virt_contexts = match (virt_contexts, &host) {
+            (None, None) => return None,
+            (virt, _) => virt.unwrap_or_default(),
+        };
+
+        Some(DiagnosticSnapshot {
+            virt_contexts,
+            host,
+            layer_cfg,
+        })
     }
 }
 

@@ -16,12 +16,14 @@ mod connection;
 pub(crate) mod coordinator;
 mod pool;
 mod protocol;
+mod root_markers;
 mod text_document;
 
 // Re-export public types
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
+pub(crate) use pool::ConnectionReadiness;
 pub use pool::LanguageServerPool;
 pub(crate) use pool::UpstreamId;
 pub(crate) use protocol::RegionOffset;

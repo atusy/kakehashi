@@ -62,7 +62,7 @@ impl LanguageServerPool {
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(host_uri))
             .await?;
         if !handle.has_capability("textDocument/rangeFormatting") {
             return Ok(None);

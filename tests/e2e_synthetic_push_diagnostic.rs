@@ -374,7 +374,7 @@ print(((
     shutdown_client(&mut client);
 }
 
-/// E2E test: layers.order without "virt" gates push diagnostics off
+/// E2E test: layers.priorities without "virt" gates push diagnostics off
 /// (cross-layer-aggregation), publishing an EMPTY diagnostics list so that
 /// anything published before the config flip is cleared rather than frozen.
 ///
@@ -394,7 +394,7 @@ fn e2e_synthetic_push_respects_layers_gate() {
                     "markdown": {
                         "layers": {
                             "aggregation": {
-                                "textDocument/publishDiagnostics": { "order": ["native"] }
+                                "textDocument/publishDiagnostics": { "priorities": ["native"] }
                             }
                         }
                     }
@@ -437,7 +437,7 @@ fn e2e_synthetic_push_respects_layers_gate() {
         .expect("publishDiagnostics should have diagnostics array");
     assert!(
         diagnostics.is_empty(),
-        "virt layer is gated off via layers.order, so the publish must carry \
+        "virt layer is gated off via layers.priorities, so the publish must carry \
          no bridge diagnostics; got: {diagnostics:?}"
     );
 

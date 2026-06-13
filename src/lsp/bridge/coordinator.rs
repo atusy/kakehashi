@@ -221,6 +221,7 @@ impl BridgeCoordinator {
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| !c.cmd.is_empty())
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -271,6 +272,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| !c.cmd.is_empty())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -311,6 +313,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.languages.iter().any(|l| l == host_language))
+                    .filter(|c| !c.cmd.is_empty())
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -705,6 +708,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -738,6 +742,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -760,6 +765,77 @@ mod tests {
     }
 
     #[test]
+    fn test_get_config_skips_server_with_empty_resolved_cmd() {
+        // A concrete entry can inherit everything except cmd from the `_`
+        // wildcard (e.g. the user listed a server name but forgot cmd).
+        // Such a server is unspawnable and must not be selected.
+        let coordinator = BridgeCoordinator::new();
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "_".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                root_markers: Some(vec![".git".to_string()]),
+            },
+        );
+        servers.insert(
+            "broken".to_string(),
+            BridgeServerConfig {
+                cmd: vec![],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                root_markers: None,
+            },
+        );
+
+        // Host bridging opted in for rust, so the host lookup would select
+        // the server if the empty-cmd filter were missing there.
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "_self".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        let settings = WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .get_config_for_language(&settings, "markdown", "rust")
+                .is_none(),
+            "a server whose resolved cmd is empty must be skipped"
+        );
+        assert!(
+            coordinator
+                .get_all_configs_for_language(&settings, "markdown", "rust")
+                .is_empty(),
+            "fan-out must also skip servers with empty resolved cmd"
+        );
+        assert!(
+            coordinator
+                .get_host_configs_for_language(&settings, "rust")
+                .is_empty(),
+            "the host lookup must also skip servers with empty resolved cmd"
+        );
+    }
+
+    #[test]
     fn test_get_all_configs_returns_multiple_servers_for_same_language() {
         let coordinator = BridgeCoordinator::new();
 
@@ -774,6 +850,7 @@ mod tests {
                 cmd: vec!["pyright-langserver".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
         servers.insert(
@@ -782,6 +859,7 @@ mod tests {
                 cmd: vec!["ruff".to_string(), "server".to_string()],
                 languages: vec!["python".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -832,6 +910,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -865,6 +944,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -977,6 +1057,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 
@@ -1195,6 +1276,7 @@ mod tests {
                 cmd: vec!["lua-language-server".to_string()],
                 languages: vec!["lua".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         );
 

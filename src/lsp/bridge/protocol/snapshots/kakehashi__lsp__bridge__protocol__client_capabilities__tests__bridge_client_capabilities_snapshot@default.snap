@@ -4,6 +4,7 @@ expression: capabilities
 ---
 {
   "workspace": {
+    "workspaceFolders": true,
     "diagnostics": {
       "refreshSupport": true
     }

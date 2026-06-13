@@ -2,7 +2,7 @@
 
 **Related Decisions**:
 - [host-document-bridge](host-document-bridge.md) — Host bridging schema (`bridge._self`); declared cross-layer combine logic out of scope, which this decision now covers
-- [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — The unified ordered-allowlist semantics that `order` follows
+- [aggregation-priorities-wildcard](aggregation-priorities-wildcard.md) — The unified ordered-allowlist semantics that the layer `priorities` follows
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method strategies and multi-server merging *within* a bridge target
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard merge machinery reused for the method-keyed map
@@ -27,7 +27,7 @@ Phased roadmap:
    fan-in — and the highest-priority non-empty result wins. A buffered
    lower-priority result waits on a still-pending higher layer (priority
    decides, not arrival), the losing in-flight future is dropped
-   best-effort, and layers absent from `order` are never polled. The
+   best-effort, and layers absent from `priorities` are never polled. The
    latency cost of a layer answering empty is therefore `max`, not `sum`;
    the trade-off is downstream load — the host server is queried even when
    virt ends up winning, mirroring how stage-1 queries every server of a
@@ -35,7 +35,7 @@ Phased roadmap:
    document when `bridge._self.enabled = true`.
 3. **Layer-level `concatenated` for `textDocument/formatting` only** — ✅
    implemented as a true sequential cross-layer pipeline in
-   `formatting_impl`: layers run in `order`, each formatting the previous
+   `formatting_impl`: layers run in priority order, each formatting the previous
    layer's output (virt region edits are applied to the host text, the host
    formatter then formats that intermediate text). With one producing layer
    the minimal edits pass through verbatim (they are against the original by
@@ -44,13 +44,28 @@ Phased roadmap:
    within-region pipeline (concatenated-formatting-pipeline Decision
    point 4), and `None` when the chain round-trips to the original.
    Constraint: virt edits resolve against the parsed snapshot, so virt can
-   only run while the accumulated text still is the snapshot text — an
-   `order` placing virt after a producing layer skips virt with a warning.
+   only run while the accumulated text still is the snapshot text — a
+   `priorities` placing virt after a producing layer skips virt with a warning.
    The default order (virt before host) is unaffected. Under `preferred`
    the walk stays lazy: the first layer producing edits wins and later
    layers are never contacted. Layer strategy applies to full formatting
    only; `textDocument/rangeFormatting` stays on `preferred`, mirroring the
    stage-1 rule.
+4. **Layer-level `concatenated` for diagnostics** — ✅ implemented for both
+   pull (`textDocument/diagnostic`) and synthetic push
+   (`textDocument/publishDiagnostics`): virt and host gate independently on
+   `priorities` membership (host additionally on `bridge._self.enabled`),
+   both layers fan out concurrently, and `combine_layer_diagnostics`
+   applies the resolved strategy — `concatenated` (the default) appends
+   items in `priorities` order, `preferred` returns the first non-empty
+   layer. The host layer is a `textDocument/diagnostic` pull with the real
+   URI (pull-first-diagnostic-forwarding extends to the host role — raw
+   downstream pushes remain unforwarded), combined within the layer per
+   `bridge._self.aggregation` via `dispatch_host_concatenated` /
+   `dispatch_host_preferred`. Diagnostics are joined rather than raced:
+   they are not latency-interactive and `concatenated` needs every layer
+   anyway, so one code path with a pure combine function replaces the
+   `race_layers_preferred` machinery here.
 
 ## Context
 
@@ -93,9 +108,11 @@ violation that led host-document-bridge to reject its Alternative A
 - **Defaults preserve current behavior**: with no user config, requests behave
   as they do today (virt preferred where an injection exists, native
   otherwise; host inert until opted in).
-- **One list semantics**: `order` follows the same ordered-allowlist rule as
-  `priorities` (aggregation-priorities-wildcard), differing only in element
-  type.
+- **One list semantics**: the layer list follows the same ordered-allowlist
+  rule as the stage-1 server list (aggregation-priorities-wildcard), differing
+  only in element type. Both fields are therefore named `priorities` — one
+  name for one semantics — with the element type (closed `LayerSource` enum
+  vs. open server-name strings) carrying the axis distinction.
 
 ## Decision Outcome
 
@@ -112,15 +129,15 @@ Stage-1 types (`AggregationConfig`, `BridgeLanguageConfig`) are untouched.
 ```toml
 # ---- Built-in defaults (declared in code; not user-facing) ----
 [languages._.layers.aggregation._]
-order = ["virt", "host", "native"]   # innermost-first; mirrors "deeper wins"
+priorities = ["virt", "host", "native"]   # innermost-first; mirrors "deeper wins"
 # host is listed but contributes nothing until the user opts in via
-# bridge._self.enabled (host-document-bridge) — order ranks layers,
+# bridge._self.enabled (host-document-bridge) — priorities ranks layers,
 # enabled flags decide whether a bridge target exists at all.
 # strategy: per-method default (concatenated for diagnostics, else preferred)
 
 # ---- User: markdown hover should prefer the host LS, and drop native ----
 [languages.markdown.layers.aggregation."textDocument/hover"]
-order = ["host", "virt"]             # allowlist: native does not run
+priorities = ["host", "virt"]             # allowlist: native does not run
 
 # ---- Stage 1 stays exactly as before: server names within one target ----
 [languages.markdown.bridge._self.aggregation."textDocument/hover"]
@@ -143,9 +160,9 @@ pub enum LayerSource {
 pub struct LayerAggregationConfig {
     /// Ordered allowlist, highest first: layers omitted from the list do
     /// not participate for that method. The set is closed and three-valued,
-    /// so explicit enumeration replaces the `"*"` element used by server
-    /// `priorities` — "the rest" is always spellable by name.
-    pub order: Option<Vec<LayerSource>>,
+    /// so explicit enumeration replaces the `"*"` element used by the
+    /// stage-1 server `priorities` — "the rest" is always spellable by name.
+    pub priorities: Option<Vec<LayerSource>>,
     /// Reuses the stage-1 strategy type; omit for the per-method default.
     pub strategy: Option<AggregationStrategy>,
 }
@@ -162,7 +179,7 @@ pub layers: Option<LayersConfig>,
 ### Two-Stage Aggregation
 
 ```
-Stage 2 (this decision)   layers.aggregation.<m>.order = [virt, host, native]   ← LayerSource enum
+Stage 2 (this decision)   layers.aggregation.<m>.priorities = [virt, host, native]   ← LayerSource enum
                              │      │      └ native handler result
                              │      └ bridge._self.aggregation.priorities  ← LS names
                              └ bridge.<inj>.aggregation.priorities         ← LS names
@@ -180,16 +197,16 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 
 ### Semantics
 
-- **`order` is an ordered allowlist.** Layers omitted from the list do not
-  participate for that method — `order = ["virt", "host"]` suppresses
-  native; `order = []` disables the method across all layers (mirroring
-  `priorities = []`). No `"*"` element is supported: with a closed
-  three-value set, "the rest" is always expressible by explicit enumeration,
-  so the enum stays pure.
-- **`order` ranks; `enabled` gates.** Host participation is additionally
+- **`priorities` is an ordered allowlist.** Layers omitted from the list do
+  not participate for that method — `priorities = ["virt", "host"]`
+  suppresses native; `priorities = []` disables the method across all layers
+  (mirroring the stage-1 `priorities = []`). No `"*"` element is supported:
+  with a closed three-value set, "the rest" is always expressible by explicit
+  enumeration, so the enum stays pure.
+- **`priorities` ranks; `enabled` gates.** Host participation is additionally
   gated by `bridge._self.enabled` (host-document-bridge), and per-injection
   virt participation by `bridge.<inj>.enabled`. These are not a double
-  opt-in: the default `order` already lists host, so enabling
+  opt-in: the default `priorities` already lists host, so enabling
   `bridge._self.enabled = true` is the *only* step a user takes to bring the
   host layer in. A disabled target is simply an empty contributor.
 - **Empty contributors are skipped.** A layer with nothing to say — no native
@@ -199,14 +216,20 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 - **Resolution reuses wildcard machinery.** The method key resolves via
   `resolve_with_wildcard` (method-specific entry inherits unset fields from
   `_`), and the `layers` field participates in the outer language-level
-  wildcard/base merge like `bridge` does. Note `order` is a single field: a
-  method-specific `order` replaces the wildcard's list wholesale, it does
-  not merge element-wise.
-- **Strategy is phased.** Phase 2 implements `preferred` only; every method
-  combines across layers by first-non-empty until then. Once layer-level
-  `concatenated` lands (formatting first, phase 3), the per-method defaults
-  of `default_aggregation_strategy_for_method` apply unchanged
-  (`concatenated` for diagnostics, `preferred` otherwise).
+  wildcard/base merge like `bridge` does. Note `priorities` is a single
+  field: a method-specific `priorities` replaces the wildcard's list
+  wholesale, it does not merge element-wise.
+- **Strategy is phased.** Phase 2 implements `preferred` only; with
+  layer-level `concatenated` landed for formatting (phase 3) and
+  diagnostics (phase 4), the layer defaults come from
+  `default_layer_strategy_for_method`: `concatenated` for diagnostics
+  *and* `textDocument/formatting`, `preferred` otherwise. The formatting
+  default diverges from the bridge level deliberately — the cross-layer
+  pipeline composes disjoint work (virt formats injection regions, host
+  formats the resulting text), whereas multiple servers of one bridge
+  target produce competing whole-document edits, so the bridge default
+  stays `preferred`. Host is opt-in, so the defaults still reproduce
+  single-layer behavior until `bridge._self.enabled = true`.
 - **Nested injections stay implicit.** When injections nest
   (markdown → python → sql), the virt layer resolves deepest-first,
   consistent with the semantic-token priority convention (deeper wins). Depth
@@ -214,13 +237,13 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 
 ### Out of Scope
 
-- **Per-virt-language ordering relative to host**: `order` ranks the three
-  layer kinds, not individual injection languages ("python virt above host,
-  sql virt below host" is not expressible). For position-based requests the
-  virt layer is effectively single-language, and document-wide methods
+- **Per-virt-language ordering relative to host**: `priorities` ranks the
+  three layer kinds, not individual injection languages ("python virt above
+  host, sql virt below host" is not expressible). For position-based requests
+  the virt layer is effectively single-language, and document-wide methods
   default to `concatenated`, so the practical need is unproven. If it
   materializes, a host-relative weight on `bridge.<inj>` is the extension
-  point — not entries in `order`.
+  point — not entries in `priorities`.
 - **Semantic tokens**: the progressive-refinement strategy
   (language-server-bridge-request-strategies Strategy 1) is a *temporal*
   merge — native immediately, bridged tokens replacing them later — not an
@@ -240,22 +263,24 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   resolve as before.
 - **Defaults preserve behavior**: `["virt", "host", "native"]` with host
   inert (opt-in off) and `preferred` reproduces today's routing exactly.
-- **Per-method layer suppression for free**: omitting a layer from `order`
-  (e.g. dropping native for hover) needs no dedicated disable switch —
-  a direct payoff of the allowlist semantics.
+- **Per-method layer suppression for free**: omitting a layer from
+  `priorities` (e.g. dropping native for hover) needs no dedicated disable
+  switch — a direct payoff of the allowlist semantics.
 - **Wildcard machinery reused**: no new resolver path; method-keyed map works
   like `bridge.<key>.aggregation`.
 
 ### Negative
 
-- **Allowlist override footgun**: writing `order = ["host"]` silently drops
+- **Allowlist override footgun**: writing `priorities = ["host"]` silently drops
   virt and native for that method — a user promoting one layer must restate
   the others. Mitigated by schema docs; inherent to allowlist semantics.
 - **Two similarly-shaped maps**: `languages.<lang>.layers.aggregation.<method>` and
   `languages.<lang>.bridge.<key>.aggregation.<method>` are both method-keyed
-  ordered-allowlist configs; users must learn which axis each controls. The
-  distinct field names and element types (`order` of a closed enum vs.
-  `priorities` of open server names) are the guard rail.
+  ordered-allowlist configs sharing the field name `priorities`; users must
+  learn which axis each controls. The element types (closed `LayerSource`
+  enum vs. open server names) and the nesting position are the guard rail —
+  a layer name in a server list is just an unknown server, while a server
+  name in a layer list fails deserialization.
 - **Jargon collision**: tree-sitter communities use "layer" for injection
   nesting depth (`LanguageTree` layers). Mitigated by the doc comment on
   `LayerSource` ("NOT injection nesting depth") and by the enum values making
@@ -269,7 +294,7 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   deferred cost.
 - **Native participates without a catalog entry**: the native layer has no
   `languageServers` entry and no `enabled` flag; its participation is
-  controlled solely by `order` membership.
+  controlled solely by `priorities` membership.
 
 ## Alternatives Considered
 
@@ -307,7 +332,7 @@ Same structure as chosen, but named `aggregation`.
 
 **Rejected because**:
 - Two fields named `aggregation` at different nesting levels with different
-  value types (server-name `priorities` vs. layer `order`) invite confusion
+  value types (server-name priorities vs. layer priorities) invite confusion
   in docs, schema, and resolution code.
 - host-document-bridge already rejected a `LanguageSettings.aggregation`
   field (its Alternative C, for host configuration); reusing the name for a
@@ -323,7 +348,7 @@ files), and "layers" matches the mental model this decision is built on
 
 ### E. Preference order with implicit fallback (first draft of this decision)
 
-`order` as a pure preference: layers omitted from the list still participate,
+`priorities` as a pure preference: layers omitted from the list still participate,
 appended in default relative order — mirroring the *pre*-wildcard `preferred`
 fan-in.
 
@@ -333,13 +358,13 @@ aggregation-priorities-wildcard retires. With the unified allowlist rule,
 "preference with fallback" remains spellable — list every layer — while
 exclusion becomes spellable too.
 
-### F. Default `order = ["virt", "native"]` with order as the host gate
+### F. Default `priorities = ["virt", "native"]` with priorities as the host gate
 
-Exclude host from the default so that listing `"host"` in `order` *is* the
+Exclude host from the default so that listing `"host"` in `priorities` *is* the
 host opt-in, making `bridge._self.enabled` redundant.
 
 **Rejected because**: it splits gating across two mechanisms asymmetrically —
-virt targets would gate via `bridge.<inj>.enabled` but host via `order`
+virt targets would gate via `bridge.<inj>.enabled` but host via `priorities`
 membership — and turning host on per-language would require restating the
 full layer order (allowlist override) instead of flipping one flag.
 Keeping host in the default order costs nothing: a disabled host layer is an

@@ -46,7 +46,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<DocumentSymbol>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(host_uri))
             .await?;
         if !handle.has_capability("textDocument/documentSymbol") {
             return Ok(None);

@@ -4,7 +4,7 @@
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — Fan-out/fan-in mechanics that consume `priorities`
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method strategies and merging rules
 - [concatenated-formatting-pipeline](concatenated-formatting-pipeline.md) — The formatting pipeline whose allowlist semantics this decision generalizes
-- [cross-layer-aggregation](cross-layer-aggregation.md) — Layer ordering (`order`), which adopts the same allowlist rule
+- [cross-layer-aggregation](cross-layer-aggregation.md) — Layer ordering (`priorities` over layers), which adopts the same allowlist rule
 
 ## Implementation Status
 
@@ -31,7 +31,7 @@ the strategy:
 Two problems with keeping the dual semantics:
 
 1. **Inconsistency compounds.** cross-layer-aggregation introduces a second
-   ordered list (`layers.aggregation.<method>.order`). Every new list must pick a side,
+   ordered list (`layers.aggregation.<method>.priorities`). Every new list must pick a side,
    and users must remember which list means which.
 2. **Exclusion and demotion are inexpressible under `preferred`.** A user
    cannot say "only foo" (fallback always re-admits the rest), nor "foo
@@ -41,8 +41,8 @@ Two problems with keeping the dual semantics:
 
 ## Decision Drivers
 
-- **One rule for every ordered list**: `priorities` (server names) and
-  `order` (layers) should share semantics, differing only in element type.
+- **One rule for every ordered list**: the server-name list and
+  the layer list should share semantics (and the `priorities` name), differing only in element type.
 - **Express exclusion and demotion**, not just promotion.
 - **Defaults preserve behavior**: configs without `priorities` must behave
   exactly as today.
@@ -112,7 +112,7 @@ per-method bridge kill switch, which had no spelling before.
 
 - **One list semantics everywhere**: the formatting pipeline's
   allowlist+order behavior stops being an exception and becomes the general
-  rule; cross-layer `order` adopts the same rule with a closed element set.
+  rule; the cross-layer `priorities` adopts the same rule with a closed element set.
 - **New expressiveness**: per-method exclusion (`[]`, or omission from the
   list) and demotion below the unlisted rest (`["*", "zzz"]`) were previously
   unwritable.
@@ -139,8 +139,8 @@ per-method bridge kill switch, which had no spelling before.
 
 ### A. Keep the dual semantics (status quo)
 
-**Rejected because**: every new ordered list (starting with cross-layer
-`order`) would have to pick a side, and the `preferred` reading cannot
+**Rejected because**: every new ordered list (starting with the cross-layer
+layer `priorities`) would have to pick a side, and the `preferred` reading cannot
 express exclusion or demotion at all.
 
 ### B. `exclusive = true` flag beside `priorities`

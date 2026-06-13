@@ -27,14 +27,16 @@ Partially implemented:
   real URI and real coordinates) and the result comes back untranslated —
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
-  `preferred` semantics): layers are tried lazily in `order` — by default
+  `preferred` semantics): layers are tried lazily in `priorities` — by default
   virt first, host as fallback. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
   formatting, and rangeFormatting (which shares the formatting layer key).
-  Not covered: diagnostics (needs cross-layer `concatenated`; push/pull
-  stay virt-gated), semantic tokens (native-only), and the experimental
+  Diagnostics are covered with real cross-layer `concatenated` (the
+  cross-layer-aggregation diagnostics phase): pull and synthetic push both
+  merge host-server pulls (real URI) with the virt regions' results per the
+  layer strategy. Not covered: semantic tokens (native-only) and the experimental
   documentColor/colorPresentation pair. `completionItem/resolve` routes by
   the envelope the virt fan-out stamps into `CompletionItem.data`; host
   completion items carry no envelope and resolve falls back gracefully

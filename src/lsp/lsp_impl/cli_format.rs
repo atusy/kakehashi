@@ -289,6 +289,7 @@ impl Kakehashi {
                         .get_or_create_connection_wait_ready(
                             &config.server_name,
                             &config.config,
+                            Some(uri),
                             timeout,
                         )
                         .await;

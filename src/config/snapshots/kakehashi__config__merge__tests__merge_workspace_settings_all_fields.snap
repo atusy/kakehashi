@@ -83,7 +83,8 @@ expression: result
       "languages": [
         "lua"
       ],
-      "initializationOptions": null
+      "initializationOptions": null,
+      "rootMarkers": null
     },
     "pyright": {
       "cmd": [
@@ -93,7 +94,8 @@ expression: result
       "languages": [
         "python"
       ],
-      "initializationOptions": null
+      "initializationOptions": null,
+      "rootMarkers": null
     },
     "rust-analyzer": {
       "cmd": [
@@ -107,7 +109,8 @@ expression: result
         "linkedProjects": [
           "./Cargo.toml"
         ]
-      }
+      },
+      "rootMarkers": null
     }
   }
 }

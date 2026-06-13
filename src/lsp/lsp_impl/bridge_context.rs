@@ -58,9 +58,12 @@ pub(crate) struct DocumentRequestContext {
 /// verbatim, plus the servers selected for the host role and the `_self`
 /// aggregation settings.
 ///
-/// The layer strategy is not carried: within the host layer, servers
-/// combine with `preferred` only. The cross-layer strategy lives in the
-/// caller (`walk_layers` / the formatting pipeline).
+/// `strategy` is the *within-host-layer* combine from
+/// `bridge._self.aggregation` — consumed by diagnostics (concatenated
+/// across host servers by default); the verbatim raw-request path combines
+/// with `preferred` regardless. The *cross-layer* strategy lives in the
+/// caller (`walk_layers` / the formatting pipeline / the diagnostics
+/// layer merge).
 pub(crate) struct HostRequestContext {
     /// The real client URI (forwarded verbatim — no virtual URI).
     pub(crate) uri: Url,
@@ -73,6 +76,8 @@ pub(crate) struct HostRequestContext {
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// Ordered allowlist from `bridge._self.aggregation` (wildcard-merged).
     pub(crate) priorities: Vec<String>,
+    /// Within-host-layer combine strategy from `bridge._self.aggregation`.
+    pub(crate) strategy: AggregationStrategy,
     /// Fan-out cap from `bridge._self.aggregation`.
     pub(crate) max_fan_out: Option<usize>,
     /// The upstream JSON-RPC request ID for cancel forwarding.
@@ -172,8 +177,8 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
 }
 
 /// Race the virt and host layer futures **concurrently** and decide by the
-/// resolved layer `order` (cross-layer-aggregation, `preferred` semantics) —
-/// the layer-level analogue of the stage-1 `preferred` fan-in:
+/// resolved layer `priorities` (cross-layer-aggregation, `preferred`
+/// semantics) — the layer-level analogue of the stage-1 `preferred` fan-in:
 ///
 /// - both layers' requests are in flight at once (latency = max, not sum);
 /// - a completed lower-priority result is buffered while a higher-priority
@@ -181,11 +186,11 @@ pub(crate) fn is_empty_layer_value(value: &serde_json::Value) -> bool {
 /// - a higher-priority layer that completes non-empty wins immediately and
 ///   the still-pending loser future is dropped (best-effort abandonment,
 ///   like the stage-1 `abort_all`);
-/// - layers absent from `order` are never polled (their future is created
-///   but async blocks are lazy);
+/// - layers absent from `priorities` are never polled (their future is
+///   created but async blocks are lazy);
 /// - native has no contributor and is skipped.
 pub(crate) async fn race_layers_preferred<R>(
-    order: &[LayerSource],
+    priorities: &[LayerSource],
     virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     is_nonempty: impl Fn(&R) -> bool,
@@ -193,17 +198,19 @@ pub(crate) async fn race_layers_preferred<R>(
     let mut virt_fut = std::pin::pin!(virt);
     let mut host_fut = std::pin::pin!(host);
     // `None` = still pending; `Some(result)` = completed. Layers not in
-    // `order` start as completed-empty so their guard never enables and the
-    // decision walk skips them.
-    let mut virt_state: Option<Option<R>> = (!order.contains(&LayerSource::Virt)).then_some(None);
-    let mut host_state: Option<Option<R>> = (!order.contains(&LayerSource::Host)).then_some(None);
+    // `priorities` start as completed-empty so their guard never enables and
+    // the decision walk skips them.
+    let mut virt_state: Option<Option<R>> =
+        (!priorities.contains(&LayerSource::Virt)).then_some(None);
+    let mut host_state: Option<Option<R>> =
+        (!priorities.contains(&LayerSource::Host)).then_some(None);
 
     loop {
         // Decision walk in priority order: a pending higher-priority layer
         // blocks; a completed empty one falls through; a completed non-empty
         // one wins.
         let mut blocked = false;
-        for layer in order {
+        for layer in priorities {
             let slot = match layer {
                 LayerSource::Virt => &mut virt_state,
                 LayerSource::Host => &mut host_state,
@@ -323,6 +330,46 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
     }
     pairs.sort();
     pairs
+}
+
+/// Names of concrete `languageServers` entries whose wildcard-resolved `cmd`
+/// is still empty — unspawnable, so every lookup silently skips them
+/// (wildcard-config-inheritance). Before cmd became optional (to allow a
+/// defaults-only `languageServers._` entry) this was a hard deserialization
+/// error; the warning restores that feedback at settings-apply time instead
+/// of leaving the user with a server that never runs.
+pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<String> {
+    let servers = &settings.language_servers;
+    let mut names: Vec<String> = servers
+        .keys()
+        .filter(|name| *name != crate::config::WILDCARD_KEY)
+        .filter(|name| {
+            crate::config::resolve_with_wildcard(
+                servers,
+                name,
+                crate::config::merge_bridge_server_configs,
+            )
+            .is_none_or(|config| config.cmd.is_empty())
+        })
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Render the single aggregated client-facing warning for unspawnable
+/// `languageServers` entries (empty resolved `cmd`). `None` when there is
+/// nothing to warn about.
+pub(crate) fn format_unspawnable_servers_warning(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "languageServers with no 'cmd' (after merging the '_' wildcard \
+         defaults): {}. Such servers cannot be spawned and are skipped by \
+         every request.",
+        names.join(", ")
+    ))
 }
 
 /// Render the single aggregated client-facing warning for misconfigured
@@ -518,12 +565,14 @@ impl Kakehashi {
 
     /// Whether the virt layer participates for this host language and LSP
     /// method (cross-layer-aggregation): when `"virt"` is absent from the
-    /// resolved `layers.order`, the bridge dispatch is skipped entirely.
+    /// resolved `layers.priorities`, the bridge dispatch is skipped entirely.
     ///
-    /// Used by entry points outside the [`Self::walk_layers`] race —
-    /// notably the push-diagnostics scheduler and the virt-only handlers
-    /// (diagnostics, documentColor) that have no host contributor yet.
-    /// Handlers on the walk get layer membership from the race itself.
+    /// Used by entry points outside the [`Self::walk_layers`] race — the
+    /// shared bridge preamble and the virt-only handlers (rangeFormatting's
+    /// region pass, documentColor) that have no host contributor yet.
+    /// Handlers on the walk get layer membership from the race itself, and
+    /// the diagnostics paths resolve the full layer config directly (they
+    /// gate virt and host independently).
     pub(crate) fn virt_layer_enabled(&self, host_language: &str, method_name: &str) -> bool {
         self.resolve_layer_config(host_language, method_name)
             .allows(LayerSource::Virt)
@@ -543,7 +592,7 @@ impl Kakehashi {
     ) -> Option<DocumentRequestContext> {
         if !self.virt_layer_enabled(&preamble.language_name, method_name) {
             log::debug!(
-                "{}: virt layer disabled for {} via layers.aggregation order",
+                "{}: virt layer disabled for {} via layers.aggregation priorities",
                 method_name,
                 preamble.language_name
             );
@@ -647,6 +696,7 @@ impl Kakehashi {
             language_id: language_name,
             configs,
             priorities: agg.priorities,
+            strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             upstream_request_id: current_upstream_id(),
         })
@@ -681,6 +731,7 @@ impl Kakehashi {
                             request_method,
                             params,
                             t.upstream_id,
+                            crate::lsp::bridge::ConnectionReadiness::FailFast,
                         )
                         .await
                 }
@@ -719,10 +770,10 @@ impl Kakehashi {
     /// highest-priority non-empty result wins.
     ///
     /// - `virt` is the handler's existing injection-bridge future, polled
-    ///   only when the virt layer is in `order`.
+    ///   only when the virt layer is in `priorities`.
     /// - The host layer forwards `raw_params` verbatim
     ///   (host-document-bridge) and maps the raw result via `host_parse`.
-    /// - `layer_method` keys `layers.order` and the `_self` aggregation
+    /// - `layer_method` keys `layers.priorities` and the `_self` aggregation
     ///   (e.g. rangeFormatting shares `textDocument/formatting`);
     ///   `request_method` is what goes on the wire and gates capability.
     /// - Native has no contributor for bridged methods.
@@ -770,7 +821,7 @@ impl Kakehashi {
         // request there is no subscriber; a cancel landing there is only
         // forwarded downstream via the upstream-request registry.
         let (cancel_rx, _cancel_guard) = self.subscribe_cancel(current_upstream_id().as_ref());
-        let race = race_layers_preferred(&layer_cfg.order, virt, host, is_nonempty);
+        let race = race_layers_preferred(&layer_cfg.priorities, virt, host, is_nonempty);
         let result = match cancel_rx {
             Some(mut cancel_rx) => {
                 tokio::select! {
@@ -846,6 +897,54 @@ mod tests {
             bridge: Some(bridge),
             ..Default::default()
         }
+    }
+
+    fn server(cmd: &[&str]) -> crate::config::settings::BridgeServerConfig {
+        crate::config::settings::BridgeServerConfig {
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            languages: vec!["lua".to_string()],
+            initialization_options: None,
+            root_markers: None,
+        }
+    }
+
+    #[test]
+    fn unspawnable_language_servers_flags_empty_cmd_but_not_wildcard() {
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&[])), // defaults-only entry: never flagged
+            ("good".to_string(), server(&["lua-language-server"])),
+            ("broken".to_string(), server(&[])),
+            ("also-broken".to_string(), server(&[])),
+        ]);
+
+        assert_eq!(
+            unspawnable_language_servers(&settings),
+            vec!["also-broken".to_string(), "broken".to_string()],
+        );
+    }
+
+    #[test]
+    fn unspawnable_language_servers_honors_cmd_inherited_from_wildcard() {
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&["shared-ls", "--stdio"])),
+            ("inherits-cmd".to_string(), server(&[])),
+        ]);
+
+        assert!(
+            unspawnable_language_servers(&settings).is_empty(),
+            "cmd supplied by the '_' wildcard makes the entry spawnable"
+        );
+    }
+
+    #[test]
+    fn format_unspawnable_servers_warning_lists_names_or_is_silent() {
+        assert_eq!(format_unspawnable_servers_warning(&[]), None);
+        let msg = format_unspawnable_servers_warning(&["broken".to_string()])
+            .expect("non-empty list warns");
+        assert!(msg.contains("broken"), "warning names the server: {msg}");
+        assert!(msg.contains("cmd"), "warning explains the cause: {msg}");
     }
 
     fn bridge_cfg_with_aggregation(
@@ -1021,7 +1120,7 @@ mod tests {
         let resolved =
             resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
         assert_eq!(
-            resolved.order,
+            resolved.priorities,
             vec![LayerSource::Virt, LayerSource::Host, LayerSource::Native]
         );
     }
@@ -1036,7 +1135,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "textDocument/hover".to_string(),
                         crate::config::settings::LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Native]),
+                            priorities: Some(vec![LayerSource::Native]),
                             strategy: None,
                         },
                     )])),
@@ -1047,7 +1146,7 @@ mod tests {
         let settings = settings_with(langs);
 
         let hover = resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
-        assert_eq!(hover.order, vec![LayerSource::Native]);
+        assert_eq!(hover.priorities, vec![LayerSource::Native]);
         assert!(!hover.allows(LayerSource::Virt));
 
         let definition =
@@ -1070,7 +1169,7 @@ mod tests {
                     aggregation: Some(HashMap::from([(
                         "_".to_string(),
                         crate::config::settings::LayerAggregationConfig {
-                            order: Some(vec![]),
+                            priorities: Some(vec![]),
                             strategy: None,
                         },
                     )])),
@@ -1082,7 +1181,7 @@ mod tests {
         let resolved =
             resolve_layer_config_from_settings(&settings, "markdown", "textDocument/hover");
         assert!(
-            resolved.order.is_empty(),
+            resolved.priorities.is_empty(),
             "wildcard-language layers must apply to unconfigured hosts"
         );
     }

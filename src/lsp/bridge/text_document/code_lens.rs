@@ -134,7 +134,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<CodeLens>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(host_uri))
             .await?;
         if !handle.has_capability("textDocument/codeLens") {
             return Ok(None);
@@ -207,8 +207,9 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> CodeLens {
         let server_name = &envelope.origin;
+        let host_uri = Url::parse(&envelope.host_uri).ok();
         let handle = match self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, host_uri.as_ref())
             .await
         {
             Ok(h) => h,

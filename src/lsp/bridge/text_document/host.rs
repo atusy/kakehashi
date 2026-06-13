@@ -182,6 +182,7 @@ impl LanguageServerPool {
     /// `partialResultToken` would stream its results into the void and could
     /// legally return an empty final result; `workDoneToken` would likewise
     /// report progress nowhere.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_host_raw_request(
         &self,
         server_name: &str,
@@ -190,11 +191,29 @@ impl LanguageServerPool {
         method: &'static str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
+        readiness: super::super::pool::ConnectionReadiness,
     ) -> io::Result<Option<serde_json::Value>> {
         strip_progress_tokens(&mut params);
-        let handle = self
-            .get_or_create_connection(server_name, server_config)
-            .await?;
+        let handle = match readiness {
+            // Fail-fast (interactive requests): an Initializing server is an
+            // empty layer for this request; the next request gets it.
+            super::super::pool::ConnectionReadiness::FailFast => {
+                self.get_or_create_connection(server_name, server_config, Some(doc.uri))
+                    .await?
+            }
+            // Diagnostics wait through initialization — same policy as the
+            // virt diagnostic path (waiting beats returning empty results);
+            // the caller's request timeout bounds the wait.
+            super::super::pool::ConnectionReadiness::WaitReady => {
+                self.get_or_create_connection_wait_ready(
+                    server_name,
+                    server_config,
+                    Some(doc.uri),
+                    std::time::Duration::from_secs(super::super::pool::INIT_TIMEOUT_SECS),
+                )
+                .await?
+            }
+        };
         if !handle.has_capability(method) {
             return Ok(None);
         }
@@ -228,7 +247,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
-            .get_or_create_connection(server_name, server_config)
+            .get_or_create_connection(server_name, server_config, Some(doc.uri))
             .await?;
         if !handle.has_capability(method) {
             return Ok(None);

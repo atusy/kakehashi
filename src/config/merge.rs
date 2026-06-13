@@ -83,6 +83,10 @@ pub(crate) fn merge_bridge_server_configs(
                 .clone()
                 .or(base.initialization_options.clone()),
         },
+        root_markers: overlay
+            .root_markers
+            .clone()
+            .or_else(|| base.root_markers.clone()),
     }
 }
 
@@ -208,15 +212,18 @@ pub(crate) fn merge_aggregation_configs(
 /// Merge two `LayerAggregationConfig`s field-by-field
 /// (cross-layer-aggregation).
 ///
-/// - `order`: overlay wins if present, else inherits from base — the list
-///   replaces wholesale, never element-wise
+/// - `priorities`: overlay wins if present, else inherits from base — the
+///   list replaces wholesale, never element-wise
 /// - `strategy`: overlay wins if set, else inherits from base
 pub(crate) fn merge_layer_aggregation_configs(
     base: &LayerAggregationConfig,
     overlay: &LayerAggregationConfig,
 ) -> LayerAggregationConfig {
     LayerAggregationConfig {
-        order: overlay.order.clone().or_else(|| base.order.clone()),
+        priorities: overlay
+            .priorities
+            .clone()
+            .or_else(|| base.priorities.clone()),
         strategy: overlay.strategy.or(base.strategy),
     }
 }
@@ -494,6 +501,7 @@ mod tests {
                         cmd: vec!["rust-analyzer".to_string()],
                         languages: vec!["rust".to_string()],
                         initialization_options: Some(json!({"checkOnSave": true})),
+                        root_markers: None,
                     },
                 ),
                 (
@@ -502,6 +510,7 @@ mod tests {
                         cmd: vec!["lua-language-server".to_string()],
                         languages: vec!["lua".to_string()],
                         initialization_options: None,
+                        root_markers: None,
                     },
                 ),
             ])),
@@ -569,6 +578,7 @@ mod tests {
                         cmd: vec![],
                         languages: vec![],
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                        root_markers: None,
                     },
                 ),
                 (
@@ -578,6 +588,7 @@ mod tests {
                         cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
                         languages: vec!["python".to_string()],
                         initialization_options: None,
+                        root_markers: None,
                     },
                 ),
             ])),
@@ -642,6 +653,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec!["rust".to_string()],
                     initialization_options: None,
+                    root_markers: None,
                 },
             )])),
             ..Default::default()
@@ -1028,6 +1040,7 @@ mod tests {
                 cmd: vec!["default-lsp".to_string()],
                 languages: vec!["any".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1041,6 +1054,7 @@ mod tests {
                 cmd: vec!["rust-analyzer".to_string()],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
+                root_markers: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1055,6 +1069,7 @@ mod tests {
                     cmd: vec!["default-lsp".to_string()],
                     languages: vec!["any".to_string()],
                     initialization_options: Some(json!({"defaultOption": true})),
+                    root_markers: None,
                 },
             ),
             (
@@ -1063,6 +1078,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec![],
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
+                    root_markers: None,
                 },
             ),
         ]);
@@ -1075,6 +1091,48 @@ mod tests {
             init_opts.get("linkedProjects"),
             Some(&json!(["./Cargo.toml"]))
         );
+    }
+
+    /// rootMarkers merges overlay-wins like other Option fields, and the
+    /// explicit `Some([])` kill switch must survive the merge — collapsing
+    /// it to "inherit" would silently re-enable the marker search a user
+    /// turned off per server.
+    #[test]
+    fn test_merge_bridge_server_configs_root_markers() {
+        use settings::BridgeServerConfig;
+
+        let base = BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: Some(vec![".git".to_string()]),
+        };
+
+        // Unset overlay inherits from base (wildcard default applies)
+        let inheriting = BridgeServerConfig {
+            cmd: vec!["rust-analyzer".to_string()],
+            languages: vec!["rust".to_string()],
+            initialization_options: None,
+            root_markers: None,
+        };
+        let merged = merge_bridge_server_configs(&base, &inheriting);
+        assert_eq!(merged.root_markers, Some(vec![".git".to_string()]));
+
+        // Set overlay wins over base
+        let overriding = BridgeServerConfig {
+            root_markers: Some(vec!["Cargo.toml".to_string()]),
+            ..inheriting.clone()
+        };
+        let merged = merge_bridge_server_configs(&base, &overriding);
+        assert_eq!(merged.root_markers, Some(vec!["Cargo.toml".to_string()]));
+
+        // Explicit [] survives as the per-server kill switch
+        let disabling = BridgeServerConfig {
+            root_markers: Some(vec![]),
+            ..inheriting
+        };
+        let merged = merge_bridge_server_configs(&base, &disabling);
+        assert_eq!(merged.root_markers, Some(vec![]));
     }
 
     // Deep merge for initialization_options (configuration-merging-strategy)
@@ -1096,6 +1154,7 @@ mod tests {
                 "shared_opt": "base",
                 "nested": { "base_only": 1, "shared": "base" }
             })),
+            root_markers: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
@@ -1105,6 +1164,7 @@ mod tests {
                 "shared_opt": "overlay",
                 "nested": { "overlay_only": 2, "shared": "overlay" }
             })),
+            root_markers: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1247,6 +1307,7 @@ mod tests {
                     cmd: vec![],
                     languages: vec![],
                     initialization_options: Some(json!({ "checkOnSave": true })),
+                    root_markers: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1256,6 +1317,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec!["rust".to_string()],
                     initialization_options: None, // Should inherit from wildcard
+                    root_markers: None,
                 },
             ),
         ]);
@@ -1292,6 +1354,7 @@ mod tests {
                     cmd: vec!["default-lsp".to_string()],
                     languages: vec!["rust".to_string(), "python".to_string()],
                     initialization_options: None,
+                    root_markers: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1301,6 +1364,7 @@ mod tests {
                     cmd: vec!["rust-analyzer".to_string()],
                     languages: vec![], // Empty - should inherit from wildcard
                     initialization_options: None,
+                    root_markers: None,
                 },
             ),
         ]);
@@ -2146,18 +2210,18 @@ mod tests {
     fn merge_layer_aggregation_configs_overlay_fields_win() {
         use crate::config::settings::{AggregationStrategy, LayerSource};
         let base = LayerAggregationConfig {
-            order: Some(vec![LayerSource::Native]),
+            priorities: Some(vec![LayerSource::Native]),
             strategy: Some(AggregationStrategy::Preferred),
         };
         let overlay = LayerAggregationConfig {
-            order: Some(vec![LayerSource::Virt, LayerSource::Host]),
+            priorities: Some(vec![LayerSource::Virt, LayerSource::Host]),
             strategy: None,
         };
         let merged = merge_layer_aggregation_configs(&base, &overlay);
         assert_eq!(
-            merged.order,
+            merged.priorities,
             Some(vec![LayerSource::Virt, LayerSource::Host]),
-            "overlay order replaces base wholesale"
+            "overlay priorities replace base wholesale"
         );
         assert_eq!(
             merged.strategy,
@@ -2175,14 +2239,14 @@ mod tests {
                     (
                         "textDocument/hover".to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Native]),
+                            priorities: Some(vec![LayerSource::Native]),
                             strategy: Some(AggregationStrategy::Preferred),
                         },
                     ),
                     (
                         "textDocument/definition".to_string(),
                         LayerAggregationConfig {
-                            order: Some(vec![LayerSource::Virt]),
+                            priorities: Some(vec![LayerSource::Virt]),
                             strategy: None,
                         },
                     ),
@@ -2195,7 +2259,7 @@ mod tests {
                 aggregation: Some(HashMap::from([(
                     "textDocument/hover".to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Host]),
+                        priorities: Some(vec![LayerSource::Host]),
                         strategy: None,
                     },
                 )])),
@@ -2209,7 +2273,7 @@ mod tests {
             .aggregation
             .expect("aggregation must survive the merge");
         assert_eq!(
-            aggregation["textDocument/hover"].order,
+            aggregation["textDocument/hover"].priorities,
             Some(vec![LayerSource::Host]),
             "overlay entry wins per field"
         );
@@ -2219,7 +2283,7 @@ mod tests {
             "unset overlay field inherits from the base entry"
         );
         assert_eq!(
-            aggregation["textDocument/definition"].order,
+            aggregation["textDocument/definition"].priorities,
             Some(vec![LayerSource::Virt]),
             "base-only entries are preserved"
         );
@@ -2233,7 +2297,7 @@ mod tests {
                 aggregation: Some(HashMap::from([(
                     "_".to_string(),
                     LayerAggregationConfig {
-                        order: Some(vec![LayerSource::Native]),
+                        priorities: Some(vec![LayerSource::Native]),
                         strategy: None,
                     },
                 )])),

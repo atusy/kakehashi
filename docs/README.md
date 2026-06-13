@@ -311,6 +311,12 @@ Configure language servers for bridging LSP requests in injection regions.
 | `cmd` | Command and arguments to start the language server |
 | `languages` | Languages this server handles |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
+| `rootMarkers` | Marker files/directories (e.g. `[".git", "Cargo.toml"]`) locating the workspace root the server is initialized with: ancestors of the document that triggered the spawn are searched nearest-first, and the first directory containing any marker becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The first spawn decides the root for the server's lifetime. |
+
+A `languageServers._` wildcard entry supplies defaults that every server
+inherits field-by-field (wildcard-config-inheritance) — e.g. set
+`rootMarkers` once for all servers. A wildcard-only entry is never spawned
+itself, and a concrete server whose merged `cmd` is still empty is skipped.
 
 **Bridge Language Configuration:**
 
@@ -326,8 +332,8 @@ Each entry in the `bridge` map configures bridging for one injection language:
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` contains the **host** language, with the real URI and no
-coordinate translation. All bridged request methods are wired (diagnostics
-and semantic tokens excepted); by default the host layer is tried after
+coordinate translation. All bridged request methods are wired (semantic
+tokens excepted); by default the host layer is tried after
 `virt` (see `layers` above), so injections keep winning inside code fences
 while the host server answers everywhere else. For formatting, combine
 fence formatters with a whole-document formatter via
@@ -392,8 +398,8 @@ the `bridge.<lang>.aggregation` nesting:
     "markdown": {
       "layers": {
         "aggregation": {
-          "textDocument/hover": { "order": ["virt", "native"] },
-          "_": { "order": ["virt", "host", "native"] }
+          "textDocument/hover": { "priorities": ["virt", "native"] },
+          "_": { "priorities": ["virt", "host", "native"] }
         }
       }
     }
@@ -403,8 +409,8 @@ the `bridge.<lang>.aggregation` nesting:
 
 | Field | Description |
 |-------|-------------|
-| `order` | Ordered allowlist of layers, highest priority first. Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
-| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins, the default for most methods) or `"concatenated"`. `"concatenated"` is honored for `textDocument/formatting` only and runs the layers as a sequential pipeline: injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit. |
+| `priorities` | Ordered allowlist of layers, highest priority first (same allowlist rule as the server-name `priorities` above, but over the closed set `virt`/`host`/`native` — no `"*"`). Layers omitted from the list do not participate; `[]` disables the method entirely. Default: `["virt", "host", "native"]`. Omitting `"virt"` turns off injection bridging for that method. |
+| `strategy` | Cross-layer combine strategy: `"preferred"` (first non-empty layer wins) or `"concatenated"`. Consumed by `textDocument/formatting` (default `"concatenated"`: a sequential pipeline — injection regions format first (`virt`), then the host formatter (`host`, see `bridge._self`) formats the resulting text, collapsing into one whole-document edit) and by the diagnostics methods (default `"concatenated"`: the `virt` regions' diagnostics and the host servers' diagnostics for the real document merge into one report/publish; `"preferred"` returns the first non-empty layer instead). Every other method combines with `"preferred"` regardless of this field. |
 
 Details:
 
@@ -413,14 +419,28 @@ Details:
 - **Formatting**: `textDocument/rangeFormatting` shares the
   `textDocument/formatting` key.
 - **Diagnostics**: two keys, mirroring their aggregation keying — pull
-  diagnostics gate under `textDocument/diagnostic`, push diagnostics under
-  `textDocument/publishDiagnostics`. Disable both (or use `_`) to fully turn
-  bridge diagnostics off.
+  diagnostics under `textDocument/diagnostic`, push diagnostics under
+  `textDocument/publishDiagnostics`. Each layer is gated independently by
+  `priorities` membership (host additionally by `bridge._self.enabled`);
+  omit both layers (or use `_` with `priorities = []`) to fully turn
+  bridge diagnostics off. With host bridging opted in, host servers are
+  pulled with the real document URI and their diagnostics merge with the
+  injection regions' per the layer `strategy`.
 - **Current effect**: the `virt` layer answers inside injection regions, and
   the `host` layer answers on the host document itself for every bridged
-  request method when host bridging is opted in (see `bridge._self` above).
-  Bridged methods have no `native` counterpart yet. Diagnostics and
-  semantic tokens stay virt-only for now.
+  request method — including pull/push diagnostics — when host bridging is
+  opted in (see `bridge._self` above). Bridged methods have no `native`
+  counterpart yet. Semantic tokens stay native-only for now.
+
+> **Migration note**: the layer list was renamed `order` →
+> `priorities` (and, one change earlier, the method map moved under
+> `aggregation`: `layers.<method>` → `layers.aggregation.<method>`). Old
+> keys are silently ignored — rewrite `layers.aggregation.<method>.order`
+> (or the older `layers.<method>.order`) as
+> `layers.aggregation.<method>.priorities`. The default `strategy` for
+> `textDocument/formatting` also changed from `"preferred"` to
+> `"concatenated"`; set it back explicitly if you relied on
+> first-non-empty-layer-wins formatting with host bridging enabled.
 
 **Bridge Filter Semantics:**
 
