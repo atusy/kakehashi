@@ -336,7 +336,7 @@ pub(crate) fn on_type_formatting_trigger_union(
         .values()
         .filter_map(|s| s.on_type_formatting_triggers.as_ref())
         .flatten()
-        .filter(|t| !t.is_empty())
+        .filter(|t| t.chars().count() == 1)
         .cloned()
         .collect();
     triggers.sort();
