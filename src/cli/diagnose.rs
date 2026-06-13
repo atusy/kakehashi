@@ -401,11 +401,19 @@ fn meets_threshold(diagnostic: &Diagnostic, threshold: Threshold) -> bool {
     effective_severity(diagnostic) <= gate
 }
 
+/// A diagnostic's code as an order key: `(discriminant, number, string)` —
+/// `None` (0) < numeric (1) < string (2), numbers compared as integers (not
+/// lexically), strings by text. Borrows from the diagnostic, so allocation-free.
+type CodeSortKey<'a> = (u8, i32, Option<&'a str>);
+
 /// A total-order key for stable output. Ordering: position, then severity
 /// (most severe first), source, code, and message — so a diagnostic with no
 /// severity (ranked as error) and one out-of-spec severity still sort
 /// deterministically.
-fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, String, &str) {
+///
+/// Allocation-free (it borrows from `diagnostic`): `sort_key` is evaluated
+/// twice per comparison across an `O(N log N)` sort, so it must not allocate.
+fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, CodeSortKey<'_>, &str) {
     let severity_rank = match diagnostic.severity {
         None => 1,
         Some(s) if s == DiagnosticSeverity::ERROR => 1,
@@ -415,9 +423,9 @@ fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, String, &st
         Some(_) => 5,
     };
     let code_key = match &diagnostic.code {
-        Some(NumberOrString::Number(n)) => format!("n{n}"),
-        Some(NumberOrString::String(s)) => format!("s{s}"),
-        None => String::new(),
+        None => (0, 0, None),
+        Some(NumberOrString::Number(n)) => (1, *n, None),
+        Some(NumberOrString::String(s)) => (2, 0, Some(s.as_str())),
     };
     (
         diagnostic.range.start.line,
@@ -610,6 +618,29 @@ mod tests {
             out,
             "f:1:1: error: apple\nf:1:1: warning: apple\nf:1:1: warning: zebra\n"
         );
+    }
+
+    #[test]
+    fn sort_key_orders_numeric_codes_numerically_not_lexically() {
+        // "n10" < "n9" lexically would mis-order; integer codes must compare
+        // as integers.
+        let mut nine = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
+        nine.code = Some(NumberOrString::Number(9));
+        let mut ten = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
+        ten.code = Some(NumberOrString::Number(10));
+        assert!(sort_key(&nine) < sort_key(&ten));
+    }
+
+    #[test]
+    fn sort_key_orders_absent_then_numeric_then_string_codes() {
+        let mut none = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
+        none.code = None;
+        let mut num = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
+        num.code = Some(NumberOrString::Number(999));
+        let mut text = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
+        text.code = Some(NumberOrString::String("E1".to_string()));
+        assert!(sort_key(&none) < sort_key(&num));
+        assert!(sort_key(&num) < sort_key(&text));
     }
 
     #[test]
