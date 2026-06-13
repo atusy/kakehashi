@@ -97,10 +97,6 @@ enum Commands {
         /// Minimum severity that makes the run exit 1 ("none" disables it)
         #[arg(long, value_enum, default_value = "error")]
         threshold: kakehashi::cli::diagnose::Threshold,
-
-        /// CI mode: suppress the summary on stderr (diagnostics still print)
-        #[arg(long)]
-        quiet: bool,
     },
 }
 
@@ -313,14 +309,12 @@ fn main() -> ExitCode {
             excludes,
             output_format,
             threshold,
-            quiet,
         }) => run_diagnose(kakehashi::cli::diagnose::DiagnoseOptions {
             paths,
             stdin_filename,
             excludes,
             output_format,
             threshold,
-            quiet,
         }),
         None => {
             // Start LSP server (backward compatible default behavior)

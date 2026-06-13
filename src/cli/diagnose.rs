@@ -81,9 +81,6 @@ pub struct DiagnoseOptions {
     pub output_format: OutputFormat,
     /// Minimum severity that triggers exit `1`.
     pub threshold: Threshold,
-    /// CI mode: suppress the human-readable summary on stderr (diagnostics on
-    /// stdout and operational errors on stderr are still printed).
-    pub quiet: bool,
 }
 
 /// No diagnostics met `--threshold`, and no operational error.
@@ -265,7 +262,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         }
     }
 
-    summarize(&report, processed, options)
+    summarize(&report, processed)
 }
 
 /// Stdin mode: diagnose stdin as if it were `--stdin-filename`.
@@ -320,7 +317,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         }
     }
 
-    summarize(&report, 1, options)
+    summarize(&report, 1)
 }
 
 /// Outcome of a streaming write to stdout.
@@ -359,17 +356,17 @@ fn write_chunk(chunk: &str) -> WriteState {
     }
 }
 
-/// Print the run summary (unless `--quiet`) to stderr and return the exit code.
-fn summarize(report: &Report, file_count: usize, options: &DiagnoseOptions) -> u8 {
-    if !options.quiet {
-        let file_label = if file_count == 1 { "file" } else { "files" };
-        let diag_label = if report.total == 1 {
-            "diagnostic"
-        } else {
-            "diagnostics"
-        };
-        eprintln!("{} {diag_label} in {file_count} {file_label}", report.total);
-    }
+/// Print the run summary to stderr and return the exit code. The summary lives
+/// on stderr, so it never pollutes the diagnostics on stdout — no need for a
+/// quiet switch; redirect or ignore stderr in CI if it's unwanted.
+fn summarize(report: &Report, file_count: usize) -> u8 {
+    let file_label = if file_count == 1 { "file" } else { "files" };
+    let diag_label = if report.total == 1 {
+        "diagnostic"
+    } else {
+        "diagnostics"
+    };
+    eprintln!("{} {diag_label} in {file_count} {file_label}", report.total);
 
     report.exit_code()
 }

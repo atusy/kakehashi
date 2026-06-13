@@ -613,12 +613,13 @@ kakehashi diagnose . --output-format jsonl
 # (error | warning | info | hint). "none" never sets exit 1.
 kakehashi diagnose . --threshold warning
 
-# CI mode: suppress the stderr summary (diagnostics still go to stdout)
-kakehashi diagnose . --threshold warning --quiet
-
 # Diagnose stdin; the filename drives language detection and config resolution
 cat README.md | kakehashi diagnose --stdin-filename README.md
 ```
+
+Diagnostics go to stdout; the one-line summary, any errors, and `RUST_LOG`
+output go to stderr — so stdout stays a clean data channel for `| jq` / `| head`
+(redirect or ignore stderr in CI if the summary is unwanted).
 
 Line and column are 1-based; a diagnostic with no severity is treated as an
 error (so it can never silently slip past a threshold). Exit codes: `0` no

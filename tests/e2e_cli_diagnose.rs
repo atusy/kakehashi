@@ -4,8 +4,8 @@
 //! that bridges lua injections to the `mock-lsp-formatter` test binary in
 //! `diagnostics` mode (answers `textDocument/diagnostic` with one severity-2
 //! warning whose message echoes the virtual URI). Asserts on the three output
-//! formats, the `--threshold` exit-code gating, `--quiet`, stdin mode, and the
-//! broken-server error path.
+//! formats, the `--threshold` exit-code gating, the stdout/stderr split, stdin
+//! mode, and the broken-server error path.
 
 #![cfg(feature = "e2e")]
 
@@ -183,22 +183,29 @@ fn e2e_diagnose_jsonl_format_is_structured() {
 }
 
 #[test]
-fn e2e_diagnose_quiet_suppresses_summary_but_keeps_diagnostics() {
+fn e2e_diagnose_diagnostics_on_stdout_summary_on_stderr() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 
-    let output = run_diagnose(ws.path(), &["doc.md", "--quiet"]);
+    let output = run_diagnose(ws.path(), &["doc.md"]);
     assert!(
         output.status.success(),
-        "quiet run should succeed; stderr: {}",
+        "run should succeed; stderr: {}",
         stderr_of(&output)
     );
+    // stdout is the data channel: only diagnostics, no summary.
+    let stdout = stdout_of(&output);
     assert!(
-        stdout_of(&output).contains("mock-diagnostic:"),
-        "diagnostics still print to stdout under --quiet"
+        stdout.contains("mock-diagnostic:"),
+        "diagnostics go to stdout; got: {stdout:?}"
     );
     assert!(
-        !stderr_of(&output).contains("diagnostic in"),
-        "--quiet must suppress the summary line; stderr: {}",
+        !stdout.contains("diagnostic in"),
+        "the summary must not pollute stdout; got: {stdout:?}"
+    );
+    // The one-line summary always goes to stderr (no --quiet switch needed).
+    assert!(
+        stderr_of(&output).contains("1 diagnostic in 1 file"),
+        "the summary goes to stderr; stderr: {}",
         stderr_of(&output)
     );
 }
