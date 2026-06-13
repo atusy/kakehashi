@@ -629,12 +629,10 @@ file could not be read, a path could not be opened, or a configured downstream
 server failed) — independent of `--threshold`, so `none` still surfaces a
 broken run rather than looking clean to CI.
 
-Diagnostics stream to stdout as each file is processed. If stdout is closed
-before the scan finishes (e.g. `kakehashi diagnose . | head`), the scan stops
-early and the exit code is best-effort over the files processed so far —
-continuing would make the pipeline hang until every file was scanned even
-though the consumer has left. CI relies on the exit code and does not truncate
-stdout, so it always gets a full scan.
+Diagnostics stream to stdout as each file is processed. Every file is always
+scanned so the exit code reflects the whole set; if stdout is closed before the
+scan finishes (e.g. `kakehashi diagnose . | head`), further writes are
+suppressed but the scan still completes.
 
 ## Editor Integration
 

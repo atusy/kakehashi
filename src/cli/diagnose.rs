@@ -19,11 +19,10 @@
 //!   of `--threshold` — a tool that could not even read a file must not look
 //!   "clean" to CI, so `none` still surfaces operational failures as `2`.
 //!
-//! If stdout is closed before the scan finishes (e.g. `kakehashi diagnose . |
-//! head`), the scan stops early and the exit code is **best-effort over the
-//! files processed so far** — continuing would make the pipeline hang until
-//! every file was scanned even though the consumer has left. CI relies on the
-//! exit code and does not truncate stdout, so it always gets a full scan.
+//! Diagnostics stream to stdout per file. Every file is always scanned so the
+//! exit code reflects the whole set; if stdout is closed early (e.g. `kakehashi
+//! diagnose . | head`), further writes are suppressed but the scan still
+//! completes.
 //!
 //! File selection mirrors `format` (see [`crate::cli::files`]).
 
@@ -211,12 +210,17 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     // diagnostics, so peak memory is bounded by the noisiest file rather than
     // the whole run. `write_chunk` locks stdout per call, so the lock is never
     // held across the `cli_diagnose_text` await below.
+    //
+    // We always scan EVERY file: the exit code must reflect the whole set (a
+    // later file may carry a threshold-meeting diagnostic or an operational
+    // error), which is this tool's core contract. A closed consumer only
+    // silences further writes via `pipe_closed` — it never shortcuts the scan.
+    // (Detecting closure requires a write anyway, so a run with sparse output
+    // could not reliably stop early regardless; completing the scan keeps the
+    // exit code correct and the behavior predictable.)
     let mut buf = String::new();
-    // Files actually visited — equals files.len() on a full run, but fewer when
-    // a closed pipe breaks the loop early, so the summary never overstates.
-    let mut processed = 0usize;
+    let mut pipe_closed = false;
     for file in &files {
-        processed += 1;
         // Collected paths are absolute; report them cwd-relative so the output
         // stays readable (and editor-openable) in deep trees.
         let display = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
@@ -243,26 +247,21 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             options.threshold,
             &mut buf,
         );
-        if !buf.is_empty() {
+        if !pipe_closed && !buf.is_empty() {
             match write_chunk(&buf) {
                 WriteState::Open => {}
-                // Consumer closed the pipe (`… | head`, `grep -q`): stop early.
-                // They've signaled they don't need the rest, so continuing to
-                // query downstream servers for the remaining files would only
-                // waste work. The exit code is then best-effort over the files
-                // scanned — the right semantics for a deliberately truncated
-                // stream, since CI (which relies on the exit code) does not
-                // truncate stdout.
-                WriteState::PipeClosed => break,
+                // Consumer closed the pipe (`… | head`): stop writing, but keep
+                // scanning so the exit code still reflects every file.
+                WriteState::PipeClosed => pipe_closed = true,
                 WriteState::Failed => {
                     report.operational_error = true;
-                    break;
+                    pipe_closed = true;
                 }
             }
         }
     }
 
-    summarize(&report, processed)
+    summarize(&report, files.len())
 }
 
 /// Stdin mode: diagnose stdin as if it were `--stdin-filename`.
