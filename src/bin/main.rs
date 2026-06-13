@@ -261,7 +261,7 @@ fn main() -> ExitCode {
     // language-server stdin), so they need the same disposition — otherwise a
     // crashed downstream server would kill the CLI with SIGPIPE instead of
     // exiting 2 with a useful error; their own stdout writes handle BrokenPipe
-    // explicitly (see `cli::format::run_stdin` / `cli::diagnose::finish`).
+    // explicitly (see `cli::format::run_stdin` / `cli::diagnose::write_chunk`).
     // Other subcommands keep the default disposition restored above.
     if matches!(
         cli.command,

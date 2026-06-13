@@ -206,12 +206,9 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     let mut report = Report::default();
     // Stream per file: a single reused buffer holds one file's rendered
     // diagnostics, so peak memory is bounded by the noisiest file rather than
-    // the whole run. Every file is still scanned (the exit code depends on
-    // whether ANY diagnostic across the set meets --threshold), so a closed
-    // consumer only stops further writes — it can't shortcut the scan.
-    let mut stdout = std::io::stdout().lock();
+    // the whole run. `write_chunk` locks stdout per call, so the lock is never
+    // held across the `cli_diagnose_text` await below.
     let mut buf = String::new();
-    let mut pipe_closed = false;
     for file in &files {
         // Collected paths are absolute; report them cwd-relative so the output
         // stays readable (and editor-openable) in deep trees.
@@ -239,20 +236,24 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             options.threshold,
             &mut buf,
         );
-        if !pipe_closed && !buf.is_empty() {
-            match write_chunk(&mut stdout, &buf) {
+        if !buf.is_empty() {
+            match write_chunk(&buf) {
                 WriteState::Open => {}
-                // Consumer closed the pipe (`… | head`): stop writing, but keep
-                // scanning so the exit code stays correct.
-                WriteState::PipeClosed => pipe_closed = true,
+                // Consumer closed the pipe (`… | head`, `grep -q`): stop early.
+                // They've signaled they don't need the rest, so continuing to
+                // query downstream servers for the remaining files would only
+                // waste work. The exit code is then best-effort over the files
+                // scanned — the right semantics for a deliberately truncated
+                // stream, since CI (which relies on the exit code) does not
+                // truncate stdout.
+                WriteState::PipeClosed => break,
                 WriteState::Failed => {
                     report.operational_error = true;
-                    pipe_closed = true;
+                    break;
                 }
             }
         }
     }
-    drop(stdout);
 
     summarize(&report, files.len(), options)
 }
@@ -302,10 +303,9 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         &mut buf,
     );
     if !buf.is_empty() {
-        let mut stdout = std::io::stdout().lock();
         // A closed consumer (`… | head`) is its normal early exit, not ours;
         // only a real write error is operational.
-        if let WriteState::Failed = write_chunk(&mut stdout, &buf) {
+        if let WriteState::Failed = write_chunk(&buf) {
             report.operational_error = true;
         }
     }
@@ -329,7 +329,13 @@ enum WriteState {
 /// buffer fills). SIGPIPE is ignored in diagnose mode (the bridge needs
 /// BrokenPipe as a recoverable error), so a closed consumer surfaces here as a
 /// `BrokenPipe` write error instead of killing the process.
-fn write_chunk(stdout: &mut impl std::io::Write, chunk: &str) -> WriteState {
+///
+/// Locks stdout per call (rather than holding the lock across the loop) so the
+/// `StdoutLock` is never held across the caller's `.await` points. The lock is
+/// uncontended in this single-writer CLI, so the per-call cost is negligible.
+fn write_chunk(chunk: &str) -> WriteState {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
     match stdout
         .write_all(chunk.as_bytes())
         .and_then(|()| stdout.flush())
