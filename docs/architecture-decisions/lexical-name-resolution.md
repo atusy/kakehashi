@@ -72,8 +72,9 @@ filename inference for `bindings.scm`) — an engine-consumed kind like
 stay file-defined and un-enumerated, unaffected by this. An explicit `kind = "locals"` in
 user config becomes a hard deserialization error once the variant is gone —
 surfaced as-is rather than aliased, per the delete-on-supersede posture —
-while stale `locals.scm` paths without an explicit kind are already skipped
-silently by filename inference.
+while stale `locals.scm` paths without an explicit kind stop being inferred
+once the kind is gone — filename inference yields nothing for an unknown
+filename, so they degrade to silently skipped rather than erroring.
 
 ### Capture vocabulary
 
@@ -97,6 +98,9 @@ capture in the pattern; targeting one capture in a multi-capture pattern
 uses the capture-scoped form that machinery already parses,
 `(#set! @definition.parameter definition.visibility "after")` — so labels
 carry no grammar of their own and no new property-key syntax is introduced.
+General predicates (`#eq?` and friends) gate the **whole match**, exactly as
+captures-protocol specifies: one failing predicate discards the match's
+scopes, definitions, references, and extent alike.
 
 | Property | Values | Declares |
 |---|---|---|
