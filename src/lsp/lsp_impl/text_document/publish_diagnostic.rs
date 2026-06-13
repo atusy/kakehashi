@@ -63,9 +63,18 @@ pub(crate) async fn collect_push_diagnostics(
         return Some(Vec::new());
     }
 
+    // Destructure so each future owns exactly the field it needs (the
+    // async blocks would otherwise rely on disjoint-field captures of
+    // `snapshot`, which compiles but reads ambiguously).
+    let DiagnosticSnapshot {
+        virt_contexts,
+        host,
+        layer_cfg,
+    } = snapshot;
+
     let virt_fut = async {
         let mut join_set = JoinSet::new();
-        for region_ctx in snapshot.virt_contexts {
+        for region_ctx in virt_contexts {
             let pool = Arc::clone(pool);
             join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
         }
@@ -87,7 +96,7 @@ pub(crate) async fn collect_push_diagnostics(
     };
 
     let host_fut = async {
-        match &snapshot.host {
+        match &host {
             Some(ctx) => collect_host_diagnostics(ctx, Arc::clone(pool)).await,
             None => Vec::new(),
         }
@@ -96,8 +105,6 @@ pub(crate) async fn collect_push_diagnostics(
     let (virt_items, host_items) = tokio::join!(virt_fut, host_fut);
 
     Some(combine_layer_diagnostics(
-        &snapshot.layer_cfg,
-        virt_items,
-        host_items,
+        &layer_cfg, virt_items, host_items,
     ))
 }
