@@ -19,6 +19,12 @@
 //!   of `--threshold` — a tool that could not even read a file must not look
 //!   "clean" to CI, so `none` still surfaces operational failures as `2`.
 //!
+//! If stdout is closed before the scan finishes (e.g. `kakehashi diagnose . |
+//! head`), the scan stops early and the exit code is **best-effort over the
+//! files processed so far** — continuing would make the pipeline hang until
+//! every file was scanned even though the consumer has left. CI relies on the
+//! exit code and does not truncate stdout, so it always gets a full scan.
+//!
 //! File selection mirrors `format` (see [`crate::cli::files`]).
 
 use std::path::{Path, PathBuf};
