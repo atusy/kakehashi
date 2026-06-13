@@ -1,4 +1,5 @@
 pub(crate) mod bridge_context;
+mod cli_diagnose;
 mod cli_format;
 mod coordinator;
 pub(crate) use coordinator::DiagnosticPublisher;

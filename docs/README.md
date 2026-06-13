@@ -593,6 +593,41 @@ server failed to start, errored on the request, timed out, or returned a
 protocol-invalid response — even when a fallback server still produced
 output).
 
+### Diagnostics
+
+`kakehashi diagnose` pulls diagnostics for files through the same bridge the
+LSP server uses (injection regions via `virt`, the host document via
+`bridge._self`, aggregated per `layers.aggregation`) and prints them in a
+machine-readable format. File selection matches `format` (directories walked
+respecting `.gitignore`, explicit paths win, `--excludes` filters everything).
+
+```bash
+# Report diagnostics (default: grep format, --threshold error)
+kakehashi diagnose README.md docs/
+
+# Output formats: grep (file:line:col:message),
+# quickfix (file:line:col: severity: message [source]), jsonl
+kakehashi diagnose . --output-format jsonl
+
+# CI gate: exit 1 if any diagnostic is at least as severe as the threshold
+# (error | warning | info | hint). "none" never sets exit 1.
+kakehashi diagnose . --threshold warning
+
+# CI mode: suppress the stderr summary (diagnostics still go to stdout)
+kakehashi diagnose . --threshold warning --quiet
+
+# Diagnose stdin; the filename drives language detection and config resolution
+cat README.md | kakehashi diagnose --stdin-filename README.md
+```
+
+Line and column are 1-based; a diagnostic with no severity is treated as an
+error (so it can never silently slip past a threshold). Exit codes: `0` no
+diagnostic met `--threshold`; `1` a diagnostic was at least as severe as
+`--threshold` (never under `--threshold none`); `2` an operational error (a
+file could not be read, a path could not be opened, or a configured downstream
+server failed) — independent of `--threshold`, so `none` still surfaces a
+broken run rather than looking clean to CI.
+
 ## Editor Integration
 
 ### Neovim
