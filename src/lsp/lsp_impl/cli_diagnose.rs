@@ -102,16 +102,24 @@ impl Kakehashi {
             ));
         }
 
+        // Counts requests that fail AFTER the server came up (crash, error
+        // response, per-step timeout) — the ready-wait above cannot see those,
+        // and the diagnostic fan-in collapses them into empty results, so
+        // without the counter they would read as a clean "no diagnostics".
+        let request_errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let report = self
-            .diagnostic_impl(DocumentDiagnosticParams {
-                text_document: TextDocumentIdentifier {
-                    uri: lsp_uri.clone(),
+            .diagnostic_impl_with_error_sink(
+                DocumentDiagnosticParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: lsp_uri.clone(),
+                    },
+                    identifier: None,
+                    previous_result_id: None,
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
                 },
-                identifier: None,
-                previous_result_id: None,
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
-            })
+                Some(std::sync::Arc::clone(&request_errors)),
+            )
             .await;
 
         self.did_close_impl(DidCloseTextDocumentParams {
@@ -130,6 +138,14 @@ impl Kakehashi {
                 Vec::new()
             }
         };
+
+        let request_errors = request_errors.load(std::sync::atomic::Ordering::Relaxed);
+        if request_errors > 0 {
+            server_failures.push(format!(
+                "{request_errors} downstream diagnostic operation(s) failed \
+                 (run with RUST_LOG=kakehashi=warn for details)"
+            ));
+        }
 
         CliDiagnoseOutcome {
             diagnostics,

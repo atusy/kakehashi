@@ -150,7 +150,7 @@ struct Report {
 
 impl Report {
     /// Account for one file's diagnostics, appending their rendered lines to
-    /// `out`. Diagnostics are sorted by position for deterministic output.
+    /// `out`. Diagnostics are sorted for deterministic output.
     fn record_file(
         &mut self,
         display: &str,
@@ -159,13 +159,11 @@ impl Report {
         threshold: Threshold,
         out: &mut String,
     ) {
-        diagnostics.sort_by(|a, b| {
-            (a.range.start.line, a.range.start.character, &a.message).cmp(&(
-                b.range.start.line,
-                b.range.start.character,
-                &b.message,
-            ))
-        });
+        // The diagnostic fan-out collects across regions and servers in
+        // completion order, so position alone is not a stable key. Sort by
+        // position, then tie-break by severity, source, code, and message so
+        // two findings at the same spot always print in the same order.
+        diagnostics.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
         for diagnostic in &diagnostics {
             out.push_str(&format_diagnostic(format, display, diagnostic));
             out.push('\n');
@@ -403,6 +401,34 @@ fn meets_threshold(diagnostic: &Diagnostic, threshold: Threshold) -> bool {
     effective_severity(diagnostic) <= gate
 }
 
+/// A total-order key for stable output. Ordering: position, then severity
+/// (most severe first), source, code, and message — so a diagnostic with no
+/// severity (ranked as error) and one out-of-spec severity still sort
+/// deterministically.
+fn sort_key(diagnostic: &Diagnostic) -> (u32, u32, u8, Option<&str>, String, &str) {
+    let severity_rank = match diagnostic.severity {
+        None => 1,
+        Some(s) if s == DiagnosticSeverity::ERROR => 1,
+        Some(s) if s == DiagnosticSeverity::WARNING => 2,
+        Some(s) if s == DiagnosticSeverity::INFORMATION => 3,
+        Some(s) if s == DiagnosticSeverity::HINT => 4,
+        Some(_) => 5,
+    };
+    let code_key = match &diagnostic.code {
+        Some(NumberOrString::Number(n)) => format!("n{n}"),
+        Some(NumberOrString::String(s)) => format!("s{s}"),
+        None => String::new(),
+    };
+    (
+        diagnostic.range.start.line,
+        diagnostic.range.start.character,
+        severity_rank,
+        diagnostic.source.as_deref(),
+        code_key,
+        diagnostic.message.as_str(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +586,30 @@ mod tests {
         assert_eq!(out, "f:2:1:first\nf:6:1:second\n");
         assert_eq!(report.total, 2);
         assert!(report.threshold_hit, "an error meets the error threshold");
+    }
+
+    #[test]
+    fn record_file_tie_breaks_same_position_by_severity_then_message() {
+        // Two findings at the same spot arriving in "worst" order must still
+        // print deterministically: more severe first, then message order.
+        let mut report = Report::default();
+        let mut out = String::new();
+        let diags = vec![
+            diag(0, 0, Some(DiagnosticSeverity::WARNING), "zebra"),
+            diag(0, 0, Some(DiagnosticSeverity::ERROR), "apple"),
+            diag(0, 0, Some(DiagnosticSeverity::WARNING), "apple"),
+        ];
+        report.record_file(
+            "f",
+            diags,
+            OutputFormat::Quickfix,
+            Threshold::None,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            "f:1:1: error: apple\nf:1:1: warning: apple\nf:1:1: warning: zebra\n"
+        );
     }
 
     #[test]

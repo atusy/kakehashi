@@ -316,6 +316,94 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_diagnose_request_time_server_failure_exits_two() {
+    // The server handshakes fine (advertises diagnosticProvider) but errors on
+    // the diagnostic request — distinct from never starting. The fan-in
+    // collapses the failure into an empty report, so without the request-error
+    // sink this would look clean; it must exit 2.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-diag-fail]
+cmd = ['{}', 'diagnostics-fail']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a request-time downstream failure must exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("operation(s) failed"),
+        "stderr should report the failed request; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn e2e_diagnose_request_time_failure_exits_two_even_under_threshold_none() {
+    // Request-time failure is operational, so --threshold none must not hide it.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languageServers.mock-diag-fail]
+cmd = ['{}', 'diagnostics-fail']
+languages = ["lua"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md", "--threshold", "none"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--threshold none does not suppress a request-time failure; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn e2e_diagnose_host_layer_request_failure_exits_two() {
+    // Same request-time failure but through the HOST layer
+    // (bridge._self.enabled): the host fan-in must also count the error so the
+    // CLI exits 2 rather than silently losing the host layer.
+    let ws = workspace_with(
+        &format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge._self]
+enabled = true
+
+[languageServers.mock-host-fail]
+cmd = ['{}', 'diagnostics-fail']
+languages = ["markdown"]
+"#,
+            env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+        &[("doc.md", MARKDOWN)],
+    );
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a host-layer request failure must exit 2; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
     let ws = workspace_with(
         &config_toml(),

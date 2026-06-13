@@ -86,10 +86,24 @@ impl LanguageServerPool {
                 build_diagnostic_request(virtual_uri, request_id, previous_result_id)
             },
             |response, ctx| {
-                transform_diagnostic_response_to_host(response, ctx.offset, host_uri.as_str())
+                // A downstream JSON-RPC error response is a request failure, not
+                // "no diagnostics" — propagate it as `Err` so CLI mode's
+                // request-error sink can surface it (mirrors the formatting
+                // path; LSP mode just logs and the layer stays empty).
+                if response_has_jsonrpc_error(&response, "textDocument/diagnostic") {
+                    return Err(io::Error::other(format!(
+                        "downstream server '{server_name}' answered textDocument/diagnostic \
+                         with an error response"
+                    )));
+                }
+                Ok(transform_diagnostic_response_to_host(
+                    response,
+                    ctx.offset,
+                    host_uri.as_str(),
+                ))
             },
         )
-        .await
+        .await?
     }
 }
 

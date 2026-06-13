@@ -143,7 +143,7 @@ fn main() {
                         "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
-                    "diagnostics" => json!({
+                    "diagnostics" | "diagnostics-fail" => json!({
                         "diagnosticProvider": {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
@@ -427,6 +427,14 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/diagnostic" => {
+                if mode == "diagnostics-fail" {
+                    // Healthy handshake (advertises diagnosticProvider), broken
+                    // request: exercises the request-time diagnostic failure
+                    // path (vs. a server that never starts), which CLI mode
+                    // must not read as "no diagnostics".
+                    respond_error(&mut writer, id, -32603, "mock diagnostic request failure");
+                    continue;
+                }
                 // One deterministic diagnostic echoing the requested URI —
                 // but only for documents this server actually received via
                 // didOpen, so the test also proves the host document was

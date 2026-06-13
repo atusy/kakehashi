@@ -37,4 +37,27 @@ mod type_definition;
 mod will_save;
 mod will_save_wait_until;
 
+/// Optional counter for downstream bridge requests that failed at request time
+/// (I/O error, error response, per-step timeout) — as opposed to startup
+/// failures, which CLI mode detects separately via its ready-wait. `None` in
+/// LSP mode, where failed requests are log-only because the editor retries;
+/// `Some` in CLI mode (`format`, `diagnose`), where a one-shot run must map
+/// them onto a non-zero exit instead of "nothing changed" / "no diagnostics".
+///
+/// Counts **observed** failures only, by design: a request abandoned because a
+/// racing layer or higher-priority server already won (its future dropped
+/// mid-flight) was *cancelled*, not failed — it never produced a verdict, and
+/// counting it would trade the race's latency win for accounting of requests
+/// whose outcome no longer matters.
+pub(crate) type RequestErrorSink = Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>;
+
+/// Add `n` request failures to the sink, if one is installed.
+pub(crate) fn count_request_errors(sink: &RequestErrorSink, n: usize) {
+    if n > 0
+        && let Some(sink) = sink
+    {
+        sink.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // Re-export the methods (they are implemented as impl blocks on Kakehashi)

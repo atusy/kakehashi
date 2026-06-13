@@ -52,6 +52,7 @@ use crate::lsp::bridge::{
     UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::lsp_impl::text_document::{RequestErrorSink, count_request_errors};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard};
 
 use super::super::{Kakehashi, uri_to_url};
@@ -521,30 +522,6 @@ impl Kakehashi {
             }
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
-    }
-}
-
-/// Optional counter for downstream formatting requests that failed at
-/// request time (I/O error, error response, per-step timeout) — as opposed
-/// to startup failures, which CLI mode detects separately via its
-/// ready-wait. `None` in LSP mode, where failed requests are log-only
-/// because the editor retries; `Some` in CLI mode, where a one-shot run
-/// must map them onto a non-zero exit instead of "nothing changed".
-///
-/// Counts **observed** failures only, by design: a request abandoned
-/// because a racing layer or higher-priority server already won (its future
-/// dropped mid-flight by `race_layers_preferred` or the preferred fan-in)
-/// was *cancelled*, not failed — it never produced a verdict, and counting
-/// it would require draining every loser to completion, trading the race's
-/// latency win for accounting of requests whose outcome no longer matters.
-pub(crate) type RequestErrorSink = Option<Arc<std::sync::atomic::AtomicUsize>>;
-
-/// Add `n` request failures to the sink, if one is installed.
-fn count_request_errors(sink: &RequestErrorSink, n: usize) {
-    if n > 0
-        && let Some(sink) = sink
-    {
-        sink.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

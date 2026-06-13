@@ -79,7 +79,10 @@ pub(crate) async fn collect_push_diagnostics(
         let mut join_set = JoinSet::new();
         for region_ctx in virt_contexts {
             let pool = Arc::clone(pool);
-            join_set.spawn(async move { collect_region_diagnostics(&region_ctx, pool).await });
+            // Push diagnostics run in LSP mode only — failures are log-only
+            // (the editor re-pulls), so no request-error sink is threaded.
+            join_set
+                .spawn(async move { collect_region_diagnostics(&region_ctx, pool, &None).await });
         }
 
         let mut all_diagnostics = Vec::new();
@@ -100,7 +103,8 @@ pub(crate) async fn collect_push_diagnostics(
 
     let host_fut = async {
         match &host {
-            Some(ctx) => collect_host_diagnostics(ctx, Arc::clone(pool)).await,
+            // Push diagnostics are LSP-mode-only; failures are log-only.
+            Some(ctx) => collect_host_diagnostics(ctx, Arc::clone(pool), &None).await,
             None => Vec::new(),
         }
     };
