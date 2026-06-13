@@ -35,7 +35,8 @@ use super::super::pool::{
     MessageSender, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcNotification, JsonRpcRequest, RequestId, response_has_jsonrpc_error,
+    JsonRpcNotification, JsonRpcRequest, RequestId, jsonrpc_error_summary,
+    response_has_jsonrpc_error,
 };
 use crate::config::settings::BridgeServerConfig;
 
@@ -453,7 +454,8 @@ fn parse_host_raw_response(
     // path uses the `Err` to count the failure for CLI mode's exit code.
     if response_has_jsonrpc_error(&response, method) {
         return Err(io::Error::other(format!(
-            "downstream server answered {method} with an error response"
+            "downstream server answered {method} with an error response: {}",
+            jsonrpc_error_summary(&response)
         )));
     }
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
@@ -478,7 +480,8 @@ fn parse_host_formatting_response(
 ) -> io::Result<Vec<TextEdit>> {
     if response_has_jsonrpc_error(&response, method) {
         return Err(io::Error::other(format!(
-            "downstream server answered {method} with an error response"
+            "downstream server answered {method} with an error response: {}",
+            jsonrpc_error_summary(&response)
         )));
     }
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {

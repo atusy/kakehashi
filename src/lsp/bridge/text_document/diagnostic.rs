@@ -25,8 +25,8 @@ use tower_lsp_server::ls_types::{DocumentDiagnosticParams, TextDocumentIdentifie
 
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    virtual_uri_to_lsp_uri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, jsonrpc_error_summary,
+    response_has_jsonrpc_error, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -93,7 +93,8 @@ impl LanguageServerPool {
                 if response_has_jsonrpc_error(&response, "textDocument/diagnostic") {
                     return Err(io::Error::other(format!(
                         "downstream server '{server_name}' answered textDocument/diagnostic \
-                         with an error response"
+                         with an error response: {}",
+                        jsonrpc_error_summary(&response)
                     )));
                 }
                 Ok(transform_diagnostic_response_to_host(
