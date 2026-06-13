@@ -39,8 +39,9 @@ The obvious prior art is nvim-treesitter's `locals.scm`
   pressure toward correctness.
 - The vocabulary cannot express **name visibility start** (hoisting vs.
   declare-before-use vs. Lua's `local x = x`), **namespaces** (a type and a
-  variable with the same name collide on text equality), or **scope-inheritance
-  control** (the Python-class and PHP-function rules above).
+  variable with the same name collide on text equality), or
+  **scope-inheritance control** (the Python-class and PHP-function rules
+  above).
 - References are a blanket `(identifier) @local.reference` with text-equality
   matching and no way to constrain what they may bind to.
 
@@ -229,9 +230,10 @@ compatibility is a non-goal.
 Rejected on a concrete failure mode: the install pipeline fetches ecosystem
 `locals.scm` files, and `searchPaths` commonly contain nvim-treesitter
 runtime directories. First-hit-wins resolution would load a file in the old
-vocabulary, produce zero captures, and the feature would be **silently dead
-per language** with no diagnosable error. A new kind name makes "no asset"
-explicit and leaves ecosystem files untouched where they lie.
+vocabulary, produce zero captures, and the feature would be
+**silently dead per language** with no diagnosable error. A new kind name
+makes "no asset" explicit and leaves ecosystem files untouched where they
+lie.
 
 ### C. tree-sitter upstream locals spec (`@local.scope`/`@local.definition`/`@local.reference` + `local.scope-inherits`)
 
