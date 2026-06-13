@@ -1,6 +1,6 @@
 //! `kakehashi diagnose <paths...>` — pull diagnostics for files through the
 //! same injection-region + host bridge the LSP server uses, and print them in
-//! a `--output-format` (grep / quickfix / JSONL).
+//! a `--output-format` (`default` line format, or `jsonl`).
 //!
 //! Like `kakehashi format`, the command runs the LSP server in-process (no
 //! JSON-RPC framing): it builds the [`LspService`] the same way the server
@@ -36,14 +36,13 @@ use crate::cli::files::collect_files;
 use crate::lsp::Kakehashi;
 
 /// How to render each diagnostic. Derives clap's kebab-case value names:
-/// `grep`, `quickfix`, `jsonl`.
+/// `default`, `jsonl`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputFormat {
-    /// `file:line:col:message` — terse, `grep`/`ripgrep --vimgrep` style.
+    /// `file:line:col: severity: message [source]` — compiler/quickfix style,
+    /// parseable by editor errorformats.
     #[default]
-    Grep,
-    /// `file:line:col: severity: message [source]` — compiler/quickfix style.
-    Quickfix,
+    Default,
     /// One JSON object per line with the full structured diagnostic.
     Jsonl,
 }
@@ -373,16 +372,13 @@ fn summarize(report: &Report, file_count: usize) -> u8 {
 /// Render one diagnostic in the requested format. `display` is the
 /// already-formatted (cwd-relative or stdin) path.
 fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnostic) -> String {
-    // LSP positions are 0-based; editors and grep/quickfix consumers expect
-    // 1-based line and column. `character` is a UTF-16 offset — presenting it
-    // as a column is the same approximation grep/ripgrep make.
+    // LSP positions are 0-based; editors and quickfix consumers expect 1-based
+    // line and column. `character` is a UTF-16 offset — presenting it as a
+    // column is the same approximation grep/ripgrep make.
     let line = diagnostic.range.start.line.saturating_add(1);
     let col = diagnostic.range.start.character.saturating_add(1);
     match format {
-        OutputFormat::Grep => {
-            format!("{display}:{line}:{col}:{}", one_line(&diagnostic.message))
-        }
-        OutputFormat::Quickfix => {
+        OutputFormat::Default => {
             let severity = severity_word(diagnostic.severity);
             let source = diagnostic
                 .source
@@ -419,7 +415,7 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
 }
 
 /// Collapse a (possibly multi-line) diagnostic message onto one line so it
-/// stays parseable in the line-oriented grep/quickfix formats. Single-pass: no
+/// stays parseable in the line-oriented `default` format. Single-pass: no
 /// intermediate `Vec` of words.
 fn one_line(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
@@ -534,29 +530,20 @@ mod tests {
     }
 
     #[test]
-    fn grep_format_is_one_based_and_terse() {
-        let d = diag(0, 0, Some(DiagnosticSeverity::WARNING), "unused variable");
-        assert_eq!(
-            format_diagnostic(OutputFormat::Grep, "src/a.lua", &d),
-            "src/a.lua:1:1:unused variable"
-        );
-    }
-
-    #[test]
-    fn quickfix_format_includes_severity_and_source() {
+    fn default_format_includes_severity_and_source() {
         let mut d = diag(4, 2, Some(DiagnosticSeverity::ERROR), "boom");
         d.source = Some("lua-ls".to_string());
         assert_eq!(
-            format_diagnostic(OutputFormat::Quickfix, "a.md", &d),
+            format_diagnostic(OutputFormat::Default, "a.md", &d),
             "a.md:5:3: error: boom [lua-ls]"
         );
     }
 
     #[test]
-    fn quickfix_without_source_omits_the_bracket() {
+    fn default_format_without_source_omits_the_bracket() {
         let d = diag(0, 0, Some(DiagnosticSeverity::HINT), "hint here");
         assert_eq!(
-            format_diagnostic(OutputFormat::Quickfix, "a.md", &d),
+            format_diagnostic(OutputFormat::Default, "a.md", &d),
             "a.md:1:1: hint: hint here"
         );
     }
@@ -598,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn message_newlines_are_collapsed_for_line_formats() {
+    fn message_newlines_are_collapsed_for_the_line_format() {
         let d = diag(
             0,
             0,
@@ -606,8 +593,8 @@ mod tests {
             "line one\n  line two",
         );
         assert_eq!(
-            format_diagnostic(OutputFormat::Grep, "f", &d),
-            "f:1:1:line one line two"
+            format_diagnostic(OutputFormat::Default, "f", &d),
+            "f:1:1: error: line one line two"
         );
     }
 
@@ -667,8 +654,14 @@ mod tests {
             diag(5, 0, Some(DiagnosticSeverity::WARNING), "second"),
             diag(1, 0, Some(DiagnosticSeverity::ERROR), "first"),
         ];
-        report.record_file("f", diags, OutputFormat::Grep, Threshold::Error, &mut out);
-        assert_eq!(out, "f:2:1:first\nf:6:1:second\n");
+        report.record_file(
+            "f",
+            diags,
+            OutputFormat::Default,
+            Threshold::Error,
+            &mut out,
+        );
+        assert_eq!(out, "f:2:1: error: first\nf:6:1: warning: second\n");
         assert_eq!(report.total, 2);
         assert!(report.threshold_hit, "an error meets the error threshold");
     }
@@ -684,13 +677,7 @@ mod tests {
             diag(0, 0, Some(DiagnosticSeverity::ERROR), "apple"),
             diag(0, 0, Some(DiagnosticSeverity::WARNING), "apple"),
         ];
-        report.record_file(
-            "f",
-            diags,
-            OutputFormat::Quickfix,
-            Threshold::None,
-            &mut out,
-        );
+        report.record_file("f", diags, OutputFormat::Default, Threshold::None, &mut out);
         assert_eq!(
             out,
             "f:1:1: error: apple\nf:1:1: warning: apple\nf:1:1: warning: zebra\n"

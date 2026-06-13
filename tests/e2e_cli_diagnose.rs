@@ -3,9 +3,9 @@
 //! Spawns the real `kakehashi` binary with a workspace-local `kakehashi.toml`
 //! that bridges lua injections to the `mock-lsp-formatter` test binary in
 //! `diagnostics` mode (answers `textDocument/diagnostic` with one severity-2
-//! warning whose message echoes the virtual URI). Asserts on the three output
-//! formats, the `--threshold` exit-code gating, the stdout/stderr split, stdin
-//! mode, and the broken-server error path.
+//! warning whose message echoes the virtual URI). Asserts on the `default` and
+//! `jsonl` output formats, the `--threshold` exit-code gating, the
+//! stdout/stderr split, stdin mode, and the broken-server error path.
 
 #![cfg(feature = "e2e")]
 
@@ -88,7 +88,7 @@ fn stderr_of(output: &Output) -> String {
 }
 
 #[test]
-fn e2e_diagnose_grep_format_reports_transformed_position() {
+fn e2e_diagnose_default_format_reports_transformed_position() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 
     let output = run_diagnose(ws.path(), &["doc.md"]);
@@ -100,9 +100,11 @@ fn e2e_diagnose_grep_format_reports_transformed_position() {
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
+    // Default format: file:line:col: severity: message, at the host-transformed
+    // 1-based position.
     assert!(
-        stdout.starts_with("doc.md:4:1:"),
-        "grep line should carry the host-transformed 1-based position; got: {stdout:?}"
+        stdout.starts_with("doc.md:4:1: warning: "),
+        "default line should carry the position and severity; got: {stdout:?}"
     );
     assert!(
         stdout.contains("mock-diagnostic:"),
@@ -141,19 +143,21 @@ fn e2e_diagnose_threshold_none_always_exits_zero() {
 }
 
 #[test]
-fn e2e_diagnose_quickfix_format_includes_severity() {
+fn e2e_diagnose_explicit_default_output_format() {
+    // `--output-format default` is accepted and renders the same severity-bearing
+    // line as the implicit default.
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 
-    let output = run_diagnose(ws.path(), &["doc.md", "--output-format", "quickfix"]);
+    let output = run_diagnose(ws.path(), &["doc.md", "--output-format", "default"]);
     assert!(
         output.status.success(),
-        "quickfix run should succeed; stderr: {}",
+        "default-format run should succeed; stderr: {}",
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
     assert!(
         stdout.starts_with("doc.md:4:1: warning: "),
-        "quickfix line should carry the severity word; got: {stdout:?}"
+        "default line should carry the severity word; got: {stdout:?}"
     );
 }
 

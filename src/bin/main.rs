@@ -91,7 +91,7 @@ enum Commands {
         excludes: Vec<String>,
 
         /// How to render each diagnostic
-        #[arg(long, value_enum, default_value = "grep")]
+        #[arg(long, value_enum, default_value = "default")]
         output_format: kakehashi::cli::diagnose::OutputFormat,
 
         /// Minimum severity that makes the run exit 1 ("none" disables it)

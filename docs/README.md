@@ -603,11 +603,10 @@ respecting `.gitignore`, explicit paths win, `--excludes` filters every path
 under the current directory — including explicitly listed ones).
 
 ```bash
-# Report diagnostics (default: grep format, --threshold error)
+# Report diagnostics (default format: file:line:col: severity: message [source])
 kakehashi diagnose README.md docs/
 
-# Output formats: grep (file:line:col:message),
-# quickfix (file:line:col: severity: message [source]), jsonl
+# Output formats: default (the above) or jsonl (one JSON object per line)
 kakehashi diagnose . --output-format jsonl
 
 # CI gate: exit 1 if any diagnostic is at least as severe as the threshold
