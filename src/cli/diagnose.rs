@@ -352,8 +352,11 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
                 "endColumn": diagnostic.range.end.character.saturating_add(1),
                 "severity": severity_word(diagnostic.severity),
                 "code": code,
-                "source": diagnostic.source,
-                "message": diagnostic.message,
+                // Borrow rather than serialize the owned fields by value (the
+                // macro borrows either way, but the explicit `&str` makes that
+                // unambiguous).
+                "source": diagnostic.source.as_deref(),
+                "message": diagnostic.message.as_str(),
             });
             value.to_string()
         }
