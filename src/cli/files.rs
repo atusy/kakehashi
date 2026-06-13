@@ -8,7 +8,11 @@
 //! - Explicitly listed files are always included, even when gitignored —
 //!   naming a path is a stronger signal than a `.gitignore` entry.
 //! - `--excludes` patterns (gitignore syntax, relative to the current
-//!   directory) filter *everything*, including explicitly listed paths.
+//!   directory) filter every path *with a cwd-relative form*, including
+//!   explicitly listed paths. A path outside the current directory has no
+//!   cwd-relative form, so no pattern can match it (see
+//!   `is_excluded` / the `excludes_do_not_apply_to_paths_outside_the_base`
+//!   test).
 
 use std::path::{Path, PathBuf};
 

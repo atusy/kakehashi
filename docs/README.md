@@ -599,7 +599,8 @@ output).
 LSP server uses (injection regions via `virt`, the host document via
 `bridge._self`, aggregated per `layers.aggregation`) and prints them in a
 machine-readable format. File selection matches `format` (directories walked
-respecting `.gitignore`, explicit paths win, `--excludes` filters everything).
+respecting `.gitignore`, explicit paths win, `--excludes` filters every path
+under the current directory — including explicitly listed ones).
 
 ```bash
 # Report diagnostics (default: grep format, --threshold error)
