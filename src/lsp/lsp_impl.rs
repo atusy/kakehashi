@@ -438,6 +438,10 @@ impl LanguageServer for Kakehashi {
         self.code_lens_impl(params).await
     }
 
+    async fn code_lens_resolve(&self, params: CodeLens) -> Result<CodeLens> {
+        self.code_lens_resolve_impl(params).await
+    }
+
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,

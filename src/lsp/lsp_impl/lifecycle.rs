@@ -246,10 +246,11 @@ impl Kakehashi {
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-                // Lazy resolution is not supported yet: bridged lenses without a
-                // command are dropped (see bridge/text_document/code_lens.rs).
+                // codeLens/resolve is routed to the origin downstream server
+                // via the envelope in lens.data (#355, see
+                // bridge/text_document/code_lens.rs).
                 code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: None,
+                    resolve_provider: Some(true),
                 }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),

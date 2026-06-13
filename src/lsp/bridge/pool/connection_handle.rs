@@ -445,6 +445,11 @@ impl ConnectionHandle {
                 )
             ),
             "textDocument/codeLens" => caps.code_lens_provider.is_some(),
+            "codeLens/resolve" => caps
+                .code_lens_provider
+                .as_ref()
+                .and_then(|opts| opts.resolve_provider)
+                .unwrap_or(false),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
             "textDocument/foldingRange" => matches!(
                 caps.folding_range_provider,
@@ -1704,6 +1709,14 @@ mod tests {
                     ));
                 }),
             ),
+            (
+                "codeLens/resolve",
+                Box::new(|c| {
+                    c.code_lens_provider = Some(tower_lsp_server::ls_types::CodeLensOptions {
+                        resolve_provider: Some(true),
+                    });
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -1852,6 +1865,8 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
+            "textDocument/codeLens",
+            "codeLens/resolve",
         ];
         for method in methods {
             assert!(
@@ -1920,5 +1935,43 @@ mod tests {
         handle.set_server_capabilities(ServerCapabilities::default());
 
         assert!(!handle.has_capability("completionItem/resolve"));
+    }
+
+    // ========================================
+    // codeLens/resolve capability tests (#355)
+    // ========================================
+
+    #[tokio::test]
+    async fn code_lens_resolve_capability_false_when_resolve_provider_false() {
+        use tower_lsp_server::ls_types::CodeLensOptions;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            code_lens_provider: Some(CodeLensOptions {
+                resolve_provider: Some(false),
+            }),
+            ..Default::default()
+        });
+
+        assert!(!handle.has_capability("codeLens/resolve"));
+        assert!(
+            handle.has_capability("textDocument/codeLens"),
+            "codeLens itself stays available without resolve support"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_lens_resolve_capability_false_when_resolve_provider_absent() {
+        use tower_lsp_server::ls_types::CodeLensOptions;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
+            code_lens_provider: Some(CodeLensOptions {
+                resolve_provider: None,
+            }),
+            ..Default::default()
+        });
+
+        assert!(!handle.has_capability("codeLens/resolve"));
     }
 }

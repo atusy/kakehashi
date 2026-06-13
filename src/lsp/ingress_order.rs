@@ -228,10 +228,16 @@ enum Role {
 /// document), pull diagnostics, and `didSave` (its synthetic-diagnostic task
 /// snapshots the document, which must reflect every edit before the save).
 /// `textDocument/codeAction` belongs in the same class once it is
-/// implemented (#352). The `kakehashi/node/*` protocol stays unclassified on
-/// purpose: node ids carry their own staleness handling (`null` → client
-/// re-acquires), so gating those point lookups would add latency without
-/// changing observable behavior.
+/// implemented (#352). `codeLens/resolve` is a reader too (#355): its
+/// freshness gate reads tracker/document state, so it must observe every
+/// `didChange` that preceded it on the wire — but its params carry no
+/// `textDocument`, so the URI comes from the routing envelope in
+/// `params.data.kakehashi.host_uri` (unenveloped lenses pass through
+/// ungated; their handler returns them unchanged anyway). The
+/// `kakehashi/node/*` protocol stays unclassified on purpose: node ids
+/// carry their own staleness handling (`null` → client re-acquires), so
+/// gating those point lookups would add latency without changing
+/// observable behavior.
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
@@ -257,6 +263,12 @@ fn classify(req: &Request) -> Option<Role> {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
         }
+        "codeLens/resolve" => {
+            let raw = req.params()?["data"]["kakehashi"]["host_uri"].as_str()?;
+            Some(Role::Reader {
+                uri: normalize_uri(raw),
+            })
+        }
         _ => None,
     }
 }
@@ -271,11 +283,15 @@ fn text_document_uri(req: &Request) -> Option<String> {
     // Indexing a missing key or non-object yields Value::Null, whose as_str()
     // returns None — same outcome as get() chains, less noise.
     let raw = req.params()?["textDocument"]["uri"].as_str()?;
-    Some(
-        url::Url::parse(raw)
-            .map(String::from)
-            .unwrap_or_else(|_| raw.to_string()),
-    )
+    Some(normalize_uri(raw))
+}
+
+/// Normalize a URI spelling through `Url` so variants of the same document
+/// (percent-encoding, default ports, scheme casing) sequence together.
+fn normalize_uri(raw: &str) -> String {
+    url::Url::parse(raw)
+        .map(String::from)
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// Tower middleware applying [`DocumentSequencer`] ordering to the LSP
@@ -544,6 +560,34 @@ mod tests {
         assert!(
             classify(&Request::build("textDocument/didChange").finish()).is_none(),
             "missing params pass through rather than panic"
+        );
+
+        // codeLens/resolve carries no textDocument; the URI comes from the
+        // routing envelope (#355). Enveloped lenses gate as readers,
+        // unenveloped ones pass through.
+        let enveloped = Request::build("codeLens/resolve")
+            .params(serde_json::json!({
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end": { "line": 0, "character": 5 } },
+                "data": { "kakehashi": { "host_uri": URI } }
+            }))
+            .finish();
+        let role = classify(&enveloped);
+        assert!(
+            matches!(role, Some(Role::Reader { ref uri }) if uri == URI),
+            "enveloped codeLens/resolve must be a reader keyed by the envelope's host_uri"
+        );
+
+        let unenveloped = Request::build("codeLens/resolve")
+            .params(serde_json::json!({
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end": { "line": 0, "character": 5 } },
+                "data": { "custom": true }
+            }))
+            .finish();
+        assert!(
+            classify(&unenveloped).is_none(),
+            "unenveloped codeLens/resolve passes through ungated"
         );
     }
 

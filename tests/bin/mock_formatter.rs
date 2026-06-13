@@ -35,6 +35,10 @@
 //!   normally, then answers formatting with a JSON-RPC *success* whose
 //!   `result` is not a `TextEdit[]`. Exercises the malformed-payload
 //!   request-failure path.
+//! - `code-lens` — advertises `codeLensProvider` with `resolveProvider`;
+//!   answers `textDocument/codeLens` with one UNRESOLVED lens (data only) and
+//!   `codeLens/resolve` by materializing a command that echoes the lens data.
+//!   Used by `tests/e2e_code_lens_resolve.rs` (#355).
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -70,6 +74,10 @@ fn main() {
                     "definition" => json!({
                         "definitionProvider": true,
                         "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "code-lens" => json!({
+                        "codeLensProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
                     _ => json!({
@@ -146,6 +154,51 @@ fn main() {
                     .map(|uri| json!({ "contents": format!("mock-hover:{uri}") }))
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            "textDocument/codeLens" => {
+                // One UNRESOLVED lens (data only, no command) on the first
+                // line of the (virtual) document — the rust-analyzer shape
+                // that motivates codeLens/resolve support (#355).
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|_| {
+                        json!([{
+                            "range": {
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 5 }
+                            },
+                            "data": { "mock": "lens-1" }
+                        }])
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            "codeLens/resolve" => {
+                // Materialize the command, echoing the lens's own data back so
+                // the test can prove the downstream data round-tripped through
+                // the bridge envelope.
+                let data = message
+                    .pointer("/params/data")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let range = message
+                    .pointer("/params/range")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                respond(
+                    &mut writer,
+                    id,
+                    json!({
+                        "range": range,
+                        "command": {
+                            "title": format!("mock resolved:{}", data["mock"].as_str().unwrap_or("?")),
+                            "command": "mock.codelens"
+                        },
+                        "data": data
+                    }),
+                );
             }
             "textDocument/formatting" | "textDocument/rangeFormatting" => {
                 if mode == "fail-request" {

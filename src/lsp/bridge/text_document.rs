@@ -8,6 +8,8 @@
 mod code_lens;
 #[cfg(feature = "experimental")]
 mod color_presentation;
+
+pub(crate) use code_lens::{CodeLensEnvelope, extract_code_lens_envelope};
 mod completion;
 mod completion_item;
 mod declaration;

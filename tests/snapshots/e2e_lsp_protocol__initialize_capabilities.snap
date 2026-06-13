@@ -34,7 +34,9 @@ expression: capabilities
   "referencesProvider": true,
   "documentHighlightProvider": true,
   "documentSymbolProvider": true,
-  "codeLensProvider": {},
+  "codeLensProvider": {
+    "resolveProvider": true
+  },
   "documentFormattingProvider": true,
   "documentRangeFormattingProvider": true,
   "renameProvider": {
