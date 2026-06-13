@@ -215,7 +215,11 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     // the whole run. `write_chunk` locks stdout per call, so the lock is never
     // held across the `cli_diagnose_text` await below.
     let mut buf = String::new();
+    // Files actually visited — equals files.len() on a full run, but fewer when
+    // a closed pipe breaks the loop early, so the summary never overstates.
+    let mut processed = 0usize;
     for file in &files {
+        processed += 1;
         // Collected paths are absolute; report them cwd-relative so the output
         // stays readable (and editor-openable) in deep trees.
         let display = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
@@ -261,7 +265,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         }
     }
 
-    summarize(&report, files.len(), options)
+    summarize(&report, processed, options)
 }
 
 /// Stdin mode: diagnose stdin as if it were `--stdin-filename`.
