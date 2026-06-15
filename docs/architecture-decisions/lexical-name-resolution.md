@@ -132,15 +132,21 @@ Per layer, per parsed version:
    scope tree from `@scope` captures (implicit root scope = the layer
    root), nested by node containment.
 2. Register each `@definition` in its scope after applying the
-   `definition.scope` lift. When a definition's `(name, namespace)`
-   already exists in the registering scope, `definition.rebind` decides
-   what happens: the default `merge` adds a **definition site** to the
-   most recent existing binding, so re-assignment (`x = 1` … `x = 2`)
-   yields one binding with two sites, never two competing bindings;
-   `fresh` instead starts a new binding, so each Rust `let x = …` shadow
-   is its own binding with its own reference set. Either way a scope may
-   hold several bindings for one `(name, namespace)`, ordered by
-   visibility start. Each site records its label, the definition node's
+   `definition.scope` lift. `definition.rebind` decides how the
+   definition relates to an earlier same-`(name, namespace)` binding in
+   the registering scope: the default `merge` adds a **definition site**
+   to the registering-scope binding active at the new definition's node
+   start byte — the one step 3's in-scope selection picks there (latest
+   visibility start at or before that byte, ties broken by the later
+   definition node), so the target is byte-grounded, never dependent on
+   query/match iteration order. A `merge` after an earlier `fresh`
+   rebind therefore attaches to that latest shadow, not an older one,
+   and the first occurrence (no binding active yet) starts one; so
+   re-assignment (`x = 1` … `x = 2`) yields one binding with two sites,
+   never two competing bindings. `fresh` instead always starts a new
+   binding, so each Rust `let x = …` shadow is its own binding with its
+   own reference set. Either way a scope may hold several bindings for
+   one `(name, namespace)`, ordered by visibility start. Each site records its label, the definition node's
    range (what navigation reports), and its visibility start: the
    **registering** scope's start byte for `scope` visibility, the
    pattern-match end byte for `after`, the definition node's start byte
