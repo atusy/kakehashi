@@ -85,7 +85,7 @@ this spec, not user-mapped.
 
 | Capture | Meaning |
 |---|---|
-| `@scope` | A node that opens a lexical scope. The layer root — the layer tree's root node, spanning the region the injection occupies (the whole document for the top layer) — is always an implicit scope; its start byte, the anchor for top-level `scope` visibility, is the layer's first byte. |
+| `@scope` / `@scope.<label>` | A node that opens a lexical scope. The layer root — the layer tree's root node, spanning the region the injection occupies (the whole document for the top layer) — is always an implicit scope; its start byte, the anchor for top-level `scope` visibility, is the layer's first byte. The optional `<label>` is an **opaque** key (like `@definition`'s) that lets a `definition.scope` in the **same pattern** register a binding into this scope regardless of containment — the mechanism for branch-scoped bindings (`if let`, `match` arms). |
 | `@definition` / `@definition.<label>` | A name-introducing node (the identifier itself, not the whole declaration). The optional `<label>` is an **opaque string**: the engine attaches no semantics to it. It serves as a property-targeting key within a pattern (below) and is surfaced in results for future use (e.g. `SymbolKind` mapping). |
 | `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references — the exclusion happens at collection, so a node registered as a definition site never enters the reference set. |
 
@@ -109,7 +109,7 @@ scopes, definitions, references, and extent alike.
 
 | Property | Values | Declares |
 |---|---|---|
-| `definition.scope` | `local` (default) / `parent` / `global` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, or the layer root. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. |
+| `definition.scope` | `local` (default) / `parent` / `global` / `<scope-label>` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, the layer root, or a `@scope.<label>` captured in the same pattern. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. A `<scope-label>` registers the binding into that captured scope **regardless of containment** — the only way to bind into a sibling block, e.g. an `if let` pattern's name into the then-branch but not the else (pair it with `scope` visibility so the name covers the whole targeted block). `local`/`parent`/`global` are reserved words, so a scope label may not be one of them; a label must be unique within a match (a duplicate is an authoring error → not registered); if the named scope is absent from the match, the binding is not registered (silence over a wrong scope). Targeting wants `scope` visibility (the name covers the whole targeted block); `after`/`declaration` anchor to the match, not the targeted scope, so they would leave the body's references unseen. |
 | `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting; Python assignments — a name assigned anywhere in a Python scope is local to the *entire* scope, so a pre-assignment reference binds locally rather than reading outward, mirroring UnboundLocalError instead of a silent outer-scope read). `after` = from the **end byte of the pattern's match** onward, defined as the largest end byte among all nodes the match captured (vocabulary and `@_`-prefixed captures alike) — in Lua's `local x = x` the pattern captures the whole declaration statement, so the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
 | `definition.rebind` | `merge` (default) / `fresh` | What happens when a definition's `(name, namespace)` already exists in the registering scope. `merge` adds a site to the existing binding — `x = 1` then `x = 2` is one variable (Python/JS re-assignment). `fresh` starts a **new** binding that shadows the previous one from its own visibility start onward — each Rust/ML `let x = …` is a distinct variable, so `let x = x + 1` reads the prior `x` yet rename/references on either never cross the shadow boundary. Any number of `fresh` rebinds may stack; resolution orders them by visibility start (pairing `fresh` with `after`/`declaration` derives each rebind's start from its own declaration — the match end or the definition-node start — so distinct declarations order textually). |
 | `definition.namespace` | string, default `default` | The binding's namespace. |
@@ -132,7 +132,16 @@ Per layer, per parsed version:
    scope tree from `@scope` captures (implicit root scope = the layer
    root), nested by node containment.
 2. Register each `@definition` in its scope after applying the
-   `definition.scope` lift. `definition.rebind` decides how the
+   `definition.scope` lift — `local`/`parent`/`global` choose the
+   innermost enclosing scope, its parent, or the layer root, while a
+   `<scope-label>` registers into the `@scope.<label>` captured in the
+   same match regardless of containment (if that capture is absent from
+   the match the definition is not registered). A targeted binding's
+   definition node may thus lie outside the scope it registers into (an
+   `if let` pattern sits in the condition, not the then-branch);
+   navigation still reports that node's range, and visibility and
+   site selection use the registering scope as for any other binding.
+   `definition.rebind` decides how the
    definition relates to an earlier same-`(name, namespace)` binding in
    the registering scope: the default `merge` adds a **definition site**
    to the registering-scope binding active at the new definition's node
@@ -331,6 +340,11 @@ the miss policy keeps the resolver silent.
   with synthetic fixtures, while per-language assets are validated separately
   with fixture documents and expected definition↔reference pairs — adding a
   language adds no Rust tests.
+* Branch-scoped bindings (`if let`, `match` arms, `while let`, `for`) are
+  expressible without the engine knowing any control-flow construct: capture
+  the branch body as `@scope.<label>` and target it from `definition.scope`,
+  so the pattern's name lands in that branch alone — an `if let` binding
+  reaches the then-branch but never the else.
 * The dead `QueryKind::Locals` pipeline is retired instead of accumulating
   semantics by accident.
 * Query loading reuses the proven captures-protocol machinery wholesale:
@@ -344,8 +358,14 @@ the miss policy keeps the resolver silent.
   from zero.
 * Authoring requires understanding the property semantics, which are richer
   (and stricter — equality-matched namespaces) than nvim-treesitter's
-  forgiving legacy spec. Misannotation degrades to silence, which is safe but
-  can read as "feature doesn't work".
+  forgiving legacy spec. Misannotation *usually* degrades to silence (safe,
+  though it can read as "feature doesn't work"); the exception is forcing a
+  construct the scope model cannot express, or mis-targeting a
+  `definition.scope` label onto a wrong but present scope, which can
+  surface a wrong native result. Per-
+  language assets are therefore validated with fixture documents, and a
+  construct that cannot be expressed is left uncaptured rather than
+  approximated.
 * Accuracy is bounded by lexical scoping: dynamic constructs (Python
   `globals()`, Lua `_ENV`, JS `with`) and anything member- or type-shaped
   stay unresolved by design. This is distinct from dynamic *scoping*
