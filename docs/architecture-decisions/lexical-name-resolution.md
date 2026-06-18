@@ -252,6 +252,18 @@ A cursor on a definition site identifies its binding directly; the
 references, documentHighlight, and rename rows then apply exactly as if a
 reference had resolved to that binding.
 
+`textDocument/declaration`, `textDocument/typeDefinition`, and
+`textDocument/implementation` are **not** served natively — the resolver
+stays silent and the bridge owns them (see Out of scope, permanently).
+`typeDefinition` and `implementation` rest on type information and the
+type/implementation hierarchy, which the tree-sitter tree does not carry.
+`textDocument/declaration` is lexical in principle — a declaration-vs-
+definition role on a binding's sites would express it — but is deliberately
+left unmodelled: the distinction that matters in practice (a C prototype in
+a header versus the body in a source file) is cross-file, already the
+bridge's domain, so modelling it within a layer would add vocabulary for a
+marginal same-file case.
+
 How a native answer and a bridge answer for the same request combine (order,
 dedup, precedence) is governed by cross-layer-aggregation, not duplicated
 here; the native resolver is one more producer feeding that record's
@@ -273,7 +285,12 @@ Member access (`a.b`), type-based method resolution, overload resolution
 by argument types, import/module-path resolution, and cross-file
 navigation are not lexical problems; they are the bridge's domain. The spec
 intentionally has no vocabulary for them, so query authors are not tempted
-to approximate them badly. Dynamic scoping is likewise unresolvable
+to approximate them badly. The navigation requests
+`textDocument/declaration`, `textDocument/typeDefinition`, and
+`textDocument/implementation` are out of scope for the same reason (see LSP
+feature mapping): the latter two are type-shaped, and
+`textDocument/declaration`'s practically-important form is the cross-file
+header/source split. Dynamic scoping is likewise unresolvable
 statically, but unlike the above it has a sanctioned in-spec approximation
 — `definition.scope "global"` — discussed under Considered Options.
 
