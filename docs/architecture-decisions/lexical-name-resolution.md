@@ -88,6 +88,7 @@ this spec, not user-mapped.
 | `@scope` / `@scope.<label>` | A node that opens a lexical scope. The layer root — the layer tree's root node, spanning the region the injection occupies (the whole document for the top layer) — is always an implicit scope; its start byte, the anchor for top-level `scope` visibility, is the layer's first byte. The optional `<label>` is an **opaque** key (like `@definition`'s) that lets a `definition.scope` in the **same pattern** register a binding into this scope regardless of containment — the mechanism for branch-scoped bindings (`if let`, `match` arms). |
 | `@definition` / `@definition.<label>` | A name-introducing node (the identifier itself, not the whole declaration). The optional `<label>` is an **opaque string**: the engine attaches no semantics to it. It serves as a property-targeting key within a pattern (below) and is surfaced in results for future use (e.g. `SymbolKind` mapping). |
 | `@reference` / `@reference.<label>` | A name-using node. The blanket form `(identifier) @reference` is expected and supported: any node also captured as a definition in the same layer is automatically excluded from references — the exclusion happens at collection, so a node registered as a definition site never enters the reference set. |
+| `@redirect` | A name node that **re-routes** that name within its enclosing scope to an outer scope (see `redirect.target`) rather than introducing or using a binding itself. Models `global`/`nonlocal`-style declarations; absent the capture, nothing is re-routed. |
 
 Captures outside this vocabulary are ignored by the engine but still count
 toward the pattern match's extent — capturing an enclosing statement under a
@@ -109,13 +110,15 @@ scopes, definitions, references, and extent alike.
 
 | Property | Values | Declares |
 |---|---|---|
-| `definition.scope` | `local` (default) / `parent` / `global` / `<scope-label>` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, the layer root, or a `@scope.<label>` captured in the same pattern. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. A `<scope-label>` registers the binding into that captured scope **regardless of containment** — the only way to bind into a sibling block, e.g. an `if let` pattern's name into the then-branch but not the else (pair it with `scope` visibility so the name covers the whole targeted block). `local`/`parent`/`global` are reserved words, so a scope label may not be one of them; a label must be unique within a match (a duplicate is an authoring error → not registered); if the named scope is absent from the match, the binding is not registered (silence over a wrong scope). Targeting wants `scope` visibility (the name covers the whole targeted block); `after`/`declaration` anchor to the match, not the targeted scope, so they would leave the body's references unseen. |
+| `definition.scope` | `local` (default) / `parent` / `global` / `<scope-label>` / `nearest:<label>` | Which scope the binding registers in: the innermost enclosing `@scope`, its parent, the layer root, a `@scope.<label>` captured in the same pattern, or the closest **ancestor** scope captured with `<label>`. `parent` expresses "a function's name belongs outside the function" when one pattern captures both the scope and the name; `parent` in the root scope clamps to the root. A `<scope-label>` registers the binding into that captured scope **regardless of containment** — the only way to bind into a sibling block, e.g. an `if let` pattern's name into the then-branch but not the else (pair it with `scope` visibility so the name covers the whole targeted block). `nearest:<label>` walks the definition's ancestor scopes outward and registers into the closest one carrying `<label>` — JS `var` deep in nested blocks belongs to its function: label function bodies `@scope.function` and set `definition.scope "nearest:function"`; if no ancestor carries the label it falls back to the layer root (correct for a top-level `var`). (Bare `<scope-label>` targets a same-match capture by containment-free label; `nearest:` searches the ancestor chain — the two label forms are distinct.) `local`/`parent`/`global` are reserved words, so a scope label may not be one of them; a label must be unique within a match (a duplicate is an authoring error → not registered); if a same-match `<scope-label>` is absent from the match, the binding is not registered (silence over a wrong scope). Targeting wants `scope` visibility (the name covers the whole targeted block); `after`/`declaration` anchor to the match, not the targeted scope, so they would leave the body's references unseen. |
 | `definition.visibility` | `scope` (default) / `after` / `declaration` | When the binding becomes visible. `scope` = the whole scope (function hoisting; Python assignments — a name assigned anywhere in a Python scope is local to the *entire* scope, so a pre-assignment reference binds locally rather than reading outward, mirroring UnboundLocalError instead of a silent outer-scope read). `after` = from the **end byte of the pattern's match** onward, defined as the largest end byte among all nodes the match captured (vocabulary and `@_`-prefixed captures alike) — in Lua's `local x = x` the pattern captures the whole declaration statement, so the right-hand `x` precedes visibility and correctly resolves outward. `declaration` = from the **start byte of the definition node** onward — Lua's `local function f` needs it: `f` is visible inside its own body (recursion) but not above the statement, which neither `scope` (an earlier `f()` would falsely bind to it) nor `after` (body references precede the match end) can express. |
-| `definition.rebind` | `merge` (default) / `fresh` | What happens when a definition's `(name, namespace)` already exists in the registering scope. `merge` adds a site to the existing binding — `x = 1` then `x = 2` is one variable (Python/JS re-assignment). `fresh` starts a **new** binding that shadows the previous one from its own visibility start onward — each Rust/ML `let x = …` is a distinct variable, so `let x = x + 1` reads the prior `x` yet rename/references on either never cross the shadow boundary. Any number of `fresh` rebinds may stack; resolution orders them by visibility start (pairing `fresh` with `after`/`declaration` derives each rebind's start from its own declaration — the match end or the definition-node start — so distinct declarations order textually). |
+| `definition.rebind` | `merge` (default) / `fresh` / `outer-or-local` | What happens when a definition's `(name, namespace)` already exists in the registering scope. `merge` adds a site to the existing binding — `x = 1` then `x = 2` is one variable (Python/JS re-assignment). `fresh` starts a **new** binding that shadows the previous one from its own visibility start onward — each Rust/ML `let x = …` is a distinct variable, so `let x = x + 1` reads the prior `x` yet rename/references on either never cross the shadow boundary. Any number of `fresh` rebinds may stack; resolution orders them by visibility start (pairing `fresh` with `after`/`declaration` derives each rebind's start from its own declaration — the match end or the definition-node start — so distinct declarations order textually). `outer-or-local` registers into an **enclosing** binding of the same `(name, namespace)` if one is visible at the definition's node start byte, and otherwise starts a local one — Ruby block assignment, which writes an outer local when one exists but introduces a block-local when it does not (determinism: see step 2's registration order). |
 | `definition.namespace` | string, default `default` | The binding's namespace. |
 | `reference.namespace` | space-separated strings, default `default` | Namespaces this reference may bind to, searched in order within each scope. A type-position reference declares `"type"`; an ambiguous-position reference declares `"type default"`. Matching is by equality — an unannotated reference does **not** match an annotated definition, which is the conservative direction (silence over a wrong answer). |
 | `scope.inherits` | `true` (default) / `false` / space-separated namespaces | Which lookups may continue past this scope to outer ones. `false` stops every namespace: lookups from inside this scope (and everything nested in it) never see outer bindings. A namespace list lets only the listed namespaces continue outward. PHP-style functions don't capture enclosing local variables but do see global function/class/constant names: `(#set! scope.inherits "function class constant")` stops `default` while keeping globally registered names reachable — provided those definitions declare the matching namespaces via `definition.namespace`. |
 | `scope.visible-to-nested` | `true` (default) / `false` | When `false`, this scope's bindings are skipped when the lookup walk arrives **from a nested scope**; references directly in the scope still see them. Expresses Python class bodies (methods and comprehensions inside the class do not see class-level names; statements in the body do). |
+| `redirect.target` | `global` / `nearest:<label>` / `nearest-binding:<label>` | On a `@redirect` capture: within the capture's enclosing scope the named name does **not** bind locally — its definitions register into the target scope and its references therefore resolve there. `global` = the layer root; `nearest:<label>` = the closest ancestor scope labelled `<label>` (unconditionally); `nearest-binding:<label>` = the closest ancestor labelled `<label>` that **already holds** a binding of the `(name, namespace)`, skipping labelled scopes that don't bind it. Expresses Python `global x` (→ `global`) and `nonlocal x` (→ `nearest-binding:function`, which binds to the nearest enclosing function that has the name, skipping intermediate functions that don't). The directive governs the whole `(name, namespace)` in its scope — every definition routes to the target regardless of that definition's own `definition.scope`/`rebind` — and a `nearest`/`nearest-binding` target that finds no qualifying ancestor registers nothing (silence; `nonlocal` with no binding enclosing function is itself invalid). |
+| `redirect.namespace` | string, default `default` | The namespace the redirect applies to. |
 
 Which visibility a construct declares is the query author's accuracy
 tradeoff, not an engine concern: JS `let` can declare `scope` to mirror
@@ -131,12 +134,35 @@ Per layer, per parsed version:
 1. Run the layer language's `bindings.scm` over the layer tree. Build the
    scope tree from `@scope` captures (implicit root scope = the layer
    root), nested by node containment.
-2. Register each `@definition` in its scope after applying the
+2. Register definitions **scope by scope, outermost first** (within a
+   scope, in document order), so every outer binding exists before an
+   inner scope is processed — `outer-or-local` below relies on this.
+   In each scope, a name carrying a `@redirect` directive binds
+   elsewhere: its `@definition`s register as `merge` sites into the
+   `redirect.target` scope (`global` = layer root, `nearest:<label>` =
+   closest labelled ancestor, `nearest-binding:<label>` = closest
+   labelled ancestor that already binds the name) and its references
+   resolve there, so Python `global x` / `nonlocal x` route a later
+   `x = …` to the outer binding instead of a new local. A `@redirect`
+   governs the whole `(name, namespace)` in its scope: every definition
+   of it routes to the target regardless of that definition's own
+   `definition.scope`/`rebind`, and a `nearest`/`nearest-binding` target
+   that finds no qualifying ancestor leaves them unregistered (silence).
+   `nearest-binding` performs a registration-time existence probe of
+   ancestor scopes, which the outermost-first order keeps deterministic
+   (like `outer-or-local`). A definition that a `definition.scope` lift sends to another
+   scope is still processed in its containing scope's document-order pass;
+   its target is an ancestor, the root, or a same-match capture — all
+   already stable under the outermost-first order — so lifting never reads
+   a half-built scope. Otherwise register each `@definition`
+   in its scope after applying the
    `definition.scope` lift — `local`/`parent`/`global` choose the
    innermost enclosing scope, its parent, or the layer root, while a
    `<scope-label>` registers into the `@scope.<label>` captured in the
    same match regardless of containment (if that capture is absent from
-   the match the definition is not registered). A targeted binding's
+   the match the definition is not registered), and `nearest:<label>`
+   registers into the closest ancestor scope captured with `<label>`
+   (the layer root if none carries it). A targeted binding's
    definition node may thus lie outside the scope it registers into (an
    `if let` pattern sits in the condition, not the then-branch);
    navigation still reports that node's range, and visibility and
@@ -154,7 +180,15 @@ Per layer, per parsed version:
    re-assignment (`x = 1` … `x = 2`) yields one binding with two sites,
    never two competing bindings. `fresh` instead always starts a new
    binding, so each Rust `let x = …` shadow is its own binding with its
-   own reference set. Either way a scope may hold several bindings for
+   own reference set. `outer-or-local` registers into an enclosing
+   binding of the same `(name, namespace)` visible at the definition's
+   node start byte — located by step 3's walk over scopes outside the
+   registering one — when one exists, and otherwise behaves as `merge`
+   locally (Ruby block assignment: write the outer local if present,
+   else introduce a block-local). The outermost-first order guarantees
+   those outer bindings are already registered and visibility is
+   byte-grounded, so the choice is deterministic and independent of
+   query/match iteration order. Either way a scope may hold several bindings for
    one `(name, namespace)`, ordered by visibility start. Each site records its label, the definition node's
    range (what navigation reports), and its visibility start: the
    **registering** scope's start byte for `scope` visibility, the
@@ -235,7 +269,8 @@ region-joining model.
 
 ### Out of scope, permanently
 
-Member access (`a.b`), type-based method resolution, and cross-file
+Member access (`a.b`), type-based method resolution, overload resolution
+by argument types, import/module-path resolution, and cross-file
 navigation are not lexical problems; they are the bridge's domain. The spec
 intentionally has no vocabulary for them, so query authors are not tempted
 to approximate them badly. Dynamic scoping is likewise unresolvable
@@ -336,7 +371,7 @@ the miss policy keeps the resolver silent.
   and the path to better accuracy is editing a `.scm` asset, with no Rust
   release.
 * The engine's correctness surface is small and language-free: scope-tree
-  construction plus seven property semantics. It can be tested exhaustively
+  construction plus nine property semantics. It can be tested exhaustively
   with synthetic fixtures, while per-language assets are validated separately
   with fixture documents and expected definition↔reference pairs — adding a
   language adds no Rust tests.
@@ -345,6 +380,14 @@ the miss policy keeps the resolver silent.
   the branch body as `@scope.<label>` and target it from `definition.scope`,
   so the pattern's name lands in that branch alone — an `if let` binding
   reaches the then-branch but never the else.
+* The harder cross-scope idioms are also expressible without language
+  knowledge in the engine: JS `var` hoisting to the enclosing function
+  (`definition.scope "nearest:function"`), Python `global`/`nonlocal`
+  (`@redirect` to the root or enclosing function), and Ruby block
+  assignment's write-outer-or-declare-local rule (`definition.rebind
+  "outer-or-local"`). Each is a query author's declaration; the engine
+  only does generic ancestor lookup, name re-routing, and a byte-grounded
+  enclosing-binding probe.
 * The dead `QueryKind::Locals` pipeline is retired instead of accumulating
   semantics by accident.
 * Query loading reuses the proven captures-protocol machinery wholesale:
@@ -375,6 +418,18 @@ the miss policy keeps the resolver silent.
   fails to capture survive a rename and must be found by the user (or a
   bridge server). The `prepareRename` gate bounds *when* a rename is offered,
   not *how complete* it is.
+* Broad language coverage cost the engine concessions to its otherwise
+  pure register-then-resolve model. `@redirect` with `global`/`nearest:`
+  targets stays static (a per-scope name→target map consulted at
+  registration, no resolution lookup). Two features instead probe other
+  scopes *at registration time*: `definition.rebind "outer-or-local"`
+  (Ruby block assignment) and `redirect.target "nearest-binding:<label>"`
+  (Python `nonlocal`). Both pin a registration order — outermost scope
+  first, document order within — and with byte-grounded visibility (or
+  whole-scope existence for `nearest-binding`) stay deterministic, but the
+  "register all, then resolve" separation no longer holds for them,
+  enlarging the part of the engine that must be reasoned about for
+  ordering. Languages that never use these are unaffected.
 * Same-scope redeclaration is the query author's call via
   `definition.rebind`: `fresh` (Rust/ML `let` shadowing) keeps each
   redeclaration a distinct binding, so rename and references stop at the
