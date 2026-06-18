@@ -31,6 +31,7 @@ mod implementation;
 mod inlay_hint;
 mod linked_editing_range;
 mod moniker;
+mod on_type_formatting;
 mod prepare_rename;
 mod range_formatting;
 mod references;

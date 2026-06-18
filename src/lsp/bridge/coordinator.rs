@@ -709,6 +709,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -743,6 +744,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -779,6 +781,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: Some(vec![".git".to_string()]),
+                on_type_formatting_triggers: None,
             },
         );
         servers.insert(
@@ -788,6 +791,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -851,6 +855,7 @@ mod tests {
                 languages: vec!["python".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
         servers.insert(
@@ -860,6 +865,7 @@ mod tests {
                 languages: vec!["python".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -911,6 +917,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -945,6 +952,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -1058,6 +1066,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 
@@ -1277,6 +1286,7 @@ mod tests {
                 languages: vec!["lua".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         );
 

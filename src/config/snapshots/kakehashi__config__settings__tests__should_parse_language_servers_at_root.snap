@@ -12,7 +12,8 @@ expression: settings.language_servers
       "python"
     ],
     "initializationOptions": null,
-    "rootMarkers": null
+    "rootMarkers": null,
+    "onTypeFormattingTriggers": null
   },
   "rust-analyzer": {
     "cmd": [
@@ -22,6 +23,7 @@ expression: settings.language_servers
       "rust"
     ],
     "initializationOptions": null,
-    "rootMarkers": null
+    "rootMarkers": null,
+    "onTypeFormattingTriggers": null
   }
 }

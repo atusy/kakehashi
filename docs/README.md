@@ -31,6 +31,7 @@ Current bridge-backed requests include:
 - Moniker / Inlay Hint
 - Code Lens (incl. `codeLens/resolve` routed back to the origin server; resolution fails soft when the region was edited since the lens was produced)
 - Pull Diagnostics
+- On Type Formatting (config-driven; see `onTypeFormattingTriggers`)
 
 The server does not currently advertise `textDocument/codeAction`.
 
@@ -312,6 +313,7 @@ Configure language servers for bridging LSP requests in injection regions.
 | `languages` | Languages this server handles |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
 | `rootMarkers` | Marker files/directories (e.g. `[".git", "Cargo.toml"]`) locating the workspace root the server is initialized with: ancestors of the document that triggered the spawn are searched nearest-first, and the first directory containing any marker becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The first spawn decides the root for the server's lifetime. |
+| `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
 
 A `languageServers._` wildcard entry supplies defaults that every server
 inherits field-by-field (wildcard-config-inheritance) — e.g. set

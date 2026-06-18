@@ -36,6 +36,7 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             languages: vec![],
             initialization_options: None,
             root_markers: Some(vec![".git".to_string()]),
+            on_type_formatting_triggers: None,
         },
     )])
 }

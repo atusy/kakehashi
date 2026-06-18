@@ -6,11 +6,11 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     CodeLensOptions, CompletionOptions, DeclarationCapability, DiagnosticOptions,
-    DiagnosticServerCapabilities, DocumentLinkOptions, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions,
-    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    DiagnosticServerCapabilities, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, LinkedEditingRangeServerCapabilities,
+    OneOf, RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
@@ -188,6 +188,13 @@ impl Kakehashi {
             };
             (raw_settings, settings)
         };
+        // Derive the onTypeFormatting trigger union before settings move into
+        // apply_raw_settings: kakehashi cannot know downstream trigger
+        // characters at initialize time (servers spawn lazily), so the
+        // advertised set is config-driven (#354). No config → None →
+        // capability not advertised, matching previous behavior.
+        let on_type_formatting_triggers =
+            crate::config::settings::on_type_formatting_trigger_union(&settings.language_servers);
         self.apply_raw_settings(raw_settings, settings).await;
 
         self.notifier().log_info("server initialized!").await;
@@ -258,6 +265,12 @@ impl Kakehashi {
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
+                document_on_type_formatting_provider: on_type_formatting_triggers.map(
+                    |(first, more)| DocumentOnTypeFormattingOptions {
+                        first_trigger_character: first,
+                        more_trigger_character: (!more.is_empty()).then_some(more),
+                    },
+                ),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
                     true,

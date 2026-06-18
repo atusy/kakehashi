@@ -87,6 +87,10 @@ pub(crate) fn merge_bridge_server_configs(
             .root_markers
             .clone()
             .or_else(|| base.root_markers.clone()),
+        on_type_formatting_triggers: overlay
+            .on_type_formatting_triggers
+            .clone()
+            .or_else(|| base.on_type_formatting_triggers.clone()),
     }
 }
 
@@ -502,6 +506,7 @@ mod tests {
                         languages: vec!["rust".to_string()],
                         initialization_options: Some(json!({"checkOnSave": true})),
                         root_markers: None,
+                        on_type_formatting_triggers: None,
                     },
                 ),
                 (
@@ -511,6 +516,7 @@ mod tests {
                         languages: vec!["lua".to_string()],
                         initialization_options: None,
                         root_markers: None,
+                        on_type_formatting_triggers: None,
                     },
                 ),
             ])),
@@ -579,6 +585,7 @@ mod tests {
                         languages: vec![],
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                         root_markers: None,
+                        on_type_formatting_triggers: None,
                     },
                 ),
                 (
@@ -589,6 +596,7 @@ mod tests {
                         languages: vec!["python".to_string()],
                         initialization_options: None,
                         root_markers: None,
+                        on_type_formatting_triggers: None,
                     },
                 ),
             ])),
@@ -654,6 +662,7 @@ mod tests {
                     languages: vec!["rust".to_string()],
                     initialization_options: None,
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             )])),
             ..Default::default()
@@ -1041,6 +1050,7 @@ mod tests {
                 languages: vec!["any".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1055,6 +1065,7 @@ mod tests {
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
                 root_markers: None,
+                on_type_formatting_triggers: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1070,6 +1081,7 @@ mod tests {
                     languages: vec!["any".to_string()],
                     initialization_options: Some(json!({"defaultOption": true})),
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             ),
             (
@@ -1079,6 +1091,7 @@ mod tests {
                     languages: vec![],
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             ),
         ]);
@@ -1106,6 +1119,7 @@ mod tests {
             languages: vec![],
             initialization_options: None,
             root_markers: Some(vec![".git".to_string()]),
+            on_type_formatting_triggers: None,
         };
 
         // Unset overlay inherits from base (wildcard default applies)
@@ -1114,6 +1128,7 @@ mod tests {
             languages: vec!["rust".to_string()],
             initialization_options: None,
             root_markers: None,
+            on_type_formatting_triggers: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
         assert_eq!(merged.root_markers, Some(vec![".git".to_string()]));
@@ -1155,6 +1170,7 @@ mod tests {
                 "nested": { "base_only": 1, "shared": "base" }
             })),
             root_markers: None,
+            on_type_formatting_triggers: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
@@ -1165,6 +1181,7 @@ mod tests {
                 "nested": { "overlay_only": 2, "shared": "overlay" }
             })),
             root_markers: None,
+            on_type_formatting_triggers: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1173,6 +1190,36 @@ mod tests {
         snap_settings.bind(|| {
             insta::assert_json_snapshot!(resolved.initialization_options);
         });
+    }
+
+    /// `onTypeFormattingTriggers` merges overlay-wins-when-present, so a
+    /// wildcard `languageServers._` default applies unless the server entry
+    /// overrides it.
+    #[test]
+    fn test_merge_bridge_server_configs_on_type_formatting_triggers_overlay_wins() {
+        use settings::BridgeServerConfig;
+
+        let server = |triggers: Option<Vec<&str>>| BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: triggers
+                .map(|t| t.into_iter().map(String::from).collect()),
+        };
+
+        let base = server(Some(vec!["}"]));
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(None)).on_type_formatting_triggers,
+            Some(vec!["}".to_string()]),
+            "unset overlay inherits the base (wildcard) value"
+        );
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(Some(vec![";"])))
+                .on_type_formatting_triggers,
+            Some(vec![";".to_string()]),
+            "explicit overlay replaces the base list (no union at merge level)"
+        );
     }
 
     // Wildcard config resolution tests
@@ -1308,6 +1355,7 @@ mod tests {
                     languages: vec![],
                     initialization_options: Some(json!({ "checkOnSave": true })),
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1318,6 +1366,7 @@ mod tests {
                     languages: vec!["rust".to_string()],
                     initialization_options: None, // Should inherit from wildcard
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             ),
         ]);
@@ -1355,6 +1404,7 @@ mod tests {
                     languages: vec!["rust".to_string(), "python".to_string()],
                     initialization_options: None,
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1365,6 +1415,7 @@ mod tests {
                     languages: vec![], // Empty - should inherit from wildcard
                     initialization_options: None,
                     root_markers: None,
+                    on_type_formatting_triggers: None,
                 },
             ),
         ]);

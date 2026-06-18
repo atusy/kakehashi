@@ -905,6 +905,7 @@ mod tests {
             languages: vec!["lua".to_string()],
             initialization_options: None,
             root_markers: None,
+            on_type_formatting_triggers: None,
         }
     }
 

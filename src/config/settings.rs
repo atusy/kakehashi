@@ -299,6 +299,51 @@ pub struct BridgeServerConfig {
     /// disables the search (the client-supplied root is forwarded as-is).
     /// When no marker matches, the client-supplied root is the fallback.
     pub root_markers: Option<Vec<String>>,
+    /// Trigger characters for bridged `textDocument/onTypeFormatting` (#354).
+    ///
+    /// kakehashi cannot know downstream trigger characters at initialize time
+    /// (servers spawn lazily), so users declare them here. The union across
+    /// all servers is advertised as `documentOnTypeFormattingProvider`; a
+    /// request is forwarded to a downstream server only when that server's
+    /// own capabilities also declare the typed character. Unset or empty
+    /// everywhere → the capability is not advertised (today's behavior).
+    ///
+    /// Note: this field feeds *only* the `initialize`-time capability
+    /// advertisement; it is never consulted when forwarding a request (that
+    /// filter uses the downstream server's own declared triggers). The
+    /// capability is negotiated once and frozen for the session, so updating
+    /// the triggers via `didChangeConfiguration` has no runtime effect at all
+    /// — neither re-advertising the capability nor changing forwarding. A
+    /// restart is required for new triggers to take effect.
+    pub on_type_formatting_triggers: Option<Vec<String>>,
+}
+
+/// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
+/// `documentOnTypeFormattingProvider` capability: `(first, more)`.
+///
+/// Sorted and deduplicated so the advertisement is deterministic regardless of
+/// `HashMap` iteration order. Returns `None` when no server declares any
+/// trigger (capability stays unadvertised). A `_` wildcard key is treated like
+/// any other entry: its triggers join the union as-is (wildcard merging into
+/// concrete servers happens at request dispatch, not here). Known edge case: a
+/// concrete server overriding the wildcard with an explicit empty list still
+/// leaves the wildcard's triggers advertised; the bridge-side trigger filter
+/// keeps such requests from reaching servers that don't declare the character.
+pub(crate) fn on_type_formatting_trigger_union(
+    servers: &HashMap<String, BridgeServerConfig>,
+) -> Option<(String, Vec<String>)> {
+    let mut triggers: Vec<String> = servers
+        .values()
+        .filter_map(|s| s.on_type_formatting_triggers.as_ref())
+        .flatten()
+        .filter(|t| t.chars().count() == 1)
+        .cloned()
+        .collect();
+    triggers.sort();
+    triggers.dedup();
+    let mut iter = triggers.into_iter();
+    let first = iter.next()?;
+    Some((first, iter.collect()))
 }
 
 /// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
@@ -1211,6 +1256,91 @@ mod tests {
         snap_settings.bind(|| {
             insta::assert_json_snapshot!(settings.language_servers);
         });
+    }
+
+    #[test]
+    fn should_parse_on_type_formatting_triggers() {
+        let config_json = r#"{
+            "languageServers": {
+                "clangd": {
+                    "cmd": ["clangd"],
+                    "languages": ["cpp"],
+                    "onTypeFormattingTriggers": ["}", ";"]
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["clangd"].on_type_formatting_triggers,
+            Some(vec!["}".to_string(), ";".to_string()]),
+            "explicit trigger list is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].on_type_formatting_triggers, None,
+            "absent onTypeFormattingTriggers parses as None"
+        );
+    }
+
+    #[test]
+    fn on_type_formatting_trigger_union_is_sorted_and_deduped() {
+        let server = |triggers: Option<Vec<&str>>| BridgeServerConfig {
+            cmd: vec!["x".to_string()],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: triggers
+                .map(|t| t.into_iter().map(String::from).collect()),
+        };
+        let servers = HashMap::from([
+            ("a".to_string(), server(Some(vec!["}", ";"]))),
+            ("b".to_string(), server(Some(vec![";", "\n"]))),
+            ("c".to_string(), server(None)),
+        ]);
+
+        let (first, more) =
+            on_type_formatting_trigger_union(&servers).expect("triggers configured");
+        // Sorted + deduped: deterministic regardless of HashMap iteration order.
+        assert_eq!(first, "\n");
+        assert_eq!(more, vec![";".to_string(), "}".to_string()]);
+
+        // Same logical contents inserted in a different order must produce
+        // the identical advertisement.
+        let servers_reordered = HashMap::from([
+            ("c".to_string(), server(None)),
+            ("b".to_string(), server(Some(vec![";", "\n"]))),
+            ("a".to_string(), server(Some(vec!["}", ";"]))),
+        ]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers_reordered),
+            Some((first, more)),
+            "union must not depend on map construction order"
+        );
+    }
+
+    #[test]
+    fn on_type_formatting_trigger_union_without_triggers_is_none() {
+        let servers = HashMap::from([(
+            "a".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["x".to_string()],
+                languages: vec![],
+                initialization_options: None,
+                root_markers: None,
+                on_type_formatting_triggers: Some(vec![String::new()]),
+            },
+        )]);
+        assert_eq!(
+            on_type_formatting_trigger_union(&servers),
+            None,
+            "empty-string triggers are ignored; no triggers means no capability"
+        );
+        assert_eq!(on_type_formatting_trigger_union(&HashMap::new()), None);
     }
 
     #[test]
