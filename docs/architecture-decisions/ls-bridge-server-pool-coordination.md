@@ -31,11 +31,26 @@ The bridge manages connections to multiple downstream language servers. Even in 
 
 ### Phase 1: Server-Name-Based Routing (Current)
 
-Each language maps to a `server_name` via configuration. The pool is keyed by `server_name`, enabling:
-- **Process sharing for related languages**: e.g., `typescript` and `typescriptreact` can share a single `tsgo` process
+Each language maps to a `server_name` via configuration. The pool is keyed by
+`(server_name, resolved workspace root)` (a `ConnectionKey`), enabling:
+- **Process sharing for related languages**: e.g., `typescript` and `typescriptreact` can share a single `tsgo` process (same `server_name`, same root)
 - **Decoupling language from process**: The same binary can serve multiple languages
+- **Per-root pooling for monorepos** (#382): the same `server_name` under two
+  different marker roots gets two downstream processes, each rooted correctly;
+  documents with no marker root share the client-root fallback connection.
 
-Routing: `language` → `server_name` (via config) → connection.
+Routing: `language` → `server_name` (via config) + document's resolved root → connection.
+The root is resolved from the triggering document's `rootMarkers` walk
+(`root_markers::resolve_marker_workspace`), the single source shared with the
+spawn handshake so a connection's key always matches the root it was spawned at.
+The `ConnectionKey` is stored on each connection handle, so the request,
+`didChange`, host, and cancel paths route per-connection state via
+`handle.key()` without re-resolving the root.
+
+**Known limitation:** per-root pooling multiplies process count with the number
+of distinct roots opened, and there is no idle-eviction yet — see Consequences.
+Resolve-style requests that carry no document URI (`completionItem/resolve`) land
+on the server's client-root fallback connection rather than the originating root.
 
 **No-Provider Handling:** Return `REQUEST_FAILED` with clear message ("bridge: no provider for hover in python") to keep misconfiguration visible.
 
@@ -430,6 +445,7 @@ languageServers:
 
 ## Amendment History
 
+- **2026-06-20**: Extended pool keying from `server_name` to `(server_name, resolved workspace root)` (`ConnectionKey`) for multi-root monorepos (#382). The root is resolved from the triggering document's `rootMarkers` walk, shared with the spawn handshake, and stored on the connection handle so all per-connection state routes via `handle.key()`. Documents under different marker roots get separate downstream processes; marker-less documents share the client-root fallback. Follow-up: idle-eviction policy to bound process growth.
 - **2026-01-24**: Changed from language-based to server-name-based pool keying to enable process sharing for related languages (e.g., ts/tsx sharing tsgo). Connection pool is now keyed by `server_name` instead of `languageId`, with configuration resolving `language` → `server_name`.
 - **2026-01-07**: Merged Amendment 002 - Simplified ID namespace by using upstream request IDs directly (no transformation), replaced `pending_correlations` with `pending_responses`
 - **2026-01-06**: Merged Amendment 001 - Updated partial results to use LSP-native fields (isIncomplete), clarified $/cancelRequest semantics, added response guarantees for cancelled requests

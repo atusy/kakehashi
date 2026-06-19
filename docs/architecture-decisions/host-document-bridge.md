@@ -135,7 +135,7 @@ Whether an LS is a candidate for a given request depends entirely on the `langua
 - **Virt path** (`bridge.<inj>` route): select LSes where `languages` contains `<inj>` (the injection language).
 - **Host path** (`bridge._self` route): select LSes where `languages` contains `<host>` (the host language of the document).
 
-The same LS naturally serves both roles when applicable. `pyright` with `languages = ["python"]` is a host candidate for `.py` files *and* a virt candidate for Python injections inside other host languages — both routes flow through one connection (one entry in the pool keyed by `server_name`).
+The same LS naturally serves both roles when applicable. `pyright` with `languages = ["python"]` is a host candidate for `.py` files *and* a virt candidate for Python injections inside other host languages — both routes flow through one connection (one entry in the pool keyed by its `ConnectionKey`, i.e. `(server_name, resolved root)`).
 
 No new fields on `BridgeServerConfig`. An LS that should not act as host for a given language is excluded by leaving `bridge._self.enabled = false` for that language, or by not listing the language in its `languages` field.
 
@@ -185,7 +185,7 @@ Host bridges use the **real URI** as sent by the client. This is the key distinc
 Practical consequences:
 
 - `compute_included_ranges` / `sub_select_included_ranges` / virtual URI generation remain virt-only.
-- The pool's `(uri, server_name)` document tracker handles host with no modification — host_uri is just another string key.
+- The pool's `(uri, connection key)` host-document sync state handles host with no modification — host_uri is just another string key.
 - `request_id.rs` ID multiplexing is URI-agnostic and serves host without changes.
 - The coordinator's response post-processing gains a single role-based branch: `if role == Host { resp } else { fixup(resp) }`.
 
