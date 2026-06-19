@@ -123,7 +123,10 @@ async fn run_async(options: DiagnoseOptions) -> u8 {
 /// final exit code.
 #[derive(Default)]
 struct Report {
-    /// Total diagnostics printed.
+    /// Total diagnostics found across all scanned files — what the stderr
+    /// summary reports. May exceed what reached stdout when a closed pipe
+    /// truncated the stream (the scan still completes, so the count is the true
+    /// total, not just the bytes written).
     total: usize,
     /// Whether any printed diagnostic should fail the run (an error, or a
     /// warning under `--fail-on-warning`).
