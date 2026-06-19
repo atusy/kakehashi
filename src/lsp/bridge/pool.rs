@@ -574,9 +574,21 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        // Resolve the marker workspace + key ONCE (one filesystem walk) and reuse
+        // the key for the initializing-retry lookup below, instead of resolving
+        // again there.
+        let (marker, connection_key) =
+            self.resolve_marker_and_key(server_name, server_config, document_uri);
+
         // First, try to get or create the connection
         match self
-            .get_or_create_connection(server_name, server_config, document_uri)
+            .get_or_create_connection_resolved(
+                server_name,
+                server_config,
+                connection_key.clone(),
+                marker,
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+            )
             .await
         {
             Ok(handle) => {
@@ -593,11 +605,8 @@ impl LanguageServerPool {
                     .is_some_and(BridgeError::is_initializing);
 
                 if is_initializing {
-                    // Get the handle from pool and wait for it to be ready.
-                    // Resolve the same key the spawn used so we wait on the
-                    // connection this document actually routes to.
-                    let connection_key =
-                        self.connection_key(server_name, server_config, document_uri);
+                    // Wait on the connection this document routes to — the key was
+                    // already resolved above, so no second filesystem walk here.
                     let handle = {
                         let connections = self.connections.lock().await;
                         connections
@@ -621,29 +630,50 @@ impl LanguageServerPool {
 }
 
 impl LanguageServerPool {
-    /// Resolve the pool identity `(server_name, root)` for a request on
-    /// `document_uri`. The single point of root resolution: every map lookup and
-    /// the spawn handshake derive their key from here (via the shared
-    /// [`resolve_marker_workspace`](super::root_markers::resolve_marker_workspace)),
-    /// so a document always routes to the same connection across acquisition,
-    /// `wait_ready`, and any later respawn.
+    /// Resolve the marker workspace AND the pool key `(server_name, root)` for a
+    /// request on `document_uri` in a SINGLE filesystem walk — the one point of
+    /// root resolution. The spawn handshake (`marker`) and every map lookup
+    /// (`key`) derive from the same value, so a document always routes to the
+    /// connection it is spawned at, even if the marker filesystem changes between
+    /// calls (#382). Returning both lets a caller resolve once and reuse the key
+    /// (e.g. `wait_ready`'s initializing-retry lookup) instead of walking twice.
     ///
     /// The root is the marker-derived workspace root when one is found —
     /// documents under different marker roots get separate downstream processes
     /// (issue #382) — or `None`, the client-root fallback shared by every
     /// document without a marker root.
+    fn resolve_marker_and_key(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+    ) -> (
+        Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        ConnectionKey,
+    ) {
+        let marker = super::root_markers::resolve_marker_workspace(
+            server_config.root_markers.as_deref(),
+            document_uri,
+        );
+        let key = ConnectionKey::new(
+            server_name,
+            marker
+                .as_ref()
+                .map(|(root, _folder)| String::from(root.clone())),
+        );
+        (marker, key)
+    }
+
+    /// The pool key alone, for callers that don't spawn (no `marker` needed).
+    /// See [`resolve_marker_and_key`](Self::resolve_marker_and_key).
     fn connection_key(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: Option<&Url>,
     ) -> ConnectionKey {
-        let root = super::root_markers::resolve_marker_workspace(
-            server_config.root_markers.as_deref(),
-            document_uri,
-        )
-        .map(|(root, _folder)| String::from(root));
-        ConnectionKey::new(server_name, root)
+        self.resolve_marker_and_key(server_name, server_config, document_uri)
+            .1
     }
 
     /// Public projection of [`connection_key`](Self::connection_key) for callers
@@ -661,11 +691,9 @@ impl LanguageServerPool {
         self.connection_key(server_name, server_config, document_uri)
     }
 
-    /// Fast-fail get-or-spawn (ls-bridge-message-ordering): on miss, start the process, split
-    /// reader+writer, store the handle as `Initializing`, and run the LSP
-    /// initialize handshake in a background task that transitions Ready or
-    /// Failed. Requests against Initializing fail with REQUEST_FAILED; Failed
-    /// causes removal and respawn on the next call.
+    /// Fast-fail get-or-spawn (ls-bridge-message-ordering): resolves the
+    /// connection's `(marker, key)` from `document_uri`, then delegates to
+    /// [`get_or_create_connection_resolved`](Self::get_or_create_connection_resolved).
     async fn get_or_create_connection_with_timeout(
         &self,
         server_name: &str,
@@ -673,22 +701,33 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        // Resolve the marker workspace ONCE, before any await, then derive both
-        // the pool key and (on a spawn) the handshake workspace from this single
-        // value. Resolving separately for the key and the spawn could observe a
-        // changed marker filesystem in between and key the connection under a
-        // different root than the server is actually spawned at (#382).
-        let marker = super::root_markers::resolve_marker_workspace(
-            server_config.root_markers.as_deref(),
-            document_uri,
-        );
-        let connection_key = ConnectionKey::new(
+        let (marker, connection_key) =
+            self.resolve_marker_and_key(server_name, server_config, document_uri);
+        self.get_or_create_connection_resolved(
             server_name,
-            marker
-                .as_ref()
-                .map(|(root, _folder)| String::from(root.clone())),
-        );
+            server_config,
+            connection_key,
+            marker,
+            timeout,
+        )
+        .await
+    }
 
+    /// Get-or-spawn against an ALREADY-resolved `(connection_key, marker)` pair
+    /// (resolve via [`resolve_marker_and_key`](Self::resolve_marker_and_key)), so
+    /// a caller can resolve the marker workspace once and reuse the key. On miss:
+    /// start the process, split reader+writer, store the handle as
+    /// `Initializing`, and run the LSP initialize handshake in a background task
+    /// that transitions Ready or Failed. Requests against Initializing fail with
+    /// REQUEST_FAILED; Failed causes removal and respawn on the next call.
+    async fn get_or_create_connection_resolved(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        connection_key: ConnectionKey,
+        marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
 
         // Get consecutive panic count for this connection

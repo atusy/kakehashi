@@ -29,7 +29,7 @@ The bridge manages connections to multiple downstream language servers. Even in 
 
 **Adopt a phased approach: start with single-LS-per-language routing, extend to multi-LS aggregation in Phase 3.**
 
-### Phase 1: Server-Name-Based Routing (Current)
+### Phase 1: Connection-Key Routing — `(server_name, root)` (Current)
 
 Each language maps to a `server_name` via configuration. The pool is keyed by
 `(server_name, resolved workspace root)` (a `ConnectionKey`), enabling:
