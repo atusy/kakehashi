@@ -61,7 +61,7 @@ pub(crate) struct DocumentTracker {
     opened_documents: DashMap<String, usize>,
     /// Reverse index: virtual URI string → connections that have this doc open.
     ///
-    /// Enables O(1) lookup in `get_all_servers_for_virtual_uri()`, replacing the
+    /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
     virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
 }
@@ -110,7 +110,14 @@ impl DocumentTracker {
         // Step 1: Check-and-initialize version under Mutex (serializes concurrent claims)
         {
             let mut versions = self.document_versions.lock().await;
-            let docs = versions.entry(connection_key.clone()).or_default();
+            // Clone the key only when this connection is seen for the first time;
+            // the common path (connection already present) skips the clone.
+            if !versions.contains_key(connection_key) {
+                versions.insert(connection_key.clone(), HashMap::new());
+            }
+            let docs = versions
+                .get_mut(connection_key)
+                .expect("inserted above when absent");
             if docs.contains_key(&uri_string) {
                 return false; // Already claimed by another caller
             }
@@ -120,7 +127,7 @@ impl DocumentTracker {
         // Step 2: Mark as opened — version is already available for concurrent didChange
         *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
 
-        // Step 3: Update reverse index so get_all_servers_for_virtual_uri works immediately.
+        // Step 3: Update reverse index so get_all_connections_for_virtual_uri works immediately.
         // This closes the TOCTOU gap between claim and register_opened_document.
         // register_opened_document will perform an idempotent duplicate-check insert.
         {
@@ -177,9 +184,13 @@ impl DocumentTracker {
         // Step 1: Update versions (release lock after block)
         {
             let mut versions = self.document_versions.lock().await;
+            // Clone the key only when this connection is first registered.
+            if !versions.contains_key(connection_key) {
+                versions.insert(connection_key.clone(), HashMap::new());
+            }
             versions
-                .entry(connection_key.clone())
-                .or_default()
+                .get_mut(connection_key)
+                .expect("inserted above when absent")
                 .entry(uri_string.clone())
                 .or_insert(1);
         }
@@ -202,7 +213,7 @@ impl DocumentTracker {
         // needed for test helpers that call this directly)
         self.opened_documents.entry(uri_string.clone()).or_insert(1);
 
-        // Update the reverse index for O(1) get_all_servers_for_virtual_uri lookups
+        // Update the reverse index for O(1) get_all_connections_for_virtual_uri lookups
         {
             let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
             if !servers.contains(connection_key) {
@@ -405,7 +416,7 @@ impl DocumentTracker {
     /// to every connection, not just the first one found.
     ///
     /// O(1) lookup via the `virtual_to_servers` reverse index.
-    pub(super) fn get_all_servers_for_virtual_uri(
+    pub(super) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
     ) -> Vec<ConnectionKey> {
@@ -633,7 +644,7 @@ mod tests {
         );
     }
 
-    /// Test that get_all_servers_for_virtual_uri works immediately after try_claim_for_open.
+    /// Test that get_all_connections_for_virtual_uri works immediately after try_claim_for_open.
     ///
     /// This verifies the reverse index is updated at claim time, closing the
     /// TOCTOU gap between try_claim_for_open and register_opened_document.
@@ -646,7 +657,7 @@ mod tests {
         // Before claim: no servers
         assert!(
             tracker
-                .get_all_servers_for_virtual_uri(&virtual_uri)
+                .get_all_connections_for_virtual_uri(&virtual_uri)
                 .is_empty(),
             "Should return empty before claim"
         );
@@ -657,7 +668,7 @@ mod tests {
             .await;
 
         // Reverse index should be available immediately — no need for register_opened_document
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert_eq!(
             servers,
             vec![ConnectionKey::for_server("lua")],
@@ -1100,10 +1111,10 @@ mod tests {
     }
 
     // ========================================
-    // get_all_servers_for_virtual_uri tests
+    // get_all_connections_for_virtual_uri tests
     // ========================================
 
-    /// Test that get_all_servers_for_virtual_uri returns multiple servers for the same URI.
+    /// Test that get_all_connections_for_virtual_uri returns multiple servers for the same URI.
     ///
     /// When two servers (e.g., emmylua and lua_ls) both open the same virtual doc,
     /// both server names should be returned.
@@ -1132,13 +1143,13 @@ mod tests {
             )
             .await;
 
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert_eq!(servers.len(), 2, "Should return both servers");
         assert!(servers.contains(&ConnectionKey::for_server("emmylua")));
         assert!(servers.contains(&ConnectionKey::for_server("lua_ls")));
     }
 
-    /// Test that get_all_servers_for_virtual_uri returns a single server when only one matches.
+    /// Test that get_all_connections_for_virtual_uri returns a single server when only one matches.
     #[tokio::test]
     async fn get_all_servers_returns_single_server() {
         let tracker = DocumentTracker::new();
@@ -1149,22 +1160,22 @@ mod tests {
             .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert_eq!(servers, vec![ConnectionKey::for_server("lua")]);
     }
 
-    /// Test that get_all_servers_for_virtual_uri returns empty vec for unknown URI.
+    /// Test that get_all_connections_for_virtual_uri returns empty vec for unknown URI.
     #[tokio::test]
     async fn get_all_servers_returns_empty_for_unknown() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert!(servers.is_empty(), "Should return empty for unknown URI");
     }
 
-    /// Test that get_all_servers_for_virtual_uri does not cross-contaminate.
+    /// Test that get_all_connections_for_virtual_uri does not cross-contaminate.
     ///
     /// Different virtual URIs should not leak servers from unrelated documents.
     #[tokio::test]
@@ -1192,8 +1203,8 @@ mod tests {
             )
             .await;
 
-        let lua_servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri_lua);
-        let python_servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri_python);
+        let lua_servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri_lua);
+        let python_servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri_python);
 
         assert_eq!(lua_servers, vec![ConnectionKey::for_server("lua")]);
         assert_eq!(python_servers, vec![ConnectionKey::for_server("python")]);
@@ -1284,7 +1295,7 @@ mod tests {
             tracker.try_claim_for_open(&vuri, &dead).await,
             "purged connection must be able to re-claim (→ re-didOpen)"
         );
-        let servers = tracker.get_all_servers_for_virtual_uri(&vuri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&vuri);
         assert!(
             servers.contains(&dead) && servers.contains(&sibling),
             "reverse index holds both connections after purge + re-claim: {servers:?}"
@@ -1297,7 +1308,7 @@ mod tests {
         );
     }
 
-    /// Test that get_all_servers_for_virtual_uri works with process sharing.
+    /// Test that get_all_connections_for_virtual_uri works with process sharing.
     ///
     /// When ts and tsx both use "tsgo" as server_name, the lookup
     /// should return "tsgo" for each language's virtual URI independently.
@@ -1330,11 +1341,11 @@ mod tests {
 
         // Both should return vec!["tsgo"] — same server, different virtual URIs
         assert_eq!(
-            tracker.get_all_servers_for_virtual_uri(&virtual_uri_ts),
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri_ts),
             vec![ConnectionKey::for_server("tsgo")]
         );
         assert_eq!(
-            tracker.get_all_servers_for_virtual_uri(&virtual_uri_tsx),
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri_tsx),
             vec![ConnectionKey::for_server("tsgo")]
         );
     }

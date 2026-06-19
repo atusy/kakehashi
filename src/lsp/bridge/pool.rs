@@ -434,12 +434,12 @@ impl LanguageServerPool {
     ///
     /// Used by did_change to forward notifications to every connection that has
     /// the document open, not just the first one found.
-    pub(super) fn get_all_servers_for_virtual_uri(
+    pub(super) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
     ) -> Vec<ConnectionKey> {
         self.document_tracker
-            .get_all_servers_for_virtual_uri(virtual_uri)
+            .get_all_connections_for_virtual_uri(virtual_uri)
     }
 
     /// Register a document as successfully opened (test helper).
@@ -657,9 +657,11 @@ impl LanguageServerPool {
         );
         let key = ConnectionKey::new(
             server_name,
+            // `as_str().to_owned()` is one allocation; `String::from(root.clone())`
+            // would clone the parsed `Url` first. The string is identical.
             marker
                 .as_ref()
-                .map(|(root, _folder)| String::from(root.clone())),
+                .map(|(root, _folder)| root.as_str().to_owned()),
         );
         (marker, key)
     }

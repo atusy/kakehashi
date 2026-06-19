@@ -64,7 +64,7 @@ impl LanguageServerPool {
             // Look up ALL connections that have this virtual doc open.
             // Multiple servers may handle the same language (e.g., emmylua and
             // lua_ls), and one server may back several workspace roots (#382).
-            let connection_keys = self.get_all_servers_for_virtual_uri(&virtual_uri);
+            let connection_keys = self.get_all_connections_for_virtual_uri(&virtual_uri);
 
             for connection_key in connection_keys {
                 // Check connection state BEFORE incrementing version.

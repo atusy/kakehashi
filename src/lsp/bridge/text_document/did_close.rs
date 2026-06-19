@@ -272,7 +272,7 @@ mod tests {
         pool.register_opened_document(&host_uri, &scratch_uri, &ConnectionKey::for_server("black"))
             .await;
         assert_eq!(
-            pool.get_all_servers_for_virtual_uri(&scratch_uri),
+            pool.get_all_connections_for_virtual_uri(&scratch_uri),
             vec![ConnectionKey::for_server("black")],
             "scratch doc should be reachable via host_to_virtual after register"
         );
