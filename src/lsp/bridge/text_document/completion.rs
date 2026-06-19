@@ -69,6 +69,7 @@ impl LanguageServerPool {
                     ctx.offset,
                     Some(EnvelopeContext {
                         server_name,
+                        host_uri: host_uri.as_str(),
                         offset: ctx.offset,
                     }),
                 )
@@ -184,6 +185,15 @@ const ENVELOPE_KEY: &str = "kakehashi";
 pub(crate) struct KakehashiEnvelope {
     /// Server name identifying which downstream produced the item.
     pub origin: String,
+    /// Host document URI the completion was requested on. Used to re-resolve the
+    /// same `(server, root)` connection for `completionItem/resolve` so the
+    /// resolve reaches the very process that produced the item (#382) — without
+    /// it, resolve would land on the server's client-root fallback connection,
+    /// a *different* process in a multi-root monorepo. Empty (via `serde(default)`)
+    /// for envelopes from before this field existed → falls back to root-less
+    /// routing, matching the old behavior.
+    #[serde(default)]
+    pub host_uri: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub inner: Option<Value>,
     /// Region offset snapshot for coordinate transformation of the resolved response.
@@ -228,6 +238,9 @@ impl From<&EnvelopeOffset> for RegionOffset {
 /// Context needed to create envelopes during completion response processing.
 pub(crate) struct EnvelopeContext<'a> {
     pub server_name: &'a str,
+    /// Host document URI the completion ran on, stored in the envelope so
+    /// `completionItem/resolve` can route back to the originating connection.
+    pub host_uri: &'a str,
     pub offset: &'a RegionOffset,
 }
 
@@ -239,6 +252,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: ctx.server_name.to_string(),
+        host_uri: ctx.host_uri.to_string(),
         inner,
         offset: EnvelopeOffset::from(ctx.offset),
     };
@@ -746,6 +760,7 @@ mod tests {
         let offset = RegionOffset::new(3, 4);
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
+            host_uri: "file:///test/doc.md",
             offset: &offset,
         };
         envelope_item_data(&mut item, &ctx);
@@ -753,6 +768,10 @@ mod tests {
         // data should now be wrapped
         let envelope = extract_envelope(&item).expect("should extract envelope");
         assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(
+            envelope.host_uri, "file:///test/doc.md",
+            "host URI must survive the envelope round-trip for resolve routing (#382)"
+        );
         assert_eq!(envelope.inner, Some(json!({"resolve_id": 42})));
         assert_eq!(
             envelope.offset,
@@ -769,6 +788,25 @@ mod tests {
         assert_eq!(item.data, Some(json!({"resolve_id": 42})));
     }
 
+    /// A pre-#382 envelope serialized without a `host_uri` field still
+    /// deserializes (to an empty host URI), so resolve degrades to root-less
+    /// routing rather than failing — `serde(default)` backward compatibility.
+    #[test]
+    fn envelope_without_host_uri_deserializes_to_empty() {
+        let legacy = json!({
+            "origin": "lua-ls",
+            "inner": null,
+            "offset": { "line": 1, "column": 0 }
+        });
+        let envelope: KakehashiEnvelope =
+            serde_json::from_value(legacy).expect("legacy envelope must still deserialize");
+        assert_eq!(envelope.origin, "lua-ls");
+        assert_eq!(
+            envelope.host_uri, "",
+            "missing host_uri must default to empty, not fail"
+        );
+    }
+
     #[test]
     fn envelope_round_trip_with_none_data() {
         let mut item = CompletionItem {
@@ -779,6 +817,7 @@ mod tests {
         let offset = RegionOffset::new(3, 4);
         let ctx = EnvelopeContext {
             server_name: "lua-ls",
+            host_uri: "file:///test/doc.md",
             offset: &offset,
         };
         envelope_item_data(&mut item, &ctx);
