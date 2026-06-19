@@ -429,9 +429,10 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
-    /// Find ALL server names that have opened a given virtual document URI.
+    /// Find ALL connections (`(server, root)` keys) that have opened a given
+    /// virtual document URI.
     ///
-    /// Used by did_change to forward notifications to every server that has
+    /// Used by did_change to forward notifications to every connection that has
     /// the document open, not just the first one found.
     pub(super) fn get_all_servers_for_virtual_uri(
         &self,
