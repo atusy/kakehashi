@@ -142,7 +142,6 @@ impl LanguageServerPool {
         let host_uri_string = host_uri.to_string();
         self.execute_bridge_request_with_handle(
             handle,
-            server_name,
             host_uri,
             injection_language,
             region_id,
@@ -229,9 +228,12 @@ impl LanguageServerPool {
             return lens;
         }
 
+        // Route per-connection cancel state by this handle's pool key (#382).
+        let connection_key = handle.key();
+
         // Register in the upstream request registry FIRST for cancel lookup.
         if let Some(ref id) = upstream_id {
-            self.register_upstream_request(id.clone(), server_name);
+            self.register_upstream_request(id.clone(), connection_key);
         }
 
         let (request_id, response_rx) =
@@ -244,7 +246,7 @@ impl LanguageServerPool {
                         server_name, e
                     );
                     if let Some(ref id) = upstream_id {
-                        self.unregister_upstream_request(id, server_name);
+                        self.unregister_upstream_request(id, connection_key);
                     }
                     re_envelope_lens(&mut lens, &envelope);
                     return lens;
@@ -268,7 +270,7 @@ impl LanguageServerPool {
                 server_name, e
             );
             if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, server_name);
+                self.unregister_upstream_request(id, connection_key);
             }
             re_envelope_lens(&mut lens, &envelope);
             return lens;
@@ -278,7 +280,7 @@ impl LanguageServerPool {
         router_guard.disarm();
 
         if let Some(ref id) = upstream_id {
-            self.unregister_upstream_request(id, server_name);
+            self.unregister_upstream_request(id, connection_key);
         }
 
         let response = match response {

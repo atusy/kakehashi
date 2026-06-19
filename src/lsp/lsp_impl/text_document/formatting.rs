@@ -904,6 +904,12 @@ async fn dispatch_concatenated_formatting(
                     return (current_text, None);
                 };
 
+                // The connection `(server, root)` this step's requests route to —
+                // resolved identically to the request path so the scratch-doc
+                // didClose and the per-step cancel target the right process (#382).
+                let connection_key =
+                    pool.resolve_connection_key(&server_name, &server_config, Some(&uri));
+
                 // ADR Decision point 6: this step's deadline is the REMAINING
                 // share of the whole-pipeline budget. Below the floor, skip
                 // outright — a request almost certain to time out is pure
@@ -1016,7 +1022,7 @@ async fn dispatch_concatenated_formatting(
                             &open_scratch,
                             OpenScratchDoc {
                                 uri: scratch_uri.clone(),
-                                server_name: server_name.clone(),
+                                connection_key: connection_key.clone(),
                             },
                         );
                     }
@@ -1134,10 +1140,10 @@ async fn dispatch_concatenated_formatting(
                         count_request_errors(&request_error_sink, 1);
                         if let Some(downstream_id) = step_downstream_id.get().copied() {
                             let pool = Arc::clone(&pool);
-                            let server_name = server_name.clone();
+                            let connection_key = connection_key.clone();
                             tokio::spawn(async move {
                                 let _ = pool
-                                    .forward_cancel_downstream(&server_name, downstream_id)
+                                    .forward_cancel_downstream(&connection_key, downstream_id)
                                     .await;
                             });
                         }
@@ -1204,12 +1210,13 @@ async fn dispatch_concatenated_formatting(
 }
 
 /// A scratch virtual document opened during a concatenated-formatting run that
-/// has not yet been closed. Paired with its `server_name` so the `didClose`
-/// targets the connection the matching `didOpen` was sent on.
+/// has not yet been closed. Paired with its connection key so the `didClose`
+/// targets the exact `(server, root)` connection the matching `didOpen` was sent
+/// on (#382).
 #[derive(Clone)]
 struct OpenScratchDoc {
     uri: VirtualDocumentUri,
-    server_name: String,
+    connection_key: crate::lsp::bridge::ConnectionKey,
 }
 
 /// Drop-based cleanup that closes every scratch document still tracked open when
@@ -1273,7 +1280,7 @@ impl Drop for ScratchCleanupGuard {
         let host_uri = self.host_uri.clone();
         let cleanup = async move {
             for doc in remaining {
-                pool.close_scratch_document(&host_uri, &doc.uri, &doc.server_name)
+                pool.close_scratch_document(&host_uri, &doc.uri, &doc.connection_key)
                     .await;
             }
         };
@@ -2082,7 +2089,7 @@ mod tests {
         let host_uri: tower_lsp_server::ls_types::Uri = host.parse().unwrap();
         OpenScratchDoc {
             uri: VirtualDocumentUri::new(&host_uri, "python", id),
-            server_name: server.to_string(),
+            connection_key: crate::lsp::bridge::ConnectionKey::for_server(server),
         }
     }
 

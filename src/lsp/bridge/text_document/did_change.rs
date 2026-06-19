@@ -61,11 +61,12 @@ impl LanguageServerPool {
                 continue;
             }
 
-            // Look up ALL server names that have this virtual doc open.
-            // Multiple servers may handle the same language (e.g., emmylua and lua_ls).
-            let server_names = self.get_all_servers_for_virtual_uri(&virtual_uri);
+            // Look up ALL connections that have this virtual doc open.
+            // Multiple servers may handle the same language (e.g., emmylua and
+            // lua_ls), and one server may back several workspace roots (#382).
+            let connection_keys = self.get_all_servers_for_virtual_uri(&virtual_uri);
 
-            for server_name in server_names {
+            for connection_key in connection_keys {
                 // Check connection state BEFORE incrementing version.
                 // Non-Ready servers shouldn't consume version numbers.
                 //
@@ -77,7 +78,7 @@ impl LanguageServerPool {
                 // is non-blocking fire-and-forget).
                 let handle = {
                     let connections = self.connections().await;
-                    let Some(handle) = connections.get(&server_name) else {
+                    let Some(handle) = connections.get(&connection_key) else {
                         continue;
                     };
 
@@ -88,10 +89,10 @@ impl LanguageServerPool {
                     Arc::clone(handle)
                 };
 
-                // increment_document_version acts as per-server filter:
-                // returns None if this server hasn't registered the doc.
+                // increment_document_version acts as per-connection filter:
+                // returns None if this connection hasn't registered the doc.
                 let Some(version) = self
-                    .increment_document_version(&virtual_uri, &server_name)
+                    .increment_document_version(&virtual_uri, &connection_key)
                     .await
                 else {
                     continue;

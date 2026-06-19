@@ -76,7 +76,6 @@ impl LanguageServerPool {
         // avoiding a redundant HashMap lookup.
         self.execute_bridge_request_with_handle(
             handle,
-            server_name,
             host_uri,
             injection_language,
             region_id,

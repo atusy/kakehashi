@@ -46,6 +46,7 @@ impl LanguageServerPool {
             }
         };
 
+        let connection_key = handle.key().clone();
         let mut sender = ConnectionHandleSender(&handle);
 
         for injection in &injections {
@@ -58,7 +59,7 @@ impl LanguageServerPool {
                     host_uri,
                     &virtual_uri,
                     &injection.content,
-                    server_name,
+                    &connection_key,
                 )
                 .await
             {
@@ -91,8 +92,12 @@ mod tests {
         let server_name = "test-server";
 
         // Pre-create a ready connection so eager_open_virtual_documents finds it
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
-        pool.insert_connection(server_name, handle).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            crate::lsp::bridge::ConnectionKey::for_server(server_name),
+        )
+        .await;
+        pool.insert_connection(handle).await;
 
         let host_uri = test_host_uri("eager_open");
         let host_uri_lsp = url_to_uri(&host_uri);
@@ -145,8 +150,12 @@ mod tests {
         let config = devnull_config();
         let server_name = "test-server";
 
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
-        pool.insert_connection(server_name, handle).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            crate::lsp::bridge::ConnectionKey::for_server(server_name),
+        )
+        .await;
+        pool.insert_connection(handle).await;
 
         let host_uri = test_host_uri("idempotent");
         let host_uri_lsp = url_to_uri(&host_uri);
