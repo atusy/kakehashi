@@ -45,8 +45,9 @@ impl ConnectionKey {
 
     /// Build a key with no resolved root (client-root fallback).
     ///
-    /// Used where the root is irrelevant or unresolved — test fixtures and the
-    /// fallback path when no marker root applies.
+    /// Test-only convenience: production builds keys via [`new`](Self::new) with
+    /// the resolved marker root. Tests use this where the root is irrelevant.
+    #[cfg(test)]
     pub(crate) fn for_server(server: impl Into<String>) -> Self {
         Self::new(server, None)
     }

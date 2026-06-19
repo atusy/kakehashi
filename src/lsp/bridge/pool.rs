@@ -519,12 +519,12 @@ impl LanguageServerPool {
     /// Get or create a connection for the specified server, spawning the server
     /// and running the LSP handshake with the default timeout on a miss.
     ///
-    /// `document_uri` is the document that triggered the call; on a spawn it
-    /// seeds the `rootMarkers` workspace-root search (root_markers module).
-    /// It is ignored for an already-pooled connection — the first spawn
-    /// decides the root for the server's lifetime, so documents under a
-    /// *different* marker root reuse a process rooted elsewhere. Per-root
-    /// pooling (key = server + root) is tracked in issue #382.
+    /// `document_uri` selects the connection: it resolves to a
+    /// `(server_name, root)` key (root_markers module), so documents under
+    /// different marker roots get their own downstream process while documents
+    /// sharing a root (or the client-root fallback) share one (issue #382). On a
+    /// spawn it also seeds that connection's `rootMarkers` workspace root for the
+    /// LSP handshake.
     pub(super) async fn get_or_create_connection(
         &self,
         server_name: &str,
@@ -622,19 +622,27 @@ impl LanguageServerPool {
 impl LanguageServerPool {
     /// Resolve the pool identity `(server_name, root)` for a request on
     /// `document_uri`. The single point of root resolution: every map lookup and
-    /// the spawn handshake derive their key from here, so a document always
-    /// routes to the same connection across acquisition, `wait_ready`, and any
-    /// later respawn.
+    /// the spawn handshake derive their key from here (via the shared
+    /// [`resolve_marker_workspace`](super::root_markers::resolve_marker_workspace)),
+    /// so a document always routes to the same connection across acquisition,
+    /// `wait_ready`, and any later respawn.
     ///
-    /// In this stage the root is always the client-root fallback (`None`);
-    /// marker-root resolution from `document_uri` is layered on next.
+    /// The root is the marker-derived workspace root when one is found —
+    /// documents under different marker roots get separate downstream processes
+    /// (issue #382) — or `None`, the client-root fallback shared by every
+    /// document without a marker root.
     fn connection_key(
         &self,
         server_name: &str,
-        _server_config: &crate::config::settings::BridgeServerConfig,
-        _document_uri: Option<&Url>,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
     ) -> ConnectionKey {
-        ConnectionKey::for_server(server_name)
+        let root = super::root_markers::resolve_marker_workspace(
+            server_config.root_markers.as_deref(),
+            document_uri,
+        )
+        .map(|(root, _folder)| String::from(root));
+        ConnectionKey::new(server_name, root)
     }
 
     /// Public projection of [`connection_key`](Self::connection_key) for callers
@@ -1254,6 +1262,129 @@ mod tests {
         assert!(
             !connections.contains_key(&ConnectionKey::for_server("test")),
             "Connection should not exist before connection attempt"
+        );
+    }
+
+    /// Per-root pooling (#382): documents under different marker roots resolve
+    /// to distinct connection keys (→ separate downstream processes), while a
+    /// document with no marker root resolves to the shared client-root fallback.
+    #[test]
+    fn connection_key_distinguishes_marker_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two sibling projects, each its own `.git` marker root.
+        let proj_a = tmp.path().join("a");
+        let proj_b = tmp.path().join("b");
+        std::fs::create_dir_all(proj_a.join("src")).unwrap();
+        std::fs::create_dir_all(proj_b.join("src")).unwrap();
+        std::fs::create_dir(proj_a.join(".git")).unwrap();
+        std::fs::create_dir(proj_b.join(".git")).unwrap();
+        let doc_a = Url::from_file_path(proj_a.join("src/main.py")).unwrap();
+        let doc_b = Url::from_file_path(proj_b.join("src/main.py")).unwrap();
+
+        let pool = LanguageServerPool::new();
+        let config = devnull_config(); // root_markers: None → default [".git"]
+
+        let key_a = pool.connection_key("pyright", &config, Some(&doc_a));
+        let key_b = pool.connection_key("pyright", &config, Some(&doc_b));
+
+        assert_ne!(
+            key_a, key_b,
+            "documents under different .git roots must get distinct connection keys"
+        );
+        // Same server name, same root → same key (e.g. a sibling file in proj A).
+        let doc_a2 = Url::from_file_path(proj_a.join("src/other.py")).unwrap();
+        assert_eq!(
+            key_a,
+            pool.connection_key("pyright", &config, Some(&doc_a2)),
+            "documents sharing a marker root must share one connection key"
+        );
+        // Different server name under the same root → distinct connection.
+        assert_ne!(
+            key_a,
+            pool.connection_key("ruff", &config, Some(&doc_a)),
+            "different servers never share a connection"
+        );
+    }
+
+    /// A document with no marker root (and the no-document case) resolves to the
+    /// client-root fallback key, shared across all such documents — preserving
+    /// the pre-#382 single-process behavior for non-monorepo layouts.
+    #[test]
+    fn connection_key_falls_back_to_shared_key_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.git` anywhere up the tree from these orphan files.
+        let orphan_1 = Url::from_file_path(tmp.path().join("one.py")).unwrap();
+        let orphan_2 = Url::from_file_path(tmp.path().join("nested/two.py")).unwrap();
+
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+
+        let fallback = pool.connection_key("pyright", &config, Some(&orphan_1));
+        assert_eq!(
+            fallback,
+            pool.connection_key("pyright", &config, Some(&orphan_2)),
+            "marker-less documents must share the fallback connection"
+        );
+        assert_eq!(
+            fallback,
+            pool.connection_key("pyright", &config, None),
+            "the no-document case must resolve to the same fallback key"
+        );
+    }
+
+    /// Two documents under different marker roots spawn two separate downstream
+    /// connections in the pool rather than reusing one (#382). Uses a sink
+    /// command and a short timeout: the handshake fails, but each acquisition
+    /// still inserts its own keyed connection, which is what we assert.
+    #[tokio::test]
+    async fn different_marker_roots_create_separate_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj_a = tmp.path().join("a");
+        let proj_b = tmp.path().join("b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+        std::fs::create_dir(proj_a.join(".git")).unwrap();
+        std::fs::create_dir(proj_b.join(".git")).unwrap();
+        let doc_a = Url::from_file_path(proj_a.join("main.py")).unwrap();
+        let doc_b = Url::from_file_path(proj_b.join("main.py")).unwrap();
+
+        let pool = LanguageServerPool::new();
+        let config = devnull_config_for_language("python");
+
+        // Sink server never completes the handshake; a short timeout fails fast.
+        // Either way the keyed connection is inserted before the handshake runs.
+        let _ = pool
+            .get_or_create_connection_with_timeout(
+                "pyright",
+                &config,
+                Some(&doc_a),
+                Duration::from_millis(150),
+            )
+            .await;
+        let _ = pool
+            .get_or_create_connection_with_timeout(
+                "pyright",
+                &config,
+                Some(&doc_b),
+                Duration::from_millis(150),
+            )
+            .await;
+
+        let connections = pool.connections.lock().await;
+        assert_eq!(
+            connections.len(),
+            2,
+            "each marker root must get its own pooled connection, not share one"
+        );
+        let key_a = pool.connection_key("pyright", &config, Some(&doc_a));
+        let key_b = pool.connection_key("pyright", &config, Some(&doc_b));
+        assert!(
+            connections.contains_key(&key_a),
+            "root A connection present"
+        );
+        assert!(
+            connections.contains_key(&key_b),
+            "root B connection present"
         );
     }
 
