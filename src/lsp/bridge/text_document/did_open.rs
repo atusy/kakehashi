@@ -48,35 +48,37 @@ impl LanguageServerPool {
         };
 
         let connection_key = handle.key().clone();
-
-        // Claim + didOpen under the `connections` lock, after verifying `handle`
-        // is still the pool's LIVE connection for its key — the same guard the
-        // request (execute.rs) and host (host.rs) paths use. Without it, a
-        // concurrent respawn (get_or_create's SpawnNew branch) could remove this
-        // handle and PURGE its document tracker between the wait-ready above and
-        // the claim below; re-claiming through the dead handle would mark the
-        // docs open under this key while the fresh process never received the
-        // didOpen, wedging later requests on it. Lock order connections →
-        // document tracker matches the respawn purge, so the purge cannot
-        // interleave. Best-effort: bail quietly if the handle was replaced.
-        let connections = self.connections().await;
-        if !connections
-            .get(&connection_key)
-            .is_some_and(|current| Arc::ptr_eq(current, &handle))
-        {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Eager open: connection {} replaced before didOpen; skipping {} injections",
-                connection_key,
-                injections.len()
-            );
-            return;
-        }
-
         let mut sender = ConnectionHandleSender(&handle);
+
         for injection in &injections {
             let virtual_uri =
                 VirtualDocumentUri::new(host_uri_lsp, &injection.language, &injection.region_id);
+
+            // Verify `handle` is still the pool's LIVE connection for its key and
+            // claim + didOpen this ONE injection under the `connections` lock,
+            // then release before the next iteration — the same respawn guard the
+            // request (execute.rs) and host (host.rs) paths use, scoped per
+            // injection so the (best-effort, possibly many-region) eager open
+            // never holds the pool lock across the whole loop and stalls
+            // unrelated requests/spawns/cancels. Without the guard, a concurrent
+            // respawn (get_or_create's SpawnNew branch) that purged this key's
+            // tracker could let a claim through the dead handle, marking the doc
+            // open while the fresh process never received the didOpen. Lock order
+            // connections → document tracker matches the respawn purge. If a
+            // respawn replaced the handle mid-loop, stop: the purge lets the next
+            // real request re-open cleanly.
+            let connections = self.connections().await;
+            if !connections
+                .get(&connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Eager open: connection {} replaced mid-loop; stopping",
+                    connection_key
+                );
+                return;
+            }
 
             if let Err(e) = self
                 .ensure_document_opened(
