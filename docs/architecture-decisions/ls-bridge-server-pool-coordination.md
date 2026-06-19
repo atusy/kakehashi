@@ -47,10 +47,14 @@ The `ConnectionKey` is stored on each connection handle, so the request,
 `didChange`, host, and cancel paths route per-connection state via
 `handle.key()` without re-resolving the root.
 
+`completionItem/resolve` and `codeLens/resolve` carry no `textDocument`, so the
+originating host URI is stashed in their routing envelope (`KakehashiEnvelope` /
+`CodeLensEnvelope`) and used to re-resolve the same `(server, root)` connection
+that produced the item. A legacy envelope without that field falls back to the
+client-root connection (the pre-#382 behavior).
+
 **Known limitation:** per-root pooling multiplies process count with the number
 of distinct roots opened, and there is no idle-eviction yet — see Consequences.
-Resolve-style requests that carry no document URI (`completionItem/resolve`) land
-on the server's client-root fallback connection rather than the originating root.
 
 **No-Provider Handling:** Return `REQUEST_FAILED` with clear message ("bridge: no provider for hover in python") to keep misconfiguration visible.
 
