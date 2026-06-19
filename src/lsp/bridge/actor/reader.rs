@@ -317,8 +317,8 @@ pub(crate) fn spawn_reader_task_with_liveness(
 /// Spawn a reader task with liveness timeout (ls-bridge-async-connection).
 ///
 /// `deps` carries the per-server context (name, channels, capability registry,
-/// workspace folders, `forwardShowMessage` gate), snapshotted at spawn time
-/// like the rest of the server config (#378).
+/// workspace folders), snapshotted at spawn time like the rest of the server
+/// config (#378).
 pub(crate) fn spawn_reader_task_for_server(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
@@ -637,25 +637,23 @@ fn forward_notification(
                 ),
             }
         }
-        Some("window/showMessage") => {
-            match ShowMessageParams::deserialize(&message["params"]) {
-                Ok(params) => send_window_notification(
-                    deps,
-                    server_prefix,
-                    "window/showMessage",
-                    UpstreamNotification::ShowMessage {
-                        typ: params.typ,
-                        message: prefixed_message(deps.server_name.as_deref(), &params.message),
-                    },
-                ),
-                Err(e) => debug!(
-                    target: "kakehashi::bridge::reader",
-                    "{}Dropping window/showMessage with invalid params: {}",
-                    server_prefix,
-                    e
-                ),
-            }
-        }
+        Some("window/showMessage") => match ShowMessageParams::deserialize(&message["params"]) {
+            Ok(params) => send_window_notification(
+                deps,
+                server_prefix,
+                "window/showMessage",
+                UpstreamNotification::ShowMessage {
+                    typ: params.typ,
+                    message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                },
+            ),
+            Err(e) => debug!(
+                target: "kakehashi::bridge::reader",
+                "{}Dropping window/showMessage with invalid params: {}",
+                server_prefix,
+                e
+            ),
+        },
         _ => {}
     }
 }

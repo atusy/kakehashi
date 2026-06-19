@@ -91,7 +91,6 @@ pub(crate) fn merge_bridge_server_configs(
             .on_type_formatting_triggers
             .clone()
             .or_else(|| base.on_type_formatting_triggers.clone()),
-        forward_show_message: overlay.forward_show_message.or(base.forward_show_message),
     }
 }
 
@@ -508,7 +507,6 @@ mod tests {
                         initialization_options: Some(json!({"checkOnSave": true})),
                         root_markers: None,
                         on_type_formatting_triggers: None,
-                        forward_show_message: None,
                     },
                 ),
                 (
@@ -519,7 +517,6 @@ mod tests {
                         initialization_options: None,
                         root_markers: None,
                         on_type_formatting_triggers: None,
-                        forward_show_message: None,
                     },
                 ),
             ])),
@@ -589,7 +586,6 @@ mod tests {
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                         root_markers: None,
                         on_type_formatting_triggers: None,
-                        forward_show_message: None,
                     },
                 ),
                 (
@@ -601,7 +597,6 @@ mod tests {
                         initialization_options: None,
                         root_markers: None,
                         on_type_formatting_triggers: None,
-                        forward_show_message: None,
                     },
                 ),
             ])),
@@ -668,7 +663,6 @@ mod tests {
                     initialization_options: None,
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             )])),
             ..Default::default()
@@ -1057,7 +1051,6 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: None,
-                forward_show_message: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1073,7 +1066,6 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: None,
-                forward_show_message: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1090,7 +1082,6 @@ mod tests {
                     initialization_options: Some(json!({"defaultOption": true})),
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             ),
             (
@@ -1101,7 +1092,6 @@ mod tests {
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             ),
         ]);
@@ -1130,7 +1120,6 @@ mod tests {
             initialization_options: None,
             root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
-            forward_show_message: None,
         };
 
         // Unset overlay inherits from base (wildcard default applies)
@@ -1140,7 +1129,6 @@ mod tests {
             initialization_options: None,
             root_markers: None,
             on_type_formatting_triggers: None,
-            forward_show_message: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
         assert_eq!(
@@ -1189,7 +1177,6 @@ mod tests {
             })),
             root_markers: None,
             on_type_formatting_triggers: None,
-            forward_show_message: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
@@ -1201,7 +1188,6 @@ mod tests {
             })),
             root_markers: None,
             on_type_formatting_triggers: None,
-            forward_show_message: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1226,7 +1212,6 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
-            forward_show_message: None,
         };
 
         let base = server(Some(vec!["}"]));
@@ -1240,49 +1225,6 @@ mod tests {
                 .on_type_formatting_triggers,
             Some(vec![";".to_string()]),
             "explicit overlay replaces the base list (no union at merge level)"
-        );
-    }
-
-    /// `forwardShowMessage` merges overlay-wins-when-present, so a wildcard
-    /// `languageServers._` default applies unless the server entry overrides it.
-    #[test]
-    fn test_merge_bridge_server_configs_forward_show_message_overlay_wins() {
-        use settings::BridgeServerConfig;
-
-        let base = BridgeServerConfig {
-            cmd: vec!["default-lsp".to_string()],
-            languages: vec![],
-            initialization_options: None,
-            root_markers: None,
-            on_type_formatting_triggers: None,
-            forward_show_message: Some(true),
-        };
-        let overlay_unset = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
-            initialization_options: None,
-            root_markers: None,
-            on_type_formatting_triggers: None,
-            forward_show_message: None,
-        };
-        assert_eq!(
-            merge_bridge_server_configs(&base, &overlay_unset).forward_show_message,
-            Some(true),
-            "unset overlay inherits the base (wildcard) value"
-        );
-
-        let overlay_off = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
-            initialization_options: None,
-            root_markers: None,
-            on_type_formatting_triggers: None,
-            forward_show_message: Some(false),
-        };
-        assert_eq!(
-            merge_bridge_server_configs(&base, &overlay_off).forward_show_message,
-            Some(false),
-            "explicit overlay value wins over the base"
         );
     }
 
@@ -1420,7 +1362,6 @@ mod tests {
                     initialization_options: Some(json!({ "checkOnSave": true })),
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1432,7 +1373,6 @@ mod tests {
                     initialization_options: None, // Should inherit from wildcard
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             ),
         ]);
@@ -1471,7 +1411,6 @@ mod tests {
                     initialization_options: None,
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1483,7 +1422,6 @@ mod tests {
                     initialization_options: None,
                     root_markers: None,
                     on_type_formatting_triggers: None,
-                    forward_show_message: None,
                 },
             ),
         ]);

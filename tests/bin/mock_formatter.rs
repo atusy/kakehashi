@@ -50,11 +50,10 @@
 //!   trigger filtering is what `tests/e2e_on_type_formatting.rs` proves).
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
-//!   Used by `tests/e2e_window_notifications.rs` to prove the bridge
-//!   forwards logMessage unconditionally and gates showMessage behind
-//!   `forwardShowMessage` (#378). showMessage is sent FIRST so that
-//!   observing the logMessage upstream proves the showMessage was dropped,
-//!   not merely delayed.
+//!   Used by `tests/e2e_window_notifications.rs` to prove the bridge forwards
+//!   both window/* notifications unconditionally (#378). showMessage is sent
+//!   FIRST, and the bridge preserves order, so the test asserts showMessage
+//!   arrives ahead of logMessage.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 

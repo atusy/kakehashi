@@ -13,8 +13,7 @@ expression: settings.language_servers
     ],
     "initializationOptions": null,
     "rootMarkers": null,
-    "onTypeFormattingTriggers": null,
-    "forwardShowMessage": null
+    "onTypeFormattingTriggers": null
   },
   "rust-analyzer": {
     "cmd": [
@@ -25,7 +24,6 @@ expression: settings.language_servers
     ],
     "initializationOptions": null,
     "rootMarkers": null,
-    "onTypeFormattingTriggers": null,
-    "forwardShowMessage": null
+    "onTypeFormattingTriggers": null
   }
 }

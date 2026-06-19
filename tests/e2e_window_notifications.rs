@@ -3,11 +3,11 @@
 //! the `mock-lsp-formatter` test binary in `notify` mode (which emits a
 //! showMessage followed by a logMessage right after `initialize`).
 //!
-//! The ordering trick: the mock sends showMessage BEFORE logMessage, and the
-//! bridge preserves notification order end-to-end (single reader task ->
-//! unbounded channel -> single forwarding loop). So when the gate is off,
-//! observing the prefixed logMessage proves the showMessage was dropped —
-//! no flaky negative-timeout assertion needed.
+//! Both window/* notifications are forwarded unconditionally. The mock sends
+//! showMessage BEFORE logMessage and the bridge preserves notification order
+//! end-to-end (single reader task -> single forwarding loop), so the test can
+//! assert showMessage arrives first, then logMessage — no flaky
+//! negative-timeout assertion needed.
 
 #![cfg(feature = "e2e")]
 
@@ -138,44 +138,6 @@ fn e2e_forwards_window_show_and_log_messages() {
         log_params["type"].as_i64(),
         Some(3),
         "MessageType::INFO should pass through unchanged"
-    );
-
-    shutdown(&mut client);
-}
-
-#[test]
-fn e2e_forwards_show_message_when_enabled() {
-    let bin = mock_formatter_bin();
-    let (mut client, _config_dir) = init_client(json!({
-        "mock-notify": {
-            "cmd": [bin, "notify"],
-            "languages": ["lua"],
-            "forwardShowMessage": true
-        }
-    }));
-
-    open_markdown(&mut client);
-
-    let (method, params) = client
-        .wait_for_notification_where(
-            &["window/showMessage", "window/logMessage"],
-            Duration::from_secs(15),
-            from_mock,
-        )
-        .expect("a notification prefixed with the mock server name should be forwarded");
-
-    // With the gate enabled the showMessage (sent first) must come through
-    // first, ahead of the logMessage.
-    assert_eq!(method, "window/showMessage");
-    assert_eq!(
-        params["message"].as_str(),
-        Some("[kakehashi:mock-notify] mock show line"),
-        "showMessage should be forwarded verbatim with the server-name prefix"
-    );
-    assert_eq!(
-        params["type"].as_i64(),
-        Some(2),
-        "MessageType::WARNING should pass through unchanged"
     );
 
     shutdown(&mut client);

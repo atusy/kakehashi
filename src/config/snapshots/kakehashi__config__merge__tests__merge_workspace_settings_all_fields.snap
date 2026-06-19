@@ -85,8 +85,7 @@ expression: result
       ],
       "initializationOptions": null,
       "rootMarkers": null,
-      "onTypeFormattingTriggers": null,
-      "forwardShowMessage": null
+      "onTypeFormattingTriggers": null
     },
     "pyright": {
       "cmd": [
@@ -98,8 +97,7 @@ expression: result
       ],
       "initializationOptions": null,
       "rootMarkers": null,
-      "onTypeFormattingTriggers": null,
-      "forwardShowMessage": null
+      "onTypeFormattingTriggers": null
     },
     "rust-analyzer": {
       "cmd": [
@@ -115,8 +113,7 @@ expression: result
         ]
       },
       "rootMarkers": null,
-      "onTypeFormattingTriggers": null,
-      "forwardShowMessage": null
+      "onTypeFormattingTriggers": null
     }
   }
 }

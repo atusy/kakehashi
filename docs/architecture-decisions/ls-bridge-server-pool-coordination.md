@@ -208,11 +208,11 @@ downstream ──notification──►  bridge  ──notification──►  ups
                                └─ ...
 ```
 
-**Implemented: `window/*` forwarding (#378).** The reader task forwards
-`window/logMessage` unconditionally and `window/showMessage` behind the
-per-server `forwardShowMessage` config gate (default off — showMessage
-surfaces directly in the user's UI, so noisy servers must opt in via config).
-Both are prefixed with `[kakehashi:<server>]` for distinguishability and need
+**Implemented: `window/*` forwarding (#378).** The reader task forwards both
+`window/logMessage` and `window/showMessage` unconditionally — the bridge
+stays transparent, so messages a direct connection would surface are not
+silently swallowed. Both are prefixed with `[kakehashi:<server>]` for
+distinguishability and need
 no coordinate translation. They reuse the `UpstreamNotification` decoupling
 (reader task -> forwarding loop -> tower-lsp `Client`) but travel on a
 **bounded** channel with drop-on-full, separate from the unbounded channel

@@ -354,15 +354,14 @@ impl Kakehashi {
 /// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
 ///   `workspace/diagnostic/refresh` to trigger a fresh diagnostic pull.
 /// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` —
-///   downstream `window/*` notifications, already prefixed with the
-///   originating server name. `ShowMessage` only arrives when the server's
-///   `forwardShowMessage` config gate is enabled.
+///   downstream `window/*` notifications, forwarded unconditionally and
+///   already prefixed with the originating server name.
 ///
 /// Each dispatch awaits tower-lsp's internal bounded channel, so a slow editor
 /// stalls the loop — but the `biased` select drains `upstream_rx` first, so a
 /// `window/*` burst cannot starve `DiagnosticRefresh`, and the bounded window
 /// queue caps memory. FIFO order is preserved within each channel (the
-/// showMessage gating e2e relies on window-channel FIFO).
+/// window-notification e2e relies on window-channel FIFO).
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the

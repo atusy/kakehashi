@@ -53,7 +53,6 @@ pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
         initialization_options: None,
         root_markers: None,
         on_type_formatting_triggers: None,
-        forward_show_message: None,
     }
 }
 
@@ -75,7 +74,6 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
         initialization_options: None,
         root_markers: None,
         on_type_formatting_triggers: None,
-        forward_show_message: None,
     }
 }
 
