@@ -110,14 +110,15 @@ impl DocumentTracker {
         // Step 1: Check-and-initialize version under Mutex (serializes concurrent claims)
         {
             let mut versions = self.document_versions.lock().await;
-            // Clone the key only when this connection is seen for the first time;
-            // the common path (connection already present) skips the clone.
-            if !versions.contains_key(connection_key) {
-                versions.insert(connection_key.clone(), HashMap::new());
-            }
-            let docs = versions
-                .get_mut(connection_key)
-                .expect("inserted above when absent");
+            // One lookup on the common path (connection already present); clone
+            // the key only when inserting it for the first time.
+            let docs = match versions.get_mut(connection_key) {
+                Some(docs) => docs,
+                None => {
+                    versions.insert(connection_key.clone(), HashMap::new());
+                    versions.get_mut(connection_key).expect("just inserted")
+                }
+            };
             if docs.contains_key(&uri_string) {
                 return false; // Already claimed by another caller
             }
@@ -184,15 +185,15 @@ impl DocumentTracker {
         // Step 1: Update versions (release lock after block)
         {
             let mut versions = self.document_versions.lock().await;
-            // Clone the key only when this connection is first registered.
-            if !versions.contains_key(connection_key) {
-                versions.insert(connection_key.clone(), HashMap::new());
-            }
-            versions
-                .get_mut(connection_key)
-                .expect("inserted above when absent")
-                .entry(uri_string.clone())
-                .or_insert(1);
+            // One lookup on the common path; clone the key only on first insert.
+            let docs = match versions.get_mut(connection_key) {
+                Some(docs) => docs,
+                None => {
+                    versions.insert(connection_key.clone(), HashMap::new());
+                    versions.get_mut(connection_key).expect("just inserted")
+                }
+            };
+            docs.entry(uri_string.clone()).or_insert(1);
         }
 
         // Step 2: Update host_to_virtual (separate lock scope)

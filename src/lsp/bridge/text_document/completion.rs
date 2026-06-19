@@ -189,7 +189,9 @@ pub(crate) struct KakehashiEnvelope {
     /// same `(server, root)` connection for `completionItem/resolve` so the
     /// resolve reaches the very process that produced the item (#382) — without
     /// it, resolve would land on the server's client-root fallback connection,
-    /// a *different* process in a multi-root monorepo. Empty (via `serde(default)`)
+    /// a *different* process in a multi-root monorepo. Stored as a `String`
+    /// (not `url::Url`) because this crate does not enable the `url/serde`
+    /// feature; the resolve path parses it once. Empty (via `serde(default)`)
     /// for envelopes from before this field existed → falls back to root-less
     /// routing, matching the old behavior.
     #[serde(default)]

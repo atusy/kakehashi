@@ -1,7 +1,10 @@
 //! Pool of downstream language-server connections (ls-bridge-server-pool-coordination), keyed by
-//! `server_name` rather than `languageId` so multiple languages can share one
-//! process (e.g. `typescript` + `typescriptreact` → `tsgo`). Routing:
-//! `languageId` → `server_name` (config) → connection.
+//! [`ConnectionKey`] = `(server_name, resolved workspace root)` rather than
+//! `languageId`. Multiple languages can share one process (e.g. `typescript`
+//! and `typescriptreact` → `tsgo`), while the same server under different
+//! marker roots gets its own process for multi-root monorepos (issue #382).
+//! Routing: `languageId` → `server_name` (config) plus the document's resolved
+//! root → connection.
 //!
 //! [`LanguageServerPool`] manages the connections; [`ConnectionHandle`]
 //! (ls-bridge-async-connection) and [`ConnectionState`] track each connection's lifecycle.
