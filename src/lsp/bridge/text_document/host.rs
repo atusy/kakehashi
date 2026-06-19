@@ -7,12 +7,12 @@
 //! per-method request builders or response transformers: the upstream
 //! request's params are forwarded as raw JSON
 //! ([`LanguageServerPool::send_host_raw_request`]) and the result comes back
-//! verbatim. The pool's `(uri, server_name)` document state and the
+//! verbatim. The pool's `(uri, connection key)` document state and the
 //! request/cancel machinery are shared with the virt path; only the document
 //! key and the (absent) translation differ.
 //!
 //! Document sync is lazy: the host document is opened on the first request
-//! per `(uri, server)` and re-synced with a full-text `didChange` whenever
+//! per `(uri, connection)` and re-synced with a full-text `didChange` whenever
 //! the host text changed since the last request (fingerprint comparison) —
 //! the same full-content sync the virt path uses for its `didChange`
 //! forwarding.
@@ -56,7 +56,7 @@ fn fingerprint(text: &str) -> u64 {
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
 ///
-/// - First request for `(uri, server)`: send `didOpen` with the real URI,
+/// - First request for `(uri, connection)`: send `didOpen` with the real URI,
 ///   the host language id, and the full host text.
 /// - Host text changed since the last sync: send a full-text `didChange`
 ///   with an incremented version.
@@ -314,7 +314,7 @@ impl LanguageServerPool {
         // `handle` was fetched earlier, and a concurrent respawn could have
         // replaced it and purged the sync state — syncing onto the dying
         // process's queue would record state the replacement never saw,
-        // wedging the `(uri, server)` pair until the next purge. Holding
+        // wedging the `(uri, connection)` pair until the next purge. Holding
         // `connections` here also excludes a purge from interleaving with
         // this sync, closing the race entirely.
         {
