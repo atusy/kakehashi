@@ -129,20 +129,19 @@ fn build_diagnostic_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/diagnostic", params)
 }
 
-/// Parse a JSON-RPC diagnostic response and transform coordinates to host document space.
+/// Parse a successful JSON-RPC diagnostic response and transform coordinates to
+/// host document space.
 ///
-/// Deserializes into `Vec<Diagnostic>` with coordinates already transformed,
-/// returning an empty `Vec` for null results, unchanged reports, missing items,
-/// and deserialization failures. Only related info matching `host_uri` is
-/// transformed.
+/// The caller ([`LanguageServerPool::send_diagnostic_request`]) handles a
+/// JSON-RPC *error* response separately (it propagates as `Err`), so this only
+/// extracts the `result`: an empty `Vec` for a null/absent result, an unchanged
+/// report, missing items, or a deserialization failure. Only related info
+/// matching `host_uri` is transformed.
 fn transform_diagnostic_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     host_uri: &str,
 ) -> Vec<Diagnostic> {
-    if response_has_jsonrpc_error(&response, "textDocument/diagnostic") {
-        return Vec::new();
-    }
     let Some(mut result) = response.get_mut("result").map(serde_json::Value::take) else {
         return Vec::new();
     };
