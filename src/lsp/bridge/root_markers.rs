@@ -56,18 +56,19 @@ fn find_marker_root(document_path: &Path, markers: &[String]) -> Option<PathBuf>
         .map(Path::to_path_buf)
 }
 
-/// Compute the `rootUri` + `workspaceFolders` for a downstream server's
-/// `initialize` request: a marker hit near the triggering document overrides
-/// the client-supplied values (and becomes the sole workspace folder);
-/// anything short of a fully usable marker root — no hint, no marker, or a
-/// root that does not parse as an LSP URI — falls back to the client
-/// supplied pair wholesale, never half-and-half.
-pub(crate) fn resolve_spawn_workspace(
-    root_markers: Option<&[String]>,
-    document_uri: Option<&Url>,
+/// Build the `rootUri` + `workspaceFolders` for a downstream spawn from an
+/// **already-resolved** marker workspace (see [`resolve_marker_workspace`]).
+///
+/// Taking the marker as a parameter — rather than resolving it here — lets the
+/// caller resolve the marker root *once* and derive both the connection-pool
+/// key and this spawn workspace from the same value, so the key can never name
+/// a different root than the server is spawned at even if the marker filesystem
+/// changes mid-spawn (#382). `None` falls back to the client-supplied pair.
+pub(crate) fn workspace_from_marker(
+    marker: Option<(Url, WorkspaceFolder)>,
     fallback: impl FnOnce() -> (Option<String>, Option<Vec<WorkspaceFolder>>),
 ) -> (Option<String>, Option<Vec<WorkspaceFolder>>) {
-    match resolve_marker_workspace(root_markers, document_uri) {
+    match marker {
         Some((root, folder)) => (Some(String::from(root)), Some(vec![folder])),
         None => fallback(),
     }
@@ -236,7 +237,9 @@ mod tests {
         let doc_uri = Url::from_file_path(project.join("src/main.rs")).unwrap();
 
         let (root_uri, folders) =
-            resolve_spawn_workspace(None, Some(&doc_uri), || panic!("must not fall back"));
+            workspace_from_marker(resolve_marker_workspace(None, Some(&doc_uri)), || {
+                panic!("must not fall back")
+            });
 
         let root = root_uri.expect("marker root becomes rootUri");
         let canonical_root = Url::from_file_path(project.canonicalize().unwrap()).unwrap();
@@ -266,11 +269,12 @@ mod tests {
         std::fs::create_dir(project.join(".git")).unwrap();
         let doc_uri = Url::from_file_path(project.join("src/main.rs")).unwrap();
 
-        let (root, folder) =
-            resolve_marker_workspace(None, Some(&doc_uri)).expect("marker root must resolve");
-        let key_root = String::from(root); // what ConnectionKey stores
+        // Resolve once, exactly as the spawn path does, then derive both halves.
+        let marker = resolve_marker_workspace(None, Some(&doc_uri)).expect("marker root resolves");
+        let folder = marker.1.clone();
+        let key_root = String::from(marker.0.clone()); // what ConnectionKey stores
         let (spawn_root_uri, _) =
-            resolve_spawn_workspace(None, Some(&doc_uri), || panic!("must not fall back"));
+            workspace_from_marker(Some(marker), || panic!("must not fall back"));
 
         assert_eq!(
             Some(key_root.clone()),
@@ -294,13 +298,15 @@ mod tests {
             name: "root".to_string(),
         };
 
-        let (root_uri, folders) =
-            resolve_spawn_workspace(Some(&markers(&[unique.as_str()])), Some(&doc_uri), || {
+        let (root_uri, folders) = workspace_from_marker(
+            resolve_marker_workspace(Some(&markers(&[unique.as_str()])), Some(&doc_uri)),
+            || {
                 (
                     Some("file:///client/root".to_string()),
                     Some(vec![fallback_folder.clone()]),
                 )
-            });
+            },
+        );
 
         assert_eq!(root_uri.as_deref(), Some("file:///client/root"));
         assert_eq!(folders, Some(vec![fallback_folder]));

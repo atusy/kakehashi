@@ -672,9 +672,21 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        // Resolve this connection's pool identity `(server_name, root)` — the
-        // single point of root resolution, shared with `wait_ready`.
-        let connection_key = self.connection_key(server_name, server_config, document_uri);
+        // Resolve the marker workspace ONCE, before any await, then derive both
+        // the pool key and (on a spawn) the handshake workspace from this single
+        // value. Resolving separately for the key and the spawn could observe a
+        // changed marker filesystem in between and key the connection under a
+        // different root than the server is actually spawned at (#382).
+        let marker = super::root_markers::resolve_marker_workspace(
+            server_config.root_markers.as_deref(),
+            document_uri,
+        );
+        let connection_key = ConnectionKey::new(
+            server_name,
+            marker
+                .as_ref()
+                .map(|(root, _folder)| String::from(root.clone())),
+        );
 
         let mut connections = self.connections.lock().await;
 
@@ -713,18 +725,22 @@ impl LanguageServerPool {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
                     connections.remove(&connection_key);
-                    // Drop host-document sync state with it: the replacement
-                    // process has no documents open, so the lazy host sync
-                    // must re-send didOpen instead of trusting stale entries
-                    // (host-document-bridge). Scoped to this exact
-                    // `(uri, connection key)` so sibling roots sharing the
-                    // server name keep their state. Lock order: connections →
-                    // host_documents, consistent with
-                    // close_host_bridge_document's prefetch.
+                    // Drop the dead connection's document state with it: the
+                    // replacement process has nothing open, so the lazy host
+                    // sync must re-send didOpen and the virt tracker must let
+                    // the next request re-claim and re-open instead of trusting
+                    // stale entries (host-document-bridge). Both purges are
+                    // scoped to this exact `(server, root)` key so sibling roots
+                    // sharing the server name keep their state. Lock order:
+                    // connections → host_documents / document tracker,
+                    // consistent with close_host_bridge_document's prefetch.
                     self.host_documents
                         .lock()
                         .await
                         .retain(|(_, key), _| key != &connection_key);
+                    self.document_tracker
+                        .purge_connection(&connection_key)
+                        .await;
                 }
             }
         }
@@ -751,16 +767,17 @@ impl LanguageServerPool {
         // Create dynamic capability registry (shared between reader and connection handle)
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
 
-        // rootMarkers workspace-root detection (root_markers module): a
-        // marker hit near the triggering document overrides the
-        // client-supplied root and folders; otherwise both fall back.
+        // rootMarkers workspace-root detection (root_markers module): the same
+        // marker workspace resolved for the pool key above also seeds the
+        // handshake — a marker hit overrides the client-supplied root and
+        // folders; otherwise both fall back. Reusing `marker` (rather than
+        // re-resolving) guarantees the spawned root matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
-        let (root_uri, workspace_folders) = super::root_markers::resolve_spawn_workspace(
-            server_config.root_markers.as_deref(),
-            document_uri,
-            || (self.root_uri(), self.workspace_folders()),
-        );
+        let (root_uri, workspace_folders) =
+            super::root_markers::workspace_from_marker(marker, || {
+                (self.root_uri(), self.workspace_folders())
+            });
         log::debug!(
             target: "kakehashi::bridge::init",
             "[{}] workspace root for spawn: {:?}",

@@ -252,6 +252,43 @@ impl DocumentTracker {
         self.remove_from_reverse_index(&uri_string, connection_key);
     }
 
+    /// Drop ALL virtual-document tracking for one connection key.
+    ///
+    /// Called when a stale (Failed/Closed) connection is removed before a
+    /// respawn: the replacement process has nothing open, so every virtual
+    /// document the dead process held must be forgotten — otherwise
+    /// `try_claim_for_open` still reports the URI as claimed under this key and
+    /// `ensure_document_opened` skips the `didOpen`, leaving the fresh process
+    /// receiving requests for documents it never opened. Scoped to exactly this
+    /// `(server, root)` key, so sibling connections sharing the server name (or
+    /// a different root) keep their state; `opened_documents` is decremented
+    /// per URI (not cleared), so a URI also open on another connection survives.
+    pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) {
+        // Take this connection's version map; its keys are the virtual URIs it
+        // had open. Done first so the per-URI refcount/reverse-index cleanup
+        // below mirrors `untrack_document` exactly, once per opened document.
+        let uris: Vec<String> = {
+            let mut versions = self.document_versions.lock().await;
+            versions
+                .remove(connection_key)
+                .map(|docs| docs.into_keys().collect())
+                .unwrap_or_default()
+        };
+        for uri in &uris {
+            self.decrement_opened(uri);
+            self.remove_from_reverse_index(uri, connection_key);
+        }
+        // Drop this connection's host→virtual registrations so a later
+        // host-close does not try to didClose documents the dead process held.
+        {
+            let mut host_map = self.host_to_virtual.lock().await;
+            for docs in host_map.values_mut() {
+                docs.retain(|doc| &doc.connection_key != connection_key);
+            }
+            host_map.retain(|_, docs| !docs.is_empty());
+        }
+    }
+
     /// Remove a single virtual document from host_to_virtual tracking.
     ///
     /// Used to roll back registration when didOpen send fails after
@@ -1209,6 +1246,54 @@ mod tests {
         assert!(
             !tracker.is_document_opened(&virtual_uri),
             "Document should not be opened after all servers untrack"
+        );
+    }
+
+    /// purge_connection forgets all of one connection's documents so the next
+    /// request re-claims and re-opens them (the respawn case, #382), while a
+    /// sibling connection that shares the same virtual URI keeps it open.
+    #[tokio::test]
+    async fn purge_connection_allows_reopen_and_spares_siblings() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let vuri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let dead = ConnectionKey::for_server("pyright-a");
+        let sibling = ConnectionKey::for_server("pyright-b");
+
+        // Two connections open the same virtual URI.
+        assert!(tracker.try_claim_for_open(&vuri, &dead).await);
+        assert!(tracker.try_claim_for_open(&vuri, &sibling).await);
+        tracker
+            .register_opened_document(&host_uri, &vuri, &dead)
+            .await;
+        assert!(
+            !tracker.try_claim_for_open(&vuri, &dead).await,
+            "already claimed on the dead connection before purge"
+        );
+
+        // The dead connection respawns → purge its state.
+        tracker.purge_connection(&dead).await;
+
+        // The document is still open (sibling holds it) but re-claimable on the
+        // purged connection, so its respawn will send a fresh didOpen.
+        assert!(
+            tracker.is_document_opened(&vuri),
+            "sibling connection keeps the document open"
+        );
+        assert!(
+            tracker.try_claim_for_open(&vuri, &dead).await,
+            "purged connection must be able to re-claim (→ re-didOpen)"
+        );
+        let servers = tracker.get_all_servers_for_virtual_uri(&vuri);
+        assert!(
+            servers.contains(&dead) && servers.contains(&sibling),
+            "reverse index holds both connections after purge + re-claim: {servers:?}"
+        );
+        // The sibling's version tracking is untouched.
+        assert_eq!(
+            tracker.increment_document_version(&vuri, &sibling).await,
+            Some(2),
+            "sibling version survives the purge"
         );
     }
 

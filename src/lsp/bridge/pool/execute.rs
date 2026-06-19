@@ -136,31 +136,62 @@ impl LanguageServerPool {
         // wait_for_response completes normally (any exit path).
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        // Send didOpen notification only if document hasn't been opened yet
-        if let Err(e) = self
-            .ensure_document_opened(
-                &mut ConnectionHandleSender(&handle),
-                host_uri,
-                &virtual_uri,
-                virtual_content,
-                connection_key,
-            )
-            .await
+        // Claim/didOpen and enqueue the request under the `connections` lock,
+        // after verifying `handle` is still the pool's LIVE connection for its
+        // key. `handle` was fetched earlier; a concurrent respawn
+        // (get_or_create's SpawnNew branch) could have removed it and PURGED the
+        // document tracker for this key. Registering didOpen state through the
+        // dead handle after that purge would re-seed `document_versions` /
+        // `opened_documents` for a process that never received the didOpen,
+        // wedging the doc until the host closes it. Holding `connections` across
+        // the claim + send excludes the purge from interleaving — the same
+        // guard the host path (`execute_host_request`) uses. Lock order
+        // connections → document tracker matches the respawn purge.
         {
-            // router_guard drops here, cleaning up the router entry
-            if let Some(ref id) = upstream_request_id {
-                self.unregister_upstream_request(id, connection_key);
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                drop(connections);
+                // router_guard drops here, cleaning up the router entry
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("connection {connection_key} was replaced before request send"),
+                ));
             }
-            return Err(e);
-        }
 
-        // Queue the request via single-writer loop (ls-bridge-message-ordering)
-        if let Err(e) = handle.send_request(request, request_id) {
-            // router_guard drops here, cleaning up the router entry
-            if let Some(ref id) = upstream_request_id {
-                self.unregister_upstream_request(id, connection_key);
+            // Send didOpen notification only if document hasn't been opened yet
+            if let Err(e) = self
+                .ensure_document_opened(
+                    &mut ConnectionHandleSender(&handle),
+                    host_uri,
+                    &virtual_uri,
+                    virtual_content,
+                    connection_key,
+                )
+                .await
+            {
+                drop(connections);
+                // router_guard drops here, cleaning up the router entry
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(e);
             }
-            return Err(e.into());
+
+            // Queue the request via single-writer loop (ls-bridge-message-ordering)
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(connections);
+                // router_guard drops here, cleaning up the router entry
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(e.into());
+            }
         }
 
         // Wait for response via oneshot channel (no Mutex held) with timeout.
