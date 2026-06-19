@@ -875,7 +875,6 @@ impl LanguageServerPool {
                 upstream_tx: self.upstream_tx.clone(),
                 window_tx: self.window_tx.clone(),
                 workspace_folders: Arc::clone(&workspace_folders),
-                forward_show_message: server_config.forward_show_message.unwrap_or(false),
             },
         );
 
