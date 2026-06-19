@@ -85,7 +85,7 @@ fn from_mock(params: &Value) -> bool {
 }
 
 #[test]
-fn e2e_forwards_log_message_and_gates_show_message_off_by_default() {
+fn e2e_forwards_window_show_and_log_messages() {
     let bin = mock_formatter_bin();
     let (mut client, _config_dir) = init_client(json!({
         "mock-notify": { "cmd": [bin, "notify"], "languages": ["lua"] }
@@ -93,27 +93,49 @@ fn e2e_forwards_log_message_and_gates_show_message_off_by_default() {
 
     open_markdown(&mut client);
 
-    let (method, params) = client
+    // The bridge forwards both window/* notifications with no per-server gate.
+    // The mock emits showMessage BEFORE logMessage and the bridge preserves
+    // order end-to-end, so showMessage must arrive first.
+    let (show_method, show_params) = client
         .wait_for_notification_where(
             &["window/showMessage", "window/logMessage"],
             Duration::from_secs(15),
             from_mock,
         )
-        .expect("a notification prefixed with the mock server name should be forwarded");
-
-    // The mock emits showMessage BEFORE logMessage; seeing logMessage first
-    // proves the default-off gate dropped the showMessage.
+        .expect("the mock's window/showMessage should be forwarded");
     assert_eq!(
-        method, "window/logMessage",
-        "showMessage must not be forwarded without forwardShowMessage; got params: {params:?}"
+        show_method, "window/showMessage",
+        "showMessage is forwarded first; got params: {show_params:?}"
     );
     assert_eq!(
-        params["message"].as_str(),
+        show_params["message"].as_str(),
+        Some("[kakehashi:mock-notify] mock show line"),
+        "showMessage should be forwarded verbatim with the server-name prefix"
+    );
+    assert_eq!(
+        show_params["type"].as_i64(),
+        Some(2),
+        "MessageType::WARNING should pass through unchanged"
+    );
+
+    let (log_method, log_params) = client
+        .wait_for_notification_where(
+            &["window/showMessage", "window/logMessage"],
+            Duration::from_secs(15),
+            from_mock,
+        )
+        .expect("the mock's window/logMessage should be forwarded");
+    assert_eq!(
+        log_method, "window/logMessage",
+        "logMessage follows the showMessage; got params: {log_params:?}"
+    );
+    assert_eq!(
+        log_params["message"].as_str(),
         Some("[kakehashi:mock-notify] mock log line"),
         "logMessage should be forwarded verbatim with the server-name prefix"
     );
     assert_eq!(
-        params["type"].as_i64(),
+        log_params["type"].as_i64(),
         Some(3),
         "MessageType::INFO should pass through unchanged"
     );
