@@ -4,7 +4,7 @@
 //! that bridges lua injections to the `mock-lsp-formatter` test binary in
 //! `diagnostics` mode (answers `textDocument/diagnostic` with one severity-2
 //! warning whose message echoes the virtual URI). Asserts on the `default` and
-//! `jsonl` output formats, the `--threshold` exit-code gating, the
+//! `jsonl` output formats, the `--fail-on-warning` exit-code gating, the
 //! stdout/stderr split, stdin mode, and the broken-server error path.
 
 #![cfg(feature = "e2e")]
@@ -92,11 +92,11 @@ fn e2e_diagnose_default_format_reports_transformed_position() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 
     let output = run_diagnose(ws.path(), &["doc.md"]);
-    // Warning < default threshold "error", so a clean exit despite a finding.
+    // The mock emits a warning; warnings don't fail by default, so exit 0.
     assert_eq!(
         output.status.code(),
         Some(0),
-        "a warning does not meet the default error threshold; stderr: {}",
+        "a warning does not fail by default; stderr: {}",
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
@@ -113,32 +113,32 @@ fn e2e_diagnose_default_format_reports_transformed_position() {
 }
 
 #[test]
-fn e2e_diagnose_threshold_warning_exits_one() {
+fn e2e_diagnose_fail_on_warning_exits_one() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 
-    let output = run_diagnose(ws.path(), &["doc.md", "--threshold", "warning"]);
+    let output = run_diagnose(ws.path(), &["doc.md", "--fail-on-warning"]);
     assert_eq!(
         output.status.code(),
         Some(1),
-        "a warning meets the warning threshold and must exit 1; stderr: {}",
+        "--fail-on-warning makes the mock's warning fail; stderr: {}",
         stderr_of(&output)
     );
 }
 
 #[test]
-fn e2e_diagnose_threshold_none_always_exits_zero() {
+fn e2e_diagnose_warning_does_not_fail_by_default() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 
-    let output = run_diagnose(ws.path(), &["doc.md", "--threshold", "none"]);
+    let output = run_diagnose(ws.path(), &["doc.md"]);
     assert_eq!(
         output.status.code(),
         Some(0),
-        "--threshold none must never exit 1 even with diagnostics; stderr: {}",
+        "a warning must not fail without --fail-on-warning; stderr: {}",
         stderr_of(&output)
     );
     assert!(
         stdout_of(&output).contains("mock-diagnostic:"),
-        "the diagnostic is still printed under --threshold none"
+        "the diagnostic is still printed"
     );
 }
 
@@ -244,8 +244,7 @@ fn e2e_diagnose_stdin_mode_prints_diagnostics() {
             "kakehashi.toml",
             "--stdin-filename",
             "doc.md",
-            "--threshold",
-            "warning",
+            "--fail-on-warning",
         ])
         .current_dir(ws.path())
         .env("KAKEHASHI_DATA_DIR", data_dir())
@@ -265,7 +264,7 @@ fn e2e_diagnose_stdin_mode_prints_diagnostics() {
     assert_eq!(
         output.status.code(),
         Some(1),
-        "stdin warning meets the warning threshold; stderr: {}",
+        "stdin warning fails under --fail-on-warning; stderr: {}",
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
@@ -304,29 +303,6 @@ languages = ["lua"]
 }
 
 #[test]
-fn e2e_diagnose_broken_server_still_exits_two_under_threshold_none() {
-    // Operational errors are independent of --threshold: a tool that could not
-    // even start its server must not look "clean" to CI under `none`.
-    let ws = workspace_with(
-        r#"autoInstall = false
-
-[languageServers.broken]
-cmd = ["/nonexistent/kakehashi-test-diagnoser"]
-languages = ["lua"]
-"#,
-        &[("doc.md", MARKDOWN)],
-    );
-
-    let output = run_diagnose(ws.path(), &["doc.md", "--threshold", "none"]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "--threshold none does not suppress operational errors; stderr: {}",
-        stderr_of(&output)
-    );
-}
-
-#[test]
 fn e2e_diagnose_request_time_server_failure_exits_two() {
     // The server handshakes fine (advertises diagnosticProvider) but errors on
     // the diagnostic request — distinct from never starting. The fan-in
@@ -355,31 +331,6 @@ languages = ["lua"]
     assert!(
         stderr_of(&output).contains("operation(s) failed"),
         "stderr should report the failed request; stderr: {}",
-        stderr_of(&output)
-    );
-}
-
-#[test]
-fn e2e_diagnose_request_time_failure_exits_two_even_under_threshold_none() {
-    // Request-time failure is operational, so --threshold none must not hide it.
-    let ws = workspace_with(
-        &format!(
-            r#"autoInstall = false
-
-[languageServers.mock-diag-fail]
-cmd = ['{}', 'diagnostics-fail']
-languages = ["lua"]
-"#,
-            env!("CARGO_BIN_EXE_mock-lsp-formatter")
-        ),
-        &[("doc.md", MARKDOWN)],
-    );
-
-    let output = run_diagnose(ws.path(), &["doc.md", "--threshold", "none"]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "--threshold none does not suppress a request-time failure; stderr: {}",
         stderr_of(&output)
     );
 }
@@ -425,7 +376,7 @@ fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
         ],
     );
 
-    let output = run_diagnose(ws.path(), &[".", "--threshold", "warning"]);
+    let output = run_diagnose(ws.path(), &[".", "--fail-on-warning"]);
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -444,7 +395,7 @@ fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
 
     // Explicitly naming the gitignored file diagnoses it anyway — naming a path
     // is a stronger signal than a .gitignore entry.
-    let output = run_diagnose(ws.path(), &["ignored.md", "--threshold", "warning"]);
+    let output = run_diagnose(ws.path(), &["ignored.md", "--fail-on-warning"]);
     assert_eq!(
         output.status.code(),
         Some(1),

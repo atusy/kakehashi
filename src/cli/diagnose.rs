@@ -11,13 +11,14 @@
 //! drift from editor diagnostics.
 //!
 //! Exit codes:
-//! - `0`: no diagnostics met `--threshold` (and no operational error).
-//! - `1`: at least one diagnostic was at least as severe as `--threshold`.
-//!   `--threshold none` disables this entirely (diagnostics never set exit 1).
+//! - `0`: no failing diagnostics, and no operational error.
+//! - `1`: a failing diagnostic — any error always, plus any warning when
+//!   `--fail-on-warning`. Info/hint never fail. To never fail on diagnostics,
+//!   append `|| true`.
 //! - `2`: an operational error (a file could not be read, a path could not be
-//!   opened, or a configured downstream server failed). This is independent
-//!   of `--threshold` — a tool that could not even read a file must not look
-//!   "clean" to CI, so `none` still surfaces operational failures as `2`.
+//!   opened, or a configured downstream server failed). Independent of the
+//!   diagnostics — a tool that could not even read a file must not look "clean"
+//!   to CI, so it surfaces as `2` regardless.
 //!
 //! Diagnostics stream to stdout per file. Every file is always scanned so the
 //! exit code reflects the whole set; if stdout is closed early (e.g. `kakehashi
@@ -47,24 +48,6 @@ pub enum OutputFormat {
     Jsonl,
 }
 
-/// Minimum severity that makes the run exit `1`. `none` disables
-/// diagnostic-based exit codes entirely. Derives clap value names `error`,
-/// `warning`, `info`, `hint`, `none`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum Threshold {
-    /// Only errors set exit `1`.
-    #[default]
-    Error,
-    /// Errors and warnings set exit `1`.
-    Warning,
-    /// Errors, warnings, and information set exit `1`.
-    Info,
-    /// Any diagnostic sets exit `1`.
-    Hint,
-    /// Diagnostics never set exit `1`.
-    None,
-}
-
 /// Options for the `diagnose` subcommand, mirroring its CLI flags.
 pub struct DiagnoseOptions {
     /// Files or directories to diagnose. With `--stdin-filename`, must be
@@ -77,16 +60,17 @@ pub struct DiagnoseOptions {
     pub excludes: Vec<String>,
     /// Output rendering for each diagnostic.
     pub output_format: OutputFormat,
-    /// Minimum severity that triggers exit `1`.
-    pub threshold: Threshold,
+    /// Exit `1` on warnings too, not just errors. Errors always exit `1`;
+    /// info/hint never do.
+    pub fail_on_warning: bool,
 }
 
-/// No diagnostics met `--threshold`, and no operational error.
+/// No failing diagnostics, and no operational error.
 pub const EXIT_OK: u8 = 0;
-/// At least one diagnostic was at least as severe as `--threshold`.
+/// A failing diagnostic (an error, or a warning under `--fail-on-warning`).
 pub const EXIT_DIAGNOSTICS: u8 = 1;
 /// An operational error (unreadable file, un-openable path, downstream server
-/// failure). Independent of `--threshold`.
+/// failure). Independent of the diagnostics.
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers, matching
@@ -141,8 +125,9 @@ async fn run_async(options: DiagnoseOptions) -> u8 {
 struct Report {
     /// Total diagnostics printed.
     total: usize,
-    /// Whether any printed diagnostic was at least as severe as the threshold.
-    threshold_hit: bool,
+    /// Whether any printed diagnostic should fail the run (an error, or a
+    /// warning under `--fail-on-warning`).
+    failure: bool,
     /// Whether any operational error occurred (unreadable file, server
     /// failure, un-openable path).
     operational_error: bool,
@@ -156,7 +141,7 @@ impl Report {
         display: &str,
         mut diagnostics: Vec<Diagnostic>,
         format: OutputFormat,
-        threshold: Threshold,
+        fail_on_warning: bool,
         out: &mut String,
     ) {
         // The diagnostic fan-out collects across regions and servers in
@@ -168,8 +153,8 @@ impl Report {
             out.push_str(&format_diagnostic(format, display, diagnostic));
             out.push('\n');
             self.total += 1;
-            if meets_threshold(diagnostic, threshold) {
-                self.threshold_hit = true;
+            if is_failure(diagnostic, fail_on_warning) {
+                self.failure = true;
             }
         }
     }
@@ -179,7 +164,7 @@ impl Report {
     fn exit_code(&self) -> u8 {
         if self.operational_error {
             EXIT_ERROR
-        } else if self.threshold_hit {
+        } else if self.failure {
             EXIT_DIAGNOSTICS
         } else {
             EXIT_OK
@@ -211,7 +196,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     // held across the `cli_diagnose_text` await below.
     //
     // We always scan EVERY file: the exit code must reflect the whole set (a
-    // later file may carry a threshold-meeting diagnostic or an operational
+    // later file may carry a failing diagnostic or an operational
     // error), which is this tool's core contract. A closed consumer only
     // silences further writes via `pipe_closed` — it never shortcuts the scan.
     // (Detecting closure requires a write anyway, so a run with sparse output
@@ -243,7 +228,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             &display,
             outcome.diagnostics,
             options.output_format,
-            options.threshold,
+            options.fail_on_warning,
             &mut buf,
         );
         if !pipe_closed && !buf.is_empty() {
@@ -304,7 +289,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         &display,
         outcome.diagnostics,
         options.output_format,
-        options.threshold,
+        options.fail_on_warning,
         &mut buf,
     );
     if !buf.is_empty() {
@@ -444,21 +429,20 @@ fn severity_word(severity: Option<DiagnosticSeverity>) -> &'static str {
 
 /// A diagnostic's effective severity for gating. LSP allows an absent
 /// severity (the client decides); we treat it as an error so a server that
-/// omits severity can never silently slip past a threshold.
+/// omits severity can never silently slip past the failure gate.
 fn effective_severity(diagnostic: &Diagnostic) -> DiagnosticSeverity {
     diagnostic.severity.unwrap_or(DiagnosticSeverity::ERROR)
 }
 
-/// Whether `diagnostic` is at least as severe as `threshold`. `DiagnosticSeverity`
-/// orders ERROR(1) < WARNING(2) < INFORMATION(3) < HINT(4), so "at least as
-/// severe" is `<=`.
-fn meets_threshold(diagnostic: &Diagnostic, threshold: Threshold) -> bool {
-    let gate = match threshold {
-        Threshold::None => return false,
-        Threshold::Error => DiagnosticSeverity::ERROR,
-        Threshold::Warning => DiagnosticSeverity::WARNING,
-        Threshold::Info => DiagnosticSeverity::INFORMATION,
-        Threshold::Hint => DiagnosticSeverity::HINT,
+/// Whether `diagnostic` should fail the run: an error always, plus a warning
+/// when `fail_on_warning`. Info/hint never fail. `DiagnosticSeverity` orders
+/// ERROR(1) < WARNING(2) < INFORMATION(3) < HINT(4), so "at least as severe as
+/// the gate" is `<=`.
+fn is_failure(diagnostic: &Diagnostic, fail_on_warning: bool) -> bool {
+    let gate = if fail_on_warning {
+        DiagnosticSeverity::WARNING
+    } else {
+        DiagnosticSeverity::ERROR
     };
     effective_severity(diagnostic) <= gate
 }
@@ -599,50 +583,44 @@ mod tests {
     }
 
     #[test]
-    fn absent_severity_renders_and_gates_as_error() {
+    fn absent_severity_renders_and_fails_as_error() {
         let d = diag(0, 0, None, "no severity");
         assert_eq!(severity_word(d.severity), "error");
-        assert!(meets_threshold(&d, Threshold::Error));
+        assert!(
+            is_failure(&d, false),
+            "absent severity is treated as an error and always fails"
+        );
     }
 
     #[test]
-    fn threshold_none_never_gates() {
-        let d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "err");
-        assert!(!meets_threshold(&d, Threshold::None));
-    }
-
-    #[test]
-    fn threshold_warning_gates_errors_and_warnings_only() {
+    fn errors_always_fail() {
         let error = diag(0, 0, Some(DiagnosticSeverity::ERROR), "e");
-        let warning = diag(0, 0, Some(DiagnosticSeverity::WARNING), "w");
-        let info = diag(0, 0, Some(DiagnosticSeverity::INFORMATION), "i");
-        let hint = diag(0, 0, Some(DiagnosticSeverity::HINT), "h");
-        assert!(meets_threshold(&error, Threshold::Warning));
-        assert!(meets_threshold(&warning, Threshold::Warning));
-        assert!(!meets_threshold(&info, Threshold::Warning));
-        assert!(!meets_threshold(&hint, Threshold::Warning));
+        assert!(is_failure(&error, false));
+        assert!(is_failure(&error, true));
     }
 
     #[test]
-    fn threshold_error_gates_errors_only() {
+    fn warnings_fail_only_with_fail_on_warning() {
         let warning = diag(0, 0, Some(DiagnosticSeverity::WARNING), "w");
-        let error = diag(0, 0, Some(DiagnosticSeverity::ERROR), "e");
-        assert!(meets_threshold(&error, Threshold::Error));
-        assert!(!meets_threshold(&warning, Threshold::Error));
+        assert!(
+            !is_failure(&warning, false),
+            "warnings don't fail by default"
+        );
+        assert!(
+            is_failure(&warning, true),
+            "--fail-on-warning makes them fail"
+        );
     }
 
     #[test]
-    fn threshold_hint_gates_everything() {
-        for sev in [
-            DiagnosticSeverity::ERROR,
-            DiagnosticSeverity::WARNING,
-            DiagnosticSeverity::INFORMATION,
-            DiagnosticSeverity::HINT,
-        ] {
-            assert!(meets_threshold(
-                &diag(0, 0, Some(sev), "x"),
-                Threshold::Hint
-            ));
+    fn info_and_hint_never_fail() {
+        for sev in [DiagnosticSeverity::INFORMATION, DiagnosticSeverity::HINT] {
+            let d = diag(0, 0, Some(sev), "x");
+            assert!(!is_failure(&d, false));
+            assert!(
+                !is_failure(&d, true),
+                "info/hint never fail, even with --fail-on-warning"
+            );
         }
     }
 
@@ -654,16 +632,10 @@ mod tests {
             diag(5, 0, Some(DiagnosticSeverity::WARNING), "second"),
             diag(1, 0, Some(DiagnosticSeverity::ERROR), "first"),
         ];
-        report.record_file(
-            "f",
-            diags,
-            OutputFormat::Default,
-            Threshold::Error,
-            &mut out,
-        );
+        report.record_file("f", diags, OutputFormat::Default, false, &mut out);
         assert_eq!(out, "f:2:1: error: first\nf:6:1: warning: second\n");
         assert_eq!(report.total, 2);
-        assert!(report.threshold_hit, "an error meets the error threshold");
+        assert!(report.failure, "an error always fails the run");
     }
 
     #[test]
@@ -677,7 +649,7 @@ mod tests {
             diag(0, 0, Some(DiagnosticSeverity::ERROR), "apple"),
             diag(0, 0, Some(DiagnosticSeverity::WARNING), "apple"),
         ];
-        report.record_file("f", diags, OutputFormat::Default, Threshold::None, &mut out);
+        report.record_file("f", diags, OutputFormat::Default, false, &mut out);
         assert_eq!(
             out,
             "f:1:1: error: apple\nf:1:1: warning: apple\nf:1:1: warning: zebra\n"
@@ -729,17 +701,17 @@ mod tests {
     fn exit_code_prefers_operational_error_over_diagnostics() {
         let report = Report {
             total: 1,
-            threshold_hit: true,
+            failure: true,
             operational_error: true,
         };
         assert_eq!(report.exit_code(), EXIT_ERROR);
     }
 
     #[test]
-    fn exit_code_diagnostics_when_threshold_hit_without_error() {
+    fn exit_code_diagnostics_when_failure_without_operational_error() {
         let report = Report {
             total: 1,
-            threshold_hit: true,
+            failure: true,
             operational_error: false,
         };
         assert_eq!(report.exit_code(), EXIT_DIAGNOSTICS);

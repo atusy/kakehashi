@@ -609,9 +609,9 @@ kakehashi diagnose README.md docs/
 # Output formats: default (the above) or jsonl (one JSON object per line)
 kakehashi diagnose . --output-format jsonl
 
-# CI gate: exit 1 if any diagnostic is at least as severe as the threshold
-# (error | warning | info | hint). "none" never sets exit 1.
-kakehashi diagnose . --threshold warning
+# CI gate: errors always exit 1; --fail-on-warning makes warnings fail too.
+# To never fail on diagnostics, append `|| true`.
+kakehashi diagnose . --fail-on-warning
 
 # Diagnose stdin; the filename drives language detection and config resolution
 cat README.md | kakehashi diagnose --stdin-filename README.md
@@ -622,12 +622,12 @@ output go to stderr — so stdout stays a clean data channel for `| jq` / `| hea
 (redirect or ignore stderr in CI if the summary is unwanted).
 
 Line and column are 1-based; a diagnostic with no severity is treated as an
-error (so it can never silently slip past a threshold). Exit codes: `0` no
-diagnostic met `--threshold`; `1` a diagnostic was at least as severe as
-`--threshold` (never under `--threshold none`); `2` an operational error (a
-file could not be read, a path could not be opened, or a configured downstream
-server failed) — independent of `--threshold`, so `none` still surfaces a
-broken run rather than looking clean to CI.
+error (so it can never silently slip past the gate). Exit codes: `0` no failing
+diagnostic; `1` a failing diagnostic — any error always, plus warnings with
+`--fail-on-warning` (info/hint never fail); `2` an operational error (a file
+could not be read, a path could not be opened, or a configured downstream
+server failed) — independent of the diagnostics, so it surfaces a broken run
+rather than looking clean to CI.
 
 Diagnostics stream to stdout as each file is processed. Every file is always
 scanned so the exit code reflects the whole set; if stdout is closed before the

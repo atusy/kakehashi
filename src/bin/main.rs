@@ -74,10 +74,10 @@ enum Commands {
     /// Directories are walked recursively respecting .gitignore; explicitly
     /// listed files are diagnosed even when gitignored.
     ///
-    /// Exit codes: 0 = no diagnostics met --threshold; 1 = a diagnostic was at
-    /// least as severe as --threshold (never with --threshold none); 2 = an
-    /// operational error (unreadable file, downstream server failure), which
-    /// --threshold none does not suppress.
+    /// Exit codes: 0 = no failing diagnostics; 1 = a failing diagnostic (any
+    /// error, plus warnings with --fail-on-warning; info/hint never fail —
+    /// append `|| true` to never fail); 2 = an operational error (unreadable
+    /// file, downstream server failure), independent of the diagnostics.
     Diagnose {
         /// Files or directories to diagnose ("-" for stdin with --stdin-filename)
         paths: Vec<PathBuf>,
@@ -94,9 +94,9 @@ enum Commands {
         #[arg(long, value_enum, default_value = "default")]
         output_format: kakehashi::cli::diagnose::OutputFormat,
 
-        /// Minimum severity that makes the run exit 1 ("none" disables it)
-        #[arg(long, value_enum, default_value = "error")]
-        threshold: kakehashi::cli::diagnose::Threshold,
+        /// Exit 1 on warnings too, not just errors (info/hint never fail)
+        #[arg(long)]
+        fail_on_warning: bool,
     },
 }
 
@@ -308,13 +308,13 @@ fn main() -> ExitCode {
             stdin_filename,
             excludes,
             output_format,
-            threshold,
+            fail_on_warning,
         }) => run_diagnose(kakehashi::cli::diagnose::DiagnoseOptions {
             paths,
             stdin_filename,
             excludes,
             output_format,
-            threshold,
+            fail_on_warning,
         }),
         None => {
             // Start LSP server (backward compatible default behavior)
