@@ -244,8 +244,8 @@ mod tests {
     #[test]
     fn all_invalid_entry_is_skipped_and_a_later_valid_entry_still_resolves() {
         // An entry whose names are all invalid drops to an empty name set and
-        // is skipped, without aborting the whole search (a behavior difference
-        // from the old flatten-once code).
+        // is skipped, without aborting the per-entry walk before a later valid
+        // entry gets its turn.
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(project.join("src")).unwrap();
