@@ -126,12 +126,20 @@ fn resolve_marker_root(
     root_markers: Option<&[RootMarker]>,
     document_uri: Option<&Url>,
 ) -> Option<Url> {
-    let default_markers: Vec<RootMarker> = DEFAULT_ROOT_MARKERS
-        .iter()
-        .map(|marker| RootMarker::Single(marker.to_string()))
-        .collect();
-    let markers = root_markers.unwrap_or(default_markers.as_slice());
+    // Resolve the path first so a non-file or hintless URI returns before the
+    // default marker list is built; build it only when no markers are configured.
     let document_path = document_uri?.to_file_path().ok()?;
+    let default_markers;
+    let markers = match root_markers {
+        Some(markers) => markers,
+        None => {
+            default_markers = DEFAULT_ROOT_MARKERS
+                .iter()
+                .map(|marker| RootMarker::Single(marker.to_string()))
+                .collect::<Vec<_>>();
+            &default_markers
+        }
+    };
     let root = find_marker_root(&document_path, markers)?;
     Url::from_file_path(root).ok()
 }
