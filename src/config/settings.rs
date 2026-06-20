@@ -1441,6 +1441,32 @@ mod tests {
     }
 
     #[test]
+    fn root_markers_group_survives_json_serialize_round_trip() {
+        // `kakehashi/effectiveConfiguration` re-serializes the user's settings
+        // via serde_json, so a Group must round-trip: array for a group, bare
+        // string for a single, with entry order preserved.
+        let config = BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: Some(vec![
+                RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
+                RootMarker::Single(".git".to_string()),
+            ]),
+            on_type_formatting_triggers: None,
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["rootMarkers"],
+            serde_json::json!([["stylua.toml", ".luarc.json"], ".git"])
+        );
+
+        let reparsed: BridgeServerConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(reparsed.root_markers, config.root_markers);
+    }
+
+    #[test]
     fn should_parse_root_markers_mixed_string_and_group_toml() {
         // TOML 1.0 allows heterogeneous arrays; the untagged enum must round
         // trip a mix of bare names and nested groups through the toml crate.
