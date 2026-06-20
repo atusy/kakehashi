@@ -224,7 +224,7 @@ This temporal ordering — native now, refined later — is precisely what
 
 ### 3. Legend translation — bounded to the standard slice
 
-kakehashi advertises a **fixed** legend: `LEGEND_TYPES` /`LEGEND_MODIFIERS`
+kakehashi advertises a **fixed** legend: `LEGEND_TYPES` / `LEGEND_MODIFIERS`
 (`src/analysis/semantic/legend.rs`) are **exactly** the standard LSP set (23
 types, 10 modifiers) — not a superset. Bridged tokens are decoded with the
 server's own legend, then re-encoded into kakehashi's:
