@@ -249,9 +249,8 @@ independent — e.g., diagnostics can be `concatenated` across layers while
   merge — native immediately, bridged tokens replacing them later — not an
   ordering. Semantic tokens stay outside this mechanism (native-only today);
   the `merged`-style strategy that brings them in is specified by
-  [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md),
-  which reuses this decision's `priorities` ordering as its sweep-line layer
-  rank.
+  cross-layer-semantic-token-merge, which reuses this decision's `priorities`
+  ordering as its sweep-line layer rank.
 
 ## Consequences
 
@@ -293,8 +292,7 @@ independent — e.g., diagnostics can be `concatenated` across layers while
 
 - **`strategy` type shared across stages**: one `AggregationStrategy` enum
   serves both. The anticipated stage-2-only `merged` strategy avoids the
-  enum-growth-vs-type-split cost entirely:
-  [cross-layer-semantic-token-merge](cross-layer-semantic-token-merge.md)
+  enum-growth-vs-type-split cost entirely: cross-layer-semantic-token-merge
   keeps `merged` off the enum, dispatching semantic-tokens methods to the
   merge path internally rather than exposing a new strategy value.
 - **Native participates without a catalog entry**: the native layer has no
