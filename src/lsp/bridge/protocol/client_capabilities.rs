@@ -225,13 +225,12 @@ fn merge_upstream_capabilities(
     // --- window.workDoneProgress (gated on real upstream support) ---
     // Only advertise server-initiated progress downstream when the editor
     // genuinely supports it, so the bridge never invites progress it can't relay
-    // (ls-bridge-work-done-progress).
-    if let Some(upstream_window) = &upstream.window {
-        let base_window = base.window.get_or_insert_with(Default::default);
-        merge_option(
-            &mut base_window.work_done_progress,
-            upstream_window.work_done_progress,
-        );
+    // (ls-bridge-work-done-progress). Guarded on `is_some()` so we don't
+    // materialize an empty `window: {}` the baseline never had.
+    if let Some(work_done_progress) = upstream.window.as_ref().and_then(|w| w.work_done_progress) {
+        base.window
+            .get_or_insert_with(Default::default)
+            .work_done_progress = Some(work_done_progress);
     }
 
     base
