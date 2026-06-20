@@ -226,8 +226,9 @@ mod tests {
     use super::*;
 
     fn dummy_writer() -> tokio::sync::mpsc::Sender<OutboundMessage> {
-        // Capacity 1 is fine; tests that need to observe sends keep the receiver.
-        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        // Capacity 1 is fine; these tests only register/translate, they never
+        // send on the writer.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         tx
     }
 

@@ -1011,9 +1011,11 @@ async fn handle_server_request(
             // the editor's real create response: this decouples the downstream from
             // editor latency and lets progress buffer on the FIFO upstream channel.
             // The bridge only advertises `window.workDoneProgress` downstream when
-            // the real editor supports it (see client_capabilities merge), so a
-            // downstream reaching here means the editor can accept the create —
-            // making editor rejection a non-issue.
+            // the real editor supports it (see client_capabilities merge), so the
+            // editor almost always accepts the create. If it nonetheless rejects
+            // or times out, the forwarding loop drops that token's `$/progress`
+            // (it admits a token only on a successful create), so the optimistic
+            // ack never leaks progress for a token the editor didn't create.
             // Deserialize the token from the borrowed value (indexing yields
             // `Null` for a missing key, which fails to parse) — no clone.
             match tower_lsp_server::ls_types::NumberOrString::deserialize(
