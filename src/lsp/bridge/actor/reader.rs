@@ -1022,6 +1022,16 @@ async fn handle_server_request(
                 &message["params"]["token"],
             ) {
                 Ok(downstream_token) => {
+                    // A downstream that re-`create`s a token it already declared
+                    // (without an intervening End) gets a fresh upstream token;
+                    // `register` evicts the prior one from the registry. Capture
+                    // it first so we can tell the forwarding loop to forget its
+                    // admission too — otherwise it would leak in `created_tokens`
+                    // (this connection's reader is the sole writer of this key,
+                    // so the translate→register pair has no concurrent races).
+                    let stale_upstream_token = deps
+                        .progress_registry
+                        .translate(deps.progress_connection_id, &downstream_token);
                     let upstream_token = deps.progress_registry.register(
                         deps.progress_connection_id,
                         downstream_token,
@@ -1032,6 +1042,11 @@ async fn handle_server_request(
                         "{}Bridging window/workDoneProgress/create as upstream token {:?}",
                         lang_prefix, upstream_token
                     );
+                    if let Some(stale) = stale_upstream_token {
+                        let _ = deps
+                            .upstream_tx
+                            .send(UpstreamNotification::ForgetWorkDoneProgress(vec![stale]));
+                    }
                     let _ = deps
                         .upstream_tx
                         .send(UpstreamNotification::CreateWorkDoneProgress {
@@ -2023,6 +2038,61 @@ mod tests {
             progress_registry.translate(progress_connection_id, &downstream_token),
             Some(token)
         );
+    }
+
+    /// Re-`create`ing the same downstream token mints a fresh upstream token and
+    /// emits a `ForgetWorkDoneProgress` for the evicted one, so the forwarding
+    /// loop's admission set can't leak the stale token.
+    #[tokio::test]
+    async fn handle_message_recreate_same_token_forgets_stale() {
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            progress_registry,
+            progress_connection_id,
+        };
+
+        let make = || {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "window/workDoneProgress/create",
+                "params": { "token": "dup" }
+            })
+        };
+
+        handle_message(make(), &router, "", &deps).await;
+        let UpstreamNotification::CreateWorkDoneProgress { token: first } =
+            upstream_rx.try_recv().expect("first create")
+        else {
+            panic!("expected CreateWorkDoneProgress");
+        };
+
+        // Second create for the SAME downstream token.
+        handle_message(make(), &router, "", &deps).await;
+        // It first forgets the stale upstream token...
+        let UpstreamNotification::ForgetWorkDoneProgress(forgotten) =
+            upstream_rx.try_recv().expect("forget stale")
+        else {
+            panic!("expected ForgetWorkDoneProgress");
+        };
+        assert_eq!(forgotten, vec![first.clone()]);
+        // ...then creates a fresh, distinct upstream token.
+        let UpstreamNotification::CreateWorkDoneProgress { token: second } =
+            upstream_rx.try_recv().expect("second create")
+        else {
+            panic!("expected CreateWorkDoneProgress");
+        };
+        assert_ne!(first, second);
     }
 
     /// A `window/workDoneProgress/create` without a token is rejected with
