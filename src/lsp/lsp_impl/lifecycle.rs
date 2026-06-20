@@ -387,6 +387,7 @@ async fn upstream_forwarding_loop(
 
             notification = upstream_rx.recv() => {
                 match notification {
+<<<<<<< HEAD
                     Some(notification) => deliver_upstream_notification(&client, notification).await,
                     None => break, // Channel closed
                 }
@@ -395,6 +396,36 @@ async fn upstream_forwarding_loop(
             notification = window_rx.recv() => {
                 match notification {
                     Some(notification) => deliver_upstream_notification(&client, notification).await,
+=======
+                    Some(UpstreamNotification::DiagnosticRefresh) => {
+                        if let Err(e) = client.workspace_diagnostic_refresh().await {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "workspace/diagnostic/refresh forwarding failed: {}",
+                                e
+                            );
+                        }
+                    }
+                    Some(UpstreamNotification::CreateWorkDoneProgress { token }) => {
+                        // Awaited inline so the editor processes the create
+                        // before the `$/progress` notifications that follow it
+                        // on this same FIFO channel (LSP requires create-first).
+                        if let Err(e) = client.create_work_done_progress(token).await {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "window/workDoneProgress/create forwarding failed: {}",
+                                e
+                            );
+                        }
+                    }
+                    Some(UpstreamNotification::Progress { params }) => {
+                        client
+                            .send_notification::<tower_lsp_server::ls_types::notification::Progress>(
+                                params,
+                            )
+                            .await;
+                    }
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
                     None => break, // Channel closed
                 }
             }

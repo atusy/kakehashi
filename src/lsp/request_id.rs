@@ -113,6 +113,16 @@ impl CancelForwarder {
             .await
     }
 
+    /// Forward a client `window/workDoneProgress/cancel` to the downstream that
+    /// owns the (bridge-minted) progress `token`. Best-effort, like
+    /// [`CancelForwarder::forward_cancel`].
+    pub(crate) async fn forward_work_done_cancel(
+        &self,
+        token: tower_lsp_server::ls_types::NumberOrString,
+    ) {
+        self.pool.forward_work_done_cancel(token).await;
+    }
+
     /// Return a oneshot receiver that fires when `$/cancelRequest` arrives for
     /// `upstream_id`. Race it against the request future with `tokio::select!`.
     ///
@@ -294,6 +304,25 @@ where
                     }
                 });
             }
+        }
+
+        // Intercept window/workDoneProgress/cancel and route it to the downstream
+        // that owns the progress token (window-work-done-progress bridging).
+        // Like $/cancelRequest above, this is a client notification we mirror
+        // downstream while still delegating to the inner service.
+        if req.method() == "window/workDoneProgress/cancel"
+            && let Some(forwarder) = cancel_forwarder.as_ref()
+            && let Some(params) = req.params()
+            && let Some(token) = params.get("token").cloned().and_then(|t| {
+                serde_json::from_value::<tower_lsp_server::ls_types::NumberOrString>(t).ok()
+            })
+        {
+            let forwarder = forwarder.clone();
+            // Fire-and-forget: cancel is a best-effort notification (same
+            // rationale as $/cancelRequest forwarding above).
+            tokio::spawn(async move {
+                forwarder.forward_work_done_cancel(token).await;
+            });
         }
 
         // Call inner service and get the future
@@ -490,6 +519,26 @@ mod tests {
 
         // Note: We can't verify the forward happened without a real pool setup,
         // but we've verified the middleware processes the cancel notification.
+    }
+
+    #[tokio::test]
+    async fn work_done_progress_cancel_is_intercepted() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock.clone(), forwarder);
+
+        // A window/workDoneProgress/cancel notification (token may be int or string).
+        let request = Request::build("window/workDoneProgress/cancel")
+            .params(serde_json::json!({ "token": "kakehashi/bridge/progress/0" }))
+            .finish();
+
+        let result = service.call(request).await;
+        assert!(result.is_ok());
+
+        // The inner service is still invoked (tower-lsp must see it too).
+        let captured = mock.get_captured_id().await;
+        assert!(captured.is_some(), "Inner service should still be called");
     }
 
     #[tokio::test]

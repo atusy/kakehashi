@@ -52,12 +52,28 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
+<<<<<<< HEAD
     /// Forward a downstream `window/logMessage` to the editor.
     /// `message` is already prefixed with the originating server name.
     LogMessage { typ: MessageType, message: String },
     /// Forward a downstream `window/showMessage` to the editor.
     /// `message` is already prefixed with the originating server name.
     ShowMessage { typ: MessageType, message: String },
+=======
+    /// Ask the editor to create a work-done progress for `token`.
+    /// Sent when a downstream issues `window/workDoneProgress/create`; `token`
+    /// is the bridge-minted *upstream* token, not the downstream's own.
+    CreateWorkDoneProgress {
+        token: tower_lsp_server::ls_types::NumberOrString,
+    },
+    /// Forward a `$/progress` notification to the editor. `params` already
+    /// carries the bridge-minted *upstream* token (see [`ProgressRegistry`]).
+    ///
+    /// [`ProgressRegistry`]: crate::lsp::bridge::ProgressRegistry
+    Progress {
+        params: tower_lsp_server::ls_types::ProgressParams,
+    },
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
 }
 
 /// Capacity of the bounded `window/*` forwarding queue. Sized like the
@@ -86,6 +102,7 @@ struct LivenessParams {
 /// the upstream notification channels, and the workspace folders this
 /// connection was initialized with (the bridge advertises the
 /// `workspace.workspaceFolders` capability, so servers may query them).
+<<<<<<< HEAD
 pub(crate) struct ServerRequestDeps {
     pub(crate) server_name: Option<String>,
     pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
@@ -95,6 +112,34 @@ pub(crate) struct ServerRequestDeps {
     /// Best-effort `window/*` notifications; bounded, dropped when full.
     pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
     pub(crate) workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+=======
+struct ServerRequestDeps {
+    language: Option<String>,
+    response_tx: mpsc::Sender<OutboundMessage>,
+    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    /// Shared registry that remaps downstream-declared progress tokens to unique
+    /// upstream tokens (window-work-done-progress bridging).
+    progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
+    /// This connection's id, used to scope forward token translation.
+    progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
+}
+
+/// RAII guard that purges this connection's progress-token mappings when the
+/// reader loop exits (crash, shutdown, respawn). Without it, a downstream that
+/// dies mid-progress would leak registry entries and a later client cancel could
+/// route to a dead writer (window-work-done-progress bridging).
+struct ProgressPurgeGuard {
+    registry: Arc<crate::lsp::bridge::ProgressRegistry>,
+    connection_id: crate::lsp::bridge::ProgressConnectionId,
+}
+
+impl Drop for ProgressPurgeGuard {
+    fn drop(&mut self) {
+        self.registry.purge_connection(self.connection_id);
+    }
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
 }
 
 /// Type alias for the pinned liveness timer future.
@@ -298,6 +343,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+<<<<<<< HEAD
     let (window_tx, _window_rx) = mpsc::channel(16);
     spawn_reader_task_for_server(
         reader,
@@ -311,6 +357,21 @@ pub(crate) fn spawn_reader_task_with_liveness(
             workspace_folders: Arc::new(None),
             window_tx,
         },
+=======
+    let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+    let progress_connection_id = progress_registry.new_connection_id();
+    spawn_reader_task_for_language(
+        reader,
+        router,
+        liveness_timeout,
+        None,
+        response_tx,
+        dynamic_capabilities,
+        upstream_tx,
+        Arc::new(None),
+        progress_registry,
+        progress_connection_id,
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
     )
 }
 
@@ -323,7 +384,17 @@ pub(crate) fn spawn_reader_task_for_server(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
     liveness_timeout: Option<Duration>,
+<<<<<<< HEAD
     deps: ServerRequestDeps,
+=======
+    language: Option<String>,
+    response_tx: mpsc::Sender<OutboundMessage>,
+    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
+    progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
 ) -> ReaderTaskHandle {
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
@@ -343,6 +414,19 @@ pub(crate) fn spawn_reader_task_for_server(
         stop_rx: liveness_stop_rx,
         failed_tx: liveness_failed_tx,
     };
+<<<<<<< HEAD
+=======
+    let server_request_deps = ServerRequestDeps {
+        language,
+        response_tx,
+        dynamic_capabilities,
+        upstream_tx,
+        workspace_folders,
+        progress_registry,
+        progress_connection_id,
+    };
+
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
     let join_handle = tokio::spawn(reader_loop_with_liveness(
         reader,
         router,
@@ -386,13 +470,20 @@ async fn reader_loop(
         stop_rx,
         failed_tx,
     };
+    let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+    let progress_connection_id = progress_registry.new_connection_id();
     let server_request_deps = ServerRequestDeps {
         server_name: None,
         response_tx,
         dynamic_capabilities,
         upstream_tx,
         workspace_folders: Arc::new(None),
+<<<<<<< HEAD
         window_tx,
+=======
+        progress_registry,
+        progress_connection_id,
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -424,6 +515,12 @@ async fn reader_loop_with_liveness(
         .as_ref()
         .map(|l| format!("[{}] ", l))
         .unwrap_or_default();
+
+    // Purge this connection's progress-token mappings when the loop exits.
+    let _progress_purge_guard = ProgressPurgeGuard {
+        registry: Arc::clone(&server_request_deps.progress_registry),
+        connection_id: server_request_deps.progress_connection_id,
+    };
 
     // Consolidated liveness timer state (ls-bridge-async-connection)
     let mut liveness = LivenessTimerState::new(liveness_timeout);
@@ -584,6 +681,8 @@ async fn handle_message(
                     "{}Discarding publishDiagnostics targeting a scratch virtual document",
                     server_prefix
                 );
+            } else if message["method"].as_str() == Some("$/progress") {
+                forward_progress_notification(&message, lang_prefix, deps);
             } else {
                 forward_notification(&message, server_prefix, deps);
             }
@@ -714,6 +813,66 @@ fn is_scratch_publish_diagnostics(message: &serde_json::Value) -> bool {
             .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
 }
 
+/// Translate and forward a downstream `$/progress` notification to the editor.
+///
+/// Only progress reported against a token the downstream declared via
+/// `window/workDoneProgress/create` is forwarded: its token is rewritten to the
+/// bridge-minted upstream token and sent on the upstream channel. Progress for
+/// any other token (e.g. a client-provided `workDoneToken`) is **dropped** — it
+/// is out of scope for token remapping (see [`ProgressRegistry`] module docs),
+/// and forwarding it verbatim risks duplicates under request fan-out.
+///
+/// A terminating `WorkDoneProgress::End` clears the mapping after forwarding.
+///
+/// [`ProgressRegistry`]: crate::lsp::bridge::ProgressRegistry
+fn forward_progress_notification(
+    message: &serde_json::Value,
+    lang_prefix: &str,
+    deps: &ServerRequestDeps,
+) {
+    use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
+
+    let Some(params) = message.get("params").cloned() else {
+        return;
+    };
+    let Ok(mut params) = serde_json::from_value::<ProgressParams>(params) else {
+        debug!(
+            target: "kakehashi::bridge::reader",
+            "{}Dropping $/progress with unparseable params",
+            lang_prefix
+        );
+        return;
+    };
+
+    let Some(upstream_token) = deps
+        .progress_registry
+        .translate(deps.progress_connection_id, &params.token)
+    else {
+        // Unknown token: not a downstream-declared progress we remapped.
+        debug!(
+            target: "kakehashi::bridge::reader",
+            "{}Dropping $/progress for unmapped token {:?}",
+            lang_prefix, params.token
+        );
+        return;
+    };
+
+    let is_end = matches!(
+        &params.value,
+        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+    );
+
+    let downstream_token = std::mem::replace(&mut params.token, upstream_token);
+    let _ = deps
+        .upstream_tx
+        .send(UpstreamNotification::Progress { params });
+
+    if is_end {
+        deps.progress_registry
+            .complete(deps.progress_connection_id, &downstream_token);
+    }
+}
+
 /// Handle a server-initiated request by dispatching on its method.
 ///
 /// Every server-initiated request (both `"id"` and `"method"`) must get a
@@ -811,6 +970,7 @@ async fn handle_server_request(
             }
         }
         "window/workDoneProgress/create" => {
+<<<<<<< HEAD
             // Common from Pyright et al. Returning MethodNotFound causes server-side log noise,
             // so we acknowledge silently.
             debug!(
@@ -819,6 +979,55 @@ async fn handle_server_request(
                 server_prefix
             );
             Ok(serde_json::Value::Null)
+=======
+            // A downstream is declaring a progress token. Downstreams pick tokens
+            // independently, so two of them can collide; mint a unique upstream
+            // token and remember the mapping so `$/progress` and cancel can be
+            // translated in both directions (window-work-done-progress bridging).
+            //
+            // We ack the downstream immediately with Ok(null) rather than relaying
+            // the editor's real create response: this decouples the downstream from
+            // editor latency and lets progress buffer on the FIFO upstream channel.
+            // The editor advertises `window.workDoneProgress` to the downstream
+            // (capabilities are forwarded), so a downstream only reaches here when
+            // the editor supports it — making editor rejection a non-issue.
+            match message
+                .get("params")
+                .and_then(|p| p.get("token"))
+                .cloned()
+                .and_then(|t| {
+                    serde_json::from_value::<tower_lsp_server::ls_types::NumberOrString>(t).ok()
+                }) {
+                Some(downstream_token) => {
+                    let upstream_token = deps.progress_registry.register(
+                        deps.progress_connection_id,
+                        downstream_token,
+                        deps.response_tx.clone(),
+                    );
+                    debug!(
+                        target: "kakehashi::bridge::reader",
+                        "{}Bridging window/workDoneProgress/create as upstream token {:?}",
+                        lang_prefix, upstream_token
+                    );
+                    let _ = deps
+                        .upstream_tx
+                        .send(UpstreamNotification::CreateWorkDoneProgress {
+                            token: upstream_token,
+                        });
+                    Ok(serde_json::Value::Null)
+                }
+                None => {
+                    warn!(
+                        target: "kakehashi::bridge::reader",
+                        "{}window/workDoneProgress/create missing/invalid token",
+                        lang_prefix
+                    );
+                    Err(jsonrpc::Error::invalid_params(
+                        "window/workDoneProgress/create requires a token",
+                    ))
+                }
+            }
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         }
         "workspace/diagnostic/refresh" => {
             // Downstream server is requesting that the client re-pull diagnostics.
@@ -963,14 +1172,24 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let caps = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+<<<<<<< HEAD
         let (window_tx, window_rx) = mpsc::channel(16);
+=======
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry,
+            progress_connection_id,
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
         (deps, (rx, upstream_rx, window_rx))
     }
@@ -1555,7 +1774,12 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         let message = json!({
@@ -1611,7 +1835,12 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         // Then unregister it
@@ -1645,42 +1874,207 @@ mod tests {
         }
     }
 
+    /// A downstream `window/workDoneProgress/create` is acknowledged to the
+    /// downstream AND bridged upstream: a unique upstream token is minted,
+    /// registered (so `$/progress` can be translated), and a
+    /// `CreateWorkDoneProgress` notification is emitted for the editor.
     #[tokio::test]
-    async fn handle_message_work_done_progress_create_sends_success() {
+    async fn handle_message_work_done_progress_create_bridges_upstream() {
+        use tower_lsp_server::ls_types::NumberOrString;
+
         let router = ResponseRouter::new();
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+<<<<<<< HEAD
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
+=======
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         let deps = ServerRequestDeps {
             server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::clone(&progress_registry),
+            progress_connection_id,
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         let message = json!({
             "jsonrpc": "2.0",
             "id": 5,
             "method": "window/workDoneProgress/create",
-            "params": {
-                "token": "some-token"
-            }
+            "params": { "token": "some-token" }
         });
 
         handle_message(message, &router, "", &deps).await;
 
-        // A success response should have been sent
+        // Downstream gets an immediate success ack.
         let response = response_rx.try_recv().expect("should have response");
-        match response {
-            OutboundMessage::Untracked(val) => {
-                assert_eq!(val["id"], 5);
-                assert!(val["result"].is_null());
+        let OutboundMessage::Untracked(val) = response else {
+            panic!("Expected Untracked variant");
+        };
+        assert_eq!(val["id"], 5);
+        assert!(val["result"].is_null());
+
+        // The editor is asked to create a *different* (unique) token.
+        let UpstreamNotification::CreateWorkDoneProgress { token } = upstream_rx
+            .try_recv()
+            .expect("should forward CreateWorkDoneProgress")
+        else {
+            panic!("Expected CreateWorkDoneProgress");
+        };
+        let downstream_token = NumberOrString::String("some-token".to_string());
+        assert_ne!(token, downstream_token, "upstream token must be remapped");
+
+        // The mapping is registered so downstream `$/progress` can be translated.
+        assert_eq!(
+            progress_registry.translate(progress_connection_id, &downstream_token),
+            Some(token)
+        );
+    }
+
+    /// A `window/workDoneProgress/create` without a token is rejected with
+    /// InvalidParams rather than silently acked.
+    #[tokio::test]
+    async fn handle_message_work_done_progress_create_missing_token_errors() {
+        let router = ResponseRouter::new();
+        let (response_tx, mut response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            progress_registry,
+            progress_connection_id,
+        };
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "window/workDoneProgress/create",
+            "params": {}
+        });
+
+        handle_message(message, &router, "", &deps).await;
+
+        // An error response is returned and nothing is bridged upstream.
+        let response = response_rx.try_recv().expect("should have response");
+        let OutboundMessage::Untracked(val) = response else {
+            panic!("Expected Untracked variant");
+        };
+        assert_eq!(val["id"], 6);
+        assert!(val.get("error").is_some(), "missing token should error");
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "nothing forwarded upstream"
+        );
+    }
+
+    /// A downstream `$/progress` for a registered token is forwarded upstream
+    /// with the token rewritten to the bridge-minted upstream token; an `End`
+    /// clears the mapping.
+    #[tokio::test]
+    async fn handle_message_progress_translates_token_and_cleans_up_on_end() {
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let downstream_token = NumberOrString::Number(1);
+        let upstream_token = progress_registry.register(
+            progress_connection_id,
+            downstream_token.clone(),
+            response_tx.clone(),
+        );
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            progress_registry: Arc::clone(&progress_registry),
+            progress_connection_id,
+        };
+
+        // A "begin" progress is forwarded with the translated token.
+        let begin = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {
+                "token": 1,
+                "value": { "kind": "begin", "title": "Indexing" }
             }
-            _ => panic!("Expected Untracked variant"),
-        }
+        });
+        handle_message(begin, &router, "", &deps).await;
+        let UpstreamNotification::Progress { params } =
+            upstream_rx.try_recv().expect("begin should forward")
+        else {
+            panic!("Expected Progress");
+        };
+        assert_eq!(params.token, upstream_token);
+
+        // An "end" is forwarded too, then the mapping is cleared.
+        let end = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": 1, "value": { "kind": "end" } }
+        });
+        handle_message(end, &router, "", &deps).await;
+        assert!(upstream_rx.try_recv().is_ok(), "end should forward");
+        assert_eq!(
+            progress_registry.translate(progress_connection_id, &downstream_token),
+            None,
+            "mapping cleared after End"
+        );
+    }
+
+    /// A `$/progress` for a token the bridge never minted (e.g. a client-provided
+    /// workDoneToken) is dropped, not forwarded.
+    #[tokio::test]
+    async fn handle_message_progress_unmapped_token_is_dropped() {
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            language: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            progress_registry,
+            progress_connection_id,
+        };
+
+        let progress = json!({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": { "token": "never-registered", "value": { "kind": "begin", "title": "x" } }
+        });
+        handle_message(progress, &router, "", &deps).await;
+
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "unmapped progress must not be forwarded"
+        );
     }
 
     /// Test that workspace/diagnostic/refresh is forwarded upstream and acknowledged.
@@ -1701,7 +2095,12 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         let message = json!({
@@ -1753,6 +2152,8 @@ mod tests {
             upstream_tx,
             window_tx,
             workspace_folders: Arc::new(Some(folders)),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
         let message = json!({
@@ -1792,6 +2193,8 @@ mod tests {
             upstream_tx,
             window_tx,
             workspace_folders: Arc::new(None),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
         let message = json!({
@@ -1830,7 +2233,12 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         let message = json!({
@@ -1906,7 +2314,12 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         let message = json!({
@@ -1941,7 +2354,12 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         // client/registerCapability with no params field at all
@@ -1991,7 +2409,12 @@ mod tests {
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         // client/unregisterCapability with no params field at all
@@ -2052,7 +2475,12 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -2108,7 +2536,12 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+<<<<<<< HEAD
             window_tx,
+=======
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+>>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         };
 
         let message = json!({
