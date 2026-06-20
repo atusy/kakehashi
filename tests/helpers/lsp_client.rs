@@ -480,8 +480,8 @@ impl LspClient {
     ///
     /// Returns `(method, params)` for the first match, or None on timeout.
     /// Unlike `wait_for_notification`, this can observe the ORDER of several
-    /// notification methods (e.g. prove a gated showMessage never arrived by
-    /// seeing a later logMessage first). Non-matching messages are skipped.
+    /// notification methods (e.g. prove showMessage arrives before a later
+    /// logMessage). Non-matching messages are skipped.
     pub(crate) fn wait_for_notification_where(
         &mut self,
         methods: &[&str],
