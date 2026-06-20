@@ -988,9 +988,10 @@ async fn handle_server_request(
             // We ack the downstream immediately with Ok(null) rather than relaying
             // the editor's real create response: this decouples the downstream from
             // editor latency and lets progress buffer on the FIFO upstream channel.
-            // The editor advertises `window.workDoneProgress` to the downstream
-            // (capabilities are forwarded), so a downstream only reaches here when
-            // the editor supports it — making editor rejection a non-issue.
+            // The bridge only advertises `window.workDoneProgress` downstream when
+            // the real editor supports it (see client_capabilities merge), so a
+            // downstream reaching here means the editor can accept the create —
+            // making editor rejection a non-issue.
             match message
                 .get("params")
                 .and_then(|p| p.get("token"))
@@ -1236,6 +1237,7 @@ mod tests {
         assert_eq!(router.pending_count(), 1);
     }
 
+<<<<<<< HEAD
     /// Deps wired with a server name, exposing the bounded window receiver so
     /// tests can assert what was (not) forwarded to the editor.
     fn server_request_deps_for(
@@ -1374,6 +1376,66 @@ mod tests {
             window_rx.try_recv().is_err(),
             "second message must be dropped when the bounded queue is full"
         );
+=======
+    /// When a reader task exits, its `ProgressPurgeGuard` clears that
+    /// connection's progress-token mappings so a later cancel can't route to a
+    /// dead writer (window-work-done-progress bridging).
+    #[tokio::test]
+    async fn reader_exit_purges_progress_mappings() {
+        use crate::lsp::bridge::connection::BridgeReader;
+        use std::process::Stdio;
+        use tokio::process::Command;
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep should spawn");
+        let stdout = child.stdout.take().expect("stdout should be available");
+        let reader = BridgeReader::new(stdout);
+
+        let router = Arc::new(ResponseRouter::new());
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let conn = progress_registry.new_connection_id();
+        let downstream_token = NumberOrString::Number(1);
+        let upstream_token =
+            progress_registry.register(conn, downstream_token.clone(), response_tx.clone());
+
+        let handle = spawn_reader_task_for_language(
+            reader,
+            Arc::clone(&router),
+            None,
+            None,
+            response_tx,
+            Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx,
+            Arc::new(None),
+            Arc::clone(&progress_registry),
+            conn,
+        );
+
+        // Mapping is live while the reader runs.
+        assert!(progress_registry.resolve_cancel(&upstream_token).is_some());
+
+        // Dropping the handle cancels the loop; its purge guard then fires.
+        drop(handle);
+        for _ in 0..50 {
+            if progress_registry.resolve_cancel(&upstream_token).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            progress_registry.resolve_cancel(&upstream_token).is_none(),
+            "reader exit must purge the connection's progress mappings"
+        );
+        assert_eq!(progress_registry.translate(conn, &downstream_token), None);
+>>>>>>> 3806bc71 (fix(bridge): address review round 1 (subagent) for work-done progress)
     }
 
     #[tokio::test]

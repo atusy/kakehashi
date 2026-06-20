@@ -541,6 +541,46 @@ mod tests {
         assert!(captured.is_some(), "Inner service should still be called");
     }
 
+    /// End-to-end through the middleware: a client `window/workDoneProgress/cancel`
+    /// is routed to the owning downstream's writer with its ORIGINAL token.
+    #[tokio::test]
+    async fn work_done_progress_cancel_reaches_owning_downstream() {
+        use crate::lsp::bridge::OutboundMessage;
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+
+        // Register a downstream token with an observable writer.
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(8);
+        let conn = pool.progress_registry().new_connection_id();
+        let upstream_token =
+            pool.progress_registry()
+                .register(conn, NumberOrString::Number(1), writer_tx);
+        let NumberOrString::String(upstream_token) = upstream_token else {
+            panic!("upstream token is a string");
+        };
+
+        let forwarder = CancelForwarder::new(Arc::clone(&pool));
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock.clone(), forwarder);
+
+        let request = Request::build("window/workDoneProgress/cancel")
+            .params(serde_json::json!({ "token": upstream_token }))
+            .finish();
+        service.call(request).await.unwrap();
+
+        // The middleware spawns the forward fire-and-forget; await its delivery.
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), writer_rx.recv())
+            .await
+            .expect("cancel should reach downstream within timeout")
+            .expect("writer channel open");
+        let OutboundMessage::Untracked(val) = sent else {
+            panic!("Expected Untracked");
+        };
+        assert_eq!(val["method"], "window/workDoneProgress/cancel");
+        assert_eq!(val["params"]["token"], serde_json::json!(1));
+    }
+
     #[tokio::test]
     async fn cancel_forwarder_handles_missing_id_in_params() {
         let mock = MockService::new();

@@ -114,7 +114,11 @@ fn build_baseline_capabilities() -> ClientCapabilities {
 /// `completionItem.{documentationFormat, snippetSupport, deprecatedSupport,
 /// tagSupport, commitCharactersSupport, resolveSupport, insertTextModeSupport,
 /// labelDetailsSupport, preselectSupport}`, `hover.contentFormat`,
-/// `signatureHelp.signatureInformation`.
+/// `signatureHelp.signatureInformation`, `window.workDoneProgress`.
+///
+/// `window.workDoneProgress` is gated on the real upstream editor so the bridge
+/// only invites downstream server-initiated progress (`window/workDoneProgress/create`)
+/// when it can actually relay it to the editor — see ls-bridge-work-done-progress.
 fn merge_upstream_capabilities(
     mut base: ClientCapabilities,
     upstream: Option<&ClientCapabilities>,
@@ -216,6 +220,18 @@ fn merge_upstream_capabilities(
                 upstream_sig_info.active_parameter_support,
             );
         }
+    }
+
+    // --- window.workDoneProgress (gated on real upstream support) ---
+    // Only advertise server-initiated progress downstream when the editor
+    // genuinely supports it, so the bridge never invites progress it can't relay
+    // (ls-bridge-work-done-progress).
+    if let Some(upstream_window) = &upstream.window {
+        let base_window = base.window.get_or_insert_with(Default::default);
+        merge_option(
+            &mut base_window.work_done_progress,
+            upstream_window.work_done_progress,
+        );
     }
 
     base
@@ -524,6 +540,42 @@ mod tests {
             merged_json["textDocument"]["references"]["dynamicRegistration"],
             base_json["textDocument"]["references"]["dynamicRegistration"],
             "references dynamicRegistration must not change"
+        );
+    }
+
+    #[test]
+    fn merge_propagates_window_work_done_progress_only_when_upstream_supports() {
+        use tower_lsp_server::ls_types::WindowClientCapabilities;
+
+        // Baseline declares no window capability, so no upstream → none downstream.
+        let baseline = build_baseline_capabilities();
+        assert!(
+            baseline.window.is_none(),
+            "baseline must not advertise window.workDoneProgress on its own"
+        );
+
+        // Upstream supports it → propagated downstream.
+        let supporting = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                work_done_progress: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&supporting));
+        assert_eq!(
+            merged.window.and_then(|w| w.work_done_progress),
+            Some(true),
+            "must advertise downstream when the editor supports progress"
+        );
+
+        // Upstream omits it → not advertised downstream (gated).
+        let non_supporting = ClientCapabilities::default();
+        let merged =
+            merge_upstream_capabilities(build_baseline_capabilities(), Some(&non_supporting));
+        assert!(
+            merged.window.and_then(|w| w.work_done_progress).is_none(),
+            "must not invite progress the editor can't handle"
         );
     }
 

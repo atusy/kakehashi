@@ -21,6 +21,8 @@ mod root_markers;
 mod text_document;
 
 // Re-export public types
+#[cfg(test)]
+pub(crate) use actor::OutboundMessage;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;

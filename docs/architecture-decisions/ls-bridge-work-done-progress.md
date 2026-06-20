@@ -29,8 +29,10 @@ so client–kakehashi–downstream stays consistent and collision-free:
   per-connection id, acks the downstream immediately, and forwards a
   `CreateWorkDoneProgress` for the editor. The downstream is acked optimistically
   (not by relaying the editor's real response) to decouple it from editor
-  latency; the editor advertises `window.workDoneProgress` downstream (forwarded
-  capabilities), so a downstream only reaches here when the editor supports it.
+  latency. The bridge advertises `window.workDoneProgress` to downstreams **only
+  when the real editor advertises it** (the capability merge gates it), so a
+  downstream only sends `create` when the editor can accept it — making the
+  optimistic ack sound.
 - **`$/progress`** (downstream → bridge notification): the reader rewrites the
   token to the mapped upstream token and forwards it; a terminating `End` clears
   the mapping.
@@ -68,8 +70,12 @@ writer.
 
 ### Negative
 
-- One registry entry per in-flight server-declared progress; bounded and purged
-  on End / connection teardown.
+- One registry entry per in-flight server-declared progress. Entries are cleared
+  on a terminating `End` or on connection teardown. A misbehaving downstream that
+  `create`s tokens (or gets cancelled) but never sends `End`, on a long-lived
+  connection, accumulates entries until the connection closes — bounded by
+  connection lifetime, not individually reclaimed. A per-connection live-token
+  cap could bound it further if this ever matters in practice.
 
 ### Neutral
 

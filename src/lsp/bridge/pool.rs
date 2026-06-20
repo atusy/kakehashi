@@ -303,6 +303,13 @@ impl LanguageServerPool {
         }
     }
 
+    /// Shared work-done progress token registry (for seam tests that need to
+    /// register a token and observe cancel routing).
+    #[cfg(test)]
+    pub(crate) fn progress_registry(&self) -> &Arc<super::ProgressRegistry> {
+        &self.progress_registry
+    }
+
     /// Set the workspace root URI.
     ///
     /// Called once during upstream initialize to forward the root URI to downstream servers.
@@ -1287,10 +1294,7 @@ impl LanguageServerPool {
     /// owns the (bridge-minted) `upstream_token`, rewriting it back to that
     /// downstream's original token. Best-effort, mirroring `$/cancelRequest`:
     /// an unknown token (already finished, or never ours) is silently dropped.
-    pub(crate) async fn forward_work_done_cancel(
-        &self,
-        upstream_token: tower_lsp_server::ls_types::NumberOrString,
-    ) {
+    pub(crate) async fn forward_work_done_cancel(&self, upstream_token: NumberOrString) {
         let Some((writer, downstream_token)) =
             self.progress_registry.resolve_cancel(&upstream_token)
         else {
