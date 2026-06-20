@@ -992,14 +992,12 @@ async fn handle_server_request(
             // the real editor supports it (see client_capabilities merge), so a
             // downstream reaching here means the editor can accept the create —
             // making editor rejection a non-issue.
-            match message
-                .get("params")
-                .and_then(|p| p.get("token"))
-                .cloned()
-                .and_then(|t| {
-                    serde_json::from_value::<tower_lsp_server::ls_types::NumberOrString>(t).ok()
-                }) {
-                Some(downstream_token) => {
+            // Deserialize the token from the borrowed value (indexing yields
+            // `Null` for a missing key, which fails to parse) — no clone.
+            match <tower_lsp_server::ls_types::NumberOrString as serde::Deserialize>::deserialize(
+                &message["params"]["token"],
+            ) {
+                Ok(downstream_token) => {
                     let upstream_token = deps.progress_registry.register(
                         deps.progress_connection_id,
                         downstream_token,
@@ -1017,7 +1015,7 @@ async fn handle_server_request(
                         });
                     Ok(serde_json::Value::Null)
                 }
-                None => {
+                Err(_) => {
                     warn!(
                         target: "kakehashi::bridge::reader",
                         "{}window/workDoneProgress/create missing/invalid token",
