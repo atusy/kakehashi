@@ -3,8 +3,11 @@
 //! Downstream language servers historically received the client-supplied
 //! workspace root verbatim, which points at the *editor's* workspace — in a
 //! monorepo that is rarely the project the document belongs to. `rootMarkers`
-//! locates the root the way editors' LSP clients do: walk up from the
-//! triggering document and pick the first directory containing a marker.
+//! locates the root the way Neovim's `vim.fs.root` does: marker entries are
+//! tried in configured order, each searched up the triggering document's
+//! ancestors before the next entry, so a higher-priority marker in a far
+//! ancestor outranks a lower-priority one next to the document. A nested
+//! array is one equal-priority tier where the nearest ancestor wins.
 
 use std::path::{Path, PathBuf};
 
