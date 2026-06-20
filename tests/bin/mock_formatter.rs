@@ -48,6 +48,12 @@
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
 //!   trigger filtering is what `tests/e2e_on_type_formatting.rs` proves).
+//! - `notify` — right after answering `initialize`, emits a
+//!   `window/showMessage` followed by a `window/logMessage` notification.
+//!   Used by `tests/e2e_window_notifications.rs` to prove the bridge forwards
+//!   both window/* notifications unconditionally (#378). showMessage is sent
+//!   FIRST, and the bridge preserves order, so the test asserts showMessage
+//!   arrives ahead of logMessage.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -109,6 +115,18 @@ fn main() {
                     }),
                 };
                 respond(&mut writer, id, json!({ "capabilities": capabilities }));
+                if mode == "notify" {
+                    notify(
+                        &mut writer,
+                        "window/showMessage",
+                        json!({ "type": 2, "message": "mock show line" }),
+                    );
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({ "type": 3, "message": "mock log line" }),
+                    );
+                }
             }
             "shutdown" => respond(&mut writer, id, Value::Null),
             "exit" => break,
@@ -359,6 +377,13 @@ fn read_message<R: BufRead>(reader: &mut R) -> Option<Value> {
     let mut body = vec![0u8; content_length?];
     reader.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
+}
+
+/// Send a JSON-RPC notification (server-initiated, no `id`).
+fn notify<W: Write>(writer: &mut W, method: &str, params: Value) {
+    let body = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
+    let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
+    let _ = writer.flush();
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).

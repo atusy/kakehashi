@@ -70,7 +70,8 @@ pub(crate) enum ConnectionReadiness {
 }
 
 use super::actor::{
-    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, UpstreamNotification, spawn_reader_task_for_language,
+    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, ServerRequestDeps, UpstreamNotification,
+    spawn_reader_task_for_server,
 };
 use super::connection::AsyncBridgeConnection;
 
@@ -242,6 +243,14 @@ pub struct LanguageServerPool {
     /// Wrapped in `Mutex<Option<...>>` because `take_upstream_rx()` moves it out.
     upstream_rx:
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<UpstreamNotification>>>,
+    /// Sender for best-effort `window/*` notifications (#378).
+    ///
+    /// Bounded with drop-on-full so a log-flooding downstream server cannot
+    /// grow memory or starve `DiagnosticRefresh` (loss-tolerance split
+    /// documented on `UpstreamNotification`).
+    window_tx: tokio::sync::mpsc::Sender<UpstreamNotification>,
+    /// Receiver for window notifications, taken once by the forwarding task.
+    window_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<UpstreamNotification>>>,
 }
 
 impl Default for LanguageServerPool {
@@ -258,6 +267,8 @@ impl LanguageServerPool {
     /// `CancelForwarder::new()`.
     pub fn new() -> Self {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (window_tx, window_rx) =
+            tokio::sync::mpsc::channel(super::actor::WINDOW_NOTIFICATION_QUEUE_CAPACITY);
         Self {
             connections: Mutex::new(HashMap::new()),
             document_tracker: DocumentTracker::new(),
@@ -270,6 +281,8 @@ impl LanguageServerPool {
             client_capabilities: OnceLock::new(),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
+            window_tx,
+            window_rx: std::sync::Mutex::new(Some(window_rx)),
         }
     }
 
@@ -329,6 +342,21 @@ impl LanguageServerPool {
             .upstream_rx
             .lock()
             .recover_poison("LanguageServerPool::take_upstream_rx");
+        guard.take()
+    }
+
+    /// Take the window notification receiver for forwarding to the editor.
+    ///
+    /// Returns `Some(receiver)` on first call, `None` on subsequent calls.
+    /// The receiver should be consumed by the same forwarding task as
+    /// `take_upstream_rx`'s.
+    pub(crate) fn take_window_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<UpstreamNotification>> {
+        let mut guard = self
+            .window_rx
+            .lock()
+            .recover_poison("LanguageServerPool::take_window_rx");
         guard.take()
     }
 
@@ -834,17 +862,20 @@ impl LanguageServerPool {
 
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
-        // Server name is passed for structured logging (observability improvement)
+        // Server name is passed for structured logging and notification prefixes
         let liveness_timeout = liveness_timeout::LivenessTimeout::default();
-        let reader_handle = spawn_reader_task_for_language(
+        let reader_handle = spawn_reader_task_for_server(
             reader,
             Arc::clone(&router),
             Some(liveness_timeout.as_duration()),
-            Some(server_name.to_string()),
-            tx.clone(),
-            Arc::clone(&dynamic_capabilities),
-            self.upstream_tx.clone(),
-            Arc::clone(&workspace_folders),
+            ServerRequestDeps {
+                server_name: Some(server_name.to_string()),
+                response_tx: tx.clone(),
+                dynamic_capabilities: Arc::clone(&dynamic_capabilities),
+                upstream_tx: self.upstream_tx.clone(),
+                window_tx: self.window_tx.clone(),
+                workspace_folders: Arc::clone(&workspace_folders),
+            },
         );
 
         // Create handle in Initializing state (fast-fail for concurrent requests)

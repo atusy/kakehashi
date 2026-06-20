@@ -17,11 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, warn};
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
+use tower_lsp_server::ls_types::{LogMessageParams, MessageType, ShowMessageParams};
 
 use super::super::connection::BridgeReader;
 use super::OutboundMessage;
@@ -34,12 +36,35 @@ use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
 ///
 /// Reader tasks use this to signal events that require upstream Client interaction,
 /// keeping the bridge module decoupled from tower-lsp's Client type.
+///
+/// Two channels carry these, split by loss tolerance:
+/// - `DiagnosticRefresh` travels on an **unbounded** channel: dropping one
+///   would silently stale the editor's diagnostics, and its volume is tiny
+///   (one per downstream `workspace/diagnostic/refresh`).
+/// - `LogMessage`/`ShowMessage` travel on a **bounded** channel
+///   ([`WINDOW_NOTIFICATION_QUEUE_CAPACITY`]) with drop-on-full: a downstream
+///   server stuck in a tight logMessage loop must not grow memory without
+///   bound or starve `DiagnosticRefresh` behind a burst (the forwarding loop
+///   drains the unbounded channel first). Within the bounded channel FIFO
+///   order is preserved, which the window-notification e2e relies on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
+    /// Forward a downstream `window/logMessage` to the editor.
+    /// `message` is already prefixed with the originating server name.
+    LogMessage { typ: MessageType, message: String },
+    /// Forward a downstream `window/showMessage` to the editor.
+    /// `message` is already prefixed with the originating server name.
+    ShowMessage { typ: MessageType, message: String },
 }
+
+/// Capacity of the bounded `window/*` forwarding queue. Sized like the
+/// outbound queue (`OUTBOUND_QUEUE_CAPACITY`): large enough that drops require
+/// a downstream server flooding faster than the editor drains for a sustained
+/// burst.
+pub(crate) const WINDOW_NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 
 /// Liveness channel endpoints for the reader task.
 ///
@@ -53,19 +78,23 @@ struct LivenessParams {
     failed_tx: oneshot::Sender<()>,
 }
 
-/// Dependencies for handling server-initiated requests.
+/// Dependencies for handling server-initiated requests and notifications.
 ///
-/// Groups the parameters that `handle_server_request` needs: the language
-/// identifier (for logging), the response channel, the dynamic capability
-/// registry, the upstream notification channel, and the workspace folders
-/// this connection was initialized with (the bridge advertises the
+/// Groups the parameters that `handle_server_request` and
+/// `forward_notification` need: the downstream server name (for logging and
+/// message prefixes), the response channel, the dynamic capability registry,
+/// the upstream notification channels, and the workspace folders this
+/// connection was initialized with (the bridge advertises the
 /// `workspace.workspaceFolders` capability, so servers may query them).
-struct ServerRequestDeps {
-    language: Option<String>,
-    response_tx: mpsc::Sender<OutboundMessage>,
-    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
-    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+pub(crate) struct ServerRequestDeps {
+    pub(crate) server_name: Option<String>,
+    pub(crate) response_tx: mpsc::Sender<OutboundMessage>,
+    pub(crate) dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+    /// Loss-intolerant notifications (`DiagnosticRefresh`); unbounded.
+    pub(crate) upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
+    /// Best-effort `window/*` notifications; bounded, dropped when full.
+    pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
+    pub(crate) workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
 }
 
 /// Type alias for the pinned liveness timer future.
@@ -106,12 +135,12 @@ impl LivenessTimerState {
     ///
     /// Called when pending count transitions 0->1.
     /// No-op if timeout is not configured.
-    fn start(&mut self, lang_prefix: &str) {
+    fn start(&mut self, server_prefix: &str) {
         if let Some(timeout) = self.timeout {
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Liveness timer started: {:?}",
-                lang_prefix,
+                server_prefix,
                 timeout
             );
             self.timer = Some(new_liveness_timer(timeout));
@@ -122,14 +151,14 @@ impl LivenessTimerState {
     ///
     /// Called on any message activity (response or notification).
     /// Only resets if timer is currently active.
-    fn reset(&mut self, lang_prefix: &str) {
+    fn reset(&mut self, server_prefix: &str) {
         if let Some(timeout) = self.timeout
             && self.timer.is_some()
         {
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Liveness timer reset on message activity",
-                lang_prefix
+                server_prefix
             );
             self.timer = Some(new_liveness_timer(timeout));
         }
@@ -139,12 +168,12 @@ impl LivenessTimerState {
     ///
     /// Called when pending count returns to 0 or shutdown begins.
     /// Only logs if timer was actually active.
-    fn stop(&mut self, lang_prefix: &str, reason: &str) {
+    fn stop(&mut self, server_prefix: &str, reason: &str) {
         if self.timer.take().is_some() {
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Liveness timer stopped: {}",
-                lang_prefix,
+                server_prefix,
                 reason
             );
         }
@@ -255,11 +284,11 @@ pub(crate) fn spawn_reader_task(
     spawn_reader_task_with_liveness(reader, router, None)
 }
 
-/// Spawn a reader task with optional liveness timeout (no language context).
+/// Spawn a reader task with optional liveness timeout (no server context).
 ///
 /// Convenience wrapper for tests that don't need structured logging with
-/// language identifiers (ls-bridge-async-connection liveness timeout); production code should use
-/// `spawn_reader_task_for_language`.
+/// server names (ls-bridge-async-connection liveness timeout); production code should use
+/// `spawn_reader_task_for_server`.
 #[cfg(test)]
 pub(crate) fn spawn_reader_task_with_liveness(
     reader: BridgeReader,
@@ -269,30 +298,32 @@ pub(crate) fn spawn_reader_task_with_liveness(
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
-    spawn_reader_task_for_language(
+    let (window_tx, _window_rx) = mpsc::channel(16);
+    spawn_reader_task_for_server(
         reader,
         router,
         liveness_timeout,
-        None,
-        response_tx,
-        dynamic_capabilities,
-        upstream_tx,
-        Arc::new(None),
+        ServerRequestDeps {
+            server_name: None,
+            response_tx,
+            dynamic_capabilities,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            window_tx,
+        },
     )
 }
 
-/// Spawn a reader task with liveness timeout (ls-bridge-async-connection) and language identifier
-/// for structured logging.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_reader_task_for_language(
+/// Spawn a reader task with liveness timeout (ls-bridge-async-connection).
+///
+/// `deps` carries the per-server context (name, channels, capability registry,
+/// workspace folders), snapshotted at spawn time like the rest of the server
+/// config (#378).
+pub(crate) fn spawn_reader_task_for_server(
     reader: BridgeReader,
     router: Arc<ResponseRouter>,
     liveness_timeout: Option<Duration>,
-    language: Option<String>,
-    response_tx: mpsc::Sender<OutboundMessage>,
-    dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
-    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    deps: ServerRequestDeps,
 ) -> ReaderTaskHandle {
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
@@ -312,20 +343,12 @@ pub(crate) fn spawn_reader_task_for_language(
         stop_rx: liveness_stop_rx,
         failed_tx: liveness_failed_tx,
     };
-    let server_request_deps = ServerRequestDeps {
-        language,
-        response_tx,
-        dynamic_capabilities,
-        upstream_tx,
-        workspace_folders,
-    };
-
     let join_handle = tokio::spawn(reader_loop_with_liveness(
         reader,
         router,
         token_clone,
         liveness,
-        server_request_deps,
+        deps,
     ));
 
     ReaderTaskHandle {
@@ -356,6 +379,7 @@ async fn reader_loop(
     let (response_tx, _response_rx) = mpsc::channel(16);
     let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
     let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+    let (window_tx, _window_rx) = mpsc::channel(16);
     let liveness = LivenessParams {
         timeout: None,
         start_rx,
@@ -363,11 +387,12 @@ async fn reader_loop(
         failed_tx,
     };
     let server_request_deps = ServerRequestDeps {
-        language: None,
+        server_name: None,
         response_tx,
         dynamic_capabilities,
         upstream_tx,
         workspace_folders: Arc::new(None),
+        window_tx,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -393,9 +418,9 @@ async fn reader_loop_with_liveness(
         failed_tx: liveness_failed_tx,
     } = liveness_params;
 
-    // Language prefix for log messages (e.g., "[lua] " or "")
-    let lang_prefix = server_request_deps
-        .language
+    // Server-name prefix for log messages (e.g., "[lua-ls] " or "")
+    let server_prefix = server_request_deps
+        .server_name
         .as_ref()
         .map(|l| format!("[{}] ", l))
         .unwrap_or_default();
@@ -412,7 +437,7 @@ async fn reader_loop_with_liveness(
                 debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Reader task cancelled, shutting down",
-                    lang_prefix
+                    server_prefix
                 );
                 // The router outlives this task (Arc-shared with ConnectionHandle),
                 // so pending waiters must be failed here or they hang until the
@@ -430,7 +455,7 @@ async fn reader_loop_with_liveness(
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Liveness timeout expired after {:?}, server appears hung - failing {} pending request(s)",
-                    lang_prefix,
+                    server_prefix,
                     liveness.timeout_duration(),
                     pending_count
                 );
@@ -442,12 +467,12 @@ async fn reader_loop_with_liveness(
 
             // Check for liveness timer start notification (pending 0->1)
             Some(()) = liveness_start_rx.recv() => {
-                liveness.start(&lang_prefix);
+                liveness.start(&server_prefix);
             }
 
             // Check for liveness timer stop notification (shutdown began - ls-bridge-timeout-hierarchy Phase 4)
             Some(()) = liveness_stop_rx.recv() => {
-                liveness.stop(&lang_prefix, "shutdown began");
+                liveness.stop(&server_prefix, "shutdown began");
             }
 
             // Try to read a message (lowest priority)
@@ -455,13 +480,13 @@ async fn reader_loop_with_liveness(
                 match result {
                     Ok(message) => {
                         // Reset liveness timer on any message activity (ls-bridge-async-connection)
-                        liveness.reset(&lang_prefix);
+                        liveness.reset(&server_prefix);
 
-                        handle_message(message, &router, &lang_prefix, &server_request_deps).await;
+                        handle_message(message, &router, &server_prefix, &server_request_deps).await;
 
                         // Check if pending count returned to 0 - stop timer
                         if liveness.is_active() && router.pending_count() == 0 {
-                            liveness.stop(&lang_prefix, "pending count is 0");
+                            liveness.stop(&server_prefix, "pending count is 0");
                         }
                     }
                     Err(e) => {
@@ -469,7 +494,7 @@ async fn reader_loop_with_liveness(
                         warn!(
                             target: "kakehashi::bridge::reader",
                             "{}Reader error: {}, failing pending requests",
-                            lang_prefix,
+                            server_prefix,
                             e
                         );
                         router.fail_all(&format!("bridge: reader error: {}", e));
@@ -511,7 +536,7 @@ fn classify_message(message: &serde_json::Value) -> MessageKind {
 async fn handle_message(
     message: serde_json::Value,
     router: &ResponseRouter,
-    lang_prefix: &str,
+    server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
     match classify_message(&message) {
@@ -528,7 +553,7 @@ async fn handle_message(
                     debug!(
                         target: "kakehashi::bridge::reader",
                         "{}Response for id={} arrived but receiver was dropped (requester cancelled)",
-                        lang_prefix,
+                        server_prefix,
                         id.unwrap_or(serde_json::Value::Null)
                     );
                 }
@@ -537,43 +562,137 @@ async fn handle_message(
                     debug!(
                         target: "kakehashi::bridge::reader",
                         "{}Response for unknown request id={}, dropping",
-                        lang_prefix,
+                        server_prefix,
                         id.unwrap_or(serde_json::Value::Null)
                     );
                 }
             }
         }
         MessageKind::ServerRequest => {
-            handle_server_request(message, lang_prefix, deps).await;
+            handle_server_request(message, server_prefix, deps).await;
         }
         MessageKind::Notification => {
-            // Server-initiated notifications are not forwarded upstream today;
             // `publishDiagnostics` targeting a pipeline *scratch* document is
             // discarded EXPLICITLY (concatenated-formatting-pipeline Decision
             // point 7: scratch state is speculative and must never reach the
-            // editor) so the invariant survives if notification forwarding is
-            // ever implemented. Everything else is silently ignored.
+            // editor). The if/else makes the discard structural: notification
+            // forwarding lives on the else side, where a scratch-targeted
+            // publishDiagnostics can never reach it.
             if is_scratch_publish_diagnostics(&message) {
                 debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Discarding publishDiagnostics targeting a scratch virtual document",
-                    lang_prefix
+                    server_prefix
                 );
             } else {
-                // All other notifications are silently ignored. The if/else
-                // makes the scratch discard structural: any future
-                // notification forwarding belongs HERE, where a
-                // scratch-targeted publishDiagnostics can never reach it.
+                forward_notification(&message, server_prefix, deps);
             }
         }
         MessageKind::Invalid => {
             warn!(
                 target: "kakehashi::bridge::reader",
                 "{}Invalid message from downstream (no id or method): {}",
-                lang_prefix,
+                server_prefix,
                 message
             );
         }
+    }
+}
+
+/// Forward supported downstream notifications to the upstream editor.
+///
+/// Both `window/logMessage` and `window/showMessage` are forwarded
+/// unconditionally — the bridge stays transparent so messages a direct
+/// connection would surface are not silently swallowed. A downstream flood
+/// cannot harm the bridge because the window channel is bounded and
+/// drop-on-full (see [`UpstreamNotification`]). Both are prefixed with the
+/// originating server name so output from multiple bridged servers stays
+/// distinguishable.
+///
+/// Everything else is still silently ignored ($/progress: #379, push-based
+/// publishDiagnostics: #380).
+fn forward_notification(
+    message: &serde_json::Value,
+    server_prefix: &str,
+    deps: &ServerRequestDeps,
+) {
+    match message["method"].as_str() {
+        Some("window/logMessage") => {
+            // Deserialize from a reference to avoid cloning the params value.
+            match LogMessageParams::deserialize(&message["params"]) {
+                Ok(params) => send_window_notification(
+                    deps,
+                    server_prefix,
+                    "window/logMessage",
+                    UpstreamNotification::LogMessage {
+                        typ: params.typ,
+                        message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                    },
+                ),
+                Err(e) => debug!(
+                    target: "kakehashi::bridge::reader",
+                    "{}Dropping window/logMessage with invalid params: {}",
+                    server_prefix,
+                    e
+                ),
+            }
+        }
+        Some("window/showMessage") => match ShowMessageParams::deserialize(&message["params"]) {
+            Ok(params) => send_window_notification(
+                deps,
+                server_prefix,
+                "window/showMessage",
+                UpstreamNotification::ShowMessage {
+                    typ: params.typ,
+                    message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                },
+            ),
+            Err(e) => debug!(
+                target: "kakehashi::bridge::reader",
+                "{}Dropping window/showMessage with invalid params: {}",
+                server_prefix,
+                e
+            ),
+        },
+        _ => {}
+    }
+}
+
+/// Enqueue a `window/*` notification on the bounded best-effort channel.
+///
+/// `try_send` keeps the reader task non-blocking: a full queue (editor slower
+/// than a downstream notification flood) drops the message instead of growing
+/// memory or stalling stdout reads; a closed queue (shutdown) has no one left
+/// to deliver to. Both are deliberate per the loss-tolerance split documented
+/// on [`UpstreamNotification`].
+fn send_window_notification(
+    deps: &ServerRequestDeps,
+    server_prefix: &str,
+    method: &str,
+    notification: UpstreamNotification,
+) {
+    if let Err(e) = deps.window_tx.try_send(notification) {
+        debug!(
+            target: "kakehashi::bridge::reader",
+            "{}Dropping {} ({})",
+            server_prefix,
+            method,
+            match e {
+                mpsc::error::TrySendError::Full(_) => "window notification queue full",
+                mpsc::error::TrySendError::Closed(_) => "forwarding loop gone",
+            }
+        );
+    }
+}
+
+/// `[kakehashi:<server>] <message>` — tells the user which downstream server
+/// a forwarded `window/*` notification came from (#378). Falls back to
+/// `[kakehashi] <message>` when the server name is absent (test-only spawns;
+/// production spawns always carry the name, see pool.rs).
+fn prefixed_message(server_name: Option<&str>, message: &str) -> String {
+    match server_name {
+        Some(name) => format!("[kakehashi:{name}] {message}"),
+        None => format!("[kakehashi] {message}"),
     }
 }
 
@@ -603,7 +722,7 @@ fn is_scratch_publish_diagnostics(message: &serde_json::Value) -> bool {
 /// request, so a server that can't handle one to its own request is buggy.
 async fn handle_server_request(
     message: serde_json::Value,
-    lang_prefix: &str,
+    server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
     let id: jsonrpc::Id = message
@@ -624,7 +743,7 @@ async fn handle_server_request(
                             debug!(
                                 target: "kakehashi::bridge::reader",
                                 "{}Registered dynamic capability: {} (id={})",
-                                lang_prefix, reg.method, reg.id
+                                server_prefix, reg.method, reg.id
                             );
                         }
                         deps.dynamic_capabilities.register(reg_params.registrations);
@@ -634,7 +753,7 @@ async fn handle_server_request(
                         warn!(
                             target: "kakehashi::bridge::reader",
                             "{}Failed to parse registerCapability params: {}",
-                            lang_prefix, e
+                            server_prefix, e
                         );
                         Err(jsonrpc::Error::invalid_params(format!(
                             "Invalid params: {e}"
@@ -645,7 +764,7 @@ async fn handle_server_request(
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Request 'client/registerCapability' is missing 'params' field",
-                    lang_prefix
+                    server_prefix
                 );
                 Err(jsonrpc::Error::invalid_params(
                     "Request 'client/registerCapability' is missing 'params' field",
@@ -662,7 +781,7 @@ async fn handle_server_request(
                             debug!(
                                 target: "kakehashi::bridge::reader",
                                 "{}Unregistered dynamic capability: {} (id={})",
-                                lang_prefix, unreg.method, unreg.id
+                                server_prefix, unreg.method, unreg.id
                             );
                         }
                         deps.dynamic_capabilities
@@ -673,7 +792,7 @@ async fn handle_server_request(
                         warn!(
                             target: "kakehashi::bridge::reader",
                             "{}Failed to parse unregisterCapability params: {}",
-                            lang_prefix, e
+                            server_prefix, e
                         );
                         Err(jsonrpc::Error::invalid_params(format!(
                             "Invalid params: {e}"
@@ -684,7 +803,7 @@ async fn handle_server_request(
                 warn!(
                     target: "kakehashi::bridge::reader",
                     "{}Request 'client/unregisterCapability' is missing 'params' field",
-                    lang_prefix
+                    server_prefix
                 );
                 Err(jsonrpc::Error::invalid_params(
                     "Request 'client/unregisterCapability' is missing 'params' field",
@@ -697,7 +816,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Acknowledged window/workDoneProgress/create",
-                lang_prefix
+                server_prefix
             );
             Ok(serde_json::Value::Null)
         }
@@ -707,7 +826,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Forwarding workspace/diagnostic/refresh upstream",
-                lang_prefix
+                server_prefix
             );
             let _ = deps
                 .upstream_tx
@@ -721,7 +840,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Answering workspace/workspaceFolders from initialize-time folders",
-                lang_prefix
+                server_prefix
             );
             Ok(serde_json::to_value(deps.workspace_folders.as_ref())
                 .unwrap_or(serde_json::Value::Null))
@@ -730,7 +849,7 @@ async fn handle_server_request(
             debug!(
                 target: "kakehashi::bridge::reader",
                 "{}Unknown server request method: {}, responding with MethodNotFound",
-                lang_prefix, method
+                server_prefix, method
             );
             Err(jsonrpc::Error::method_not_found())
         }
@@ -741,7 +860,19 @@ async fn handle_server_request(
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
     // Response implements Serialize, so convert to Value for OutboundMessage.
-    let response = serde_json::to_value(response).expect("Response serialization is infallible");
+    // Serialization cannot fail in practice, but the project bans panics in
+    // production code; dropping the response is the only sane fallback here.
+    let response = match serde_json::to_value(response) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(
+                target: "kakehashi::bridge::reader",
+                "{}Failed to serialize response for server request '{}': {}",
+                server_prefix, method, e
+            );
+            return;
+        }
+    };
 
     // Send response via the writer channel.
     // We use OutboundMessage::Untracked because a server-initiated response has
@@ -765,7 +896,7 @@ async fn handle_server_request(
         warn!(
             target: "kakehashi::bridge::reader",
             "{}Failed to send response for server request '{}': {}",
-            lang_prefix, method, e
+            server_prefix, method, e
         );
     }
 }
@@ -832,14 +963,16 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let caps = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
-        (deps, (rx, upstream_rx))
+        (deps, (rx, upstream_rx, window_rx))
     }
 
     #[tokio::test]
@@ -882,6 +1015,146 @@ mod tests {
 
         // Pending count should still be 1 (notification was ignored)
         assert_eq!(router.pending_count(), 1);
+    }
+
+    /// Deps wired with a server name, exposing the bounded window receiver so
+    /// tests can assert what was (not) forwarded to the editor.
+    fn server_request_deps_for(
+        server_name: Option<&str>,
+    ) -> (
+        ServerRequestDeps,
+        mpsc::Receiver<UpstreamNotification>,
+        impl std::any::Any,
+    ) {
+        let (tx, rx) = mpsc::channel(16);
+        let caps = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            server_name: server_name.map(String::from),
+            response_tx: tx,
+            dynamic_capabilities: caps,
+            upstream_tx,
+            workspace_folders: Arc::new(None),
+            window_tx,
+        };
+        (deps, window_rx, (rx, upstream_rx))
+    }
+
+    #[tokio::test]
+    async fn handle_message_forwards_window_log_message_upstream() {
+        let router = ResponseRouter::new();
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/logMessage",
+            "params": { "type": 3, "message": "downstream says hi" }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        let forwarded = window_rx
+            .try_recv()
+            .expect("window/logMessage should be forwarded upstream");
+        assert_eq!(
+            forwarded,
+            UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::INFO,
+                message: "[kakehashi:mock-ls] downstream says hi".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_drops_window_log_message_with_invalid_params() {
+        let router = ResponseRouter::new();
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/logMessage",
+            "params": { "message": 42 }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        assert!(
+            window_rx.try_recv().is_err(),
+            "window/logMessage with unparseable params must be dropped, not forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_message_forwards_window_show_message() {
+        let router = ResponseRouter::new();
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "window/showMessage",
+            "params": { "type": 1, "message": "important popup" }
+        });
+
+        handle_message(notification, &router, "", &deps).await;
+
+        let forwarded = window_rx
+            .try_recv()
+            .expect("window/showMessage should be forwarded to the editor");
+        assert_eq!(
+            forwarded,
+            UpstreamNotification::ShowMessage {
+                typ: tower_lsp_server::ls_types::MessageType::ERROR,
+                message: "[kakehashi:mock-ls] important popup".to_string(),
+            }
+        );
+    }
+
+    /// A full window queue drops the notification instead of blocking the
+    /// reader or growing memory (the loss-tolerance split documented on
+    /// UpstreamNotification).
+    #[tokio::test]
+    async fn handle_message_drops_window_log_message_when_queue_full() {
+        let router = ResponseRouter::new();
+        let (tx, _rx) = mpsc::channel(16);
+        let caps = Arc::new(DynamicCapabilityRegistry::new());
+        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, mut window_rx) = mpsc::channel(1);
+        let deps = ServerRequestDeps {
+            server_name: Some("mock-ls".to_string()),
+            response_tx: tx,
+            dynamic_capabilities: caps,
+            upstream_tx,
+            window_tx,
+            workspace_folders: Arc::new(None),
+        };
+
+        let notification = |text: &str| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "window/logMessage",
+                "params": { "type": 3, "message": text }
+            })
+        };
+
+        // Capacity 1: the first message fills the queue, the second must be
+        // dropped without blocking (this await completing IS the assertion
+        // that the reader path stays non-blocking on a full queue).
+        handle_message(notification("first"), &router, "", &deps).await;
+        handle_message(notification("second"), &router, "", &deps).await;
+
+        let forwarded = window_rx.try_recv().expect("first message is delivered");
+        assert_eq!(
+            forwarded,
+            UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::INFO,
+                message: "[kakehashi:mock-ls] first".to_string(),
+            }
+        );
+        assert!(
+            window_rx.try_recv().is_err(),
+            "second message must be dropped when the bounded queue is full"
+        );
     }
 
     #[tokio::test]
@@ -1275,12 +1548,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         let message = json!({
@@ -1320,6 +1595,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // First register a capability
         dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
@@ -1330,11 +1606,12 @@ mod tests {
         assert!(dynamic_capabilities.has_registration("textDocument/diagnostic"));
 
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         // Then unregister it
@@ -1374,12 +1651,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         let message = json!({
@@ -1415,12 +1694,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         let message = json!({
@@ -1460,15 +1741,17 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(1);
         let folders = vec![tower_lsp_server::ls_types::WorkspaceFolder {
             uri: "file:///repo".parse().unwrap(),
             name: "repo".to_string(),
         }];
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            window_tx,
             workspace_folders: Arc::new(Some(folders)),
         };
 
@@ -1501,11 +1784,13 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(1);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
+            window_tx,
             workspace_folders: Arc::new(None),
         };
 
@@ -1538,12 +1823,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         let message = json!({
@@ -1612,12 +1899,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         let message = json!({
@@ -1645,12 +1934,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         // client/registerCapability with no params field at all
@@ -1685,6 +1976,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(16);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // Pre-register a capability so we can verify it's NOT removed
         dynamic_capabilities.register(vec![tower_lsp_server::ls_types::Registration {
@@ -1694,11 +1986,12 @@ mod tests {
         }]);
 
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         // client/unregisterCapability with no params field at all
@@ -1744,6 +2037,7 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(1);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // Fill the channel with a dummy message to create backpressure
         response_tx
@@ -1753,11 +2047,12 @@ mod tests {
 
         // Spawn handle_server_request in a separate task (it needs to await)
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -1802,16 +2097,18 @@ mod tests {
         let (response_tx, response_rx) = mpsc::channel(1);
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
 
         // Drop the receiver to simulate a closed channel
         drop(response_rx);
 
         let deps = ServerRequestDeps {
-            language: None,
+            server_name: None,
             response_tx,
             dynamic_capabilities,
             upstream_tx,
             workspace_folders: Arc::new(None),
+            window_tx,
         };
 
         let message = json!({

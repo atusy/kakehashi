@@ -392,6 +392,16 @@ impl BridgeCoordinator {
         self.pool.take_upstream_rx()
     }
 
+    /// Take the bounded `window/*` notification receiver (#378).
+    ///
+    /// Returns `Some(receiver)` on first call, `None` on subsequent calls.
+    /// Delegates to the underlying pool.
+    pub(crate) fn take_window_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<super::actor::UpstreamNotification>> {
+        self.pool.take_window_rx()
+    }
+
     /// Graceful shutdown of all downstream language server connections.
     pub(crate) async fn shutdown_all(&self) {
         self.pool.shutdown_all().await;
