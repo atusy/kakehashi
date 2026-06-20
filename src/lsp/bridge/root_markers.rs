@@ -34,30 +34,40 @@ fn is_valid_marker(marker: &str) -> bool {
         && components.all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// Find the nearest ancestor directory of `document_path` that contains any
-/// of `markers` (as a file or a directory). Returns `None` when no ancestor
-/// matches or `markers` is empty (the explicit `[]` kill switch).
+/// Resolve the marker root for `document_path` following Neovim's
+/// `vim.fs.root` `(string|string[])[]` priority: entries are tried in order,
+/// and each entry is searched up the document's ancestors nearest-first
+/// before the next entry is considered, so an earlier entry found in a far
+/// ancestor outranks a later entry sitting right next to the document. A
+/// `Group` entry is one equal-priority tier where proximity decides among its
+/// names. Returns `None` when no entry matches or `markers` is empty (the
+/// explicit `[]` kill switch).
 fn find_marker_root(document_path: &Path, markers: &[RootMarker]) -> Option<PathBuf> {
-    let (markers, invalid): (Vec<&String>, Vec<&String>) = markers
-        .iter()
-        .flat_map(RootMarker::names)
-        .partition(|marker| is_valid_marker(marker));
-    if !invalid.is_empty() {
-        // Spawn-time only (not per request), so a plain warn does not flood.
-        log::warn!(
-            target: "kakehashi::bridge::init",
-            "ignoring invalid rootMarkers entries (must be plain relative names): {:?}",
-            invalid
-        );
+    let parent = document_path.parent()?;
+    for entry in markers {
+        let (names, invalid): (Vec<&String>, Vec<&String>) = entry
+            .names()
+            .iter()
+            .partition(|marker| is_valid_marker(marker));
+        if !invalid.is_empty() {
+            // Spawn-time only (not per request), so a plain warn does not flood.
+            log::warn!(
+                target: "kakehashi::bridge::init",
+                "ignoring invalid rootMarkers entries (must be plain relative names): {:?}",
+                invalid
+            );
+        }
+        if names.is_empty() {
+            continue;
+        }
+        if let Some(dir) = parent
+            .ancestors()
+            .find(|dir| names.iter().any(|marker| dir.join(marker).exists()))
+        {
+            return Some(dir.to_path_buf());
+        }
     }
-    if markers.is_empty() {
-        return None;
-    }
-    document_path
-        .parent()?
-        .ancestors()
-        .find(|dir| markers.iter().any(|marker| dir.join(marker).exists()))
-        .map(Path::to_path_buf)
+    None
 }
 
 /// Build the `rootUri` + `workspaceFolders` for a downstream spawn from an
@@ -150,6 +160,59 @@ mod tests {
             root.map(|p| p.canonicalize().unwrap()),
             Some(inner.canonicalize().unwrap()),
             "nearest marker wins over the outer one"
+        );
+    }
+
+    #[test]
+    fn earlier_entry_wins_even_when_a_later_entry_is_nearer() {
+        // Neovim's flat (string|string[])[] priority: each entry is searched
+        // up the whole ancestry before the next entry is tried, so a far
+        // higher-priority marker beats a near lower-priority one.
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let inner = outer.join("sub");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(outer.join("a.toml"), "").unwrap(); // far, higher priority
+        std::fs::write(inner.join("b.toml"), "").unwrap(); // near, lower priority
+        let doc = inner.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Single("a.toml".to_string()),
+                RootMarker::Single("b.toml".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(outer.canonicalize().unwrap()),
+            "earlier entry a.toml outranks the nearer b.toml"
+        );
+    }
+
+    #[test]
+    fn group_entry_lets_proximity_decide_among_equal_priority_names() {
+        // A nested array is one equal-priority entry: the nearest ancestor
+        // containing any of its names wins (Neovim's string[] group).
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let inner = outer.join("sub");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(outer.join("a.toml"), "").unwrap();
+        std::fs::write(inner.join("b.toml"), "").unwrap();
+        let doc = inner.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[RootMarker::Group(vec![
+                "a.toml".to_string(),
+                "b.toml".to_string(),
+            ])],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(inner.canonicalize().unwrap()),
+            "within a group the nearer b.toml wins"
         );
     }
 
