@@ -58,15 +58,18 @@ impl ProgressConnectionId {
 struct CancelTarget {
     writer: tokio::sync::mpsc::Sender<OutboundMessage>,
     downstream_token: NumberOrString,
-    connection_id: ProgressConnectionId,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// upstream token key → cancel routing target.
-    up_to_down: HashMap<String, CancelTarget>,
-    /// (connection, downstream token key) → upstream token.
-    down_to_up: HashMap<(ProgressConnectionId, String), NumberOrString>,
+    /// upstream token → cancel routing target.
+    up_to_down: HashMap<NumberOrString, CancelTarget>,
+    /// connection → (downstream token → upstream token). Nesting by connection
+    /// keeps forward translation scoped (the same downstream token value may be
+    /// used by different connections) and makes per-connection purge a single
+    /// map removal. `NumberOrString` derives `Hash`/`Eq`, so the numeric token
+    /// `1` and the string token `"1"` never collide as keys.
+    down_to_up: HashMap<ProgressConnectionId, HashMap<NumberOrString, NumberOrString>>,
 }
 
 /// Bidirectional registry mapping downstream-declared progress tokens to
@@ -109,22 +112,25 @@ impl ProgressRegistry {
     ) -> NumberOrString {
         let suffix = self.token_counter.fetch_add(1, Ordering::Relaxed);
         let upstream_token = NumberOrString::String(format!("kakehashi/bridge/progress/{suffix}"));
-        let up_key = token_key(&upstream_token);
-        let down_key = (connection_id, token_key(&downstream_token));
 
-        let mut inner = self
+        let mut guard = self
             .inner
             .lock()
             .recover_poison("ProgressRegistry::register");
-        if let Some(stale) = inner.down_to_up.insert(down_key, upstream_token.clone()) {
-            inner.up_to_down.remove(&token_key(&stale));
+        let inner = &mut *guard;
+        let stale = inner
+            .down_to_up
+            .entry(connection_id)
+            .or_default()
+            .insert(downstream_token.clone(), upstream_token.clone());
+        if let Some(stale_upstream) = stale {
+            inner.up_to_down.remove(&stale_upstream);
         }
         inner.up_to_down.insert(
-            up_key,
+            upstream_token.clone(),
             CancelTarget {
                 writer,
                 downstream_token,
-                connection_id,
             },
         );
         upstream_token
@@ -138,12 +144,14 @@ impl ProgressRegistry {
         connection_id: ProgressConnectionId,
         downstream_token: &NumberOrString,
     ) -> Option<NumberOrString> {
-        let down_key = (connection_id, token_key(downstream_token));
         let inner = self
             .inner
             .lock()
             .recover_poison("ProgressRegistry::translate");
-        inner.down_to_up.get(&down_key).cloned()
+        inner
+            .down_to_up
+            .get(&connection_id)
+            .and_then(|tokens| tokens.get(downstream_token).cloned())
     }
 
     /// Drop the mapping for a finished progress operation (a `$/progress` with
@@ -153,13 +161,17 @@ impl ProgressRegistry {
         connection_id: ProgressConnectionId,
         downstream_token: &NumberOrString,
     ) {
-        let down_key = (connection_id, token_key(downstream_token));
-        let mut inner = self
+        let mut guard = self
             .inner
             .lock()
             .recover_poison("ProgressRegistry::complete");
-        if let Some(upstream_token) = inner.down_to_up.remove(&down_key) {
-            inner.up_to_down.remove(&token_key(&upstream_token));
+        let inner = &mut *guard;
+        let removed = inner
+            .down_to_up
+            .get_mut(&connection_id)
+            .and_then(|tokens| tokens.remove(downstream_token));
+        if let Some(upstream_token) = removed {
+            inner.up_to_down.remove(&upstream_token);
         }
     }
 
@@ -167,16 +179,16 @@ impl ProgressRegistry {
     /// reader task exits (crash, shutdown, respawn) so dead entries don't leak
     /// and a later cancel can't route to a dead writer.
     pub(crate) fn purge_connection(&self, connection_id: ProgressConnectionId) {
-        let mut inner = self
+        let mut guard = self
             .inner
             .lock()
             .recover_poison("ProgressRegistry::purge_connection");
-        inner
-            .down_to_up
-            .retain(|(conn, _), _| *conn != connection_id);
-        inner
-            .up_to_down
-            .retain(|_, target| target.connection_id != connection_id);
+        let inner = &mut *guard;
+        if let Some(tokens) = inner.down_to_up.remove(&connection_id) {
+            for upstream_token in tokens.values() {
+                inner.up_to_down.remove(upstream_token);
+            }
+        }
     }
 
     /// Resolve an upstream token (from a client `window/workDoneProgress/cancel`)
@@ -190,24 +202,14 @@ impl ProgressRegistry {
         &self,
         upstream_token: &NumberOrString,
     ) -> Option<(tokio::sync::mpsc::Sender<OutboundMessage>, NumberOrString)> {
-        let up_key = token_key(upstream_token);
         let inner = self
             .inner
             .lock()
             .recover_poison("ProgressRegistry::resolve_cancel");
         inner
             .up_to_down
-            .get(&up_key)
+            .get(upstream_token)
             .map(|target| (target.writer.clone(), target.downstream_token.clone()))
-    }
-}
-
-/// Canonical string key for a progress token. The number/string discriminant is
-/// encoded so the numeric token `1` and the string token `"1"` never collide.
-fn token_key(token: &NumberOrString) -> String {
-    match token {
-        NumberOrString::Number(n) => format!("n:{n}"),
-        NumberOrString::String(s) => format!("s:{s}"),
     }
 }
 

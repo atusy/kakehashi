@@ -1306,14 +1306,16 @@ impl LanguageServerPool {
             return;
         };
 
-        let params = tower_lsp_server::ls_types::WorkDoneProgressCancelParams {
-            token: downstream_token,
-        };
-        let notification = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "window/workDoneProgress/cancel",
-            "params": params,
-        });
+        // Build via the typed notification helper (like `$/cancelRequest` above)
+        // for a consistent JSON-RPC shape, then serialize for the writer channel.
+        let notification = JsonRpcNotification::new(
+            "window/workDoneProgress/cancel",
+            tower_lsp_server::ls_types::WorkDoneProgressCancelParams {
+                token: downstream_token,
+            },
+        );
+        let notification = serde_json::to_value(notification)
+            .expect("WorkDoneProgressCancel notification serialization is infallible");
 
         // send_timeout (not try_send) to ride out transient backpressure, like
         // the reader's server-request responses. The downstream's writer drops
