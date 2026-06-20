@@ -17,7 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, warn};
+<<<<<<< HEAD
 use serde::Deserialize;
+=======
+use serde::Deserialize as _;
+>>>>>>> 556aab24 (refactor(bridge): use Type::deserialize call form for tokens)
 use tokio::sync::{mpsc, oneshot};
 
 use tokio::task::JoinHandle;
@@ -849,7 +853,6 @@ fn forward_progress_notification(
     lang_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
-    use serde::Deserialize as _;
     use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
 
     // Deserialize from the borrowed `params` value (indexing yields `Null` for a
@@ -1013,7 +1016,7 @@ async fn handle_server_request(
             // making editor rejection a non-issue.
             // Deserialize the token from the borrowed value (indexing yields
             // `Null` for a missing key, which fails to parse) — no clone.
-            match <tower_lsp_server::ls_types::NumberOrString as serde::Deserialize>::deserialize(
+            match tower_lsp_server::ls_types::NumberOrString::deserialize(
                 &message["params"]["token"],
             ) {
                 Ok(downstream_token) => {

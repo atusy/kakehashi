@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use serde::Deserialize as _;
 use tokio::sync::oneshot;
 use tower::Service;
 use tower_lsp_server::jsonrpc::{Id, Request, Response};
@@ -314,9 +315,7 @@ where
             && let Some(forwarder) = cancel_forwarder.as_ref()
             && let Some(params) = req.params()
             && let Ok(token) =
-                <tower_lsp_server::ls_types::NumberOrString as serde::Deserialize>::deserialize(
-                    &params["token"],
-                )
+                tower_lsp_server::ls_types::NumberOrString::deserialize(&params["token"])
         {
             let forwarder = forwarder.clone();
             // Fire-and-forget: cancel is a best-effort notification (same
