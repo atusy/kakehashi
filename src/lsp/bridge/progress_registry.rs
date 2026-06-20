@@ -97,19 +97,23 @@ impl ProgressRegistry {
         ProgressConnectionId(self.connection_counter.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Register a downstream-declared token and return the unique upstream token
-    /// the editor should see. `writer` is the owning connection's writer channel,
-    /// used later to route a cancel back to that downstream.
+    /// Register a downstream-declared token and return `(upstream_token, stale)`:
+    /// the unique upstream token the editor should see, plus the prior upstream
+    /// token if this `(connection, downstream_token)` was already registered.
+    /// `writer` is the owning connection's writer channel, used later to route a
+    /// cancel back to that downstream.
     ///
-    /// Re-registering the same `(connection, downstream_token)` (a downstream
-    /// that re-creates a token it already declared) replaces the prior mapping
-    /// and mints a new upstream token; the stale upstream entry is dropped.
+    /// Re-registering the same `(connection, downstream_token)` (a downstream that
+    /// re-creates a token it already declared) replaces the prior mapping and
+    /// mints a new upstream token; the evicted one is dropped from the registry
+    /// and returned as `stale` so callers can also forget its loop admission —
+    /// done in one locked pass (no separate `translate` lookup).
     pub(crate) fn register(
         &self,
         connection_id: ProgressConnectionId,
         downstream_token: NumberOrString,
         writer: tokio::sync::mpsc::Sender<OutboundMessage>,
-    ) -> NumberOrString {
+    ) -> (NumberOrString, Option<NumberOrString>) {
         let suffix = self.token_counter.fetch_add(1, Ordering::Relaxed);
         let upstream_token = NumberOrString::String(format!("kakehashi/bridge/progress/{suffix}"));
 
@@ -123,8 +127,8 @@ impl ProgressRegistry {
             .entry(connection_id)
             .or_default()
             .insert(downstream_token.clone(), upstream_token.clone());
-        if let Some(stale_upstream) = stale {
-            inner.up_to_down.remove(&stale_upstream);
+        if let Some(ref stale_upstream) = stale {
+            inner.up_to_down.remove(stale_upstream);
         }
         inner.up_to_down.insert(
             upstream_token.clone(),
@@ -133,7 +137,7 @@ impl ProgressRegistry {
                 downstream_token,
             },
         );
-        upstream_token
+        (upstream_token, stale)
     }
 
     /// Translate a downstream token to its upstream token for `$/progress`
@@ -239,8 +243,8 @@ mod tests {
         let conn_b = reg.new_connection_id();
 
         // Both downstreams declare the SAME token value.
-        let up_a = reg.register(conn_a, NumberOrString::Number(1), dummy_writer());
-        let up_b = reg.register(conn_b, NumberOrString::Number(1), dummy_writer());
+        let (up_a, _) = reg.register(conn_a, NumberOrString::Number(1), dummy_writer());
+        let (up_b, _) = reg.register(conn_b, NumberOrString::Number(1), dummy_writer());
 
         assert_ne!(
             up_a, up_b,
@@ -255,8 +259,8 @@ mod tests {
         let conn_b = reg.new_connection_id();
         let token = NumberOrString::String("work".to_string());
 
-        let up_a = reg.register(conn_a, token.clone(), dummy_writer());
-        let up_b = reg.register(conn_b, token.clone(), dummy_writer());
+        let (up_a, _) = reg.register(conn_a, token.clone(), dummy_writer());
+        let (up_b, _) = reg.register(conn_b, token.clone(), dummy_writer());
 
         assert_eq!(reg.translate(conn_a, &token), Some(up_a));
         assert_eq!(reg.translate(conn_b, &token), Some(up_b));
@@ -276,8 +280,8 @@ mod tests {
         let num = NumberOrString::Number(1);
         let string = NumberOrString::String("1".to_string());
 
-        let up_num = reg.register(conn, num.clone(), dummy_writer());
-        let up_string = reg.register(conn, string.clone(), dummy_writer());
+        let (up_num, _) = reg.register(conn, num.clone(), dummy_writer());
+        let (up_string, _) = reg.register(conn, string.clone(), dummy_writer());
 
         assert_ne!(up_num, up_string);
         assert_eq!(reg.translate(conn, &num), Some(up_num));
@@ -289,7 +293,7 @@ mod tests {
         let reg = ProgressRegistry::new();
         let conn = reg.new_connection_id();
         let downstream = NumberOrString::Number(7);
-        let upstream = reg.register(conn, downstream.clone(), dummy_writer());
+        let (upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
 
         let (_writer, resolved) = reg
             .resolve_cancel(&upstream)
@@ -311,7 +315,7 @@ mod tests {
         let reg = ProgressRegistry::new();
         let conn = reg.new_connection_id();
         let downstream = NumberOrString::Number(3);
-        let upstream = reg.register(conn, downstream.clone(), dummy_writer());
+        let (upstream, _) = reg.register(conn, downstream.clone(), dummy_writer());
 
         reg.complete(conn, &downstream);
 
@@ -325,8 +329,8 @@ mod tests {
         let conn_a = reg.new_connection_id();
         let conn_b = reg.new_connection_id();
         let token = NumberOrString::Number(1);
-        let up_a = reg.register(conn_a, token.clone(), dummy_writer());
-        let up_b = reg.register(conn_b, token.clone(), dummy_writer());
+        let (up_a, _) = reg.register(conn_a, token.clone(), dummy_writer());
+        let (up_b, _) = reg.register(conn_b, token.clone(), dummy_writer());
 
         reg.purge_connection(conn_a);
 
@@ -342,10 +346,13 @@ mod tests {
         let conn = reg.new_connection_id();
         let downstream = NumberOrString::Number(1);
 
-        let up_first = reg.register(conn, downstream.clone(), dummy_writer());
-        let up_second = reg.register(conn, downstream.clone(), dummy_writer());
+        let (up_first, stale_first) = reg.register(conn, downstream.clone(), dummy_writer());
+        let (up_second, stale_second) = reg.register(conn, downstream.clone(), dummy_writer());
 
         assert_ne!(up_first, up_second);
+        // First registration evicts nothing; the second evicts and returns the first.
+        assert_eq!(stale_first, None);
+        assert_eq!(stale_second, Some(up_first.clone()));
         // Stale upstream token no longer routable.
         assert!(reg.resolve_cancel(&up_first).is_none());
         // New one is.

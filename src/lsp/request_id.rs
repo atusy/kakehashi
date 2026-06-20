@@ -554,7 +554,7 @@ mod tests {
         // Register a downstream token with an observable writer.
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(8);
         let conn = pool.progress_registry().new_connection_id();
-        let upstream_token =
+        let (upstream_token, _) =
             pool.progress_registry()
                 .register(conn, NumberOrString::Number(1), writer_tx);
         let NumberOrString::String(upstream_token) = upstream_token else {

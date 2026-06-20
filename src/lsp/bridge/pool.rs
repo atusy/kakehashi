@@ -70,13 +70,8 @@ pub(crate) enum ConnectionReadiness {
 }
 
 use super::actor::{
-<<<<<<< HEAD
-    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, ServerRequestDeps, UpstreamNotification,
-    spawn_reader_task_for_server,
-=======
-    OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ResponseRouter, UpstreamNotification,
-    spawn_reader_task_for_language,
->>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
+    OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ResponseRouter, ServerRequestDeps,
+    UpstreamNotification, spawn_reader_task_for_server,
 };
 use super::connection::AsyncBridgeConnection;
 
@@ -248,7 +243,6 @@ pub struct LanguageServerPool {
     /// Wrapped in `Mutex<Option<...>>` because `take_upstream_rx()` moves it out.
     upstream_rx:
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<UpstreamNotification>>>,
-<<<<<<< HEAD
     /// Sender for best-effort `window/*` notifications (#378).
     ///
     /// Bounded with drop-on-full so a log-flooding downstream server cannot
@@ -257,13 +251,11 @@ pub struct LanguageServerPool {
     window_tx: tokio::sync::mpsc::Sender<UpstreamNotification>,
     /// Receiver for window notifications, taken once by the forwarding task.
     window_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<UpstreamNotification>>>,
-=======
     /// Remaps downstream-declared work-done progress tokens to globally unique
     /// upstream tokens (window-work-done-progress bridging). Shared with every
     /// reader task (to register/translate) and the cancel path (to route a
     /// client `window/workDoneProgress/cancel` to the owning downstream).
     progress_registry: Arc<super::ProgressRegistry>,
->>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
 }
 
 impl Default for LanguageServerPool {
@@ -294,12 +286,9 @@ impl LanguageServerPool {
             client_capabilities: OnceLock::new(),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
-<<<<<<< HEAD
             window_tx,
             window_rx: std::sync::Mutex::new(Some(window_rx)),
-=======
             progress_registry: Arc::new(super::ProgressRegistry::new()),
->>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         }
     }
 
@@ -892,7 +881,6 @@ impl LanguageServerPool {
             reader,
             Arc::clone(&router),
             Some(liveness_timeout.as_duration()),
-<<<<<<< HEAD
             ServerRequestDeps {
                 server_name: Some(server_name.to_string()),
                 response_tx: tx.clone(),
@@ -900,16 +888,9 @@ impl LanguageServerPool {
                 upstream_tx: self.upstream_tx.clone(),
                 window_tx: self.window_tx.clone(),
                 workspace_folders: Arc::clone(&workspace_folders),
+                progress_registry: Arc::clone(&self.progress_registry),
+                progress_connection_id: self.progress_registry.new_connection_id(),
             },
-=======
-            Some(server_name.to_string()),
-            tx.clone(),
-            Arc::clone(&dynamic_capabilities),
-            self.upstream_tx.clone(),
-            Arc::clone(&workspace_folders),
-            Arc::clone(&self.progress_registry),
-            self.progress_registry.new_connection_id(),
->>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
         );
 
         // Create handle in Initializing state (fast-fail for concurrent requests)
@@ -1431,7 +1412,7 @@ mod tests {
 
         let conn = pool.progress_registry.new_connection_id();
         let downstream_token = NumberOrString::Number(1);
-        let upstream_token =
+        let (upstream_token, _) =
             pool.progress_registry
                 .register(conn, downstream_token.clone(), writer_tx);
 
