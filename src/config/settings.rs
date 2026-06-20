@@ -272,6 +272,30 @@ impl BridgeLanguageConfig {
     }
 }
 
+/// A single `rootMarkers` entry, mirroring Neovim's `vim.fs.root`
+/// `(string|string[])[]` shape: a bare string is its own priority tier; a
+/// nested array is an equal-priority group. Entries are tried in list order
+/// (earlier wins); within a group all names are equal and the nearest
+/// ancestor containing any of them decides the root.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(untagged)]
+pub enum RootMarker {
+    /// A single marker name forming its own priority tier.
+    Single(String),
+    /// An equal-priority group; proximity decides among its names.
+    Group(Vec<String>),
+}
+
+impl RootMarker {
+    /// The marker names this entry tests, regardless of single/group shape.
+    pub(crate) fn names(&self) -> &[String] {
+        match self {
+            RootMarker::Single(name) => std::slice::from_ref(name),
+            RootMarker::Group(names) => names.as_slice(),
+        }
+    }
+}
+
 /// Configuration for a bridge language server.
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
@@ -293,12 +317,16 @@ pub struct BridgeServerConfig {
     /// Optional initialization options to pass to the server during initialize
     pub initialization_options: Option<Value>,
     /// Marker files/directories that locate the workspace root for this
-    /// server: ancestors of the document are searched nearest-first and the
-    /// first directory containing any marker becomes the server's rootUri.
+    /// server, mirroring Neovim's `vim.fs.root` `(string|string[])[]` shape:
+    /// entries are tried in list order (earlier = higher priority) and each
+    /// entry is searched up the document's ancestors nearest-first; a nested
+    /// array is an equal-priority group where the nearest ancestor containing
+    /// any of its names wins. The first matching entry's directory becomes the
+    /// server's rootUri.
     /// `None` = inherit (built-in default `[".git"]`); an explicit `[]`
     /// disables the search (the client-supplied root is forwarded as-is).
     /// When no marker matches, the client-supplied root is the fallback.
-    pub root_markers: Option<Vec<String>>,
+    pub root_markers: Option<Vec<RootMarker>>,
     /// Trigger characters for bridged `textDocument/onTypeFormatting` (#354).
     ///
     /// kakehashi cannot know downstream trigger characters at initialize time
@@ -1370,7 +1398,10 @@ mod tests {
         let wildcard = &servers["_"];
         assert!(wildcard.cmd.is_empty());
         assert!(wildcard.languages.is_empty());
-        assert_eq!(wildcard.root_markers, Some(vec![".git".to_string()]));
+        assert_eq!(
+            wildcard.root_markers,
+            Some(vec![RootMarker::Single(".git".to_string())])
+        );
     }
 
     #[test]
@@ -1384,7 +1415,75 @@ mod tests {
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
         assert_eq!(
             config.root_markers,
-            Some(vec![".git".to_string(), "Cargo.toml".to_string()])
+            Some(vec![
+                RootMarker::Single(".git".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn should_parse_root_markers_mixed_string_and_group_json() {
+        // Neovim's (string|string[])[] shape: a bare string is one tier, a
+        // nested array is an equal-priority group.
+        let config_json = r#"{
+            "rootMarkers": [["stylua.toml", ".luarc.json"], ".git"]
+        }"#;
+
+        let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
+        assert_eq!(
+            config.root_markers,
+            Some(vec![
+                RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
+                RootMarker::Single(".git".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn root_markers_group_survives_json_serialize_round_trip() {
+        // `kakehashi/effectiveConfiguration` re-serializes the user's settings
+        // via serde_json, so a Group must round-trip: array for a group, bare
+        // string for a single, with entry order preserved.
+        let config = BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: Some(vec![
+                RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
+                RootMarker::Single(".git".to_string()),
+            ]),
+            on_type_formatting_triggers: None,
+        };
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["rootMarkers"],
+            serde_json::json!([["stylua.toml", ".luarc.json"], ".git"])
+        );
+
+        let reparsed: BridgeServerConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(reparsed.root_markers, config.root_markers);
+    }
+
+    #[test]
+    fn should_parse_root_markers_mixed_string_and_group_toml() {
+        // TOML 1.0 allows heterogeneous arrays; the untagged enum must round
+        // trip a mix of bare names and nested groups through the toml crate.
+        let toml_str = r#"
+            [languageServers._]
+            rootMarkers = [["stylua.toml", ".luarc.json"], ".git"]
+        "#;
+
+        let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
+        let servers = settings.language_servers.unwrap();
+        let wildcard = &servers["_"];
+        assert_eq!(
+            wildcard.root_markers,
+            Some(vec![
+                RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),
+                RootMarker::Single(".git".to_string()),
+            ])
         );
     }
 

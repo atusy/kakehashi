@@ -3,13 +3,18 @@
 //! Downstream language servers historically received the client-supplied
 //! workspace root verbatim, which points at the *editor's* workspace — in a
 //! monorepo that is rarely the project the document belongs to. `rootMarkers`
-//! locates the root the way editors' LSP clients do: walk up from the
-//! triggering document and pick the first directory containing a marker.
+//! locates the root the way Neovim's `vim.fs.root` does: marker entries are
+//! tried in configured order, each searched up the triggering document's
+//! ancestors before the next entry, so a higher-priority marker in a far
+//! ancestor outranks a lower-priority one next to the document. A nested
+//! array is one equal-priority tier where the nearest ancestor wins.
 
 use std::path::{Path, PathBuf};
 
 use tower_lsp_server::ls_types::WorkspaceFolder;
 use url::Url;
+
+use crate::config::settings::RootMarker;
 
 /// Built-in default applied when a server config has no `rootMarkers`.
 /// Mirrored as a literal by the `config init` template
@@ -32,28 +37,40 @@ fn is_valid_marker(marker: &str) -> bool {
         && components.all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// Find the nearest ancestor directory of `document_path` that contains any
-/// of `markers` (as a file or a directory). Returns `None` when no ancestor
-/// matches or `markers` is empty (the explicit `[]` kill switch).
-fn find_marker_root(document_path: &Path, markers: &[String]) -> Option<PathBuf> {
-    let (markers, invalid): (Vec<&String>, Vec<&String>) =
-        markers.iter().partition(|marker| is_valid_marker(marker));
-    if !invalid.is_empty() {
-        // Spawn-time only (not per request), so a plain warn does not flood.
-        log::warn!(
-            target: "kakehashi::bridge::init",
-            "ignoring invalid rootMarkers entries (must be plain relative names): {:?}",
-            invalid
-        );
+/// Resolve the marker root for `document_path` following Neovim's
+/// `vim.fs.root` `(string|string[])[]` priority: entries are tried in order,
+/// and each entry is searched up the document's ancestors nearest-first
+/// before the next entry is considered, so an earlier entry found in a far
+/// ancestor outranks a later entry sitting right next to the document. A
+/// `Group` entry is one equal-priority tier where proximity decides among its
+/// names. Returns `None` when no entry matches or `markers` is empty (the
+/// explicit `[]` kill switch).
+fn find_marker_root(document_path: &Path, markers: &[RootMarker]) -> Option<PathBuf> {
+    let parent = document_path.parent()?;
+    for entry in markers {
+        let (names, invalid): (Vec<&String>, Vec<&String>) = entry
+            .names()
+            .iter()
+            .partition(|marker| is_valid_marker(marker));
+        if !invalid.is_empty() {
+            // Spawn-time only (not per request), so a plain warn does not flood.
+            log::warn!(
+                target: "kakehashi::bridge::init",
+                "ignoring invalid rootMarkers entries (must be plain relative names): {:?}",
+                invalid
+            );
+        }
+        if names.is_empty() {
+            continue;
+        }
+        if let Some(dir) = parent
+            .ancestors()
+            .find(|dir| names.iter().any(|marker| dir.join(marker).exists()))
+        {
+            return Some(dir.to_path_buf());
+        }
     }
-    if markers.is_empty() {
-        return None;
-    }
-    document_path
-        .parent()?
-        .ancestors()
-        .find(|dir| markers.iter().any(|marker| dir.join(marker).exists()))
-        .map(Path::to_path_buf)
+    None
 }
 
 /// Build the `rootUri` + `workspaceFolders` for a downstream spawn from an
@@ -82,7 +99,7 @@ pub(crate) fn workspace_from_marker(
 /// (no hint, no marker, the `[]` kill switch, or an unparseable URI), the key
 /// roots at the client-root fallback and so does the spawn. They never disagree.
 pub(crate) fn resolve_marker_workspace(
-    root_markers: Option<&[String]>,
+    root_markers: Option<&[RootMarker]>,
     document_uri: Option<&Url>,
 ) -> Option<(Url, WorkspaceFolder)> {
     let root = resolve_marker_root(root_markers, document_uri)?;
@@ -105,13 +122,24 @@ pub(crate) fn resolve_marker_workspace(
 /// [`DEFAULT_ROOT_MARKERS`]; callers fall back to the client-supplied root
 /// when this returns `None` (non-file URI, no hint, no marker found, or
 /// markers explicitly disabled with `[]`).
-fn resolve_marker_root(root_markers: Option<&[String]>, document_uri: Option<&Url>) -> Option<Url> {
-    let default_markers: Vec<String> = DEFAULT_ROOT_MARKERS
-        .iter()
-        .map(|marker| marker.to_string())
-        .collect();
-    let markers = root_markers.unwrap_or(default_markers.as_slice());
+fn resolve_marker_root(
+    root_markers: Option<&[RootMarker]>,
+    document_uri: Option<&Url>,
+) -> Option<Url> {
+    // Resolve the path first so a non-file or hintless URI returns before the
+    // default marker list is built; build it only when no markers are configured.
     let document_path = document_uri?.to_file_path().ok()?;
+    let default_markers;
+    let markers = match root_markers {
+        Some(markers) => markers,
+        None => {
+            default_markers = DEFAULT_ROOT_MARKERS
+                .iter()
+                .map(|marker| RootMarker::Single(marker.to_string()))
+                .collect::<Vec<_>>();
+            &default_markers
+        }
+    };
     let root = find_marker_root(&document_path, markers)?;
     Url::from_file_path(root).ok()
 }
@@ -120,8 +148,11 @@ fn resolve_marker_root(root_markers: Option<&[String]>, document_uri: Option<&Ur
 mod tests {
     use super::*;
 
-    fn markers(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
+    fn markers(names: &[&str]) -> Vec<RootMarker> {
+        names
+            .iter()
+            .map(|name| RootMarker::Single(name.to_string()))
+            .collect()
     }
 
     #[test]
@@ -140,6 +171,133 @@ mod tests {
             root.map(|p| p.canonicalize().unwrap()),
             Some(inner.canonicalize().unwrap()),
             "nearest marker wins over the outer one"
+        );
+    }
+
+    #[test]
+    fn earlier_entry_wins_even_when_a_later_entry_is_nearer() {
+        // Neovim's flat (string|string[])[] priority: each entry is searched
+        // up the whole ancestry before the next entry is tried, so a far
+        // higher-priority marker beats a near lower-priority one.
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let inner = outer.join("sub");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(outer.join("a.toml"), "").unwrap(); // far, higher priority
+        std::fs::write(inner.join("b.toml"), "").unwrap(); // near, lower priority
+        let doc = inner.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Single("a.toml".to_string()),
+                RootMarker::Single("b.toml".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(outer.canonicalize().unwrap()),
+            "earlier entry a.toml outranks the nearer b.toml"
+        );
+    }
+
+    #[test]
+    fn group_entry_lets_proximity_decide_among_equal_priority_names() {
+        // A nested array is one equal-priority entry: the nearest ancestor
+        // containing any of its names wins (Neovim's string[] group).
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        let inner = outer.join("sub");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        std::fs::write(outer.join("a.toml"), "").unwrap();
+        std::fs::write(inner.join("b.toml"), "").unwrap();
+        let doc = inner.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[RootMarker::Group(vec![
+                "a.toml".to_string(),
+                "b.toml".to_string(),
+            ])],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(inner.canonicalize().unwrap()),
+            "within a group the nearer b.toml wins"
+        );
+    }
+
+    #[test]
+    fn falls_through_to_next_entry_when_earlier_entry_is_absent_everywhere() {
+        // The core of entry-priority: a higher-priority entry found nowhere in
+        // the ancestry must not block a later entry from resolving.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("b.toml"), "").unwrap();
+        let doc = project.join("src/main.rs");
+        let absent = format!(".kakehashi-absent-{}", std::process::id());
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Single(absent),
+                RootMarker::Single("b.toml".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(project.canonicalize().unwrap()),
+            "absent earlier entry falls through to b.toml"
+        );
+    }
+
+    #[test]
+    fn all_invalid_entry_is_skipped_and_a_later_valid_entry_still_resolves() {
+        // An entry whose names are all invalid drops to an empty name set and
+        // is skipped, without aborting the per-entry walk before a later valid
+        // entry gets its turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let doc = project.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Single("..".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(project.canonicalize().unwrap()),
+            "an all-invalid entry is skipped, not treated as a match"
+        );
+    }
+
+    #[test]
+    fn empty_group_entry_is_skipped_not_the_kill_switch() {
+        // A non-terminal empty group is skipped like any nameless entry; only
+        // a top-level empty markers list is the `[]` kill switch.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir(project.join(".git")).unwrap();
+        let doc = project.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Group(vec![]),
+                RootMarker::Single(".git".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(project.canonicalize().unwrap()),
+            "an empty group is skipped, and .git still resolves"
         );
     }
 

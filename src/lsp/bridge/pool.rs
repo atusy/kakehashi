@@ -813,10 +813,11 @@ impl LanguageServerPool {
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
 
         // rootMarkers workspace-root detection (root_markers module): the same
-        // marker workspace resolved for the pool key above also seeds the
-        // handshake — a marker hit overrides the client-supplied root and
-        // folders; otherwise both fall back. Reusing `marker` (rather than
-        // re-resolving) guarantees the spawned root matches `connection_key`.
+        // marker workspace resolved for the pool key above (entry-priority
+        // order) also seeds the handshake — a marker hit overrides the
+        // client-supplied root and folders; otherwise both fall back. Reusing
+        // `marker` (rather than re-resolving) guarantees the spawned root
+        // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
         let (root_uri, workspace_folders) =
