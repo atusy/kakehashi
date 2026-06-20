@@ -223,14 +223,16 @@ fn merge_upstream_capabilities(
     }
 
     // --- window.workDoneProgress (gated on real upstream support) ---
-    // Only advertise server-initiated progress downstream when the editor
-    // genuinely supports it, so the bridge never invites progress it can't relay
-    // (ls-bridge-work-done-progress). Guarded on `is_some()` so we don't
-    // materialize an empty `window: {}` the baseline never had.
-    if let Some(work_done_progress) = upstream.window.as_ref().and_then(|w| w.work_done_progress) {
+    // Advertise server-initiated progress downstream ONLY when the editor
+    // genuinely supports it (`Some(true)`), so the bridge never invites progress
+    // it can't relay (ls-bridge-work-done-progress). An explicit `false` or an
+    // absent value is left unadvertised — and we never materialize an empty
+    // `window: {}` the baseline lacked — so a server that misreads field presence
+    // as support is not misled.
+    if upstream.window.as_ref().and_then(|w| w.work_done_progress) == Some(true) {
         base.window
             .get_or_insert_with(Default::default)
-            .work_done_progress = Some(work_done_progress);
+            .work_done_progress = Some(true);
     }
 
     base
@@ -575,6 +577,22 @@ mod tests {
         assert!(
             merged.window.and_then(|w| w.work_done_progress).is_none(),
             "must not invite progress the editor can't handle"
+        );
+
+        // Upstream explicitly false → not advertised, and no empty `window` is
+        // materialized (a server must not misread field presence as support).
+        let explicit_false = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                work_done_progress: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged =
+            merge_upstream_capabilities(build_baseline_capabilities(), Some(&explicit_false));
+        assert!(
+            merged.window.is_none(),
+            "explicit false must leave window unadvertised, not materialize workDoneProgress:false"
         );
     }
 

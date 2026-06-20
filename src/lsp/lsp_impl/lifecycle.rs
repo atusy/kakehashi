@@ -478,7 +478,18 @@ async fn upstream_forwarding_loop(
                         }
                     }
                     Some(UpstreamNotification::Progress { params }) => {
-                        if !created_tokens.contains(&params.token) {
+                        let is_end = matches!(
+                            &params.value,
+                            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+                        );
+                        // Single set lookup: `End` removes the admission (and
+                        // reports whether it was admitted); others just check.
+                        let admitted = if is_end {
+                            created_tokens.remove(&params.token)
+                        } else {
+                            created_tokens.contains(&params.token)
+                        };
+                        if !admitted {
                             // Create timed out / was rejected — the editor never
                             // created this token, so drop its progress.
                             log::debug!(
@@ -488,17 +499,17 @@ async fn upstream_forwarding_loop(
                             );
                             continue;
                         }
-                        let is_end = matches!(
-                            &params.value,
-                            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
-                        );
-                        let token = params.token.clone();
                         client
                             .send_notification::<tower_lsp_server::ls_types::notification::Progress>(
                                 params,
                             )
                             .await;
-                        if is_end {
+                    }
+                    Some(UpstreamNotification::ForgetWorkDoneProgress(tokens)) => {
+                        // A downstream reader exited with progress in flight;
+                        // drop its admissions so the set can't leak across
+                        // respawns.
+                        for token in tokens {
                             created_tokens.remove(&token);
                         }
                     }
@@ -759,6 +770,103 @@ mod tests {
             next.method(),
             "workspace/diagnostic/refresh",
             "progress for a rejected token must be dropped; only the later request survives"
+        );
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    /// `ForgetWorkDoneProgress` (sent when a downstream reader exits mid-progress)
+    /// drops the token's admission, so a late `$/progress` for it is not
+    /// forwarded — preventing the created-token set from leaking across respawns.
+    #[tokio::test]
+    async fn forwarding_loop_forgets_progress_on_connection_purge() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(rx, client, cancel.clone()));
+
+        let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
+        // Editor accepts the create (admits the token).
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: token.clone(),
+        })
+        .unwrap();
+        let first = requests.next().await.expect("create request emitted");
+        assert_eq!(first.method(), "window/workDoneProgress/create");
+        let id = first.id().expect("create request has an id").clone();
+        responses
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+
+        // Connection dies mid-progress: forget the token, then a late progress
+        // arrives, then an unrelated request.
+        tx.send(UpstreamNotification::ForgetWorkDoneProgress(vec![
+            token.clone(),
+        ]))
+        .unwrap();
+        tx.send(UpstreamNotification::Progress {
+            params: ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        })
+        .unwrap();
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+
+        // The forgotten token's progress must be dropped; the next editor-bound
+        // message is the diagnostic refresh.
+        let next = requests.next().await.expect("a follow-up request emitted");
+        assert_eq!(
+            next.method(),
+            "workspace/diagnostic/refresh",
+            "progress for a forgotten token must be dropped"
         );
 
         cancel.cancel();

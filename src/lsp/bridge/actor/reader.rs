@@ -73,7 +73,15 @@ pub(crate) enum UpstreamNotification {
     Progress {
         params: tower_lsp_server::ls_types::ProgressParams,
     },
+<<<<<<< HEAD
 >>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
+=======
+    /// Tell the forwarding loop to forget these (upstream) progress tokens
+    /// without an `End` — sent when a downstream connection's reader exits with
+    /// progress still in flight, so the loop's created-token set can't leak
+    /// entries across crashes/respawns (window-work-done-progress bridging).
+    ForgetWorkDoneProgress(Vec<tower_lsp_server::ls_types::NumberOrString>),
+>>>>>>> 65af3d19 (fix(bridge): prevent created-token leak; gate capability on true only)
 }
 
 /// Capacity of the bounded `window/*` forwarding queue. Sized like the
@@ -130,14 +138,24 @@ struct ServerRequestDeps {
 /// reader loop exits (crash, shutdown, respawn). Without it, a downstream that
 /// dies mid-progress would leak registry entries and a later client cancel could
 /// route to a dead writer (window-work-done-progress bridging).
+///
+/// Any still-live upstream tokens are forwarded to the loop so it can drop their
+/// created-token admissions too — otherwise progress that never reached `End`
+/// before the crash would leak in the loop's set across respawns.
 struct ProgressPurgeGuard {
     registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     connection_id: crate::lsp::bridge::ProgressConnectionId,
+    upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
 }
 
 impl Drop for ProgressPurgeGuard {
     fn drop(&mut self) {
-        self.registry.purge_connection(self.connection_id);
+        let tokens = self.registry.purge_connection(self.connection_id);
+        if !tokens.is_empty() {
+            let _ = self
+                .upstream_tx
+                .send(UpstreamNotification::ForgetWorkDoneProgress(tokens));
+        }
     }
 >>>>>>> ac6e6333 (feat(bridge): bridge work-done progress with token remapping)
 }
@@ -520,6 +538,7 @@ async fn reader_loop_with_liveness(
     let _progress_purge_guard = ProgressPurgeGuard {
         registry: Arc::clone(&server_request_deps.progress_registry),
         connection_id: server_request_deps.progress_connection_id,
+        upstream_tx: server_request_deps.upstream_tx.clone(),
     };
 
     // Consolidated liveness timer state (ls-bridge-async-connection)

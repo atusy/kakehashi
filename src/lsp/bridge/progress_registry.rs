@@ -175,20 +175,28 @@ impl ProgressRegistry {
         }
     }
 
-    /// Remove every mapping owned by a connection. Called when the connection's
-    /// reader task exits (crash, shutdown, respawn) so dead entries don't leak
-    /// and a later cancel can't route to a dead writer.
-    pub(crate) fn purge_connection(&self, connection_id: ProgressConnectionId) {
+    /// Remove every mapping owned by a connection and return the upstream tokens
+    /// that were live. Called when the connection's reader task exits (crash,
+    /// shutdown, respawn) so dead entries don't leak and a later cancel can't
+    /// route to a dead writer. The returned tokens let the forwarding loop drop
+    /// its matching created-token admissions (window-work-done-progress).
+    pub(crate) fn purge_connection(
+        &self,
+        connection_id: ProgressConnectionId,
+    ) -> Vec<NumberOrString> {
         let mut guard = self
             .inner
             .lock()
             .recover_poison("ProgressRegistry::purge_connection");
         let inner = &mut *guard;
-        if let Some(tokens) = inner.down_to_up.remove(&connection_id) {
-            for upstream_token in tokens.values() {
-                inner.up_to_down.remove(upstream_token);
-            }
+        let Some(tokens) = inner.down_to_up.remove(&connection_id) else {
+            return Vec::new();
+        };
+        let upstream_tokens: Vec<NumberOrString> = tokens.into_values().collect();
+        for upstream_token in &upstream_tokens {
+            inner.up_to_down.remove(upstream_token);
         }
+        upstream_tokens
     }
 
     /// Resolve an upstream token (from a client `window/workDoneProgress/cancel`)
