@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::WorkspaceFolder;
 use url::Url;
 
+use crate::config::settings::RootMarker;
+
 /// Built-in default applied when a server config has no `rootMarkers`.
 /// Mirrored as a literal by the `config init` template
 /// (`config::defaults::default_language_servers`), which cannot reference
@@ -35,9 +37,11 @@ fn is_valid_marker(marker: &str) -> bool {
 /// Find the nearest ancestor directory of `document_path` that contains any
 /// of `markers` (as a file or a directory). Returns `None` when no ancestor
 /// matches or `markers` is empty (the explicit `[]` kill switch).
-fn find_marker_root(document_path: &Path, markers: &[String]) -> Option<PathBuf> {
-    let (markers, invalid): (Vec<&String>, Vec<&String>) =
-        markers.iter().partition(|marker| is_valid_marker(marker));
+fn find_marker_root(document_path: &Path, markers: &[RootMarker]) -> Option<PathBuf> {
+    let (markers, invalid): (Vec<&String>, Vec<&String>) = markers
+        .iter()
+        .flat_map(RootMarker::names)
+        .partition(|marker| is_valid_marker(marker));
     if !invalid.is_empty() {
         // Spawn-time only (not per request), so a plain warn does not flood.
         log::warn!(
@@ -82,7 +86,7 @@ pub(crate) fn workspace_from_marker(
 /// (no hint, no marker, the `[]` kill switch, or an unparseable URI), the key
 /// roots at the client-root fallback and so does the spawn. They never disagree.
 pub(crate) fn resolve_marker_workspace(
-    root_markers: Option<&[String]>,
+    root_markers: Option<&[RootMarker]>,
     document_uri: Option<&Url>,
 ) -> Option<(Url, WorkspaceFolder)> {
     let root = resolve_marker_root(root_markers, document_uri)?;
@@ -105,10 +109,13 @@ pub(crate) fn resolve_marker_workspace(
 /// [`DEFAULT_ROOT_MARKERS`]; callers fall back to the client-supplied root
 /// when this returns `None` (non-file URI, no hint, no marker found, or
 /// markers explicitly disabled with `[]`).
-fn resolve_marker_root(root_markers: Option<&[String]>, document_uri: Option<&Url>) -> Option<Url> {
-    let default_markers: Vec<String> = DEFAULT_ROOT_MARKERS
+fn resolve_marker_root(
+    root_markers: Option<&[RootMarker]>,
+    document_uri: Option<&Url>,
+) -> Option<Url> {
+    let default_markers: Vec<RootMarker> = DEFAULT_ROOT_MARKERS
         .iter()
-        .map(|marker| marker.to_string())
+        .map(|marker| RootMarker::Single(marker.to_string()))
         .collect();
     let markers = root_markers.unwrap_or(default_markers.as_slice());
     let document_path = document_uri?.to_file_path().ok()?;
@@ -120,8 +127,11 @@ fn resolve_marker_root(root_markers: Option<&[String]>, document_uri: Option<&Ur
 mod tests {
     use super::*;
 
-    fn markers(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
+    fn markers(names: &[&str]) -> Vec<RootMarker> {
+        names
+            .iter()
+            .map(|name| RootMarker::Single(name.to_string()))
+            .collect()
     }
 
     #[test]

@@ -785,7 +785,9 @@ mod tests {
                 cmd: vec![],
                 languages: vec!["rust".to_string()],
                 initialization_options: None,
-                root_markers: Some(vec![".git".to_string()]),
+                root_markers: Some(vec![crate::config::settings::RootMarker::Single(
+                    ".git".to_string(),
+                )]),
                 on_type_formatting_triggers: None,
             },
         );

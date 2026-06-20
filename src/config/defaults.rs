@@ -7,7 +7,7 @@ use super::WILDCARD_KEY;
 use super::settings::{
     AggregationConfig, AggregationStrategy, BridgeLanguageConfig, BridgeServerConfig,
     CaptureMapping, CaptureMappings, LanguageSettings, LayerAggregationConfig, LayerSource,
-    LayersConfig, QueryTypeMappings, RawWorkspaceSettings,
+    LayersConfig, QueryTypeMappings, RawWorkspaceSettings, RootMarker,
 };
 use std::collections::HashMap;
 
@@ -35,7 +35,7 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             cmd: vec![],
             languages: vec![],
             initialization_options: None,
-            root_markers: Some(vec![".git".to_string()]),
+            root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
         },
     )])
@@ -382,7 +382,10 @@ mod tests {
             .as_ref()
             .expect("should have languageServers");
         let wildcard = servers.get(WILDCARD_KEY).expect("should have '_' entry");
-        assert_eq!(wildcard.root_markers, Some(vec![".git".to_string()]));
+        assert_eq!(
+            wildcard.root_markers,
+            Some(vec![RootMarker::Single(".git".to_string())])
+        );
         assert!(
             wildcard.cmd.is_empty() && wildcard.languages.is_empty(),
             "the wildcard entry is defaults-only, not a spawnable server"
