@@ -830,15 +830,15 @@ fn forward_progress_notification(
     lang_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
+    use serde::Deserialize as _;
     use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
 
-    let Some(params) = message.get("params").cloned() else {
-        return;
-    };
-    let Ok(mut params) = serde_json::from_value::<ProgressParams>(params) else {
+    // Deserialize from the borrowed `params` value (indexing yields `Null` for a
+    // missing key, which fails to parse and is dropped) — no clone of the Value.
+    let Ok(mut params) = ProgressParams::deserialize(&message["params"]) else {
         debug!(
             target: "kakehashi::bridge::reader",
-            "{}Dropping $/progress with unparseable params",
+            "{}Dropping $/progress with missing/unparseable params",
             lang_prefix
         );
         return;

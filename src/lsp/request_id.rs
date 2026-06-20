@@ -313,9 +313,10 @@ where
         if req.method() == "window/workDoneProgress/cancel"
             && let Some(forwarder) = cancel_forwarder.as_ref()
             && let Some(params) = req.params()
-            && let Some(token) = params.get("token").cloned().and_then(|t| {
-                serde_json::from_value::<tower_lsp_server::ls_types::NumberOrString>(t).ok()
-            })
+            && let Ok(token) =
+                <tower_lsp_server::ls_types::NumberOrString as serde::Deserialize>::deserialize(
+                    &params["token"],
+                )
         {
             let forwarder = forwarder.clone();
             // Fire-and-forget: cancel is a best-effort notification (same
