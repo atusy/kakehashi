@@ -14,7 +14,7 @@ pub(in crate::lsp::bridge) use crate::config::settings::BridgeServerConfig;
 
 use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
 use crate::lsp::bridge::connection::AsyncBridgeConnection;
-use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState};
+use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionKey, ConnectionState};
 
 // Test ULID constants - valid 26-char alphanumeric strings matching ULID format.
 // Using realistic ULIDs ensures tests reflect actual runtime behavior.
@@ -121,10 +121,29 @@ pub async fn create_handle_with_state(state: ConnectionState) -> Arc<ConnectionH
     create_handle_with_state_and_pid(state).await.0
 }
 
+/// Like [`create_handle_with_state`], but assigns the connection's pool key
+/// (`(server_name, root)`) so tests whose `didChange`/host paths route via
+/// `handle.key()` agree with the key the handle is inserted under.
+pub(in crate::lsp::bridge) async fn create_handle_with_key(
+    state: ConnectionState,
+    key: ConnectionKey,
+) -> Arc<ConnectionHandle> {
+    create_handle_with_state_and_pid_keyed(state, key).await.0
+}
+
 /// Like [`create_handle_with_state`], but also returns the sink child's pid
 /// so tests can assert the process actually dies (e.g. kill-on-timeout paths).
 pub async fn create_handle_with_state_and_pid(
     state: ConnectionState,
+) -> (Arc<ConnectionHandle>, u32) {
+    create_handle_with_state_and_pid_keyed(state, ConnectionKey::for_server("test")).await
+}
+
+/// Backing implementation for the handle test helpers: spawns a sink process,
+/// wires the reader/writer, and assigns `key` as the connection's pool identity.
+pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
+    state: ConnectionState,
+    key: ConnectionKey,
 ) -> (Arc<ConnectionHandle>, u32) {
     // Create a mock server process (sink — discards all input, no output)
     let mut conn = AsyncBridgeConnection::spawn(vec![
@@ -141,7 +160,17 @@ pub async fn create_handle_with_state_and_pid(
     let router = Arc::new(ResponseRouter::new());
     let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
 
-    let handle = Arc::new(ConnectionHandle::new(writer, router, reader_handle));
-    handle.set_state(state);
+    let (tx, rx) = tokio::sync::mpsc::channel(crate::lsp::bridge::actor::OUTBOUND_QUEUE_CAPACITY);
+    let dynamic_capabilities = Arc::new(crate::lsp::bridge::pool::DynamicCapabilityRegistry::new());
+    let handle = Arc::new(ConnectionHandle::with_state(
+        writer,
+        router,
+        reader_handle,
+        state,
+        tx,
+        rx,
+        dynamic_capabilities,
+        key,
+    ));
     (handle, pid)
 }

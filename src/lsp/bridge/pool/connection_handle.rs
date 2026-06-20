@@ -19,6 +19,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::connection_action::BridgeError;
+use super::connection_key::ConnectionKey;
 use super::dynamic_capability_registry::DynamicCapabilityRegistry;
 use super::{ConnectionState, UpstreamId};
 use crate::error::LockResultExt;
@@ -88,6 +89,14 @@ pub(crate) struct ConnectionHandle {
     ///
     /// Updated by the reader task, queried by request handlers via `has_capability()`.
     dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+    /// Pool identity of this connection: `(server_name, resolved_root)`.
+    ///
+    /// Set once at construction (the pool resolves the workspace root before
+    /// spawning) and never changes. Downstream request, `didChange`, and cancel
+    /// paths recover it via [`key()`](Self::key) instead of re-resolving the
+    /// root, so per-(server, root) pool state (issue #382) stays consistent
+    /// without threading the root through every call site.
+    connection_key: ConnectionKey,
 }
 
 impl ConnectionHandle {
@@ -111,12 +120,14 @@ impl ConnectionHandle {
             tx,
             rx,
             dynamic_capabilities,
+            ConnectionKey::for_server("test"),
         )
     }
 
     /// Create a new ConnectionHandle with a specific initial state, spawning the
     /// writer task (ls-bridge-message-ordering). Even handshake messages flow through the channel so
     /// all writes keep FIFO ordering and avoid races against the writer task.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn with_state(
         writer: SplitConnectionWriter,
         router: Arc<ResponseRouter>,
@@ -125,6 +136,7 @@ impl ConnectionHandle {
         tx: mpsc::Sender<OutboundMessage>,
         rx: mpsc::Receiver<OutboundMessage>,
         dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
+        connection_key: ConnectionKey,
     ) -> Self {
         use crate::lsp::bridge::actor::spawn_writer_task;
 
@@ -144,7 +156,17 @@ impl ConnectionHandle {
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
             dynamic_capabilities,
+            connection_key,
         }
+    }
+
+    /// This connection's pool identity: `(server_name, resolved_root)`.
+    ///
+    /// Downstream request/`didChange`/cancel paths route per-connection pool
+    /// state by this key instead of re-resolving the workspace root, keeping
+    /// per-(server, root) pooling (issue #382) consistent across the lifecycle.
+    pub(crate) fn key(&self) -> &ConnectionKey {
+        &self.connection_key
     }
 
     /// Generate a unique downstream request ID (from 2; ID=1 is reserved for
@@ -841,6 +863,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Verify initial state is Ready
@@ -914,6 +937,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Register a request to start the liveness timer
@@ -971,6 +995,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Register a request - this should NOT start the liveness timer
@@ -1035,6 +1060,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Register first request - this starts the liveness timer
@@ -1127,6 +1153,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         );
 
         // Register a request with upstream ID
@@ -1168,6 +1195,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         );
 
         // Register without upstream ID
@@ -1208,6 +1236,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         );
 
         // Should return immediately
@@ -1240,6 +1269,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Spawn a task that will transition to Ready after a delay
@@ -1283,6 +1313,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Spawn a task that will transition to Failed
@@ -1328,6 +1359,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         );
 
         // Wait with short timeout - should timeout
@@ -1362,6 +1394,7 @@ mod tests {
             tx,
             rx,
             default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
         ));
 
         // Spawn a task that will transition to Closing

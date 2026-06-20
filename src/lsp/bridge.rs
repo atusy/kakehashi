@@ -23,6 +23,7 @@ mod text_document;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
+pub(crate) use pool::ConnectionKey;
 pub(crate) use pool::ConnectionReadiness;
 pub use pool::LanguageServerPool;
 pub(crate) use pool::UpstreamId;
@@ -254,18 +255,19 @@ mod tests {
     #[tokio::test]
     async fn same_server_different_languages_share_connection() {
         use super::pool::ConnectionState;
-        use super::pool::test_helpers::create_handle_with_state;
+        use super::pool::test_helpers::create_handle_with_key;
+        use crate::lsp::bridge::ConnectionKey;
 
         let pool = std::sync::Arc::new(LanguageServerPool::new());
 
         // Create and insert a Ready connection for server_name "tsgo"
-        let server_name = "tsgo";
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let server_name = ConnectionKey::for_server("tsgo");
+        let handle = create_handle_with_key(ConnectionState::Ready, server_name.clone()).await;
         let inserted_ptr = std::sync::Arc::as_ptr(&handle);
 
         pool.connections()
             .await
-            .insert(server_name.to_string(), std::sync::Arc::clone(&handle));
+            .insert(server_name.clone(), std::sync::Arc::clone(&handle));
 
         // Verify only one connection exists
         let connections = pool.connections().await;
@@ -275,12 +277,12 @@ mod tests {
             "Only one connection should exist for server_name"
         );
         assert!(
-            connections.contains_key(server_name),
+            connections.contains_key(&server_name),
             "Connection should be keyed by server_name"
         );
 
         // Verify the connection is the same one we inserted
-        let retrieved_ptr = std::sync::Arc::as_ptr(connections.get(server_name).unwrap());
+        let retrieved_ptr = std::sync::Arc::as_ptr(connections.get(&server_name).unwrap());
         assert_eq!(
             inserted_ptr, retrieved_ptr,
             "Connection should be the same instance we inserted"
@@ -288,8 +290,8 @@ mod tests {
 
         // Both ts and tsx lookups should return the same connection
         // (in the real system, coordinator resolves both languages to "tsgo")
-        let ts_lookup = connections.get("tsgo");
-        let tsx_lookup = connections.get("tsgo"); // Same key, same connection
+        let ts_lookup = connections.get(&ConnectionKey::for_server("tsgo"));
+        let tsx_lookup = connections.get(&ConnectionKey::for_server("tsgo")); // Same key, same connection
         assert!(ts_lookup.is_some(), "ts lookup should find connection");
         assert!(tsx_lookup.is_some(), "tsx lookup should find connection");
         assert!(
@@ -308,20 +310,26 @@ mod tests {
     #[tokio::test]
     async fn different_servers_create_separate_connections() {
         use super::pool::ConnectionState;
-        use super::pool::test_helpers::create_handle_with_state;
+        use super::pool::test_helpers::create_handle_with_key;
+        use crate::lsp::bridge::ConnectionKey;
 
         let pool = std::sync::Arc::new(LanguageServerPool::new());
 
         // Create and insert two different connections with different server_names
-        let handle_tsgo = create_handle_with_state(ConnectionState::Ready).await;
-        let handle_eslint = create_handle_with_state(ConnectionState::Ready).await;
+        let handle_tsgo =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("tsgo")).await;
+        let handle_eslint =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("eslint"))
+                .await;
 
-        pool.connections()
-            .await
-            .insert("tsgo".to_string(), std::sync::Arc::clone(&handle_tsgo));
-        pool.connections()
-            .await
-            .insert("eslint".to_string(), std::sync::Arc::clone(&handle_eslint));
+        pool.connections().await.insert(
+            ConnectionKey::for_server("tsgo"),
+            std::sync::Arc::clone(&handle_tsgo),
+        );
+        pool.connections().await.insert(
+            ConnectionKey::for_server("eslint"),
+            std::sync::Arc::clone(&handle_eslint),
+        );
 
         // Verify two separate connections exist
         let connections = pool.connections().await;
@@ -331,17 +339,22 @@ mod tests {
             "Two separate connections should exist for different server_names"
         );
         assert!(
-            connections.contains_key("tsgo"),
+            connections.contains_key(&ConnectionKey::for_server("tsgo")),
             "Should have tsgo connection"
         );
         assert!(
-            connections.contains_key("eslint"),
+            connections.contains_key(&ConnectionKey::for_server("eslint")),
             "Should have eslint connection"
         );
 
         // Verify handles point to different connections
-        let tsgo_ptr = std::sync::Arc::as_ptr(connections.get("tsgo").unwrap());
-        let eslint_ptr = std::sync::Arc::as_ptr(connections.get("eslint").unwrap());
+        let tsgo_ptr =
+            std::sync::Arc::as_ptr(connections.get(&ConnectionKey::for_server("tsgo")).unwrap());
+        let eslint_ptr = std::sync::Arc::as_ptr(
+            connections
+                .get(&ConnectionKey::for_server("eslint"))
+                .unwrap(),
+        );
         assert_ne!(
             tsgo_ptr, eslint_ptr,
             "Different server_names should have different connections"

@@ -10,7 +10,7 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::pool::{
-    ConnectionState, LanguageServerPool, NotificationSendResult, OpenedVirtualDoc,
+    ConnectionKey, ConnectionState, LanguageServerPool, NotificationSendResult, OpenedVirtualDoc,
 };
 use super::super::protocol::{VirtualDocumentUri, build_didclose_notification};
 
@@ -24,14 +24,14 @@ impl LanguageServerPool {
     pub(crate) async fn send_didclose_notification(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         let uri_string = virtual_uri.to_uri_string();
 
-        // Get the connection for this server (if it exists and is Ready)
+        // Get the connection (if it exists and is Ready)
         let connections = self.connections().await;
-        let Some(handle) = connections.get(server_name) else {
-            // No connection for this server - nothing to do
+        let Some(handle) = connections.get(connection_key) else {
+            // No connection for this key - nothing to do
             return Ok(());
         };
 
@@ -66,10 +66,10 @@ impl LanguageServerPool {
     }
 
     /// Close a single scratch virtual document by URI: send didClose and remove
-    /// it from all tracking state for `server_name` (the `host_to_virtual`
+    /// it from all tracking state for `connection_key` (the `host_to_virtual`
     /// registration, plus the version/opened/reverse-index entries that
     /// `untrack_document` clears). A scratch URI is only ever opened against the
-    /// one server formatting that step, so per-server untracking is complete.
+    /// one connection formatting that step, so per-connection untracking is complete.
     ///
     /// Used by the concatenated formatting pipeline, which opens a throwaway
     /// scratch virtual document per step (a unique URI carrying the accumulated
@@ -96,7 +96,7 @@ impl LanguageServerPool {
         &self,
         host_uri: &Url,
         scratch_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) {
         // Idempotent close: if the scratch document is no longer open, a
         // concurrent cleanup (e.g. `close_host_document`) already closed and
@@ -123,9 +123,9 @@ impl LanguageServerPool {
         // double-close-race fix without reintroducing an orphaned-downstream-doc
         // leak on cancel.
         self.unregister_virtual_doc(host_uri, scratch_uri).await;
-        self.untrack_document(scratch_uri, server_name).await;
+        self.untrack_document(scratch_uri, connection_key).await;
         if let Err(e) = self
-            .send_didclose_notification(scratch_uri, server_name)
+            .send_didclose_notification(scratch_uri, connection_key)
             .await
         {
             log::warn!(
@@ -143,7 +143,7 @@ impl LanguageServerPool {
     /// cleanup of the document_versions tracking.
     async fn close_single_virtual_doc(&self, doc: &OpenedVirtualDoc) {
         if let Err(e) = self
-            .send_didclose_notification(&doc.virtual_uri, &doc.server_name)
+            .send_didclose_notification(&doc.virtual_uri, &doc.connection_key)
             .await
         {
             log::warn!(
@@ -152,8 +152,8 @@ impl LanguageServerPool {
                 doc.virtual_uri.to_uri_string(), e
             );
         }
-        // Use server_name from OpenedVirtualDoc for server-name-based tracking
-        self.untrack_document(&doc.virtual_uri, &doc.server_name)
+        // Use the connection key from OpenedVirtualDoc for per-connection tracking
+        self.untrack_document(&doc.virtual_uri, &doc.connection_key)
             .await;
     }
 
@@ -225,7 +225,7 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
 
         // Simulate the per-step didOpen having registered the scratch doc.
-        pool.register_opened_document(&host_uri, &scratch_uri, "black")
+        pool.register_opened_document(&host_uri, &scratch_uri, &ConnectionKey::for_server("black"))
             .await;
         assert!(
             pool.is_document_opened(&scratch_uri),
@@ -234,7 +234,7 @@ mod tests {
 
         // No connection exists for "black", so the didClose send is a no-op,
         // but the untrack must still happen so the scratch doc never lingers.
-        pool.close_scratch_document(&host_uri, &scratch_uri, "black")
+        pool.close_scratch_document(&host_uri, &scratch_uri, &ConnectionKey::for_server("black"))
             .await;
 
         assert!(
@@ -245,7 +245,7 @@ mod tests {
         // Idempotent: a second close (the scratch doc is already gone, e.g. a
         // concurrent close_host_document beat the per-step/sweep cleanup) is a
         // safe no-op rather than a redundant didClose.
-        pool.close_scratch_document(&host_uri, &scratch_uri, "black")
+        pool.close_scratch_document(&host_uri, &scratch_uri, &ConnectionKey::for_server("black"))
             .await;
         assert!(
             !pool.is_document_opened(&scratch_uri),
@@ -269,15 +269,15 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
 
         // Same path ensure_document_opened takes: register under the host.
-        pool.register_opened_document(&host_uri, &scratch_uri, "black")
+        pool.register_opened_document(&host_uri, &scratch_uri, &ConnectionKey::for_server("black"))
             .await;
         assert_eq!(
-            pool.get_all_servers_for_virtual_uri(&scratch_uri),
-            vec!["black".to_string()],
+            pool.get_all_connections_for_virtual_uri(&scratch_uri),
+            vec![ConnectionKey::for_server("black")],
             "scratch doc should be reachable via host_to_virtual after register"
         );
 
-        pool.close_scratch_document(&host_uri, &scratch_uri, "black")
+        pool.close_scratch_document(&host_uri, &scratch_uri, &ConnectionKey::for_server("black"))
             .await;
 
         // After close, the host_to_virtual registration is gone: closing the
@@ -308,8 +308,12 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", "REGION-scratch-0");
 
         // Canonical region document already open downstream (the bug trigger).
-        pool.register_opened_document(&host_uri, &canonical_uri, "black")
-            .await;
+        pool.register_opened_document(
+            &host_uri,
+            &canonical_uri,
+            &ConnectionKey::for_server("black"),
+        )
+        .await;
 
         assert!(
             pool.is_document_opened(&canonical_uri),

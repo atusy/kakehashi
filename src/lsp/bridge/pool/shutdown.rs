@@ -41,25 +41,25 @@ impl LanguageServerPool {
     /// force-killed (SIGTERM→SIGKILL on Unix) and all enter Closed.
     pub(crate) async fn shutdown_all_with_timeout(&self, timeout: GlobalShutdownTimeout) {
         // Track connections that were skipped for logging (minimize lock duration)
-        let mut failed_connections: Vec<String> = Vec::new();
-        let mut already_closing: Vec<String> = Vec::new();
+        let mut failed_connections: Vec<super::ConnectionKey> = Vec::new();
+        let mut already_closing: Vec<super::ConnectionKey> = Vec::new();
 
         // Collect handles to shutdown - release lock before async operations
-        let handles_to_shutdown: Vec<(String, Arc<super::ConnectionHandle>)> = {
+        let handles_to_shutdown: Vec<(super::ConnectionKey, Arc<super::ConnectionHandle>)> = {
             let connections = self.connections.lock().await;
             connections
                 .iter()
-                .filter_map(|(language, handle)| match handle.state() {
+                .filter_map(|(key, handle)| match handle.state() {
                     ConnectionState::Ready | ConnectionState::Initializing => {
-                        Some((language.clone(), Arc::clone(handle)))
+                        Some((key.clone(), Arc::clone(handle)))
                     }
                     ConnectionState::Failed => {
-                        failed_connections.push(language.clone());
+                        failed_connections.push(key.clone());
                         handle.complete_shutdown();
                         None
                     }
                     ConnectionState::Closing | ConnectionState::Closed => {
-                        already_closing.push(language.clone());
+                        already_closing.push(key.clone());
                         None
                     }
                 })
@@ -67,18 +67,18 @@ impl LanguageServerPool {
         };
 
         // Log after releasing lock
-        for language in failed_connections {
+        for key in failed_connections {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Shutting down {} connection (Failed → Closed)",
-                language
+                key
             );
         }
-        for language in already_closing {
+        for key in already_closing {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Connection {} already shutting down or closed",
-                language
+                key
             );
         }
 
@@ -88,18 +88,18 @@ impl LanguageServerPool {
 
         // Spawn graceful shutdown tasks into JoinSet (outside timeout so we can abort on timeout)
         let mut join_set = tokio::task::JoinSet::new();
-        for (language, handle) in handles_to_shutdown {
+        for (key, handle) in handles_to_shutdown {
             join_set.spawn(async move {
                 log::debug!(
                     target: "kakehashi::bridge",
                     "Performing graceful shutdown for {} connection",
-                    language
+                    key
                 );
                 if let Err(e) = handle.graceful_shutdown().await {
                     log::warn!(
                         target: "kakehashi::bridge",
                         "Graceful shutdown failed for {}: {}",
-                        language, e
+                        key, e
                     );
                 }
             });
@@ -146,14 +146,18 @@ impl LanguageServerPool {
         const FORCE_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
         // Collect handles to force-kill (minimize lock duration - no logging inside lock)
-        let handles_with_info: Vec<(String, ConnectionState, Arc<super::ConnectionHandle>)> = {
+        let handles_with_info: Vec<(
+            super::ConnectionKey,
+            ConnectionState,
+            Arc<super::ConnectionHandle>,
+        )> = {
             let connections = self.connections.lock().await;
             connections
                 .iter()
-                .filter_map(|(language, handle)| {
+                .filter_map(|(key, handle)| {
                     let state = handle.state();
                     if state != ConnectionState::Closed {
-                        Some((language.clone(), state, Arc::clone(handle)))
+                        Some((key.clone(), state, Arc::clone(handle)))
                     } else {
                         None
                     }
@@ -164,11 +168,11 @@ impl LanguageServerPool {
         // Force-kill all connections in parallel.
         // Using JoinSet for parallel execution ensures O(1) force-kill time for N connections.
         let mut join_set = tokio::task::JoinSet::new();
-        for (language, state, handle) in handles_with_info {
+        for (key, state, handle) in handles_with_info {
             log::debug!(
                 target: "kakehashi::bridge",
                 "Force-killing {} connection (state: {:?})",
-                language,
+                key,
                 state
             );
             join_set.spawn(async move {
@@ -189,7 +193,7 @@ impl LanguageServerPool {
                         log::error!(
                             target: "kakehashi::bridge",
                             "Panic during force-kill for {} connection, marking as closed: {}",
-                            language,
+                            key,
                             join_error
                         );
                         handle.complete_shutdown();
@@ -207,7 +211,7 @@ impl LanguageServerPool {
                         log::warn!(
                             target: "kakehashi::bridge",
                             "Force-kill timeout for {} connection, marking as closed",
-                            language
+                            key
                         );
                         handle.complete_shutdown();
                     }
@@ -245,7 +249,7 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), handle);
+            .insert(super::super::ConnectionKey::for_server("test"), handle);
 
         pool.force_kill_all().await;
 

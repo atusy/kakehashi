@@ -83,7 +83,6 @@ impl LanguageServerPool {
         let virtual_line_count = count_lines(virtual_content);
         self.execute_position_bridge_request_with_handle(
             handle,
-            server_name,
             host_uri,
             injection_language,
             region_id,

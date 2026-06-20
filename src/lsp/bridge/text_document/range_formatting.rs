@@ -71,7 +71,6 @@ impl LanguageServerPool {
         let offset_for_request = offset.clone();
         self.execute_bridge_request_observed(
             handle,
-            server_name,
             host_uri,
             injection_language,
             region_id,

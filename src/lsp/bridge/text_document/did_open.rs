@@ -4,6 +4,7 @@
 //! language servers when injection regions are detected during `did_open`
 //! or `did_change` processing.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::pool::{ConnectionHandleSender, INIT_TIMEOUT_SECS, LanguageServerPool};
@@ -46,11 +47,38 @@ impl LanguageServerPool {
             }
         };
 
+        let connection_key = handle.key().clone();
         let mut sender = ConnectionHandleSender(&handle);
 
         for injection in &injections {
             let virtual_uri =
                 VirtualDocumentUri::new(host_uri_lsp, &injection.language, &injection.region_id);
+
+            // Verify `handle` is still the pool's LIVE connection for its key and
+            // claim + didOpen this ONE injection under the `connections` lock,
+            // then release before the next iteration — the same respawn guard the
+            // request (execute.rs) and host (host.rs) paths use, scoped per
+            // injection so the (best-effort, possibly many-region) eager open
+            // never holds the pool lock across the whole loop and stalls
+            // unrelated requests/spawns/cancels. Without the guard, a concurrent
+            // respawn (get_or_create's SpawnNew branch) that purged this key's
+            // tracker could let a claim through the dead handle, marking the doc
+            // open while the fresh process never received the didOpen. Lock order
+            // connections → document tracker matches the respawn purge. If a
+            // respawn replaced the handle mid-loop, stop: the purge lets the next
+            // real request re-open cleanly.
+            let connections = self.connections().await;
+            if !connections
+                .get(&connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Eager open: connection {} replaced mid-loop; stopping",
+                    connection_key
+                );
+                return;
+            }
 
             if let Err(e) = self
                 .ensure_document_opened(
@@ -58,7 +86,7 @@ impl LanguageServerPool {
                     host_uri,
                     &virtual_uri,
                     &injection.content,
-                    server_name,
+                    &connection_key,
                 )
                 .await
             {
@@ -91,8 +119,12 @@ mod tests {
         let server_name = "test-server";
 
         // Pre-create a ready connection so eager_open_virtual_documents finds it
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
-        pool.insert_connection(server_name, handle).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            crate::lsp::bridge::ConnectionKey::for_server(server_name),
+        )
+        .await;
+        pool.insert_connection(handle).await;
 
         let host_uri = test_host_uri("eager_open");
         let host_uri_lsp = url_to_uri(&host_uri);
@@ -145,8 +177,12 @@ mod tests {
         let config = devnull_config();
         let server_name = "test-server";
 
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
-        pool.insert_connection(server_name, handle).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            crate::lsp::bridge::ConnectionKey::for_server(server_name),
+        )
+        .await;
+        pool.insert_connection(handle).await;
 
         let host_uri = test_host_uri("idempotent");
         let host_uri_lsp = url_to_uri(&host_uri);

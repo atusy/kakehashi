@@ -7,12 +7,12 @@
 //! per-method request builders or response transformers: the upstream
 //! request's params are forwarded as raw JSON
 //! ([`LanguageServerPool::send_host_raw_request`]) and the result comes back
-//! verbatim. The pool's `(uri, server_name)` document state and the
+//! verbatim. The pool's `(uri, connection key)` document state and the
 //! request/cancel machinery are shared with the virt path; only the document
 //! key and the (absent) translation differ.
 //!
 //! Document sync is lazy: the host document is opened on the first request
-//! per `(uri, server)` and re-synced with a full-text `didChange` whenever
+//! per `(uri, connection)` and re-synced with a full-text `didChange` whenever
 //! the host text changed since the last request (fingerprint comparison) —
 //! the same full-content sync the virt path uses for its `didChange`
 //! forwarding.
@@ -31,8 +31,8 @@ use url::Url;
 
 use super::super::actor::RouterCleanupGuard;
 use super::super::pool::{
-    ConnectionHandle, ConnectionHandleSender, HostDocSyncState, LanguageServerPool, MessageSender,
-    UpstreamId,
+    ConnectionHandle, ConnectionHandleSender, ConnectionKey, HostDocSyncState, LanguageServerPool,
+    MessageSender, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, response_has_jsonrpc_error,
@@ -56,7 +56,7 @@ fn fingerprint(text: &str) -> u64 {
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
 ///
-/// - First request for `(uri, server)`: send `didOpen` with the real URI,
+/// - First request for `(uri, connection)`: send `didOpen` with the real URI,
 ///   the host language id, and the full host text.
 /// - Host text changed since the last sync: send a full-text `didChange`
 ///   with an incremented version.
@@ -71,12 +71,12 @@ fn fingerprint(text: &str) -> u64 {
 /// a channel.
 async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
-    docs: &mut std::collections::HashMap<(String, String), HostDocSyncState>,
+    docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
-    server_name: &str,
+    connection_key: &ConnectionKey,
 ) -> io::Result<()> {
     let uri_lsp = host_url_to_lsp_uri(doc.uri)?;
-    let key = (doc.uri.to_string(), server_name.to_string());
+    let key = (doc.uri.to_string(), connection_key.clone());
     let fp = fingerprint(doc.text);
 
     match docs.entry(key) {
@@ -145,17 +145,17 @@ impl LanguageServerPool {
         };
         let uri_string = uri.to_string();
 
-        let handles: Vec<(String, Arc<ConnectionHandle>)> = {
+        let handles: Vec<(ConnectionKey, Arc<ConnectionHandle>)> = {
             let connections = self.connections().await;
             connections
                 .iter()
-                .map(|(name, handle)| (name.clone(), Arc::clone(handle)))
+                .map(|(key, handle)| (key.clone(), Arc::clone(handle)))
                 .collect()
         };
 
         let mut docs = self.host_documents().await;
-        for (server_name, handle) in &handles {
-            if !docs.contains_key(&(uri_string.clone(), server_name.clone())) {
+        for (connection_key, handle) in &handles {
+            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
                 continue;
             }
             let notification = JsonRpcNotification::new(
@@ -219,7 +219,6 @@ impl LanguageServerPool {
         }
         self.execute_host_request(
             handle,
-            server_name,
             doc,
             upstream_request_id,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
@@ -254,7 +253,6 @@ impl LanguageServerPool {
         }
         self.execute_host_request(
             handle,
-            server_name,
             doc,
             upstream_request_id,
             |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
@@ -277,14 +275,15 @@ impl LanguageServerPool {
     async fn execute_host_request<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
-        server_name: &str,
         doc: &HostDocument<'_>,
         upstream_request_id: Option<UpstreamId>,
         build_request: impl FnOnce(RequestId) -> JsonRpcRequest<P>,
         transform_response: impl FnOnce(serde_json::Value) -> T,
     ) -> io::Result<T> {
+        // Route per-connection state by this handle's pool key (#382).
+        let connection_key = handle.key();
         if let Some(ref id) = upstream_request_id {
-            self.register_upstream_request(id.clone(), server_name);
+            self.register_upstream_request(id.clone(), connection_key);
         }
 
         let (request_id, response_rx) =
@@ -292,7 +291,7 @@ impl LanguageServerPool {
                 Ok(result) => result,
                 Err(e) => {
                     if let Some(ref id) = upstream_request_id {
-                        self.unregister_upstream_request(id, server_name);
+                        self.unregister_upstream_request(id, connection_key);
                     }
                     return Err(e);
                 }
@@ -315,32 +314,32 @@ impl LanguageServerPool {
         // `handle` was fetched earlier, and a concurrent respawn could have
         // replaced it and purged the sync state — syncing onto the dying
         // process's queue would record state the replacement never saw,
-        // wedging the `(uri, server)` pair until the next purge. Holding
+        // wedging the `(uri, connection)` pair until the next purge. Holding
         // `connections` here also excludes a purge from interleaving with
         // this sync, closing the race entirely.
         {
             let connections = self.connections().await;
             if !connections
-                .get(server_name)
+                .get(connection_key)
                 .is_some_and(|current| Arc::ptr_eq(current, &handle))
             {
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
-                    self.unregister_upstream_request(id, server_name);
+                    self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
-                    format!("connection to {server_name} was replaced during host sync"),
+                    format!("connection to {connection_key} was replaced during host sync"),
                 ));
             }
 
             let mut docs = self.host_documents().await;
             let mut sender = ConnectionHandleSender(&handle);
-            if let Err(e) = sync_host_document(&mut sender, &mut docs, doc, server_name).await {
+            if let Err(e) = sync_host_document(&mut sender, &mut docs, doc, connection_key).await {
                 drop(docs);
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
-                    self.unregister_upstream_request(id, server_name);
+                    self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e);
             }
@@ -349,7 +348,7 @@ impl LanguageServerPool {
                 drop(docs);
                 drop(connections);
                 if let Some(ref id) = upstream_request_id {
-                    self.unregister_upstream_request(id, server_name);
+                    self.unregister_upstream_request(id, connection_key);
                 }
                 return Err(e.into());
             }
@@ -359,7 +358,7 @@ impl LanguageServerPool {
         router_guard.disarm();
 
         if let Some(ref id) = upstream_request_id {
-            self.unregister_upstream_request(id, server_name);
+            self.unregister_upstream_request(id, connection_key);
         }
 
         Ok(transform_response(response?))
@@ -642,9 +641,14 @@ mod tests {
         let uri = Url::parse("file:///test/host.md").unwrap();
 
         // First sync: didOpen with the full text, version 1.
-        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v1"), "srv")
-            .await
-            .unwrap();
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "v1"),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
         let msg = rx.try_recv().expect("didOpen must be queued");
         let OutboundMessage::Untracked(payload) = msg else {
             panic!("expected a notification");
@@ -654,15 +658,25 @@ mod tests {
         assert_eq!(payload["params"]["textDocument"]["version"], 1);
 
         // Unchanged text: no notification at all.
-        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v1"), "srv")
-            .await
-            .unwrap();
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "v1"),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
         assert!(rx.try_recv().is_err(), "unchanged text must be a no-op");
 
         // Drifted text: full-text didChange with version 2.
-        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v2"), "srv")
-            .await
-            .unwrap();
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "v2"),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
         let OutboundMessage::Untracked(payload) = rx.try_recv().expect("didChange must be queued")
         else {
             panic!("expected a notification");
@@ -672,9 +686,14 @@ mod tests {
         assert_eq!(payload["params"]["contentChanges"][0]["text"], "v2");
 
         // Drift again: version keeps increasing monotonically.
-        sync_host_document(&mut sender, &mut docs, &host_doc(&uri, "v3"), "srv")
-            .await
-            .unwrap();
+        sync_host_document(
+            &mut sender,
+            &mut docs,
+            &host_doc(&uri, "v3"),
+            &ConnectionKey::for_server("srv"),
+        )
+        .await
+        .unwrap();
         let OutboundMessage::Untracked(payload) = rx.try_recv().expect("didChange must be queued")
         else {
             panic!("expected a notification");
@@ -690,14 +709,14 @@ mod tests {
         {
             let mut docs = pool.host_documents().await;
             docs.insert(
-                (uri_a.to_string(), "srv".to_string()),
+                (uri_a.to_string(), ConnectionKey::for_server("srv")),
                 HostDocSyncState {
                     version: 1,
                     fingerprint: 1,
                 },
             );
             docs.insert(
-                (uri_b.to_string(), "srv".to_string()),
+                (uri_b.to_string(), ConnectionKey::for_server("srv")),
                 HostDocSyncState {
                     version: 1,
                     fingerprint: 2,
@@ -709,11 +728,11 @@ mod tests {
 
         let docs = pool.host_documents().await;
         assert!(
-            !docs.contains_key(&(uri_a.to_string(), "srv".to_string())),
+            !docs.contains_key(&(uri_a.to_string(), ConnectionKey::for_server("srv"))),
             "closed uri's state must be dropped"
         );
         assert!(
-            docs.contains_key(&(uri_b.to_string(), "srv".to_string())),
+            docs.contains_key(&(uri_b.to_string(), ConnectionKey::for_server("srv"))),
             "other documents must be untouched"
         );
     }

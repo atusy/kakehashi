@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use url::Url;
 
+use super::ConnectionKey;
 use crate::lsp::bridge::protocol::VirtualDocumentUri;
 
 /// Represents an opened virtual document for tracking.
@@ -24,43 +25,45 @@ use crate::lsp::bridge::protocol::VirtualDocumentUri;
 pub(crate) struct OpenedVirtualDoc {
     /// The virtual document URI (contains language and region_id)
     pub(crate) virtual_uri: VirtualDocumentUri,
-    /// The server name this document was opened on.
+    /// The connection `(server_name, root)` this document was opened on.
     ///
-    /// Used for reverse lookup when routing didClose notifications.
-    /// Multiple languages may map to the same server (e.g., ts and tsx -> tsgo).
-    pub(crate) server_name: String,
+    /// Used for reverse lookup when routing didClose notifications. Multiple
+    /// languages may map to the same server (e.g., ts and tsx -> tsgo), and the
+    /// same server may back several connections (one per workspace root, #382).
+    pub(crate) connection_key: ConnectionKey,
 }
 
-/// Per-server virtual document state: versions (for `didChange`),
+/// Per-connection virtual document state: versions (for `didChange`),
 /// host→virtual mappings (for `didClose` propagation), and opened state
 /// (for LSP spec compliance, ls-bridge-message-ordering).
 ///
-/// Keyed by `server_name` (not language) so related languages can share one
-/// process (e.g. ts/tsx → tsgo); the URI itself still uses `injection_language`
+/// Keyed by [`ConnectionKey`] (not language) so related languages can share one
+/// process (e.g. ts/tsx → tsgo) while the same server under different workspace
+/// roots stays separate (#382); the URI itself still uses `injection_language`
 /// for the file extension. The two `Mutex`es are acquired independently —
 /// never held simultaneously — and `opened_documents` is a `DashMap` whose
 /// internal sharding lets reads contend per-shard instead of on one global lock.
 pub(crate) struct DocumentTracker {
-    /// Map of server_name -> (virtual document URI -> version).
+    /// Map of connection key -> (virtual document URI -> version).
     ///
-    /// Keyed by server_name (not language) to enable process sharing.
-    /// Multiple languages may map to the same server entry.
-    document_versions: Mutex<HashMap<String, HashMap<String, i32>>>,
+    /// Keyed by connection (not language) to enable process sharing while
+    /// keeping per-root connections distinct.
+    document_versions: Mutex<HashMap<ConnectionKey, HashMap<String, i32>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
-    /// Each OpenedVirtualDoc stores its server_name for reverse lookup during didClose.
+    /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
     host_to_virtual: Mutex<HashMap<Url, Vec<OpenedVirtualDoc>>>,
     /// Tracks documents claimed for opening on downstream servers.
     /// Incremented at claim time (`try_claim_for_open`), before the actual didOpen send.
     /// Rolled back via `unclaim_document` if the send fails.
-    /// Reference-counted: multiple servers may open the same virtual URI.
+    /// Reference-counted: multiple connections may open the same virtual URI.
     /// Uses DashMap for concurrent reads via internal sharded locking (ls-bridge-message-ordering).
     opened_documents: DashMap<String, usize>,
-    /// Reverse index: virtual URI string → server names that have this doc open.
+    /// Reverse index: virtual URI string → connections that have this doc open.
     ///
-    /// Enables O(1) lookup in `get_all_servers_for_virtual_uri()`, replacing the
+    /// Enables O(1) lookup in `get_all_connections_for_virtual_uri()`, replacing the
     /// previous O(N×M) scan over `host_to_virtual`.
-    virtual_to_servers: DashMap<String, Vec<String>>,
+    virtual_to_servers: DashMap<String, Vec<ConnectionKey>>,
 }
 
 impl DocumentTracker {
@@ -100,14 +103,22 @@ impl DocumentTracker {
     pub(super) async fn try_claim_for_open(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) -> bool {
         let uri_string = virtual_uri.to_uri_string();
 
         // Step 1: Check-and-initialize version under Mutex (serializes concurrent claims)
         {
             let mut versions = self.document_versions.lock().await;
-            let docs = versions.entry(server_name.to_string()).or_default();
+            // One lookup on the common path (connection already present); clone
+            // the key only when inserting it for the first time.
+            let docs = match versions.get_mut(connection_key) {
+                Some(docs) => docs,
+                None => {
+                    versions.insert(connection_key.clone(), HashMap::new());
+                    versions.get_mut(connection_key).expect("just inserted")
+                }
+            };
             if docs.contains_key(&uri_string) {
                 return false; // Already claimed by another caller
             }
@@ -117,13 +128,13 @@ impl DocumentTracker {
         // Step 2: Mark as opened — version is already available for concurrent didChange
         *self.opened_documents.entry(uri_string.clone()).or_insert(0) += 1;
 
-        // Step 3: Update reverse index so get_all_servers_for_virtual_uri works immediately.
+        // Step 3: Update reverse index so get_all_connections_for_virtual_uri works immediately.
         // This closes the TOCTOU gap between claim and register_opened_document.
         // register_opened_document will perform an idempotent duplicate-check insert.
         {
             let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
-            if !servers.contains(&server_name.to_string()) {
-                servers.push(server_name.to_string());
+            if !servers.contains(connection_key) {
+                servers.push(connection_key.clone());
             }
         }
 
@@ -138,21 +149,21 @@ impl DocumentTracker {
     pub(super) async fn unclaim_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) {
         let uri_string = virtual_uri.to_uri_string();
 
         // Remove version first (mirrors claim order)
         {
             let mut versions = self.document_versions.lock().await;
-            if let Some(docs) = versions.get_mut(server_name) {
+            if let Some(docs) = versions.get_mut(connection_key) {
                 docs.remove(&uri_string);
             }
         }
 
         // Then decrement the opened refcount and clean reverse index
         self.decrement_opened(&uri_string);
-        self.remove_from_reverse_index(&uri_string, server_name);
+        self.remove_from_reverse_index(&uri_string, connection_key);
     }
 
     /// Record the host→virtual mapping, bump opened ref-count, and seed the
@@ -167,18 +178,22 @@ impl DocumentTracker {
         &self,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) {
         let uri_string = virtual_uri.to_uri_string();
 
         // Step 1: Update versions (release lock after block)
         {
             let mut versions = self.document_versions.lock().await;
-            versions
-                .entry(server_name.to_string())
-                .or_default()
-                .entry(uri_string.clone())
-                .or_insert(1);
+            // One lookup on the common path; clone the key only on first insert.
+            let docs = match versions.get_mut(connection_key) {
+                Some(docs) => docs,
+                None => {
+                    versions.insert(connection_key.clone(), HashMap::new());
+                    versions.get_mut(connection_key).expect("just inserted")
+                }
+            };
+            docs.entry(uri_string.clone()).or_insert(1);
         }
 
         // Step 2: Update host_to_virtual (separate lock scope)
@@ -186,11 +201,11 @@ impl DocumentTracker {
             let mut host_map = self.host_to_virtual.lock().await;
             let docs = host_map.entry(host_uri.clone()).or_default();
             if !docs.iter().any(|d| {
-                d.virtual_uri.to_uri_string() == uri_string && d.server_name == server_name
+                d.virtual_uri.to_uri_string() == uri_string && &d.connection_key == connection_key
             }) {
                 docs.push(OpenedVirtualDoc {
                     virtual_uri: virtual_uri.clone(),
-                    server_name: server_name.to_string(),
+                    connection_key: connection_key.clone(),
                 });
             }
         }
@@ -199,11 +214,11 @@ impl DocumentTracker {
         // needed for test helpers that call this directly)
         self.opened_documents.entry(uri_string.clone()).or_insert(1);
 
-        // Update the reverse index for O(1) get_all_servers_for_virtual_uri lookups
+        // Update the reverse index for O(1) get_all_connections_for_virtual_uri lookups
         {
             let mut servers = self.virtual_to_servers.entry(uri_string).or_default();
-            if !servers.contains(&server_name.to_string()) {
-                servers.push(server_name.to_string());
+            if !servers.contains(connection_key) {
+                servers.push(connection_key.clone());
             }
         }
     }
@@ -214,12 +229,12 @@ impl DocumentTracker {
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) -> Option<i32> {
         let uri_string = virtual_uri.to_uri_string();
 
         let mut versions = self.document_versions.lock().await;
-        if let Some(docs) = versions.get_mut(server_name)
+        if let Some(docs) = versions.get_mut(connection_key)
             && let Some(version) = docs.get_mut(&uri_string)
         {
             *version += 1;
@@ -236,17 +251,54 @@ impl DocumentTracker {
     pub(crate) async fn untrack_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) {
         let uri_string = virtual_uri.to_uri_string();
 
         let mut versions = self.document_versions.lock().await;
-        if let Some(docs) = versions.get_mut(server_name) {
+        if let Some(docs) = versions.get_mut(connection_key) {
             docs.remove(&uri_string);
         }
 
         self.decrement_opened(&uri_string);
-        self.remove_from_reverse_index(&uri_string, server_name);
+        self.remove_from_reverse_index(&uri_string, connection_key);
+    }
+
+    /// Drop ALL virtual-document tracking for one connection key.
+    ///
+    /// Called when a stale (Failed/Closed) connection is removed before a
+    /// respawn: the replacement process has nothing open, so every virtual
+    /// document the dead process held must be forgotten — otherwise
+    /// `try_claim_for_open` still reports the URI as claimed under this key and
+    /// `ensure_document_opened` skips the `didOpen`, leaving the fresh process
+    /// receiving requests for documents it never opened. Scoped to exactly this
+    /// `(server, root)` key, so sibling connections sharing the server name (or
+    /// a different root) keep their state; `opened_documents` is decremented
+    /// per URI (not cleared), so a URI also open on another connection survives.
+    pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) {
+        // Take this connection's version map; its keys are the virtual URIs it
+        // had open. Done first so the per-URI refcount/reverse-index cleanup
+        // below mirrors `untrack_document` exactly, once per opened document.
+        let uris: Vec<String> = {
+            let mut versions = self.document_versions.lock().await;
+            versions
+                .remove(connection_key)
+                .map(|docs| docs.into_keys().collect())
+                .unwrap_or_default()
+        };
+        for uri in &uris {
+            self.decrement_opened(uri);
+            self.remove_from_reverse_index(uri, connection_key);
+        }
+        // Drop this connection's host→virtual registrations so a later
+        // host-close does not try to didClose documents the dead process held.
+        {
+            let mut host_map = self.host_to_virtual.lock().await;
+            for docs in host_map.values_mut() {
+                docs.retain(|doc| &doc.connection_key != connection_key);
+            }
+            host_map.retain(|_, docs| !docs.is_empty());
+        }
     }
 
     /// Remove a single virtual document from host_to_virtual tracking.
@@ -262,16 +314,16 @@ impl DocumentTracker {
         let uri_string = virtual_uri.to_uri_string();
         let mut host_map = self.host_to_virtual.lock().await;
         if let Some(docs) = host_map.get_mut(host_uri) {
-            // Collect server names being removed for reverse index cleanup
-            let removed_servers: Vec<String> = docs
+            // Collect connection keys being removed for reverse index cleanup
+            let removed_keys: Vec<ConnectionKey> = docs
                 .iter()
                 .filter(|d| d.virtual_uri.to_uri_string() == uri_string)
-                .map(|d| d.server_name.clone())
+                .map(|d| d.connection_key.clone())
                 .collect();
             docs.retain(|d| d.virtual_uri.to_uri_string() != uri_string);
             drop(host_map);
-            for server_name in &removed_servers {
-                self.remove_from_reverse_index(&uri_string, server_name);
+            for connection_key in &removed_keys {
+                self.remove_from_reverse_index(&uri_string, connection_key);
             }
         }
     }
@@ -284,7 +336,7 @@ impl DocumentTracker {
         let docs = host_map.remove(host_uri).unwrap_or_default();
         drop(host_map);
         for doc in &docs {
-            self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.server_name);
+            self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.connection_key);
         }
         docs
     }
@@ -328,7 +380,7 @@ impl DocumentTracker {
 
         // Clean reverse index for each closed doc
         for doc in &to_close {
-            self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.server_name);
+            self.remove_from_reverse_index(&doc.virtual_uri.to_uri_string(), &doc.connection_key);
         }
 
         to_close
@@ -345,29 +397,30 @@ impl DocumentTracker {
         });
     }
 
-    /// Remove a server from the reverse index for a given virtual URI.
+    /// Remove a connection from the reverse index for a given virtual URI.
     ///
-    /// Removes the entry entirely when no servers remain.
-    fn remove_from_reverse_index(&self, uri_string: &str, server_name: &str) {
+    /// Removes the entry entirely when no connections remain.
+    fn remove_from_reverse_index(&self, uri_string: &str, connection_key: &ConnectionKey) {
         self.virtual_to_servers
-            .remove_if_mut(uri_string, |_, servers| {
-                servers.retain(|s| s != server_name);
-                servers.is_empty()
+            .remove_if_mut(uri_string, |_, keys| {
+                keys.retain(|k| k != connection_key);
+                keys.is_empty()
             });
     }
 
-    /// Find ALL server names that have opened a given virtual document URI.
+    /// Find ALL connections that have opened a given virtual document URI.
     ///
     /// When multiple servers handle the same language (e.g., emmylua and lua_ls
-    /// both handling Lua), each server opens its own copy of the virtual document.
-    /// This method collects ALL matching server names so that didChange can be
-    /// forwarded to every server, not just the first one found.
+    /// both handling Lua), or one server backs several workspace roots (#382),
+    /// each connection opens its own copy of the virtual document. This method
+    /// collects ALL matching connection keys so that didChange can be forwarded
+    /// to every connection, not just the first one found.
     ///
     /// O(1) lookup via the `virtual_to_servers` reverse index.
-    pub(super) fn get_all_servers_for_virtual_uri(
+    pub(super) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
-    ) -> Vec<String> {
+    ) -> Vec<ConnectionKey> {
         self.virtual_to_servers
             .get(&virtual_uri.to_uri_string())
             .map(|entry| entry.value().clone())
@@ -395,12 +448,12 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "region-0");
         let doc = OpenedVirtualDoc {
             virtual_uri: virtual_uri.clone(),
-            server_name: "lua".to_string(),
+            connection_key: ConnectionKey::for_server("lua"),
         };
 
         assert_eq!(doc.virtual_uri.language(), "lua");
         assert_eq!(doc.virtual_uri.region_id(), "region-0");
-        assert_eq!(doc.server_name, "lua");
+        assert_eq!(doc.connection_key, ConnectionKey::for_server("lua"));
     }
 
     // ========================================
@@ -415,7 +468,7 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
 
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Verify the host_to_virtual mapping was recorded
@@ -426,7 +479,10 @@ mod tests {
         assert_eq!(virtual_docs.len(), 1);
         assert_eq!(virtual_docs[0].virtual_uri.language(), "lua");
         assert_eq!(virtual_docs[0].virtual_uri.region_id(), "lua-0");
-        assert_eq!(virtual_docs[0].server_name, "lua");
+        assert_eq!(
+            virtual_docs[0].connection_key,
+            ConnectionKey::for_server("lua")
+        );
     }
 
     /// Test that register_opened_document records multiple virtual docs for same host.
@@ -437,12 +493,12 @@ mod tests {
 
         let virtual_uri_0 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_0, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_0, &ConnectionKey::for_server("lua"))
             .await;
 
         let virtual_uri_1 = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-1");
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_1, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_1, &ConnectionKey::for_server("lua"))
             .await;
 
         let host_map = tracker.host_to_virtual.lock().await;
@@ -466,10 +522,10 @@ mod tests {
 
         // Register twice
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Verify only one entry exists (no duplicate)
@@ -497,7 +553,7 @@ mod tests {
         );
 
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         assert!(
@@ -535,7 +591,9 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         assert!(
-            tracker.try_claim_for_open(&virtual_uri, "lua").await,
+            tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+                .await,
             "First claim should succeed"
         );
     }
@@ -548,11 +606,17 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // First claim succeeds
-        assert!(tracker.try_claim_for_open(&virtual_uri, "lua").await);
+        assert!(
+            tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+                .await
+        );
 
         // Second claim for same URI fails
         assert!(
-            !tracker.try_claim_for_open(&virtual_uri, "lua").await,
+            !tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+                .await,
             "Second claim should fail — already claimed"
         );
     }
@@ -565,15 +629,23 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Claim, unclaim, then claim again
-        assert!(tracker.try_claim_for_open(&virtual_uri, "lua").await);
-        tracker.unclaim_document(&virtual_uri, "lua").await;
         assert!(
-            tracker.try_claim_for_open(&virtual_uri, "lua").await,
+            tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+                .await
+        );
+        tracker
+            .unclaim_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
+        assert!(
+            tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+                .await,
             "Should be able to reclaim after unclaim"
         );
     }
 
-    /// Test that get_all_servers_for_virtual_uri works immediately after try_claim_for_open.
+    /// Test that get_all_connections_for_virtual_uri works immediately after try_claim_for_open.
     ///
     /// This verifies the reverse index is updated at claim time, closing the
     /// TOCTOU gap between try_claim_for_open and register_opened_document.
@@ -586,19 +658,21 @@ mod tests {
         // Before claim: no servers
         assert!(
             tracker
-                .get_all_servers_for_virtual_uri(&virtual_uri)
+                .get_all_connections_for_virtual_uri(&virtual_uri)
                 .is_empty(),
             "Should return empty before claim"
         );
 
         // Claim the document (should update reverse index)
-        tracker.try_claim_for_open(&virtual_uri, "lua").await;
+        tracker
+            .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
 
         // Reverse index should be available immediately — no need for register_opened_document
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert_eq!(
             servers,
-            vec!["lua".to_string()],
+            vec![ConnectionKey::for_server("lua")],
             "Reverse index should be available immediately after claim"
         );
     }
@@ -615,11 +689,13 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Claim the document (should initialize version to 1)
-        tracker.try_claim_for_open(&virtual_uri, "lua").await;
+        tracker
+            .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
 
         // Version should be available immediately — no need for register_opened_document
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert_eq!(
             version,
@@ -639,12 +715,16 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Claim (initializes version) then unclaim (should remove version)
-        tracker.try_claim_for_open(&virtual_uri, "lua").await;
-        tracker.unclaim_document(&virtual_uri, "lua").await;
+        tracker
+            .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
+        tracker
+            .unclaim_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
 
         // Version should no longer exist
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(version.is_none(), "Version should be removed after unclaim");
     }
@@ -662,7 +742,7 @@ mod tests {
 
         // Document was never registered via register_opened_document
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(
             version.is_none(),
@@ -679,18 +759,18 @@ mod tests {
 
         // Open the document (sets version to 1)
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // First increment: 1 -> 2
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert_eq!(version, Some(2), "First increment should return 2");
 
         // Second increment: 2 -> 3
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert_eq!(version, Some(3), "Second increment should return 3");
     }
@@ -708,12 +788,12 @@ mod tests {
 
         // Open the document
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Verify version exists
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(
             version.is_some(),
@@ -721,11 +801,13 @@ mod tests {
         );
 
         // Untrack the document
-        tracker.untrack_document(&virtual_uri, "lua").await;
+        tracker
+            .untrack_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
 
         // Version should no longer exist
         let version = tracker
-            .increment_document_version(&virtual_uri, "lua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(
             version.is_none(),
@@ -742,7 +824,7 @@ mod tests {
 
         // Register as opened (sets version + host mapping + opened state)
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         assert!(
             tracker.is_document_opened(&virtual_uri),
@@ -750,7 +832,9 @@ mod tests {
         );
 
         // Untrack the document
-        tracker.untrack_document(&virtual_uri, "lua").await;
+        tracker
+            .untrack_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
 
         // Should no longer be marked as opened
         assert!(
@@ -771,11 +855,13 @@ mod tests {
 
         // Open the document (adds to host_to_virtual)
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Untrack the document
-        tracker.untrack_document(&virtual_uri, "lua").await;
+        tracker
+            .untrack_document(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
 
         // host_to_virtual should still have the entry
         let host_map = tracker.host_to_virtual.lock().await;
@@ -801,10 +887,14 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
 
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_1, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_1, &ConnectionKey::for_server("lua"))
             .await;
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_2, "python")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri_2,
+                &ConnectionKey::for_server("python"),
+            )
             .await;
 
         // Parse the ULIDs for matching
@@ -847,7 +937,7 @@ mod tests {
         // Register a virtual doc
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Try to take a different ULID
@@ -885,7 +975,7 @@ mod tests {
         // Register a virtual doc
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Take with empty ULID list (fast path)
@@ -911,13 +1001,17 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
 
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_1, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_1, &ConnectionKey::for_server("lua"))
             .await;
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_2, "lua")
+            .register_opened_document(&host_uri, &virtual_uri_2, &ConnectionKey::for_server("lua"))
             .await;
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_3, "python")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri_3,
+                &ConnectionKey::for_server("python"),
+            )
             .await;
 
         // Take both Lua ULIDs
@@ -957,7 +1051,7 @@ mod tests {
 
         // Register then unregister
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
         tracker
             .unregister_virtual_doc(&host_uri, &virtual_uri)
@@ -984,10 +1078,10 @@ mod tests {
 
         // Register two documents
         tracker
-            .register_opened_document(&host_uri, &vuri_0, "lua")
+            .register_opened_document(&host_uri, &vuri_0, &ConnectionKey::for_server("lua"))
             .await;
         tracker
-            .register_opened_document(&host_uri, &vuri_1, "lua")
+            .register_opened_document(&host_uri, &vuri_1, &ConnectionKey::for_server("lua"))
             .await;
 
         // Unregister only the first
@@ -1018,10 +1112,10 @@ mod tests {
     }
 
     // ========================================
-    // get_all_servers_for_virtual_uri tests
+    // get_all_connections_for_virtual_uri tests
     // ========================================
 
-    /// Test that get_all_servers_for_virtual_uri returns multiple servers for the same URI.
+    /// Test that get_all_connections_for_virtual_uri returns multiple servers for the same URI.
     ///
     /// When two servers (e.g., emmylua and lua_ls) both open the same virtual doc,
     /// both server names should be returned.
@@ -1033,22 +1127,30 @@ mod tests {
 
         // Open the same virtual doc on two different servers
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "emmylua")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri,
+                &ConnectionKey::for_server("emmylua"),
+            )
             .await;
         // Second server gets a different key in document_versions but same virtual_uri.
         // Two different servers opening the same URI is achieved by calling
         // register_opened_document with different server_names.
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua_ls")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri,
+                &ConnectionKey::for_server("lua_ls"),
+            )
             .await;
 
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert_eq!(servers.len(), 2, "Should return both servers");
-        assert!(servers.contains(&"emmylua".to_string()));
-        assert!(servers.contains(&"lua_ls".to_string()));
+        assert!(servers.contains(&ConnectionKey::for_server("emmylua")));
+        assert!(servers.contains(&ConnectionKey::for_server("lua_ls")));
     }
 
-    /// Test that get_all_servers_for_virtual_uri returns a single server when only one matches.
+    /// Test that get_all_connections_for_virtual_uri returns a single server when only one matches.
     #[tokio::test]
     async fn get_all_servers_returns_single_server() {
         let tracker = DocumentTracker::new();
@@ -1056,25 +1158,25 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         tracker
-            .register_opened_document(&host_uri, &virtual_uri, "lua")
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
-        assert_eq!(servers, vec!["lua".to_string()]);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
+        assert_eq!(servers, vec![ConnectionKey::for_server("lua")]);
     }
 
-    /// Test that get_all_servers_for_virtual_uri returns empty vec for unknown URI.
+    /// Test that get_all_connections_for_virtual_uri returns empty vec for unknown URI.
     #[tokio::test]
     async fn get_all_servers_returns_empty_for_unknown() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
-        let servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri);
+        let servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri);
         assert!(servers.is_empty(), "Should return empty for unknown URI");
     }
 
-    /// Test that get_all_servers_for_virtual_uri does not cross-contaminate.
+    /// Test that get_all_connections_for_virtual_uri does not cross-contaminate.
     ///
     /// Different virtual URIs should not leak servers from unrelated documents.
     #[tokio::test]
@@ -1088,17 +1190,25 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "python", TEST_ULID_PYTHON_0);
 
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_lua, "lua")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri_lua,
+                &ConnectionKey::for_server("lua"),
+            )
             .await;
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_python, "python")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri_python,
+                &ConnectionKey::for_server("python"),
+            )
             .await;
 
-        let lua_servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri_lua);
-        let python_servers = tracker.get_all_servers_for_virtual_uri(&virtual_uri_python);
+        let lua_servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri_lua);
+        let python_servers = tracker.get_all_connections_for_virtual_uri(&virtual_uri_python);
 
-        assert_eq!(lua_servers, vec!["lua".to_string()]);
-        assert_eq!(python_servers, vec!["python".to_string()]);
+        assert_eq!(lua_servers, vec![ConnectionKey::for_server("lua")]);
+        assert_eq!(python_servers, vec![ConnectionKey::for_server("python")]);
     }
 
     /// Test that untracking one server preserves opened state for another server.
@@ -1113,15 +1223,25 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Two servers claim the same virtual URI
-        assert!(tracker.try_claim_for_open(&virtual_uri, "emmylua").await);
-        assert!(tracker.try_claim_for_open(&virtual_uri, "lua_ls").await);
+        assert!(
+            tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("emmylua"))
+                .await
+        );
+        assert!(
+            tracker
+                .try_claim_for_open(&virtual_uri, &ConnectionKey::for_server("lua_ls"))
+                .await
+        );
         assert!(
             tracker.is_document_opened(&virtual_uri),
             "Document should be opened after two claims"
         );
 
         // Untrack one server
-        tracker.untrack_document(&virtual_uri, "emmylua").await;
+        tracker
+            .untrack_document(&virtual_uri, &ConnectionKey::for_server("emmylua"))
+            .await;
 
         // Document should still be opened because lua_ls still has it
         assert!(
@@ -1130,7 +1250,9 @@ mod tests {
         );
 
         // Untrack the second server
-        tracker.untrack_document(&virtual_uri, "lua_ls").await;
+        tracker
+            .untrack_document(&virtual_uri, &ConnectionKey::for_server("lua_ls"))
+            .await;
 
         // Now it should be gone
         assert!(
@@ -1139,7 +1261,55 @@ mod tests {
         );
     }
 
-    /// Test that get_all_servers_for_virtual_uri works with process sharing.
+    /// purge_connection forgets all of one connection's documents so the next
+    /// request re-claims and re-opens them (the respawn case, #382), while a
+    /// sibling connection that shares the same virtual URI keeps it open.
+    #[tokio::test]
+    async fn purge_connection_allows_reopen_and_spares_siblings() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let vuri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let dead = ConnectionKey::for_server("pyright-a");
+        let sibling = ConnectionKey::for_server("pyright-b");
+
+        // Two connections open the same virtual URI.
+        assert!(tracker.try_claim_for_open(&vuri, &dead).await);
+        assert!(tracker.try_claim_for_open(&vuri, &sibling).await);
+        tracker
+            .register_opened_document(&host_uri, &vuri, &dead)
+            .await;
+        assert!(
+            !tracker.try_claim_for_open(&vuri, &dead).await,
+            "already claimed on the dead connection before purge"
+        );
+
+        // The dead connection respawns → purge its state.
+        tracker.purge_connection(&dead).await;
+
+        // The document is still open (sibling holds it) but re-claimable on the
+        // purged connection, so its respawn will send a fresh didOpen.
+        assert!(
+            tracker.is_document_opened(&vuri),
+            "sibling connection keeps the document open"
+        );
+        assert!(
+            tracker.try_claim_for_open(&vuri, &dead).await,
+            "purged connection must be able to re-claim (→ re-didOpen)"
+        );
+        let servers = tracker.get_all_connections_for_virtual_uri(&vuri);
+        assert!(
+            servers.contains(&dead) && servers.contains(&sibling),
+            "reverse index holds both connections after purge + re-claim: {servers:?}"
+        );
+        // The sibling's version tracking is untouched.
+        assert_eq!(
+            tracker.increment_document_version(&vuri, &sibling).await,
+            Some(2),
+            "sibling version survives the purge"
+        );
+    }
+
+    /// Test that get_all_connections_for_virtual_uri works with process sharing.
     ///
     /// When ts and tsx both use "tsgo" as server_name, the lookup
     /// should return "tsgo" for each language's virtual URI independently.
@@ -1152,24 +1322,32 @@ mod tests {
         let virtual_uri_ts =
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", TEST_ULID_LUA_0);
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_ts, "tsgo")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri_ts,
+                &ConnectionKey::for_server("tsgo"),
+            )
             .await;
 
         // Open a tsx document with server_name "tsgo"
         let virtual_uri_tsx =
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescriptreact", TEST_ULID_LUA_1);
         tracker
-            .register_opened_document(&host_uri, &virtual_uri_tsx, "tsgo")
+            .register_opened_document(
+                &host_uri,
+                &virtual_uri_tsx,
+                &ConnectionKey::for_server("tsgo"),
+            )
             .await;
 
         // Both should return vec!["tsgo"] — same server, different virtual URIs
         assert_eq!(
-            tracker.get_all_servers_for_virtual_uri(&virtual_uri_ts),
-            vec!["tsgo".to_string()]
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri_ts),
+            vec![ConnectionKey::for_server("tsgo")]
         );
         assert_eq!(
-            tracker.get_all_servers_for_virtual_uri(&virtual_uri_tsx),
-            vec!["tsgo".to_string()]
+            tracker.get_all_connections_for_virtual_uri(&virtual_uri_tsx),
+            vec![ConnectionKey::for_server("tsgo")]
         );
     }
 }

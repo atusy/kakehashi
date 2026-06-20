@@ -56,34 +56,48 @@ fn find_marker_root(document_path: &Path, markers: &[String]) -> Option<PathBuf>
         .map(Path::to_path_buf)
 }
 
-/// Compute the `rootUri` + `workspaceFolders` for a downstream server's
-/// `initialize` request: a marker hit near the triggering document overrides
-/// the client-supplied values (and becomes the sole workspace folder);
-/// anything short of a fully usable marker root — no hint, no marker, or a
-/// root that does not parse as an LSP URI — falls back to the client
-/// supplied pair wholesale, never half-and-half.
-pub(crate) fn resolve_spawn_workspace(
-    root_markers: Option<&[String]>,
-    document_uri: Option<&Url>,
+/// Build the `rootUri` + `workspaceFolders` for a downstream spawn from an
+/// **already-resolved** marker workspace (see [`resolve_marker_workspace`]).
+///
+/// Taking the marker as a parameter — rather than resolving it here — lets the
+/// caller resolve the marker root *once* and derive both the connection-pool
+/// key and this spawn workspace from the same value, so the key can never name
+/// a different root than the server is spawned at even if the marker filesystem
+/// changes mid-spawn (#382). `None` falls back to the client-supplied pair.
+pub(crate) fn workspace_from_marker(
+    marker: Option<(Url, WorkspaceFolder)>,
     fallback: impl FnOnce() -> (Option<String>, Option<Vec<WorkspaceFolder>>),
 ) -> (Option<String>, Option<Vec<WorkspaceFolder>>) {
-    let marker_workspace = resolve_marker_root(root_markers, document_uri).and_then(|root| {
-        // `WorkspaceFolder.uri` is `ls_types::Uri`, not `url::Url` — the
-        // string parse IS the type conversion, not a redundant round-trip.
-        let uri = root.as_str().parse().ok()?;
-        // Basename of the root dir; a root with no basename (e.g. `/`) falls
-        // back to the URI string rather than an empty name.
-        let name = root
-            .to_file_path()
-            .ok()
-            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| root.as_str().to_string());
-        Some((
-            Some(String::from(root)),
-            Some(vec![WorkspaceFolder { uri, name }]),
-        ))
-    });
-    marker_workspace.unwrap_or_else(fallback)
+    match marker {
+        Some((root, folder)) => (Some(String::from(root)), Some(vec![folder])),
+        None => fallback(),
+    }
+}
+
+/// Resolve the marker root **and** its `WorkspaceFolder` for a spawn, as a
+/// single unit — `Some` only when a marker root is found *and* parses as an LSP
+/// `Uri`. Returning both together means the connection-pool key (issue #382) and
+/// the spawn handshake derive from the exact same decision: when this is `Some`,
+/// the key roots at `root` and the server spawns rooted there; when it is `None`
+/// (no hint, no marker, the `[]` kill switch, or an unparseable URI), the key
+/// roots at the client-root fallback and so does the spawn. They never disagree.
+pub(crate) fn resolve_marker_workspace(
+    root_markers: Option<&[String]>,
+    document_uri: Option<&Url>,
+) -> Option<(Url, WorkspaceFolder)> {
+    let root = resolve_marker_root(root_markers, document_uri)?;
+    // `WorkspaceFolder.uri` is `ls_types::Uri`, not `url::Url` — the string
+    // parse IS the type conversion, not a redundant round-trip. A root that does
+    // not parse yields `None`, so the key falls back too (consistency above).
+    let uri = root.as_str().parse().ok()?;
+    // Basename of the root dir; a root with no basename (e.g. `/`) falls back to
+    // the URI string rather than an empty name.
+    let name = root
+        .to_file_path()
+        .ok()
+        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| root.as_str().to_string());
+    Some((root, WorkspaceFolder { uri, name }))
 }
 
 /// Resolve the marker-derived root for a server spawn from the document that
@@ -223,7 +237,9 @@ mod tests {
         let doc_uri = Url::from_file_path(project.join("src/main.rs")).unwrap();
 
         let (root_uri, folders) =
-            resolve_spawn_workspace(None, Some(&doc_uri), || panic!("must not fall back"));
+            workspace_from_marker(resolve_marker_workspace(None, Some(&doc_uri)), || {
+                panic!("must not fall back")
+            });
 
         let root = root_uri.expect("marker root becomes rootUri");
         let canonical_root = Url::from_file_path(project.canonicalize().unwrap()).unwrap();
@@ -243,6 +259,36 @@ mod tests {
     }
 
     #[test]
+    fn marker_workspace_root_matches_spawn_root_uri() {
+        // The connection-pool key (#382) and the spawn handshake both derive
+        // their root from `resolve_marker_workspace`, so the key's root string
+        // must equal the rootUri the server is spawned with.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir(project.join(".git")).unwrap();
+        let doc_uri = Url::from_file_path(project.join("src/main.rs")).unwrap();
+
+        // Resolve once, exactly as the spawn path does, then derive both halves.
+        let marker = resolve_marker_workspace(None, Some(&doc_uri)).expect("marker root resolves");
+        let folder = marker.1.clone();
+        let key_root = String::from(marker.0.clone()); // what ConnectionKey stores
+        let (spawn_root_uri, _) =
+            workspace_from_marker(Some(marker), || panic!("must not fall back"));
+
+        assert_eq!(
+            Some(key_root.clone()),
+            spawn_root_uri,
+            "key root string must equal the spawn rootUri"
+        );
+        assert_eq!(
+            key_root,
+            folder.uri.as_str(),
+            "key root must equal the workspace folder uri"
+        );
+    }
+
+    #[test]
     fn spawn_workspace_falls_back_wholesale_without_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let doc_uri = Url::from_file_path(tmp.path().join("orphan.md")).unwrap();
@@ -252,13 +298,15 @@ mod tests {
             name: "root".to_string(),
         };
 
-        let (root_uri, folders) =
-            resolve_spawn_workspace(Some(&markers(&[unique.as_str()])), Some(&doc_uri), || {
+        let (root_uri, folders) = workspace_from_marker(
+            resolve_marker_workspace(Some(&markers(&[unique.as_str()])), Some(&doc_uri)),
+            || {
                 (
                     Some("file:///client/root".to_string()),
                     Some(vec![fallback_folder.clone()]),
                 )
-            });
+            },
+        );
 
         assert_eq!(root_uri.as_deref(), Some("file:///client/root"));
         assert_eq!(folders, Some(vec![fallback_folder]));

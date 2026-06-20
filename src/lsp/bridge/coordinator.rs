@@ -169,11 +169,16 @@ impl BridgeCoordinator {
     /// depending on a real downstream language server.
     #[cfg(test)]
     pub(crate) async fn insert_ready_test_connection(&self, server_name: &str) {
+        use crate::lsp::bridge::pool::ConnectionKey;
         use crate::lsp::bridge::pool::ConnectionState;
-        use crate::lsp::bridge::pool::test_helpers::create_handle_with_state;
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_key;
 
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
-        self.pool.insert_connection(server_name, handle).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server(server_name),
+        )
+        .await;
+        self.pool.insert_connection(handle).await;
     }
 
     // ========================================

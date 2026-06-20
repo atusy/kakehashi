@@ -1,13 +1,17 @@
 //! Pool of downstream language-server connections (ls-bridge-server-pool-coordination), keyed by
-//! `server_name` rather than `languageId` so multiple languages can share one
-//! process (e.g. `typescript` + `typescriptreact` → `tsgo`). Routing:
-//! `languageId` → `server_name` (config) → connection.
+//! [`ConnectionKey`] = `(server_name, resolved workspace root)` rather than
+//! `languageId`. Multiple languages can share one process (e.g. `typescript`
+//! and `typescriptreact` → `tsgo`), while the same server under different
+//! marker roots gets its own process for multi-root monorepos (issue #382).
+//! Routing: `languageId` → `server_name` (config) plus the document's resolved
+//! root → connection.
 //!
 //! [`LanguageServerPool`] manages the connections; [`ConnectionHandle`]
 //! (ls-bridge-async-connection) and [`ConnectionState`] track each connection's lifecycle.
 
 mod connection_action;
 mod connection_handle;
+mod connection_key;
 mod connection_state;
 mod document_tracker;
 mod dynamic_capability_registry;
@@ -25,6 +29,7 @@ use connection_action::{ConnectionAction, decide_connection_action};
 use handshake::perform_lsp_handshake;
 
 pub(crate) use connection_handle::{ConnectionHandle, NotificationSendResult};
+pub(crate) use connection_key::ConnectionKey;
 pub(crate) use connection_state::ConnectionState;
 use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
@@ -180,31 +185,36 @@ pub(super) struct HostDocSyncState {
 }
 
 pub struct LanguageServerPool {
-    /// Map of server_name -> connection handle (wraps connection with its state)
-    connections: Mutex<HashMap<String, Arc<ConnectionHandle>>>,
+    /// Map of connection key `(server_name, root)` -> connection handle.
+    ///
+    /// Keyed by [`ConnectionKey`] rather than `server_name` alone so a
+    /// multi-root monorepo spawns a separate downstream process per resolved
+    /// workspace root (issue #382); documents sharing a root (or the
+    /// client-root fallback) still share one process.
+    connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
     /// Document tracking for virtual documents (versions, host mappings, opened state)
     document_tracker: DocumentTracker,
-    /// Host-document sync state per `(uri, server_name)`
+    /// Host-document sync state per `(uri, connection key)`
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
-    host_documents: Mutex<HashMap<(String, String), HostDocSyncState>>,
-    /// Upstream request ID → set of downstream servers, for fan-out cancel
-    /// forwarding (ls-bridge-message-ordering). Multiple servers can share an ID when a single
+    host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    /// Upstream request ID → set of downstream connections, for fan-out cancel
+    /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
     ///
-    /// Cleaned per-server via `unregister_upstream_request` on response or
-    /// pre-send failure; the entry is removed when the last server unregisters.
+    /// Cleaned per-connection via `unregister_upstream_request` on response or
+    /// pre-send failure; the entry is removed when the last connection unregisters.
     /// Connection failure via `ResponseRouter::fail_all()` deliberately leaves
     /// entries dangling to avoid a router→pool back-reference — stale lookups
     /// fail gracefully and IDs get reused.
-    upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashMap<String, usize>>>,
+    upstream_request_registry: std::sync::Mutex<HashMap<UpstreamId, HashMap<ConnectionKey, usize>>>,
     /// Metrics for cancel forwarding observability.
     cancel_metrics: CancelForwardingMetrics,
-    /// Consecutive handshake-task panics per server (reset to 0 on success).
+    /// Consecutive handshake-task panics per connection (reset to 0 on success).
     /// At `MAX_CONSECUTIVE_PANICS` we stop retrying, preventing an infinite
-    /// retry loop when a server's handshake consistently panics.
-    consecutive_panic_counts: std::sync::Mutex<HashMap<String, u32>>,
+    /// retry loop when a connection's handshake consistently panics.
+    consecutive_panic_counts: std::sync::Mutex<HashMap<ConnectionKey, u32>>,
     /// Workspace root URI forwarded from upstream client.
     ///
     /// Set once via `set_root_uri()` after receiving the upstream initialize request.
@@ -333,7 +343,7 @@ impl LanguageServerPool {
     /// Used by text_document submodules that need to access connections.
     pub(super) async fn connections(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<String, Arc<ConnectionHandle>>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<ConnectionKey, Arc<ConnectionHandle>>> {
         self.connections.lock().await
     }
 
@@ -341,22 +351,20 @@ impl LanguageServerPool {
     /// request path in `text_document/host.rs`.
     pub(super) async fn host_documents(
         &self,
-    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), HostDocSyncState>> {
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, ConnectionKey), HostDocSyncState>> {
         self.host_documents.lock().await
     }
 
     /// Insert a pre-created connection handle for testing.
     ///
     /// This allows tests to set up a pool with a known connection state
-    /// without going through the full server spawn + handshake flow.
+    /// without going through the full server spawn + handshake flow. The handle
+    /// is keyed by its own `handle.key()` so lookups via the key (didChange,
+    /// cancel) agree with the map.
     #[cfg(test)]
-    pub(in crate::lsp::bridge) async fn insert_connection(
-        &self,
-        server_name: &str,
-        handle: Arc<ConnectionHandle>,
-    ) {
+    pub(in crate::lsp::bridge) async fn insert_connection(&self, handle: Arc<ConnectionHandle>) {
         let mut connections = self.connections.lock().await;
-        connections.insert(server_name.to_string(), handle);
+        connections.insert(handle.key().clone(), handle);
     }
 
     // ========================================
@@ -391,10 +399,10 @@ impl LanguageServerPool {
     pub(crate) async fn untrack_document(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) {
         self.document_tracker
-            .untrack_document(virtual_uri, server_name)
+            .untrack_document(virtual_uri, connection_key)
             .await
     }
 
@@ -424,16 +432,17 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
-    /// Find ALL server names that have opened a given virtual document URI.
+    /// Find ALL connections (`(server, root)` keys) that have opened a given
+    /// virtual document URI.
     ///
-    /// Used by did_change to forward notifications to every server that has
+    /// Used by did_change to forward notifications to every connection that has
     /// the document open, not just the first one found.
-    pub(super) fn get_all_servers_for_virtual_uri(
+    pub(super) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
-    ) -> Vec<String> {
+    ) -> Vec<ConnectionKey> {
         self.document_tracker
-            .get_all_servers_for_virtual_uri(virtual_uri)
+            .get_all_connections_for_virtual_uri(virtual_uri)
     }
 
     /// Register a document as successfully opened (test helper).
@@ -445,10 +454,10 @@ impl LanguageServerPool {
         &self,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) {
         self.document_tracker
-            .register_opened_document(host_uri, virtual_uri, server_name)
+            .register_opened_document(host_uri, virtual_uri, connection_key)
             .await
     }
 
@@ -469,11 +478,11 @@ impl LanguageServerPool {
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
         virtual_content: &str,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         if !self
             .document_tracker
-            .try_claim_for_open(virtual_uri, server_name)
+            .try_claim_for_open(virtual_uri, connection_key)
             .await
         {
             return Ok(()); // Already claimed by another caller
@@ -484,12 +493,12 @@ impl LanguageServerPool {
         // any subsequent didClose queued by close_host_document will arrive
         // after didOpen on the wire.
         self.document_tracker
-            .register_opened_document(host_uri, virtual_uri, server_name)
+            .register_opened_document(host_uri, virtual_uri, connection_key)
             .await;
         let did_open = build_didopen_notification(virtual_uri, virtual_content);
         if let Err(e) = sender.send_notification(did_open).await {
             self.document_tracker
-                .unclaim_document(virtual_uri, server_name)
+                .unclaim_document(virtual_uri, connection_key)
                 .await;
             self.document_tracker
                 .unregister_virtual_doc(host_uri, virtual_uri)
@@ -504,22 +513,22 @@ impl LanguageServerPool {
     pub(super) async fn increment_document_version(
         &self,
         virtual_uri: &VirtualDocumentUri,
-        server_name: &str,
+        connection_key: &ConnectionKey,
     ) -> Option<i32> {
         self.document_tracker
-            .increment_document_version(virtual_uri, server_name)
+            .increment_document_version(virtual_uri, connection_key)
             .await
     }
 
     /// Get or create a connection for the specified server, spawning the server
     /// and running the LSP handshake with the default timeout on a miss.
     ///
-    /// `document_uri` is the document that triggered the call; on a spawn it
-    /// seeds the `rootMarkers` workspace-root search (root_markers module).
-    /// It is ignored for an already-pooled connection — the first spawn
-    /// decides the root for the server's lifetime, so documents under a
-    /// *different* marker root reuse a process rooted elsewhere. Per-root
-    /// pooling (key = server + root) is tracked in issue #382.
+    /// `document_uri` selects the connection: it resolves to a
+    /// `(server_name, root)` key (root_markers module), so documents under
+    /// different marker roots get their own downstream process while documents
+    /// sharing a root (or the client-root fallback) share one (issue #382). On a
+    /// spawn it also seeds that connection's `rootMarkers` workspace root for the
+    /// LSP handshake.
     pub(super) async fn get_or_create_connection(
         &self,
         server_name: &str,
@@ -568,9 +577,21 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        // Resolve the marker workspace + key ONCE (one filesystem walk) and reuse
+        // the key for the initializing-retry lookup below, instead of resolving
+        // again there.
+        let (marker, connection_key) =
+            self.resolve_marker_and_key(server_name, server_config, document_uri);
+
         // First, try to get or create the connection
         match self
-            .get_or_create_connection(server_name, server_config, document_uri)
+            .get_or_create_connection_resolved(
+                server_name,
+                server_config,
+                connection_key.clone(),
+                marker,
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+            )
             .await
         {
             Ok(handle) => {
@@ -587,11 +608,12 @@ impl LanguageServerPool {
                     .is_some_and(BridgeError::is_initializing);
 
                 if is_initializing {
-                    // Get the handle from pool and wait for it to be ready
+                    // Wait on the connection this document routes to — the key was
+                    // already resolved above, so no second filesystem walk here.
                     let handle = {
                         let connections = self.connections.lock().await;
                         connections
-                            .get(server_name)
+                            .get(&connection_key)
                             .map(Arc::clone)
                             .ok_or_else(|| {
                                 io::Error::other("bridge: connection disappeared during wait")
@@ -611,11 +633,72 @@ impl LanguageServerPool {
 }
 
 impl LanguageServerPool {
-    /// Fast-fail get-or-spawn (ls-bridge-message-ordering): on miss, start the process, split
-    /// reader+writer, store the handle as `Initializing`, and run the LSP
-    /// initialize handshake in a background task that transitions Ready or
-    /// Failed. Requests against Initializing fail with REQUEST_FAILED; Failed
-    /// causes removal and respawn on the next call.
+    /// Resolve the marker workspace AND the pool key `(server_name, root)` for a
+    /// request on `document_uri` in a SINGLE filesystem walk — the one point of
+    /// root resolution. The spawn handshake (`marker`) and every map lookup
+    /// (`key`) derive from the same value, so a document always routes to the
+    /// connection it is spawned at, even if the marker filesystem changes between
+    /// calls (#382). Returning both lets a caller resolve once and reuse the key
+    /// (e.g. `wait_ready`'s initializing-retry lookup) instead of walking twice.
+    ///
+    /// The root is the marker-derived workspace root when one is found —
+    /// documents under different marker roots get separate downstream processes
+    /// (issue #382) — or `None`, the client-root fallback shared by every
+    /// document without a marker root.
+    fn resolve_marker_and_key(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+    ) -> (
+        Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        ConnectionKey,
+    ) {
+        let marker = super::root_markers::resolve_marker_workspace(
+            server_config.root_markers.as_deref(),
+            document_uri,
+        );
+        let key = ConnectionKey::new(
+            server_name,
+            // `as_str().to_owned()` is one allocation; `String::from(root.clone())`
+            // would clone the parsed `Url` first. The string is identical.
+            marker
+                .as_ref()
+                .map(|(root, _folder)| root.as_str().to_owned()),
+        );
+        (marker, key)
+    }
+
+    /// The pool key alone, for callers that don't spawn (no `marker` needed).
+    /// See [`resolve_marker_and_key`](Self::resolve_marker_and_key).
+    fn connection_key(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+    ) -> ConnectionKey {
+        self.resolve_marker_and_key(server_name, server_config, document_uri)
+            .1
+    }
+
+    /// Public projection of [`connection_key`](Self::connection_key) for callers
+    /// outside the pool that hold a `(server_name, server_config, document_uri)`
+    /// and need the same key the request path used — e.g. the concatenated
+    /// formatting pipeline, which tags each scratch document and per-step cancel
+    /// with the connection it was issued on. Resolves identically to the spawn
+    /// path, so it always names the right connection.
+    pub(crate) fn resolve_connection_key(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+    ) -> ConnectionKey {
+        self.connection_key(server_name, server_config, document_uri)
+    }
+
+    /// Fast-fail get-or-spawn (ls-bridge-message-ordering): resolves the
+    /// connection's `(marker, key)` from `document_uri`, then delegates to
+    /// [`get_or_create_connection_resolved`](Self::get_or_create_connection_resolved).
     async fn get_or_create_connection_with_timeout(
         &self,
         server_name: &str,
@@ -623,23 +706,50 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        let (marker, connection_key) =
+            self.resolve_marker_and_key(server_name, server_config, document_uri);
+        self.get_or_create_connection_resolved(
+            server_name,
+            server_config,
+            connection_key,
+            marker,
+            timeout,
+        )
+        .await
+    }
+
+    /// Get-or-spawn against an ALREADY-resolved `(connection_key, marker)` pair
+    /// (resolve via [`resolve_marker_and_key`](Self::resolve_marker_and_key)), so
+    /// a caller can resolve the marker workspace once and reuse the key. On miss:
+    /// start the process, split reader+writer, store the handle as
+    /// `Initializing`, and run the LSP initialize handshake in a background task
+    /// that transitions Ready or Failed. Requests against Initializing fail with
+    /// REQUEST_FAILED; Failed causes removal and respawn on the next call.
+    async fn get_or_create_connection_resolved(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        connection_key: ConnectionKey,
+        marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         let mut connections = self.connections.lock().await;
 
-        // Get consecutive panic count for this server
+        // Get consecutive panic count for this connection
         let panic_count = {
             let counts = self
                 .consecutive_panic_counts
                 .lock()
                 .recover_poison("LanguageServerPool::get_or_create_connection_with_timeout");
-            counts.get(server_name).copied().unwrap_or(0)
+            counts.get(&connection_key).copied().unwrap_or(0)
         };
 
-        // Check if we already have a connection for this server
+        // Check if we already have a connection for this key
         // Use pure decision function for testability (ls-bridge-message-ordering Operation Gating)
-        let existing_state = connections.get(server_name).map(|h| h.state());
+        let existing_state = connections.get(&connection_key).map(|h| h.state());
         match decide_connection_action(existing_state, panic_count) {
             ConnectionAction::ReturnExisting => {
-                return Ok(Arc::clone(connections.get(server_name).expect(
+                return Ok(Arc::clone(connections.get(&connection_key).expect(
                     "Invariant violation: Connection expected for ReturnExisting action",
                 )));
             }
@@ -649,7 +759,7 @@ impl LanguageServerPool {
                     log::error!(
                         target: "kakehashi::bridge::connection",
                         "[{}] Server disabled after {} consecutive handshake panics (max: {})",
-                        server_name,
+                        connection_key,
                         panic_count,
                         connection_action::MAX_CONSECUTIVE_PANICS
                     );
@@ -659,17 +769,23 @@ impl LanguageServerPool {
             ConnectionAction::SpawnNew => {
                 // Remove stale connection if present (Failed or Closed state)
                 if existing_state.is_some() {
-                    connections.remove(server_name);
-                    // Drop host-document sync state with it: the replacement
-                    // process has no documents open, so the lazy host sync
-                    // must re-send didOpen instead of trusting stale entries
-                    // (host-document-bridge). Lock order: connections →
-                    // host_documents, consistent with
-                    // close_host_bridge_document's prefetch.
+                    connections.remove(&connection_key);
+                    // Drop the dead connection's document state with it: the
+                    // replacement process has nothing open, so the lazy host
+                    // sync must re-send didOpen and the virt tracker must let
+                    // the next request re-claim and re-open instead of trusting
+                    // stale entries (host-document-bridge). Both purges are
+                    // scoped to this exact `(server, root)` key so sibling roots
+                    // sharing the server name keep their state. Lock order:
+                    // connections → host_documents / document tracker,
+                    // consistent with close_host_bridge_document's prefetch.
                     self.host_documents
                         .lock()
                         .await
-                        .retain(|(_, server), _| server != server_name);
+                        .retain(|(_, key), _| key != &connection_key);
+                    self.document_tracker
+                        .purge_connection(&connection_key)
+                        .await;
                 }
             }
         }
@@ -696,16 +812,17 @@ impl LanguageServerPool {
         // Create dynamic capability registry (shared between reader and connection handle)
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
 
-        // rootMarkers workspace-root detection (root_markers module): a
-        // marker hit near the triggering document overrides the
-        // client-supplied root and folders; otherwise both fall back.
+        // rootMarkers workspace-root detection (root_markers module): the same
+        // marker workspace resolved for the pool key above also seeds the
+        // handshake — a marker hit overrides the client-supplied root and
+        // folders; otherwise both fall back. Reusing `marker` (rather than
+        // re-resolving) guarantees the spawned root matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
-        let (root_uri, workspace_folders) = super::root_markers::resolve_spawn_workspace(
-            server_config.root_markers.as_deref(),
-            document_uri,
-            || (self.root_uri(), self.workspace_folders()),
-        );
+        let (root_uri, workspace_folders) =
+            super::root_markers::workspace_from_marker(marker, || {
+                (self.root_uri(), self.workspace_folders())
+            });
         log::debug!(
             target: "kakehashi::bridge::init",
             "[{}] workspace root for spawn: {:?}",
@@ -738,10 +855,11 @@ impl LanguageServerPool {
             tx,
             rx,
             dynamic_capabilities,
+            connection_key.clone(),
         ));
 
         // Insert into pool immediately so concurrent requests see Initializing state
-        connections.insert(server_name.to_string(), Arc::clone(&handle));
+        connections.insert(connection_key.clone(), Arc::clone(&handle));
 
         // Release lock before spawning handshake task
         drop(connections);
@@ -822,12 +940,12 @@ impl LanguageServerPool {
         // $/cancelRequest), the spawned task continues running to completion.
         match handshake_task.await {
             Ok(Ok(())) => {
-                // Success - reset panic count for this server
+                // Success - reset panic count for this connection
                 let mut counts = self
                     .consecutive_panic_counts
                     .lock()
                     .recover_poison("LanguageServerPool::get_or_create_connection_with_timeout");
-                counts.remove(server_name);
+                counts.remove(&connection_key);
                 Ok(handle)
             }
             Ok(Err(e)) => Err(e),
@@ -841,14 +959,14 @@ impl LanguageServerPool {
                         let mut counts = self.consecutive_panic_counts.lock().recover_poison(
                             "LanguageServerPool::get_or_create_connection_with_timeout",
                         );
-                        let count = counts.entry(server_name.to_string()).or_insert(0);
+                        let count = counts.entry(connection_key.clone()).or_insert(0);
                         *count += 1;
                         *count
                     };
                     log::error!(
                         target: "kakehashi::bridge::init",
                         "[{}] Handshake task panicked (consecutive count: {}): {}",
-                        server_name,
+                        connection_key,
                         new_count,
                         join_err
                     );
@@ -890,50 +1008,50 @@ impl LanguageServerPool {
     /// send failures bubble up as `Err`.
     pub(crate) async fn forward_cancel_downstream(
         &self,
-        server_name: &str,
+        connection_key: &ConnectionKey,
         downstream_id: RequestId,
     ) -> io::Result<()> {
         let Some(handle) = self
             .ready_connection_for_cancel(
-                server_name,
+                connection_key,
                 &format!("downstream_id: {}", downstream_id.as_i64()),
             )
             .await
         else {
             return Ok(());
         };
-        self.send_cancel_notification(&handle, server_name, downstream_id)
+        self.send_cancel_notification(&handle, connection_key, downstream_id)
     }
 
-    /// Fetch `server_name`'s connection for cancel forwarding, returning
-    /// `None` (after best-effort metrics/logging) when there is no connection
-    /// or it is not Ready. `request_desc` identifies the request in logs.
+    /// Fetch a connection for cancel forwarding, returning `None` (after
+    /// best-effort metrics/logging) when there is no connection or it is not
+    /// Ready. `request_desc` identifies the request in logs.
     async fn ready_connection_for_cancel(
         &self,
-        server_name: &str,
+        connection_key: &ConnectionKey,
         request_desc: &str,
     ) -> Option<Arc<ConnectionHandle>> {
         let connections = self.connections().await;
-        self.ready_handle_for_cancel_in(&connections, server_name, request_desc)
+        self.ready_handle_for_cancel_in(&connections, connection_key, request_desc)
     }
 
     /// Lock-free core of [`ready_connection_for_cancel`](Self::ready_connection_for_cancel):
-    /// look up `server_name` in an already-acquired connections map so callers
-    /// fanning out over several servers can pay the lock acquisition once.
+    /// look up `connection_key` in an already-acquired connections map so callers
+    /// fanning out over several connections can pay the lock acquisition once.
     fn ready_handle_for_cancel_in(
         &self,
-        connections: &HashMap<String, Arc<ConnectionHandle>>,
-        server_name: &str,
+        connections: &HashMap<ConnectionKey, Arc<ConnectionHandle>>,
+        connection_key: &ConnectionKey,
         request_desc: &str,
     ) -> Option<Arc<ConnectionHandle>> {
-        let Some(handle) = connections.get(server_name) else {
+        let Some(handle) = connections.get(connection_key) else {
             // No connection - request may have completed or server never started.
             // Silently drop per best-effort semantics.
             self.cancel_metrics.record_no_connection();
             log::debug!(
                 target: "kakehashi::bridge::cancel",
-                "Cancel dropped: no connection for server '{}' ({}, expected if request completed)",
-                server_name,
+                "Cancel dropped: no connection for '{}' ({}, expected if request completed)",
+                connection_key,
                 request_desc
             );
             return None;
@@ -946,8 +1064,8 @@ impl LanguageServerPool {
             self.cancel_metrics.record_not_ready();
             log::debug!(
                 target: "kakehashi::bridge::cancel",
-                "Cancel dropped: connection not ready for server '{}' ({}, state: {:?})",
-                server_name,
+                "Cancel dropped: connection not ready for '{}' ({}, state: {:?})",
+                connection_key,
                 request_desc,
                 handle.state()
             );
@@ -964,7 +1082,7 @@ impl LanguageServerPool {
     fn send_cancel_notification(
         &self,
         handle: &ConnectionHandle,
-        server_name: &str,
+        connection_key: &ConnectionKey,
         downstream_id: RequestId,
     ) -> io::Result<()> {
         // Per LSP spec: $/cancelRequest is a notification with { id: request_id }
@@ -982,9 +1100,9 @@ impl LanguageServerPool {
                 self.cancel_metrics.record_success();
                 log::debug!(
                     target: "kakehashi::bridge::cancel",
-                    "Cancel forwarded: downstream {} for server '{}'",
+                    "Cancel forwarded: downstream {} for '{}'",
                     downstream_id.as_i64(),
-                    server_name
+                    connection_key
                 );
                 Ok(())
             }
@@ -1026,14 +1144,14 @@ impl LanguageServerPool {
         upstream_id: UpstreamId,
         notify: impl FnOnce(),
     ) -> io::Result<()> {
-        // 1. Snapshot the servers registered for this upstream id.
-        let server_names: Vec<String> = {
+        // 1. Snapshot the connections registered for this upstream id.
+        let connection_keys: Vec<ConnectionKey> = {
             let registry = self
                 .upstream_request_registry
                 .lock()
                 .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id");
             match registry.get(&upstream_id) {
-                Some(servers) => servers.keys().cloned().collect(),
+                Some(connections) => connections.keys().cloned().collect(),
                 None => {
                     // Request not registered yet (still initializing) or already completed.
                     // This is expected - silently drop the cancel per best-effort semantics.
@@ -1053,13 +1171,13 @@ impl LanguageServerPool {
         //    ids under a single connections-lock acquisition, so the time until
         //    `notify` wakes the upstream handler is bounded by one lock wait,
         //    not one per server (PR #359 review).
-        let mut targets: Vec<(String, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
+        let mut targets: Vec<(ConnectionKey, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
         {
             let connections = self.connections().await;
-            for server_name in server_names {
+            for connection_key in connection_keys {
                 let Some(handle) = self.ready_handle_for_cancel_in(
                     &connections,
-                    &server_name,
+                    &connection_key,
                     &format!("upstream_id: {upstream_id}"),
                 ) else {
                     continue;
@@ -1071,13 +1189,13 @@ impl LanguageServerPool {
                     self.cancel_metrics.record_unknown_id();
                     log::debug!(
                         target: "kakehashi::bridge::cancel",
-                        "Cancel dropped: upstream ID {} not found for server '{}' (request may have completed)",
+                        "Cancel dropped: upstream ID {} not found for '{}' (request may have completed)",
                         upstream_id,
-                        server_name
+                        connection_key
                     );
                     continue;
                 }
-                targets.push((server_name, handle, downstream_ids));
+                targets.push((connection_key, handle, downstream_ids));
             }
             // Lock dropped here — notify and the sends below run without it.
         }
@@ -1086,9 +1204,10 @@ impl LanguageServerPool {
         notify();
 
         // 4. Send the cancels (best-effort, log I/O errors).
-        for (server_name, handle, downstream_ids) in targets {
+        for (connection_key, handle, downstream_ids) in targets {
             for downstream_id in downstream_ids {
-                if let Err(e) = self.send_cancel_notification(&handle, &server_name, downstream_id)
+                if let Err(e) =
+                    self.send_cancel_notification(&handle, &connection_key, downstream_id)
                 {
                     // Log I/O errors (queue full, channel closed) for observability.
                     // These indicate connection issues worth investigating.
@@ -1105,19 +1224,24 @@ impl LanguageServerPool {
         Ok(())
     }
 
-    /// Record `upstream_id → server_name` so `$/cancelRequest` from the client
-    /// can be forwarded to every downstream server handling that ID.
+    /// Record `upstream_id → connection_key` so `$/cancelRequest` from the
+    /// client can be forwarded to every downstream connection handling that ID.
     ///
     /// For fan-out (e.g. diagnostics dispatched to multiple injected languages),
-    /// callers register the same `upstream_id` once per request. The per-server
-    /// count handles whole-document fan-out, where the SAME server receives one
-    /// request per injection region under one upstream id: the server must stay
-    /// registered until its last in-flight request completes.
+    /// callers register the same `upstream_id` once per request. The
+    /// per-connection count handles whole-document fan-out, where the SAME
+    /// connection receives one request per injection region under one upstream
+    /// id: the connection must stay registered until its last in-flight request
+    /// completes.
     ///
     /// Callers MUST call `unregister_upstream_request` per request on completion
     /// (success, error, or timeout) — typically after `wait_for_response()` or
     /// in `ensure_document_opened()` error cleanup — to avoid leaking entries.
-    pub(crate) fn register_upstream_request(&self, upstream_id: UpstreamId, server_name: &str) {
+    pub(crate) fn register_upstream_request(
+        &self,
+        upstream_id: UpstreamId,
+        connection_key: &ConnectionKey,
+    ) {
         let mut registry = self
             .upstream_request_registry
             .lock()
@@ -1125,26 +1249,30 @@ impl LanguageServerPool {
         *registry
             .entry(upstream_id)
             .or_default()
-            .entry(server_name.to_string())
+            .entry(connection_key.clone())
             .or_insert(0) += 1;
     }
 
-    /// Unregister one in-flight request for `(upstream_id, server_name)`.
-    /// The server is removed once its count reaches zero; the upstream entry is
-    /// fully removed once all servers have been unregistered.
-    pub(crate) fn unregister_upstream_request(&self, upstream_id: &UpstreamId, server_name: &str) {
+    /// Unregister one in-flight request for `(upstream_id, connection_key)`.
+    /// The connection is removed once its count reaches zero; the upstream entry
+    /// is fully removed once all connections have been unregistered.
+    pub(crate) fn unregister_upstream_request(
+        &self,
+        upstream_id: &UpstreamId,
+        connection_key: &ConnectionKey,
+    ) {
         let mut registry = self
             .upstream_request_registry
             .lock()
             .recover_poison("LanguageServerPool::unregister_upstream_request");
-        if let Some(servers) = registry.get_mut(upstream_id) {
-            if let Some(count) = servers.get_mut(server_name) {
+        if let Some(connections) = registry.get_mut(upstream_id) {
+            if let Some(count) = connections.get_mut(connection_key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    servers.remove(server_name);
+                    connections.remove(connection_key);
                 }
             }
-            if servers.is_empty() {
+            if connections.is_empty() {
                 registry.remove(upstream_id);
             }
         }
@@ -1194,8 +1322,131 @@ mod tests {
             "Connections map should exist and be empty initially"
         );
         assert!(
-            !connections.contains_key("test"),
+            !connections.contains_key(&ConnectionKey::for_server("test")),
             "Connection should not exist before connection attempt"
+        );
+    }
+
+    /// Per-root pooling (#382): documents under different marker roots resolve
+    /// to distinct connection keys (→ separate downstream processes), while a
+    /// document with no marker root resolves to the shared client-root fallback.
+    #[test]
+    fn connection_key_distinguishes_marker_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two sibling projects, each its own `.git` marker root.
+        let proj_a = tmp.path().join("a");
+        let proj_b = tmp.path().join("b");
+        std::fs::create_dir_all(proj_a.join("src")).unwrap();
+        std::fs::create_dir_all(proj_b.join("src")).unwrap();
+        std::fs::create_dir(proj_a.join(".git")).unwrap();
+        std::fs::create_dir(proj_b.join(".git")).unwrap();
+        let doc_a = Url::from_file_path(proj_a.join("src/main.py")).unwrap();
+        let doc_b = Url::from_file_path(proj_b.join("src/main.py")).unwrap();
+
+        let pool = LanguageServerPool::new();
+        let config = devnull_config(); // root_markers: None → default [".git"]
+
+        let key_a = pool.connection_key("pyright", &config, Some(&doc_a));
+        let key_b = pool.connection_key("pyright", &config, Some(&doc_b));
+
+        assert_ne!(
+            key_a, key_b,
+            "documents under different .git roots must get distinct connection keys"
+        );
+        // Same server name, same root → same key (e.g. a sibling file in proj A).
+        let doc_a2 = Url::from_file_path(proj_a.join("src/other.py")).unwrap();
+        assert_eq!(
+            key_a,
+            pool.connection_key("pyright", &config, Some(&doc_a2)),
+            "documents sharing a marker root must share one connection key"
+        );
+        // Different server name under the same root → distinct connection.
+        assert_ne!(
+            key_a,
+            pool.connection_key("ruff", &config, Some(&doc_a)),
+            "different servers never share a connection"
+        );
+    }
+
+    /// A document with no marker root (and the no-document case) resolves to the
+    /// client-root fallback key, shared across all such documents — preserving
+    /// the pre-#382 single-process behavior for non-monorepo layouts.
+    #[test]
+    fn connection_key_falls_back_to_shared_key_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.git` anywhere up the tree from these orphan files.
+        let orphan_1 = Url::from_file_path(tmp.path().join("one.py")).unwrap();
+        let orphan_2 = Url::from_file_path(tmp.path().join("nested/two.py")).unwrap();
+
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+
+        let fallback = pool.connection_key("pyright", &config, Some(&orphan_1));
+        assert_eq!(
+            fallback,
+            pool.connection_key("pyright", &config, Some(&orphan_2)),
+            "marker-less documents must share the fallback connection"
+        );
+        assert_eq!(
+            fallback,
+            pool.connection_key("pyright", &config, None),
+            "the no-document case must resolve to the same fallback key"
+        );
+    }
+
+    /// Two documents under different marker roots spawn two separate downstream
+    /// connections in the pool rather than reusing one (#382). Uses a sink
+    /// command and a short timeout: the handshake fails, but each acquisition
+    /// still inserts its own keyed connection, which is what we assert.
+    #[tokio::test]
+    async fn different_marker_roots_create_separate_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj_a = tmp.path().join("a");
+        let proj_b = tmp.path().join("b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+        std::fs::create_dir(proj_a.join(".git")).unwrap();
+        std::fs::create_dir(proj_b.join(".git")).unwrap();
+        let doc_a = Url::from_file_path(proj_a.join("main.py")).unwrap();
+        let doc_b = Url::from_file_path(proj_b.join("main.py")).unwrap();
+
+        let pool = LanguageServerPool::new();
+        let config = devnull_config_for_language("python");
+
+        // Sink server never completes the handshake; a short timeout fails fast.
+        // Either way the keyed connection is inserted before the handshake runs.
+        let _ = pool
+            .get_or_create_connection_with_timeout(
+                "pyright",
+                &config,
+                Some(&doc_a),
+                Duration::from_millis(150),
+            )
+            .await;
+        let _ = pool
+            .get_or_create_connection_with_timeout(
+                "pyright",
+                &config,
+                Some(&doc_b),
+                Duration::from_millis(150),
+            )
+            .await;
+
+        let connections = pool.connections.lock().await;
+        assert_eq!(
+            connections.len(),
+            2,
+            "each marker root must get its own pooled connection, not share one"
+        );
+        let key_a = pool.connection_key("pyright", &config, Some(&doc_a));
+        let key_b = pool.connection_key("pyright", &config, Some(&doc_b));
+        assert!(
+            connections.contains_key(&key_a),
+            "root A connection present"
+        );
+        assert!(
+            connections.contains_key(&key_b),
+            "root B connection present"
         );
     }
 
@@ -1210,11 +1461,15 @@ mod tests {
 
         // Insert a ConnectionHandle with Initializing state
         {
-            let handle = create_handle_with_state(ConnectionState::Initializing).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Initializing,
+                ConnectionKey::for_server("lua"),
+            )
+            .await;
             pool.connections
                 .lock()
                 .await
-                .insert("lua".to_string(), handle);
+                .insert(ConnectionKey::for_server("lua"), handle);
         }
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
@@ -1282,11 +1537,13 @@ mod tests {
 
         // Insert a ConnectionHandle with Failed state
         {
-            let handle = create_handle_with_state(ConnectionState::Failed).await;
+            let handle =
+                create_handle_with_key(ConnectionState::Failed, ConnectionKey::for_server("lua"))
+                    .await;
             pool.connections
                 .lock()
                 .await
-                .insert("lua".to_string(), handle);
+                .insert(ConnectionKey::for_server("lua"), handle);
         }
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
@@ -1318,7 +1575,9 @@ mod tests {
         // Verify the connection is now Ready
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("lua").expect("Should have connection");
+            let handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Should have connection");
             assert_eq!(
                 handle.state(),
                 ConnectionState::Ready,
@@ -1392,7 +1651,9 @@ mod tests {
         // Verify state is Ready after successful init (via ConnectionHandle)
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("lua").expect("Connection should exist");
+            let handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Connection should exist");
             assert_eq!(
                 handle.state(),
                 ConnectionState::Ready,
@@ -1459,7 +1720,7 @@ mod tests {
         // With async fast-fail architecture, failed connections are in Failed state
         // (will be removed on next request attempt via Failed state handling)
         let connections = pool.connections.lock().await;
-        if let Some(handle) = connections.get("test") {
+        if let Some(handle) = connections.get(&ConnectionKey::for_server("test")) {
             assert_eq!(
                 handle.state(),
                 ConnectionState::Failed,
@@ -1517,17 +1778,21 @@ mod tests {
 
         // Setup: Insert a Failed connection handle
         {
-            let handle = create_handle_with_state(ConnectionState::Failed).await;
+            let handle =
+                create_handle_with_key(ConnectionState::Failed, ConnectionKey::for_server("lua"))
+                    .await;
             pool.connections
                 .lock()
                 .await
-                .insert("lua".to_string(), handle);
+                .insert(ConnectionKey::for_server("lua"), handle);
         }
 
         // Verify Failed state is in cache
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("lua").expect("Should have cached handle");
+            let handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Should have cached handle");
             assert_eq!(handle.state(), ConnectionState::Failed, "Should be Failed");
         }
 
@@ -1556,7 +1821,9 @@ mod tests {
         // Verify the old Failed handle was replaced in cache
         {
             let connections = pool.connections.lock().await;
-            let cached_handle = connections.get("lua").expect("Should have cached handle");
+            let cached_handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Should have cached handle");
             assert_eq!(
                 cached_handle.state(),
                 ConnectionState::Ready,
@@ -1614,7 +1881,7 @@ mod tests {
         // With async fast-fail architecture, connection is stored and transitions to Failed
         {
             let connections = pool.connections.lock().await;
-            if let Some(handle) = connections.get("lua") {
+            if let Some(handle) = connections.get(&ConnectionKey::for_server("lua")) {
                 assert_eq!(
                     handle.state(),
                     ConnectionState::Failed,
@@ -1653,7 +1920,9 @@ mod tests {
         // Verify cache contains the Ready connection
         {
             let connections = pool.connections.lock().await;
-            let cached_handle = connections.get("lua").expect("Should have cached handle");
+            let cached_handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Should have cached handle");
             assert_eq!(
                 cached_handle.state(),
                 ConnectionState::Ready,
@@ -1701,7 +1970,9 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Send didClose notification (server_name matches the one used in send_hover_request)
-        let result = pool.send_didclose_notification(&virtual_uri, "lua").await;
+        let result = pool
+            .send_didclose_notification(&virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
         assert!(
             result.is_ok(),
             "send_didclose_notification should succeed: {:?}",
@@ -1711,7 +1982,9 @@ mod tests {
         // Verify connection is still Ready
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("lua").expect("Connection should exist");
+            let handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Connection should exist");
             assert_eq!(
                 handle.state(),
                 ConnectionState::Ready,
@@ -1791,7 +2064,9 @@ mod tests {
         // Verify connection is still Ready (not closed)
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("lua").expect("Connection should exist");
+            let handle = connections
+                .get(&ConnectionKey::for_server("lua"))
+                .expect("Connection should exist");
             assert_eq!(
                 handle.state(),
                 ConnectionState::Ready,
@@ -1815,14 +2090,15 @@ mod tests {
 
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         // Simulate successful didOpen by registering the document
-        pool.register_opened_document(&host_uri, &virtual_uri, "lua")
+        pool.register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
 
         // ls-bridge-message-ordering: No need to hold a writer lock - sends are channel-based and non-blocking
         use crate::lsp::bridge::coordinator::BridgeInjection;
@@ -1875,7 +2151,13 @@ mod tests {
 
         // Call ensure_document_opened
         let result = pool
-            .ensure_document_opened(&mut sender, &host_uri, &virtual_uri, virtual_content, "lua")
+            .ensure_document_opened(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                virtual_content,
+                &ConnectionKey::for_server("lua"),
+            )
             .await;
 
         // Should succeed
@@ -1915,7 +2197,7 @@ mod tests {
         let virtual_content = "print('hello')";
 
         // Pre-register the document (simulate previous successful didOpen)
-        pool.register_opened_document(&host_uri, &virtual_uri, "lua")
+        pool.register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
             .await;
 
         // Verify document is already marked as opened
@@ -1929,7 +2211,13 @@ mod tests {
 
         // Call ensure_document_opened - should skip didOpen
         let result = pool
-            .ensure_document_opened(&mut sender, &host_uri, &virtual_uri, virtual_content, "lua")
+            .ensure_document_opened(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                virtual_content,
+                &ConnectionKey::for_server("lua"),
+            )
             .await;
 
         // Should succeed (just skips didOpen)
@@ -1971,7 +2259,13 @@ mod tests {
 
         // Call ensure_document_opened — should fail with BrokenPipe
         let result = pool
-            .ensure_document_opened(&mut sender, &host_uri, &virtual_uri, virtual_content, "lua")
+            .ensure_document_opened(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                virtual_content,
+                &ConnectionKey::for_server("lua"),
+            )
             .await;
 
         assert!(result.is_err(), "Should fail with BrokenPipe");
@@ -2005,11 +2299,13 @@ mod tests {
 
         // Insert a ConnectionHandle with Closing state
         {
-            let handle = create_handle_with_state(ConnectionState::Closing).await;
+            let handle =
+                create_handle_with_key(ConnectionState::Closing, ConnectionKey::for_server("lua"))
+                    .await;
             pool.connections
                 .lock()
                 .await
-                .insert("lua".to_string(), handle);
+                .insert(ConnectionKey::for_server("lua"), handle);
         }
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
@@ -2179,14 +2475,22 @@ mod tests {
 
         // Create multiple connections with different states
         {
-            let ready_handle = create_handle_with_state(ConnectionState::Ready).await;
-            let failed_handle = create_handle_with_state(ConnectionState::Failed).await;
-            let closing_handle = create_handle_with_state(ConnectionState::Closing).await;
+            let ready_handle =
+                create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua"))
+                    .await;
+            let failed_handle = create_handle_with_key(
+                ConnectionState::Failed,
+                ConnectionKey::for_server("python"),
+            )
+            .await;
+            let closing_handle =
+                create_handle_with_key(ConnectionState::Closing, ConnectionKey::for_server("rust"))
+                    .await;
 
             let mut connections = pool.connections.lock().await;
-            connections.insert("lua".to_string(), ready_handle);
-            connections.insert("python".to_string(), failed_handle);
-            connections.insert("rust".to_string(), closing_handle);
+            connections.insert(ConnectionKey::for_server("lua"), ready_handle);
+            connections.insert(ConnectionKey::for_server("python"), failed_handle);
+            connections.insert(ConnectionKey::for_server("rust"), closing_handle);
         }
 
         // Call shutdown_all
@@ -2196,7 +2500,9 @@ mod tests {
         let connections = pool.connections.lock().await;
 
         // Ready -> should be Closed (went through graceful shutdown)
-        let lua_handle = connections.get("lua").expect("lua should exist");
+        let lua_handle = connections
+            .get(&ConnectionKey::for_server("lua"))
+            .expect("lua should exist");
         assert_eq!(
             lua_handle.state(),
             ConnectionState::Closed,
@@ -2204,7 +2510,9 @@ mod tests {
         );
 
         // Failed -> should be Closed (directly, no LSP handshake)
-        let python_handle = connections.get("python").expect("python should exist");
+        let python_handle = connections
+            .get(&ConnectionKey::for_server("python"))
+            .expect("python should exist");
         assert_eq!(
             python_handle.state(),
             ConnectionState::Closed,
@@ -2216,7 +2524,9 @@ mod tests {
         // Ready handle's graceful_shutdown hangs until the global timeout. When
         // force_kill_all runs, it transitions ALL non-Closed connections to Closed,
         // including this one that was already Closing.
-        let rust_handle = connections.get("rust").expect("rust should exist");
+        let rust_handle = connections
+            .get(&ConnectionKey::for_server("rust"))
+            .expect("rust should exist");
         assert_eq!(
             rust_handle.state(),
             ConnectionState::Closed,
@@ -2264,13 +2574,14 @@ mod tests {
             tx,
             rx,
             Arc::new(DynamicCapabilityRegistry::new()),
+            ConnectionKey::for_server("test"),
         ));
 
         // Add connection to pool
         pool.connections
             .lock()
             .await
-            .insert("test".to_string(), handle);
+            .insert(ConnectionKey::for_server("test"), handle);
 
         // Start timer
         let start = Instant::now();
@@ -2294,7 +2605,9 @@ mod tests {
 
         // Connection should be Closed
         let connections = pool.connections.lock().await;
-        let handle = connections.get("test").expect("connection should exist");
+        let handle = connections
+            .get(&ConnectionKey::for_server("test"))
+            .expect("connection should exist");
         assert_eq!(
             handle.state(),
             ConnectionState::Closed,
@@ -2388,11 +2701,15 @@ mod tests {
 
         // Insert a connection that will hang (cat > /dev/null never responds)
         {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("hung_server"),
+            )
+            .await;
             pool.connections
                 .lock()
                 .await
-                .insert("hung_server".to_string(), handle);
+                .insert(ConnectionKey::for_server("hung_server"), handle);
         }
 
         let timeout = GlobalShutdownTimeout::new(Duration::from_secs(5)).expect("5s is valid");
@@ -2412,7 +2729,7 @@ mod tests {
 
         // All connections should be in Closed state
         let connections = pool.connections.lock().await;
-        if let Some(handle) = connections.get("hung_server") {
+        if let Some(handle) = connections.get(&ConnectionKey::for_server("hung_server")) {
             assert_eq!(
                 handle.state(),
                 ConnectionState::Closed,
@@ -2428,11 +2745,15 @@ mod tests {
 
         // Insert 3 hung servers - if sequential would be 3 * 5s = 15s
         for i in 0..3 {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
-            pool.connections
-                .lock()
-                .await
-                .insert(format!("hung_server_{}", i), handle);
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server(format!("hung_server_{}", i)),
+            )
+            .await;
+            pool.connections.lock().await.insert(
+                ConnectionKey::for_server(format!("hung_server_{}", i)),
+                handle,
+            );
         }
 
         // Use 5s timeout - should complete in ~5s even with 3 servers
@@ -2455,7 +2776,7 @@ mod tests {
         // All connections should be in Closed state
         let connections = pool.connections.lock().await;
         for i in 0..3 {
-            let key = format!("hung_server_{}", i);
+            let key = ConnectionKey::for_server(format!("hung_server_{}", i));
             if let Some(handle) = connections.get(&key) {
                 assert_eq!(
                     handle.state(),
@@ -2479,11 +2800,15 @@ mod tests {
 
         // Insert connections
         for i in 0..2 {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server(format!("server_{}", i)),
+            )
+            .await;
             pool.connections
                 .lock()
                 .await
-                .insert(format!("server_{}", i), handle);
+                .insert(ConnectionKey::for_server(format!("server_{}", i)), handle);
         }
 
         // Use minimum valid timeout (5s)
@@ -2494,7 +2819,7 @@ mod tests {
         // All connections should be in Closed state (via graceful shutdown or force-kill)
         let connections = pool.connections.lock().await;
         for i in 0..2 {
-            let key = format!("server_{}", i);
+            let key = ConnectionKey::for_server(format!("server_{}", i));
             if let Some(handle) = connections.get(&key) {
                 assert_eq!(
                     handle.state(),
@@ -2573,7 +2898,8 @@ mod tests {
 
         // Create a pool and connection manually
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Register a request with upstream ID
         let upstream_id = UpstreamId::Number(42);
@@ -2585,8 +2911,8 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         // Forward cancel request
         let result = pool
@@ -2626,7 +2952,8 @@ mod tests {
         use std::sync::Arc;
 
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Two in-flight requests sharing one upstream id (sibling regions).
         let upstream_id = UpstreamId::Number(42);
@@ -2640,10 +2967,12 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
 
         // Cancel exactly the first request by its downstream id.
-        let result = pool.forward_cancel_downstream("lua", first_id).await;
+        let result = pool
+            .forward_cancel_downstream(&ConnectionKey::for_server("lua"), first_id)
+            .await;
         assert!(
             result.is_ok(),
             "forward_cancel_downstream should succeed: {:?}",
@@ -2662,7 +2991,7 @@ mod tests {
         let pool = LanguageServerPool::new();
 
         let result = pool
-            .forward_cancel_downstream("nonexistent", RequestId::new(7))
+            .forward_cancel_downstream(&ConnectionKey::for_server("nonexistent"), RequestId::new(7))
             .await;
 
         assert!(
@@ -2677,7 +3006,10 @@ mod tests {
     async fn forward_cancel_silently_drops_when_no_connection() {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
-        pool.register_upstream_request(upstream_id.clone(), "nonexistent");
+        pool.register_upstream_request(
+            upstream_id.clone(),
+            &ConnectionKey::for_server("nonexistent"),
+        );
 
         let result = pool
             .forward_cancel_by_upstream_id_with_notify(upstream_id, || {})
@@ -2697,15 +3029,16 @@ mod tests {
         use std::sync::Arc;
 
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Insert connection but don't register any request with the router
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
         let upstream_id = UpstreamId::Number(999);
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         let result = pool
             .forward_cancel_by_upstream_id_with_notify(upstream_id, || {})
@@ -2727,13 +3060,13 @@ mod tests {
     fn register_upstream_request_stores_mapping() {
         let pool = LanguageServerPool::new();
 
-        pool.register_upstream_request(UpstreamId::Number(42), "lua");
+        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry
             .get(&UpstreamId::Number(42))
             .expect("should have entry");
-        assert!(servers.contains_key("lua"));
+        assert!(servers.contains_key(&ConnectionKey::for_server("lua")));
         assert_eq!(servers.len(), 1);
     }
 
@@ -2742,8 +3075,11 @@ mod tests {
     fn unregister_upstream_request_removes_mapping() {
         let pool = LanguageServerPool::new();
 
-        pool.register_upstream_request(UpstreamId::Number(42), "lua");
-        pool.unregister_upstream_request(&UpstreamId::Number(42), "lua");
+        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
+        pool.unregister_upstream_request(
+            &UpstreamId::Number(42),
+            &ConnectionKey::for_server("lua"),
+        );
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert_eq!(registry.get(&UpstreamId::Number(42)), None);
@@ -2759,7 +3095,8 @@ mod tests {
         use std::sync::Arc;
 
         let pool = Arc::new(LanguageServerPool::new());
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         let upstream_id = UpstreamId::Number(42);
         let (downstream_id, _response_rx) = handle
@@ -2769,8 +3106,8 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         // Simulate the handler waking on the cancel notification and running
         // its cleanup before the forwarding pass sends anything.
@@ -2810,10 +3147,13 @@ mod tests {
     fn unregister_upstream_request_keeps_server_while_sibling_requests_in_flight() {
         let pool = LanguageServerPool::new();
 
-        pool.register_upstream_request(UpstreamId::Number(42), "lua");
-        pool.register_upstream_request(UpstreamId::Number(42), "lua");
+        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
+        pool.register_upstream_request(UpstreamId::Number(42), &ConnectionKey::for_server("lua"));
 
-        pool.unregister_upstream_request(&UpstreamId::Number(42), "lua");
+        pool.unregister_upstream_request(
+            &UpstreamId::Number(42),
+            &ConnectionKey::for_server("lua"),
+        );
         {
             let registry = pool.upstream_request_registry.lock().unwrap();
             assert!(
@@ -2822,7 +3162,10 @@ mod tests {
             );
         }
 
-        pool.unregister_upstream_request(&UpstreamId::Number(42), "lua");
+        pool.unregister_upstream_request(
+            &UpstreamId::Number(42),
+            &ConnectionKey::for_server("lua"),
+        );
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert_eq!(registry.get(&UpstreamId::Number(42)), None);
     }
@@ -2833,7 +3176,8 @@ mod tests {
         use std::sync::Arc;
 
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Register a request with upstream ID mapping in ResponseRouter
         let upstream_id = UpstreamId::Number(42);
@@ -2845,10 +3189,10 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
 
         // Register the upstream request in the registry
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         // Forward cancel by upstream ID only (no language parameter)
         let result = pool
@@ -2888,7 +3232,8 @@ mod tests {
         use std::sync::Arc;
 
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Register a request with upstream ID
         let upstream_id = UpstreamId::Number(42);
@@ -2900,8 +3245,8 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         // Forward cancel request (simulating client cancelling the request)
         let cancel_result = pool
@@ -2963,7 +3308,8 @@ mod tests {
         use std::sync::Arc;
 
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Register a request with upstream ID
         let upstream_id = UpstreamId::Number(42);
@@ -2975,8 +3321,8 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         // Forward cancel request
         let cancel_result = pool
@@ -3019,7 +3365,8 @@ mod tests {
         use std::sync::Arc;
 
         let pool = LanguageServerPool::new();
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
 
         // Register a request with upstream ID
         let upstream_id = UpstreamId::Number(42);
@@ -3030,8 +3377,8 @@ mod tests {
         pool.connections
             .lock()
             .await
-            .insert("lua".to_string(), Arc::clone(&handle));
-        pool.register_upstream_request(upstream_id.clone(), "lua");
+            .insert(ConnectionKey::for_server("lua"), Arc::clone(&handle));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua"));
 
         // Forward cancel
         let _ = pool
@@ -3056,7 +3403,10 @@ mod tests {
         let pool = LanguageServerPool::new();
 
         // Test: no connection
-        pool.register_upstream_request(UpstreamId::Number(1), "nonexistent");
+        pool.register_upstream_request(
+            UpstreamId::Number(1),
+            &ConnectionKey::for_server("nonexistent"),
+        );
         let _ = pool
             .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(1), || {})
             .await;
@@ -3067,23 +3417,37 @@ mod tests {
             .await;
 
         // Test: connection not ready
-        let handle_init = create_handle_with_state(ConnectionState::Initializing).await;
-        pool.connections
-            .lock()
-            .await
-            .insert("init_lang".to_string(), Arc::clone(&handle_init));
-        pool.register_upstream_request(UpstreamId::Number(2), "init_lang");
+        let handle_init = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("init_lang"),
+        )
+        .await;
+        pool.connections.lock().await.insert(
+            ConnectionKey::for_server("init_lang"),
+            Arc::clone(&handle_init),
+        );
+        pool.register_upstream_request(
+            UpstreamId::Number(2),
+            &ConnectionKey::for_server("init_lang"),
+        );
         let _ = pool
             .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(2), || {})
             .await;
 
         // Test: unknown upstream ID
-        let handle_ready = create_handle_with_state(ConnectionState::Ready).await;
-        pool.connections
-            .lock()
-            .await
-            .insert("ready_lang".to_string(), Arc::clone(&handle_ready));
-        pool.register_upstream_request(UpstreamId::Number(3), "ready_lang");
+        let handle_ready = create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("ready_lang"),
+        )
+        .await;
+        pool.connections.lock().await.insert(
+            ConnectionKey::for_server("ready_lang"),
+            Arc::clone(&handle_ready),
+        );
+        pool.register_upstream_request(
+            UpstreamId::Number(3),
+            &ConnectionKey::for_server("ready_lang"),
+        );
         let _ = pool
             .forward_cancel_by_upstream_id_with_notify(UpstreamId::Number(3), || {})
             .await;
@@ -3123,28 +3487,35 @@ mod tests {
             VirtualDocumentUri::new(&url_to_uri(&host_uri), "typescript", TEST_ULID_LUA_0);
 
         // Insert a connection keyed by "tsgo" (server_name), NOT "typescript" (language)
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("tsgo")).await;
         pool.connections
             .lock()
             .await
-            .insert("tsgo".to_string(), Arc::clone(&handle));
+            .insert(ConnectionKey::for_server("tsgo"), Arc::clone(&handle));
 
         // Verify there is NO connection for "typescript" (the language)
         {
             let connections = pool.connections.lock().await;
             assert!(
-                connections.get("typescript").is_none(),
+                connections
+                    .get(&ConnectionKey::for_server("typescript"))
+                    .is_none(),
                 "Should NOT have a 'typescript' connection"
             );
             assert!(
-                connections.get("tsgo").is_some(),
+                connections
+                    .get(&ConnectionKey::for_server("tsgo"))
+                    .is_some(),
                 "Should have a 'tsgo' connection"
             );
         }
 
         // Send didClose with server_name="tsgo"
         // This should succeed because we look up by server_name, not language
-        let result = pool.send_didclose_notification(&virtual_uri, "tsgo").await;
+        let result = pool
+            .send_didclose_notification(&virtual_uri, &ConnectionKey::for_server("tsgo"))
+            .await;
         assert!(
             result.is_ok(),
             "send_didclose_notification should succeed when using server_name 'tsgo': {:?}",
@@ -3154,7 +3525,9 @@ mod tests {
         // Verify connection is still Ready (not closed)
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("tsgo").expect("Connection should exist");
+            let handle = connections
+                .get(&ConnectionKey::for_server("tsgo"))
+                .expect("Connection should exist");
             assert_eq!(
                 handle.state(),
                 ConnectionState::Ready,
@@ -3181,15 +3554,16 @@ mod tests {
 
         // Register the document with server_name="tsgo" (process-sharing scenario)
         // This simulates what happens when a typescript block uses the tsgo server
-        pool.register_opened_document(&host_uri, &virtual_uri, "tsgo")
+        pool.register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("tsgo"))
             .await;
 
         // Insert a connection keyed by "tsgo" (NOT "typescript")
-        let handle = create_handle_with_state(ConnectionState::Ready).await;
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("tsgo")).await;
         pool.connections
             .lock()
             .await
-            .insert("tsgo".to_string(), Arc::clone(&handle));
+            .insert(ConnectionKey::for_server("tsgo"), Arc::clone(&handle));
 
         // Close the host document - this triggers close_single_virtual_doc internally
         let closed_docs = pool.close_host_document(&host_uri).await;
@@ -3202,7 +3576,8 @@ mod tests {
             "Closed doc should have language 'typescript'"
         );
         assert_eq!(
-            closed_docs[0].server_name, "tsgo",
+            closed_docs[0].connection_key,
+            ConnectionKey::for_server("tsgo"),
             "Closed doc should have server_name 'tsgo'"
         );
 
@@ -3215,7 +3590,9 @@ mod tests {
         // Verify connection is still Ready (not closed)
         {
             let connections = pool.connections.lock().await;
-            let handle = connections.get("tsgo").expect("Connection should exist");
+            let handle = connections
+                .get(&ConnectionKey::for_server("tsgo"))
+                .expect("Connection should exist");
             assert_eq!(
                 handle.state(),
                 ConnectionState::Ready,
@@ -3250,7 +3627,7 @@ mod tests {
         // Before: no connection exists
         {
             let connections = pool.connections.lock().await;
-            assert!(!connections.contains_key("test-server"));
+            assert!(!connections.contains_key(&ConnectionKey::for_server("test-server")));
         }
 
         // Spawn server (ignoring errors like ensure_server_ready does)
@@ -3263,7 +3640,7 @@ mod tests {
         {
             let connections = pool.connections.lock().await;
             assert!(
-                connections.contains_key("test-server"),
+                connections.contains_key(&ConnectionKey::for_server("test-server")),
                 "Connection entry should be created by ensure_server_ready"
             );
             // We don't assert specific state because devnull's behavior varies:
@@ -3317,7 +3694,7 @@ mod tests {
         let handle = {
             let connections = pool.connections.lock().await;
             connections
-                .get("lua-ls")
+                .get(&ConnectionKey::for_server("lua-ls"))
                 .cloned()
                 .expect("Connection handle should exist after ensure_server_ready")
         };
@@ -3347,12 +3724,16 @@ mod tests {
         let config = devnull_config();
 
         // Insert a connection in Initializing state
-        let handle = create_handle_with_state(ConnectionState::Initializing).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("test-server"),
+        )
+        .await;
         let handle_clone = Arc::clone(&handle);
         pool.connections
             .lock()
             .await
-            .insert("test-server".to_string(), handle);
+            .insert(ConnectionKey::for_server("test-server"), handle);
 
         // Spawn a task that will transition to Ready after a delay
         tokio::spawn(async move {
@@ -3394,12 +3775,16 @@ mod tests {
         let config = devnull_config();
 
         // Insert a connection in Initializing state
-        let handle = create_handle_with_state(ConnectionState::Initializing).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("test-server"),
+        )
+        .await;
         let handle_clone = Arc::clone(&handle);
         pool.connections
             .lock()
             .await
-            .insert("test-server".to_string(), handle);
+            .insert(ConnectionKey::for_server("test-server"), handle);
 
         // Spawn a task that will transition to Failed after a delay
         tokio::spawn(async move {
@@ -3437,11 +3822,15 @@ mod tests {
         let config = devnull_config();
 
         // Insert a connection in Initializing state that won't transition
-        let handle = create_handle_with_state(ConnectionState::Initializing).await;
+        let handle = create_handle_with_key(
+            ConnectionState::Initializing,
+            ConnectionKey::for_server("test-server"),
+        )
+        .await;
         pool.connections
             .lock()
             .await
-            .insert("test-server".to_string(), handle);
+            .insert(ConnectionKey::for_server("test-server"), handle);
 
         // Call with short timeout - should timeout
         let result = pool
@@ -3503,14 +3892,14 @@ mod tests {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
 
-        pool.register_upstream_request(upstream_id.clone(), "lua-ls");
-        pool.register_upstream_request(upstream_id.clone(), "pyright");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry.get(&upstream_id).expect("should have entry");
 
-        assert!(servers.contains_key("lua-ls"));
-        assert!(servers.contains_key("pyright"));
+        assert!(servers.contains_key(&ConnectionKey::for_server("lua-ls")));
+        assert!(servers.contains_key(&ConnectionKey::for_server("pyright")));
         assert_eq!(servers.len(), 2);
     }
 
@@ -3520,15 +3909,15 @@ mod tests {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
 
-        pool.register_upstream_request(upstream_id.clone(), "lua-ls");
-        pool.register_upstream_request(upstream_id.clone(), "pyright");
-        pool.unregister_upstream_request(&upstream_id, "lua-ls");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
+        pool.unregister_upstream_request(&upstream_id, &ConnectionKey::for_server("lua-ls"));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         let servers = registry.get(&upstream_id).expect("should still have entry");
 
-        assert!(!servers.contains_key("lua-ls"));
-        assert!(servers.contains_key("pyright"));
+        assert!(!servers.contains_key(&ConnectionKey::for_server("lua-ls")));
+        assert!(servers.contains_key(&ConnectionKey::for_server("pyright")));
         assert_eq!(servers.len(), 1);
     }
 
@@ -3538,8 +3927,8 @@ mod tests {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
 
-        pool.register_upstream_request(upstream_id.clone(), "lua-ls");
-        pool.unregister_upstream_request(&upstream_id, "lua-ls");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
+        pool.unregister_upstream_request(&upstream_id, &ConnectionKey::for_server("lua-ls"));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
         assert!(
@@ -3557,12 +3946,16 @@ mod tests {
         let upstream_id = UpstreamId::Number(42);
 
         // Create two Ready connections with registered requests
-        let handle_lua = create_handle_with_state(ConnectionState::Ready).await;
+        let handle_lua =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua-ls"))
+                .await;
         let (_downstream_id_lua, _rx_lua) = handle_lua
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register lua request");
 
-        let handle_py = create_handle_with_state(ConnectionState::Ready).await;
+        let handle_py =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("pyright"))
+                .await;
         let (_downstream_id_py, _rx_py) = handle_py
             .register_request_with_upstream(Some(upstream_id.clone()))
             .expect("should register py request");
@@ -3570,13 +3963,13 @@ mod tests {
         // Insert handles
         {
             let mut connections = pool.connections.lock().await;
-            connections.insert("lua-ls".to_string(), Arc::clone(&handle_lua));
-            connections.insert("pyright".to_string(), Arc::clone(&handle_py));
+            connections.insert(ConnectionKey::for_server("lua-ls"), Arc::clone(&handle_lua));
+            connections.insert(ConnectionKey::for_server("pyright"), Arc::clone(&handle_py));
         }
 
         // Register both servers for the same upstream ID
-        pool.register_upstream_request(upstream_id.clone(), "lua-ls");
-        pool.register_upstream_request(upstream_id.clone(), "pyright");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
 
         // Forward cancel - should succeed for both servers
         let result = pool
@@ -3598,8 +3991,8 @@ mod tests {
         let pool = LanguageServerPool::new();
         let upstream_id = UpstreamId::Number(42);
 
-        pool.register_upstream_request(upstream_id.clone(), "lua-ls");
-        pool.register_upstream_request(upstream_id.clone(), "pyright");
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("lua-ls"));
+        pool.register_upstream_request(upstream_id.clone(), &ConnectionKey::for_server("pyright"));
         pool.unregister_all_for_upstream_id(Some(&upstream_id));
 
         let registry = pool.upstream_request_registry.lock().unwrap();
@@ -3635,18 +4028,32 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Register the same virtual doc for two servers
-        pool.register_opened_document(&host_uri, &virtual_uri, "emmylua")
-            .await;
-        pool.register_opened_document(&host_uri, &virtual_uri, "lua_ls")
-            .await;
+        pool.register_opened_document(
+            &host_uri,
+            &virtual_uri,
+            &ConnectionKey::for_server("emmylua"),
+        )
+        .await;
+        pool.register_opened_document(
+            &host_uri,
+            &virtual_uri,
+            &ConnectionKey::for_server("lua_ls"),
+        )
+        .await;
 
         // Insert Ready connections for both servers
         {
-            let handle_emmylua = create_handle_with_state(ConnectionState::Ready).await;
-            let handle_lua_ls = create_handle_with_state(ConnectionState::Ready).await;
+            let handle_emmylua = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("emmylua"),
+            )
+            .await;
+            let handle_lua_ls =
+                create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua_ls"))
+                    .await;
             let mut connections = pool.connections.lock().await;
-            connections.insert("emmylua".to_string(), handle_emmylua);
-            connections.insert("lua_ls".to_string(), handle_lua_ls);
+            connections.insert(ConnectionKey::for_server("emmylua"), handle_emmylua);
+            connections.insert(ConnectionKey::for_server("lua_ls"), handle_lua_ls);
         }
 
         // Forward didChange
@@ -3660,10 +4067,10 @@ mod tests {
 
         // Verify both servers got their versions incremented (1 -> 2)
         let version_emmylua = pool
-            .increment_document_version(&virtual_uri, "emmylua")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("emmylua"))
             .await;
         let version_lua_ls = pool
-            .increment_document_version(&virtual_uri, "lua_ls")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("lua_ls"))
             .await;
 
         // After forward_didchange incremented once (1->2), our manual increment makes it 2->3
@@ -3690,18 +4097,34 @@ mod tests {
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
 
         // Register the same virtual doc for two servers
-        pool.register_opened_document(&host_uri, &virtual_uri, "ready_server")
-            .await;
-        pool.register_opened_document(&host_uri, &virtual_uri, "init_server")
-            .await;
+        pool.register_opened_document(
+            &host_uri,
+            &virtual_uri,
+            &ConnectionKey::for_server("ready_server"),
+        )
+        .await;
+        pool.register_opened_document(
+            &host_uri,
+            &virtual_uri,
+            &ConnectionKey::for_server("init_server"),
+        )
+        .await;
 
         // One Ready, one Initializing
         {
-            let handle_ready = create_handle_with_state(ConnectionState::Ready).await;
-            let handle_init = create_handle_with_state(ConnectionState::Initializing).await;
+            let handle_ready = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("ready_server"),
+            )
+            .await;
+            let handle_init = create_handle_with_key(
+                ConnectionState::Initializing,
+                ConnectionKey::for_server("init_server"),
+            )
+            .await;
             let mut connections = pool.connections.lock().await;
-            connections.insert("ready_server".to_string(), handle_ready);
-            connections.insert("init_server".to_string(), handle_init);
+            connections.insert(ConnectionKey::for_server("ready_server"), handle_ready);
+            connections.insert(ConnectionKey::for_server("init_server"), handle_init);
         }
 
         // Forward didChange
@@ -3715,7 +4138,7 @@ mod tests {
 
         // ready_server should have been incremented (1->2)
         let version_ready = pool
-            .increment_document_version(&virtual_uri, "ready_server")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("ready_server"))
             .await;
         assert_eq!(
             version_ready,
@@ -3725,7 +4148,7 @@ mod tests {
 
         // init_server should NOT have been incremented (still at 1)
         let version_init = pool
-            .increment_document_version(&virtual_uri, "init_server")
+            .increment_document_version(&virtual_uri, &ConnectionKey::for_server("init_server"))
             .await;
         assert_eq!(
             version_init,

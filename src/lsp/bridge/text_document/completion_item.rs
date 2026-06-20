@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use log::warn;
 use tower_lsp_server::ls_types::CompletionItem;
+use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error};
@@ -74,12 +75,16 @@ impl LanguageServerPool {
         upstream_id: Option<UpstreamId>,
     ) -> CompletionItem {
         let server_name = &envelope.origin;
-        // No rootMarkers document hint: resolve params carry no textDocument.
-        // The origin server is normally already pooled by the completion
-        // request that produced the item; only if it died in between does
-        // this respawn — then with the client-supplied root.
+        // Route to the SAME `(server, root)` connection the completion request
+        // ran on (#382): the envelope carries the originating host URI, which
+        // resolves to the same connection key. Without it (legacy envelope with
+        // an empty host_uri), this falls back to the server's client-root
+        // connection — a different process in a multi-root monorepo. The origin
+        // is normally already pooled by the completion request that produced the
+        // item; only if it died in between does this respawn.
+        let host_uri = Url::parse(&envelope.host_uri).ok();
         let handle = match self
-            .get_or_create_connection(server_name, server_config, None)
+            .get_or_create_connection(server_name, server_config, host_uri.as_ref())
             .await
         {
             Ok(h) => h,
@@ -99,9 +104,14 @@ impl LanguageServerPool {
             return item;
         }
 
+        // Route per-connection cancel state by this handle's pool key (#382) —
+        // the same connection the completion ran on, recovered from the
+        // envelope's host URI above.
+        let connection_key = handle.key();
+
         // Register in the upstream request registry FIRST for cancel lookup.
         if let Some(ref id) = upstream_id {
-            self.register_upstream_request(id.clone(), server_name);
+            self.register_upstream_request(id.clone(), connection_key);
         }
 
         let (request_id, response_rx) =
@@ -114,7 +124,7 @@ impl LanguageServerPool {
                         server_name, e
                     );
                     if let Some(ref id) = upstream_id {
-                        self.unregister_upstream_request(id, server_name);
+                        self.unregister_upstream_request(id, connection_key);
                     }
                     re_envelope_item(&mut item, &envelope);
                     return item;
@@ -132,7 +142,7 @@ impl LanguageServerPool {
                 server_name, e
             );
             if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, server_name);
+                self.unregister_upstream_request(id, connection_key);
             }
             re_envelope_item(&mut item, &envelope);
             return item;
@@ -143,7 +153,7 @@ impl LanguageServerPool {
 
         // Unregister from the upstream request registry regardless of result
         if let Some(ref id) = upstream_id {
-            self.unregister_upstream_request(id, server_name);
+            self.unregister_upstream_request(id, connection_key);
         }
 
         let response = match response {
@@ -206,6 +216,7 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     let ctx = EnvelopeContext {
         server_name: &envelope.origin,
+        host_uri: &envelope.host_uri,
         offset: &RegionOffset::from(&envelope.offset),
     };
     envelope_item_data(item, &ctx);
@@ -222,6 +233,7 @@ mod tests {
     fn test_envelope() -> KakehashiEnvelope {
         KakehashiEnvelope {
             origin: "lua-ls".to_string(),
+            host_uri: "file:///test/doc.md".to_string(),
             inner: Some(json!({"resolve_id": 99})),
             offset: EnvelopeOffset {
                 line: 5,
@@ -344,6 +356,7 @@ mod tests {
     fn enveloped_item(server: &str) -> CompletionItem {
         let envelope = KakehashiEnvelope {
             origin: server.to_string(),
+            host_uri: "file:///test/doc.md".to_string(),
             inner: Some(json!({"resolve_id": 42})),
             offset: EnvelopeOffset {
                 line: 5,

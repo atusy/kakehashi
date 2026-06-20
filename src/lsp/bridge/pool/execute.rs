@@ -44,7 +44,6 @@ impl LanguageServerPool {
     pub(crate) async fn execute_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
-        server_name: &str,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
@@ -56,7 +55,6 @@ impl LanguageServerPool {
     ) -> io::Result<T> {
         self.execute_bridge_request_observed(
             handle,
-            server_name,
             host_uri,
             injection_language,
             region_id,
@@ -81,7 +79,6 @@ impl LanguageServerPool {
     pub(crate) async fn execute_bridge_request_observed<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
-        server_name: &str,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
@@ -92,6 +89,11 @@ impl LanguageServerPool {
         transform_response: impl FnOnce(serde_json::Value, &BridgeResponseContext<'_>) -> T,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
     ) -> io::Result<T> {
+        // Route all per-connection state by this handle's pool key
+        // `(server_name, root)` rather than a separately-threaded server name,
+        // so per-root pooling (#382) stays consistent.
+        let connection_key = handle.key();
+
         // Convert host_uri to lsp_types::Uri for bridge protocol functions
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -104,7 +106,7 @@ impl LanguageServerPool {
         // the cancel will fail at the router lookup (which is acceptable for best-effort
         // cancel semantics) rather than finding the server but no downstream ID.
         if let Some(ref id) = upstream_request_id {
-            self.register_upstream_request(id.clone(), server_name);
+            self.register_upstream_request(id.clone(), connection_key);
         }
 
         // Register request with upstream ID mapping for cancel forwarding
@@ -114,7 +116,7 @@ impl LanguageServerPool {
                 Err(e) => {
                     // Clean up the pool registration on failure
                     if let Some(ref id) = upstream_request_id {
-                        self.unregister_upstream_request(id, server_name);
+                        self.unregister_upstream_request(id, connection_key);
                     }
                     return Err(e);
                 }
@@ -134,31 +136,62 @@ impl LanguageServerPool {
         // wait_for_response completes normally (any exit path).
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        // Send didOpen notification only if document hasn't been opened yet
-        if let Err(e) = self
-            .ensure_document_opened(
-                &mut ConnectionHandleSender(&handle),
-                host_uri,
-                &virtual_uri,
-                virtual_content,
-                server_name,
-            )
-            .await
+        // Claim/didOpen and enqueue the request under the `connections` lock,
+        // after verifying `handle` is still the pool's LIVE connection for its
+        // key. `handle` was fetched earlier; a concurrent respawn
+        // (get_or_create's SpawnNew branch) could have removed it and PURGED the
+        // document tracker for this key. Registering didOpen state through the
+        // dead handle after that purge would re-seed `document_versions` /
+        // `opened_documents` for a process that never received the didOpen,
+        // wedging the doc until the host closes it. Holding `connections` across
+        // the claim + send excludes the purge from interleaving — the same
+        // guard the host path (`execute_host_request`) uses. Lock order
+        // connections → document tracker matches the respawn purge.
         {
-            // router_guard drops here, cleaning up the router entry
-            if let Some(ref id) = upstream_request_id {
-                self.unregister_upstream_request(id, server_name);
+            let connections = self.connections().await;
+            if !connections
+                .get(connection_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &handle))
+            {
+                drop(connections);
+                // router_guard drops here, cleaning up the router entry
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!("connection {connection_key} was replaced before request send"),
+                ));
             }
-            return Err(e);
-        }
 
-        // Queue the request via single-writer loop (ls-bridge-message-ordering)
-        if let Err(e) = handle.send_request(request, request_id) {
-            // router_guard drops here, cleaning up the router entry
-            if let Some(ref id) = upstream_request_id {
-                self.unregister_upstream_request(id, server_name);
+            // Send didOpen notification only if document hasn't been opened yet
+            if let Err(e) = self
+                .ensure_document_opened(
+                    &mut ConnectionHandleSender(&handle),
+                    host_uri,
+                    &virtual_uri,
+                    virtual_content,
+                    connection_key,
+                )
+                .await
+            {
+                drop(connections);
+                // router_guard drops here, cleaning up the router entry
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(e);
             }
-            return Err(e.into());
+
+            // Queue the request via single-writer loop (ls-bridge-message-ordering)
+            if let Err(e) = handle.send_request(request, request_id) {
+                drop(connections);
+                // router_guard drops here, cleaning up the router entry
+                if let Some(ref id) = upstream_request_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return Err(e.into());
+            }
         }
 
         // Wait for response via oneshot channel (no Mutex held) with timeout.
@@ -169,7 +202,7 @@ impl LanguageServerPool {
 
         // Unregister from the upstream request registry regardless of result
         if let Some(ref id) = upstream_request_id {
-            self.unregister_upstream_request(id, server_name);
+            self.unregister_upstream_request(id, connection_key);
         }
 
         // Build context and transform response via caller-provided closure
@@ -205,7 +238,6 @@ impl LanguageServerPool {
     pub(crate) async fn execute_position_bridge_request_with_handle<T, P: serde::Serialize>(
         &self,
         handle: Arc<ConnectionHandle>,
-        server_name: &str,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
@@ -259,7 +291,6 @@ impl LanguageServerPool {
 
         self.execute_bridge_request_with_handle(
             handle,
-            server_name,
             host_uri,
             injection_language,
             region_id,
@@ -276,6 +307,7 @@ impl LanguageServerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::pool::ConnectionKey;
     use crate::lsp::bridge::pool::ConnectionState;
     use crate::lsp::bridge::pool::test_helpers::*;
     use std::sync::Arc;
@@ -292,12 +324,16 @@ mod tests {
 
         // Insert a Ready connection with no capabilities set (all providers = None)
         {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("test-server"),
+            )
+            .await;
             // Don't call set_server_capabilities — all providers will be None
             pool.connections
                 .lock()
                 .await
-                .insert("test-server".to_string(), handle);
+                .insert(ConnectionKey::for_server("test-server"), handle);
         }
 
         let host_uri = test_host_uri("doc");
@@ -341,7 +377,11 @@ mod tests {
         let config = devnull_config();
 
         {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("test-server"),
+            )
+            .await;
             handle.set_server_capabilities(ServerCapabilities {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
@@ -349,7 +389,7 @@ mod tests {
             pool.connections
                 .lock()
                 .await
-                .insert("test-server".to_string(), handle);
+                .insert(ConnectionKey::for_server("test-server"), handle);
         }
 
         let host_uri = test_host_uri("doc");
@@ -391,7 +431,11 @@ mod tests {
         let config = devnull_config();
 
         {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("test-server"),
+            )
+            .await;
             handle.set_server_capabilities(ServerCapabilities {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
@@ -399,7 +443,7 @@ mod tests {
             pool.connections
                 .lock()
                 .await
-                .insert("test-server".to_string(), handle);
+                .insert(ConnectionKey::for_server("test-server"), handle);
         }
 
         let host_uri = test_host_uri("doc");
@@ -440,11 +484,15 @@ mod tests {
 
         // Insert a Ready connection with no capabilities set (all providers = None)
         {
-            let handle = create_handle_with_state(ConnectionState::Ready).await;
+            let handle = create_handle_with_key(
+                ConnectionState::Ready,
+                ConnectionKey::for_server("test-server"),
+            )
+            .await;
             pool.connections
                 .lock()
                 .await
-                .insert("test-server".to_string(), handle);
+                .insert(ConnectionKey::for_server("test-server"), handle);
         }
 
         let host_uri = test_host_uri("doc");
