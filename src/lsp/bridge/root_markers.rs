@@ -217,6 +217,80 @@ mod tests {
     }
 
     #[test]
+    fn falls_through_to_next_entry_when_earlier_entry_is_absent_everywhere() {
+        // The core of entry-priority: a higher-priority entry found nowhere in
+        // the ancestry must not block a later entry from resolving.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("b.toml"), "").unwrap();
+        let doc = project.join("src/main.rs");
+        let absent = format!(".kakehashi-absent-{}", std::process::id());
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Single(absent),
+                RootMarker::Single("b.toml".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(project.canonicalize().unwrap()),
+            "absent earlier entry falls through to b.toml"
+        );
+    }
+
+    #[test]
+    fn all_invalid_entry_is_skipped_and_a_later_valid_entry_still_resolves() {
+        // An entry whose names are all invalid drops to an empty name set and
+        // is skipped, without aborting the whole search (a behavior difference
+        // from the old flatten-once code).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let doc = project.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Single("..".to_string()),
+                RootMarker::Single("Cargo.toml".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(project.canonicalize().unwrap()),
+            "an all-invalid entry is skipped, not treated as a match"
+        );
+    }
+
+    #[test]
+    fn empty_group_entry_is_skipped_not_the_kill_switch() {
+        // A non-terminal empty group is skipped like any nameless entry; only
+        // a top-level empty markers list is the `[]` kill switch.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir(project.join(".git")).unwrap();
+        let doc = project.join("src/main.rs");
+
+        let root = find_marker_root(
+            &doc,
+            &[
+                RootMarker::Group(vec![]),
+                RootMarker::Single(".git".to_string()),
+            ],
+        );
+        assert_eq!(
+            root.map(|p| p.canonicalize().unwrap()),
+            Some(project.canonicalize().unwrap()),
+            "an empty group is skipped, and .git still resolves"
+        );
+    }
+
+    #[test]
     fn marker_may_be_a_file() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
