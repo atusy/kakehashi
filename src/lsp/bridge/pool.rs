@@ -70,8 +70,8 @@ pub(crate) enum ConnectionReadiness {
 }
 
 use super::actor::{
-    OUTBOUND_QUEUE_CAPACITY, ResponseRouter, ServerRequestDeps, UpstreamNotification,
-    spawn_reader_task_for_server,
+    OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ResponseRouter, ServerRequestDeps,
+    UpstreamNotification, spawn_reader_task_for_server,
 };
 use super::connection::AsyncBridgeConnection;
 
@@ -251,6 +251,11 @@ pub struct LanguageServerPool {
     window_tx: tokio::sync::mpsc::Sender<UpstreamNotification>,
     /// Receiver for window notifications, taken once by the forwarding task.
     window_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<UpstreamNotification>>>,
+    /// Remaps downstream-declared work-done progress tokens to globally unique
+    /// upstream tokens (window-work-done-progress bridging). Shared with every
+    /// reader task (to register/translate) and the cancel path (to route a
+    /// client `window/workDoneProgress/cancel` to the owning downstream).
+    progress_registry: Arc<super::ProgressRegistry>,
 }
 
 impl Default for LanguageServerPool {
@@ -283,7 +288,15 @@ impl LanguageServerPool {
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
             window_tx,
             window_rx: std::sync::Mutex::new(Some(window_rx)),
+            progress_registry: Arc::new(super::ProgressRegistry::new()),
         }
+    }
+
+    /// Shared work-done progress token registry (for seam tests that need to
+    /// register a token and observe cancel routing).
+    #[cfg(test)]
+    pub(crate) fn progress_registry(&self) -> &Arc<super::ProgressRegistry> {
+        &self.progress_registry
     }
 
     /// Set the workspace root URI.
@@ -875,6 +888,8 @@ impl LanguageServerPool {
                 upstream_tx: self.upstream_tx.clone(),
                 window_tx: self.window_tx.clone(),
                 workspace_folders: Arc::clone(&workspace_folders),
+                progress_registry: Arc::clone(&self.progress_registry),
+                progress_connection_id: self.progress_registry.new_connection_id(),
             },
         );
 
@@ -1256,6 +1271,51 @@ impl LanguageServerPool {
         Ok(())
     }
 
+    /// Forward a client `window/workDoneProgress/cancel` to the downstream that
+    /// owns the (bridge-minted) `upstream_token`, rewriting it back to that
+    /// downstream's original token. Best-effort, mirroring `$/cancelRequest`:
+    /// an unknown token (already finished, or never ours) is silently dropped.
+    pub(crate) async fn forward_work_done_cancel(&self, upstream_token: NumberOrString) {
+        let Some((writer, downstream_token)) =
+            self.progress_registry.resolve_cancel(&upstream_token)
+        else {
+            log::debug!(
+                target: "kakehashi::bridge::progress",
+                "workDoneProgress/cancel dropped: unknown upstream token {:?}",
+                upstream_token
+            );
+            return;
+        };
+
+        // Build via the typed notification helper (like `$/cancelRequest` above)
+        // for a consistent JSON-RPC shape, then serialize for the writer channel.
+        let notification = JsonRpcNotification::new(
+            "window/workDoneProgress/cancel",
+            tower_lsp_server::ls_types::WorkDoneProgressCancelParams {
+                token: downstream_token,
+            },
+        );
+        let notification = serde_json::to_value(notification)
+            .expect("WorkDoneProgressCancel notification serialization is infallible");
+
+        // send_timeout (not try_send) to ride out transient backpressure, like
+        // the reader's server-request responses. The downstream's writer drops
+        // its receiver on teardown, so a dead connection just errors here.
+        if let Err(e) = writer
+            .send_timeout(
+                OutboundMessage::Untracked(notification),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        {
+            log::debug!(
+                target: "kakehashi::bridge::progress",
+                "Failed to forward workDoneProgress/cancel downstream: {}",
+                e
+            );
+        }
+    }
+
     /// Record `upstream_id → connection_key` so `$/cancelRequest` from the
     /// client can be forwarded to every downstream connection handling that ID.
     ///
@@ -1340,6 +1400,45 @@ mod tests {
     // Unit tests for ConnectionHandle, ConnectionState, GlobalShutdownTimeout,
     // and OpenedVirtualDoc live in their respective submodules.
     // This file contains integration tests that exercise cross-module behavior.
+
+    /// A client `window/workDoneProgress/cancel` for a bridge-minted token is
+    /// routed to the owning downstream with its ORIGINAL token restored.
+    #[tokio::test]
+    async fn forward_work_done_cancel_routes_to_owning_downstream() {
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let pool = LanguageServerPool::new();
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(8);
+
+        let conn = pool.progress_registry.new_connection_id();
+        let downstream_token = NumberOrString::Number(1);
+        let (upstream_token, _) =
+            pool.progress_registry
+                .register(conn, downstream_token.clone(), writer_tx);
+
+        pool.forward_work_done_cancel(upstream_token).await;
+
+        let sent = writer_rx
+            .try_recv()
+            .expect("cancel should be sent downstream");
+        let OutboundMessage::Untracked(val) = sent else {
+            panic!("Expected Untracked");
+        };
+        assert_eq!(val["method"], "window/workDoneProgress/cancel");
+        // Original downstream token is restored (not the upstream one).
+        assert_eq!(val["params"]["token"], serde_json::json!(1));
+    }
+
+    /// Cancelling an unknown token is a best-effort no-op (no panic, no send).
+    #[tokio::test]
+    async fn forward_work_done_cancel_unknown_token_is_noop() {
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let pool = LanguageServerPool::new();
+        pool.forward_work_done_cancel(NumberOrString::String("nope".to_string()))
+            .await;
+        // Reaching here without panic is the assertion.
+    }
 
     /// Test that LanguageServerPool starts with no connections.
     /// Connections (and their states) are created lazily on first request.

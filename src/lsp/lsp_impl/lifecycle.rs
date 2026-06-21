@@ -347,21 +347,61 @@ impl Kakehashi {
     }
 }
 
+/// Upper bound on how long the shared forwarding loop waits for the editor to
+/// answer a server→client *request*. The loop is a single FIFO consumer for all
+/// connections, so an editor that accepts a request but never replies would
+/// otherwise wedge it (and let the unbounded `upstream_tx` channel grow). A
+/// generous bound degrades that to a logged timeout without harming normal use.
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Await an editor-bound request on the forwarding loop with a timeout, logging
+/// (rather than propagating) both editor-side errors and timeouts — forwarding
+/// is best-effort and must never wedge the shared loop. Returns whether the
+/// editor acknowledged the request successfully.
+async fn forward_upstream_request(
+    method: &str,
+    request: impl std::future::Future<Output = tower_lsp_server::jsonrpc::Result<()>>,
+) -> bool {
+    match tokio::time::timeout(UPSTREAM_REQUEST_TIMEOUT, request).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "{} forwarding failed: {}",
+                method, e
+            );
+            false
+        }
+        Err(_) => {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "{} forwarding timed out after {:?}; editor did not reply",
+                method, UPSTREAM_REQUEST_TIMEOUT
+            );
+            false
+        }
+    }
+}
+
 /// Forward upstream notifications from downstream language servers to the editor.
 ///
 /// Consumes notifications from two channels (loss-tolerance split, #378) and
 /// dispatches them to the LSP client:
 /// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
-///   `workspace/diagnostic/refresh` to trigger a fresh diagnostic pull.
+///   `workspace/diagnostic/refresh` — and the server-declared work-done
+///   progress notifications (`CreateWorkDoneProgress`/`Progress`/
+///   `ForgetWorkDoneProgress`, window-work-done-progress), which must not be
+///   lost or reordered.
 /// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` —
 ///   downstream `window/*` notifications, forwarded unconditionally and
 ///   already prefixed with the originating server name.
 ///
 /// Each dispatch awaits tower-lsp's internal bounded channel, so a slow editor
 /// stalls the loop — but the `biased` select drains `upstream_rx` first, so a
-/// `window/*` burst cannot starve `DiagnosticRefresh`, and the bounded window
-/// queue caps memory. FIFO order is preserved within each channel (the
-/// window-notification e2e relies on window-channel FIFO).
+/// `window/*` burst cannot starve `DiagnosticRefresh` or progress, and the
+/// bounded window queue caps memory. FIFO order is preserved within each channel
+/// (the window-notification e2e relies on window-channel FIFO; create-before-
+/// progress relies on upstream-channel FIFO).
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the
@@ -373,6 +413,14 @@ async fn upstream_forwarding_loop(
     client: Client,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
+    // Tokens the editor successfully created. `$/progress` is forwarded only for
+    // these: if a create timed out or was rejected, the editor never created the
+    // token, so reporting progress against it would violate LSP's create-before-
+    // progress contract (window-work-done-progress). Loop-local + FIFO, so the
+    // create for a token is always processed before its progress.
+    let mut created_tokens: std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString> =
+        std::collections::HashSet::new();
+
     loop {
         tokio::select! {
             biased;
@@ -387,14 +435,20 @@ async fn upstream_forwarding_loop(
 
             notification = upstream_rx.recv() => {
                 match notification {
-                    Some(notification) => deliver_upstream_notification(&client, notification).await,
+                    Some(notification) => {
+                        deliver_upstream_notification(&client, notification, &mut created_tokens)
+                            .await
+                    }
                     None => break, // Channel closed
                 }
             }
 
             notification = window_rx.recv() => {
                 match notification {
-                    Some(notification) => deliver_upstream_notification(&client, notification).await,
+                    Some(notification) => {
+                        deliver_upstream_notification(&client, notification, &mut created_tokens)
+                            .await
+                    }
                     None => break, // Channel closed
                 }
             }
@@ -403,11 +457,17 @@ async fn upstream_forwarding_loop(
 }
 
 /// Dispatch one upstream notification to the editor client.
+///
+/// `created_tokens` tracks work-done progress tokens the editor successfully
+/// created; it gates `$/progress` so progress for a token the editor rejected
+/// (or never replied to) is dropped (window-work-done-progress).
 async fn deliver_upstream_notification(
     client: &Client,
     notification: crate::lsp::bridge::UpstreamNotification,
+    created_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
 ) {
     use crate::lsp::bridge::UpstreamNotification;
+    use tower_lsp_server::ls_types::{ProgressParamsValue, WorkDoneProgress};
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
             if let Err(e) = client.workspace_diagnostic_refresh().await {
@@ -423,6 +483,53 @@ async fn deliver_upstream_notification(
         }
         UpstreamNotification::ShowMessage { typ, message } => {
             client.show_message(typ, message).await;
+        }
+        UpstreamNotification::CreateWorkDoneProgress { token } => {
+            // Awaited inline so the editor processes the create before the
+            // `$/progress` notifications that follow it on this same FIFO
+            // channel (LSP requires create-first). Only on success do we admit
+            // the token for progress.
+            if forward_upstream_request(
+                "window/workDoneProgress/create",
+                client.create_work_done_progress(token.clone()),
+            )
+            .await
+            {
+                created_tokens.insert(token);
+            }
+        }
+        UpstreamNotification::Progress { params } => {
+            let is_end = matches!(
+                &params.value,
+                ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+            );
+            // Single set lookup: `End` removes the admission (and reports whether
+            // it was admitted); others just check.
+            let admitted = if is_end {
+                created_tokens.remove(&params.token)
+            } else {
+                created_tokens.contains(&params.token)
+            };
+            if !admitted {
+                // Create timed out / was rejected — the editor never created this
+                // token, so drop its progress.
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Dropping $/progress for token the editor did not create: {:?}",
+                    params.token
+                );
+                return;
+            }
+            client
+                .send_notification::<tower_lsp_server::ls_types::notification::Progress>(params)
+                .await;
+        }
+        UpstreamNotification::ForgetWorkDoneProgress(tokens) => {
+            // A downstream reader exited with progress in flight; drop its
+            // admissions so the set can't leak across respawns.
+            for token in tokens {
+                created_tokens.remove(&token);
+            }
         }
     }
 }
@@ -462,6 +569,333 @@ async fn upstream_forwarding_loop_with_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the create-before-progress ordering the feature
+    /// depends on: the forwarding loop must deliver `window/workDoneProgress/create`
+    /// to the editor (and receive its reply) BEFORE the corresponding `$/progress`.
+    /// A refactor of the inline `await` to a `tokio::spawn` would break this and
+    /// is exactly what this asserts against (window-work-done-progress bridging).
+    #[tokio::test]
+    async fn forwarding_loop_delivers_create_before_progress() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Build a real tower-lsp Client + socket; capture the Client.
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+
+        // Server→client messages are suppressed until the client is Initialized;
+        // drive an initialize request to flip that state.
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Keep `_window_tx` alive so the bounded window channel does not close
+        // and break the loop early; this test exercises only the upstream channel.
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: token.clone(),
+        })
+        .unwrap();
+        tx.send(UpstreamNotification::Progress {
+            params: ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        })
+        .unwrap();
+
+        // First server→client message MUST be the create request.
+        let first = requests.next().await.expect("create request emitted");
+        assert_eq!(first.method(), "window/workDoneProgress/create");
+        let id = first.id().expect("create request has an id").clone();
+        // Reply so the loop's inline await completes and it forwards progress.
+        responses
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+
+        // Second message MUST be the $/progress notification — proving create
+        // was delivered (and answered) strictly before progress.
+        let second = requests
+            .next()
+            .await
+            .expect("progress notification emitted");
+        assert_eq!(second.method(), "$/progress");
+        assert_eq!(
+            second.params().unwrap()["token"],
+            serde_json::json!("kakehashi/bridge/progress/0")
+        );
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    /// When the editor REJECTS `window/workDoneProgress/create`, the loop must
+    /// NOT forward that token's `$/progress` (the editor never created it). A
+    /// later, unrelated request still goes through — proving only the progress
+    /// was dropped, not the loop (window-work-done-progress).
+    #[tokio::test]
+    async fn forwarding_loop_drops_progress_when_create_rejected() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Error, Request, Response};
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Keep `_window_tx` alive so the bounded window channel does not close
+        // and break the loop early; this test exercises only the upstream channel.
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: token.clone(),
+        })
+        .unwrap();
+        tx.send(UpstreamNotification::Progress {
+            params: ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        })
+        .unwrap();
+        // A later, unrelated request that IS expected to reach the editor.
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+
+        // First message: the create request — reject it.
+        let first = requests.next().await.expect("create request emitted");
+        assert_eq!(first.method(), "window/workDoneProgress/create");
+        let id = first.id().expect("create request has an id").clone();
+        responses
+            .send(Response::from_error(id, Error::internal_error()))
+            .await
+            .unwrap();
+
+        // Next message MUST be the diagnostic refresh, NOT $/progress — the
+        // rejected token's progress was dropped.
+        let next = requests.next().await.expect("a follow-up request emitted");
+        assert_eq!(
+            next.method(),
+            "workspace/diagnostic/refresh",
+            "progress for a rejected token must be dropped; only the later request survives"
+        );
+        // Respond so the loop's inline (un-timed) refresh await completes.
+        let id = next.id().expect("refresh request has an id").clone();
+        responses
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    /// `ForgetWorkDoneProgress` (sent when a downstream reader exits mid-progress)
+    /// drops the token's admission, so a late `$/progress` for it is not
+    /// forwarded — preventing the created-token set from leaking across respawns.
+    #[tokio::test]
+    async fn forwarding_loop_forgets_progress_on_connection_purge() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Keep `_window_tx` alive so the bounded window channel does not close
+        // and break the loop early; this test exercises only the upstream channel.
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
+        // Editor accepts the create (admits the token).
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: token.clone(),
+        })
+        .unwrap();
+        let first = requests.next().await.expect("create request emitted");
+        assert_eq!(first.method(), "window/workDoneProgress/create");
+        let id = first.id().expect("create request has an id").clone();
+        responses
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+
+        // Connection dies mid-progress: forget the token, then a late progress
+        // arrives, then an unrelated request.
+        tx.send(UpstreamNotification::ForgetWorkDoneProgress(vec![
+            token.clone(),
+        ]))
+        .unwrap();
+        tx.send(UpstreamNotification::Progress {
+            params: ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        })
+        .unwrap();
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+
+        // The forgotten token's progress must be dropped; the next editor-bound
+        // message is the diagnostic refresh.
+        let next = requests.next().await.expect("a follow-up request emitted");
+        assert_eq!(
+            next.method(),
+            "workspace/diagnostic/refresh",
+            "progress for a forgotten token must be dropped"
+        );
+        // Respond so the loop's inline (un-timed) refresh await completes.
+        let id = next.id().expect("refresh request has an id").clone();
+        responses
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
 
     /// Test that upstream_forwarding_loop exits when its CancellationToken is cancelled,
     /// even if the channel is still open.

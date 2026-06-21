@@ -15,11 +15,14 @@ mod actor;
 mod connection;
 pub(crate) mod coordinator;
 mod pool;
+mod progress_registry;
 mod protocol;
 mod root_markers;
 mod text_document;
 
 // Re-export public types
+#[cfg(test)]
+pub(crate) use actor::OutboundMessage;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
@@ -27,6 +30,7 @@ pub(crate) use pool::ConnectionKey;
 pub(crate) use pool::ConnectionReadiness;
 pub use pool::LanguageServerPool;
 pub(crate) use pool::UpstreamId;
+pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;

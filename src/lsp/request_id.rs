@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use serde::Deserialize as _;
 use tokio::sync::oneshot;
 use tower::Service;
 use tower_lsp_server::jsonrpc::{Id, Request, Response};
@@ -111,6 +112,16 @@ impl CancelForwarder {
                 self.notify_cancel(&upstream_id);
             })
             .await
+    }
+
+    /// Forward a client `window/workDoneProgress/cancel` to the downstream that
+    /// owns the (bridge-minted) progress `token`. Best-effort, like
+    /// [`CancelForwarder::forward_cancel`].
+    pub(crate) async fn forward_work_done_cancel(
+        &self,
+        token: tower_lsp_server::ls_types::NumberOrString,
+    ) {
+        self.pool.forward_work_done_cancel(token).await;
     }
 
     /// Return a oneshot receiver that fires when `$/cancelRequest` arrives for
@@ -294,6 +305,24 @@ where
                     }
                 });
             }
+        }
+
+        // Intercept window/workDoneProgress/cancel and route it to the downstream
+        // that owns the progress token (window-work-done-progress bridging).
+        // Like $/cancelRequest above, this is a client notification we mirror
+        // downstream while still delegating to the inner service.
+        if req.method() == "window/workDoneProgress/cancel"
+            && let Some(forwarder) = cancel_forwarder.as_ref()
+            && let Some(params) = req.params()
+            && let Ok(token) =
+                tower_lsp_server::ls_types::NumberOrString::deserialize(&params["token"])
+        {
+            let forwarder = forwarder.clone();
+            // Fire-and-forget: cancel is a best-effort notification (same
+            // rationale as $/cancelRequest forwarding above).
+            tokio::spawn(async move {
+                forwarder.forward_work_done_cancel(token).await;
+            });
         }
 
         // Call inner service and get the future
@@ -490,6 +519,66 @@ mod tests {
 
         // Note: We can't verify the forward happened without a real pool setup,
         // but we've verified the middleware processes the cancel notification.
+    }
+
+    #[tokio::test]
+    async fn work_done_progress_cancel_is_intercepted() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock.clone(), forwarder);
+
+        // A window/workDoneProgress/cancel notification (token may be int or string).
+        let request = Request::build("window/workDoneProgress/cancel")
+            .params(serde_json::json!({ "token": "kakehashi/bridge/progress/0" }))
+            .finish();
+
+        let result = service.call(request).await;
+        assert!(result.is_ok());
+
+        // The inner service is still invoked (tower-lsp must see it too).
+        let captured = mock.get_captured_id().await;
+        assert!(captured.is_some(), "Inner service should still be called");
+    }
+
+    /// End-to-end through the middleware: a client `window/workDoneProgress/cancel`
+    /// is routed to the owning downstream's writer with its ORIGINAL token.
+    #[tokio::test]
+    async fn work_done_progress_cancel_reaches_owning_downstream() {
+        use crate::lsp::bridge::OutboundMessage;
+        use tower_lsp_server::ls_types::NumberOrString;
+
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+
+        // Register a downstream token with an observable writer.
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(8);
+        let conn = pool.progress_registry().new_connection_id();
+        let (upstream_token, _) =
+            pool.progress_registry()
+                .register(conn, NumberOrString::Number(1), writer_tx);
+        let NumberOrString::String(upstream_token) = upstream_token else {
+            panic!("upstream token is a string");
+        };
+
+        let forwarder = CancelForwarder::new(Arc::clone(&pool));
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock.clone(), forwarder);
+
+        let request = Request::build("window/workDoneProgress/cancel")
+            .params(serde_json::json!({ "token": upstream_token }))
+            .finish();
+        service.call(request).await.unwrap();
+
+        // The middleware spawns the forward fire-and-forget; await its delivery.
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), writer_rx.recv())
+            .await
+            .expect("cancel should reach downstream within timeout")
+            .expect("writer channel open");
+        let OutboundMessage::Untracked(val) = sent else {
+            panic!("Expected Untracked");
+        };
+        assert_eq!(val["method"], "window/workDoneProgress/cancel");
+        assert_eq!(val["params"]["token"], serde_json::json!(1));
     }
 
     #[tokio::test]
