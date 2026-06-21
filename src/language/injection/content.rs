@@ -2,7 +2,7 @@
 //! selection-range paths: clean-content extraction, per-line column offsets,
 //! parsing with included ranges, and byte→`Point` coordinate conversion.
 
-use crate::text::floor_char_boundary;
+use crate::text::{clamped_slice, floor_char_boundary};
 
 /// Extract clean injection content, stripping child node bytes when `included_ranges` present.
 ///
@@ -14,14 +14,19 @@ pub(crate) fn extract_clean_content(
     byte_range: std::ops::Range<usize>,
     included_ranges: Option<&[tree_sitter::Range]>,
 ) -> String {
-    let content = &host_text[byte_range.clone()];
+    // `clamped_slice` guards against byte offsets from a stale tree that no
+    // longer matches `host_text` (out of bounds or mid-codepoint).
+    let content = clamped_slice(host_text, byte_range.clone());
     match included_ranges {
         None => content.to_string(),
         Some(ranges) => {
-            let capacity: usize = ranges.iter().map(|r| r.end_byte - r.start_byte).sum();
+            let capacity: usize = ranges
+                .iter()
+                .map(|r| r.end_byte.saturating_sub(r.start_byte))
+                .sum();
             let mut result = String::with_capacity(capacity);
             for range in ranges {
-                result.push_str(&content[range.start_byte..range.end_byte]);
+                result.push_str(clamped_slice(content, range.start_byte..range.end_byte));
             }
             result
         }
@@ -67,8 +72,9 @@ pub(super) fn compute_line_column_offsets(
                             // The gap's start_byte is relative to content node start.
                             // The line starts at the byte after the previous newline.
                             let gap_abs_byte = byte_range.start + range.start_byte;
-                            let line_start_byte = gap_abs_byte - range.start_point.column;
-                            let prefix = &host_text[line_start_byte..gap_abs_byte];
+                            let line_start_byte =
+                                gap_abs_byte.saturating_sub(range.start_point.column);
+                            let prefix = clamped_slice(host_text, line_start_byte..gap_abs_byte);
                             offsets[line] = prefix.encode_utf16().count() as u32;
                         }
                     }
@@ -147,10 +153,13 @@ pub(crate) fn byte_to_point_anchored(
     anchor_point: tree_sitter::Point,
 ) -> tree_sitter::Point {
     let clamped = floor_char_boundary(text, byte);
+    // Snap the anchor too: on a stale tree it may be out of bounds or land
+    // mid-codepoint, which would panic the `text[anchor_byte..clamped]` slice.
+    let anchor_byte = floor_char_boundary(text, anchor_byte);
     if clamped < anchor_byte {
         return byte_to_point(text, clamped);
     }
-    let segment = &text[anchor_byte..clamped];
+    let segment = clamped_slice(text, anchor_byte..clamped);
     match segment.rfind('\n') {
         Some(last_nl) => tree_sitter::Point {
             row: anchor_point.row + segment.bytes().filter(|b| *b == b'\n').count(),
@@ -388,5 +397,49 @@ mod tests {
             vec![2, 2],
             "Both 'let' keywords should be at column 2 (from Range.start_point), not 0"
         );
+    }
+
+    // --- stale-tree hardening: byte offsets that no longer match `text` must
+    // degrade gracefully instead of panicking (#401). ---
+
+    fn range_at(
+        start_byte: usize,
+        end_byte: usize,
+        row: usize,
+        column: usize,
+    ) -> tree_sitter::Range {
+        tree_sitter::Range {
+            start_byte,
+            end_byte,
+            start_point: tree_sitter::Point { row, column },
+            end_point: tree_sitter::Point { row, column },
+        }
+    }
+
+    #[test]
+    fn extract_clean_content_out_of_bounds_does_not_panic() {
+        assert_eq!(extract_clean_content("hi", 0..100, None), "hi");
+        assert_eq!(extract_clean_content("hi", 50..100, None), "");
+        // Included sub-ranges past the end of the (clamped) content are skipped.
+        let oversized = [range_at(0, 999, 0, 0)];
+        assert_eq!(extract_clean_content("hi", 0..2, Some(&oversized)), "hi");
+    }
+
+    #[test]
+    fn compute_line_column_offsets_oversized_column_does_not_panic() {
+        // A non-first line whose start_point.column exceeds its absolute byte
+        // position would underflow `gap_abs_byte - column` and slice past the end.
+        let ranges = [range_at(2, 3, 1, 100)];
+        let offsets = compute_line_column_offsets("hello", 0..5, 0, Some(&ranges));
+        assert_eq!(offsets.len(), 2);
+    }
+
+    #[test]
+    fn byte_to_point_anchored_stale_anchor_does_not_panic() {
+        // "あ" is 3 bytes; an anchor landing mid-codepoint (byte 1) or past the
+        // end must not panic the `text[anchor..clamped]` slice.
+        let p = byte_to_point_anchored("あ", 3, 1, tree_sitter::Point { row: 0, column: 0 });
+        assert_eq!(p.row, 0);
+        let _ = byte_to_point_anchored("あ", 99, 50, tree_sitter::Point { row: 0, column: 0 });
     }
 }
