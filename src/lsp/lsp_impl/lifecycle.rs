@@ -524,9 +524,9 @@ async fn upstream_forwarding_loop(
 /// editor never saw, a divergence a direct connection never produces. The only
 /// concern the bridge can't delegate is its own survival (it is one process
 /// shared by all downstream connections), but the per-request cost it holds — a
-/// lightweight task awaiting a oneshot — is far smaller than the editor's
+/// lightweight task awaiting a `oneshot` — is far smaller than the editor's
 /// per-dialog cost, so the editor pushes back first. See issue #405
-/// (closed not-planned) for the full rationale.
+/// (closed as not planned) for the full rationale.
 fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::UpstreamRequest) {
     use crate::lsp::bridge::UpstreamRequest;
     let client = client.clone();
