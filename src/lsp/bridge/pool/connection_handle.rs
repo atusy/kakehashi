@@ -30,7 +30,7 @@ use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, build_exit_notification, build_shutdown_request,
 };
-use crate::lsp::bridge::workspace_folders::WorkspaceFolderSet;
+use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
 /// Whether `caps` advertises everything the shared-instance opt-in (#391)
 /// needs to drive one connection across roots via
