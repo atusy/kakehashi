@@ -418,9 +418,8 @@ async fn upstream_forwarding_loop(
     // token, so reporting progress against it would violate LSP's create-before-
     // progress contract (window-work-done-progress). Loop-local + FIFO, so the
     // create for a token is always processed before its progress.
-    let mut created_tokens: std::collections::HashSet<
-        tower_lsp_server::ls_types::NumberOrString,
-    > = std::collections::HashSet::new();
+    let mut created_tokens: std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString> =
+        std::collections::HashSet::new();
 
     loop {
         tokio::select! {
@@ -627,8 +626,12 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
-        let loop_handle =
-            tokio::spawn(upstream_forwarding_loop(rx, window_rx, client, cancel.clone()));
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            client,
+            cancel.clone(),
+        ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
         tx.send(UpstreamNotification::CreateWorkDoneProgress {
@@ -726,8 +729,12 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
-        let loop_handle =
-            tokio::spawn(upstream_forwarding_loop(rx, window_rx, client, cancel.clone()));
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            client,
+            cancel.clone(),
+        ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
         tx.send(UpstreamNotification::CreateWorkDoneProgress {
@@ -828,8 +835,12 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
-        let loop_handle =
-            tokio::spawn(upstream_forwarding_loop(rx, window_rx, client, cancel.clone()));
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            client,
+            cancel.clone(),
+        ));
 
         let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
         // Editor accepts the create (admits the token).
