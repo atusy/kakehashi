@@ -547,7 +547,9 @@ fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::Upstream
 }
 
 /// A `telemetry/event` notification whose `Params` is raw `serde_json::Value`,
-/// so the downstream payload is forwarded to the editor byte-for-byte. The
+/// so the downstream payload is forwarded to the editor as the same JSON value
+/// (its shape is preserved — scalars are not wrapped, no fields added/dropped;
+/// re-serialization may still normalize whitespace/number formatting). The
 /// `ls_types` `TelemetryEvent` models params as `OneOf<Map, Vec>`, which can't
 /// carry a scalar LSPAny payload unchanged.
 enum RawTelemetryEvent {}
@@ -586,12 +588,13 @@ async fn deliver_upstream_notification(
             client.show_message(typ, message).await;
         }
         UpstreamNotification::TelemetryEvent { data } => {
-            // Forward the raw LSPAny `params` verbatim. We can't use
-            // `client.telemetry_event` (it wraps any non-object/array scalar in a
-            // single-element array) or `send_notification::<ls_types TelemetryEvent>`
-            // (its `Params` is `OneOf<Map, Vec>`, rejecting scalars). A local
-            // marker with `Params = serde_json::Value` keeps the payload byte-for-
-            // byte identical, matching how `$/progress` is forwarded.
+            // Forward the raw LSPAny `params` as the same JSON value. We can't
+            // use `client.telemetry_event` (it wraps any non-object/array scalar
+            // in a single-element array) or `send_notification::<ls_types
+            // TelemetryEvent>` (its `Params` is `OneOf<Map, Vec>`, rejecting
+            // scalars). A local marker with `Params = serde_json::Value` preserves
+            // the payload's JSON shape (no scalar-wrapping), matching how
+            // `$/progress` is forwarded.
             client.send_notification::<RawTelemetryEvent>(data).await;
         }
         UpstreamNotification::CreateWorkDoneProgress { token } => {
