@@ -1,5 +1,9 @@
 //! Per-connection, mutable workspace-folder set.
 //!
+//! This is the *data type* backing the `workspace/workspaceFolders` pull; the
+//! pull *handler* that answers a downstream query from it lives in
+//! [`workspace_folders`](super::workspace_folders).
+//!
 //! Historically the folders a downstream connection serves were frozen at spawn
 //! in an immutable `Arc<Option<Vec<WorkspaceFolder>>>`: set once from the
 //! resolved root (or the upstream fallback) and only ever read, to answer

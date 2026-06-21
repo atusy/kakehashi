@@ -17,21 +17,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, warn};
-use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_lsp_server::jsonrpc;
-use tower_lsp_server::ls_types::{LogMessageParams, MessageType, ShowMessageParams};
+use tower_lsp_server::ls_types::MessageType;
 
 use super::super::connection::BridgeReader;
+use super::super::{client, text_document, window};
 use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::RouteResult;
 use crate::error::LockResultExt;
 use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
-use crate::lsp::bridge::workspace_folders::WorkspaceFolderSet;
+use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
 
 /// Notification to forward from downstream server to upstream editor.
 ///
@@ -646,14 +646,14 @@ async fn handle_message(
             // editor). The if/else makes the discard structural: notification
             // forwarding lives on the else side, where a scratch-targeted
             // publishDiagnostics can never reach it.
-            if is_scratch_publish_diagnostics(&message) {
+            if text_document::publish_diagnostics::is_scratch_publish_diagnostics(&message) {
                 debug!(
                     target: "kakehashi::bridge::reader",
                     "{}Discarding publishDiagnostics targeting a scratch virtual document",
                     server_prefix
                 );
             } else if message["method"].as_str() == Some("$/progress") {
-                forward_progress_notification(&message, server_prefix, deps);
+                window::progress::forward(&message, server_prefix, deps);
             } else {
                 forward_notification(&message, server_prefix, deps);
             }
@@ -671,177 +671,22 @@ async fn handle_message(
 
 /// Forward supported downstream notifications to the upstream editor.
 ///
-/// Both `window/logMessage` and `window/showMessage` are forwarded
-/// unconditionally — the bridge stays transparent so messages a direct
-/// connection would surface are not silently swallowed. A downstream flood
-/// cannot harm the bridge because the window channel is bounded and
-/// drop-on-full (see [`UpstreamNotification`]). Both are prefixed with the
-/// originating server name so output from multiple bridged servers stays
-/// distinguishable.
+/// Routes `window/logMessage` and `window/showMessage` to their per-method
+/// modules ([`window::log_message`], [`window::show_message`]); both are
+/// forwarded unconditionally so the bridge stays transparent.
 ///
-/// `$/progress` is handled earlier in `handle_message` (translated and
-/// forwarded via `forward_progress_notification`), so it never reaches here.
-/// Everything else is still silently ignored (push-based publishDiagnostics:
-/// #380).
+/// `$/progress` is handled earlier in `handle_message` (translated and forwarded
+/// via [`window::progress::forward`]), so it never reaches here. Everything else
+/// is still silently ignored (push-based publishDiagnostics: #380).
 fn forward_notification(
     message: &serde_json::Value,
     server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
     match message["method"].as_str() {
-        Some("window/logMessage") => {
-            // Deserialize from a reference to avoid cloning the params value.
-            match LogMessageParams::deserialize(&message["params"]) {
-                Ok(params) => send_window_notification(
-                    deps,
-                    server_prefix,
-                    "window/logMessage",
-                    UpstreamNotification::LogMessage {
-                        typ: params.typ,
-                        message: prefixed_message(deps.server_name.as_deref(), &params.message),
-                    },
-                ),
-                Err(e) => debug!(
-                    target: "kakehashi::bridge::reader",
-                    "{}Dropping window/logMessage with invalid params: {}",
-                    server_prefix,
-                    e
-                ),
-            }
-        }
-        Some("window/showMessage") => match ShowMessageParams::deserialize(&message["params"]) {
-            Ok(params) => send_window_notification(
-                deps,
-                server_prefix,
-                "window/showMessage",
-                UpstreamNotification::ShowMessage {
-                    typ: params.typ,
-                    message: prefixed_message(deps.server_name.as_deref(), &params.message),
-                },
-            ),
-            Err(e) => debug!(
-                target: "kakehashi::bridge::reader",
-                "{}Dropping window/showMessage with invalid params: {}",
-                server_prefix,
-                e
-            ),
-        },
+        Some("window/logMessage") => window::log_message::forward(message, server_prefix, deps),
+        Some("window/showMessage") => window::show_message::forward(message, server_prefix, deps),
         _ => {}
-    }
-}
-
-/// Enqueue a `window/*` notification on the bounded best-effort channel.
-///
-/// `try_send` keeps the reader task non-blocking: a full queue (editor slower
-/// than a downstream notification flood) drops the message instead of growing
-/// memory or stalling stdout reads; a closed queue (shutdown) has no one left
-/// to deliver to. Both are deliberate per the loss-tolerance split documented
-/// on [`UpstreamNotification`].
-fn send_window_notification(
-    deps: &ServerRequestDeps,
-    server_prefix: &str,
-    method: &str,
-    notification: UpstreamNotification,
-) {
-    if let Err(e) = deps.window_tx.try_send(notification) {
-        debug!(
-            target: "kakehashi::bridge::reader",
-            "{}Dropping {} ({})",
-            server_prefix,
-            method,
-            match e {
-                mpsc::error::TrySendError::Full(_) => "window notification queue full",
-                mpsc::error::TrySendError::Closed(_) => "forwarding loop gone",
-            }
-        );
-    }
-}
-
-/// `[kakehashi:<server>] <message>` — tells the user which downstream server
-/// a forwarded `window/*` notification came from (#378). Falls back to
-/// `[kakehashi] <message>` when the server name is absent (test-only spawns;
-/// production spawns always carry the name, see pool.rs).
-fn prefixed_message(server_name: Option<&str>, message: &str) -> String {
-    match server_name {
-        Some(name) => format!("[kakehashi:{name}] {message}"),
-        None => format!("[kakehashi] {message}"),
-    }
-}
-
-/// Whether `message` is a `textDocument/publishDiagnostics` notification
-/// targeting a concatenated-formatting *scratch* virtual document
-/// ([`VirtualDocumentUri::is_scratch_uri`]).
-///
-/// Scratch documents carry speculative pipeline text the editor has never
-/// seen; diagnostics computed against them are meaningless to the user and
-/// must be discarded, not forwarded (concatenated-formatting-pipeline
-/// Decision point 7). The prompt `didClose` after each pipeline run shrinks
-/// but cannot eliminate the window in which a downstream server pushes them.
-fn is_scratch_publish_diagnostics(message: &serde_json::Value) -> bool {
-    // `Value` indexing returns `Null` for missing keys / non-objects, so the
-    // lookups below are panic-free on malformed messages.
-    message["method"].as_str() == Some("textDocument/publishDiagnostics")
-        && message["params"]["uri"]
-            .as_str()
-            .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
-}
-
-/// Translate and forward a downstream `$/progress` notification to the editor.
-///
-/// Only progress reported against a token the downstream declared via
-/// `window/workDoneProgress/create` is forwarded: its token is rewritten to the
-/// bridge-minted upstream token and sent on the upstream channel. Progress for
-/// any other token (e.g. a client-provided `workDoneToken`) is **dropped** — it
-/// is out of scope for token remapping (see [`ProgressRegistry`] module docs),
-/// and forwarding it verbatim risks duplicates under request fan-out.
-///
-/// A terminating `WorkDoneProgress::End` clears the mapping after forwarding.
-///
-/// [`ProgressRegistry`]: crate::lsp::bridge::ProgressRegistry
-fn forward_progress_notification(
-    message: &serde_json::Value,
-    server_prefix: &str,
-    deps: &ServerRequestDeps,
-) {
-    use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
-
-    // Deserialize from the borrowed `params` value (indexing yields `Null` for a
-    // missing key, which fails to parse and is dropped) — no clone of the Value.
-    let Ok(mut params) = ProgressParams::deserialize(&message["params"]) else {
-        debug!(
-            target: "kakehashi::bridge::reader",
-            "{}Dropping $/progress with missing/unparseable params",
-            server_prefix
-        );
-        return;
-    };
-
-    let Some(upstream_token) = deps
-        .progress_registry
-        .translate(deps.progress_connection_id, &params.token)
-    else {
-        // Unknown token: not a downstream-declared progress we remapped.
-        debug!(
-            target: "kakehashi::bridge::reader",
-            "{}Dropping $/progress for unmapped token {:?}",
-            server_prefix, params.token
-        );
-        return;
-    };
-
-    let is_end = matches!(
-        &params.value,
-        ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
-    );
-
-    let downstream_token = std::mem::replace(&mut params.token, upstream_token);
-    let _ = deps
-        .upstream_tx
-        .send(UpstreamNotification::Progress { params });
-
-    if is_end {
-        deps.progress_registry
-            .complete(deps.progress_connection_id, &downstream_token);
     }
 }
 
@@ -865,168 +710,18 @@ async fn handle_server_request(
 
     let body: jsonrpc::Result<serde_json::Value> = match method {
         "client/registerCapability" => {
-            if let Some(params) = message.get("params") {
-                match serde_json::from_value::<tower_lsp_server::ls_types::RegistrationParams>(
-                    params.clone(),
-                ) {
-                    Ok(reg_params) => {
-                        for reg in &reg_params.registrations {
-                            debug!(
-                                target: "kakehashi::bridge::reader",
-                                "{}Registered dynamic capability: {} (id={})",
-                                server_prefix, reg.method, reg.id
-                            );
-                        }
-                        deps.dynamic_capabilities.register(reg_params.registrations);
-                        Ok(serde_json::Value::Null)
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "kakehashi::bridge::reader",
-                            "{}Failed to parse registerCapability params: {}",
-                            server_prefix, e
-                        );
-                        Err(jsonrpc::Error::invalid_params(format!(
-                            "Invalid params: {e}"
-                        )))
-                    }
-                }
-            } else {
-                warn!(
-                    target: "kakehashi::bridge::reader",
-                    "{}Request 'client/registerCapability' is missing 'params' field",
-                    server_prefix
-                );
-                Err(jsonrpc::Error::invalid_params(
-                    "Request 'client/registerCapability' is missing 'params' field",
-                ))
-            }
+            client::register_capability::handle(&message, server_prefix, deps)
         }
         "client/unregisterCapability" => {
-            if let Some(params) = message.get("params") {
-                match serde_json::from_value::<tower_lsp_server::ls_types::UnregistrationParams>(
-                    params.clone(),
-                ) {
-                    Ok(unreg_params) => {
-                        for unreg in &unreg_params.unregisterations {
-                            debug!(
-                                target: "kakehashi::bridge::reader",
-                                "{}Unregistered dynamic capability: {} (id={})",
-                                server_prefix, unreg.method, unreg.id
-                            );
-                        }
-                        deps.dynamic_capabilities
-                            .unregister(unreg_params.unregisterations);
-                        Ok(serde_json::Value::Null)
-                    }
-                    Err(e) => {
-                        warn!(
-                            target: "kakehashi::bridge::reader",
-                            "{}Failed to parse unregisterCapability params: {}",
-                            server_prefix, e
-                        );
-                        Err(jsonrpc::Error::invalid_params(format!(
-                            "Invalid params: {e}"
-                        )))
-                    }
-                }
-            } else {
-                warn!(
-                    target: "kakehashi::bridge::reader",
-                    "{}Request 'client/unregisterCapability' is missing 'params' field",
-                    server_prefix
-                );
-                Err(jsonrpc::Error::invalid_params(
-                    "Request 'client/unregisterCapability' is missing 'params' field",
-                ))
-            }
+            client::unregister_capability::handle(&message, server_prefix, deps)
         }
         "window/workDoneProgress/create" => {
-            // A downstream is declaring a progress token. Downstreams pick tokens
-            // independently, so two of them can collide; mint a unique upstream
-            // token and remember the mapping so `$/progress` and cancel can be
-            // translated in both directions (window-work-done-progress bridging).
-            //
-            // We ack the downstream immediately with Ok(null) rather than relaying
-            // the editor's real create response: this decouples the downstream from
-            // editor latency and lets progress buffer on the FIFO upstream channel.
-            // The bridge only advertises `window.workDoneProgress` downstream when
-            // the real editor supports it (see client_capabilities merge), so the
-            // editor almost always accepts the create. If it nonetheless rejects
-            // or times out, the forwarding loop drops that token's `$/progress`
-            // (it admits a token only on a successful create), so the optimistic
-            // ack never leaks progress for a token the editor didn't create.
-            // Deserialize the token from the borrowed value (indexing yields
-            // `Null` for a missing key, which fails to parse) — no clone.
-            match tower_lsp_server::ls_types::NumberOrString::deserialize(
-                &message["params"]["token"],
-            ) {
-                Ok(downstream_token) => {
-                    // A downstream that re-`create`s a token it already declared
-                    // (without an intervening End) gets a fresh upstream token;
-                    // `register` evicts the prior one and returns it as `stale` so
-                    // we can tell the forwarding loop to forget its admission too —
-                    // otherwise it would leak in `created_tokens`.
-                    let (upstream_token, stale_upstream_token) = deps.progress_registry.register(
-                        deps.progress_connection_id,
-                        downstream_token,
-                        deps.response_tx.clone(),
-                    );
-                    debug!(
-                        target: "kakehashi::bridge::reader",
-                        "{}Bridging window/workDoneProgress/create as upstream token {:?}",
-                        server_prefix, upstream_token
-                    );
-                    if let Some(stale) = stale_upstream_token {
-                        let _ = deps
-                            .upstream_tx
-                            .send(UpstreamNotification::ForgetWorkDoneProgress(vec![stale]));
-                    }
-                    let _ = deps
-                        .upstream_tx
-                        .send(UpstreamNotification::CreateWorkDoneProgress {
-                            token: upstream_token,
-                        });
-                    Ok(serde_json::Value::Null)
-                }
-                Err(_) => {
-                    warn!(
-                        target: "kakehashi::bridge::reader",
-                        "{}window/workDoneProgress/create missing/invalid token",
-                        server_prefix
-                    );
-                    Err(jsonrpc::Error::invalid_params(
-                        "window/workDoneProgress/create requires a token",
-                    ))
-                }
-            }
+            window::work_done_progress_create::handle(&message, server_prefix, deps)
         }
         "workspace/diagnostic/refresh" => {
-            // Downstream server is requesting that the client re-pull diagnostics.
-            // Forward this upstream so the editor triggers a fresh diagnostic pull.
-            debug!(
-                target: "kakehashi::bridge::reader",
-                "{}Forwarding workspace/diagnostic/refresh upstream",
-                server_prefix
-            );
-            let _ = deps
-                .upstream_tx
-                .send(UpstreamNotification::DiagnosticRefresh);
-            Ok(serde_json::Value::Null)
+            workspace::diagnostic_refresh::handle(server_prefix, deps)
         }
-        "workspace/workspaceFolders" => {
-            // The bridge advertises workspace.workspaceFolders, so answer with
-            // the folders this connection currently serves — which a
-            // preferSharedInstance connection grows over time (#391)
-            // (WorkspaceFolder[] | null).
-            debug!(
-                target: "kakehashi::bridge::reader",
-                "{}Answering workspace/workspaceFolders from the connection's current folders",
-                server_prefix
-            );
-            Ok(serde_json::to_value(deps.workspace_folders.snapshot())
-                .unwrap_or(serde_json::Value::Null))
-        }
+        "workspace/workspaceFolders" => workspace::workspace_folders::handle(server_prefix, deps),
         _ => {
             debug!(
                 target: "kakehashi::bridge::reader",
@@ -2349,39 +2044,6 @@ mod tests {
             response_rx.try_recv().is_err(),
             "a notification must not trigger any downstream response"
         );
-    }
-
-    #[test]
-    fn is_scratch_publish_diagnostics_matches_only_scratch_targets() {
-        let scratch = json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/publishDiagnostics",
-            "params": {"uri": "file:///p/kakehashi-virtual-uri-R-kakehashi-scratch-0-1.py", "diagnostics": []}
-        });
-        assert!(is_scratch_publish_diagnostics(&scratch));
-
-        // Canonical virtual document: not scratch.
-        let canonical = json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/publishDiagnostics",
-            "params": {"uri": "file:///p/kakehashi-virtual-uri-R.py", "diagnostics": []}
-        });
-        assert!(!is_scratch_publish_diagnostics(&canonical));
-
-        // Different method on a scratch URI: not publishDiagnostics.
-        let other_method = json!({
-            "jsonrpc": "2.0",
-            "method": "$/progress",
-            "params": {"uri": "file:///p/kakehashi-virtual-uri-R-kakehashi-scratch-0-1.py"}
-        });
-        assert!(!is_scratch_publish_diagnostics(&other_method));
-
-        // Missing params: must not panic, just no match.
-        let no_params = json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/publishDiagnostics"
-        });
-        assert!(!is_scratch_publish_diagnostics(&no_params));
     }
 
     #[tokio::test]

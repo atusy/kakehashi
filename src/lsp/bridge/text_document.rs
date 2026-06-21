@@ -33,6 +33,7 @@ mod linked_editing_range;
 mod moniker;
 mod on_type_formatting;
 mod prepare_rename;
+pub(in crate::lsp::bridge) mod publish_diagnostics;
 mod range_formatting;
 mod references;
 mod rename;

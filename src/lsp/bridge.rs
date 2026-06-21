@@ -10,8 +10,22 @@
 //! - `coordinator` - BridgeCoordinator for unified pool + node tracking
 //! - `protocol` - VirtualDocumentUri, request building, and response transformation
 //! - `pool` - LanguageServerPool for server pool coordination (ls-bridge-server-pool-coordination)
+//!
+//! # Per-method namespace modules
+//!
+//! Message handling is organized by LSP namespace, one file per method, so the
+//! directory listing maps to the supported surface. The dispatcher in
+//! `actor::reader` owns the shared transport and routes each method to its file:
+//!
+//! - `text_document` - the `textDocument` namespace (mostly outbound request
+//!   senders, plus the inbound scratch `publishDiagnostics` discard)
+//! - `client` - inbound `client/*` (dynamic capability register/unregister)
+//! - `window` - inbound `window/*` (log/show message, work-done progress) plus
+//!   the bridged `$/progress` stream
+//! - `workspace` - inbound `workspace/*` (diagnostic refresh, workspace folders)
 
 mod actor;
+mod client;
 mod connection;
 pub(crate) mod coordinator;
 mod pool;
@@ -19,7 +33,8 @@ mod progress_registry;
 mod protocol;
 mod root_markers;
 mod text_document;
-mod workspace_folders;
+mod window;
+mod workspace;
 
 // Re-export public types
 #[cfg(test)]
@@ -39,7 +54,7 @@ pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use text_document::host::{HostDocument, normalize_host_goto_result};
 pub(crate) use text_document::{CodeLensEnvelope, extract_code_lens_envelope};
-pub(crate) use workspace_folders::WorkspaceFolderSet;
+pub(crate) use workspace::WorkspaceFolderSet;
 
 /// Integration tests for the bridge module.
 ///
