@@ -2,7 +2,7 @@ use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
 use crate::language::query_predicates::check_predicate;
-use crate::text::fnv1a_hash;
+use crate::text::{floor_char_boundary, fnv1a_hash};
 use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingIterator, Tree};
 use ulid::Ulid;
 use url::Url;
@@ -847,25 +847,6 @@ pub(crate) fn byte_to_point_anchored(
             column: anchor_point.column + segment.len(),
         },
     }
-}
-
-/// Snap `index` forward to the nearest char boundary (stable alternative to
-/// the unstable `str::ceil_char_boundary`).
-pub(crate) fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
-    while index < text.len() && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index.min(text.len())
-}
-
-/// Snap `index` backward to the nearest char boundary (stable alternative to
-/// the unstable `str::floor_char_boundary`).
-pub(crate) fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 impl CacheableInjectionRegion {

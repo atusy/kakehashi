@@ -17,11 +17,10 @@ use super::injection_aware::{
 };
 use crate::analysis::offset_calculator::{ByteRange, calculate_effective_range};
 use crate::language::injection::{
-    self, InjectionOffset, ceil_char_boundary, compute_included_ranges,
-    compute_included_ranges_clipped, effective_offset_for_pattern, floor_char_boundary,
-    has_include_children_for_pattern, parse_with_ranges,
+    self, InjectionOffset, compute_included_ranges, compute_included_ranges_clipped,
+    effective_offset_for_pattern, has_include_children_for_pattern, parse_with_ranges,
 };
-use crate::text::PositionMapper;
+use crate::text::{PositionMapper, ceil_char_boundary, floor_char_boundary};
 
 /// Convert tree-sitter Node to LSP Range with proper UTF-16 encoding.
 ///
