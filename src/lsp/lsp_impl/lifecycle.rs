@@ -513,6 +513,20 @@ async fn upstream_forwarding_loop(
 /// detached tasks are not tracked for abort on shutdown, but they self-terminate:
 /// when the service shuts down the editor `Client` closes, so each pending
 /// `client.*` call returns `Err` promptly and the task ends.
+///
+/// Why not bound this as flood protection? A request flood from an
+/// adversarial/buggy downstream propagates to the editor either way — exactly as
+/// it would if the editor spoke to that server directly, with no bridge. The
+/// bridge cannot shield the client from such floods, and rate-limiting
+/// client-facing requests is the *client's* responsibility; the bridge's job is
+/// to forward transparently. A cap whose overflow behavior answered the protocol
+/// default would be strictly worse: the bridge would fabricate responses the
+/// editor never saw, a divergence a direct connection never produces. The only
+/// concern the bridge can't delegate is its own survival (it is one process
+/// shared by all downstream connections), but the per-request cost it holds — a
+/// lightweight task awaiting a oneshot — is far smaller than the editor's
+/// per-dialog cost, so the editor pushes back first. See issue #405
+/// (closed not-planned) for the full rationale.
 fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::UpstreamRequest) {
     use crate::lsp::bridge::UpstreamRequest;
     let client = client.clone();
