@@ -522,6 +522,17 @@ fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::Upstream
     });
 }
 
+/// A `telemetry/event` notification whose `Params` is raw `serde_json::Value`,
+/// so the downstream payload is forwarded to the editor byte-for-byte. The
+/// `ls_types` `TelemetryEvent` models params as `OneOf<Map, Vec>`, which can't
+/// carry a scalar LSPAny payload unchanged.
+enum RawTelemetryEvent {}
+
+impl tower_lsp_server::ls_types::notification::Notification for RawTelemetryEvent {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "telemetry/event";
+}
+
 /// Dispatch one upstream notification to the editor client.
 ///
 /// `created_tokens` tracks work-done progress tokens the editor successfully
@@ -551,12 +562,13 @@ async fn deliver_upstream_notification(
             client.show_message(typ, message).await;
         }
         UpstreamNotification::TelemetryEvent { data } => {
-            // `telemetry/event` params are LSPAny, but the notification type
-            // models them as object-or-array (`OneOf<Map, Vec>`). `telemetry_event`
-            // performs exactly that conversion (object → as-is, array → as-is, any
-            // other JSON scalar → wrapped in a single-element array), so objects
-            // and arrays — the conformant payloads — pass through unchanged.
-            client.telemetry_event(data).await;
+            // Forward the raw LSPAny `params` verbatim. We can't use
+            // `client.telemetry_event` (it wraps any non-object/array scalar in a
+            // single-element array) or `send_notification::<ls_types TelemetryEvent>`
+            // (its `Params` is `OneOf<Map, Vec>`, rejecting scalars). A local
+            // marker with `Params = serde_json::Value` keeps the payload byte-for-
+            // byte identical, matching how `$/progress` is forwarded.
+            client.send_notification::<RawTelemetryEvent>(data).await;
         }
         UpstreamNotification::CreateWorkDoneProgress { token } => {
             // Awaited inline so the editor processes the create before the
@@ -1196,6 +1208,7 @@ mod tests {
             cancel.clone(),
         ));
 
+        // An object payload passes through unchanged.
         upstream_tx
             .send(UpstreamNotification::TelemetryEvent {
                 data: serde_json::json!({ "kind": "metric", "value": 42 }),
@@ -1207,6 +1220,23 @@ mod tests {
         assert_eq!(
             event.params().expect("telemetry params"),
             &serde_json::json!({ "kind": "metric", "value": 42 })
+        );
+
+        // A scalar payload is forwarded verbatim, NOT wrapped in an array (which
+        // is what `client.telemetry_event` would do) — this is why a raw-`Value`
+        // notification marker is used.
+        upstream_tx
+            .send(UpstreamNotification::TelemetryEvent {
+                data: serde_json::json!(42),
+            })
+            .unwrap();
+
+        let scalar = requests.next().await.expect("scalar telemetry emitted");
+        assert_eq!(scalar.method(), "telemetry/event");
+        assert_eq!(
+            scalar.params().expect("telemetry params"),
+            &serde_json::json!(42),
+            "scalar telemetry payload must be forwarded verbatim, not wrapped"
         );
 
         cancel.cancel();
