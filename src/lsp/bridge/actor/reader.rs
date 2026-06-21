@@ -2837,6 +2837,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_show_document_invalid_params_responds_error() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        // Missing the required `uri` field.
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "window/showDocument",
+            "params": { "external": true }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 13);
+        assert!(
+            response["error"].is_object(),
+            "invalid params should produce an error response: {response}"
+        );
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn handle_message_show_document_loop_gone_responds_success_false() {
         let router = ResponseRouter::new();
         let (deps, mut response_rx, request_rx) = server_request_deps_with_request_rx();

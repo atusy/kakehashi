@@ -477,12 +477,26 @@ async fn upstream_forwarding_loop(
 /// oneshot.
 ///
 /// Spawned (not awaited) so the shared forwarding loop keeps draining
-/// notifications while the editor — possibly a human — takes its time. No
-/// bridge-imposed timeout: `showMessageRequest` legitimately pends on user
-/// interaction, and `showDocument` is relayed as-is. On editor error the
-/// protocol default is sent (`None` selection / `success:false`); if the
-/// downstream connection drops, the receiving oneshot end is gone and
+/// notifications while the editor — possibly a human — takes its time. On editor
+/// error the protocol default is sent (`None` selection / `success:false`); if
+/// the downstream connection drops, the receiving oneshot end is gone and
 /// `reply.send` simply no-ops.
+///
+/// **No bridge-imposed timeout** (unlike `create_work_done_progress`):
+/// `showMessageRequest` legitimately pends on user interaction, and `showDocument`
+/// deliberately opts out too — a timeout there would answer `success:false` while
+/// the editor might still open the document moments later, which is worse than
+/// waiting. Both are relayed as-is and resolve when the editor answers or the
+/// client closes.
+///
+/// **No concurrency cap / unbounded request channel** is a deliberate tradeoff,
+/// matching the unbounded loss-intolerant `upstream_tx`: a forwarded request must
+/// be answered (a dropped one would hang the downstream), and these are
+/// user-paced, low-volume requests rather than a flood-prone stream like
+/// `window/logMessage` (which is what the *bounded* window channel guards). The
+/// detached tasks are not tracked for abort on shutdown, but they self-terminate:
+/// when the service shuts down the editor `Client` closes, so each pending
+/// `client.*` call returns `Err` promptly and the task ends.
 fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::UpstreamRequest) {
     use crate::lsp::bridge::UpstreamRequest;
     let client = client.clone();
