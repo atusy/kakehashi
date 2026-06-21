@@ -302,12 +302,14 @@ impl Kakehashi {
         // best-effort window/logMessage / window/showMessage forwarding.
         if let Some(upstream_rx) = self.bridge.take_upstream_rx()
             && let Some(window_rx) = self.bridge.take_window_rx()
+            && let Some(upstream_request_rx) = self.bridge.take_upstream_request_rx()
         {
             let client = self.client.clone();
             let token = self.shutdown_token.clone();
             tokio::spawn(upstream_forwarding_loop(
                 upstream_rx,
                 window_rx,
+                upstream_request_rx,
                 client,
                 token,
             ));
@@ -410,6 +412,9 @@ async fn forward_upstream_request(
 async fn upstream_forwarding_loop(
     mut upstream_rx: tokio::sync::mpsc::UnboundedReceiver<crate::lsp::bridge::UpstreamNotification>,
     mut window_rx: tokio::sync::mpsc::Receiver<crate::lsp::bridge::UpstreamNotification>,
+    mut upstream_request_rx: tokio::sync::mpsc::UnboundedReceiver<
+        crate::lsp::bridge::UpstreamRequest,
+    >,
     client: Client,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
@@ -452,8 +457,55 @@ async fn upstream_forwarding_loop(
                     None => break, // Channel closed
                 }
             }
+
+            request = upstream_request_rx.recv() => {
+                match request {
+                    // Serviced on a spawned task, never awaited inline: these are
+                    // user-interactive (showMessageRequest can pend for minutes),
+                    // so awaiting here would freeze forwarding for every bridged
+                    // server. The reply travels back through the request's oneshot.
+                    Some(request) => spawn_upstream_request(&client, request),
+                    None => break, // Channel closed
+                }
+            }
         }
     }
+}
+
+/// Service a downstream-initiated request by forwarding it to the editor on a
+/// detached task and relaying the editor's answer through the request's `reply`
+/// oneshot.
+///
+/// Spawned (not awaited) so the shared forwarding loop keeps draining
+/// notifications while the editor — possibly a human — takes its time. No
+/// bridge-imposed timeout: `showMessageRequest` legitimately pends on user
+/// interaction, and `showDocument` is relayed as-is. On editor error the
+/// protocol default is sent (`None` selection / `success:false`); if the
+/// downstream connection drops, the receiving oneshot end is gone and
+/// `reply.send` simply no-ops.
+fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::UpstreamRequest) {
+    use crate::lsp::bridge::UpstreamRequest;
+    let client = client.clone();
+    tokio::spawn(async move {
+        match request {
+            UpstreamRequest::ShowMessageRequest {
+                typ,
+                message,
+                actions,
+                reply,
+            } => {
+                let action = client
+                    .show_message_request(typ, message, actions)
+                    .await
+                    .unwrap_or(None);
+                let _ = reply.send(action);
+            }
+            UpstreamRequest::ShowDocument { params, reply } => {
+                let success = client.show_document(params).await.unwrap_or(false);
+                let _ = reply.send(success);
+            }
+        }
+    });
 }
 
 /// Dispatch one upstream notification to the editor client.
@@ -483,6 +535,14 @@ async fn deliver_upstream_notification(
         }
         UpstreamNotification::ShowMessage { typ, message } => {
             client.show_message(typ, message).await;
+        }
+        UpstreamNotification::TelemetryEvent { data } => {
+            // `telemetry/event` params are LSPAny, but the notification type
+            // models them as object-or-array (`OneOf<Map, Vec>`). `telemetry_event`
+            // performs exactly that conversion (object → as-is, array → as-is, any
+            // other JSON scalar → wrapped in a single-element array), so objects
+            // and arrays — the conformant payloads — pass through unchanged.
+            client.telemetry_event(data).await;
         }
         UpstreamNotification::CreateWorkDoneProgress { token } => {
             // Awaited inline so the editor processes the create before the
@@ -626,9 +686,13 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        // Keep `_request_tx` alive so the request channel does not close and
+        // break the loop early; this test exercises only the upstream channel.
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
             window_rx,
+            request_rx,
             client,
             cancel.clone(),
         ));
@@ -729,9 +793,13 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        // Keep `_request_tx` alive so the request channel does not close and
+        // break the loop early; this test exercises only the upstream channel.
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
             window_rx,
+            request_rx,
             client,
             cancel.clone(),
         ));
@@ -835,9 +903,13 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        // Keep `_request_tx` alive so the request channel does not close and
+        // break the loop early; this test exercises only the upstream channel.
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
             window_rx,
+            request_rx,
             client,
             cancel.clone(),
         ));
@@ -941,5 +1013,189 @@ mod tests {
             join_result.is_ok(),
             "upstream_forwarding_loop task panicked or was aborted after cancellation"
         );
+    }
+
+    /// Build an initialized tower-lsp `Client` plus the socket halves, so a test
+    /// can observe server→client traffic and answer requests. Server→client
+    /// messages are suppressed until the client is `Initialized`, so an
+    /// `initialize` request is driven through first.
+    #[cfg(test)]
+    async fn init_client_and_socket() -> (
+        Client,
+        impl futures::Stream<Item = tower_lsp_server::jsonrpc::Request> + Unpin,
+        impl futures::Sink<tower_lsp_server::jsonrpc::Response> + Unpin,
+    ) {
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::Request;
+        use tower_lsp_server::ls_types::{InitializeParams, InitializeResult};
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (requests, responses) = socket.split();
+        (client, requests, responses)
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_relays_show_message_request_response() {
+        use crate::lsp::bridge::UpstreamRequest;
+        use futures::{SinkExt, StreamExt};
+        use tower_lsp_server::jsonrpc::Response;
+        use tower_lsp_server::ls_types::MessageType;
+
+        let (client, mut requests, mut responses) = init_client_and_socket().await;
+
+        // `_upstream_tx`/`_window_tx` kept alive so those channels stay open and
+        // the loop doesn't exit early; this test drives only the request channel.
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ShowMessageRequest {
+                typ: MessageType::INFO,
+                message: "pick one".to_string(),
+                actions: Some(vec![
+                    serde_json::from_value(serde_json::json!({ "title": "Retry" })).unwrap(),
+                ]),
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        // The editor receives the request and answers with the selected action.
+        let req = requests.next().await.expect("showMessageRequest emitted");
+        assert_eq!(req.method(), "window/showMessageRequest");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "title": "Retry" }),
+            ))
+            .await;
+
+        let action = reply_rx.await.expect("reply delivered");
+        assert_eq!(action.expect("an action selected").title, "Retry");
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_relays_show_document_response() {
+        use crate::lsp::bridge::UpstreamRequest;
+        use futures::{SinkExt, StreamExt};
+        use tower_lsp_server::jsonrpc::Response;
+
+        let (client, mut requests, mut responses) = init_client_and_socket().await;
+
+        // `_upstream_tx`/`_window_tx` kept alive so those channels stay open and
+        // the loop doesn't exit early; this test drives only the request channel.
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ShowDocument {
+                params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
+                    .unwrap(),
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        let req = requests.next().await.expect("showDocument emitted");
+        assert_eq!(req.method(), "window/showDocument");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "success": true }),
+            ))
+            .await;
+
+        assert!(reply_rx.await.expect("reply delivered"));
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_delivers_telemetry_event() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::StreamExt;
+
+        let (client, mut requests, _responses) = init_client_and_socket().await;
+
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        upstream_tx
+            .send(UpstreamNotification::TelemetryEvent {
+                data: serde_json::json!({ "kind": "metric", "value": 42 }),
+            })
+            .unwrap();
+
+        let event = requests.next().await.expect("telemetry/event emitted");
+        assert_eq!(event.method(), "telemetry/event");
+        assert_eq!(
+            event.params().expect("telemetry params"),
+            &serde_json::json!({ "kind": "metric", "value": 42 })
+        );
+
+        cancel.cancel();
+        let _ = loop_handle.await;
     }
 }

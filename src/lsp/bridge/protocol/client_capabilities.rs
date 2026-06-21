@@ -114,11 +114,16 @@ fn build_baseline_capabilities() -> ClientCapabilities {
 /// `completionItem.{documentationFormat, snippetSupport, deprecatedSupport,
 /// tagSupport, commitCharactersSupport, resolveSupport, insertTextModeSupport,
 /// labelDetailsSupport, preselectSupport}`, `hover.contentFormat`,
-/// `signatureHelp.signatureInformation`, `window.workDoneProgress`.
+/// `signatureHelp.signatureInformation`, `window.workDoneProgress`,
+/// `window.showDocument`, `window.showMessage`.
 ///
-/// `window.workDoneProgress` is gated on the real upstream editor so the bridge
-/// only invites downstream server-initiated progress (`window/workDoneProgress/create`)
-/// when it can actually relay it to the editor — see ls-bridge-work-done-progress.
+/// `window.workDoneProgress` and `window.showDocument` are gated on the real
+/// upstream editor so the bridge only invites a downstream server-initiated
+/// request (`window/workDoneProgress/create`, `window/showDocument`) when it can
+/// actually relay it to the editor — see ls-bridge-work-done-progress.
+/// `window.showMessage` (the `messageActionItem` refinement) is a plain
+/// pass-through: `window/showMessageRequest` is a base-protocol request the
+/// bridge always relays.
 fn merge_upstream_capabilities(
     mut base: ClientCapabilities,
     upstream: Option<&ClientCapabilities>,
@@ -233,6 +238,40 @@ fn merge_upstream_capabilities(
         base.window
             .get_or_insert_with(Default::default)
             .work_done_progress = Some(true);
+    }
+
+    // --- window.showDocument (gated on real upstream support) ---
+    // Same rationale as workDoneProgress: advertise downstream ONLY when the
+    // editor genuinely supports `window/showDocument` (`support == true`), so the
+    // bridge never invites a request it could only ever answer `success:false`.
+    // An absent or `false` capability leaves `window.showDocument` unadvertised
+    // (and never materializes an empty `window: {}` the baseline lacked).
+    if upstream
+        .window
+        .as_ref()
+        .and_then(|w| w.show_document.as_ref())
+        .map(|s| s.support)
+        == Some(true)
+    {
+        use tower_lsp_server::ls_types::ShowDocumentClientCapabilities;
+        base.window
+            .get_or_insert_with(Default::default)
+            .show_document = Some(ShowDocumentClientCapabilities { support: true });
+    }
+
+    // --- window.showMessage messageActionItem (passthrough) ---
+    // `window/showMessageRequest` is a base-protocol request the bridge always
+    // relays, so this only forwards the editor's `messageActionItem` refinement
+    // (e.g. `additionalPropertiesSupport`) when present, keeping the action items
+    // the downstream receives — and the selection it sends back — faithful.
+    if let Some(show_message) = upstream
+        .window
+        .as_ref()
+        .and_then(|w| w.show_message.as_ref())
+    {
+        base.window
+            .get_or_insert_with(Default::default)
+            .show_message = Some(show_message.clone());
     }
 
     base
@@ -593,6 +632,75 @@ mod tests {
         assert!(
             merged.window.is_none(),
             "explicit false must leave window unadvertised, not materialize workDoneProgress:false"
+        );
+    }
+
+    #[test]
+    fn merge_advertises_show_document_only_when_upstream_supports() {
+        use tower_lsp_server::ls_types::{
+            ShowDocumentClientCapabilities, WindowClientCapabilities,
+        };
+
+        // Upstream supports showDocument → advertised downstream.
+        let supporting = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                show_document: Some(ShowDocumentClientCapabilities { support: true }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&supporting));
+        assert_eq!(
+            merged
+                .window
+                .and_then(|w| w.show_document)
+                .map(|s| s.support),
+            Some(true),
+            "must advertise showDocument when the editor supports it"
+        );
+
+        // Upstream support=false → not advertised, no empty `window` materialized.
+        let unsupported = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                show_document: Some(ShowDocumentClientCapabilities { support: false }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&unsupported));
+        assert!(
+            merged.window.is_none(),
+            "support=false must leave window unadvertised (bridge would only answer success:false)"
+        );
+    }
+
+    #[test]
+    fn merge_passes_through_show_message_message_action_item() {
+        use tower_lsp_server::ls_types::{
+            MessageActionItemCapabilities, ShowMessageRequestClientCapabilities,
+            WindowClientCapabilities,
+        };
+
+        let upstream = ClientCapabilities {
+            window: Some(WindowClientCapabilities {
+                show_message: Some(ShowMessageRequestClientCapabilities {
+                    message_action_item: Some(MessageActionItemCapabilities {
+                        additional_properties_support: Some(true),
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = merge_upstream_capabilities(build_baseline_capabilities(), Some(&upstream));
+        assert_eq!(
+            merged
+                .window
+                .and_then(|w| w.show_message)
+                .and_then(|s| s.message_action_item)
+                .and_then(|m| m.additional_properties_support),
+            Some(true),
+            "showMessage messageActionItem must pass through from upstream"
         );
     }
 

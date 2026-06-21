@@ -32,6 +32,7 @@ mod pool;
 mod progress_registry;
 mod protocol;
 mod root_markers;
+mod telemetry;
 mod text_document;
 mod window;
 mod workspace;
@@ -40,6 +41,7 @@ mod workspace;
 #[cfg(test)]
 pub(crate) use actor::OutboundMessage;
 pub(crate) use actor::UpstreamNotification;
+pub(crate) use actor::UpstreamRequest;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub(crate) use pool::ConnectionKey;
