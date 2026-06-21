@@ -344,6 +344,21 @@ pub struct BridgeServerConfig {
     /// — neither re-advertising the capability nor changing forwarding. A
     /// restart is required for new triggers to take effect.
     pub on_type_formatting_triggers: Option<Vec<String>>,
+    /// Prefer reusing **one** downstream process across every workspace root for
+    /// this server, instead of spawning a separate process per marker root
+    /// (issue #391). It is a *preference*, honored only when the downstream
+    /// server advertises `workspace.workspaceFolders.{supported,
+    /// changeNotifications}`: when it does, kakehashi routes all roots to a
+    /// single connection and announces each new root with
+    /// `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs
+    /// once and silently falls back to the per-root-instance model. That
+    /// universal fallback makes a blanket `languageServers._` opt-in safe.
+    ///
+    /// `None` = inherit (built-in default `false` = per-root instances). Like
+    /// `root_markers`, a concrete server's explicit value overrides the
+    /// wildcard, so `_.preferSharedInstance: true` can be opted out of
+    /// per server with `preferSharedInstance: false`.
+    pub prefer_shared_instance: Option<bool>,
 }
 
 /// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
@@ -1287,6 +1302,35 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_prefer_shared_instance() {
+        let config_json = r#"{
+            "languageServers": {
+                "tsgo": {
+                    "cmd": ["typescript-language-server", "--stdio"],
+                    "languages": ["typescript"],
+                    "preferSharedInstance": true
+                },
+                "pyright": {
+                    "cmd": ["pyright-langserver", "--stdio"],
+                    "languages": ["python"]
+                }
+            }
+        }"#;
+
+        let settings: RawWorkspaceSettings = serde_json::from_str(config_json).unwrap();
+        let servers = settings.language_servers.expect("languageServers parses");
+        assert_eq!(
+            servers["tsgo"].prefer_shared_instance,
+            Some(true),
+            "explicit preferSharedInstance is preserved"
+        );
+        assert_eq!(
+            servers["pyright"].prefer_shared_instance, None,
+            "absent preferSharedInstance parses as None (inherit -> per-root)"
+        );
+    }
+
+    #[test]
     fn should_parse_on_type_formatting_triggers() {
         let config_json = r#"{
             "languageServers": {
@@ -1324,6 +1368,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
+            prefer_shared_instance: None,
         };
         let servers = HashMap::from([
             ("a".to_string(), server(Some(vec!["}", ";"]))),
@@ -1361,6 +1406,7 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
+                prefer_shared_instance: None,
             },
         )]);
         assert_eq!(
@@ -1454,6 +1500,7 @@ mod tests {
                 RootMarker::Single(".git".to_string()),
             ]),
             on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
         };
 
         let json = serde_json::to_value(&config).unwrap();

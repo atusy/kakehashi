@@ -25,9 +25,10 @@ pub fn default_settings() -> RawWorkspaceSettings {
 }
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
-/// entry documenting the built-in `rootMarkers` default that every concrete
-/// server inherits (wildcard-config-inheritance). Not spawnable itself —
-/// lookups skip the wildcard key and any server with an empty resolved cmd.
+/// entry documenting the built-in `rootMarkers` and `preferSharedInstance`
+/// defaults that every concrete server inherits (wildcard-config-inheritance).
+/// Not spawnable itself — lookups skip the wildcard key and any server with an
+/// empty resolved cmd.
 fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
     HashMap::from([(
         WILDCARD_KEY.to_string(),
@@ -37,6 +38,10 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             initialization_options: None,
             root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
+            // Spell out the built-in default (per-root instances) so the
+            // generated template documents the opt-in and the knob is
+            // discoverable (#391). Concrete servers inherit it via the wildcard.
+            prefer_shared_instance: Some(false),
         },
     )])
 }
