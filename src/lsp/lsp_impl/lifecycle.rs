@@ -296,18 +296,25 @@ impl Kakehashi {
     pub(crate) async fn initialized_impl(&self, _: InitializedParams) {
         self.notifier().log_info("server is ready").await;
 
-        // Forward downstream server notifications to upstream editor.
-        // The reader tasks feed two channels (loss-tolerance split, #378):
-        // unbounded for DiagnosticRefresh (must not be lost) and bounded for
-        // best-effort window/logMessage / window/showMessage forwarding.
+        // Forward downstream-initiated messages to the upstream editor. The
+        // reader tasks feed three channels:
+        // - unbounded `upstream_rx` (loss-intolerant): DiagnosticRefresh and
+        //   work-done progress (create/$progress/forget).
+        // - bounded `window_rx` (best-effort, drop-on-full): window/logMessage,
+        //   window/showMessage, and telemetry/event.
+        // - unbounded `upstream_request_rx` (loss-intolerant): downstream
+        //   requests forwarded with a response relayed back
+        //   (window/showMessageRequest, window/showDocument).
         if let Some(upstream_rx) = self.bridge.take_upstream_rx()
             && let Some(window_rx) = self.bridge.take_window_rx()
+            && let Some(upstream_request_rx) = self.bridge.take_upstream_request_rx()
         {
             let client = self.client.clone();
             let token = self.shutdown_token.clone();
             tokio::spawn(upstream_forwarding_loop(
                 upstream_rx,
                 window_rx,
+                upstream_request_rx,
                 client,
                 token,
             ));
@@ -383,25 +390,30 @@ async fn forward_upstream_request(
     }
 }
 
-/// Forward upstream notifications from downstream language servers to the editor.
+/// Forward downstream-initiated messages from language servers to the editor.
 ///
-/// Consumes notifications from two channels (loss-tolerance split, #378) and
-/// dispatches them to the LSP client:
+/// Consumes from three channels (loss-tolerance split, #378) and dispatches them
+/// to the LSP client:
 /// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
 ///   `workspace/diagnostic/refresh` — and the server-declared work-done
 ///   progress notifications (`CreateWorkDoneProgress`/`Progress`/
 ///   `ForgetWorkDoneProgress`, window-work-done-progress), which must not be
 ///   lost or reordered.
-/// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` —
-///   downstream `window/*` notifications, forwarded unconditionally and
-///   already prefixed with the originating server name.
+/// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
+///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
+///   editor's response relayed back; loss-intolerant (a dropped request hangs
+///   the downstream). Serviced via [`spawn_upstream_request`] so a slow/human
+///   editor never stalls the loop.
+/// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` and
+///   `telemetry/event` — best-effort notifications, forwarded unconditionally.
 ///
-/// Each dispatch awaits tower-lsp's internal bounded channel, so a slow editor
-/// stalls the loop — but the `biased` select drains `upstream_rx` first, so a
-/// `window/*` burst cannot starve `DiagnosticRefresh` or progress, and the
-/// bounded window queue caps memory. FIFO order is preserved within each channel
-/// (the window-notification e2e relies on window-channel FIFO; create-before-
-/// progress relies on upstream-channel FIFO).
+/// Notification dispatch awaits tower-lsp's internal bounded channel, so a slow
+/// editor stalls the loop — but the `biased` select drains the two loss-intolerant
+/// channels (`upstream_rx`, then `upstream_request_rx`) before the best-effort
+/// `window_rx`, so a `window/*` burst cannot starve `DiagnosticRefresh`, progress,
+/// or request forwarding, and the bounded window queue caps memory. FIFO order is
+/// preserved within each channel (the window-notification e2e relies on
+/// window-channel FIFO; create-before-progress relies on upstream-channel FIFO).
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the
@@ -410,6 +422,9 @@ async fn forward_upstream_request(
 async fn upstream_forwarding_loop(
     mut upstream_rx: tokio::sync::mpsc::UnboundedReceiver<crate::lsp::bridge::UpstreamNotification>,
     mut window_rx: tokio::sync::mpsc::Receiver<crate::lsp::bridge::UpstreamNotification>,
+    mut upstream_request_rx: tokio::sync::mpsc::UnboundedReceiver<
+        crate::lsp::bridge::UpstreamRequest,
+    >,
     client: Client,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
@@ -443,6 +458,23 @@ async fn upstream_forwarding_loop(
                 }
             }
 
+            request = upstream_request_rx.recv() => {
+                match request {
+                    // Serviced on a spawned task, never awaited inline: these are
+                    // user-interactive (showMessageRequest can pend for minutes),
+                    // so awaiting here would freeze forwarding for every bridged
+                    // server. The reply travels back through the request's oneshot.
+                    //
+                    // Ordered before `window_rx` (best-effort) so a `window/*` flood
+                    // (e.g. logMessage) can't starve loss-intolerant request
+                    // forwarding under `biased`. Servicing is just a spawn, and
+                    // requests are user-paced/low-volume, so this can't starve
+                    // `window_rx` in turn.
+                    Some(request) => spawn_upstream_request(&client, request),
+                    None => break, // Channel closed
+                }
+            }
+
             notification = window_rx.recv() => {
                 match notification {
                     Some(notification) => {
@@ -454,6 +486,88 @@ async fn upstream_forwarding_loop(
             }
         }
     }
+}
+
+/// Service a downstream-initiated request by forwarding it to the editor on a
+/// detached task and relaying the editor's answer through the request's `reply`
+/// oneshot.
+///
+/// Spawned (not awaited) so the shared forwarding loop keeps draining
+/// notifications while the editor — possibly a human — takes its time. On editor
+/// error the protocol default is sent (`None` selection / `success:false`); if
+/// the downstream connection drops, the receiving oneshot end is gone and
+/// `reply.send` simply no-ops.
+///
+/// **No bridge-imposed timeout** (unlike `create_work_done_progress`):
+/// `showMessageRequest` legitimately pends on user interaction, and `showDocument`
+/// deliberately opts out too — a timeout there would answer `success:false` while
+/// the editor might still open the document moments later, which is worse than
+/// waiting. Both are relayed as-is and resolve when the editor answers or the
+/// client closes.
+///
+/// **No concurrency cap / unbounded request channel** is a deliberate tradeoff,
+/// matching the unbounded loss-intolerant `upstream_tx`: a forwarded request must
+/// be answered (a dropped one would hang the downstream), and these are
+/// user-paced, low-volume requests rather than a flood-prone stream like
+/// `window/logMessage` (which is what the *bounded* window channel guards). The
+/// detached tasks are not tracked for abort on shutdown, but they self-terminate:
+/// when the service shuts down the editor `Client` closes, so each pending
+/// `client.*` call returns `Err` promptly and the task ends.
+fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::UpstreamRequest) {
+    use crate::lsp::bridge::UpstreamRequest;
+    let client = client.clone();
+    tokio::spawn(async move {
+        match request {
+            UpstreamRequest::ShowMessageRequest {
+                typ,
+                message,
+                actions,
+                reply,
+            } => {
+                let action = match client.show_message_request(typ, message, actions).await {
+                    Ok(action) => action,
+                    Err(e) => {
+                        // e.g. method-not-supported or transport failure — log for
+                        // diagnosis, still relay the protocol default (no selection).
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "window/showMessageRequest forwarding failed: {}; answering null",
+                            e
+                        );
+                        None
+                    }
+                };
+                let _ = reply.send(action);
+            }
+            UpstreamRequest::ShowDocument { params, reply } => {
+                let success = match client.show_document(params).await {
+                    Ok(success) => success,
+                    Err(e) => {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "window/showDocument forwarding failed: {}; answering success:false",
+                            e
+                        );
+                        false
+                    }
+                };
+                let _ = reply.send(success);
+            }
+        }
+    });
+}
+
+/// A `telemetry/event` notification whose `Params` is raw `serde_json::Value`,
+/// so the downstream payload is forwarded to the editor as the same JSON value
+/// (its shape is preserved — scalars are not wrapped, no fields added/dropped;
+/// re-serialization may still normalize whitespace/number formatting). The
+/// `ls_types` `TelemetryEvent` models params as `OneOf<Map, Vec>`, which can't
+/// carry a scalar LSPAny payload unchanged.
+enum RawTelemetryEvent {}
+
+impl tower_lsp_server::ls_types::notification::Notification for RawTelemetryEvent {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "telemetry/event";
 }
 
 /// Dispatch one upstream notification to the editor client.
@@ -483,6 +597,16 @@ async fn deliver_upstream_notification(
         }
         UpstreamNotification::ShowMessage { typ, message } => {
             client.show_message(typ, message).await;
+        }
+        UpstreamNotification::TelemetryEvent { data } => {
+            // Forward the raw LSPAny `params` as the same JSON value. We can't
+            // use `client.telemetry_event` (it wraps any non-object/array scalar
+            // in a single-element array) or `send_notification::<ls_types
+            // TelemetryEvent>` (its `Params` is `OneOf<Map, Vec>`, rejecting
+            // scalars). A local marker with `Params = serde_json::Value` preserves
+            // the payload's JSON shape (no scalar-wrapping), matching how
+            // `$/progress` is forwarded.
+            client.send_notification::<RawTelemetryEvent>(data).await;
         }
         UpstreamNotification::CreateWorkDoneProgress { token } => {
             // Awaited inline so the editor processes the create before the
@@ -626,9 +750,13 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        // Keep `_request_tx` alive so the request channel does not close and
+        // break the loop early; this test exercises only the upstream channel.
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
             window_rx,
+            request_rx,
             client,
             cancel.clone(),
         ));
@@ -729,9 +857,13 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        // Keep `_request_tx` alive so the request channel does not close and
+        // break the loop early; this test exercises only the upstream channel.
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
             window_rx,
+            request_rx,
             client,
             cancel.clone(),
         ));
@@ -835,9 +967,13 @@ mod tests {
         // Keep `_window_tx` alive so the bounded window channel does not close
         // and break the loop early; this test exercises only the upstream channel.
         let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        // Keep `_request_tx` alive so the request channel does not close and
+        // break the loop early; this test exercises only the upstream channel.
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
             rx,
             window_rx,
+            request_rx,
             client,
             cancel.clone(),
         ));
@@ -941,5 +1077,207 @@ mod tests {
             join_result.is_ok(),
             "upstream_forwarding_loop task panicked or was aborted after cancellation"
         );
+    }
+
+    /// Build an initialized tower-lsp `Client` plus the socket halves, so a test
+    /// can observe server→client traffic and answer requests. Server→client
+    /// messages are suppressed until the client is `Initialized`, so an
+    /// `initialize` request is driven through first.
+    #[cfg(test)]
+    async fn init_client_and_socket() -> (
+        Client,
+        impl futures::Stream<Item = tower_lsp_server::jsonrpc::Request> + Unpin,
+        impl futures::Sink<tower_lsp_server::jsonrpc::Response> + Unpin,
+    ) {
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::Request;
+        use tower_lsp_server::ls_types::{InitializeParams, InitializeResult};
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (requests, responses) = socket.split();
+        (client, requests, responses)
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_relays_show_message_request_response() {
+        use crate::lsp::bridge::UpstreamRequest;
+        use futures::{SinkExt, StreamExt};
+        use tower_lsp_server::jsonrpc::Response;
+        use tower_lsp_server::ls_types::MessageType;
+
+        let (client, mut requests, mut responses) = init_client_and_socket().await;
+
+        // `_upstream_tx`/`_window_tx` kept alive so those channels stay open and
+        // the loop doesn't exit early; this test drives only the request channel.
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ShowMessageRequest {
+                typ: MessageType::INFO,
+                message: "pick one".to_string(),
+                actions: Some(vec![
+                    serde_json::from_value(serde_json::json!({ "title": "Retry" })).unwrap(),
+                ]),
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        // The editor receives the request and answers with the selected action.
+        let req = requests.next().await.expect("showMessageRequest emitted");
+        assert_eq!(req.method(), "window/showMessageRequest");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "title": "Retry" }),
+            ))
+            .await;
+
+        let action = reply_rx.await.expect("reply delivered");
+        assert_eq!(action.expect("an action selected").title, "Retry");
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_relays_show_document_response() {
+        use crate::lsp::bridge::UpstreamRequest;
+        use futures::{SinkExt, StreamExt};
+        use tower_lsp_server::jsonrpc::Response;
+
+        let (client, mut requests, mut responses) = init_client_and_socket().await;
+
+        // `_upstream_tx`/`_window_tx` kept alive so those channels stay open and
+        // the loop doesn't exit early; this test drives only the request channel.
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ShowDocument {
+                params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
+                    .unwrap(),
+                reply: reply_tx,
+            })
+            .unwrap();
+
+        let req = requests.next().await.expect("showDocument emitted");
+        assert_eq!(req.method(), "window/showDocument");
+        let id = req.id().expect("request has an id").clone();
+        let _ = responses
+            .send(Response::from_ok(
+                id,
+                serde_json::json!({ "success": true }),
+            ))
+            .await;
+
+        assert!(reply_rx.await.expect("reply delivered"));
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_loop_delivers_telemetry_event() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::StreamExt;
+
+        let (client, mut requests, _responses) = init_client_and_socket().await;
+
+        let (upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            client,
+            cancel.clone(),
+        ));
+
+        // An object payload passes through unchanged.
+        upstream_tx
+            .send(UpstreamNotification::TelemetryEvent {
+                data: serde_json::json!({ "kind": "metric", "value": 42 }),
+            })
+            .unwrap();
+
+        let event = requests.next().await.expect("telemetry/event emitted");
+        assert_eq!(event.method(), "telemetry/event");
+        assert_eq!(
+            event.params().expect("telemetry params"),
+            &serde_json::json!({ "kind": "metric", "value": 42 })
+        );
+
+        // A scalar payload is forwarded verbatim, NOT wrapped in an array (which
+        // is what `client.telemetry_event` would do) — this is why a raw-`Value`
+        // notification marker is used.
+        upstream_tx
+            .send(UpstreamNotification::TelemetryEvent {
+                data: serde_json::json!(42),
+            })
+            .unwrap();
+
+        let scalar = requests.next().await.expect("scalar telemetry emitted");
+        assert_eq!(scalar.method(), "telemetry/event");
+        assert_eq!(
+            scalar.params().expect("telemetry params"),
+            &serde_json::json!(42),
+            "scalar telemetry payload must be forwarded verbatim, not wrapped"
+        );
+
+        cancel.cancel();
+        let _ = loop_handle.await;
     }
 }

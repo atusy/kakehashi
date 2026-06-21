@@ -25,17 +25,24 @@ use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 
 pub(in crate::lsp::bridge) mod log_message;
 pub(in crate::lsp::bridge) mod progress;
+pub(in crate::lsp::bridge) mod show_document;
 pub(in crate::lsp::bridge) mod show_message;
+pub(in crate::lsp::bridge) mod show_message_request;
 pub(in crate::lsp::bridge) mod work_done_progress_create;
 
-/// Enqueue a `window/*` notification on the bounded best-effort channel.
+/// Enqueue a notification on the bounded best-effort channel.
+///
+/// Shared by the `window/*` forwarders and [`telemetry::event`] (which rides the
+/// same loss-tolerant channel); hence `pub(in crate::lsp::bridge)`.
 ///
 /// `try_send` keeps the reader task non-blocking: a full queue (editor slower
 /// than a downstream notification flood) drops the message instead of growing
 /// memory or stalling stdout reads; a closed queue (shutdown) has no one left
 /// to deliver to. Both are deliberate per the loss-tolerance split documented
 /// on [`UpstreamNotification`].
-fn send_window_notification(
+///
+/// [`telemetry::event`]: crate::lsp::bridge::telemetry::event
+pub(in crate::lsp::bridge) fn send_window_notification(
     deps: &ServerRequestDeps,
     server_prefix: &str,
     method: &str,

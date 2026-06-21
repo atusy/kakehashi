@@ -72,7 +72,7 @@ pub(crate) enum ConnectionReadiness {
 
 use super::actor::{
     OUTBOUND_QUEUE_CAPACITY, OutboundMessage, ResponseRouter, ServerRequestDeps,
-    UpstreamNotification, spawn_reader_task_for_server,
+    UpstreamNotification, UpstreamRequest, spawn_reader_task_for_server,
 };
 use super::connection::AsyncBridgeConnection;
 
@@ -252,6 +252,15 @@ pub struct LanguageServerPool {
     window_tx: tokio::sync::mpsc::Sender<UpstreamNotification>,
     /// Receiver for window notifications, taken once by the forwarding task.
     window_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<UpstreamNotification>>>,
+    /// Sender for downstream-initiated requests forwarded to the editor with a
+    /// response relayed back (`window/showMessageRequest`, `window/showDocument`).
+    ///
+    /// Cloned into each reader task. Unbounded: a dropped request would hang the
+    /// downstream waiting for a response (loss-intolerant, like `upstream_tx`).
+    upstream_request_tx: tokio::sync::mpsc::UnboundedSender<UpstreamRequest>,
+    /// Receiver for upstream requests, taken once by the forwarding task.
+    upstream_request_rx:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<UpstreamRequest>>>,
     /// Remaps downstream-declared work-done progress tokens to globally unique
     /// upstream tokens (window-work-done-progress bridging). Shared with every
     /// reader task (to register/translate) and the cancel path (to route a
@@ -275,6 +284,7 @@ impl LanguageServerPool {
         let (upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
         let (window_tx, window_rx) =
             tokio::sync::mpsc::channel(super::actor::WINDOW_NOTIFICATION_QUEUE_CAPACITY);
+        let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             connections: Mutex::new(HashMap::new()),
             document_tracker: DocumentTracker::new(),
@@ -289,6 +299,8 @@ impl LanguageServerPool {
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
             window_tx,
             window_rx: std::sync::Mutex::new(Some(window_rx)),
+            upstream_request_tx,
+            upstream_request_rx: std::sync::Mutex::new(Some(upstream_request_rx)),
             progress_registry: Arc::new(super::ProgressRegistry::new()),
         }
     }
@@ -371,6 +383,21 @@ impl LanguageServerPool {
             .window_rx
             .lock()
             .recover_poison("LanguageServerPool::take_window_rx");
+        guard.take()
+    }
+
+    /// Take the upstream request receiver for forwarding to the editor.
+    ///
+    /// Returns `Some(receiver)` on first call, `None` on subsequent calls.
+    /// The receiver should be consumed by the same forwarding task as
+    /// `take_upstream_rx`'s.
+    pub(crate) fn take_upstream_request_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<UpstreamRequest>> {
+        let mut guard = self
+            .upstream_request_rx
+            .lock()
+            .recover_poison("LanguageServerPool::take_upstream_request_rx");
         guard.take()
     }
 
@@ -1168,6 +1195,7 @@ impl LanguageServerPool {
                 dynamic_capabilities: Arc::clone(&dynamic_capabilities),
                 upstream_tx: self.upstream_tx.clone(),
                 window_tx: self.window_tx.clone(),
+                upstream_request_tx: self.upstream_request_tx.clone(),
                 // #391: share the per-connection mutable folder set with the
                 // reader (it answers workspace/workspaceFolders pulls).
                 workspace_folders: workspace_folders.clone(),

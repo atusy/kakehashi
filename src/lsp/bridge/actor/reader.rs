@@ -25,7 +25,7 @@ use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::MessageType;
 
 use super::super::connection::BridgeReader;
-use super::super::{client, text_document, window};
+use super::super::{client, telemetry, text_document, window};
 use super::OutboundMessage;
 use super::ResponseRouter;
 use super::response_router::RouteResult;
@@ -42,13 +42,16 @@ use crate::lsp::bridge::workspace::{self, WorkspaceFolderSet};
 /// - `DiagnosticRefresh` travels on an **unbounded** channel: dropping one
 ///   would silently stale the editor's diagnostics, and its volume is tiny
 ///   (one per downstream `workspace/diagnostic/refresh`).
-/// - `LogMessage`/`ShowMessage` travel on a **bounded** channel
+/// - `LogMessage`/`ShowMessage`/`TelemetryEvent` travel on a **bounded** channel
 ///   ([`WINDOW_NOTIFICATION_QUEUE_CAPACITY`]) with drop-on-full: a downstream
-///   server stuck in a tight logMessage loop must not grow memory without
-///   bound or starve `DiagnosticRefresh` behind a burst (the forwarding loop
-///   drains the unbounded channel first). Within the bounded channel FIFO
+///   server stuck in a tight logMessage (or telemetry) loop must not grow memory
+///   without bound or starve `DiagnosticRefresh` behind a burst (the forwarding
+///   loop drains the unbounded channel first). Within the bounded channel FIFO
 ///   order is preserved, which the window-notification e2e relies on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived: `TelemetryEvent` carries an arbitrary
+/// `serde_json::Value` (which is `PartialEq` but not `Eq` because of floats).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
@@ -59,6 +62,10 @@ pub(crate) enum UpstreamNotification {
     /// Forward a downstream `window/showMessage` to the editor.
     /// `message` is already prefixed with the originating server name.
     ShowMessage { typ: MessageType, message: String },
+    /// Forward a downstream `telemetry/event` notification to the editor
+    /// verbatim. `data` is the raw notification `params` (arbitrary LSPAny);
+    /// telemetry has no client capability and is always passed through.
+    TelemetryEvent { data: serde_json::Value },
     /// Ask the editor to create a work-done progress for `token`.
     /// Sent when a downstream issues `window/workDoneProgress/create`; `token`
     /// is the bridge-minted *upstream* token, not the downstream's own.
@@ -77,6 +84,44 @@ pub(crate) enum UpstreamNotification {
     /// progress still in flight, so the loop's created-token set can't leak
     /// entries across crashes/respawns (window-work-done-progress bridging).
     ForgetWorkDoneProgress(Vec<tower_lsp_server::ls_types::NumberOrString>),
+}
+
+/// A downstream-initiated **request** the bridge forwards to the editor and
+/// whose response must be relayed back to that downstream server.
+///
+/// Unlike [`UpstreamNotification`] (fire-and-forget), these need the editor's
+/// answer routed back, so each variant carries a `oneshot` reply the forwarding
+/// loop fulfills with the editor's typed result. The reader-side handler then
+/// frames the JSON-RPC response and writes it to the originating connection's
+/// `response_tx`. This keeps the bridge decoupled from tower-lsp's `Client`
+/// (the loop owns the `Client`) and the forwarding loop decoupled from
+/// [`OutboundMessage`] / JSON-RPC framing (the reader side owns that).
+///
+/// A separate **unbounded** channel carries these (a dropped request would hang
+/// the downstream waiting for a response that never comes); the channel is held
+/// off [`UpstreamNotification`] because `oneshot::Sender` is neither `Clone` nor
+/// `Eq`. The forwarding loop must service each request on a spawned task — these
+/// are user-interactive and can pend indefinitely, so awaiting one inline would
+/// freeze forwarding for every bridged server.
+///
+/// `$/cancelRequest` propagation for an in-flight forwarded request is out of
+/// scope for now: if the downstream cancels or dies, the reader-side oneshot is
+/// dropped and the spawned waiter resolves to the protocol's default answer.
+pub(crate) enum UpstreamRequest {
+    /// Forward a `window/showMessageRequest`; the editor's selected action (or
+    /// `None`) is relayed back to the downstream.
+    ShowMessageRequest {
+        typ: MessageType,
+        message: String,
+        actions: Option<Vec<tower_lsp_server::ls_types::MessageActionItem>>,
+        reply: oneshot::Sender<Option<tower_lsp_server::ls_types::MessageActionItem>>,
+    },
+    /// Forward a `window/showDocument` (URI passed through verbatim, including
+    /// virtual-document URIs); the editor's success flag is relayed back.
+    ShowDocument {
+        params: tower_lsp_server::ls_types::ShowDocumentParams,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 /// Capacity of the bounded `window/*` forwarding queue. Sized like the
@@ -112,8 +157,14 @@ pub(crate) struct ServerRequestDeps {
     /// Loss-intolerant notifications (`DiagnosticRefresh` and work-done
     /// progress create/$progress/forget); unbounded.
     pub(crate) upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    /// Best-effort `window/*` notifications; bounded, dropped when full.
+    /// Best-effort `window/*` (and `telemetry/event`) notifications; bounded,
+    /// dropped when full.
     pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
+    /// Downstream-initiated requests forwarded to the editor with a response
+    /// relayed back (`window/showMessageRequest`, `window/showDocument`).
+    /// Unbounded: a dropped request would hang the downstream. See
+    /// [`UpstreamRequest`].
+    pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
     /// The folders this connection currently serves, used to answer downstream
     /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
     /// connection grows it as new marker roots join (#391).
@@ -364,6 +415,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
             dynamic_capabilities,
             upstream_tx,
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
@@ -452,6 +504,7 @@ async fn reader_loop(
         upstream_tx,
         workspace_folders: WorkspaceFolderSet::new(None),
         window_tx,
+        upstream_request_tx: mpsc::unbounded_channel().0,
         progress_registry,
         progress_connection_id,
     };
@@ -671,9 +724,10 @@ async fn handle_message(
 
 /// Forward supported downstream notifications to the upstream editor.
 ///
-/// Routes `window/logMessage` and `window/showMessage` to their per-method
-/// modules ([`window::log_message`], [`window::show_message`]); both are
-/// forwarded unconditionally so the bridge stays transparent.
+/// Routes `window/logMessage`, `window/showMessage`, and `telemetry/event` to
+/// their per-method modules ([`window::log_message`], [`window::show_message`],
+/// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
+/// transparent.
 ///
 /// `$/progress` is handled earlier in `handle_message` (translated and forwarded
 /// via [`window::progress::forward`]), so it never reaches here. Everything else
@@ -686,6 +740,7 @@ fn forward_notification(
     match message["method"].as_str() {
         Some("window/logMessage") => window::log_message::forward(message, server_prefix, deps),
         Some("window/showMessage") => window::show_message::forward(message, server_prefix, deps),
+        Some("telemetry/event") => telemetry::event::forward(message, server_prefix, deps),
         _ => {}
     }
 }
@@ -707,6 +762,22 @@ async fn handle_server_request(
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let method = message.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Deferred request handlers forward to the editor and relay its response
+    // back asynchronously (the editor may pend on user interaction), so they own
+    // their entire response lifecycle on a spawned task rather than returning a
+    // synchronous `body` to frame-and-send below.
+    match method {
+        "window/showMessageRequest" => {
+            window::show_message_request::handle(&message, id, server_prefix, deps);
+            return;
+        }
+        "window/showDocument" => {
+            window::show_document::handle(&message, id, server_prefix, deps);
+            return;
+        }
+        _ => {}
+    }
 
     let body: jsonrpc::Result<serde_json::Value> = match method {
         "client/registerCapability" => {
@@ -733,9 +804,32 @@ async fn handle_server_request(
     };
 
     let response = match body {
-        Ok(result) => jsonrpc::Response::from_ok(id.clone(), result),
+        Ok(result) => jsonrpc::Response::from_ok(id, result),
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
+    send_server_response(&deps.response_tx, response, server_prefix, method).await;
+}
+
+/// Frame a server-request response and send it to the downstream server via the
+/// writer channel.
+///
+/// Used both by the synchronous dispatch in [`handle_server_request`] and by the
+/// deferred request handlers ([`window::show_message_request`],
+/// [`window::show_document`]) that relay an editor response back asynchronously.
+///
+/// We use [`OutboundMessage::Untracked`] because a server-initiated response has
+/// no [`ResponseRouter`] entry to clean up on failure (unlike `Tracked`
+/// requests). `send_timeout(5s)` (rather than `try_send`) guarantees delivery
+/// under transient backpressure without risking the deadlock a bare
+/// `send().await` could cause if the queue is full while the writer is blocked
+/// on stdin and the server on stdout — the response is dropped only after 5s of
+/// sustained backpressure, far better than instant loss.
+pub(in crate::lsp::bridge) async fn send_server_response(
+    response_tx: &mpsc::Sender<OutboundMessage>,
+    response: jsonrpc::Response,
+    server_prefix: &str,
+    method: &str,
+) {
     // Response implements Serialize, so convert to Value for OutboundMessage.
     // Serialization cannot fail in practice, but the project bans panics in
     // production code; dropping the response is the only sane fallback here.
@@ -751,22 +845,7 @@ async fn handle_server_request(
         }
     };
 
-    // Send response via the writer channel.
-    // We use OutboundMessage::Untracked because a server-initiated response has
-    // no ResponseRouter entry to clean up on failure (unlike Tracked requests).
-    //
-    // We use send_timeout(5s) instead of try_send() to guarantee delivery under
-    // transient backpressure. try_send() silently drops the response if the queue
-    // (capacity 256) is momentarily full — a correctness bug for server-initiated
-    // requests like client/registerCapability that require acknowledgment.
-    //
-    // We avoid bare send().await because it could theoretically deadlock if the
-    // queue is full, the writer is blocked on stdin, and the downstream server is
-    // blocked on stdout — creating a circular wait. send_timeout(5s) provides an
-    // explicit safety net: the response is dropped only after 5 seconds of
-    // sustained backpressure, which is far better than instant loss.
-    if let Err(e) = deps
-        .response_tx
+    if let Err(e) = response_tx
         .send_timeout(OutboundMessage::Untracked(response), Duration::from_secs(5))
         .await
     {
@@ -850,6 +929,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry,
             progress_connection_id,
         };
@@ -920,6 +1000,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry,
             progress_connection_id,
         };
@@ -1013,6 +1094,7 @@ mod tests {
             dynamic_capabilities: caps,
             upstream_tx,
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
@@ -1086,6 +1168,7 @@ mod tests {
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
                 window_tx,
+                upstream_request_tx: mpsc::unbounded_channel().0,
                 workspace_folders: WorkspaceFolderSet::new(None),
                 progress_registry: Arc::clone(&progress_registry),
                 progress_connection_id: conn,
@@ -1509,6 +1592,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -1567,6 +1651,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -1624,6 +1709,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::clone(&progress_registry),
             progress_connection_id,
         };
@@ -1681,6 +1767,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry,
             progress_connection_id,
         };
@@ -1737,6 +1824,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry,
             progress_connection_id,
         };
@@ -1790,6 +1878,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::clone(&progress_registry),
             progress_connection_id,
         };
@@ -1844,6 +1933,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry,
             progress_connection_id,
         };
@@ -1880,6 +1970,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -1932,6 +2023,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             workspace_folders: WorkspaceFolderSet::new(Some(folders)),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -1973,6 +2065,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2015,6 +2108,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2060,6 +2154,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2097,6 +2192,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2149,6 +2245,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2212,6 +2309,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2270,6 +2368,7 @@ mod tests {
             upstream_tx,
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2525,5 +2624,259 @@ mod tests {
             0,
             "Pending should be 0 after timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_message_forwards_telemetry_event_upstream() {
+        let router = ResponseRouter::new();
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "telemetry/event",
+            "params": { "kind": "metric", "value": 42 }
+        });
+        handle_message(notification, &router, "", &deps).await;
+
+        match window_rx
+            .try_recv()
+            .expect("telemetry/event should be forwarded")
+        {
+            UpstreamNotification::TelemetryEvent { data } => {
+                assert_eq!(data, json!({ "kind": "metric", "value": 42 }));
+            }
+            other => panic!("expected TelemetryEvent, got {other:?}"),
+        }
+    }
+
+    /// Deps exposing the response receiver and the upstream-request receiver, for
+    /// the deferred request-relay handlers (showMessageRequest / showDocument).
+    fn server_request_deps_with_request_rx() -> (
+        ServerRequestDeps,
+        mpsc::Receiver<OutboundMessage>,
+        mpsc::UnboundedReceiver<UpstreamRequest>,
+    ) {
+        let (response_tx, response_rx) = mpsc::channel(16);
+        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let (upstream_request_tx, upstream_request_rx) = mpsc::unbounded_channel();
+        let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
+        let progress_connection_id = progress_registry.new_connection_id();
+        let deps = ServerRequestDeps {
+            server_name: Some("mock-ls".to_string()),
+            response_tx,
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx,
+            window_tx,
+            upstream_request_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            progress_registry,
+            progress_connection_id,
+        };
+        (deps, response_rx, upstream_request_rx)
+    }
+
+    /// Await the next outbound response, unwrapping the `Untracked` envelope.
+    async fn recv_untracked(
+        response_rx: &mut mpsc::Receiver<OutboundMessage>,
+    ) -> serde_json::Value {
+        match response_rx.recv().await.expect("a response should be sent") {
+            OutboundMessage::Untracked(value) => value,
+            other => panic!("expected Untracked response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_message_request_relays_selected_action() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "window/showMessageRequest",
+            "params": {
+                "type": 3,
+                "message": "pick one",
+                "actions": [{ "title": "Retry" }, { "title": "Cancel" }]
+            }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        // The bridge forwards an UpstreamRequest carrying the reply channel.
+        let UpstreamRequest::ShowMessageRequest {
+            message,
+            actions,
+            reply,
+            ..
+        } = request_rx
+            .recv()
+            .await
+            .expect("should forward an UpstreamRequest")
+        else {
+            panic!("expected ShowMessageRequest");
+        };
+        assert_eq!(message, "pick one");
+        assert_eq!(actions.expect("actions present").len(), 2);
+
+        // Simulate the editor selecting "Retry".
+        reply
+            .send(Some(
+                serde_json::from_value(json!({ "title": "Retry" })).unwrap(),
+            ))
+            .expect("reply channel open");
+
+        // The downstream receives a response whose result is the selected action.
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["result"]["title"], "Retry");
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_message_request_editor_error_responds_null() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "window/showMessageRequest",
+            "params": { "type": 1, "message": "oops" }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        // Dropping the request (and its reply sender) simulates the editor failing
+        // to answer; the downstream must still get a `null` (no selection).
+        let request = request_rx.recv().await.expect("forwarded");
+        drop(request);
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 8);
+        assert_eq!(response["result"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_message_request_invalid_params_responds_error() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        // Missing the required `type` field.
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "window/showMessageRequest",
+            "params": { "message": "no type" }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 9);
+        assert!(
+            response["error"].is_object(),
+            "invalid params should produce an error response: {response}"
+        );
+        // No request should have been forwarded to the editor.
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_document_relays_success_and_passes_virtual_uri_through() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        // A virtual-document URI is passed through verbatim (no translation).
+        let virtual_uri = "file:///p/kakehashi-virtual-uri-R.py";
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "window/showDocument",
+            "params": { "uri": virtual_uri }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let UpstreamRequest::ShowDocument { params, reply } = request_rx
+            .recv()
+            .await
+            .expect("should forward an UpstreamRequest")
+        else {
+            panic!("expected ShowDocument");
+        };
+        assert_eq!(params.uri.as_str(), virtual_uri);
+
+        reply.send(true).expect("reply channel open");
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 10);
+        assert_eq!(response["result"]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_document_editor_failure_responds_success_false() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "window/showDocument",
+            "params": { "uri": "file:///nope.rs" }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let UpstreamRequest::ShowDocument { reply, .. } =
+            request_rx.recv().await.expect("forwarded")
+        else {
+            panic!("expected ShowDocument");
+        };
+        // Editor could not open the document.
+        reply.send(false).expect("reply channel open");
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 11);
+        assert_eq!(response["result"]["success"], false);
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_document_invalid_params_responds_error() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, mut request_rx) = server_request_deps_with_request_rx();
+
+        // Missing the required `uri` field.
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "window/showDocument",
+            "params": { "external": true }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 13);
+        assert!(
+            response["error"].is_object(),
+            "invalid params should produce an error response: {response}"
+        );
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_message_show_document_loop_gone_responds_success_false() {
+        let router = ResponseRouter::new();
+        let (deps, mut response_rx, request_rx) = server_request_deps_with_request_rx();
+
+        // Forwarding loop gone before the request is handled.
+        drop(request_rx);
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "window/showDocument",
+            "params": { "uri": "file:///x.rs" }
+        });
+        handle_message(request, &router, "", &deps).await;
+
+        let response = recv_untracked(&mut response_rx).await;
+        assert_eq!(response["id"], 12);
+        assert_eq!(response["result"]["success"], false);
     }
 }

@@ -402,6 +402,16 @@ impl BridgeCoordinator {
         self.pool.take_window_rx()
     }
 
+    /// Take the upstream request receiver for forwarding to the editor.
+    ///
+    /// Returns `Some(receiver)` on first call, `None` on subsequent calls.
+    /// Delegates to the underlying pool.
+    pub(crate) fn take_upstream_request_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::actor::UpstreamRequest>> {
+        self.pool.take_upstream_request_rx()
+    }
+
     /// Graceful shutdown of all downstream language server connections.
     pub(crate) async fn shutdown_all(&self) {
         self.pool.shutdown_all().await;
