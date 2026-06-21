@@ -53,6 +53,7 @@ pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
         initialization_options: None,
         root_markers: None,
         on_type_formatting_triggers: None,
+        prefer_shared_instance: None,
     }
 }
 
@@ -74,6 +75,7 @@ pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> Bri
         initialization_options: None,
         root_markers: None,
         on_type_formatting_triggers: None,
+        prefer_shared_instance: None,
     }
 }
 
@@ -171,6 +173,7 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
         rx,
         dynamic_capabilities,
         key,
+        crate::lsp::bridge::WorkspaceFolderSet::new(None),
     ));
     (handle, pid)
 }

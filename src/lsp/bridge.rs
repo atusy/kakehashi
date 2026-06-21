@@ -19,6 +19,7 @@ mod progress_registry;
 mod protocol;
 mod root_markers;
 mod text_document;
+mod workspace_folders;
 
 // Re-export public types
 #[cfg(test)]
@@ -38,6 +39,7 @@ pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use text_document::host::{HostDocument, normalize_host_goto_result};
 pub(crate) use text_document::{CodeLensEnvelope, extract_code_lens_envelope};
+pub(crate) use workspace_folders::WorkspaceFolderSet;
 
 /// Integration tests for the bridge module.
 ///

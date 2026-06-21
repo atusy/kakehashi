@@ -54,6 +54,15 @@
 //!   both window/* notifications unconditionally (#378). showMessage is sent
 //!   FIRST, and the bridge preserves order, so the test asserts showMessage
 //!   arrives ahead of logMessage.
+//! - `workspace-folders` — advertises `workspace.workspaceFolders.{supported,
+//!   changeNotifications}` + `hoverProvider`; records the `initialize`-time
+//!   workspace folders and every `workspace/didChangeWorkspaceFolders`
+//!   addition, then answers `textDocument/hover` with the sorted list of folder
+//!   URIs it currently knows (not gated on `didOpen` — the folder set is the
+//!   subject under test, populated by initialize + didChangeWorkspaceFolders).
+//!   Used by
+//!   `tests/e2e_shared_instance.rs` (#391) to prove the shared-instance opt-in
+//!   grows one downstream process's folder set across roots.
 //!
 //! Only built for E2E runs (`required-features = ["e2e"]` in Cargo.toml).
 
@@ -71,6 +80,9 @@ fn main() {
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
     let mut documents: HashMap<String, String> = HashMap::new();
+    // `workspace-folders` mode: every folder URI this server has been told
+    // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
+    let mut workspace_folders: Vec<String> = Vec::new();
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -109,11 +121,41 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
+                    "workspace-folders" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": 1,
+                        "workspace": {
+                            "workspaceFolders": {
+                                "supported": true,
+                                "changeNotifications": true
+                            }
+                        }
+                    }),
+                    // Like `workspace-folders` but does NOT advertise the
+                    // workspaceFolders capability, so a `preferSharedInstance`
+                    // opt-in must fall back to per-root instances (#391).
+                    "workspace-folders-incapable" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
                     _ => json!({
                         "documentFormattingProvider": true,
                         "textDocumentSync": 1
                     }),
                 };
+                // Record the initialize-time workspace folders so the
+                // `workspace-folders` mode can prove the first root is known
+                // before any didChangeWorkspaceFolders arrives.
+                if let Some(folders) = message
+                    .pointer("/params/workspaceFolders")
+                    .and_then(Value::as_array)
+                {
+                    for folder in folders {
+                        if let Some(uri) = folder.get("uri").and_then(Value::as_str) {
+                            workspace_folders.push(uri.to_string());
+                        }
+                    }
+                }
                 respond(&mut writer, id, json!({ "capabilities": capabilities }));
                 if mode == "notify" {
                     notify(
@@ -187,13 +229,38 @@ fn main() {
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
+            "workspace/didChangeWorkspaceFolders" => {
+                // Notification (no id): record every added folder URI so a
+                // later hover can prove the bridge announced the new root.
+                if let Some(added) = message
+                    .pointer("/params/event/added")
+                    .and_then(Value::as_array)
+                {
+                    for folder in added {
+                        if let Some(uri) = folder.get("uri").and_then(Value::as_str) {
+                            workspace_folders.push(uri.to_string());
+                        }
+                    }
+                }
+            }
             "textDocument/hover" => {
-                let result = message
-                    .pointer("/params/textDocument/uri")
-                    .and_then(Value::as_str)
-                    .filter(|uri| documents.contains_key(*uri))
-                    .map(|uri| json!({ "contents": format!("mock-hover:{uri}") }))
-                    .unwrap_or(Value::Null);
+                let result = if mode.starts_with("workspace-folders") {
+                    // Echo the sorted, de-duplicated set of folder URIs this
+                    // single process currently knows. Not gated on didOpen: the
+                    // folder set is the subject under test, and it is populated
+                    // by initialize + didChangeWorkspaceFolders, not didOpen.
+                    let mut folders = workspace_folders.clone();
+                    folders.sort();
+                    folders.dedup();
+                    json!({ "contents": format!("folders:{}", folders.join(",")) })
+                } else {
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| documents.contains_key(*uri))
+                        .map(|uri| json!({ "contents": format!("mock-hover:{uri}") }))
+                        .unwrap_or(Value::Null)
+                };
                 respond(&mut writer, id, result);
             }
             "textDocument/codeLens" => {

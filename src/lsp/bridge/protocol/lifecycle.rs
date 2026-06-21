@@ -6,8 +6,9 @@
 use std::str::FromStr;
 
 use tower_lsp_server::ls_types::{
-    ClientCapabilities, DidCloseTextDocumentParams, InitializeParams, InitializedParams,
-    TextDocumentIdentifier, Uri, WorkspaceFolder,
+    ClientCapabilities, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    InitializeParams, InitializedParams, TextDocumentIdentifier, Uri, WorkspaceFolder,
+    WorkspaceFoldersChangeEvent,
 };
 
 use super::client_capabilities::build_bridge_client_capabilities;
@@ -87,6 +88,22 @@ pub(crate) fn build_didclose_notification(
     };
 
     Some(JsonRpcNotification::new("textDocument/didClose", params))
+}
+
+/// Build a `workspace/didChangeWorkspaceFolders` notification announcing newly
+/// added workspace folders (#391). Removal is not modeled — the shared-instance
+/// opt-in only ever grows a connection's folder set; idle eviction is a
+/// separate follow-up.
+pub(crate) fn build_did_change_workspace_folders_notification(
+    added: Vec<WorkspaceFolder>,
+) -> JsonRpcNotification<DidChangeWorkspaceFoldersParams> {
+    let params = DidChangeWorkspaceFoldersParams {
+        event: WorkspaceFoldersChangeEvent {
+            added,
+            removed: Vec::new(),
+        },
+    };
+    JsonRpcNotification::new("workspace/didChangeWorkspaceFolders", params)
 }
 
 /// Validates a JSON-RPC initialize response.

@@ -267,6 +267,36 @@ fn test_config_init_includes_capture_mappings() {
     );
 }
 
+/// Test that config init documents the per-root-instance default by emitting
+/// `preferSharedInstance = false` under the `languageServers._` wildcard, so
+/// the opt-in (#391) is discoverable in the generated template.
+#[test]
+fn test_config_init_includes_prefer_shared_instance() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "config init should exit successfully. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("[languageServers._]"),
+        "Should contain languageServers wildcard section. Got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("preferSharedInstance = false"),
+        "Should document the per-root-instance default. Got: {}",
+        stdout
+    );
+}
+
 /// Test that config init --output creates a configuration file
 #[test]
 fn test_config_init_output_creates_file() {

@@ -53,8 +53,26 @@ originating host URI is stashed in their routing envelope (`KakehashiEnvelope` /
 that produced the item. A legacy envelope without that field falls back to the
 client-root connection (the pre-#382 behavior).
 
+**Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
+(default `false`) routes a server's documents to one shared connection
+(`ConnectionKey::shared`, kept distinct from the client-root fallback) instead
+of one per marker root. It is honored only when the downstream server
+advertises `workspace.workspaceFolders.{supported, changeNotifications}`
+(`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
+(`resolve_acquire`) checks the existing shared connection's capability and, if
+it is `Ready` but incapable, logs once and falls back to the per-root key — so a
+misconfigured opt-in degrades to per-root instances rather than wedging the
+2nd+ root on a server that ignores `rootUri`. The shared connection's folder set
+(`WorkspaceFolderSet`, shared with the reader task that answers
+`workspace/workspaceFolders` pulls) grows as new roots join: on acquiring the
+shared connection for a not-yet-known root, the pool CAS-inserts the root and
+emits `workspace/didChangeWorkspaceFolders { added: [root] }` ahead of the
+`didOpen` through the single-writer FIFO. The set is add-only; idle
+removal/eviction is a separate follow-up.
+
 **Known limitation:** per-root pooling multiplies process count with the number
 of distinct roots opened, and there is no idle-eviction yet — see Consequences.
+The shared-instance opt-in mitigates this for capable servers.
 
 **No-Provider Handling:** Return `REQUEST_FAILED` with clear message ("bridge: no provider for hover in python") to keep misconfiguration visible.
 
@@ -463,6 +481,7 @@ languageServers:
 
 ## Amendment History
 
+- **2026-06-20**: Added the per-server `preferSharedInstance` opt-in (#391): capability-gated routing to one `ConnectionKey::shared` connection across roots, a mutable per-connection `WorkspaceFolderSet`, and `workspace/didChangeWorkspaceFolders` emission ahead of `didOpen` for newly joined roots. Default stays per-root (#382); incapable servers (no `workspace.workspaceFolders.{supported, changeNotifications}`) log once and fall back to per-root.
 - **2026-06-20**: Extended pool keying from `server_name` to `(server_name, resolved workspace root)` (`ConnectionKey`) for multi-root monorepos (#382). The root is resolved from the triggering document's `rootMarkers` walk, shared with the spawn handshake, and stored on the connection handle so all per-connection state routes via `handle.key()`. Documents under different marker roots get separate downstream processes; marker-less documents share the client-root fallback. Follow-up: idle-eviction policy to bound process growth.
 - **2026-01-24**: Changed from language-based to server-name-based pool keying to enable process sharing for related languages (e.g., ts/tsx sharing tsgo). Connection pool is now keyed by `server_name` instead of `languageId`, with configuration resolving `language` → `server_name`.
 - **2026-01-07**: Merged Amendment 002 - Simplified ID namespace by using upstream request IDs directly (no transformation), replaced `pending_correlations` with `pending_responses`

@@ -670,19 +670,30 @@ fn select_pipeline_step_request(supports_full: bool, supports_range: bool) -> Pi
 /// [`select_pipeline_step_request`]. The connection handle is fetched once
 /// and both capabilities are read off it directly, so the probe locks the
 /// pool's connection map a single time.
+///
+/// Returns the kind together with the **actual** connection key the request
+/// will route to (`handle.key()`). The caller must use this — not a key
+/// resolved up front — to tag the step's scratch document and cancel: a
+/// `preferSharedInstance` server whose shared connection was still
+/// `Initializing` at resolve time, but turns out incapable, is diverted to a
+/// per-root connection here, so a pre-resolved (optimistic shared) key would
+/// mis-target the scratch `didClose` and the cancel (#391).
 async fn pipeline_step_request_kind(
     pool: &crate::lsp::bridge::LanguageServerPool,
     server_name: &str,
     server_config: &crate::config::settings::BridgeServerConfig,
     document_uri: Option<&url::Url>,
     timeout: std::time::Duration,
-) -> std::io::Result<PipelineStepRequest> {
+) -> std::io::Result<(PipelineStepRequest, crate::lsp::bridge::ConnectionKey)> {
     let handle = pool
         .get_or_create_connection_wait_ready(server_name, server_config, document_uri, timeout)
         .await?;
     let supports_full = handle.has_capability("textDocument/formatting");
     let supports_range = handle.has_capability("textDocument/rangeFormatting");
-    Ok(select_pipeline_step_request(supports_full, supports_range))
+    Ok((
+        select_pipeline_step_request(supports_full, supports_range),
+        handle.key().clone(),
+    ))
 }
 
 /// `preferred`-strategy formatting for one region: the existing
@@ -904,12 +915,6 @@ async fn dispatch_concatenated_formatting(
                     return (current_text, None);
                 };
 
-                // The connection `(server, root)` this step's requests route to —
-                // resolved identically to the request path so the scratch-doc
-                // didClose and the per-step cancel target the right process (#382).
-                let connection_key =
-                    pool.resolve_connection_key(&server_name, &server_config, Some(&uri));
-
                 // ADR Decision point 6: this step's deadline is the REMAINING
                 // share of the whole-pipeline budget. Below the floor, skip
                 // outright — a request almost certain to time out is pure
@@ -952,6 +957,13 @@ async fn dispatch_concatenated_formatting(
                 // be cancelled by this step's timeout.
                 let step_downstream_id: std::sync::OnceLock<crate::lsp::bridge::RequestId> =
                     std::sync::OnceLock::new();
+                // The connection `(server, root)` this step actually routed to,
+                // captured from the probe's acquired handle so the scratch-doc
+                // didClose and the timeout cancel target the same process the
+                // request used — including a preferSharedInstance server diverted
+                // to a per-root connection (#391). Read by the timeout arm below.
+                let step_connection_key: std::sync::OnceLock<crate::lsp::bridge::ConnectionKey> =
+                    std::sync::OnceLock::new();
 
                 // Everything that talks to the downstream server — capability
                 // probe (which may spawn/handshake a cold server), scratch
@@ -966,7 +978,7 @@ async fn dispatch_concatenated_formatting(
                     // and arrives as `Some(vec![])` from the bridge transform).
                     // A probe error (connection spawn/handshake failure) is a
                     // failed step: skip-and-continue (ADR point 6).
-                    let step_request = match pipeline_step_request_kind(
+                    let (step_request, connection_key) = match pipeline_step_request_kind(
                         &pool,
                         &server_name,
                         &server_config,
@@ -975,7 +987,7 @@ async fn dispatch_concatenated_formatting(
                     )
                     .await
                     {
-                        Ok(kind) => kind,
+                        Ok(probe) => probe,
                         Err(e) => {
                             log::warn!(
                                 target: "kakehashi::formatting",
@@ -988,6 +1000,10 @@ async fn dispatch_concatenated_formatting(
                             return None;
                         }
                     };
+                    // Publish the actual routed connection so the timeout arm can
+                    // cancel on the right process (the request below routes to the
+                    // same key the probe acquired).
+                    let _ = step_connection_key.set(connection_key.clone());
                     if step_request == PipelineStepRequest::Skip {
                         // Neither documentFormattingProvider nor
                         // documentRangeFormattingProvider: contribute nothing and
@@ -1138,9 +1154,15 @@ async fn dispatch_concatenated_formatting(
                             step_budget
                         );
                         count_request_errors(&request_error_sink, 1);
-                        if let Some(downstream_id) = step_downstream_id.get().copied() {
+                        // Cancel on the connection the request actually routed to
+                        // (set right after the probe). Both are set only once a
+                        // request was registered, so this never cancels on a stale
+                        // optimistic key.
+                        if let (Some(downstream_id), Some(connection_key)) = (
+                            step_downstream_id.get().copied(),
+                            step_connection_key.get().cloned(),
+                        ) {
                             let pool = Arc::clone(&pool);
-                            let connection_key = connection_key.clone();
                             tokio::spawn(async move {
                                 let _ = pool
                                     .forward_cancel_downstream(&connection_key, downstream_id)
@@ -1748,6 +1770,7 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
             }),
         }
     }

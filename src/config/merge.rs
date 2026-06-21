@@ -91,6 +91,13 @@ pub(crate) fn merge_bridge_server_configs(
             .on_type_formatting_triggers
             .clone()
             .or_else(|| base.on_type_formatting_triggers.clone()),
+        // Overlay-wins-when-present, mirroring `root_markers`: a concrete
+        // server's explicit `preferSharedInstance` overrides the wildcard
+        // (#391), so `_.preferSharedInstance: true` can be opted out of per
+        // server. An unset overlay inherits the base (wildcard) value.
+        prefer_shared_instance: overlay
+            .prefer_shared_instance
+            .or(base.prefer_shared_instance),
     }
 }
 
@@ -507,6 +514,7 @@ mod tests {
                         initialization_options: Some(json!({"checkOnSave": true})),
                         root_markers: None,
                         on_type_formatting_triggers: None,
+                        prefer_shared_instance: None,
                     },
                 ),
                 (
@@ -517,6 +525,7 @@ mod tests {
                         initialization_options: None,
                         root_markers: None,
                         on_type_formatting_triggers: None,
+                        prefer_shared_instance: None,
                     },
                 ),
             ])),
@@ -586,6 +595,7 @@ mod tests {
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                         root_markers: None,
                         on_type_formatting_triggers: None,
+                        prefer_shared_instance: None,
                     },
                 ),
                 (
@@ -597,6 +607,7 @@ mod tests {
                         initialization_options: None,
                         root_markers: None,
                         on_type_formatting_triggers: None,
+                        prefer_shared_instance: None,
                     },
                 ),
             ])),
@@ -663,6 +674,7 @@ mod tests {
                     initialization_options: None,
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             )])),
             ..Default::default()
@@ -1051,6 +1063,7 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1066,6 +1079,7 @@ mod tests {
                 initialization_options: None,
                 root_markers: None,
                 on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
@@ -1082,6 +1096,7 @@ mod tests {
                     initialization_options: Some(json!({"defaultOption": true})),
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             ),
             (
@@ -1092,6 +1107,7 @@ mod tests {
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             ),
         ]);
@@ -1120,6 +1136,7 @@ mod tests {
             initialization_options: None,
             root_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
         };
 
         // Unset overlay inherits from base (wildcard default applies)
@@ -1129,6 +1146,7 @@ mod tests {
             initialization_options: None,
             root_markers: None,
             on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
         };
         let merged = merge_bridge_server_configs(&base, &inheriting);
         assert_eq!(
@@ -1156,6 +1174,47 @@ mod tests {
         assert_eq!(merged.root_markers, Some(vec![]));
     }
 
+    /// `preferSharedInstance` merges overlay-wins-when-present like
+    /// `root_markers`, so a `languageServers._` opt-in applies to servers that
+    /// stay unset, yet a concrete server can override it either direction —
+    /// crucially opting **out** of a blanket `_.preferSharedInstance: true`
+    /// with an explicit `false` (#391).
+    #[test]
+    fn test_merge_bridge_server_configs_prefer_shared_instance() {
+        use settings::BridgeServerConfig;
+
+        let server = |prefer: Option<bool>| BridgeServerConfig {
+            cmd: vec![],
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: prefer,
+        };
+
+        // Unset overlay inherits the base (wildcard) value.
+        let base = server(Some(true));
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(None)).prefer_shared_instance,
+            Some(true),
+            "unset overlay inherits the wildcard opt-in"
+        );
+
+        // Explicit overlay overrides the base — including opting OUT of a
+        // wildcard opt-in.
+        assert_eq!(
+            merge_bridge_server_configs(&base, &server(Some(false))).prefer_shared_instance,
+            Some(false),
+            "explicit false opts a server out of the wildcard opt-in"
+        );
+
+        // And opting in over a wildcard that left it unset.
+        assert_eq!(
+            merge_bridge_server_configs(&server(None), &server(Some(true))).prefer_shared_instance,
+            Some(true),
+        );
+    }
+
     // Deep merge for initialization_options (configuration-merging-strategy)
 
     /// configuration-merging-strategy: initialization_options deep merge covers three behaviors:
@@ -1177,6 +1236,7 @@ mod tests {
             })),
             root_markers: None,
             on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
         };
         let overlay = BridgeServerConfig {
             cmd: vec!["rust-analyzer".to_string()],
@@ -1188,6 +1248,7 @@ mod tests {
             })),
             root_markers: None,
             on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
         };
 
         let resolved = merge_bridge_server_configs(&base, &overlay);
@@ -1212,6 +1273,7 @@ mod tests {
             root_markers: None,
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
+            prefer_shared_instance: None,
         };
 
         let base = server(Some(vec!["}"]));
@@ -1362,6 +1424,7 @@ mod tests {
                     initialization_options: Some(json!({ "checkOnSave": true })),
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             ),
             // rust-analyzer: only specifies cmd and languages
@@ -1373,6 +1436,7 @@ mod tests {
                     initialization_options: None, // Should inherit from wildcard
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             ),
         ]);
@@ -1411,6 +1475,7 @@ mod tests {
                     initialization_options: None,
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             ),
             // rust-analyzer: specifies only cmd, inherits languages from wildcard
@@ -1422,6 +1487,7 @@ mod tests {
                     initialization_options: None,
                     root_markers: None,
                     on_type_formatting_triggers: None,
+                    prefer_shared_instance: None,
                 },
             ),
         ]);

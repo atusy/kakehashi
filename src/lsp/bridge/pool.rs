@@ -51,7 +51,8 @@ use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
 use crate::error::LockResultExt;
 
 use super::protocol::{
-    JsonRpcNotification, RequestId, VirtualDocumentUri, build_didopen_notification,
+    JsonRpcNotification, RequestId, VirtualDocumentUri,
+    build_did_change_workspace_folders_notification, build_didopen_notification,
 };
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
@@ -618,56 +619,124 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        // Resolve the marker workspace + key ONCE (one filesystem walk) and reuse
-        // the key for the initializing-retry lookup below, instead of resolving
-        // again there.
-        let (marker, connection_key) =
-            self.resolve_marker_and_key(server_name, server_config, document_uri);
+        // `timeout` is the caller's overall budget; the incapable-shared divert
+        // below acquires a second connection, so track elapsed time and hand it
+        // only the remaining budget rather than a fresh full `timeout`.
+        let start = std::time::Instant::now();
+        // Resolve the marker workspace + key ONCE (one filesystem walk, plus the
+        // shared-instance capability probe).
+        let (marker, connection_key) = self
+            .resolve_acquire(server_name, server_config, document_uri)
+            .await;
 
-        // First, try to get or create the connection
+        // Acquire and wait through initialization for the resolved key.
+        let handle = self
+            .acquire_resolved_wait_ready(
+                server_name,
+                server_config,
+                connection_key,
+                marker.clone(),
+                timeout,
+            )
+            .await?;
+
+        // The shared connection's capability is only known now that it is Ready.
+        // If it came up incapable and does not already serve this root, the
+        // shared-instance opt-in must degrade to a per-root instance (#391):
+        // opening this document on a server that ignores
+        // didChangeWorkspaceFolders would wedge the 2nd+ root. `resolve_acquire`
+        // now sees the shared connection as Ready+incapable, so it re-resolves
+        // to the per-root key; acquire that connection instead, within the
+        // caller's remaining budget.
+        if handle.key().is_shared() && !handle.supports_workspace_folder_changes() {
+            let serves_this_root = marker
+                .as_ref()
+                .is_some_and(|(_root, folder)| handle.workspace_folders().contains(folder));
+            if !serves_this_root {
+                handle.log_incapable_fallback_once(server_name);
+                let remaining = timeout.saturating_sub(start.elapsed());
+                // Reuse the already-resolved `marker` to build the per-root key
+                // directly — re-running `resolve_acquire` here would redo the
+                // filesystem marker walk and re-lock `connections` for the same
+                // result (the shared connection is now Ready+incapable).
+                let per_root_key = ConnectionKey::new(
+                    server_name,
+                    marker
+                        .as_ref()
+                        .map(|(root, _folder)| root.as_str().to_owned()),
+                );
+                return self
+                    .acquire_resolved_wait_ready(
+                        server_name,
+                        server_config,
+                        per_root_key,
+                        marker,
+                        remaining,
+                    )
+                    .await;
+            }
+        }
+
+        // Announce the (possibly newly-joined) root before the caller opens any
+        // document. Idempotent if `acquire_resolved_wait_ready`'s ReturnExisting
+        // path already announced; on the initializing-retry path it is the only
+        // announce. Propagates a queue-full failure so the caller retries rather
+        // than open a document for an unannounced root.
+        self.announce_shared_root(&handle, &marker).await?;
+        Ok(handle)
+    }
+
+    /// Acquire the connection for an already-resolved `(connection_key, marker)`
+    /// and wait (up to `timeout`) for it to reach Ready, transparently waiting
+    /// through a concurrent spawn that returns `Initializing`. Does NOT apply
+    /// shared-instance routing or announce — callers layer that on top.
+    async fn acquire_resolved_wait_ready(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        connection_key: ConnectionKey,
+        marker: Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         match self
             .get_or_create_connection_resolved(
                 server_name,
                 server_config,
                 connection_key.clone(),
                 marker,
-                Duration::from_secs(INIT_TIMEOUT_SECS),
+                // Bound the spawn handshake by the caller's budget, not a fresh
+                // full INIT_TIMEOUT_SECS — so a cold spawn (including the
+                // incapable-shared divert, which passes its REMAINING budget)
+                // stays within `timeout` overall.
+                timeout,
             )
             .await
         {
             Ok(handle) => {
-                // Ensure the connection is Ready before returning
-                // (get_or_create_connection may return Initializing state for new connections)
                 handle.wait_for_ready(timeout).await?;
                 Ok(handle)
             }
             Err(e) => {
-                // Check if error is due to server still initializing using type-safe matching
                 let is_initializing = e
                     .get_ref()
                     .and_then(|inner| inner.downcast_ref::<BridgeError>())
                     .is_some_and(BridgeError::is_initializing);
-
-                if is_initializing {
-                    // Wait on the connection this document routes to — the key was
-                    // already resolved above, so no second filesystem walk here.
-                    let handle = {
-                        let connections = self.connections.lock().await;
-                        connections
-                            .get(&connection_key)
-                            .map(Arc::clone)
-                            .ok_or_else(|| {
-                                io::Error::other("bridge: connection disappeared during wait")
-                            })?
-                    };
-
-                    // Wait for Ready state
-                    handle.wait_for_ready(timeout).await?;
-                    Ok(handle)
-                } else {
-                    // Other error - propagate it
-                    Err(e)
+                if !is_initializing {
+                    return Err(e);
                 }
+                // A concurrent caller is spawning this exact key; wait on the
+                // connection it routes to — no second filesystem walk here.
+                let handle = {
+                    let connections = self.connections.lock().await;
+                    connections
+                        .get(&connection_key)
+                        .map(Arc::clone)
+                        .ok_or_else(|| {
+                            io::Error::other("bridge: connection disappeared during wait")
+                        })?
+                };
+                handle.wait_for_ready(timeout).await?;
+                Ok(handle)
             }
         }
     }
@@ -710,8 +779,11 @@ impl LanguageServerPool {
         (marker, key)
     }
 
-    /// The pool key alone, for callers that don't spawn (no `marker` needed).
-    /// See [`resolve_marker_and_key`](Self::resolve_marker_and_key).
+    /// The per-root pool key alone (sync, pool-independent), for callers that
+    /// don't spawn. Does NOT apply shared-instance routing (#391) — use
+    /// [`resolve_acquire`](Self::resolve_acquire) for that. Test-only: the
+    /// production key always flows through `resolve_acquire`.
+    #[cfg(test)]
     fn connection_key(
         &self,
         server_name: &str,
@@ -722,19 +794,210 @@ impl LanguageServerPool {
             .1
     }
 
-    /// Public projection of [`connection_key`](Self::connection_key) for callers
-    /// outside the pool that hold a `(server_name, server_config, document_uri)`
-    /// and need the same key the request path used — e.g. the concatenated
-    /// formatting pipeline, which tags each scratch document and per-step cancel
-    /// with the connection it was issued on. Resolves identically to the spawn
-    /// path, so it always names the right connection.
-    pub(crate) fn resolve_connection_key(
+    /// Resolve the `(marker, key)` a request on `document_uri` routes to,
+    /// applying shared-instance routing (#391) on top of the per-root key.
+    ///
+    /// For a server without `preferSharedInstance`, this is exactly
+    /// [`resolve_marker_and_key`](Self::resolve_marker_and_key) (per-root/#382).
+    /// For an opt-in server it returns the shared-instance key — UNLESS a shared
+    /// connection already exists, is `Ready`, and did NOT advertise the
+    /// `workspaceFolders` capability. In that case kakehashi logs once and
+    /// degrades to per-root instances, so a misconfigured opt-in never wedges
+    /// the 2nd+ root on a server that ignores `didChangeWorkspaceFolders`. The
+    /// fallback keeps the shared connection's OWN spawn root on the shared key
+    /// (that connection is correctly rooted there and already serves it) and
+    /// diverts only *other* roots to per-root keys — yielding true per-root
+    /// isolation rather than splitting one root across two processes.
+    ///
+    /// A still-initializing shared connection is treated optimistically as
+    /// shared, because its capability is not known yet. The two acquire paths
+    /// then resolve the race once it is `Ready`: the fast-fail path returns the
+    /// `Initializing` error before any `didOpen` and re-resolves on retry, and
+    /// the wait path
+    /// ([`get_or_create_connection_wait_ready`](Self::get_or_create_connection_wait_ready))
+    /// re-checks the capability after waiting and diverts a new root to a
+    /// per-root connection if the shared one came up incapable — so no document
+    /// is ever opened on an incapable shared connection for a root it does not
+    /// already serve.
+    ///
+    /// Briefly locks `connections` for the capability probe; the marker is still
+    /// resolved with a single filesystem walk.
+    async fn resolve_acquire(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
         document_uri: Option<&Url>,
-    ) -> ConnectionKey {
-        self.connection_key(server_name, server_config, document_uri)
+    ) -> (
+        Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+        ConnectionKey,
+    ) {
+        let (marker, per_root_key) =
+            self.resolve_marker_and_key(server_name, server_config, document_uri);
+        if !server_config.prefers_shared_instance() {
+            return (marker, per_root_key);
+        }
+        // A marker-less document (no marker root, non-file URI, no document
+        // hint, or the `[]` kill switch) has no root to share and nothing to
+        // announce, so it stays on the client-root fallback (`per_root_key`,
+        // here a `ClientFallback` key). The shared key is reserved for
+        // marker-rooted documents that join via `didChangeWorkspaceFolders`,
+        // keeping `ConnectionRoot::Shared` distinct from the fallback.
+        if marker.is_none() {
+            return (marker, per_root_key);
+        }
+
+        let shared_key = ConnectionKey::shared(server_name);
+        // Clone the shared handle out under the lock, then probe its capability
+        // and folder set without nesting the folder-set lock under `connections`.
+        let shared_handle = {
+            let connections = self.connections.lock().await;
+            connections.get(&shared_key).map(Arc::clone)
+        };
+
+        let key = match shared_handle {
+            // A Ready shared connection that never advertised the capability
+            // can't take on new roots via didChangeWorkspaceFolders.
+            Some(handle)
+                if handle.state() == ConnectionState::Ready
+                    && !handle.supports_workspace_folder_changes() =>
+            {
+                handle.log_incapable_fallback_once(server_name);
+                // Keep the shared connection's own spawn root on the shared key
+                // (it is already rooted and serving it); divert every other root
+                // to its own per-root process for true per-root isolation.
+                let serves_this_root = marker
+                    .as_ref()
+                    .is_some_and(|(_root, folder)| handle.workspace_folders().contains(folder));
+                if serves_this_root {
+                    shared_key
+                } else {
+                    per_root_key
+                }
+            }
+            // No shared connection yet, still initializing, or Ready+capable:
+            // route to the shared instance.
+            _ => shared_key,
+        };
+
+        (marker, key)
+    }
+
+    /// For a shared-instance connection (#391), record this acquisition's marker
+    /// root in the connection's folder set and, when it is newly added and the
+    /// downstream server advertised the `workspaceFolders` capability, announce
+    /// it with `workspace/didChangeWorkspaceFolders`. The notification is queued
+    /// through the single-writer loop, so a `didOpen` the caller sends next on
+    /// the same connection follows it on the wire (FIFO), satisfying "announce
+    /// the root, then open the document".
+    ///
+    /// Returns `Ok(())` when the root is announced (or no announce is needed).
+    /// Returns an error only when the root is newly required but its
+    /// `didChangeWorkspaceFolders` could not be queued (outbound queue full or
+    /// closed): the caller must NOT then open documents on this connection,
+    /// because they would reach the server without the preceding announcement.
+    /// Surfacing it as an error makes the acquire fail and retry, re-attempting
+    /// the announce once the queue drains.
+    ///
+    /// `Ok(())` no-op for per-root keys, marker-less acquisitions,
+    /// capability-less servers, or a root already in the set — including a
+    /// connection's own initialize-time root, so the first root never
+    /// re-announces.
+    async fn announce_shared_root(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        marker: &Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
+    ) -> io::Result<()> {
+        if !handle.key().is_shared() {
+            return Ok(());
+        }
+        let Some((_root, folder)) = marker else {
+            return Ok(());
+        };
+        if !handle.supports_workspace_folder_changes() {
+            return Ok(());
+        }
+        let folder = folder.clone();
+        // The closure runs under the folder-set lock and reports its send
+        // outcome out here so the error kind can distinguish retryable
+        // backpressure (queue full) from a dead/serialization-failed connection.
+        let mut send_outcome = NotificationSendResult::Queued;
+        // Hold the `connections` lock across the liveness check AND the
+        // add+announce so a concurrent respawn (get_or_create's SpawnNew branch,
+        // which purges this key's state) cannot interleave between verifying the
+        // handle is still the live pool connection and queuing the
+        // `didChangeWorkspaceFolders` — the same Arc::ptr_eq live-handle guard
+        // the request (execute.rs) and eager-open (did_open.rs) send paths use.
+        // `add_and_announce` is fully synchronous (the send is a non-blocking
+        // try_send), so no `.await` is held under either lock; lock order is
+        // connections → folder set, never the reverse.
+        let connections = self.connections.lock().await;
+        if !connections
+            .get(handle.key())
+            .is_some_and(|live| Arc::ptr_eq(live, handle))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "bridge: connection was replaced before didChangeWorkspaceFolders",
+            ));
+        }
+        // Add + announce atomically under the folder-set lock: the folder is
+        // committed only if the `didChangeWorkspaceFolders` actually queued, and
+        // a concurrent caller cannot observe it as announced (and skip its own
+        // announce) until that notification is on the FIFO ahead of any later
+        // `didOpen`. If the queue is full/closed, nothing commits and the error
+        // below makes this acquisition retry rather than open a document for an
+        // unannounced root.
+        let announced = handle
+            .workspace_folders()
+            .add_and_announce(folder.clone(), || {
+                let result = handle.send_notification(
+                    build_did_change_workspace_folders_notification(vec![folder.clone()]),
+                );
+                send_outcome = result;
+                if result == NotificationSendResult::Queued {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "[{}] announced workspace folder {}",
+                        handle.key(),
+                        folder.uri.as_str()
+                    );
+                    true
+                } else {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "[{}] didChangeWorkspaceFolders for {} not queued ({:?})",
+                        handle.key(),
+                        folder.uri.as_str(),
+                        result
+                    );
+                    false
+                }
+            });
+        drop(connections);
+
+        if announced {
+            return Ok(());
+        }
+        // Map the send failure to a faithful error kind so callers recover
+        // correctly: queue-full is retryable backpressure, but a closed channel
+        // / serialization failure is terminal (the next acquire respawns rather
+        // than retrying against a dead connection). Mirrors the bridge's other
+        // notification error mapping (text_document/did_close).
+        let kind = match send_outcome {
+            NotificationSendResult::QueueFull => io::ErrorKind::WouldBlock,
+            NotificationSendResult::ChannelClosed => io::ErrorKind::BrokenPipe,
+            NotificationSendResult::SerializationFailed => io::ErrorKind::InvalidData,
+            // Not reachable: `announced` is false only when the send did not queue.
+            NotificationSendResult::Queued => io::ErrorKind::Other,
+        };
+        Err(io::Error::new(
+            kind,
+            format!(
+                "bridge: could not queue didChangeWorkspaceFolders for {} ({:?})",
+                folder.uri.as_str(),
+                send_outcome
+            ),
+        ))
     }
 
     /// Fast-fail get-or-spawn (ls-bridge-message-ordering): resolves the
@@ -747,8 +1010,9 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
-        let (marker, connection_key) =
-            self.resolve_marker_and_key(server_name, server_config, document_uri);
+        let (marker, connection_key) = self
+            .resolve_acquire(server_name, server_config, document_uri)
+            .await;
         self.get_or_create_connection_resolved(
             server_name,
             server_config,
@@ -785,14 +1049,27 @@ impl LanguageServerPool {
             counts.get(&connection_key).copied().unwrap_or(0)
         };
 
-        // Check if we already have a connection for this key
+        // Check if we already have a connection for this key in ONE lookup,
+        // reused by the ReturnExisting arm below.
         // Use pure decision function for testability (ls-bridge-message-ordering Operation Gating)
-        let existing_state = connections.get(&connection_key).map(|h| h.state());
+        let existing = connections.get(&connection_key);
+        let existing_state = existing.map(|h| h.state());
         match decide_connection_action(existing_state, panic_count) {
             ConnectionAction::ReturnExisting => {
-                return Ok(Arc::clone(connections.get(&connection_key).expect(
-                    "Invariant violation: Connection expected for ReturnExisting action",
-                )));
+                // `decide_connection_action` only returns ReturnExisting when a
+                // connection exists for this key, so the lookup is an invariant;
+                // surface it as an error rather than panicking in production
+                // (no-panic convention) if that ever fails to hold.
+                let handle = existing.cloned().ok_or_else(|| {
+                    io::Error::other("bridge: connection disappeared before ReturnExisting")
+                })?;
+                // Release the pool lock before announcing: `announce_shared_root`
+                // re-locks `connections` itself for its Arc::ptr_eq liveness
+                // check, so it must not be held here (the tokio mutex is not
+                // reentrant).
+                drop(connections);
+                self.announce_shared_root(&handle, &marker).await?;
+                return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
                 // Log once when server is disabled due to repeated panics
@@ -861,17 +1138,21 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
-        let (root_uri, workspace_folders) =
-            super::root_markers::workspace_from_marker(marker, || {
-                (self.root_uri(), self.workspace_folders())
-            });
+        let (root_uri, init_folders) = super::root_markers::workspace_from_marker(marker, || {
+            (self.root_uri(), self.workspace_folders())
+        });
         log::debug!(
             target: "kakehashi::bridge::init",
             "[{}] workspace root for spawn: {:?}",
             server_name,
             root_uri
         );
-        let workspace_folders = Arc::new(workspace_folders);
+        // Per-connection mutable folder set (workspace-folders module): seeded
+        // with the spawn-time folders and shared with the reader so it can
+        // answer downstream `workspace/workspaceFolders` pulls. Shared-instance
+        // servers (#391) grow it as new roots join; the immutable spawn-time
+        // `init_folders` still seeds the `initialize` handshake.
+        let workspace_folders = super::WorkspaceFolderSet::new(init_folders.clone());
 
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
@@ -887,13 +1168,17 @@ impl LanguageServerPool {
                 dynamic_capabilities: Arc::clone(&dynamic_capabilities),
                 upstream_tx: self.upstream_tx.clone(),
                 window_tx: self.window_tx.clone(),
-                workspace_folders: Arc::clone(&workspace_folders),
+                // #391: share the per-connection mutable folder set with the
+                // reader (it answers workspace/workspaceFolders pulls).
+                workspace_folders: workspace_folders.clone(),
                 progress_registry: Arc::clone(&self.progress_registry),
                 progress_connection_id: self.progress_registry.new_connection_id(),
             },
         );
 
-        // Create handle in Initializing state (fast-fail for concurrent requests)
+        // Create handle in Initializing state (fast-fail for concurrent requests).
+        // The handle shares the reader's `workspace_folders` set so the
+        // shared-instance path (#391) can grow it and announce new roots.
         let handle = Arc::new(ConnectionHandle::with_state(
             writer,
             router,
@@ -903,6 +1188,7 @@ impl LanguageServerPool {
             rx,
             dynamic_capabilities,
             connection_key.clone(),
+            workspace_folders,
         ));
 
         // Insert into pool immediately so concurrent requests see Initializing state
@@ -933,7 +1219,7 @@ impl LanguageServerPool {
                     init_response_rx,
                     init_options,
                     root_uri,
-                    workspace_folders.as_ref().clone(),
+                    init_folders,
                     client_capabilities,
                 ),
             )
@@ -1501,9 +1787,10 @@ mod tests {
 
     /// A document with no marker root (and the no-document case) resolves to the
     /// client-root fallback key, shared across all such documents — preserving
-    /// the pre-#382 single-process behavior for non-monorepo layouts.
+    /// the pre-#382 single-process behavior for non-monorepo layouts. (Distinct
+    /// from the #391 `ConnectionKey::shared` instance key.)
     #[test]
-    fn connection_key_falls_back_to_shared_key_without_marker() {
+    fn connection_key_falls_back_to_client_root_without_marker() {
         let tmp = tempfile::tempdir().unwrap();
         // No `.git` anywhere up the tree from these orphan files.
         let orphan_1 = Url::from_file_path(tmp.path().join("one.py")).unwrap();
@@ -1522,6 +1809,166 @@ mod tests {
             fallback,
             pool.connection_key("pyright", &config, None),
             "the no-document case must resolve to the same fallback key"
+        );
+    }
+
+    /// Build `ServerCapabilities` that advertise the workspaceFolders +
+    /// changeNotifications support the shared-instance opt-in (#391) requires.
+    fn capable_workspace_folders_caps() -> tower_lsp_server::ls_types::ServerCapabilities {
+        use tower_lsp_server::ls_types::{
+            OneOf, ServerCapabilities, WorkspaceFoldersServerCapabilities,
+            WorkspaceServerCapabilities,
+        };
+        ServerCapabilities {
+            workspace: Some(WorkspaceServerCapabilities {
+                workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                    supported: Some(true),
+                    change_notifications: Some(OneOf::Left(true)),
+                }),
+                file_operations: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn shared_config() -> crate::config::settings::BridgeServerConfig {
+        crate::config::settings::BridgeServerConfig {
+            prefer_shared_instance: Some(true),
+            ..devnull_config()
+        }
+    }
+
+    /// A doc under a `.git` marker root, so the per-root key is a concrete
+    /// Marker (not the client-root fallback).
+    fn marker_rooted_doc() -> (tempfile::TempDir, Url) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let doc = Url::from_file_path(tmp.path().join("src/main.lua")).unwrap();
+        (tmp, doc)
+    }
+
+    /// `preferSharedInstance` routes every document to the one shared-instance
+    /// key while no shared connection exists yet (#391) — the optimistic path
+    /// before any capability is known.
+    #[tokio::test]
+    async fn resolve_acquire_routes_opt_in_server_to_shared_key() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+        assert_eq!(key, ConnectionKey::shared("lua"));
+        assert!(key.is_shared());
+
+        // A non-opt-in server keeps its per-root key under the same conditions.
+        let (_marker, per_root) = pool
+            .resolve_acquire("lua", &devnull_config(), Some(&doc))
+            .await;
+        assert!(!per_root.is_shared());
+    }
+
+    /// A marker-less document (no `.git`, no document hint) has no root to
+    /// share, so even with `preferSharedInstance` it stays on the client-root
+    /// fallback rather than the shared key (#391).
+    #[tokio::test]
+    async fn resolve_acquire_keeps_marker_less_docs_on_client_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.git` up the tree from this orphan file.
+        let orphan = Url::from_file_path(tmp.path().join("scratch.lua")).unwrap();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&orphan)).await;
+        assert!(
+            !key.is_shared(),
+            "a marker-less document must stay on the client-root fallback, not shared"
+        );
+        // The no-document case likewise stays off the shared key.
+        let (_marker, no_doc_key) = pool.resolve_acquire("lua", &config, None).await;
+        assert!(!no_doc_key.is_shared());
+    }
+
+    /// A capable, Ready shared connection keeps subsequent roots on the shared
+    /// key (they join via didChangeWorkspaceFolders).
+    #[tokio::test]
+    async fn resolve_acquire_joins_capable_shared_connection() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(handle).await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+        assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    /// A Ready shared connection whose server never advertised the
+    /// workspaceFolders capability makes the opt-in degrade to per-root
+    /// instances (#391): a root the incapable shared connection does NOT already
+    /// serve routes to a per-root key, not the shared one.
+    #[tokio::test]
+    async fn resolve_acquire_falls_back_to_per_root_when_shared_is_incapable() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        // Capabilities set, but WITHOUT workspaceFolders support. Its folder set
+        // is empty, so it serves no root yet.
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(handle).await;
+
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+        assert!(
+            !key.is_shared(),
+            "an incapable shared connection must fall back to a per-root key"
+        );
+        // And it is the same per-root key the non-opt-in path would pick.
+        let per_root = pool.connection_key("lua", &devnull_config(), Some(&doc));
+        assert_eq!(key, per_root);
+    }
+
+    /// The incapable-fallback must not split a single root across two processes:
+    /// the shared connection's OWN spawn root stays on the shared key (it is
+    /// already correctly rooted and serving it), while only *other* roots divert
+    /// to per-root keys (#391).
+    #[tokio::test]
+    async fn resolve_acquire_keeps_incapable_shared_own_root_on_shared() {
+        let (_tmp, doc) = marker_rooted_doc();
+        let pool = LanguageServerPool::new();
+        let config = shared_config();
+
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        // Seed the shared connection's folder set with this doc's marker root,
+        // as if it had spawned rooted there.
+        let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
+        let own_root = marker.expect("doc has a marker root").1;
+        handle
+            .workspace_folders()
+            .add_and_announce(own_root, || true);
+        pool.insert_connection(handle).await;
+
+        // A document under the shared connection's own root stays on shared.
+        let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
+        assert_eq!(
+            key,
+            ConnectionKey::shared("lua"),
+            "the incapable shared connection's own root must stay on the shared key"
+        );
+
+        // A document under a DIFFERENT root still diverts to per-root.
+        let (_tmp2, other_doc) = marker_rooted_doc();
+        let (_marker, other_key) = pool.resolve_acquire("lua", &config, Some(&other_doc)).await;
+        assert!(
+            !other_key.is_shared(),
+            "a root the incapable shared connection does not serve must go per-root"
         );
     }
 
@@ -1991,6 +2438,7 @@ mod tests {
             initialization_options: None,
             root_markers: None,
             on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
         };
 
         let result = pool
@@ -2706,6 +3154,7 @@ mod tests {
             rx,
             Arc::new(DynamicCapabilityRegistry::new()),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Add connection to pool
