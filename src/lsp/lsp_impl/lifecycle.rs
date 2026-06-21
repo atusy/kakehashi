@@ -390,25 +390,30 @@ async fn forward_upstream_request(
     }
 }
 
-/// Forward upstream notifications from downstream language servers to the editor.
+/// Forward downstream-initiated messages from language servers to the editor.
 ///
-/// Consumes notifications from two channels (loss-tolerance split, #378) and
-/// dispatches them to the LSP client:
+/// Consumes from three channels (loss-tolerance split, #378) and dispatches them
+/// to the LSP client:
 /// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
 ///   `workspace/diagnostic/refresh` — and the server-declared work-done
 ///   progress notifications (`CreateWorkDoneProgress`/`Progress`/
 ///   `ForgetWorkDoneProgress`, window-work-done-progress), which must not be
 ///   lost or reordered.
-/// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` —
-///   downstream `window/*` notifications, forwarded unconditionally and
-///   already prefixed with the originating server name.
+/// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
+///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
+///   editor's response relayed back; loss-intolerant (a dropped request hangs
+///   the downstream). Serviced via [`spawn_upstream_request`] so a slow/human
+///   editor never stalls the loop.
+/// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` and
+///   `telemetry/event` — best-effort notifications, forwarded unconditionally.
 ///
-/// Each dispatch awaits tower-lsp's internal bounded channel, so a slow editor
-/// stalls the loop — but the `biased` select drains `upstream_rx` first, so a
-/// `window/*` burst cannot starve `DiagnosticRefresh` or progress, and the
-/// bounded window queue caps memory. FIFO order is preserved within each channel
-/// (the window-notification e2e relies on window-channel FIFO; create-before-
-/// progress relies on upstream-channel FIFO).
+/// Notification dispatch awaits tower-lsp's internal bounded channel, so a slow
+/// editor stalls the loop — but the `biased` select drains the two loss-intolerant
+/// channels (`upstream_rx`, then `upstream_request_rx`) before the best-effort
+/// `window_rx`, so a `window/*` burst cannot starve `DiagnosticRefresh`, progress,
+/// or request forwarding, and the bounded window queue caps memory. FIFO order is
+/// preserved within each channel (the window-notification e2e relies on
+/// window-channel FIFO; create-before-progress relies on upstream-channel FIFO).
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the
@@ -453,23 +458,29 @@ async fn upstream_forwarding_loop(
                 }
             }
 
-            notification = window_rx.recv() => {
-                match notification {
-                    Some(notification) => {
-                        deliver_upstream_notification(&client, notification, &mut created_tokens)
-                            .await
-                    }
-                    None => break, // Channel closed
-                }
-            }
-
             request = upstream_request_rx.recv() => {
                 match request {
                     // Serviced on a spawned task, never awaited inline: these are
                     // user-interactive (showMessageRequest can pend for minutes),
                     // so awaiting here would freeze forwarding for every bridged
                     // server. The reply travels back through the request's oneshot.
+                    //
+                    // Ordered before `window_rx` (best-effort) so a `window/*` flood
+                    // (e.g. logMessage) can't starve loss-intolerant request
+                    // forwarding under `biased`. Servicing is just a spawn, and
+                    // requests are user-paced/low-volume, so this can't starve
+                    // `window_rx` in turn.
                     Some(request) => spawn_upstream_request(&client, request),
+                    None => break, // Channel closed
+                }
+            }
+
+            notification = window_rx.recv() => {
+                match notification {
+                    Some(notification) => {
+                        deliver_upstream_notification(&client, notification, &mut created_tokens)
+                            .await
+                    }
                     None => break, // Channel closed
                 }
             }

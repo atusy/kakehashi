@@ -22,7 +22,7 @@ use log::{debug, warn};
 use serde::Deserialize;
 use tokio::sync::oneshot;
 use tower_lsp_server::jsonrpc;
-use tower_lsp_server::ls_types::{ShowDocumentParams, ShowDocumentResult};
+use tower_lsp_server::ls_types::ShowDocumentParams;
 
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamRequest, send_server_response};
 
@@ -66,8 +66,10 @@ pub(in crate::lsp::bridge) fn handle(
     // response without a special-cased "loop gone" reply path.
     tokio::spawn(async move {
         let success = reply_rx.await.unwrap_or(false);
-        let result =
-            serde_json::to_value(ShowDocumentResult { success }).unwrap_or(serde_json::Value::Null);
+        // Build the `ShowDocumentResult` shape (`{ "success": bool }`) directly
+        // and infallibly — `serde_json::to_value` of the typed struct would force
+        // a fallback whose only safe value is this same object anyway.
+        let result = serde_json::json!({ "success": success });
         let response = jsonrpc::Response::from_ok(id, result);
         send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
     });
