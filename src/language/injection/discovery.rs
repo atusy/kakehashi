@@ -40,7 +40,7 @@ fn iter_valid_injection_content_captures<'a, 'b>(
 }
 
 /// Checks if a node is within the bounds of another node
-pub(crate) fn is_node_within(node: &Node, container: &Node) -> bool {
+fn is_node_within(node: &Node, container: &Node) -> bool {
     node.start_byte() >= container.start_byte() && node.end_byte() <= container.end_byte()
 }
 
@@ -407,7 +407,7 @@ fn extract_content_and_language<'a>(
 ///
 /// Returns `(index, region)` for use with `calculate_region_id`, or `None` when the
 /// position is not within any injection region.
-pub(crate) fn find_injection_at_position<'a>(
+fn find_injection_at_position<'a>(
     injections: &'a [InjectionRegionInfo<'a>],
     byte_offset: usize,
 ) -> Option<(usize, &'a InjectionRegionInfo<'a>)> {
@@ -558,5 +558,874 @@ impl InjectionResolver {
             .iter()
             .map(|region| Self::build_resolved_injection(coordinator, tracker, uri, region, text))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::language::LanguageCoordinator;
+    use crate::language::node_tracker::NodeTracker;
+    use rstest::rstest;
+    use tree_sitter::{Node, Parser, Query, StreamingIterator};
+    use url::Url;
+
+    fn create_rust_parser() -> Parser {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        parser
+    }
+
+    fn parse_rust_code(parser: &mut Parser, code: &str) -> tree_sitter::Tree {
+        parser.parse(code, None).expect("parse rust")
+    }
+
+    // Helper function to find a node at a specific byte position
+    fn find_node_at_byte<'a>(root: &Node<'a>, byte: usize) -> Option<Node<'a>> {
+        root.descendant_for_byte_range(byte, byte)
+    }
+
+    fn test_uri(name: &str) -> Url {
+        Url::parse(&format!("file:///test/{}.rs", name)).unwrap()
+    }
+
+    fn test_coordinator() -> LanguageCoordinator {
+        LanguageCoordinator::new()
+    }
+
+    /// Helper: parse `text` with tree-sitter Rust, match `string_content` nodes
+    /// via injection query, and return the `CacheableInjectionRegion` for the first match.
+    fn cacheable_from_first_injection(text: &str) -> CacheableInjectionRegion {
+        let mut parser = create_rust_parser();
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((string_literal
+              (string_content) @injection.content)
+             (#set! injection.language "test"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let regions =
+            collect_all_injections(&root, text, Some(&query)).expect("should find injections");
+        assert!(!regions.is_empty(), "expected at least one injection");
+
+        CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text)
+    }
+
+    #[test]
+    fn test_detect_nested_injections() {
+        use tree_sitter::Parser;
+
+        // Simulate a markdown file with a code block
+        let mut parser = Parser::new();
+        let language = tree_sitter_rust::LANGUAGE.into();
+        parser.set_language(&language).expect("load rust grammar");
+
+        let text = r#"let x = "markdown with ```lua code```";"#;
+        let tree = parser.parse(text, None).expect("parse rust");
+        let root = tree.root_node();
+
+        // Create a mock injection query that simulates nested injections
+        let query_str = r#"
+        (string_literal
+          (string_content) @injection.content
+          (#set! injection.language "markdown"))
+        "#;
+
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        // Find a node within the string content
+        let node_in_string = find_node_at_byte(&root, 20).expect("node at position");
+
+        // Detect injection with content
+        let result = detect_injection(&node_in_string, &root, text, Some(&query), "rust");
+
+        assert!(result.is_some());
+        let (hierarchy, _content_node, _pattern_index) = result.unwrap();
+
+        // Should detect rust -> markdown hierarchy
+        assert_eq!(hierarchy, vec!["rust", "markdown"]);
+    }
+
+    #[test]
+    fn test_detect_injection_with_static_language() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let re = Regex::new(r"^\d+$").unwrap(); }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Create a query that matches Regex::new with static language
+        let query_str = r#"
+            (call_expression
+              function: (scoped_identifier
+                path: (identifier) @_regex
+                (#eq? @_regex "Regex")
+                name: (identifier) @_new
+                (#eq? @_new "new"))
+              arguments: (arguments
+                (raw_string_literal
+                  (string_content) @injection.content))
+              (#set! injection.language "regex"))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        // Find a node inside the regex string
+        let node = find_node_at_byte(&root, 35); // Position in regex string
+        assert!(node.is_some());
+
+        let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
+        assert_eq!(
+            result.map(|(h, _, _)| h),
+            Some(vec!["rust".to_string(), "regex".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_detect_injection_with_no_injection() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { println!("hello"); }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Query that won't match
+        let query_str = r#"
+            (call_expression
+              function: (identifier) @_fn
+              (#eq? @_fn "nonexistent")
+              (arguments) @injection.content
+              (#set! injection.language "test"))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let node = find_node_at_byte(&root, 20); // Position in string
+        assert!(node.is_some());
+
+        let result = detect_injection(&node.unwrap(), &root, text, Some(&query), "rust");
+        assert_eq!(result.map(|(h, _, _)| h), None);
+    }
+
+    #[test]
+    fn test_detect_injection_without_query() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let node = root.child(0).unwrap();
+        let result = detect_injection(&node, &root, text, None, "rust");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_is_node_within() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let x = 42; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let outer = root.child(0).unwrap(); // function_item
+        let inner = find_node_at_byte(&root, 20).unwrap(); // Some node inside
+
+        assert!(is_node_within(&inner, &outer));
+        assert!(!is_node_within(&outer, &inner));
+    }
+
+    #[test]
+    fn test_recursive_injection_depth_limit() {
+        // Test that we can handle multiple levels of injection
+        // This is a simple test - real recursive injection happens in refactor.rs
+
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let x = "nested"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Create a query that would inject strings as another language
+        let query_str = r#"
+        ((string_literal
+          (string_content) @injection.content)
+         (#set! injection.language "nested_lang"))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let node = find_node_at_byte(&root, 22).expect("node in string");
+        let result = detect_injection(&node, &root, text, Some(&query), "rust");
+
+        assert!(result.is_some());
+        let (hierarchy, _, _) = result.unwrap();
+        assert_eq!(hierarchy, vec!["rust", "nested_lang"]);
+
+        // The actual deep recursion is tested through integration with refactor.rs
+        // where handle_nested_injection recursively processes injections
+    }
+
+    #[test]
+    fn test_duplicate_injections_same_node() {
+        // Test that multiple injection patterns matching the same node
+        // should only result in one injection (not nested)
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { /* comment */ }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Create a mock query that would inject the same node twice
+        // This simulates what happens with luadoc -> comment
+        let query_str = r#"
+        ((block_comment) @injection.content
+         (#set! injection.language "doc"))
+
+        ((block_comment) @injection.content
+         (#set! injection.language "comment"))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        // Find a node inside the comment
+        // The injection query matches on block_comment nodes, so we need to be inside one
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, root, text.as_bytes());
+
+        let mut injection_count = 0;
+        while let Some(_match) = matches.next() {
+            injection_count += 1;
+        }
+
+        // This should find 2 matches (both patterns match the same comment)
+        assert_eq!(injection_count, 2, "Expected 2 injection patterns to match");
+
+        // Now test our detection from inside the comment
+        let node_in_comment = find_node_at_byte(&root, 14).expect("node in comment");
+        let result = detect_injection(&node_in_comment, &root, text, Some(&query), "rust");
+
+        // Should detect only one injection (first pattern takes precedence)
+        assert!(result.is_some(), "Should find injection");
+        let (hierarchy, _, _) = result.unwrap();
+        // Should only use the first matching pattern, not both
+        assert_eq!(
+            hierarchy,
+            vec!["rust", "doc"],
+            "Should only show first injection"
+        );
+    }
+
+    #[test]
+    fn test_cacheable_injection_region_from_region_info() {
+        // Create a parser and parse some code to get a real Node
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "hello"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Create an injection query that matches the string
+        let query_str = r#"
+            ((string_literal) @injection.content
+              (#set! injection.language "markdown"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        // Get injection regions
+        let regions = collect_all_injections(&root, text, Some(&query));
+        let regions = regions.expect("Should find injections");
+        assert!(!regions.is_empty(), "Should find at least one injection");
+
+        let region_info = &regions[0];
+
+        // Convert to CacheableInjectionRegion (owned, no lifetime)
+        let cacheable =
+            CacheableInjectionRegion::from_region_info(region_info, "test-result-id", text);
+
+        // Verify all fields are captured correctly
+        assert_eq!(cacheable.language, "markdown");
+        assert_eq!(
+            cacheable.byte_range.start,
+            region_info.content_node.start_byte()
+        );
+        assert_eq!(
+            cacheable.byte_range.end,
+            region_info.content_node.end_byte()
+        );
+        assert_eq!(
+            cacheable.line_range.start,
+            region_info.content_node.start_position().row as u32
+        );
+        assert_eq!(
+            cacheable.line_range.end,
+            region_info.content_node.start_position().row as u32 + 1
+        );
+        assert_eq!(cacheable.region_id, "test-result-id");
+    }
+
+    #[test]
+    fn test_from_region_info_applies_column_offset() {
+        // #offset! with a column delta (e.g. regex content after a prefix)
+        // must shift byte_range and start_column to the effective position,
+        // so the bridge extracts the right content and translates coordinates
+        // correctly (#183).
+        let mut parser = create_rust_parser();
+        let text = "// regex content";
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "regex")
+              (#offset! @injection.content 0 3 0 0))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
+        assert_eq!(regions.len(), 1);
+        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text);
+
+        assert_eq!(&text[cacheable.byte_range.clone()], "regex content");
+        assert_eq!(cacheable.byte_range, 3..text.len());
+        assert_eq!(cacheable.start_column, 3);
+        assert_eq!(cacheable.line_range, 0..1);
+    }
+
+    #[test]
+    fn test_from_region_info_applies_row_offset_for_frontmatter() {
+        // The vendored markdown query trims `---` frontmatter delimiters via
+        // (#offset! @injection.content 1 0 -1 0); the cacheable region must
+        // reflect the effective (delimiter-free) range (#183).
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: x\n---\n\n# heading\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let root = tree.root_node();
+
+        let query_str = r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children)
+              (#offset! @injection.content 1 0 -1 0))
+        "#;
+        let query = Query::new(&md_language, query_str).expect("valid query");
+
+        let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
+        assert_eq!(regions.len(), 1);
+        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "test-id", text);
+
+        assert_eq!(&text[cacheable.byte_range.clone()], "title: x\n");
+        assert_eq!(cacheable.line_range, 1..2);
+        assert_eq!(cacheable.start_column, 0);
+    }
+
+    #[test]
+    fn test_resolved_injection_virtual_content_honors_offset() {
+        // End-to-end through the bridge resolution path: the virtual document
+        // sent downstream must contain only the effective (post-offset)
+        // content, not the raw node text with delimiters (#183).
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "---\ntitle: x\n---\n\n# heading\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query_str = r#"
+            ((minus_metadata) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children)
+              (#offset! @injection.content 1 0 -1 0))
+        "#;
+        let query = Query::new(&md_language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("offset_frontmatter");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "title: x\n");
+        assert_eq!(resolved[0].region.line_range.start, 1);
+        assert_eq!(resolved[0].line_column_offsets, vec![0]);
+    }
+
+    #[test]
+    fn test_resolved_virtual_content_combines_offset_with_child_exclusion() {
+        // #186: a query with #offset! but WITHOUT injection.include-children.
+        // Blockquote `> ` prefixes (block_continuation children) must still be
+        // stripped, restricted to the post-offset window — previously the
+        // child-exclusion step was skipped entirely whenever an offset was
+        // active, leaking prefixes into the virtual document.
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md_language).expect("set md language");
+        let text = "> ```lua\n> local a = 1\n> local b = 2\n> ```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+
+        let query_str = r#"
+            ((fenced_code_block
+               (info_string (language) @injection.language)
+               (code_fence_content) @injection.content)
+              (#offset! @injection.content 1 0 0 0))
+        "#;
+        let query = Query::new(&md_language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("offset_blockquote");
+
+        let resolved =
+            InjectionResolver::resolve_all(&coordinator, &tracker, &uri, &tree, text, &query);
+        assert_eq!(resolved.len(), 1);
+        // The row offset trims the first content line; child exclusion strips
+        // the remaining `> ` prefixes.
+        assert_eq!(resolved[0].virtual_content, "local b = 2\n");
+    }
+
+    #[test]
+    fn test_resolve_injection_returns_ulid_format() {
+        // Test that resolved injection has region_id in ULID format (26 chars)
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "hello"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+
+        let query_str = r#"
+            ((string_literal) @injection.content
+              (#set! injection.language "lua"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("ulid_format");
+
+        // Resolve injection at byte offset inside the string literal
+        let resolved = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            22,
+        );
+        assert!(resolved.is_some(), "Should resolve injection");
+        let region_id = resolved.unwrap().region.region_id;
+        assert_eq!(
+            region_id.len(),
+            26,
+            "ULID should be 26 characters, got: {}",
+            region_id
+        );
+    }
+
+    #[test]
+    fn test_resolve_injection_multiple_regions_stable_ulids() {
+        // Test that multiple injection regions get stable ULIDs for same ordinal
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "hello"; let b = "world"; let c = "test"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+
+        let query_str = r#"
+            ((string_literal) @injection.content
+              (#set! injection.language "lua"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("multiple");
+
+        // Find byte offsets for each string
+        let query_all = Query::new(&language, r#"(string_literal) @str"#).expect("valid query");
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches_iter = cursor.matches(&query_all, tree.root_node(), text.as_bytes());
+        let mut byte_offsets = Vec::new();
+        while let Some(m) = matches_iter.next() {
+            byte_offsets.push(m.captures[0].node.start_byte() + 1);
+        }
+        assert_eq!(byte_offsets.len(), 3, "Should find 3 strings");
+
+        // Resolve each injection
+        let r1 = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            byte_offsets[0],
+        );
+        let r2 = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            byte_offsets[1],
+        );
+        let r3 = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            byte_offsets[2],
+        );
+
+        // Each should have different ULIDs (different ordinals)
+        let id1 = r1.unwrap().region.region_id;
+        let id2 = r2.unwrap().region.region_id;
+        let id3 = r3.unwrap().region.region_id;
+        assert_ne!(id1, id2, "Different ordinals should have different ULIDs");
+        assert_ne!(id2, id3, "Different ordinals should have different ULIDs");
+        assert_ne!(id1, id3, "Different ordinals should have different ULIDs");
+    }
+
+    #[test]
+    fn test_resolve_injection_same_position_returns_consistent_region_id() {
+        // Test that resolving the same position returns consistent region_id
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "hello"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+
+        let query_str = r#"
+            ((string_literal) @injection.content
+              (#set! injection.language "lua"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("consistent");
+
+        // Resolve the same position multiple times
+        let byte_offset = 22;
+        let r1 = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            byte_offset,
+        );
+        let r2 = InjectionResolver::resolve_at_byte_offset(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            byte_offset,
+        );
+
+        assert_eq!(
+            r1.unwrap().region.region_id,
+            r2.unwrap().region.region_id,
+            "Same position should return same region_id"
+        );
+    }
+
+    #[test]
+    fn test_calculate_region_id_different_positions_different_ulids() {
+        // Test that different injection positions produce different ULIDs
+        // Phase 2: Uses position-based keys (start_byte, end_byte, kind)
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "lua1"; let b = "python"; let c = "lua2"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let query_str = r#"(string_literal) @str"#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let mut matches_iter = cursor.matches(&query, root, text.as_bytes());
+        let mut nodes = Vec::new();
+        while let Some(m) = matches_iter.next() {
+            nodes.push(m.captures[0].node);
+        }
+        assert_eq!(nodes.len(), 3, "Should find 3 strings");
+
+        // Create injection regions manually: lua, python, lua
+        let injections = [
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: nodes[0],
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+            },
+            InjectionRegionInfo {
+                language: "python".to_string(),
+                content_node: nodes[1],
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+            },
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: nodes[2],
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+            },
+        ];
+
+        let tracker = NodeTracker::new();
+        let uri = test_uri("mixed");
+
+        // Phase 2: calculate_region_id uses position-based keys (not ordinals)
+        // Different positions → different ULIDs regardless of language
+        let ulid_0 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0]);
+        let ulid_1 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[1]);
+        let ulid_2 = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[2]);
+
+        // All different because they have different byte positions
+        assert_ne!(
+            ulid_0, ulid_1,
+            "Different positions should have different ULIDs"
+        );
+        assert_ne!(
+            ulid_1, ulid_2,
+            "Different positions should have different ULIDs"
+        );
+        assert_ne!(
+            ulid_0, ulid_2,
+            "Different positions should have different ULIDs"
+        );
+
+        // Same position returns same ULID (stability)
+        let ulid_0_again = InjectionResolver::calculate_region_id(&tracker, &uri, &injections[0]);
+        assert_eq!(
+            ulid_0, ulid_0_again,
+            "Same position key should return same ULID"
+        );
+    }
+
+    #[test]
+    fn test_find_injection_at_position_returns_correct_region_and_index() {
+        // Test that find_injection_at_position returns the correct region and its index
+        // for use with calculate_region_id
+
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "lua1"; let b = "py"; let c = "lua2"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Find all string_literal nodes
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let query_str = r#"(string_literal) @str"#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let mut matches_iter = cursor.matches(&query, root, text.as_bytes());
+        let mut nodes = Vec::new();
+        while let Some(m) = matches_iter.next() {
+            nodes.push(m.captures[0].node);
+        }
+
+        assert_eq!(nodes.len(), 3, "Should find 3 strings");
+
+        // Create injection regions: lua, python, lua
+        let injections = vec![
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: nodes[0],
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+            },
+            InjectionRegionInfo {
+                language: "python".to_string(),
+                content_node: nodes[1],
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+            },
+            InjectionRegionInfo {
+                language: "lua".to_string(),
+                content_node: nodes[2],
+                pattern_index: 0,
+                include_children: false,
+                offset: None,
+            },
+        ];
+
+        // Test finding position inside first Lua block
+        let lua1_byte = nodes[0].start_byte() + 1; // Inside first string
+        let result = find_injection_at_position(&injections, lua1_byte);
+        assert!(result.is_some(), "Should find injection at lua1 position");
+        let (idx, region) = result.unwrap();
+        assert_eq!(idx, 0, "Should be at index 0");
+        assert_eq!(region.language, "lua", "Should be lua region");
+
+        // Test finding position inside Python block
+        let py_byte = nodes[1].start_byte() + 1;
+        let result = find_injection_at_position(&injections, py_byte);
+        assert!(result.is_some(), "Should find injection at python position");
+        let (idx, region) = result.unwrap();
+        assert_eq!(idx, 1, "Should be at index 1");
+        assert_eq!(region.language, "python", "Should be python region");
+
+        // Test finding position inside second Lua block
+        let lua2_byte = nodes[2].start_byte() + 1;
+        let result = find_injection_at_position(&injections, lua2_byte);
+        assert!(result.is_some(), "Should find injection at lua2 position");
+        let (idx, region) = result.unwrap();
+        assert_eq!(idx, 2, "Should be at index 2");
+        assert_eq!(region.language, "lua", "Should be lua region");
+
+        // Test position outside all injections
+        let outside_byte = 5; // Position before any string
+        let result = find_injection_at_position(&injections, outside_byte);
+        assert!(
+            result.is_none(),
+            "Should not find injection outside regions"
+        );
+    }
+
+    #[test]
+    fn test_collect_all_injections_respects_lua_match_predicate() {
+        // Regression test: #lua-match? is a general predicate (not built-in to tree-sitter).
+        // collect_all_injections must apply predicate filtering so that injection rules
+        // guarded by #lua-match? only match when the predicate actually passes.
+        //
+        // Without filtering, a rule like:
+        //   (string content: _ @injection.content (#lua-match? @injection.content "^;") (#set! injection.language "query"))
+        // would match ALL strings, not just those starting with ";".
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "hello"; let b = "; query"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+
+        // Injection query with #lua-match? predicate:
+        // Only strings starting with ";" should be injected as "query"
+        let query_str = r#"
+            ((string_literal
+                (string_content) @injection.content)
+              (#lua-match? @injection.content "^;")
+              (#set! injection.language "query"))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        let injections =
+            collect_all_injections(&root, text, Some(&query)).expect("Should return Some");
+
+        // Only "; query" should match, not "hello"
+        assert_eq!(
+            injections.len(),
+            1,
+            "Only strings matching #lua-match? should be injected, got: {:?}",
+            injections
+                .iter()
+                .map(|i| &text[i.content_node.start_byte()..i.content_node.end_byte()])
+                .collect::<Vec<_>>()
+        );
+        let content =
+            &text[injections[0].content_node.start_byte()..injections[0].content_node.end_byte()];
+        assert!(
+            content.starts_with(';'),
+            "Injected content should start with ';', got: {:?}",
+            content
+        );
+    }
+
+    #[rstest]
+    #[case::single_line_no_trailing_newline(
+        // "hello" sits entirely on row 0; no trailing newline → exclusive end = 1
+        r#"let s = "hello";"#,
+        0..1,
+    )]
+    #[case::multi_line_trailing_newline(
+        // string_content starts at the byte after `"` on row 0; the content
+        // ends with `\n` so end_position().column == 0 at row 4 → exclusive end = 4.
+        "let s = \"\nline1\nline2\nline3\n\";",
+        0..4,
+    )]
+    #[case::multi_line_no_trailing_newline(
+        // string_content starts on row 0; last line has content (no trailing \n),
+        // so end_position().column > 0 at row 2 → exclusive end = 3.
+        "let s = \"\nline1\nline2\";",
+        0..3,
+    )]
+    #[trace]
+    fn test_line_range_edge_cases(
+        #[case] text: &str,
+        #[case] expected_line_range: std::ops::Range<u32>,
+    ) {
+        let cacheable = cacheable_from_first_injection(text);
+        assert_eq!(
+            cacheable.line_range, expected_line_range,
+            "line_range mismatch for text: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn collects_injected_languages_from_markdown_code_blocks() {
+        use std::collections::HashSet;
+        use tree_sitter::Query;
+
+        let markdown_text = r#"# Example
+
+```lua
+print("Hello from Lua")
+local x = 42
+```
+
+Some text.
+
+```python
+def hello():
+    print("Hello from Python")
+```
+
+```lua
+local y = "duplicate"
+```
+"#;
+
+        let mut parser = Parser::new();
+        let md_language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        parser.set_language(&md_language).expect("set markdown");
+        let tree = parser.parse(markdown_text, None).expect("parse markdown");
+        let root = tree.root_node();
+
+        let injection_query_str = r#"
+            (fenced_code_block
+              (info_string
+                (language) @injection.language)
+              (code_fence_content) @injection.content)
+        "#;
+        let injection_query =
+            Query::new(&md_language, injection_query_str).expect("valid injection query");
+
+        let injections = collect_all_injections(&root, markdown_text, Some(&injection_query))
+            .unwrap_or_default();
+
+        let unique_languages: HashSet<String> =
+            injections.iter().map(|i| i.language.clone()).collect();
+
+        assert_eq!(unique_languages.len(), 2);
+        assert!(unique_languages.contains("lua"));
+        assert!(unique_languages.contains("python"));
+        assert_eq!(injections.len(), 3, "2 lua + 1 python");
     }
 }

@@ -128,3 +128,88 @@ pub(crate) fn parse_offset_directive_for_pattern(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+    use tree_sitter::Query;
+
+    #[test]
+    fn test_parse_offset_directive_for_pattern() {
+        // Test that the pattern-aware function correctly returns
+        // offsets only for the specific pattern
+
+        // Create a query similar to markdown's injection.scm with multiple patterns
+        let query_str = r#"
+            ; Pattern 0: Raw string literals - NO OFFSET
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ; Pattern 1: Comments - HAS OFFSET
+            ((line_comment) @injection.content
+              (#set! injection.language "markdown")
+              (#offset! @injection.content 1 0 -1 0))
+        "#;
+
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        // Pattern 0 (raw_string_literal) has NO offset
+        let offset_pattern_0 = parse_offset_directive_for_pattern(&query, 0);
+        assert_eq!(offset_pattern_0, None, "Pattern 0 should have no offset");
+
+        // Pattern 1 (line_comment) HAS offset
+        let offset_pattern_1 = parse_offset_directive_for_pattern(&query, 1);
+        assert_eq!(
+            offset_pattern_1,
+            Some(InjectionOffset {
+                start_row: 1,
+                start_column: 0,
+                end_row: -1,
+                end_column: 0
+            }),
+            "Pattern 1 should have offset (1, 0, -1, 0)"
+        );
+    }
+
+    #[rstest]
+    #[case::non_numeric_values("foo bar baz qux", Some(InjectionOffset::default()))]
+    #[case::missing_arguments("1 0", Some(InjectionOffset::default()))]
+    #[case::extra_arguments("1 0 -1 0 5", Some(InjectionOffset { start_row: 1, start_column: 0, end_row: -1, end_column: 0 }))]
+    #[case::mixed_valid_invalid("1 invalid -1 0", Some(InjectionOffset::default()))]
+    #[case::empty_args("", Some(InjectionOffset::default()))]
+    #[trace]
+    fn test_offset_directive_edge_cases(
+        #[case] offset_args: &str,
+        #[case] expected: Option<InjectionOffset>,
+    ) {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query_str = if offset_args.is_empty() {
+            r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "test")
+              (#offset! @injection.content))
+        "#
+            .to_string()
+        } else {
+            format!(
+                r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "test")
+              (#offset! @injection.content {}))
+        "#,
+                offset_args
+            )
+        };
+
+        let query = Query::new(&language, &query_str).expect("valid query");
+        let offset = parse_offset_directive_for_pattern(&query, 0);
+
+        assert_eq!(
+            offset, expected,
+            "offset_args={:?} should produce {:?}",
+            offset_args, expected
+        );
+    }
+}

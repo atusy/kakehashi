@@ -342,3 +342,490 @@ pub(crate) fn intersect_included_ranges(
 
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::{Parser, Query};
+
+    fn create_rust_parser() -> Parser {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("load rust grammar");
+        parser
+    }
+
+    /// Helper to build a tree_sitter::Range for test fixtures.
+    fn make_range(
+        start_byte: usize,
+        end_byte: usize,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> tree_sitter::Range {
+        tree_sitter::Range {
+            start_byte,
+            end_byte,
+            start_point: tree_sitter::Point {
+                row: start_row,
+                column: start_col,
+            },
+            end_point: tree_sitter::Point {
+                row: end_row,
+                column: end_col,
+            },
+        }
+    }
+
+    #[test]
+    fn test_has_include_children_for_pattern_without_property() {
+        // Pattern 0 has NO #set! injection.include-children
+        let query_str = r#"
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_include_children_for_pattern(&query, 0),
+            "Pattern without #set! injection.include-children should return false"
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_for_pattern_with_property() {
+        // Pattern has #set! injection.include-children (value-less property)
+        let query_str = r#"
+            ((line_comment) @injection.content
+              (#set! injection.language "html")
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            has_include_children_for_pattern(&query, 0),
+            "Pattern with #set! injection.include-children should return true"
+        );
+    }
+
+    #[test]
+    fn test_has_include_children_multi_pattern() {
+        // Two patterns: first without, second with include-children
+        let query_str = r#"
+            ; Pattern 0: NO include-children
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ; Pattern 1: HAS include-children
+            ((line_comment) @injection.content
+              (#set! injection.language "yaml")
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_include_children_for_pattern(&query, 0),
+            "Pattern 0 should not have include-children"
+        );
+        assert!(
+            has_include_children_for_pattern(&query, 1),
+            "Pattern 1 should have include-children"
+        );
+    }
+
+    #[test]
+    fn test_has_combined_for_pattern() {
+        // Pattern 0 has no combined property; pattern 1 mirrors the vendored
+        // markdown html_block pattern shape.
+        let query_str = r#"
+            ((raw_string_literal) @injection.content
+              (#set! injection.language "regex"))
+
+            ((line_comment) @injection.content
+              (#set! injection.language "html")
+              (#set! injection.combined)
+              (#set! injection.include-children))
+        "#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+
+        assert!(
+            !has_combined_for_pattern(&query, 0),
+            "Pattern without #set! injection.combined should return false"
+        );
+        assert!(
+            has_combined_for_pattern(&query, 1),
+            "Pattern with #set! injection.combined should return true"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_when_include_children() {
+        // When include_children is true, all content is included (no restriction)
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        assert!(
+            compute_included_ranges(&root, true).is_none(),
+            "include_children=true should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_returns_none_for_no_named_children() {
+        // A leaf node (identifier) has no named children
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("x", None).unwrap();
+        let root = tree.root_node();
+
+        // Find identifier leaf node
+        let ident = root
+            .named_descendant_for_byte_range(0, 1)
+            .expect("should find node");
+        assert_eq!(ident.named_child_count(), 0);
+
+        assert!(
+            compute_included_ranges(&ident, false).is_none(),
+            "Node with no named children should return None"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_computes_gap_ranges() {
+        // Use a node that has named children with gaps between them.
+        // In Rust, a function_item has named children (name, parameters, body)
+        // with gaps (the "fn" keyword, whitespace, etc.)
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("fn main() {}", None).unwrap();
+        let root = tree.root_node();
+
+        // function_item is the top-level node
+        let func = root.named_child(0).expect("should have function_item");
+        let func_start = func.start_byte();
+        let func_size = func.end_byte() - func_start;
+
+        let ranges = compute_included_ranges(&func, false);
+        let ranges = ranges.expect("Node with named children should produce gap ranges");
+        assert!(
+            !ranges.is_empty(),
+            "Should have at least one gap range between named children"
+        );
+
+        // Collect named children byte ranges (relative to func start)
+        let mut tree_cursor = func.walk();
+        let child_ranges: Vec<(usize, usize)> = func
+            .named_children(&mut tree_cursor)
+            .map(|c| (c.start_byte() - func_start, c.end_byte() - func_start))
+            .collect();
+
+        // Gap ranges must not overlap any named child
+        for r in &ranges {
+            assert!(
+                r.start_byte < r.end_byte,
+                "Range should be non-empty: {r:?}"
+            );
+            assert!(r.end_byte <= func_size, "Range exceeds node bounds: {r:?}");
+            for (cs, ce) in &child_ranges {
+                assert!(
+                    r.end_byte <= *cs || r.start_byte >= *ce,
+                    "Gap range {r:?} overlaps named child [{cs}, {ce})"
+                );
+            }
+        }
+
+        // Gap ranges + named child ranges should cover the entire node
+        let mut covered = vec![false; func_size];
+        for r in &ranges {
+            for c in covered[r.start_byte..r.end_byte].iter_mut() {
+                *c = true;
+            }
+        }
+        for (cs, ce) in &child_ranges {
+            for c in covered[*cs..*ce].iter_mut() {
+                *c = true;
+            }
+        }
+        assert!(
+            covered.iter().all(|&b| b),
+            "Gaps + children should cover the entire node"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_full_window_matches_unclipped() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        let unclipped = compute_included_ranges(&func, false).expect("named children produce gaps");
+        let clipped =
+            compute_included_ranges_clipped(&func, false, text, func.start_byte()..func.end_byte())
+                .expect("full window should produce the same gaps");
+
+        assert_eq!(
+            clipped, unclipped,
+            "window covering the whole node must reproduce compute_included_ranges"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_drops_children_before_window() {
+        // "fn main() {}": named children of function_item are
+        // main(3..7), parameters(7..9), body(10..12); gaps are [0..3) and [9..10).
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        // Window starts inside `main` (3..7): the straddling child is clipped,
+        // the "fn " gap disappears, and only the " " gap [9..10) remains,
+        // relative to the window start.
+        let ranges = compute_included_ranges_clipped(&func, false, text, 4..12)
+            .expect("gap inside window should survive");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!((ranges[0].start_byte, ranges[0].end_byte), (5, 6));
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 0, column: 5 }
+        );
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 0, column: 6 }
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_truncates_at_window_end() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        // Window ends inside the body (10..12): both gaps survive, and no
+        // spurious gap is emitted after the clipped body.
+        let ranges = compute_included_ranges_clipped(&func, false, text, 0..11)
+            .expect("gaps inside window should survive");
+
+        let bytes: Vec<(usize, usize)> =
+            ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect();
+        assert_eq!(bytes, vec![(0, 3), (9, 10)]);
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_returns_none_when_children_cover_window() {
+        let mut parser = create_rust_parser();
+        let text = "fn main() {}";
+        let tree = parser.parse(text, None).unwrap();
+        let func = tree.root_node().named_child(0).expect("function_item");
+
+        // Window [10..12) lies entirely inside the body child: no gaps.
+        assert!(
+            compute_included_ranges_clipped(&func, false, text, 10..12).is_none(),
+            "window fully covered by a child has no gaps"
+        );
+    }
+
+    #[test]
+    fn test_compute_included_ranges_clipped_relativizes_points_to_window_start() {
+        // Two statements on separate lines; gaps are the newlines [4..5) and [9..10).
+        let mut parser = create_rust_parser();
+        let text = "a();\nb();\n";
+        let tree = parser.parse(text, None).unwrap();
+        let root = tree.root_node();
+
+        // Window starts at byte 6 = row 1, column 1 (inside `b();`).
+        let ranges = compute_included_ranges_clipped(&root, false, text, 6..10)
+            .expect("trailing newline gap should survive");
+
+        assert_eq!(ranges.len(), 1);
+        // Gap [9..10) relative to window start 6.
+        assert_eq!((ranges[0].start_byte, ranges[0].end_byte), (3, 4));
+        // Same row as window start: column is relative (4 - 1 = 3).
+        assert_eq!(
+            ranges[0].start_point,
+            tree_sitter::Point { row: 0, column: 3 }
+        );
+        // Next row: column stays absolute.
+        assert_eq!(
+            ranges[0].end_point,
+            tree_sitter::Point { row: 1, column: 0 }
+        );
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_basic() {
+        // Parent has 3 ranges spanning 3 rows (simulating "> " prefix on each line).
+        // Each line is ">" (1 byte) + " " (1 byte) + content.
+        // Line 0: "> abc\n"  → bytes 0..6, gap at 2..6, row 0 col 2
+        // Line 1: "> def\n"  → bytes 6..12, gap at 8..12, row 1 col 2
+        // Line 2: "> ghi\n"  → bytes 12..18, gap at 14..18, row 2 col 2
+        let parent_ranges = vec![
+            make_range(2, 6, 0, 2, 0, 6),
+            make_range(8, 12, 1, 2, 1, 6),
+            make_range(14, 18, 2, 2, 2, 6),
+        ];
+
+        // Nested region covers rows 1-2 (bytes 8..18 in parent coordinates)
+        let result = sub_select_included_ranges(&parent_ranges, 8, 18);
+
+        assert!(
+            result.is_some(),
+            "Should return Some for overlapping ranges"
+        );
+        let ranges = result.unwrap();
+        assert_eq!(ranges.len(), 2, "Should have 2 ranges for rows 1-2");
+
+        // First range: re-relativized from parent byte 8..12 → nested byte 0..4
+        // First range column is 0 (prefix bytes are outside nested content_text)
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, 4);
+        assert_eq!(ranges[0].start_point.row, 0);
+        assert_eq!(ranges[0].start_point.column, 0); // first range: no prefix in nested content
+        assert_eq!(ranges[0].end_point.row, 0);
+        assert_eq!(ranges[0].end_point.column, 6);
+
+        // Second range: re-relativized from parent byte 14..18 → nested byte 6..10
+        assert_eq!(ranges[1].start_byte, 6);
+        assert_eq!(ranges[1].end_byte, 10);
+        assert_eq!(ranges[1].start_point.row, 1);
+        assert_eq!(ranges[1].start_point.column, 2);
+        assert_eq!(ranges[1].end_point.row, 1);
+        assert_eq!(ranges[1].end_point.column, 6);
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_no_overlap() {
+        // Parent ranges span bytes 0..6
+        let parent_ranges = vec![make_range(2, 6, 0, 2, 0, 6)];
+
+        // Nested region is completely outside parent ranges
+        let result = sub_select_included_ranges(&parent_ranges, 10, 20);
+
+        assert!(
+            result.is_none(),
+            "Should return None for non-overlapping ranges"
+        );
+    }
+
+    #[test]
+    fn test_sub_select_included_ranges_partial_overlap() {
+        // Parent range: bytes 2..10 on row 0
+        let parent_ranges = vec![make_range(2, 10, 0, 2, 0, 10)];
+
+        // Nested region starts at byte 5 (mid-range) and ends at byte 15 (past range)
+        let result = sub_select_included_ranges(&parent_ranges, 5, 15);
+
+        assert!(
+            result.is_some(),
+            "Should return Some for partially overlapping range"
+        );
+        let ranges = result.unwrap();
+        assert_eq!(ranges.len(), 1);
+
+        // Clipped: start clamped to 5, end clamped to 10
+        // Re-relativized: 5-5=0 start, 10-5=5 end
+        assert_eq!(ranges[0].start_byte, 0);
+        assert_eq!(ranges[0].end_byte, 5);
+        assert_eq!(ranges[0].start_point.row, 0);
+        assert_eq!(ranges[0].start_point.column, 0); // first range: column zeroed
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_identical() {
+        let ranges = vec![make_range(0, 4, 0, 0, 0, 4), make_range(6, 10, 1, 2, 1, 6)];
+        let result = intersect_included_ranges(&ranges, &ranges);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start_byte, 0);
+        assert_eq!(result[0].end_byte, 4);
+        assert_eq!(result[1].start_byte, 6);
+        assert_eq!(result[1].end_byte, 10);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_no_overlap() {
+        let a = vec![make_range(0, 4, 0, 0, 0, 4)];
+        let b = vec![make_range(6, 10, 1, 2, 1, 6)];
+        let result = intersect_included_ranges(&a, &b);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_partial_overlap() {
+        // a: [2..8], b: [5..12]
+        // intersection: [5..8]
+        let a = vec![make_range(2, 8, 0, 2, 0, 8)];
+        let b = vec![make_range(5, 12, 0, 5, 0, 12)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 8);
+        // start_byte == b's start → use b's start_point
+        assert_eq!(result[0].start_point.column, 5);
+        // end_byte == a's end → use a's end_point
+        assert_eq!(result[0].end_point.column, 8);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_one_contains_other() {
+        // a: [0..20], b: [5..10]
+        // intersection: [5..10]
+        let a = vec![make_range(0, 20, 0, 0, 0, 20)];
+        let b = vec![make_range(5, 10, 0, 5, 0, 10)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 10);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_multiple_overlaps() {
+        // a: [0..10, 20..30]
+        // b: [5..25]
+        // intersections: [5..10, 20..25]
+        let a = vec![
+            make_range(0, 10, 0, 0, 0, 10),
+            make_range(20, 30, 2, 0, 2, 10),
+        ];
+        let b = vec![make_range(5, 25, 0, 5, 2, 5)];
+        let result = intersect_included_ranges(&a, &b);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].start_byte, 5);
+        assert_eq!(result[0].end_byte, 10);
+        assert_eq!(result[1].start_byte, 20);
+        assert_eq!(result[1].end_byte, 25);
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_empty_inputs() {
+        let ranges = vec![make_range(0, 4, 0, 0, 0, 4)];
+        assert!(intersect_included_ranges(&[], &ranges).is_empty());
+        assert!(intersect_included_ranges(&ranges, &[]).is_empty());
+        assert!(intersect_included_ranges(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn test_intersect_included_ranges_adjacent_non_overlapping() {
+        // a: [0..5], b: [5..10] — touching but not overlapping
+        let a = vec![make_range(0, 5, 0, 0, 0, 5)];
+        let b = vec![make_range(5, 10, 0, 5, 0, 10)];
+        let result = intersect_included_ranges(&a, &b);
+        assert!(result.is_empty(), "Adjacent ranges should not intersect");
+    }
+}
