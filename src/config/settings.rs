@@ -361,6 +361,14 @@ pub struct BridgeServerConfig {
     pub prefer_shared_instance: Option<bool>,
 }
 
+impl BridgeServerConfig {
+    /// Effective `prefer_shared_instance` preference, resolving the inherit
+    /// (`None`) case to the built-in default `false` (per-root instances).
+    pub(crate) fn prefers_shared_instance(&self) -> bool {
+        self.prefer_shared_instance.unwrap_or(false)
+    }
+}
+
 /// Union of every server's `onTypeFormattingTriggers`, shaped for the LSP
 /// `documentOnTypeFormattingProvider` capability: `(first, more)`.
 ///

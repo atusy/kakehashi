@@ -173,6 +173,7 @@ pub(in crate::lsp::bridge) async fn create_handle_with_state_and_pid_keyed(
         rx,
         dynamic_capabilities,
         key,
+        crate::lsp::bridge::WorkspaceFolderSet::new(None),
     ));
     (handle, pid)
 }

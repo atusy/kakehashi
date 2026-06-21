@@ -31,6 +31,7 @@ use super::ResponseRouter;
 use super::response_router::RouteResult;
 use crate::error::LockResultExt;
 use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
+use crate::lsp::bridge::workspace_folders::WorkspaceFolderSet;
 
 /// Notification to forward from downstream server to upstream editor.
 ///
@@ -113,7 +114,10 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
     /// Best-effort `window/*` notifications; bounded, dropped when full.
     pub(crate) window_tx: mpsc::Sender<UpstreamNotification>,
-    pub(crate) workspace_folders: Arc<Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>>,
+    /// The folders this connection currently serves, used to answer downstream
+    /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
+    /// connection grows it as new marker roots join (#391).
+    pub(crate) workspace_folders: WorkspaceFolderSet,
     /// Shared registry that remaps downstream-declared progress tokens to unique
     /// upstream tokens (window-work-done-progress bridging).
     pub(crate) progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
@@ -360,7 +364,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
             dynamic_capabilities,
             upstream_tx,
             window_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
         },
@@ -446,7 +450,7 @@ async fn reader_loop(
         response_tx,
         dynamic_capabilities,
         upstream_tx,
-        workspace_folders: Arc::new(None),
+        workspace_folders: WorkspaceFolderSet::new(None),
         window_tx,
         progress_registry,
         progress_connection_id,
@@ -1011,15 +1015,16 @@ async fn handle_server_request(
             Ok(serde_json::Value::Null)
         }
         "workspace/workspaceFolders" => {
-            // The bridge advertises workspace.workspaceFolders, so answer
-            // with the folders this connection was initialized with
+            // The bridge advertises workspace.workspaceFolders, so answer with
+            // the folders this connection currently serves — which a
+            // preferSharedInstance connection grows over time (#391)
             // (WorkspaceFolder[] | null).
             debug!(
                 target: "kakehashi::bridge::reader",
-                "{}Answering workspace/workspaceFolders from initialize-time folders",
+                "{}Answering workspace/workspaceFolders from the connection's current folders",
                 server_prefix
             );
-            Ok(serde_json::to_value(deps.workspace_folders.as_ref())
+            Ok(serde_json::to_value(deps.workspace_folders.snapshot())
                 .unwrap_or(serde_json::Value::Null))
         }
         _ => {
@@ -1148,7 +1153,7 @@ mod tests {
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry,
             progress_connection_id,
@@ -1218,7 +1223,7 @@ mod tests {
             response_tx: tx,
             dynamic_capabilities: caps,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry,
             progress_connection_id,
@@ -1313,7 +1318,7 @@ mod tests {
             dynamic_capabilities: caps,
             upstream_tx,
             window_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
         };
@@ -1386,7 +1391,7 @@ mod tests {
                 dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
                 upstream_tx,
                 window_tx,
-                workspace_folders: Arc::new(None),
+                workspace_folders: WorkspaceFolderSet::new(None),
                 progress_registry: Arc::clone(&progress_registry),
                 progress_connection_id: conn,
             },
@@ -1807,7 +1812,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -1865,7 +1870,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -1922,7 +1927,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::clone(&progress_registry),
             progress_connection_id,
@@ -1979,7 +1984,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry,
             progress_connection_id,
@@ -2035,7 +2040,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry,
             progress_connection_id,
@@ -2088,7 +2093,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::clone(&progress_registry),
             progress_connection_id,
@@ -2142,7 +2147,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry,
             progress_connection_id,
@@ -2178,7 +2183,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2232,7 +2237,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             window_tx,
-            workspace_folders: Arc::new(Some(folders)),
+            workspace_folders: WorkspaceFolderSet::new(Some(folders)),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2273,7 +2278,7 @@ mod tests {
             dynamic_capabilities,
             upstream_tx,
             window_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2313,7 +2318,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2391,7 +2396,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2428,7 +2433,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2480,7 +2485,7 @@ mod tests {
             response_tx,
             dynamic_capabilities: Arc::clone(&dynamic_capabilities),
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2543,7 +2548,7 @@ mod tests {
             response_tx: response_tx.clone(),
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2601,7 +2606,7 @@ mod tests {
             response_tx,
             dynamic_capabilities,
             upstream_tx,
-            workspace_folders: Arc::new(None),
+            workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),

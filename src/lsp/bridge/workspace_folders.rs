@@ -1,0 +1,163 @@
+//! Per-connection, mutable workspace-folder set.
+//!
+//! Historically the folders a downstream connection serves were frozen at spawn
+//! in an immutable `Arc<Option<Vec<WorkspaceFolder>>>`: set once from the
+//! resolved root (or the upstream fallback) and only ever read, to answer
+//! downstream `workspace/workspaceFolders` pulls. The shared-instance opt-in
+//! (#391) needs that set to *grow* as new marker roots join a single
+//! connection, so this type wraps it in a shared mutex that both the reader
+//! (pull answers) and the pool (announcing new roots) hold a clone of.
+//!
+//! The lock is only ever held for synchronous work (clone, scan, push) — never
+//! across an `.await` — so it is a plain `std::sync::Mutex`, with poison
+//! recovery per the project lock convention.
+//!
+//! `None` is preserved as a distinct "no folders / answer `null`" state, not
+//! collapsed into an empty list, matching the pre-#391 behavior.
+
+use std::sync::{Arc, Mutex};
+
+use tower_lsp_server::ls_types::WorkspaceFolder;
+
+use crate::error::LockResultExt;
+
+/// The workspace folders one downstream connection currently serves, shared
+/// (cheaply cloneable) between the reader task and the pool.
+#[derive(Clone)]
+pub(crate) struct WorkspaceFolderSet {
+    inner: Arc<Mutex<Option<Vec<WorkspaceFolder>>>>,
+}
+
+impl WorkspaceFolderSet {
+    /// Seed the set with the connection's initialize-time folders (`None` when
+    /// the connection has no folders to advertise).
+    pub(crate) fn new(initial: Option<Vec<WorkspaceFolder>>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(initial)),
+        }
+    }
+
+    /// Snapshot the current folders for answering a `workspace/workspaceFolders`
+    /// pull (the LSP `WorkspaceFolder[] | null` response).
+    pub(crate) fn snapshot(&self) -> Option<Vec<WorkspaceFolder>> {
+        self.inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::snapshot")
+            .clone()
+    }
+
+    /// Whether a folder with `folder`'s URI is already in the set.
+    pub(crate) fn contains(&self, folder: &WorkspaceFolder) -> bool {
+        self.inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::contains")
+            .as_ref()
+            .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri))
+    }
+
+    /// Atomically add `folder` and announce it, returning whether the set now
+    /// contains it. If `folder` is already present, returns `true` without
+    /// calling `announce`. Otherwise `announce` runs **while the set lock is
+    /// held** (it enqueues `workspace/didChangeWorkspaceFolders`): the folder is
+    /// committed only when `announce` returns `true` (the notification queued).
+    ///
+    /// Holding the lock across the add + announce is what makes
+    /// announce-before-`didOpen` safe under concurrency: a second caller cannot
+    /// observe the folder as present — and so skip its own announce — until the
+    /// first caller's notification is actually on the single-writer FIFO. If the
+    /// announce fails to queue, nothing is committed (and a `None` set stays
+    /// `None`), so a later acquisition re-attempts it rather than opening a
+    /// document for an unannounced root.
+    pub(crate) fn add_and_announce<F>(&self, folder: WorkspaceFolder, announce: F) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::add_and_announce");
+        if let Some(folders) = guard.as_ref()
+            && folders.iter().any(|existing| existing.uri == folder.uri)
+        {
+            return true;
+        }
+        if announce() {
+            // Materialize the `None` set into `Some` ONLY on a committed add, so
+            // a failed announce leaves the "answer null" state untouched.
+            guard.get_or_insert_with(Vec::new).push(folder);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use tower_lsp_server::ls_types::Uri;
+
+    fn folder(uri: &str) -> WorkspaceFolder {
+        WorkspaceFolder {
+            uri: Uri::from_str(uri).unwrap(),
+            name: uri.rsplit('/').next().unwrap_or(uri).to_string(),
+        }
+    }
+
+    #[test]
+    fn snapshot_returns_seeded_folders() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+
+        let empty = WorkspaceFolderSet::new(None);
+        assert_eq!(empty.snapshot(), None);
+    }
+
+    #[test]
+    fn add_and_announce_commits_only_on_successful_announce() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
+
+        // Already present -> returns true WITHOUT calling announce.
+        assert!(set.add_and_announce(folder("file:///a"), || panic!("must not announce present")));
+
+        // New root, announce fails -> not committed, returns false.
+        assert!(!set.add_and_announce(folder("file:///b"), || false));
+        assert!(!set.contains(&folder("file:///b")));
+
+        // New root, announce succeeds -> committed once.
+        assert!(set.add_and_announce(folder("file:///b"), || true));
+        // Second attempt at the same committed root -> no re-announce.
+        assert!(set.add_and_announce(folder("file:///b"), || panic!("must not re-announce")));
+
+        assert_eq!(
+            set.snapshot(),
+            Some(vec![folder("file:///a"), folder("file:///b")])
+        );
+    }
+
+    #[test]
+    fn failed_announce_keeps_a_none_set_null() {
+        // Regression: a failed announce on a `None` (answer-null) set must not
+        // collapse it to `Some([])`, which the reader would answer as `[]`.
+        let set = WorkspaceFolderSet::new(None);
+        assert!(!set.add_and_announce(folder("file:///a"), || false));
+        assert_eq!(set.snapshot(), None, "None must survive a failed announce");
+    }
+
+    #[test]
+    fn contains_matches_by_uri() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
+        assert!(set.contains(&folder("file:///a")));
+        assert!(!set.contains(&folder("file:///b")));
+        // A None set contains nothing.
+        assert!(!WorkspaceFolderSet::new(None).contains(&folder("file:///a")));
+    }
+
+    #[test]
+    fn add_and_announce_seeds_a_none_set_on_success() {
+        let set = WorkspaceFolderSet::new(None);
+        assert!(set.add_and_announce(folder("file:///a"), || true));
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+    }
+}

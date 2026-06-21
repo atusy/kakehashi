@@ -7,7 +7,7 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -30,6 +30,30 @@ use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
     JsonRpcNotification, JsonRpcRequest, RequestId, build_exit_notification, build_shutdown_request,
 };
+use crate::lsp::bridge::workspace_folders::WorkspaceFolderSet;
+
+/// Whether `caps` advertises everything the shared-instance opt-in (#391)
+/// needs to drive one connection across roots via
+/// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
+/// `supported == true` AND `changeNotifications` set to a value other than the
+/// explicit `false` (either `true` or a registration id string). Anything
+/// missing or `Left(false)` means the server will not act on folder-change
+/// notifications, so the bridge must keep it on per-root instances.
+pub(crate) fn supports_workspace_folder_changes(caps: &ServerCapabilities) -> bool {
+    let Some(folders) = caps
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.workspace_folders.as_ref())
+    else {
+        return false;
+    };
+    let supported = folders.supported == Some(true);
+    let wants_change_notifications = matches!(
+        folders.change_notifications,
+        Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+    );
+    supported && wants_change_notifications
+}
 
 /// Result of attempting to send a notification.
 ///
@@ -97,6 +121,17 @@ pub(crate) struct ConnectionHandle {
     /// root, so per-(server, root) pool state (issue #382) stays consistent
     /// without threading the root through every call site.
     connection_key: ConnectionKey,
+    /// The workspace folders this connection currently serves, shared with the
+    /// reader task (which answers downstream `workspace/workspaceFolders`
+    /// pulls). For a `preferSharedInstance` connection (#391) the pool grows it
+    /// as new marker roots join, each addition paired with a
+    /// `workspace/didChangeWorkspaceFolders`; for a per-root connection it is
+    /// seeded once and never mutated.
+    workspace_folders: WorkspaceFolderSet,
+    /// Guards the one-time "opt-in server lacks `workspaceFolders` capability,
+    /// falling back to per-root instances" log for this server (#391), so the
+    /// per-acquisition capability check does not spam the log.
+    incapable_fallback_logged: AtomicBool,
 }
 
 impl ConnectionHandle {
@@ -121,6 +156,7 @@ impl ConnectionHandle {
             rx,
             dynamic_capabilities,
             ConnectionKey::for_server("test"),
+            WorkspaceFolderSet::new(None),
         )
     }
 
@@ -137,6 +173,7 @@ impl ConnectionHandle {
         rx: mpsc::Receiver<OutboundMessage>,
         dynamic_capabilities: Arc<DynamicCapabilityRegistry>,
         connection_key: ConnectionKey,
+        workspace_folders: WorkspaceFolderSet,
     ) -> Self {
         use crate::lsp::bridge::actor::spawn_writer_task;
 
@@ -157,6 +194,8 @@ impl ConnectionHandle {
             server_capabilities: OnceLock::new(),
             dynamic_capabilities,
             connection_key,
+            workspace_folders,
+            incapable_fallback_logged: AtomicBool::new(false),
         }
     }
 
@@ -362,6 +401,43 @@ impl ConnectionHandle {
     /// Access the dynamic capability registry for this connection.
     pub(crate) fn dynamic_capabilities(&self) -> &DynamicCapabilityRegistry {
         &self.dynamic_capabilities
+    }
+
+    /// The workspace folders this connection currently serves (#391), shared
+    /// with the reader task. The pool grows it (and announces the new root)
+    /// when a `preferSharedInstance` connection takes on another marker root.
+    pub(crate) fn workspace_folders(&self) -> &WorkspaceFolderSet {
+        &self.workspace_folders
+    }
+
+    /// Whether the downstream server advertised support for receiving
+    /// `workspace/didChangeWorkspaceFolders` notifications — the capability
+    /// the shared-instance opt-in (#391) requires. Returns `false` until the
+    /// initialize handshake stores capabilities, so a still-initializing
+    /// connection is treated as not-yet-capable.
+    pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
+        self.server_capabilities()
+            .is_some_and(supports_workspace_folder_changes)
+    }
+
+    /// Log, at most once per connection, that a `preferSharedInstance` server
+    /// lacks the `workspaceFolders` capability and is therefore staying on the
+    /// per-root-instance model (#391). Returns `true` on the first call.
+    pub(crate) fn log_incapable_fallback_once(&self, server: &str) -> bool {
+        let first = self
+            .incapable_fallback_logged
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if first {
+            log::info!(
+                target: "kakehashi::bridge",
+                "Server '{}' has preferSharedInstance set but does not advertise \
+                 workspace.workspaceFolders.{{supported, changeNotifications}}; \
+                 falling back to per-root instances",
+                server
+            );
+        }
+        first
     }
 
     /// Whether the downstream server supports `method`, via dynamic registration
@@ -864,6 +940,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Verify initial state is Ready
@@ -938,6 +1015,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Register a request to start the liveness timer
@@ -996,6 +1074,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Register a request - this should NOT start the liveness timer
@@ -1061,6 +1140,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Register first request - this starts the liveness timer
@@ -1154,6 +1234,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         );
 
         // Register a request with upstream ID
@@ -1196,6 +1277,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         );
 
         // Register without upstream ID
@@ -1237,6 +1319,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         );
 
         // Should return immediately
@@ -1270,6 +1353,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Spawn a task that will transition to Ready after a delay
@@ -1314,6 +1398,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Spawn a task that will transition to Failed
@@ -1360,6 +1445,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         );
 
         // Wait with short timeout - should timeout
@@ -1395,6 +1481,7 @@ mod tests {
             rx,
             default_dynamic_caps(),
             ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
         ));
 
         // Spawn a task that will transition to Closing
@@ -1487,6 +1574,88 @@ mod tests {
         assert!(caps.hover_provider.is_none());
         assert!(caps.diagnostic_provider.is_none());
         assert!(caps.completion_provider.is_none());
+    }
+
+    // ========================================
+    // workspaceFolders Capability Tests (#391)
+    // ========================================
+
+    fn caps_with_workspace_folders(
+        folders: Option<tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities>,
+    ) -> ServerCapabilities {
+        use tower_lsp_server::ls_types::WorkspaceServerCapabilities;
+        ServerCapabilities {
+            workspace: Some(WorkspaceServerCapabilities {
+                workspace_folders: folders,
+                file_operations: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn folders_cap(
+        supported: Option<bool>,
+        change_notifications: Option<OneOf<bool, String>>,
+    ) -> tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities {
+        tower_lsp_server::ls_types::WorkspaceFoldersServerCapabilities {
+            supported,
+            change_notifications,
+        }
+    }
+
+    #[test]
+    fn supports_workspace_folder_changes_requires_supported_and_change_notifications() {
+        // The capable shapes: supported + (Left(true) | Right(id)).
+        assert!(supports_workspace_folder_changes(
+            &caps_with_workspace_folders(Some(folders_cap(Some(true), Some(OneOf::Left(true)))),)
+        ));
+        assert!(supports_workspace_folder_changes(
+            &caps_with_workspace_folders(Some(folders_cap(
+                Some(true),
+                Some(OneOf::Right("id".to_string()))
+            )),)
+        ));
+
+        // Missing or negative pieces -> not capable.
+        assert!(!supports_workspace_folder_changes(
+            &caps_with_workspace_folders(Some(folders_cap(Some(true), Some(OneOf::Left(false))))),
+        ));
+        assert!(!supports_workspace_folder_changes(
+            &caps_with_workspace_folders(Some(folders_cap(Some(true), None))),
+        ));
+        assert!(!supports_workspace_folder_changes(
+            &caps_with_workspace_folders(Some(folders_cap(None, Some(OneOf::Left(true))))),
+        ));
+        assert!(!supports_workspace_folder_changes(
+            &caps_with_workspace_folders(Some(folders_cap(Some(false), Some(OneOf::Left(true))))),
+        ));
+        assert!(!supports_workspace_folder_changes(
+            &caps_with_workspace_folders(None)
+        ));
+        assert!(!supports_workspace_folder_changes(
+            &ServerCapabilities::default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_reports_workspace_folder_capability_after_init() {
+        let handle = spawn_sink_handle().await;
+        // Not-yet-initialized handle is treated as not-capable.
+        assert!(!handle.supports_workspace_folder_changes());
+
+        handle.set_server_capabilities(caps_with_workspace_folders(Some(folders_cap(
+            Some(true),
+            Some(OneOf::Left(true)),
+        ))));
+        assert!(handle.supports_workspace_folder_changes());
+    }
+
+    #[tokio::test]
+    async fn log_incapable_fallback_once_returns_true_only_first_time() {
+        let handle = spawn_sink_handle().await;
+        assert!(handle.log_incapable_fallback_once("tsgo"));
+        assert!(!handle.log_incapable_fallback_once("tsgo"));
+        assert!(!handle.log_incapable_fallback_once("tsgo"));
     }
 
     // ========================================
