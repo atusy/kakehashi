@@ -2,6 +2,7 @@
 name = "kakehashi"
 version = "0.6.0"
 edition = "2024"
+default-run = "kakehashi"
 
 [[bin]]
 name = "kakehashi"
