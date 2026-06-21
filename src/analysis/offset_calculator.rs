@@ -1,4 +1,5 @@
-use crate::language::injection::{InjectionOffset, ceil_char_boundary, floor_char_boundary};
+use crate::language::injection::InjectionOffset;
+use crate::text::{ceil_char_boundary, floor_char_boundary};
 
 /// Represents a byte range with start and end positions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

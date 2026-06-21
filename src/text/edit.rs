@@ -8,6 +8,7 @@
 
 use tower_lsp_server::ls_types::TextEdit;
 
+use super::char_boundary::floor_char_boundary;
 use super::position::PositionMapper;
 
 /// Apply `edits` to `text`, returning the resulting string.
@@ -34,8 +35,7 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
             // `floor_char_boundary` clamps an index past the end down to
             // `text.len()` and floors a mid-codepoint offset to a char boundary,
             // so a buggy out-of-range/mid-codepoint offset can't make the slices
-            // below panic. (Hand-rolled rather than `str::floor_char_boundary` to
-            // avoid raising the crate's MSRV — see the helper below.)
+            // below panic.
             let a = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.start));
             let b = floor_char_boundary(text, mapper.position_to_byte_clamped(e.range.end));
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
@@ -69,20 +69,6 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     }
     result.push_str(&text[cursor..]);
     result
-}
-
-/// Floor `offset` to the nearest UTF-8 char boundary of `text` (clamping past the
-/// end to `text.len()`), so slicing at it never panics on a mid-codepoint or
-/// out-of-range offset from a buggy downstream server.
-///
-/// Hand-rolled rather than `str::floor_char_boundary` (stable only since Rust
-/// 1.95) to keep the crate's MSRV from being raised.
-fn floor_char_boundary(text: &str, offset: usize) -> usize {
-    let mut offset = offset.min(text.len());
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }
 
 #[cfg(test)]
