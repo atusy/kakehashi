@@ -675,8 +675,10 @@ async fn handle_message(
 /// originating server name so output from multiple bridged servers stays
 /// distinguishable.
 ///
-/// Everything else is still silently ignored ($/progress: #379, push-based
-/// publishDiagnostics: #380).
+/// `$/progress` is handled earlier in `handle_message` (translated and
+/// forwarded via `forward_progress_notification`), so it never reaches here.
+/// Everything else is still silently ignored (push-based publishDiagnostics:
+/// #380).
 fn forward_notification(
     message: &serde_json::Value,
     server_prefix: &str,
