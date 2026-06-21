@@ -43,7 +43,7 @@ pub(in crate::lsp::bridge) fn handle(
         Err(e) => {
             warn!(
                 target: "kakehashi::bridge::reader",
-                "{}Dropping {} with invalid params: {}",
+                "{}Rejecting {} with InvalidParams (unparseable params): {}",
                 server_prefix, METHOD, e
             );
             tokio::spawn(async move {

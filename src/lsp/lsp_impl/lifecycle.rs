@@ -296,10 +296,15 @@ impl Kakehashi {
     pub(crate) async fn initialized_impl(&self, _: InitializedParams) {
         self.notifier().log_info("server is ready").await;
 
-        // Forward downstream server notifications to upstream editor.
-        // The reader tasks feed two channels (loss-tolerance split, #378):
-        // unbounded for DiagnosticRefresh (must not be lost) and bounded for
-        // best-effort window/logMessage / window/showMessage forwarding.
+        // Forward downstream-initiated messages to the upstream editor. The
+        // reader tasks feed three channels:
+        // - unbounded `upstream_rx` (loss-intolerant): DiagnosticRefresh and
+        //   work-done progress (create/$progress/forget).
+        // - bounded `window_rx` (best-effort, drop-on-full): window/logMessage,
+        //   window/showMessage, and telemetry/event.
+        // - unbounded `upstream_request_rx` (loss-intolerant): downstream
+        //   requests forwarded with a response relayed back
+        //   (window/showMessageRequest, window/showDocument).
         if let Some(upstream_rx) = self.bridge.take_upstream_rx()
             && let Some(window_rx) = self.bridge.take_window_rx()
             && let Some(upstream_request_rx) = self.bridge.take_upstream_request_rx()
@@ -508,14 +513,33 @@ fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::Upstream
                 actions,
                 reply,
             } => {
-                let action = client
-                    .show_message_request(typ, message, actions)
-                    .await
-                    .unwrap_or(None);
+                let action = match client.show_message_request(typ, message, actions).await {
+                    Ok(action) => action,
+                    Err(e) => {
+                        // e.g. method-not-supported or transport failure — log for
+                        // diagnosis, still relay the protocol default (no selection).
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "window/showMessageRequest forwarding failed: {}; answering null",
+                            e
+                        );
+                        None
+                    }
+                };
                 let _ = reply.send(action);
             }
             UpstreamRequest::ShowDocument { params, reply } => {
-                let success = client.show_document(params).await.unwrap_or(false);
+                let success = match client.show_document(params).await {
+                    Ok(success) => success,
+                    Err(e) => {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "window/showDocument forwarding failed: {}; answering success:false",
+                            e
+                        );
+                        false
+                    }
+                };
                 let _ = reply.send(success);
             }
         }
