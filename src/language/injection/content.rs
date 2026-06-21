@@ -33,7 +33,7 @@ pub(crate) fn extract_clean_content(
 /// Each offset is the width of the blockquote prefix (or other excluded content)
 /// before the gap on that line. When `included_ranges` is `None`, returns
 /// `vec![start_column]` — the non-blockquote fallback where only line 0 has an offset.
-pub(crate) fn compute_line_column_offsets(
+pub(super) fn compute_line_column_offsets(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
     start_column: u32,

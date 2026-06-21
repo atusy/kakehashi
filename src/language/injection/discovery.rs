@@ -46,7 +46,7 @@ fn is_node_within(node: &Node, container: &Node) -> bool {
 
 /// Represents an injection region found in the document
 #[derive(Debug, Clone)]
-pub struct InjectionRegionInfo<'a> {
+pub(crate) struct InjectionRegionInfo<'a> {
     /// The injection language (e.g., "lua", "yaml")
     pub language: String,
     /// The content node from the injection query
@@ -69,7 +69,7 @@ pub struct InjectionRegionInfo<'a> {
 /// Unlike `InjectionRegionInfo<'a>`, this struct owns all its data and can be
 /// stored in caches that outlive the parse tree. Created via `from_region_info()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheableInjectionRegion {
+pub(crate) struct CacheableInjectionRegion {
     /// The injection language (e.g., "lua", "yaml")
     pub language: String,
     /// Byte range of the injection content in the source
@@ -163,7 +163,11 @@ impl CacheableInjectionRegion {
     /// # Panics (debug builds)
     /// Panics if the content node is zero-width (`start_byte >= end_byte`).
     /// Callers must filter zero-width nodes upstream (see `collect_all_injections`).
-    pub fn from_region_info(info: &InjectionRegionInfo<'_>, region_id: &str, text: &str) -> Self {
+    pub(crate) fn from_region_info(
+        info: &InjectionRegionInfo<'_>,
+        region_id: &str,
+        text: &str,
+    ) -> Self {
         let node = &info.content_node;
         debug_assert!(
             node.start_byte() < node.end_byte(),
@@ -255,7 +259,7 @@ impl CacheableInjectionRegion {
 /// Unlike `detect_injection` (which requires a specific node), this finds ALL
 /// injection regions in the whole document — used by semantic tokens to highlight
 /// every injected region. `None` when there is no query.
-pub fn collect_all_injections<'a>(
+pub(crate) fn collect_all_injections<'a>(
     root: &Node<'a>,
     text: &str,
     injection_query: Option<&Query>,
@@ -419,7 +423,7 @@ fn find_injection_at_position<'a>(
 }
 
 /// Resolved injection region with all necessary context for LSP bridge requests
-pub struct ResolvedInjection {
+pub(crate) struct ResolvedInjection {
     /// Cacheable injection region with line range information
     pub region: CacheableInjectionRegion,
     /// Language of the injection content
@@ -432,7 +436,7 @@ pub struct ResolvedInjection {
 }
 
 /// Central service for resolving injection regions at LSP positions
-pub struct InjectionResolver;
+pub(crate) struct InjectionResolver;
 
 impl InjectionResolver {
     /// Resolve the injection region (if any) covering `byte_offset`. Shared by

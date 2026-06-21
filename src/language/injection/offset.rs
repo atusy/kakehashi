@@ -6,7 +6,7 @@ use tree_sitter::Query;
 
 /// Represents offset adjustments for injection content boundaries
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct InjectionOffset {
+pub(crate) struct InjectionOffset {
     pub start_row: i32,
     pub start_column: i32,
     pub end_row: i32,

@@ -4,7 +4,7 @@
 
 use crate::language::predicate_accessor::{UnifiedPredicate, get_all_predicates};
 
-use super::byte_to_point_anchored;
+use super::content::byte_to_point_anchored;
 
 /// Checks whether the given pattern has `#set! injection.combined`.
 ///

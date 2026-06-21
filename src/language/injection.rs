@@ -18,17 +18,14 @@ mod ranges;
 /// Maximum recursion depth for nested injections to prevent stack overflow.
 pub(crate) const MAX_INJECTION_DEPTH: usize = 10;
 
-pub use discovery::{
-    CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, ResolvedInjection,
-    collect_all_injections,
-};
-pub use offset::InjectionOffset;
-
 pub(crate) use content::{
     byte_to_point, byte_to_point_anchored, extract_clean_content, parse_with_ranges,
 };
-pub(crate) use discovery::detect_injection;
-pub(crate) use offset::effective_offset_for_pattern;
+pub(crate) use discovery::{
+    CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, ResolvedInjection,
+    collect_all_injections, detect_injection,
+};
+pub(crate) use offset::{InjectionOffset, effective_offset_for_pattern};
 pub(crate) use ranges::{
     compute_included_ranges, compute_included_ranges_clipped, has_combined_for_pattern,
     has_include_children_for_pattern, intersect_included_ranges, sub_select_included_ranges,
