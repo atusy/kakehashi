@@ -75,7 +75,7 @@ pub(super) fn compute_line_column_offsets(
                             // Convert byte column to UTF-16 code units.
                             // The gap's start_byte is relative to content node start.
                             // The line starts at the byte after the previous newline.
-                            let gap_abs_byte = byte_range.start + range.start_byte;
+                            let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
                             let line_start_byte =
                                 gap_abs_byte.saturating_sub(range.start_point.column);
                             let prefix = clamped_slice(host_text, line_start_byte..gap_abs_byte);
