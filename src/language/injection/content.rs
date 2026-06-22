@@ -146,10 +146,11 @@ pub(crate) fn byte_to_point(text: &str, byte: usize) -> tree_sitter::Point {
 
 /// Like [`byte_to_point`], but scans only the span between a known anchor
 /// and `byte` instead of the whole prefix of `text` — the anchor is
-/// typically a tree-sitter node's cached `start_position()`. Falls back to a
-/// full scan when `byte` precedes the anchor (e.g. a negative `#offset!`
-/// extending before the content node). `anchor_byte` must lie on a char
-/// boundary, with `anchor_point` its Point in `text`.
+/// typically a tree-sitter node's cached `start_position()`. The anchored fast
+/// path is taken only when `anchor_byte` is an in-bounds char boundary and
+/// `anchor_point` is its Point in `text`; otherwise — `byte` before the anchor
+/// (e.g. a negative `#offset!`), or a stale anchor that's out of bounds or
+/// mid-codepoint — it falls back to the full scan, which trusts neither.
 pub(crate) fn byte_to_point_anchored(
     text: &str,
     byte: usize,
