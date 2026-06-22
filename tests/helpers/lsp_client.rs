@@ -12,6 +12,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Project-local persistent data directory used by every spawned
@@ -54,12 +56,55 @@ fn test_data_dir() -> &'static Path {
 ///
 /// Handles JSON-RPC 2.0 message framing with Content-Length headers,
 /// request/response matching, and server-initiated notifications.
+///
+/// Server stdout is drained by a dedicated background thread that frames
+/// messages and pushes them onto an `mpsc` channel. Reads therefore become
+/// `recv_timeout` with **exact** deadlines — a notification-wait against an
+/// alive-but-silent server returns at its timeout instead of blocking on a
+/// quiet pipe (see issue #385).
 pub struct LspClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    /// Framed messages from the background reader thread, in arrival order.
+    /// A `Disconnected` recv means the reader thread ended (clean EOF).
+    rx: Receiver<ReaderEvent>,
+    /// Handle to the background reader thread, joined on drop after the child
+    /// is killed (which closes stdout and unblocks the thread).
+    reader: Option<JoinHandle<()>>,
     stderr: Option<std::process::ChildStderr>,
     request_id: i64,
+}
+
+/// Message pushed from the background reader thread to the client.
+///
+/// A clean EOF is signaled out-of-band by the thread dropping its [`Sender`],
+/// which surfaces to the client as a `Disconnected` recv.
+enum ReaderEvent {
+    /// A complete, parsed JSON-RPC message.
+    Message(Value),
+    /// A framing/parse failure with a precise diagnostic. The reader thread
+    /// terminates after sending this.
+    Error(String),
+}
+
+/// Background reader thread body: frame messages off `reader` and forward them
+/// over `tx` until EOF, a framing error, or the consumer goes away.
+fn reader_loop(mut reader: BufReader<ChildStdout>, tx: Sender<ReaderEvent>) {
+    loop {
+        match read_framed_message(&mut reader) {
+            ReadOutcome::Message(value) => {
+                if tx.send(ReaderEvent::Message(value)).is_err() {
+                    return; // consumer dropped the receiver
+                }
+            }
+            // Clean EOF: drop tx so the consumer observes `Disconnected`.
+            ReadOutcome::Eof => return,
+            ReadOutcome::Error(e) => {
+                let _ = tx.send(ReaderEvent::Error(e));
+                return;
+            }
+        }
+    }
 }
 
 /// Builder for creating LspClient instances with custom configuration.
@@ -123,19 +168,8 @@ impl LspClientBuilder {
             cmd.env(key, value);
         }
 
-        let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
-
-        let stdin = child.stdin.take().expect("Failed to get stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
-        let stderr = child.stderr.take();
-
-        LspClient {
-            child,
-            stdin: Some(stdin),
-            stdout,
-            stderr,
-            request_id: 0,
-        }
+        let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        LspClient::from_child(child)
     }
 }
 
@@ -264,16 +298,25 @@ impl LspClient {
             cmd.env("RUST_LOG", "debug");
         }
 
-        let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        Self::from_child(child)
+    }
 
+    /// Wire up a spawned child: take its stdio handles and start the background
+    /// reader thread that drains stdout into the message channel.
+    fn from_child(mut child: Child) -> Self {
         let stdin = child.stdin.take().expect("Failed to get stdin");
         let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
         let stderr = child.stderr.take();
 
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || reader_loop(stdout, tx));
+
         Self {
             child,
             stdin: Some(stdin),
-            stdout,
+            rx,
+            reader: Some(reader),
             stderr,
             request_id: 0,
         }
@@ -393,15 +436,20 @@ impl LspClient {
         }
     }
 
-    /// Receive a single LSP message with Content-Length framing.
-    /// Validates Content-Length to prevent excessive memory allocation.
+    /// Receive a single LSP message from the background reader thread.
+    /// Times out after 30 seconds to prevent indefinite blocking on an
+    /// unresponsive (alive but silent) server.
     fn receive_message(&mut self) -> Value {
-        match read_framed_message(&mut self.stdout) {
-            ReadOutcome::Message(value) => value,
-            ReadOutcome::Eof => {
-                panic!("Server closed connection prematurely while reading header")
+        const TIMEOUT: Duration = Duration::from_secs(30);
+        match self.rx.recv_timeout(TIMEOUT) {
+            Ok(ReaderEvent::Message(value)) => value,
+            Ok(ReaderEvent::Error(e)) => panic!("{e}"),
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("Timeout reading LSP message after {TIMEOUT:?}")
             }
-            ReadOutcome::Error(e) => panic!("{e}"),
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("Server closed connection prematurely (reader thread ended at EOF)")
+            }
         }
     }
 
@@ -473,30 +521,23 @@ impl LspClient {
         let start_time = Instant::now();
 
         loop {
-            // Check timeout
-            if start_time.elapsed() > timeout {
-                return None;
-            }
-
-            // Use a short poll timeout to check the overall timeout frequently
             let remaining = timeout.saturating_sub(start_time.elapsed());
             if remaining.is_zero() {
                 return None;
             }
 
-            // Try to read a message with remaining timeout
-            if let Some(message) =
-                self.try_receive_message(remaining.min(Duration::from_millis(100)))
+            // Block up to the *remaining* deadline. None means the deadline
+            // elapsed or the server disconnected — either way, give up.
+            let message = self.try_receive_message(remaining)?;
+
+            // Notifications have no "id" field and must match the expected method.
+            if message.get("id").is_none()
+                && message.get("method").and_then(|m| m.as_str()) == Some(expected_method)
             {
-                // Check if this is the notification we're waiting for
-                // Notifications have no "id" field and must match the expected method
-                if message.get("id").is_none()
-                    && message.get("method").and_then(|m| m.as_str()) == Some(expected_method)
-                {
-                    return message.get("params").cloned();
-                }
-                // Otherwise it's a response or server-to-client request, skip it
+                return message.get("params").cloned();
             }
+            // Otherwise it's a response or server-to-client request; skip it
+            // and keep waiting within the deadline.
         }
     }
 
@@ -521,9 +562,11 @@ impl LspClient {
                 return None;
             }
 
-            if let Some(message) =
-                self.try_receive_message(remaining.min(Duration::from_millis(100)))
-                && message.get("id").is_none()
+            // Block up to the *remaining* deadline. None means the deadline
+            // elapsed or the server disconnected — either way, give up.
+            let message = self.try_receive_message(remaining)?;
+
+            if message.get("id").is_none()
                 && let Some(method) = message.get("method").and_then(|m| m.as_str())
                 && methods.contains(&method)
             {
@@ -535,44 +578,20 @@ impl LspClient {
         }
     }
 
-    /// Try to receive a message with a timeout, returning None if no message available.
+    /// Try to receive a message within `timeout`, returning None if none arrives.
     ///
-    /// # Known Limitation
-    ///
-    /// The `fill_buf()` call can potentially block on pipes if no data is available,
-    /// which may cause the timeout to be approximate rather than exact. In practice,
-    /// this works well for test scenarios where:
-    /// 1. The server is expected to respond (tests wait after sending requests)
-    /// 2. The server process eventually terminates (EOF triggers return)
-    ///
-    /// For truly non-blocking behavior, platform-specific non-blocking I/O or async
-    /// would be required, but this adds significant complexity for test helper code.
+    /// Backed by the background reader thread's channel, so the deadline is
+    /// exact: against an alive-but-silent server this blocks for precisely
+    /// `timeout` and then returns None, rather than hanging on a quiet pipe.
+    /// A disconnect (reader thread ended at EOF) also returns None — no further
+    /// messages can arrive. A framing/parse error panics with its diagnostic.
     fn try_receive_message(&mut self, timeout: Duration) -> Option<Value> {
-        let start_time = Instant::now();
-
-        // Polling loop with short sleeps between buffer checks.
-        // Note: fill_buf() may block briefly if the pipe has no data, making
-        // the timeout approximate. This is acceptable for test code where we
-        // expect the server to respond or terminate.
-        while start_time.elapsed() < timeout {
-            // Check if data is already available in the buffer
-            if !self.stdout.buffer().is_empty() {
-                return Some(self.receive_message());
-            }
-
-            // Try to fill the buffer with available data.
-            // This may block briefly on pipes, but typically returns quickly
-            // if data is being sent or the server has terminated.
-            let _ = self.stdout.fill_buf();
-            if !self.stdout.buffer().is_empty() {
-                return Some(self.receive_message());
-            }
-
-            // No data yet, sleep briefly and retry
-            std::thread::sleep(Duration::from_millis(10));
+        match self.rx.recv_timeout(timeout) {
+            Ok(ReaderEvent::Message(value)) => Some(value),
+            Ok(ReaderEvent::Error(e)) => panic!("{e}"),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => None,
         }
-
-        None
     }
 
     /// Check if the server process is still running.
@@ -604,7 +623,12 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        // Kill first: closing the child's stdout unblocks the reader thread's
+        // pending read, so the subsequent join returns promptly.
         self.kill();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
     }
 }
 
