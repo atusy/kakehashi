@@ -588,9 +588,11 @@ async fn send_editor_request(
 /// dismissed — and return `None`, so the downstream gets the protocol default.
 ///
 /// On cancel the in-flight `send_editor_request` future is dropped. tower-lsp's
-/// client keeps that request's slot in its pending map (no cancel/remove API),
-/// but a conformant editor's eventual (cancelled) response reclaims it, so the
-/// leak is bounded to requests the editor never answers at all.
+/// client registers a pending-response slot inside `call` (no cancel/remove API),
+/// so dropping the future can leave that slot parked — whether the request had
+/// already been written to the editor or cancellation won before the write. A
+/// later response from the editor reclaims the slot, so the leak is bounded to
+/// requests the editor never answers (including ones it never received).
 async fn forward_with_cancel(
     client: &Client,
     editor_id: tower_lsp_server::jsonrpc::Id,
