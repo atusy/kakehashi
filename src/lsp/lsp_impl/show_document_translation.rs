@@ -72,18 +72,17 @@ impl ShowDocumentTranslator {
             return params;
         };
 
-        match &params.selection {
-            // Only a selection needs the region offset. If it can't be resolved
-            // (region invalidated by edits), pass through rather than send a
-            // selection in stale/virtual coordinates.
-            Some(_) => match self.region_offset(&host_url, &region_id) {
-                Some(offset) => Self::apply_host_translation(params, host_uri, &offset),
-                None => params,
-            },
-            // No selection: just point the editor at the host document — this
-            // works even when the region offset is unavailable.
+        match self.region_offset(&host_url, &region_id) {
+            // Offset resolved: rewrite the URI and translate the selection (if any).
+            Some(offset) => Self::apply_host_translation(params, host_uri, &offset),
+            // Offset unavailable (region invalidated by edits, or unresolvable):
+            // still open the host document, but drop a selection we can't
+            // translate — a virtual-coordinate selection on the host URI would
+            // point at the wrong place, and keeping the virtual URI would leave
+            // the editor unable to open it at all.
             None => {
                 params.uri = host_uri;
+                params.selection = None;
                 params
             }
         }
