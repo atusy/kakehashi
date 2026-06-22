@@ -1,5 +1,7 @@
 //! Lifecycle methods for Kakehashi (initialize, initialized, shutdown).
 
+use std::sync::Arc;
+
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
 #[cfg(feature = "experimental")]
@@ -22,6 +24,7 @@ use crate::config::WorkspaceSettings;
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 use crate::lsp::{SettingsSource, load_settings};
 
+use super::show_document_translation::ShowDocumentTranslator;
 use super::{Kakehashi, uri_to_url};
 
 fn lsp_legend_types() -> Vec<SemanticTokenType> {
@@ -311,10 +314,18 @@ impl Kakehashi {
         {
             let client = self.client.clone();
             let token = self.shutdown_token.clone();
+            // Translates downstream-initiated window/showDocument virtual URIs +
+            // selections back to host coordinates before forwarding (#403).
+            let show_document_translator = Some(Arc::new(ShowDocumentTranslator::new(
+                Arc::clone(&self.documents),
+                Arc::clone(&self.language),
+                Arc::clone(&self.bridge),
+            )));
             tokio::spawn(upstream_forwarding_loop(
                 upstream_rx,
                 window_rx,
                 upstream_request_rx,
+                show_document_translator,
                 client,
                 token,
             ));
@@ -425,6 +436,7 @@ async fn upstream_forwarding_loop(
     mut upstream_request_rx: tokio::sync::mpsc::UnboundedReceiver<
         crate::lsp::bridge::UpstreamRequest,
     >,
+    show_document_translator: Option<Arc<ShowDocumentTranslator>>,
     client: Client,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
@@ -470,7 +482,9 @@ async fn upstream_forwarding_loop(
                     // forwarding under `biased`. Servicing is just a spawn, and
                     // requests are user-paced/low-volume, so this can't starve
                     // `window_rx` in turn.
-                    Some(request) => spawn_upstream_request(&client, request),
+                    Some(request) => {
+                        spawn_upstream_request(show_document_translator.clone(), &client, request)
+                    }
                     None => break, // Channel closed
                 }
             }
@@ -527,7 +541,11 @@ async fn upstream_forwarding_loop(
 /// lightweight task awaiting a `oneshot` — is far smaller than the editor's
 /// per-dialog cost, so the editor pushes back first. See issue #405
 /// (closed as not planned) for the full rationale.
-fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::UpstreamRequest) {
+fn spawn_upstream_request(
+    show_document_translator: Option<Arc<ShowDocumentTranslator>>,
+    client: &Client,
+    request: crate::lsp::bridge::UpstreamRequest,
+) {
     use crate::lsp::bridge::UpstreamRequest;
     let client = client.clone();
     tokio::spawn(async move {
@@ -554,6 +572,16 @@ fn spawn_upstream_request(client: &Client, request: crate::lsp::bridge::Upstream
                 let _ = reply.send(action);
             }
             UpstreamRequest::ShowDocument { params, reply } => {
+                // Translate a virtual-document URI + selection back to the host
+                // document before forwarding, so the editor opens the real file
+                // (#403). For a resolvable virtual URI the host URI is always
+                // used (selection translated, or dropped if the offset can't be
+                // rebuilt); only a non-virtual/unresolvable URI is forwarded
+                // unchanged. See `ShowDocumentTranslator::translate`.
+                let params = match &show_document_translator {
+                    Some(translator) => translator.translate(params).await,
+                    None => params,
+                };
                 let success = match client.show_document(params).await {
                     Ok(success) => success,
                     Err(e) => {
@@ -771,6 +799,7 @@ mod tests {
             rx,
             window_rx,
             request_rx,
+            None,
             client,
             cancel.clone(),
         ));
@@ -878,6 +907,7 @@ mod tests {
             rx,
             window_rx,
             request_rx,
+            None,
             client,
             cancel.clone(),
         ));
@@ -988,6 +1018,7 @@ mod tests {
             rx,
             window_rx,
             request_rx,
+            None,
             client,
             cancel.clone(),
         ));
@@ -1160,6 +1191,7 @@ mod tests {
             upstream_rx,
             window_rx,
             request_rx,
+            None,
             client,
             cancel.clone(),
         ));
@@ -1212,6 +1244,7 @@ mod tests {
             upstream_rx,
             window_rx,
             request_rx,
+            None,
             client,
             cancel.clone(),
         ));
@@ -1256,6 +1289,7 @@ mod tests {
             upstream_rx,
             window_rx,
             request_rx,
+            None,
             client,
             cancel.clone(),
         ));

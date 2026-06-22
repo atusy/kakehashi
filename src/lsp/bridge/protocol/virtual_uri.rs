@@ -102,13 +102,35 @@ impl VirtualDocumentUri {
             return false;
         };
 
-        // Check for {VIRTUAL_URI_PREFIX}{region_id}.{ext} pattern
-        // Requires non-empty extension after the last dot
+        // Check for {VIRTUAL_URI_PREFIX}{region_id}.{ext} pattern. Both the
+        // region_id and the extension must be non-empty — a real virtual URI
+        // always has both (`new` asserts a non-empty region_id), so requiring
+        // them rejects degenerate shapes like `kakehashi-virtual-uri-.lua`.
         filename.starts_with(VIRTUAL_URI_PREFIX)
             && filename
                 .get(VIRTUAL_URI_PREFIX.len()..)
                 .and_then(|s| s.rsplit_once('.'))
-                .is_some_and(|(_name, ext)| !ext.is_empty())
+                .is_some_and(|(region_id, ext)| !region_id.is_empty() && !ext.is_empty())
+    }
+
+    /// Extract the `region_id` from a virtual-document URI string, or `None` if
+    /// it isn't one. Parses the same `{prefix}{region_id}.{ext}` filename shape
+    /// as [`Self::is_virtual_uri`]; `region_id`s are dot-free (a ULID in
+    /// production, also scratch/test ids), so the last `.` separates the id from
+    /// the extension. Used as a cheap pre-filter when scanning open virtual
+    /// documents (`DocumentTracker::resolve_virtual_uri`).
+    pub(crate) fn region_id_of(uri: &str) -> Option<String> {
+        let url = url::Url::parse(uri).ok()?;
+        let filename = url.path_segments().and_then(|mut s| s.next_back())?;
+        let (region_id, ext) = filename
+            .strip_prefix(VIRTUAL_URI_PREFIX)?
+            .rsplit_once('.')?;
+        // A real virtual URI always has a non-empty region_id and extension; an
+        // empty region_id (`kakehashi-virtual-uri-.lua`) matches no open document.
+        if region_id.is_empty() || ext.is_empty() {
+            return None;
+        }
+        Some(region_id.to_string())
     }
 
     /// Marker embedded in the `region_id` of throwaway scratch documents the
@@ -673,6 +695,7 @@ mod tests {
     #[case::kakehashi_in_dir("file:///home/.kakehashi/config.lua", false)]
     #[case::kakehashi_prefix_no_virtual("file:///project/kakehashi.config.lua", false)]
     #[case::no_extension("file:///project/kakehashi-virtual-uri-lua", false)]
+    #[case::empty_region_id("file:///project/kakehashi-virtual-uri-.lua", false)]
     #[case::not_a_url("not a url", false)]
     #[case::empty_string("", false)]
     #[case::missing_scheme("://missing-scheme", false)]
@@ -750,6 +773,34 @@ mod tests {
             VirtualDocumentUri::is_virtual_uri(&uri_string),
             "Fallback URI should be detected as virtual: {}",
             uri_string
+        );
+    }
+
+    #[test]
+    fn region_id_of_round_trips_to_uri_string() {
+        // Standard (file://) form and the cannot-be-a-base fallback form both
+        // recover the region_id.
+        for host in ["file:///project/doc.md", "untitled:Untitled-1"] {
+            let host_uri: Uri = host.parse().unwrap();
+            let uri = VirtualDocumentUri::new(&host_uri, "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            assert_eq!(
+                VirtualDocumentUri::region_id_of(&uri.to_uri_string()).as_deref(),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                "round-trip region_id for host {host}"
+            );
+        }
+
+        // Non-virtual URIs yield None.
+        assert_eq!(
+            VirtualDocumentUri::region_id_of("file:///project/main.rs"),
+            None
+        );
+
+        // A virtual-shaped filename with an empty region_id is rejected (a real
+        // virtual URI always has a non-empty region_id).
+        assert_eq!(
+            VirtualDocumentUri::region_id_of("file:///project/kakehashi-virtual-uri-.lua"),
+            None
         );
     }
 }

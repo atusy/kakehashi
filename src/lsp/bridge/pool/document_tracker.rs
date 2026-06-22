@@ -426,6 +426,39 @@ impl DocumentTracker {
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
     }
+
+    /// Resolve a virtual-document URI string back to its `(host_url, region_id)`.
+    ///
+    /// Used by the inbound `window/showDocument` translation to recover which
+    /// host document and injection region a downstream-supplied virtual URI
+    /// refers to. Returns `None` when the URI is not a currently-open virtual
+    /// document.
+    ///
+    /// O(N) over open virtual docs (the virtual URI string encodes only the host
+    /// *directory* + region id, not the host filename, so the host can't be
+    /// derived without a scan). `window/showDocument` is rare, so the scan is
+    /// acceptable.
+    pub(super) async fn resolve_virtual_uri(&self, virtual_uri: &str) -> Option<(Url, String)> {
+        // A non-virtual URI can't match any open virtual document, so bail before
+        // taking the lock. The parsed `region_id` is then a cheap `&str` pre-filter
+        // skipping the per-entry `to_uri_string()` allocation for non-matching
+        // docs; the full URI compare is what actually confirms the match, so this
+        // stays correct even if two docs ever shared a `region_id`.
+        let target_region_id = VirtualDocumentUri::region_id_of(virtual_uri)?;
+        let host_map = self.host_to_virtual.lock().await;
+        for (host, docs) in host_map.iter() {
+            for doc in docs {
+                if doc.virtual_uri.region_id() == target_region_id.as_str()
+                    && doc.virtual_uri.to_uri_string() == virtual_uri
+                {
+                    // region_id == target_region_id here, so reuse the already-
+                    // owned String instead of allocating it again.
+                    return Some((host.clone(), target_region_id));
+                }
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1348,6 +1381,33 @@ mod tests {
         assert_eq!(
             tracker.get_all_connections_for_virtual_uri(&virtual_uri_tsx),
             vec![ConnectionKey::for_server("tsgo")]
+        );
+    }
+
+    /// `resolve_virtual_uri` recovers the host URL + region id for an open
+    /// virtual document, and returns `None` for an unknown URI.
+    #[tokio::test]
+    async fn resolve_virtual_uri_recovers_host_and_region() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///project/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", "lua-0");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &ConnectionKey::for_server("lua"))
+            .await;
+
+        assert_eq!(
+            tracker
+                .resolve_virtual_uri(&virtual_uri.to_uri_string())
+                .await,
+            Some((host_uri, "lua-0".to_string()))
+        );
+
+        // A URI that was never opened resolves to None (pass-through case).
+        assert_eq!(
+            tracker
+                .resolve_virtual_uri("file:///project/other.lua")
+                .await,
+            None
         );
     }
 }

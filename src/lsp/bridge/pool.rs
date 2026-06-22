@@ -501,6 +501,13 @@ impl LanguageServerPool {
         self.document_tracker.is_document_opened(virtual_uri)
     }
 
+    /// Resolve a virtual-document URI string to its `(host_url, region_id)`
+    /// (used by `window/showDocument` translation). See
+    /// [`DocumentTracker::resolve_virtual_uri`].
+    pub(super) async fn resolve_virtual_uri(&self, virtual_uri: &str) -> Option<(Url, String)> {
+        self.document_tracker.resolve_virtual_uri(virtual_uri).await
+    }
+
     /// Find ALL connections (`(server, root)` keys) that have opened a given
     /// virtual document URI.
     ///

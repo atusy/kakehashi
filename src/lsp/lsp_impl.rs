@@ -3,6 +3,7 @@ mod cli_format;
 mod coordinator;
 mod kakehashi;
 mod lifecycle;
+mod show_document_translation;
 pub(crate) mod text_document;
 mod whole_document;
 mod workspace;
