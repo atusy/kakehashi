@@ -58,30 +58,29 @@ pub(super) fn compute_line_column_offsets(
             let mut offsets = Vec::new();
             for range in ranges {
                 let gap_start_line = range.start_point.row;
-                // How many virtual lines does this gap span?
                 let gap_end_line = range.end_point.row;
-                for line in gap_start_line..=gap_end_line {
-                    offsets.resize(line + 1, 0);
-                    if line == gap_start_line {
-                        // The column offset is the gap's start column within the host line.
-                        // For the first line (row 0) of the content node, use start_column
-                        // (which accounts for the full prefix from the line start).
-                        // For subsequent lines, the start_point.column from
-                        // compute_included_ranges is already the raw byte column
-                        // within the line — convert to UTF-16.
-                        if line == 0 {
-                            offsets[line] = start_column;
-                        } else {
-                            // Convert byte column to UTF-16 code units.
-                            // The gap's start_byte is relative to content node start.
-                            // The line starts at the byte after the previous newline.
-                            let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
-                            let line_start_byte =
-                                gap_abs_byte.saturating_sub(range.start_point.column);
-                            let prefix = clamped_slice(host_text, line_start_byte..gap_abs_byte);
-                            offsets[line] = prefix.encode_utf16().count() as u32;
-                        }
-                    }
+                // Only the gap's start line carries a column offset; the rest of
+                // its spanned rows stay at the default 0. Gaps arrive in document
+                // order (ascending, non-overlapping rows), so resizing once to
+                // `gap_end_line + 1` only grows `offsets` — equivalent to the
+                // previous per-row resize loop, without re-resizing each row.
+                offsets.resize(gap_end_line + 1, 0);
+                // The column offset is the gap's start column within the host line.
+                // For the first line (row 0) of the content node, use start_column
+                // (which accounts for the full prefix from the line start).
+                // For subsequent lines, the start_point.column from
+                // compute_included_ranges is already the raw byte column
+                // within the line — convert to UTF-16.
+                if gap_start_line == 0 {
+                    offsets[gap_start_line] = start_column;
+                } else {
+                    // Convert byte column to UTF-16 code units.
+                    // The gap's start_byte is relative to content node start.
+                    // The line starts at the byte after the previous newline.
+                    let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
+                    let line_start_byte = gap_abs_byte.saturating_sub(range.start_point.column);
+                    let prefix = clamped_slice(host_text, line_start_byte..gap_abs_byte);
+                    offsets[gap_start_line] = prefix.encode_utf16().count() as u32;
                 }
             }
             if offsets.is_empty() {
