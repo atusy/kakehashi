@@ -2423,6 +2423,29 @@ mod tests {
             }
             _ => panic!("expected PublishDiagnostics"),
         }
+
+        // Adversarial: `params` is not an object (string) — must not panic, drop.
+        let (deps, mut upstream_rx) = make_deps();
+        let bad_params = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": "not-an-object"
+        });
+        handle_message(bad_params, &ResponseRouter::new(), "", &deps).await;
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "a non-object params must be dropped without panicking"
+        );
+
+        // Adversarial: `params` present but missing `uri` — drop, no panic.
+        let (deps, mut upstream_rx) = make_deps();
+        let no_uri = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"diagnostics": []}
+        });
+        handle_message(no_uri, &ResponseRouter::new(), "", &deps).await;
+        assert!(upstream_rx.try_recv().is_err(), "missing uri is dropped");
     }
 
     #[tokio::test]

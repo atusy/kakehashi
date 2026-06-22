@@ -52,20 +52,27 @@ pub(in crate::lsp::bridge) fn forward_push(
         );
         return;
     };
-    // Take the owned URI string out of the message (no clone).
-    let serde_json::Value::String(uri) = message["params"]["uri"].take() else {
+    // `params` must be a JSON object. Using `get_mut(...).as_object_mut()` rather
+    // than `IndexMut` (`message["params"]["uri"]`) avoids a panic on adversarial
+    // input where `params` exists but is a string/number/array; `Map::remove`
+    // still moves the owned values out (no clone).
+    let Some(params) = message.get_mut("params").and_then(serde_json::Value::as_object_mut) else {
+        return;
+    };
+    let Some(serde_json::Value::String(uri)) = params.remove("uri") else {
         return;
     };
     if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(&uri) {
         return;
     }
-    // Deserialize by value (move) out of the owned, soon-discarded message —
-    // `from_value` moves the diagnostics' owned strings instead of cloning them
-    // (which `deserialize(&value)` would). A parse failure is *dropped* (not
-    // treated as an empty/clearing push, which would silently wipe the region's
-    // diagnostics); an empty array still yields an empty Vec and clears legitimately.
+    // Deserialize the moved-out diagnostics value (no clone) — `from_value` moves
+    // the diagnostics' owned strings. A parse failure (including an absent or
+    // non-array `diagnostics`) is *dropped* (not treated as an empty/clearing push,
+    // which would silently wipe the region's diagnostics); an empty `[]` array
+    // yields an empty Vec and clears legitimately.
+    let diagnostics_value = params.remove("diagnostics").unwrap_or(serde_json::Value::Null);
     let diagnostics = match serde_json::from_value::<Vec<tower_lsp_server::ls_types::Diagnostic>>(
-        message["params"]["diagnostics"].take(),
+        diagnostics_value,
     ) {
         Ok(diagnostics) => diagnostics,
         Err(e) => {
