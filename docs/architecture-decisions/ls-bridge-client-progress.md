@@ -34,8 +34,8 @@ reaches the editor.
 
 Stop stripping client-provided tokens (selectively), route the resulting
 downstream→upstream `$/progress` and partial-result notifications, and aggregate
-them so the editor sees **one coherent lifecycle** whose source matches the
-delivered result.
+them so the editor sees **one coherent lifecycle** whose data-bearing signals
+(`report`, the result, the terminal `End`) all come from the delivered server.
 
 **Core principle.** Every *data-bearing* signal the editor sees — each `report`,
 the delivered result, and the terminal `End` — must come from the *same server
@@ -117,8 +117,8 @@ bridge composes the terminal rather than relaying a downstream's.
 
 - Client-requested progress (`workDoneToken`) reaches the editor for the first
   time.
-- Progress UI and delivered results always share one source — no jarring swap and
-  no freeze of shown data.
+- The data-bearing progress signals (`report`/`End`) and the delivered result
+  always share one source — no jarring swap and no freeze of shown data.
 - partialResult streaming becomes possible without mis-translated locations.
 - Failure degrades gracefully: if data was shown the editor keeps it and the
   lifecycle terminates cleanly; if not, the request falls through to the next
