@@ -602,6 +602,14 @@ impl ConnectionHandle {
             // contract and decline rather than send a contract-violating textless
             // didSave. `Supported(false)` and the bare `Kind` number form also
             // correctly fall through to false.
+            //
+            // Caveat: this `includeText = true` exclusion only applies to STATIC
+            // (initialize) capabilities. A server that *dynamically* registers
+            // didSave with `includeText: true` is admitted by the method-name-only
+            // dynamic registry above and would receive a textless didSave. Benign
+            // in practice (the virt doc is already current via didChange) and
+            // honoring dynamic `includeText` would require the registry to parse
+            // and store registration options — deferred.
             "textDocument/didSave" => matches!(
                 caps.text_document_sync,
                 Some(TextDocumentSyncCapability::Options(
