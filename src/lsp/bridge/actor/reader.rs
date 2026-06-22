@@ -752,16 +752,6 @@ async fn handle_message(
     }
 }
 
-/// Forward supported downstream notifications to the upstream editor.
-///
-/// Routes `window/logMessage`, `window/showMessage`, and `telemetry/event` to
-/// their per-method modules ([`window::log_message`], [`window::show_message`],
-/// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
-/// transparent.
-///
-/// `$/progress` is handled earlier in `handle_message` (translated and forwarded
-/// via [`window::progress::forward`]), so it never reaches here. Everything else
-/// is still silently ignored (push-based publishDiagnostics: #380).
 /// Handle an inbound downstream `$/cancelRequest`: if it targets a forwarded
 /// request still in flight (`window/showMessageRequest` / `window/showDocument`),
 /// cancel the editor-bound request so its dialog is dismissed (#404). The id is
@@ -781,6 +771,16 @@ fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) 
         .cancel(deps.progress_connection_id, &request_id);
 }
 
+/// Forward supported downstream notifications to the upstream editor.
+///
+/// Routes `window/logMessage`, `window/showMessage`, and `telemetry/event` to
+/// their per-method modules ([`window::log_message`], [`window::show_message`],
+/// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
+/// transparent.
+///
+/// `$/progress` and `$/cancelRequest` are handled earlier in `handle_message`,
+/// so they never reach here. Everything else is still silently ignored
+/// (push-based publishDiagnostics: #380).
 fn forward_notification(
     message: &serde_json::Value,
     server_prefix: &str,
