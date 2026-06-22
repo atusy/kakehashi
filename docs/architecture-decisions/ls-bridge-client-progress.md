@@ -80,7 +80,7 @@ lifecycle is committed.
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
   path (which assumes a single final blob today and must accept incremental
-  input). Preferred streams the winner's translated chunks; concatenated
+  input). *Preferred* streams the winner's translated chunks; *concatenated*
   concatenates all contributors' translated chunks.
 
 The terminal `End` the bridge emits on failure is the same primitive
