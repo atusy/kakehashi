@@ -604,11 +604,16 @@ async fn forward_with_cancel(
             use tower_lsp_server::ls_types::notification::Cancel;
             use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
             // The id we minted is always numeric (next_request_id, an AtomicU32
-            // counter); map it to the notification's NumberOrString. The i32
-            // narrowing is lossless until ~2.1B server→client requests in one
-            // session, far beyond any real session.
+            // counter); map it to the notification's `NumberOrString`. The cancel
+            // must carry the *same* numeric id the editor saw, so for the
+            // (astronomically unlikely) ids beyond i32 — which `NumberOrString`
+            // can't represent as a number — there's no correlating cancel to
+            // send; skip it rather than wrap to a wrong id.
             let id = match editor_id {
-                tower_lsp_server::jsonrpc::Id::Number(n) => NumberOrString::Number(n as i32),
+                tower_lsp_server::jsonrpc::Id::Number(n) => match i32::try_from(n) {
+                    Ok(n) => NumberOrString::Number(n),
+                    Err(_) => return None,
+                },
                 tower_lsp_server::jsonrpc::Id::String(s) => NumberOrString::String(s),
                 tower_lsp_server::jsonrpc::Id::Null => return None,
             };

@@ -1029,6 +1029,41 @@ mod tests {
         assert_eq!(router.pending_count(), 1);
     }
 
+    /// #404: an inbound downstream `$/cancelRequest` fires the registered
+    /// in-flight request's token; an unknown id is a no-op.
+    #[tokio::test]
+    async fn handle_message_cancel_request_fires_registered_token() {
+        let router = ResponseRouter::new();
+        let (deps, _keep) = dummy_server_request_deps();
+
+        // The handler would have registered this before enqueueing the request.
+        let token = deps
+            .inbound_request_registry
+            .register(deps.progress_connection_id, jsonrpc::Id::Number(7));
+        assert!(!token.is_cancelled());
+
+        handle_message(
+            json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 7 } }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+        assert!(
+            token.is_cancelled(),
+            "inbound $/cancelRequest should fire the registered token"
+        );
+
+        // A cancel for an unknown id must not panic.
+        handle_message(
+            json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 999 } }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+    }
+
     /// Deps wired with a server name, exposing the bounded window receiver so
     /// tests can assert what was (not) forwarded to the editor.
     fn server_request_deps_for(
