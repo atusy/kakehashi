@@ -291,13 +291,22 @@ pub(crate) fn collect_all_injections<'a>(
             }
             if let Some(language) = extract_injection_language(query, match_, text) {
                 let key = (capture.node.start_byte(), capture.node.end_byte());
-                injections_map.entry(key).or_insert(InjectionRegionInfo {
-                    language,
-                    content_node: capture.node,
-                    pattern_index: match_.pattern_index,
-                    include_children: has_include_children_for_pattern(query, match_.pattern_index),
-                    offset: effective_offset_for_pattern(query, match_.pattern_index),
-                });
+                // `or_insert_with` so the per-pattern predicate scans
+                // (`has_include_children_for_pattern` / `effective_offset_for_pattern`)
+                // are skipped when this content-node range was already inserted by
+                // an earlier matching pattern. Same resulting map, fewer scans.
+                injections_map
+                    .entry(key)
+                    .or_insert_with(|| InjectionRegionInfo {
+                        language,
+                        content_node: capture.node,
+                        pattern_index: match_.pattern_index,
+                        include_children: has_include_children_for_pattern(
+                            query,
+                            match_.pattern_index,
+                        ),
+                        offset: effective_offset_for_pattern(query, match_.pattern_index),
+                    });
             }
         }
     }
