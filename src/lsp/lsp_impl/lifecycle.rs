@@ -541,12 +541,48 @@ async fn upstream_forwarding_loop(
 /// lightweight task awaiting a `oneshot` — is far smaller than the editor's
 /// per-dialog cost, so the editor pushes back first. See issue #405
 /// (closed as not planned) for the full rationale.
+/// Send a server→client request to the editor with an id *we* mint, returning
+/// the parsed result value (`None` on an error response or transport failure).
+///
+/// This mirrors what `Client::send_request` does internally, but mints the id
+/// via `next_request_id` and sends through the `Client`'s `tower::Service` so we
+/// hold the editor-facing request id — needed to cancel an in-flight request by
+/// sending a correlated `$/cancelRequest` to the editor (#404); the `Client`
+/// exposes no cancel API for outgoing requests.
+async fn send_editor_request(
+    client: &Client,
+    id: tower_lsp_server::jsonrpc::Id,
+    method: &'static str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    use tower::Service as _;
+    let request = tower_lsp_server::jsonrpc::Request::build(method)
+        .id(id)
+        .params(params)
+        .finish();
+    match client.clone().call(request).await {
+        Ok(Some(response)) => response.into_parts().1.ok(),
+        Ok(None) => None,
+        Err(e) => {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "{} forwarding to editor failed: {}",
+                method, e
+            );
+            None
+        }
+    }
+}
+
 fn spawn_upstream_request(
     show_document_translator: Option<Arc<ShowDocumentTranslator>>,
     client: &Client,
     request: crate::lsp::bridge::UpstreamRequest,
 ) {
     use crate::lsp::bridge::UpstreamRequest;
+    use tower_lsp_server::ls_types::{
+        MessageActionItem, ShowDocumentResult, ShowMessageRequestParams,
+    };
     let client = client.clone();
     tokio::spawn(async move {
         match request {
@@ -556,19 +592,17 @@ fn spawn_upstream_request(
                 actions,
                 reply,
             } => {
-                let action = match client.show_message_request(typ, message, actions).await {
-                    Ok(action) => action,
-                    Err(e) => {
-                        // e.g. method-not-supported or transport failure — log for
-                        // diagnosis, still relay the protocol default (no selection).
-                        log::debug!(
-                            target: "kakehashi::bridge",
-                            "window/showMessageRequest forwarding failed: {}; answering null",
-                            e
-                        );
-                        None
-                    }
-                };
+                let id = client.next_request_id();
+                let params = serde_json::to_value(ShowMessageRequestParams {
+                    typ,
+                    message,
+                    actions,
+                })
+                .unwrap_or(serde_json::Value::Null);
+                let action = send_editor_request(&client, id, "window/showMessageRequest", params)
+                    .await
+                    .and_then(|v| serde_json::from_value::<Option<MessageActionItem>>(v).ok())
+                    .flatten();
                 let _ = reply.send(action);
             }
             UpstreamRequest::ShowDocument { params, reply } => {
@@ -579,17 +613,13 @@ fn spawn_upstream_request(
                     Some(translator) => translator.translate(params).await,
                     None => params,
                 };
-                let success = match client.show_document(params).await {
-                    Ok(success) => success,
-                    Err(e) => {
-                        log::debug!(
-                            target: "kakehashi::bridge",
-                            "window/showDocument forwarding failed: {}; answering success:false",
-                            e
-                        );
-                        false
-                    }
-                };
+                let id = client.next_request_id();
+                let value = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
+                let success = send_editor_request(&client, id, "window/showDocument", value)
+                    .await
+                    .and_then(|v| serde_json::from_value::<ShowDocumentResult>(v).ok())
+                    .map(|r| r.success)
+                    .unwrap_or(false);
                 let _ = reply.send(success);
             }
         }
