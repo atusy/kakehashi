@@ -17,7 +17,7 @@ host document.
 
 ### The prior approach and its structural limit
 
-The superseded decision (pull-first-diagnostic-forwarding) drove diagnostics
+The prior pull-first approach (pull-first-diagnostic-forwarding) drove diagnostics
 entirely from host-document events: on `didOpen` / `didSave` / `didChange`,
 kakehashi *pulled* `textDocument/diagnostic` from every region's downstream
 server, aggregated, and published a synthesized result. Downstream-initiated
@@ -86,8 +86,9 @@ diagnostics:
    retaining a region's diagnostics in **virtual coordinates** (the host layer
    needs no transform, so it stores host coordinates) plus the `content_epoch` the
    push maps to (see Versioning). A pull-driven server's spontaneous push and its
-   `pullFallback` pull share this slot; the latest update for that `(source,
-   server)` replaces it, and eligibility/election uses `content_epoch`.
+   `pullFallback` pull share this slot; the latest **current-epoch** update for
+   that `(source, server)` replaces it (a stale-epoch push is dropped, never
+   overwrites — see Versioning), and eligibility/election uses `content_epoch`.
 4. Re-merge **all** slots for that `host_uri` and publish the merge to the
    client.
 
@@ -204,10 +205,12 @@ policy clean:
   `(source, connection, wire_version) → content_epoch` entry **when each
   `didOpen`/`didChange` is successfully enqueued to that connection's writer**
   (enqueued, not merely counter-incremented). A non-null `publishDiagnostics.version`
-  is then an exact lookup in that map; since the map is populated at enqueue time,
-  an unknown version is a protocol mismatch or a very stale push and is **dropped
-  with a log line** (e.g. a late server publishing for `N` after `N+1` was synced).
-  Null versions fall back to the best-effort rule below. Eligibility is "slot's epoch ==
+  is an exact lookup, with three outcomes: maps to the **current** epoch → the push
+  replaces the slot; maps to an **older** epoch (a late push for content already
+  superseded) → **dropped and logged, the slot is not replaced** (so a stale push
+  can never overwrite a fresher slot); **not in the map** (protocol mismatch) →
+  dropped and logged. Only a current-epoch push replaces a slot. Null versions fall
+  back to the best-effort rule below. Eligibility is "slot's epoch ==
   source's current epoch", never a raw cross-server version compare.
 - **Lazy re-anchor**: transforming at publish time against the region's *current*
   offset re-positions an unchanged region's diagnostics after an edit *above* it
@@ -406,7 +409,7 @@ Virtual (UTF-16) → position_to_byte → + content_start_byte → byte_to_posit
    push-driven ones, an unjustified asymmetry. The `pullFallback` / `pushFallback`
    toggles (default `true`) make both paths cover every server.
 7. **Client-side aggregation (forward virtual URIs raw).** Rejected (as in the
-   superseded decision): leaks internal virtual URIs and breaks the
+   prior pull-first approach): leaks internal virtual URIs and breaks the
    host-as-single-entity abstraction.
 8. **`preferred` winner keyed on publish count (`nthPublish`).** Rejected: the
    per-server publish counter measures chattiness, not quality, and is not
@@ -461,7 +464,7 @@ because the #380 benefit now outweighs it:
 ## Decision–Implementation Gap
 
 Not yet implemented — this decision runs ahead of the code, which still
-implements the superseded pull-first synthetic push:
+implements the prior pull-first synthetic push:
 
 - `src/lsp/lsp_impl/coordinator/diagnostic.rs`
   (`spawn_synthetic_diagnostic_task`, `schedule_debounced_diagnostic`),
@@ -475,4 +478,4 @@ per-host merge cache; reduce the synthetic/debounced *proactive* pull to the
 `pullFallback` scope (pull-driven servers only) instead of retiring it outright;
 keep the *client* pull handler (augmented with the push cache for push-driven
 servers); update the bare-slug code references that currently name
-the superseded decision.
+the prior pull-first decision.
