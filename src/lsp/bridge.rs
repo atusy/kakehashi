@@ -28,6 +28,7 @@ mod actor;
 mod client;
 mod connection;
 pub(crate) mod coordinator;
+mod inbound_request_registry;
 mod pool;
 mod progress_registry;
 mod protocol;
@@ -39,11 +40,14 @@ mod workspace;
 
 // Re-export public types
 #[cfg(test)]
+pub(crate) use actor::ForwardedRequestCancel;
+#[cfg(test)]
 pub(crate) use actor::OutboundMessage;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use actor::UpstreamRequest;
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
+pub(crate) use inbound_request_registry::InboundRequestRegistry;
 pub(crate) use pool::ConnectionKey;
 pub(crate) use pool::ConnectionReadiness;
 pub use pool::LanguageServerPool;
