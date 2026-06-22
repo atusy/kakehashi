@@ -349,6 +349,13 @@ impl LanguageServer for Kakehashi {
         self.will_save_impl(params).await
     }
 
+    async fn will_save_wait_until(
+        &self,
+        params: WillSaveTextDocumentParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.will_save_wait_until_impl(params).await
+    }
+
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         self.did_save_impl(params).await
     }
