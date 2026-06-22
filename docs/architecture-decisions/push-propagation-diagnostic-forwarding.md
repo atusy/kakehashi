@@ -159,14 +159,15 @@ Producing the host publish mirrors the existing staged pull aggregation:
    regions, ordered by region start position (so arrival order never leaks),
    lazily transforming each region slot's virtual coordinates to **current** host
    coordinates via the region's current offset (recovered from the stable region
-   id). The host layer's diagnostics are already host-local and skip the
-   transform.
-3. **Cross-layer combine** — combine the virt-layer and host-layer results per
-   cross-layer-aggregation (host-document-bridge governs host participation).
+   id).
+3. **Cross-layer combine** — combine the virt-layer result with the host-layer
+   result per cross-layer-aggregation (host-document-bridge governs host
+   participation). The host layer's diagnostics are already host-local, so they
+   skip the virtual→host transform.
 
-The cross-region level is what republishes the cumulative host set on every push:
-when region A publishes, then the host layer, then region C, each event re-merges
-and re-publishes `{A}`, `{A, host}`, `{A, host, C}` — a slot is *replaced* by its
+Re-merging on every push republishes the cumulative host set: when region A
+publishes, then the host layer, then region C, each event re-runs the merge and
+re-publishes `{A}`, `{A, host}`, `{A, host, C}` — a slot is *replaced* by its
 source's latest push, never accumulated.
 
 ### Versioning and staleness (the crux)
