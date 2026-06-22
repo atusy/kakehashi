@@ -59,8 +59,9 @@ fn test_data_dir() -> &'static Path {
 ///
 /// Server stdout is drained by a dedicated background thread that frames
 /// messages and pushes them onto an `mpsc` channel. Reads therefore become
-/// `recv_timeout` with **exact** deadlines — a notification-wait against an
-/// alive-but-silent server returns at its timeout instead of blocking on a
+/// `recv_timeout`, so waits honor their deadline (modulo scheduler jitter)
+/// instead of blocking indefinitely — a notification-wait against an
+/// alive-but-silent server returns at its timeout rather than hanging on a
 /// quiet pipe (see issue #385).
 pub struct LspClient {
     child: Child,
@@ -510,9 +511,11 @@ impl LspClient {
 
     /// Wait for a notification with a specific method name.
     ///
-    /// Returns the notification params if received within the timeout,
-    /// or None if timeout occurs without receiving the expected notification.
-    /// Skips other notifications and server-to-client requests while waiting.
+    /// Returns the notification params if received within the timeout, or None
+    /// if the timeout elapses (or the server disconnects) without it. Skips
+    /// other notifications and server-to-client requests while waiting. Panics
+    /// if the stream is malformed (a framing/parse error is surfaced, not
+    /// hidden behind the `Option`).
     pub(crate) fn wait_for_notification(
         &mut self,
         expected_method: &str,
@@ -544,10 +547,12 @@ impl LspClient {
     /// Wait for the first notification whose method is in `methods` AND whose
     /// params satisfy `predicate`, preserving arrival order across methods.
     ///
-    /// Returns `(method, params)` for the first match, or None on timeout.
-    /// Unlike `wait_for_notification`, this can observe the ORDER of several
-    /// notification methods (e.g. prove showMessage arrives before a later
-    /// logMessage). Non-matching messages are skipped.
+    /// Returns `(method, params)` for the first match, or None on timeout (or
+    /// server disconnect). Unlike `wait_for_notification`, this can observe the
+    /// ORDER of several notification methods (e.g. prove showMessage arrives
+    /// before a later logMessage). Non-matching messages are skipped. Panics if
+    /// the stream is malformed (a framing/parse error is surfaced, not hidden
+    /// behind the `Option`).
     pub(crate) fn wait_for_notification_where(
         &mut self,
         methods: &[&str],
@@ -581,10 +586,11 @@ impl LspClient {
     /// Try to receive a message within `timeout`, returning None if none arrives.
     ///
     /// Backed by the background reader thread's channel, so the deadline is
-    /// exact: against an alive-but-silent server this blocks for precisely
-    /// `timeout` and then returns None, rather than hanging on a quiet pipe.
-    /// A disconnect (reader thread ended at EOF) also returns None — no further
-    /// messages can arrive. A framing/parse error panics with its diagnostic.
+    /// honored (modulo scheduler jitter): against an alive-but-silent server
+    /// this blocks for about `timeout` and then returns None, rather than
+    /// hanging on a quiet pipe. A disconnect (reader thread ended at EOF) also
+    /// returns None — no further messages can arrive. A framing/parse error
+    /// panics with its diagnostic.
     fn try_receive_message(&mut self, timeout: Duration) -> Option<Value> {
         match self.rx.recv_timeout(timeout) {
             Ok(ReaderEvent::Message(value)) => Some(value),
