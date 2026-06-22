@@ -56,6 +56,18 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
+    /// A downstream-initiated `textDocument/publishDiagnostics` for an injection
+    /// region's virtual document (push-propagation-diagnostic-forwarding). The
+    /// forwarding loop resolves `uri` to its host document + region, caches the
+    /// diagnostics under `server`, and republishes the merged host set.
+    PublishDiagnostics {
+        /// The virtual document URI the downstream published for.
+        uri: String,
+        /// The originating downstream server's config name (`deps.server_name`).
+        server: Option<String>,
+        /// The pushed diagnostics, in the virtual document's coordinates.
+        diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
+    },
     /// Forward a downstream `window/logMessage` to the editor.
     /// `message` is already prefixed with the originating server name.
     LogMessage { typ: MessageType, message: String },
@@ -739,6 +751,10 @@ async fn handle_message(
                     "{}Discarding publishDiagnostics targeting a scratch virtual document",
                     server_prefix
                 );
+            } else if message["method"].as_str() == Some("textDocument/publishDiagnostics") {
+                // Non-scratch region push: route into the diagnostics cache
+                // (push-propagation-diagnostic-forwarding) instead of dropping (#380).
+                text_document::publish_diagnostics::forward_push(&message, deps);
             } else if message["method"].as_str() == Some("$/progress") {
                 window::progress::forward(&message, server_prefix, deps);
             } else if message["method"].as_str() == Some("$/cancelRequest") {
@@ -784,9 +800,10 @@ fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) 
 /// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
 /// transparent.
 ///
-/// `$/progress` and `$/cancelRequest` are handled earlier in `handle_message`,
-/// so they never reach here. Everything else is still silently ignored
-/// (push-based publishDiagnostics: #380).
+/// `$/progress`, `$/cancelRequest`, and non-scratch `textDocument/publishDiagnostics`
+/// (routed to the diagnostics cache — push-propagation-diagnostic-forwarding) are
+/// handled earlier in `handle_message`, so they never reach here. Everything else
+/// is still silently ignored.
 fn forward_notification(
     message: &serde_json::Value,
     server_prefix: &str,
@@ -2247,6 +2264,98 @@ mod tests {
         assert!(
             response_rx.try_recv().is_err(),
             "a notification must not trigger any downstream response"
+        );
+    }
+
+    /// A non-scratch push for an injection region's virtual document is routed
+    /// upstream as `PublishDiagnostics` (push-propagation-diagnostic-forwarding),
+    /// carrying the originating server name and the pushed diagnostics.
+    #[tokio::test]
+    async fn handle_message_routes_non_scratch_publish_diagnostics_for_virtual_uri() {
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            server_name: Some("luals".to_string()),
+            response_tx,
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///project/kakehashi-virtual-uri-REGION.lua",
+                "diagnostics": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "message": "boom"
+                }]
+            }
+        });
+
+        handle_message(message, &router, "", &deps).await;
+
+        match upstream_rx
+            .try_recv()
+            .expect("virtual-uri push should be routed upstream")
+        {
+            UpstreamNotification::PublishDiagnostics {
+                uri,
+                server,
+                diagnostics,
+            } => {
+                assert!(uri.contains("kakehashi-virtual-uri-REGION"));
+                assert_eq!(server.as_deref(), Some("luals"));
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0].message, "boom");
+            }
+            _ => panic!("expected PublishDiagnostics"),
+        }
+    }
+
+    /// A push for a non-virtual URI (the downstream's own file, or the real host
+    /// URI) has no region mapping and is dropped, not routed.
+    #[tokio::test]
+    async fn handle_message_drops_publish_diagnostics_for_non_virtual_uri() {
+        let router = ResponseRouter::new();
+        let (response_tx, _response_rx) = mpsc::channel(16);
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+        let (window_tx, _window_rx) = mpsc::channel(16);
+        let deps = ServerRequestDeps {
+            server_name: Some("luals".to_string()),
+            response_tx,
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+        };
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///project/real_file.lua",
+                "diagnostics": []
+            }
+        });
+
+        handle_message(message, &router, "", &deps).await;
+
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "a non-virtual-uri push must not be routed"
         );
     }
 

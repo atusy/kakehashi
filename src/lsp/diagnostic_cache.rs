@@ -25,9 +25,16 @@ use std::sync::{Mutex, PoisonError};
 use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
 
+use crate::lsp::bridge::{RegionOffset, translate_virtual_range_to_host};
+
 /// Which contributor a slot belongs to under a host document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum DiagnosticSource {
+    /// A downstream **push** for an injection region, identified by its stable
+    /// region id (lazy-node-identity-tracking ULID). Held in **virtual**
+    /// coordinates and transformed to host coordinates at publish time against
+    /// the region's *current* offset (lazy re-anchor).
+    Region(String),
     /// The host-event pull's cross-layer-combined result, in host coordinates.
     /// A single blob (one synthetic server slot) for now — a follow-up replaces
     /// it with per-`(region, server)` slots gated by `pullFallback`.
@@ -58,15 +65,41 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// Merge a host's cached slots into the publishable diagnostic set, in host
 /// coordinates.
 ///
-/// Staged: every current slot ([`DiagnosticSource::PullLayer`]) is already
-/// host-local and concatenated. A follow-up adds region slots (virtual
-/// coordinates, transformed against the region's current offset) and per-source
-/// strategy fan-in.
-pub(crate) fn merge_cached_diagnostics(snapshot: &SourceSlots) -> Vec<Diagnostic> {
+/// - [`DiagnosticSource::Region`] slots hold virtual coordinates and are
+///   transformed via `region_offsets[region_id]` (lazy re-anchor against the
+///   region's *current* offset). A region with no current offset (it no longer
+///   resolves, e.g. it was edited away) is skipped — its slot is stale and gets
+///   evicted by the lifecycle.
+/// - [`DiagnosticSource::PullLayer`] slots are already host-local and pass through.
+///
+/// Staged: results are concatenated (the default `textDocument/publishDiagnostics`
+/// strategy). Per-source strategy fan-in (`preferred` sticky / `concatenated`
+/// visible-walk) and `relatedInformation` range translation are follow-ups.
+pub(crate) fn merge_cached_diagnostics(
+    snapshot: &SourceSlots,
+    region_offsets: &HashMap<String, RegionOffset>,
+) -> Vec<Diagnostic> {
     let mut merged = Vec::new();
-    for servers in snapshot.values() {
-        for slot in servers.values() {
-            merged.extend(slot.diagnostics.iter().cloned());
+    for (source, servers) in snapshot {
+        match source {
+            DiagnosticSource::Region(region_id) => {
+                let Some(offset) = region_offsets.get(region_id) else {
+                    // Stale region: no current offset to anchor against.
+                    continue;
+                };
+                for slot in servers.values() {
+                    for diagnostic in &slot.diagnostics {
+                        let mut diagnostic = diagnostic.clone();
+                        translate_virtual_range_to_host(&mut diagnostic.range, offset);
+                        merged.push(diagnostic);
+                    }
+                }
+            }
+            DiagnosticSource::PullLayer => {
+                for slot in servers.values() {
+                    merged.extend(slot.diagnostics.iter().cloned());
+                }
+            }
         }
     }
     merged
@@ -189,16 +222,26 @@ mod tests {
         agg.set_pull_layer(&host(), vec![diag("x")]);
         agg.set_pull_layer(&host(), vec![]);
         let snap = agg.snapshot(&host());
-        assert!(snap[&DiagnosticSource::PullLayer][PULL_LAYER_SERVER]
-            .diagnostics
-            .is_empty());
+        assert!(
+            snap[&DiagnosticSource::PullLayer][PULL_LAYER_SERVER]
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    fn diag_at(message: &str, line: u32, col: u32) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(line, col), Position::new(line, col + 1)),
+            message: message.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn merge_concatenates_pull_layer() {
         let agg = DiagnosticAggregator::new();
         agg.set_pull_layer(&host(), vec![diag("a"), diag("b")]);
-        let merged = merge_cached_diagnostics(&agg.snapshot(&host()));
+        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &HashMap::new());
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["a", "b"]);
@@ -206,7 +249,57 @@ mod tests {
 
     #[test]
     fn merge_of_empty_snapshot_is_empty() {
-        assert!(merge_cached_diagnostics(&SourceSlots::new()).is_empty());
+        assert!(merge_cached_diagnostics(&SourceSlots::new(), &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn merge_transforms_region_slots_to_host_coords() {
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "luals".into(),
+            vec![diag_at("err", 0, 2)],
+        );
+        let mut offsets = HashMap::new();
+        // Region r1 sits at host line 5, column offset 4 on its first line.
+        offsets.insert("r1".to_string(), RegionOffset::new(5, 4));
+        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &offsets);
+        assert_eq!(merged.len(), 1);
+        // line 0 -> 0+5, character 2 -> 2+4
+        assert_eq!(merged[0].range.start, Position::new(5, 6));
+    }
+
+    #[test]
+    fn merge_skips_region_without_current_offset() {
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("gone".into()),
+            "luals".into(),
+            vec![diag("stale")],
+        );
+        // No offset for "gone" -> region is stale -> skipped.
+        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &HashMap::new());
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_combines_region_push_and_pull_layer() {
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "luals".into(),
+            vec![diag_at("push", 0, 0)],
+        );
+        agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
+        let mut offsets = HashMap::new();
+        offsets.insert("r1".to_string(), RegionOffset::new(2, 0));
+        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &offsets);
+        let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
+        msgs.sort();
+        assert_eq!(msgs, vec!["pull", "push"]);
     }
 
     #[test]

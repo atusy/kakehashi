@@ -27,6 +27,41 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
             .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
 }
 
+/// Route a non-scratch downstream `textDocument/publishDiagnostics` for an
+/// injection region's virtual document into the proactive diagnostics cache
+/// (push-propagation-diagnostic-forwarding). The forwarding loop resolves the
+/// virtual URI to its host + region and republishes the merged host set.
+///
+/// A push for a non-virtual URI (the downstream's own files, or the real host
+/// URI) has no region mapping and is dropped — the host layer is still served by
+/// the pull feed for now.
+pub(in crate::lsp::bridge) fn forward_push(
+    message: &serde_json::Value,
+    deps: &crate::lsp::bridge::actor::ServerRequestDeps,
+) {
+    let Some(uri) = message["params"]["uri"].as_str() else {
+        return;
+    };
+    if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(uri) {
+        return;
+    }
+    // Deserialize the diagnostics array straight from the borrowed value (no
+    // clone of the message); a malformed array yields an empty (clearing) push.
+    let diagnostics =
+        <Vec<tower_lsp_server::ls_types::Diagnostic> as serde::Deserialize>::deserialize(
+            &message["params"]["diagnostics"],
+        )
+        .unwrap_or_default();
+
+    let _ = deps.upstream_tx.send(
+        crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
+            uri: uri.to_string(),
+            server: deps.server_name.clone(),
+            diagnostics,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
