@@ -43,11 +43,12 @@ impl LanguageServerPool {
     /// Forward `textDocument/didSave` to every open virtual document of
     /// `host_uri`, on each live server that advertises `save` (#357).
     ///
-    /// The notification carries no `text` even if the downstream server
-    /// requested `save.includeText = true`: the virtual document is already
-    /// current from the didChange stream, so the saved text would be redundant.
-    /// `text` is optional in `DidSaveTextDocumentParams`, and re-deriving each
-    /// region's content here is not worth it for a fire-and-forget save hook.
+    /// The notification carries no `text`. Servers that demand
+    /// `save.includeText = true` are filtered out by the capability gate
+    /// (`has_capability("textDocument/didSave")`) rather than served a textless
+    /// didSave: kakehashi advertises `includeText = false` upstream and so never
+    /// receives the editor's saved bytes to forward. Servers that accept
+    /// textless didSave already have current content from the didChange stream.
     pub(crate) async fn forward_did_save_to_virtual_docs(&self, host_uri: &Url) {
         self.forward_save_notification_to_virtual_docs(
             host_uri,

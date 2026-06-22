@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability,
-    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
     TypeDefinitionProviderCapability,
 };
@@ -594,16 +594,23 @@ impl ConnectionHandle {
                 ))
             ),
             // didSave is opt-in via `textDocumentSync.save` (a server declares
-            // it reacts to saves). Only the `Options` form carries it;
-            // `Supported(false)` and the bare `Kind` number form correctly fall
-            // through to false. Gates save-hook forwarding to virt servers (#357).
+            // it reacts to saves). Gates save-hook forwarding to virt servers
+            // (#357). A server demanding `includeText = true` is deliberately
+            // EXCLUDED: kakehashi advertises `includeText = false` to the editor
+            // and so never receives the saved bytes to forward, and the virt doc
+            // is already current from didChange — so we cannot honor that
+            // contract and decline rather than send a contract-violating textless
+            // didSave. `Supported(false)` and the bare `Kind` number form also
+            // correctly fall through to false.
             "textDocument/didSave" => matches!(
                 caps.text_document_sync,
                 Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         save: Some(
                             TextDocumentSyncSaveOptions::Supported(true)
-                                | TextDocumentSyncSaveOptions::SaveOptions(_)
+                                | TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                                    include_text: None | Some(false),
+                                })
                         ),
                         ..
                     }
@@ -2200,6 +2207,33 @@ mod tests {
             text_document_sync: Some(TextDocumentSyncCapability::Options(
                 TextDocumentSyncOptions {
                     save: Some(TextDocumentSyncSaveOptions::Supported(false)),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        handle.set_server_capabilities(caps);
+
+        assert!(!handle.has_capability("textDocument/didSave"));
+    }
+
+    /// A server demanding `save.includeText = true` is excluded: kakehashi
+    /// cannot supply the saved text, so didSave must not be forwarded to it
+    /// rather than send a contract-violating textless didSave (#357).
+    #[tokio::test]
+    async fn has_capability_did_save_false_for_save_include_text_true() {
+        use tower_lsp_server::ls_types::{
+            SaveOptions, TextDocumentSyncCapability, TextDocumentSyncOptions,
+            TextDocumentSyncSaveOptions,
+        };
+
+        let handle = spawn_sink_handle().await;
+        let caps = ServerCapabilities {
+            text_document_sync: Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                        include_text: Some(true),
+                    })),
                     ..Default::default()
                 },
             )),

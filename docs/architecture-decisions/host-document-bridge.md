@@ -66,10 +66,14 @@ Partially implemented:
   Each recipient is **gated per-server** on the relevant capability —
   `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`
   — which is also the safety valve: a virt server only hears about a fragment
-  "save" if it opted into save hooks; one that didn't never sees it. Both are
-  fire-and-forget (no lazy spawn). `willSave` is advertised whenever a runnable
-  bridge server (host or virt) is configured; `didSave` is always advertised
-  (`save.includeText = false`).
+  "save" if it opted into save hooks; one that didn't never sees it. The
+  `didSave` gate additionally **excludes servers that demand
+  `save.includeText = true`**: kakehashi advertises `includeText = false`
+  upstream and so never receives the editor's saved bytes, so rather than send a
+  contract-violating textless didSave it declines (the server still has current
+  content from didChange). Both are fire-and-forget (no lazy spawn). `willSave`
+  is advertised whenever a runnable bridge server (host or virt) is configured;
+  `didSave` is always advertised to the editor (`save.includeText = false`).
 
   **`willSaveWaitUntil` (the request) remains host-only** and bypasses the
   layer walk: it forwards verbatim and returns the host servers' `TextEdit[]`
