@@ -128,14 +128,26 @@ reads unambiguously out of context.
 ### Cache model
 
 ```
-host_uri ──► { virtual_uri (source) ──► SlotEntry { diagnostics(virtual coords), virtual_version } }
+host_uri ──► { (virtual_uri, server) ──► SlotEntry { diagnostics(virtual coords), virtual_version } }
 ```
 
-Merge = for each slot, lazily transform its virtual-coordinate diagnostics to
-**current** host coordinates using the region's current host offset (recovered
-from the stable region id), then combine per cross-layer-aggregation
-(`concatenated` over `priorities` by default, or `preferred`). Host-layer
-participation follows host-document-bridge.
+The slot key includes the **server**: several servers can attach to one virtual
+document (e.g. two Lua linters on one region) and each pushes independently.
+Producing the host publish is therefore two levels, mirroring the existing
+two-stage pull aggregation:
+
+1. **Per-region fan-in** — for each virtual document, combine its servers' slots
+   per the method's `strategy`: `concatenated` appends all, `preferred` elects one
+   (see `preferred` as a push stream).
+2. **Cross-region merge** — concatenate every region's fan-in result for the host,
+   lazily transforming each slot's virtual coordinates to **current** host
+   coordinates via the region's current offset (recovered from the stable region
+   id). Host-layer participation follows host-document-bridge.
+
+The cross-region level is what republishes the cumulative host set on every push:
+when region A publishes, then the host layer, then region C, each event re-merges
+and re-publishes `{A}`, `{A, host}`, `{A, host, C}` — a slot is *replaced* by its
+source's latest push, never accumulated.
 
 ### Versioning and staleness (the crux)
 
@@ -150,6 +162,55 @@ policy clean:
   document version is held (not published) until a matching push arrives. This
   bounds the wrong-position window to the re-parse gap and self-heals as the
   downstream re-emits against the new content.
+
+### `preferred` as a push stream
+
+Pull resolves `preferred` synchronously — fan out, take the first non-empty
+response in priority order, abort the rest. `fan_in/preferred.rs` shows the exact
+rule: a named server holds a strict position and is waited for even if a lower one
+answers first, while the `"*"` group is decided by **earliest non-empty arrival**
+and then `abort_all`. A push stream never ends, so "abort the rest" becomes "stop
+switching away from the elected server" — i.e. **sticky-first**. Per virtual
+document:
+
+- **Effective version** `Veff` = the highest `virtual_version` seen for that
+  virtual document. Slots older than `Veff` are held (treated as absent) until
+  they re-publish at `Veff`. This is the version gate, and it is what makes a
+  document-version bump re-open the election.
+- **Winner walk** over the expanded `priorities`:
+  - `Server(name)` — wins if its slot is eligible (present, **non-empty**, at
+    `Veff`); otherwise fall through to the next entry.
+  - `Rest("*")` group — the **incumbent** keeps the position while it stays
+    eligible (sticky); when it loses eligibility, re-elect the earliest-arrived
+    eligible member, and **the new winner becomes the incumbent** (never snap back
+    to the original — that ping-pongs the display).
+- The region's fan-in result is the winner's latest diagnostics; a push that does
+  not change the elected winner's content emits nothing.
+
+**Empty falls through (matches pull's "first *non-empty*").** A preferred server
+publishing `[]` (clean) does not win — the walk continues, so a unique finding
+from a lower-priority server still surfaces. Deliberate consequence: a clean
+result from the preferred server does **not** suppress a lower server reporting a
+current-version problem. The alternative (empty-wins, where the preferred server's
+clean silences everyone below) was rejected — it diverges from pull and hides real
+findings; stale-error flicker is prevented by the version gate, not by empty-wins.
+
+**Null `version`.** `publishDiagnostics.version` is optional. kakehashi generates
+and syncs the virtual document version itself, so a null-version push is taken as
+"for the currently synced virtual version" and gated against that — a known value,
+not a guess.
+
+Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<ver,nth>`):
+
+- Same version — raw `a2<1,1>, a3<1,1>, a1<1,1>, a3<1,2>, a3<1,3>, a1<1,2>`
+  publishes `a2<1,1>` **once**. `a2` is elected on first arrival and stays
+  incumbent; every later push (including `a3`'s own revisions) leaves the winner
+  unchanged. (Contrast: keying the winner on `nth` would let the chattiest server
+  win — loudest ≠ best — so `nth` governs only *within* a server, as slot
+  replacement, never *across* servers.)
+- Version bump — raw `a2<1,1>, a1<2,1>, a2<2,1>` publishes `a2<1,1>` then
+  `a1<2,1>`. `a1`'s v2 lifts `Veff` to 2, holding `a2`'s v1 slot; `a1` is
+  re-elected at v2, and `a2<2,1>` then leaves the incumbent unchanged.
 
 ### Lifecycle
 
@@ -190,6 +251,15 @@ Virtual (UTF-16) → position_to_byte → + content_start_byte → byte_to_posit
 7. **Client-side aggregation (forward virtual URIs raw).** Rejected (as in the
    superseded decision): leaks internal virtual URIs and breaks the
    host-as-single-entity abstraction.
+8. **`preferred` winner keyed on publish count (`nthPublish`).** Rejected: the
+   per-server publish counter measures chattiness, not quality, and is not
+   comparable across servers — it makes the loudest server win. `nth` is
+   meaningful only *within* a server (later replaces earlier), which sticky-first
+   already captures as slot replacement.
+9. **`preferred` empty-wins (preferred server's clean suppresses lower servers).**
+   Rejected: diverges from pull's "first *non-empty*" for the same `strategy` key,
+   and hides a lower server's real current-version findings. Empty falls through
+   instead; the version gate handles stale-error flicker.
 
 ## Consequences
 
