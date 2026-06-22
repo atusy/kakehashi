@@ -102,13 +102,15 @@ impl VirtualDocumentUri {
             return false;
         };
 
-        // Check for {VIRTUAL_URI_PREFIX}{region_id}.{ext} pattern
-        // Requires non-empty extension after the last dot
+        // Check for {VIRTUAL_URI_PREFIX}{region_id}.{ext} pattern. Both the
+        // region_id and the extension must be non-empty — a real virtual URI
+        // always has both (`new` asserts a non-empty region_id), so requiring
+        // them rejects degenerate shapes like `kakehashi-virtual-uri-.lua`.
         filename.starts_with(VIRTUAL_URI_PREFIX)
             && filename
                 .get(VIRTUAL_URI_PREFIX.len()..)
                 .and_then(|s| s.rsplit_once('.'))
-                .is_some_and(|(_name, ext)| !ext.is_empty())
+                .is_some_and(|(region_id, ext)| !region_id.is_empty() && !ext.is_empty())
     }
 
     /// Extract the `region_id` from a virtual-document URI string, or `None` if
@@ -123,7 +125,9 @@ impl VirtualDocumentUri {
         let (region_id, ext) = filename
             .strip_prefix(VIRTUAL_URI_PREFIX)?
             .rsplit_once('.')?;
-        if ext.is_empty() {
+        // A real virtual URI always has a non-empty region_id and extension; an
+        // empty region_id (`kakehashi-virtual-uri-.lua`) matches no open document.
+        if region_id.is_empty() || ext.is_empty() {
             return None;
         }
         Some(region_id.to_string())
@@ -691,6 +695,7 @@ mod tests {
     #[case::kakehashi_in_dir("file:///home/.kakehashi/config.lua", false)]
     #[case::kakehashi_prefix_no_virtual("file:///project/kakehashi.config.lua", false)]
     #[case::no_extension("file:///project/kakehashi-virtual-uri-lua", false)]
+    #[case::empty_region_id("file:///project/kakehashi-virtual-uri-.lua", false)]
     #[case::not_a_url("not a url", false)]
     #[case::empty_string("", false)]
     #[case::missing_scheme("://missing-scheme", false)]
@@ -788,6 +793,13 @@ mod tests {
         // Non-virtual URIs yield None.
         assert_eq!(
             VirtualDocumentUri::region_id_of("file:///project/main.rs"),
+            None
+        );
+
+        // A virtual-shaped filename with an empty region_id is rejected (a real
+        // virtual URI always has a non-empty region_id).
+        assert_eq!(
+            VirtualDocumentUri::region_id_of("file:///project/kakehashi-virtual-uri-.lua"),
             None
         );
     }
