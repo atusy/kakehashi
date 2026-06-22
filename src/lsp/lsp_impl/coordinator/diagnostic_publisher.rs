@@ -110,7 +110,18 @@ impl DiagnosticPublisher {
         let _guard = self.aggregator.lock_republish().await;
 
         let snapshot = self.aggregator.snapshot(host);
-        let region_offsets = self.current_region_offsets(host);
+        // Recompute injection offsets only when there are region push slots to
+        // transform. A PullLayer-only snapshot (the common pull-driven case) needs
+        // none, so skip the whole-document injection resolution — and shorten the
+        // time the global republish lock is held.
+        let region_offsets = if snapshot
+            .keys()
+            .any(|source| matches!(source, DiagnosticSource::Region(_)))
+        {
+            self.current_region_offsets(host)
+        } else {
+            HashMap::new()
+        };
         let diagnostics = merge_cached_diagnostics(host, snapshot, &region_offsets);
 
         let lsp_uri = match crate::lsp::lsp_impl::url_to_uri(host) {
