@@ -221,12 +221,17 @@ fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
         };
 
         if bytes_read == 0 {
-            // EOF. Clean only at a message boundary (no Content-Length seen yet
-            // for an in-progress message); otherwise the stream was truncated.
-            return if content_length.is_some() {
-                ReadOutcome::Error("Server closed connection prematurely after header".to_string())
-            } else {
+            // EOF. Clean only at a true message boundary — i.e. before any
+            // header line of the next message. If we have already consumed one
+            // or more header lines (whether or not Content-Length was among
+            // them), the stream was truncated mid-message.
+            return if header_count == 0 {
                 ReadOutcome::Eof
+            } else {
+                ReadOutcome::Error(
+                    "Server closed connection prematurely mid-message (incomplete header block)"
+                        .to_string(),
+                )
             };
         }
         header_count += 1;
@@ -728,6 +733,17 @@ mod tests {
     #[test]
     fn read_framed_message_premature_eof_is_error() {
         let mut input = &b"Content-Length: 99\r\n\r\n"[..];
+        assert!(matches!(
+            read_framed_message(&mut input),
+            ReadOutcome::Error(_)
+        ));
+    }
+
+    /// EOF after a partial header block that has NOT yet included
+    /// Content-Length is still a mid-message truncation, not a clean boundary.
+    #[test]
+    fn read_framed_message_eof_after_partial_headers_is_error() {
+        let mut input = &b"Content-Type: application/vscode-jsonrpc\r\n"[..];
         assert!(matches!(
             read_framed_message(&mut input),
             ReadOutcome::Error(_)
