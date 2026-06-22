@@ -139,6 +139,106 @@ impl LspClientBuilder {
     }
 }
 
+/// Outcome of reading one Content-Length-framed message from the server.
+enum ReadOutcome {
+    /// A complete, parsed JSON-RPC message.
+    Message(Value),
+    /// Clean end-of-stream at a message boundary (server closed stdout).
+    Eof,
+    /// Protocol/framing failure carrying a precise, human-readable diagnostic.
+    Error(String),
+}
+
+/// Read a single Content-Length-framed JSON-RPC message from `reader`.
+///
+/// Blocks until a full message is available. Returns [`ReadOutcome::Eof`] only
+/// for a clean stream end at a message boundary (the next header read yields 0
+/// bytes); every malformed header, oversized/zero `Content-Length`, truncated
+/// body, or invalid JSON becomes [`ReadOutcome::Error`] so the caller — or the
+/// background reader thread — can surface the exact failure rather than a
+/// generic disconnect.
+fn read_framed_message(reader: &mut BufReader<ChildStdout>) -> ReadOutcome {
+    const MAX_HEADERS: u32 = 100;
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100MB limit
+
+    let mut header = String::new();
+    let mut header_count = 0u32;
+
+    loop {
+        if header_count >= MAX_HEADERS {
+            return ReadOutcome::Error(format!(
+                "Exceeded maximum header count ({MAX_HEADERS}) - server may be sending malformed headers"
+            ));
+        }
+
+        header.clear();
+        let bytes_read = match reader.read_line(&mut header) {
+            Ok(n) => n,
+            Err(e) => return ReadOutcome::Error(format!("Failed to read header line: {e}")),
+        };
+
+        // EOF while awaiting the next header is a clean shutdown at a message
+        // boundary.
+        if bytes_read == 0 {
+            return ReadOutcome::Eof;
+        }
+        header_count += 1;
+
+        if header == "\r\n" {
+            continue;
+        }
+
+        let Some(rest) = header.strip_prefix("Content-Length:") else {
+            // Unknown header line; ignore and keep reading (mirrors prior behavior).
+            continue;
+        };
+
+        let len: usize = match rest.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return ReadOutcome::Error(format!(
+                    "Invalid Content-Length value: {:?}",
+                    rest.trim()
+                ));
+            }
+        };
+
+        // Validate Content-Length to prevent excessive allocations.
+        if len > MAX_MESSAGE_SIZE {
+            return ReadOutcome::Error(format!(
+                "Content-Length {len} exceeds maximum allowed size {MAX_MESSAGE_SIZE}"
+            ));
+        }
+        if len == 0 {
+            return ReadOutcome::Error(
+                "Invalid Content-Length: 0 - message body cannot be empty".to_string(),
+            );
+        }
+
+        // Read the blank line separating headers from the body.
+        let mut empty = String::new();
+        let bytes_read = match reader.read_line(&mut empty) {
+            Ok(n) => n,
+            Err(e) => return ReadOutcome::Error(format!("Failed to read empty line: {e}")),
+        };
+        if bytes_read == 0 {
+            return ReadOutcome::Error(
+                "Server closed connection prematurely after header".to_string(),
+            );
+        }
+
+        let mut body = vec![0u8; len];
+        if let Err(e) = std::io::Read::read_exact(reader, &mut body) {
+            return ReadOutcome::Error(format!("Failed to read body: {e}"));
+        }
+
+        return match serde_json::from_slice(&body) {
+            Ok(value) => ReadOutcome::Message(value),
+            Err(e) => ReadOutcome::Error(format!("Failed to parse response: {e}")),
+        };
+    }
+}
+
 impl LspClient {
     /// Spawn the kakehashi binary and create a new LSP client.
     pub fn new() -> Self {
@@ -294,89 +394,14 @@ impl LspClient {
     }
 
     /// Receive a single LSP message with Content-Length framing.
-    /// Times out after 30 seconds to prevent indefinite blocking on unresponsive servers.
     /// Validates Content-Length to prevent excessive memory allocation.
     fn receive_message(&mut self) -> Value {
-        const MAX_HEADERS: u32 = 100;
-        const TIMEOUT: Duration = Duration::from_secs(30);
-        const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100MB limit
-
-        let start_time = Instant::now();
-        let mut header_count = 0u32;
-
-        // Read Content-Length header
-        let mut header = String::new();
-        loop {
-            // Check timeout
-            if start_time.elapsed() > TIMEOUT {
-                panic!(
-                    "Timeout reading LSP message header. Elapsed: {:?}",
-                    start_time.elapsed()
-                );
+        match read_framed_message(&mut self.stdout) {
+            ReadOutcome::Message(value) => value,
+            ReadOutcome::Eof => {
+                panic!("Server closed connection prematurely while reading header")
             }
-
-            // Check header count threshold
-            if header_count >= MAX_HEADERS {
-                panic!(
-                    "Exceeded maximum header count ({}) - server may be sending malformed headers",
-                    MAX_HEADERS
-                );
-            }
-
-            header.clear();
-            let bytes_read = self
-                .stdout
-                .read_line(&mut header)
-                .expect("Failed to read header line");
-
-            // EOF detection: if read_line returns 0 bytes, the connection closed
-            if bytes_read == 0 {
-                panic!("Server closed connection prematurely while reading header");
-            }
-
-            header_count += 1;
-
-            if header == "\r\n" {
-                continue;
-            }
-
-            if header.starts_with("Content-Length:") {
-                let len: usize = header
-                    .trim_start_matches("Content-Length:")
-                    .trim()
-                    .parse()
-                    .expect("Invalid Content-Length value");
-
-                // Validate Content-Length to prevent excessive allocations
-                if len > MAX_MESSAGE_SIZE {
-                    panic!(
-                        "Content-Length {} exceeds maximum allowed size {}",
-                        len, MAX_MESSAGE_SIZE
-                    );
-                }
-
-                if len == 0 {
-                    panic!("Invalid Content-Length: 0 - message body cannot be empty");
-                }
-
-                // Read empty line
-                let mut empty = String::new();
-                let bytes_read = self
-                    .stdout
-                    .read_line(&mut empty)
-                    .expect("Failed to read empty line");
-
-                if bytes_read == 0 {
-                    panic!("Server closed connection prematurely after header");
-                }
-
-                // Read body
-                let mut body = vec![0u8; len];
-                std::io::Read::read_exact(&mut self.stdout, &mut body)
-                    .expect("Failed to read body");
-
-                return serde_json::from_slice(&body).expect("Failed to parse response");
-            }
+            ReadOutcome::Error(e) => panic!("{e}"),
         }
     }
 
