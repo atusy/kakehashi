@@ -153,14 +153,14 @@ pub(crate) fn byte_to_point_anchored(
     anchor_point: tree_sitter::Point,
 ) -> tree_sitter::Point {
     let clamped = floor_char_boundary(text, byte);
-    // Compare against the raw anchor so a stale anchor past `clamped` still takes
-    // the full-scan fallback (rather than reusing a stale `anchor_point`).
-    if clamped < anchor_byte {
+    // Reuse the cached `anchor_point` only when `anchor_byte` is a real position
+    // in the current text: if it's past the target, out of bounds, or
+    // mid-codepoint (a stale tree), `anchor_point` no longer matches it and the
+    // `text[anchor_byte..clamped]` slice could panic — fall back to a full scan,
+    // which depends on neither.
+    if clamped < anchor_byte || !text.is_char_boundary(anchor_byte) {
         return byte_to_point(text, clamped);
     }
-    // Here `anchor_byte <= clamped <= text.len()`, so snapping it to a char
-    // boundary (a stale tree may land it mid-codepoint) makes the slice safe.
-    let anchor_byte = floor_char_boundary(text, anchor_byte);
     let segment = &text[anchor_byte..clamped];
     match segment.rfind('\n') {
         Some(last_nl) => tree_sitter::Point {
