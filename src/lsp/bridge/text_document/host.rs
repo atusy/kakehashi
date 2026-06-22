@@ -184,11 +184,16 @@ impl LanguageServerPool {
     /// fire-and-forget notification it must not lazily spawn a connection just
     /// to announce a save (issue Q3, latency).
     ///
-    /// Lock discipline matches [`Self::close_host_bridge_document`]: connection
-    /// handles are pre-fetched before the `host_documents` lock (consistent
-    /// `connections` → `host_documents` ordering with the respawn purge), and
-    /// the notifications are queued while the lock is held so a concurrent
-    /// open/close cannot interleave inconsistently.
+    /// Lock discipline follows the host **request** path
+    /// ([`Self::execute_host_request`]), stricter than the pre-snapshot in
+    /// [`Self::close_host_bridge_document`]: `connections` is held across the
+    /// `host_documents` iteration (consistent `connections` → `host_documents`
+    /// ordering with the respawn purge in `pool.rs`), and willSave is queued
+    /// only onto the **live** handle for each key. A pre-snapshot would leave a
+    /// window where a respawn between the snapshot and the send could queue
+    /// willSave onto a replaced/dead connection; holding `connections`
+    /// excludes the purge from interleaving, closing it (#357 review). The
+    /// sends are non-yielding queue writes, so holding both locks is cheap.
     pub(crate) async fn notify_host_will_save(
         &self,
         uri: &Url,
@@ -198,16 +203,9 @@ impl LanguageServerPool {
         // one allocation, skipping the `Display`/`to_string` formatting path.
         let uri_string = uri.as_str().to_owned();
 
-        let handles: Vec<(ConnectionKey, Arc<ConnectionHandle>)> = {
-            let connections = self.connections().await;
-            connections
-                .iter()
-                .map(|(key, handle)| (key.clone(), Arc::clone(handle)))
-                .collect()
-        };
-
+        let connections = self.connections().await;
         let docs = self.host_documents().await;
-        for (connection_key, handle) in &handles {
+        for (connection_key, handle) in connections.iter() {
             if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
                 continue;
             }
