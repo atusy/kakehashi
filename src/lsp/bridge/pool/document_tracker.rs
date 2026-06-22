@@ -328,6 +328,18 @@ impl DocumentTracker {
         }
     }
 
+    /// Snapshot (without removing) every virtual document currently open for a
+    /// host URI. Used by the save-notification fan-out (#357), which forwards
+    /// willSave/didSave to the host's open virtual docs but must keep them open.
+    pub(super) async fn host_virtual_docs(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
+        self.host_to_virtual
+            .lock()
+            .await
+            .get(host_uri)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.
@@ -425,6 +437,23 @@ impl DocumentTracker {
             .get(&virtual_uri.to_uri_string())
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
+    }
+
+    /// Membership check: is the virtual document at `virtual_uri` (its URI
+    /// string) open on `connection_key`? Reads the same `virtual_to_servers`
+    /// reverse index as [`Self::get_all_connections_for_virtual_uri`] but only
+    /// tests membership, avoiding that method's `Vec<ConnectionKey>` clone — and
+    /// takes `&str` so the caller (which already has the URI string for the
+    /// notification params) need not allocate it twice. Used by the per-doc save
+    /// fan-out liveness recheck.
+    pub(super) fn is_virtual_doc_open_on_connection(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        self.virtual_to_servers
+            .get(virtual_uri)
+            .is_some_and(|entry| entry.value().contains(connection_key))
     }
 
     /// Resolve a virtual-document URI string back to its `(host_url, region_id)`.

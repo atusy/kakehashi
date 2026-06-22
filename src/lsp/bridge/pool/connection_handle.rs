@@ -14,8 +14,9 @@ use tokio::sync::mpsc;
 use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability,
-    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
+    LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, SaveOptions, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
+    TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -592,6 +593,12 @@ impl ConnectionHandle {
                     }
                 ))
             ),
+            // NOTE: `textDocument/didSave` is intentionally NOT handled here.
+            // didSave forwarding (virt save fan-out, #357) needs an
+            // includeText-aware decision that the dynamic registry — which is
+            // method-name-only and cannot carry `save.includeText` — would
+            // bypass. It uses [`Self::accepts_textless_did_save`] (static
+            // capabilities only) instead.
             "textDocument/documentSymbol" => {
                 matches!(
                     caps.document_symbol_provider,
@@ -608,6 +615,39 @@ impl ConnectionHandle {
             ),
             _ => false,
         }
+    }
+
+    /// Whether this server accepts a **textless** `textDocument/didSave` from the
+    /// virt save fan-out (#357): it must advertise `save` in its STATIC
+    /// (initialize) `textDocumentSync` *without* demanding `includeText = true`.
+    ///
+    /// Deliberately reads only static capabilities, NOT the dynamic registry:
+    /// kakehashi advertises `includeText = false` to the editor and so never
+    /// receives the saved bytes to forward, and the method-name-only dynamic
+    /// registry cannot carry `save.includeText` — so trusting a dynamic didSave
+    /// registration could send a textless didSave to a server that registered
+    /// `includeText: true`. `includeText = true`, `Supported(false)`, the bare
+    /// `Kind` form, and an absent `save` all yield false. A server that opts in
+    /// without `includeText` already has current content from the didChange
+    /// stream, so the textless notification is sufficient.
+    pub(crate) fn accepts_textless_did_save(&self) -> bool {
+        let Some(caps) = self.server_capabilities() else {
+            return false;
+        };
+        matches!(
+            caps.text_document_sync,
+            Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    save: Some(
+                        TextDocumentSyncSaveOptions::Supported(true)
+                            | TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                                include_text: None | Some(false),
+                            })
+                    ),
+                    ..
+                }
+            ))
+        )
     }
 
     /// Begin graceful shutdown: transition to Closing (rejecting new requests) and
@@ -2136,6 +2176,75 @@ mod tests {
                 "has_capability({}) should return false with default capabilities",
                 method
             );
+        }
+    }
+
+    /// `accepts_textless_did_save` is true for a static `save` opt-in without
+    /// `includeText` — both the `Supported(true)` and `SaveOptions` forms (#357).
+    #[tokio::test]
+    async fn accepts_textless_did_save_true_for_save_without_include_text() {
+        use tower_lsp_server::ls_types::{
+            SaveOptions, TextDocumentSyncCapability, TextDocumentSyncOptions,
+            TextDocumentSyncSaveOptions,
+        };
+
+        for save in [
+            TextDocumentSyncSaveOptions::Supported(true),
+            TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                include_text: Some(false),
+            }),
+            TextDocumentSyncSaveOptions::SaveOptions(SaveOptions { include_text: None }),
+        ] {
+            let handle = spawn_sink_handle().await;
+            handle.set_server_capabilities(ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        save: Some(save),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            });
+            assert!(handle.accepts_textless_did_save());
+        }
+    }
+
+    /// `accepts_textless_did_save` is false with no capabilities, for
+    /// `Supported(false)`, the bare `Kind` form, and — crucially — a server
+    /// demanding `save.includeText = true` (kakehashi cannot supply the text)
+    /// (#357).
+    #[tokio::test]
+    async fn accepts_textless_did_save_false_cases() {
+        use tower_lsp_server::ls_types::{
+            SaveOptions, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+            TextDocumentSyncSaveOptions,
+        };
+
+        // No capabilities at all.
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.accepts_textless_did_save());
+
+        let sync_cases = [
+            TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL),
+            TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+                save: Some(TextDocumentSyncSaveOptions::Supported(false)),
+                ..Default::default()
+            }),
+            TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+                save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                    include_text: Some(true),
+                })),
+                ..Default::default()
+            }),
+        ];
+        for sync in sync_cases {
+            let handle = spawn_sink_handle().await;
+            handle.set_server_capabilities(ServerCapabilities {
+                text_document_sync: Some(sync),
+                ..Default::default()
+            });
+            assert!(!handle.accepts_textless_did_save());
         }
     }
 

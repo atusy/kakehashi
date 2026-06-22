@@ -311,6 +311,20 @@ impl WorkspaceSettings {
             .values()
             .any(LanguageSettings::is_host_bridging_enabled)
     }
+
+    /// True if any configured language server has a runnable command. The
+    /// built-in `_` wildcard defaults entry carries an empty `cmd` and is thus
+    /// excluded, so this is false on a blank config but true once a real server
+    /// (host- or virt-capable) is configured.
+    ///
+    /// Gates willSave advertisement (#357): willSave now fans out to both host
+    /// and virt bridges, so a single runnable bridge server is a potential
+    /// consumer — but a config with only the empty defaults entry has none.
+    pub(crate) fn any_bridge_server_runnable(&self) -> bool {
+        self.language_servers
+            .values()
+            .any(|server| !server.cmd.is_empty())
+    }
 }
 
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {
@@ -397,6 +411,40 @@ mod tests {
         // `resolve_host_language_settings`, so a wildcard opt-in must count.
         let settings = settings_with_host_bridge(WILDCARD_KEY, true);
         assert!(settings.any_host_bridging_enabled());
+    }
+
+    #[test]
+    fn any_bridge_server_runnable_excludes_empty_cmd_defaults() {
+        use crate::config::settings::BridgeServerConfig;
+
+        let server = |cmd: Vec<&str>| BridgeServerConfig {
+            cmd: cmd.into_iter().map(String::from).collect(),
+            languages: vec![],
+            initialization_options: None,
+            root_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+        };
+
+        // Only the built-in `_` defaults entry (empty cmd): not runnable.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([(WILDCARD_KEY.to_string(), server(vec![]))]),
+            ..Default::default()
+        };
+        assert!(
+            !settings.any_bridge_server_runnable(),
+            "only the empty defaults entry → no runnable server"
+        );
+
+        // A real server with a command counts.
+        let settings = WorkspaceSettings {
+            language_servers: HashMap::from([
+                (WILDCARD_KEY.to_string(), server(vec![])),
+                ("lua_ls".to_string(), server(vec!["lua-language-server"])),
+            ]),
+            ..Default::default()
+        };
+        assert!(settings.any_bridge_server_runnable());
     }
 
     #[test]

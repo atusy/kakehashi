@@ -472,21 +472,27 @@ fn init_will_save_client_with_mode(
     (client, config_dir, init)
 }
 
-/// Hover the host document, returning the `will-save` mock's `contents`
-/// (`willsave-count:<n>:reason:<r>`) once the host bridge is warm, else `None`.
-fn host_save_hover(client: &mut LspClient) -> Option<String> {
+/// Hover `uri` at `(line, character)` and parse the `will-save` mock's JSON
+/// state (`{will,reason,willUri,did,didUri}`) from the hover contents, or `None`
+/// while the bridge is still warming up.
+fn save_state_hover(client: &mut LspClient, uri: &str, line: u64, character: u64) -> Option<Value> {
     let response = client.send_request(
         "textDocument/hover",
         json!({
-            "textDocument": { "uri": SAVE_URI },
-            "position": { "line": 0, "character": 0 },
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
         }),
     );
     assert!(response.get("error").is_none(), "hover must not error");
     response
         .pointer("/result/contents")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+}
+
+/// Hover the host document itself (host-bridge `will-save` server).
+fn host_save_hover(client: &mut LspClient) -> Option<Value> {
+    save_state_hover(client, SAVE_URI, 0, 0)
 }
 
 #[test]
@@ -512,21 +518,61 @@ fn e2e_host_bridge_advertises_save_capabilities_when_enabled() {
 }
 
 #[test]
-fn e2e_host_bridge_hides_save_capabilities_when_disabled() {
-    // No `bridge._self.enabled` anywhere: the save methods forward only to host
-    // bridges, so kakehashi must keep advertising neither (today's behavior).
+fn e2e_host_bridge_save_capabilities_decouple_willsave_from_waituntil() {
+    // A server IS configured (so virt bridging can consume willSave) but host
+    // bridging is OFF. willSave now fans out to virt too, so it must be
+    // advertised; willSaveWaitUntil is host-only, so it must stay hidden (#357).
     let (mut client, _config_dir, init) = init_will_save_client("");
+
+    let sync = init
+        .pointer("/result/capabilities/textDocumentSync")
+        .expect("textDocumentSync must be present");
+    assert_eq!(
+        sync.get("willSave").and_then(Value::as_bool),
+        Some(true),
+        "willSave must be advertised when any bridge server is configured; got {sync}"
+    );
+    assert!(
+        sync.get("willSaveWaitUntil").is_none_or(Value::is_null),
+        "willSaveWaitUntil must stay host-only (hidden without host bridging); got {sync}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_bridge_hides_save_capabilities_without_any_server() {
+    // With no RUNNABLE bridge servers configured (only the built-in `_`
+    // wildcard defaults entry, which has an empty cmd), neither save method has
+    // a possible consumer, so kakehashi advertises neither (today's behavior).
+    // Use an explicit empty config file and omit initializationOptions so no
+    // default/user config can leak servers or host bridging in.
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("empty.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+        }),
+    );
 
     let sync = init
         .pointer("/result/capabilities/textDocumentSync")
         .expect("textDocumentSync must be present");
     assert!(
         sync.get("willSave").is_none_or(Value::is_null),
-        "willSave must NOT be advertised without a host bridge; got {sync}"
+        "willSave must NOT be advertised with no servers configured; got {sync}"
     );
     assert!(
         sync.get("willSaveWaitUntil").is_none_or(Value::is_null),
-        "willSaveWaitUntil must NOT be advertised without a host bridge; got {sync}"
+        "willSaveWaitUntil must NOT be advertised with no servers configured; got {sync}"
     );
 
     shutdown(&mut client);
@@ -580,10 +626,10 @@ fn e2e_host_will_save_notification_reaches_host() {
     // any willSave is forwarded.
     let mut warmed = false;
     for _ in 0..300 {
-        if let Some(contents) = host_save_hover(&mut client) {
-            assert!(
-                contents.starts_with("willsave-count:0:"),
-                "before any willSave the host server must report zero; got {contents}"
+        if let Some(state) = host_save_hover(&mut client) {
+            assert_eq!(
+                state["will"], 0,
+                "before any willSave the host server must report zero; got {state}"
             );
             warmed = true;
             break;
@@ -601,21 +647,24 @@ fn e2e_host_will_save_notification_reaches_host() {
         json!({ "textDocument": { "uri": SAVE_URI }, "reason": 2 }),
     );
 
-    // Subsequent hovers must reflect the recorded willSave: count 1, reason 2.
+    // Subsequent hovers must reflect the recorded willSave: count 1, reason 2,
+    // and the REAL host URI (the host path forwards verbatim).
     let mut seen = None;
     for _ in 0..300 {
-        if let Some(contents) = host_save_hover(&mut client)
-            && !contents.starts_with("willsave-count:0:")
+        if let Some(state) = host_save_hover(&mut client)
+            && state["will"] != 0
         {
-            seen = Some(contents);
+            seen = Some(state);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let contents = seen.expect("the forwarded willSave must reach the host server");
+    let state = seen.expect("the forwarded willSave must reach the host server");
+    assert_eq!(state["will"], 1, "host server must record one willSave");
+    assert_eq!(state["reason"], 2, "host server must record the reason");
     assert_eq!(
-        contents, "willsave-count:1:reason:2",
-        "the host server must record the forwarded willSave and its reason"
+        state["willUri"], SAVE_URI,
+        "host willSave must carry the real host URI verbatim"
     );
 
     shutdown(&mut client);
@@ -674,6 +723,175 @@ fn e2e_host_will_save_wait_until_times_out_without_hanging_save() {
         elapsed < std::time::Duration::from_secs(20),
         "must time out on the 5s budget, not the 30s request timeout; elapsed {elapsed:?}"
     );
+
+    shutdown(&mut client);
+}
+
+// ==========================================================================
+// Virt-bridge willSave / didSave (notifications fan out to virtual docs, #357)
+// ==========================================================================
+
+const VIRT_SAVE_URI: &str = "file:///test_virt_save.md";
+/// A markdown host whose lua fence content sits on LSP line 3 (`print(1)`).
+const VIRT_SAVE_MARKDOWN: &str = "# Title\n\n```lua\nprint(1)\n```\n";
+
+/// Initialize a client whose **lua** injections are served by the mock's
+/// `will-save` mode (a virt bridge, no host bridging), and open a markdown host
+/// with a lua fence.
+fn init_virt_save_client() -> (LspClient, tempfile::TempDir) {
+    init_virt_save_client_with_mode("will-save")
+}
+
+fn init_virt_save_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("virt_save.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "lua-save": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": VIRT_SAVE_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": VIRT_SAVE_MARKDOWN
+            }
+        }),
+    );
+    (client, config_dir)
+}
+
+/// Hover inside the lua fence content (LSP line 3 = `print(1)`), which routes to
+/// the lua virt server and opens its virtual document.
+fn virt_save_hover(client: &mut LspClient) -> Option<Value> {
+    save_state_hover(client, VIRT_SAVE_URI, 3, 2)
+}
+
+#[test]
+fn e2e_virt_will_save_and_did_save_reach_virtual_doc() {
+    let (mut client, _config_dir) = init_virt_save_client();
+
+    // Warm up: a hover inside the lua fence opens the virtual document on the
+    // virt server (lazy didOpen). Zero saves recorded yet.
+    let mut warmed = false;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client) {
+            assert_eq!(state["will"], 0, "no willSave yet; got {state}");
+            assert_eq!(state["did"], 0, "no didSave yet; got {state}");
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        warmed,
+        "virt lua server must answer hover (virtual doc opened) before the saves"
+    );
+
+    // Forward willSave (reason 1) and didSave on the HOST document.
+    client.send_notification(
+        "textDocument/willSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI }, "reason": 1 }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    // The virt server must receive BOTH, carrying the VIRTUAL document URI — a
+    // host URI here would betray a routing bug.
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client)
+            && state["will"] != 0
+            && state["did"] != 0
+        {
+            seen = Some(state);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let state = seen.expect("willSave + didSave must reach the virt server");
+    assert_eq!(
+        state["reason"], 1,
+        "willSave reason must be forwarded verbatim"
+    );
+
+    for key in ["willUri", "didUri"] {
+        let uri = state[key].as_str().unwrap_or_default();
+        assert!(
+            uri.contains("kakehashi-virtual-uri"),
+            "{key} must be the VIRTUAL document URI; got {uri}"
+        );
+        assert_ne!(uri, VIRT_SAVE_URI, "{key} must NOT be the host URI");
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virt_save_skips_server_without_save_capability() {
+    // The per-server capability gate is the phantom-save mitigation: a virt
+    // server that advertises neither `willSave` nor `save` must NOT be told
+    // about the host save, even with its virtual doc open (#357).
+    let (mut client, _config_dir) = init_virt_save_client_with_mode("will-save-incapable");
+
+    // Warm up: open the virtual doc (hover still works — the mode advertises it)
+    // and confirm zero saves recorded.
+    let mut warmed = false;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client) {
+            assert_eq!(state["will"], 0);
+            assert_eq!(state["did"], 0);
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "incapable virt server must still answer hover");
+
+    client.send_notification(
+        "textDocument/willSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI }, "reason": 1 }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    // Give the (incorrect) fan-out time to land, then confirm the gate held:
+    // counts stay zero. Poll a handful of times so a late delivery would fail.
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let state = virt_save_hover(&mut client).expect("hover must answer");
+        assert_eq!(
+            state["will"], 0,
+            "willSave must NOT reach a server lacking the willSave capability; got {state}"
+        );
+        assert_eq!(
+            state["did"], 0,
+            "didSave must NOT reach a server lacking the save capability; got {state}"
+        );
+    }
 
     shutdown(&mut client);
 }

@@ -455,6 +455,12 @@ impl LanguageServerPool {
     // DocumentTracker delegation methods
     // ========================================
 
+    /// Snapshot (without removing) every virtual document currently open for a
+    /// host URI. Used by the save-notification fan-out (#357).
+    pub(crate) async fn host_virtual_docs(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
+        self.document_tracker.host_virtual_docs(host_uri).await
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.
@@ -534,6 +540,18 @@ impl LanguageServerPool {
     ) -> Vec<ConnectionKey> {
         self.document_tracker
             .get_all_connections_for_virtual_uri(virtual_uri)
+    }
+
+    /// Membership check for the save fan-out liveness recheck (avoids the
+    /// reverse-index `Vec<ConnectionKey>` clone): is the virtual document at
+    /// `virtual_uri` (its URI string) open on `connection_key`?
+    pub(super) fn is_virtual_doc_open_on_connection(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        self.document_tracker
+            .is_virtual_doc_open_on_connection(virtual_uri, connection_key)
     }
 
     /// Register a document as successfully opened (test helper).

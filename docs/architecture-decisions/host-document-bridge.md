@@ -53,18 +53,40 @@ Partially implemented:
   matches the virt path's full-content `didChange` forwarding and avoids
   hooking the concurrent upstream `didChange` stream; verbatim forwarding
   remains the target if eager sync proves necessary.
-- **Save methods are host-bridge-only** (#357): `willSave` (notification) and
-  `willSaveWaitUntil` (request) concern the document being saved — the *host*
-  document — so they bypass the layer walk and forward only to host servers,
-  never to virt bridges. `willSave` is fan-out to host servers that already
-  have the document open and advertise it (no lazy spawn for a fire-and-forget
-  notification); `willSaveWaitUntil` forwards verbatim and returns the host
-  servers' `TextEdit[]` via the `preferred` host aggregation, bounded by a 5s
-  budget so a slow server cannot hang the editor's save. Both capabilities are
-  advertised at initialize only when some language enables host bridging.
-  Virt fan-out (one save per open virtual doc) is deliberately deferred: it
-  overlaps with format-on-save semantics the concatenated formatting pipeline
-  owns, and is left for a follow-up should a concrete need appear.
+- **Save notifications fan out to both layers; `willSaveWaitUntil` stays
+  host-only** (#357). The save *notifications* concern the host save but are
+  forwarded to BOTH bridge layers:
+  - **`willSave`** goes to host servers that already have the host document
+    open *and* to every open virtual document (URI rewritten to the virtual
+    one, reason verbatim);
+  - **`didSave`** goes to every open virtual document (URI rewritten); it is
+    not forwarded to host servers today (the host `didSave` handler drives the
+    synthetic-diagnostic pull instead).
+
+  Each recipient is **gated per-server** on the relevant capability —
+  `willSave` on `textDocumentSync.willSave`, `didSave` on `textDocumentSync.save`
+  — which is also the safety valve: a virt server only hears about a fragment
+  "save" if it opted into save hooks; one that didn't never sees it. The
+  `didSave` gate additionally **excludes servers that demand
+  `save.includeText = true`**: kakehashi advertises `includeText = false`
+  upstream and so never receives the editor's saved bytes, so rather than send a
+  contract-violating textless didSave it declines (the server still has current
+  content from didChange). That gate reads **static** capabilities only — a
+  *dynamic* didSave registration is not honored for forwarding, since the
+  method-name-only dynamic registry cannot carry `includeText` and could
+  otherwise smuggle an `includeText = true` server past the filter. Both are
+  fire-and-forget (no lazy spawn). `willSave` is advertised whenever a runnable
+  bridge server (host or virt) is configured; `didSave` is always advertised to
+  the editor (`save.includeText = false`).
+
+  **`willSaveWaitUntil` (the request) remains host-only** and bypasses the
+  layer walk: it forwards verbatim and returns the host servers' `TextEdit[]`
+  via the `preferred` host aggregation, bounded by a 5s budget so a slow server
+  cannot hang the editor's save. It is advertised only when some language
+  enables host bridging. Fanning the *request* out to virt would need
+  virtual→host edit translation and cross-region aggregation that overlap the
+  concatenated formatting pipeline (format-on-save), so virt `willSaveWaitUntil`
+  stays deferred.
 - **Not implemented**: `publishDiagnostics` pass-through from host servers
   (downstream notifications are not forwarded upstream today on either
   path).

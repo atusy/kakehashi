@@ -37,6 +37,7 @@ pub(in crate::lsp::bridge) mod publish_diagnostics;
 mod range_formatting;
 mod references;
 mod rename;
+mod save;
 mod signature_help;
 #[cfg(test)]
 pub(in crate::lsp::bridge) mod test_helpers;
