@@ -158,7 +158,7 @@ For materialized documents:
 4. **Registration**: Send `textDocument/didOpen` to language server
 5. **Wait for indexing**: For materialized documents, wait for `publishDiagnostics`
 6. **Sync**: On host document change, send `textDocument/didChange` (or rewrite temp file)
-7. **Save hooks** (#357): On host `willSave`/`didSave`, fan the notification out to every open virtual document (URI rewritten to the virtual one), gated per-server on `willSave` / `save` capability — see [host-document-bridge](host-document-bridge.md). `willSaveWaitUntil` is host-only.
+7. **Save hooks** (#357): On host `willSave`/`didSave`, fan the notification out to every open virtual document (URI rewritten to the virtual one), gated per-server on `willSave` / `save` capability — see host-document-bridge. `willSaveWaitUntil` is host-only.
 8. **Cleanup**: Send `textDocument/didClose` and delete temp files when injection is removed or host closes
 
 ### Server Process Sharing

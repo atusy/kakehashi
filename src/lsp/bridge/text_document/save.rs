@@ -67,10 +67,12 @@ impl LanguageServerPool {
     /// send is guarded against a stale target by holding `connections` across
     /// the liveness recheck AND the send (order `connections` → tracker,
     /// matching the respawn purge in `pool.rs`):
-    /// - while `connections` is held a respawn purge cannot interleave, so a
-    ///   replacement process can never be installed between the recheck and the
-    ///   send (a pre-handle reverse-index check alone would NOT close this — the
-    ///   purge could swap in a fresh Ready handle that never opened the doc);
+    /// - `connections` is taken once after the snapshot and held across the
+    ///   whole loop — no `.await` happens inside it. While it is held a respawn
+    ///   purge cannot interleave, so a replacement process can never be installed
+    ///   between the recheck and the send (a pre-handle reverse-index check
+    ///   alone would NOT close this — the purge could swap in a fresh Ready
+    ///   handle that never opened the doc);
     /// - the `(virtual_uri, connection)` pair is then re-checked against the
     ///   **live** reverse index ([`Self::get_all_connections_for_virtual_uri`]),
     ///   dropping a doc a concurrent `didClose` removed (best-effort, the same
@@ -78,8 +80,8 @@ impl LanguageServerPool {
     /// - the handle must be the current `Ready` one.
     ///
     /// `send_notification` is a non-blocking queue write (FIFO single-writer
-    /// loop, ls-bridge-message-ordering), so holding `connections` across it is
-    /// cheap — the same discipline as `notify_host_will_save`.
+    /// loop, ls-bridge-message-ordering), so holding `connections` across the
+    /// batch is cheap — the same discipline as `notify_host_will_save`.
     async fn forward_save_notification_to_virtual_docs(
         &self,
         host_uri: &Url,
@@ -88,8 +90,8 @@ impl LanguageServerPool {
         build_params: impl Fn(&str) -> serde_json::Value,
     ) {
         let docs = self.host_virtual_docs(host_uri).await;
+        let connections = self.connections().await;
         for doc in docs {
-            let connections = self.connections().await;
             // Under the `connections` lock (purge excluded): only send if this
             // connection STILL has this virtual doc open and is the current
             // Ready handle.
