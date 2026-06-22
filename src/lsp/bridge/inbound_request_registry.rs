@@ -73,14 +73,15 @@ impl InboundRequestRegistry {
     /// Drop a settled request's entry (called by the forwarding loop once the
     /// editor responded or the cancel was forwarded).
     pub(crate) fn unregister(&self, connection_id: ProgressConnectionId, request_id: &jsonrpc::Id) {
-        let mut guard = self
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self
             .inner
             .lock()
-            .recover_poison("InboundRequestRegistry::unregister");
-        if let Some(requests) = guard.get_mut(&connection_id) {
-            requests.remove(request_id);
-            if requests.is_empty() {
-                guard.remove(&connection_id);
+            .recover_poison("InboundRequestRegistry::unregister")
+            .entry(connection_id)
+        {
+            entry.get_mut().remove(request_id);
+            if entry.get().is_empty() {
+                entry.remove();
             }
         }
     }
