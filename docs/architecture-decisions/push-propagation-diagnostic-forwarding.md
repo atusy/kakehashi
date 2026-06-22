@@ -2,7 +2,7 @@
 
 **Related Decisions**:
 - [cross-layer-aggregation](cross-layer-aggregation.md) — How virt/host layers combine into one published result
-- [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method bridge strategies (this supersedes the diagnostic strategy)
+- [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method bridge strategies relevant to diagnostics
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model
 - [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md) — Server pool, document tracking, notification forwarding
 - [ls-bridge-message-ordering](ls-bridge-message-ordering.md) — Per-URI ordering the cache relies on
@@ -383,11 +383,17 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
 Per-URI ordering between incoming pushes and edits is the ordering already relied
 on by ls-bridge-message-ordering.
 
-### Position transformation (carried forward, unchanged)
+### Position transformation (reuses the existing bridge translation)
 
-```
-Virtual (UTF-16) → position_to_byte → + content_start_byte → byte_to_position → Host (UTF-16)
-```
+Mapping a region slot's virtual coordinates to host coordinates reuses the
+bridge's existing virtual→host translation (`translation.rs`): each virtual
+UTF-16 `Position` is shifted by the region's `RegionOffset` — a base line plus a
+per-virtual-line UTF-16 **column** offset (a single value for ordinary
+injections; one per line for blockquote prefixes), applied with saturating
+arithmetic for stale-region safety. This is the same path the current pull
+diagnostics already transform through (`diagnostic.rs`); the push path adds no new
+transform. Lazy re-anchor (Versioning) simply re-applies it against the region's
+*current* `RegionOffset` at publish time.
 
 ## Considered Options
 
