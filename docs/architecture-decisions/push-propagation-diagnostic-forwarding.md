@@ -52,8 +52,8 @@ that state already exists today for other features:
   `did_change.rs`, `did_close.rs`). Downstream servers already *push*
   `publishDiagnostics` for these opened docs — that is exactly why
   `is_scratch_publish_diagnostics` filtering had to be added.
-- **Reverse map**: `document_tracker.host_to_virtual` resolves a virtual URI
-  back to `(host_uri, region_id)` (`resolve_virtual_uri`).
+- **Reverse map**: `resolve_virtual_uri` scans `document_tracker.host_to_virtual`
+  (a host→virtual map) to recover `(host_uri, region_id)` from a virtual URI.
 - **Stable region identity**: `node_tracker` assigns ULIDs that survive edits via
   position-keyed tracking, with `close_invalidated_docs` evicting regions whose
   positions are invalidated — a ready-made eviction hook.
@@ -74,16 +74,26 @@ diagnostics:
 1. The reader routes a non-scratch downstream `publishDiagnostics` into the
    diagnostic aggregator instead of dropping it at `_ => {}`. (Scratch URIs are
    still discarded earlier — concatenated-formatting-pipeline Decision point 7.)
-2. Resolve the target virtual URI to `(host_uri, region_id)` via the document
-   tracker; discard if it resolves to no live region.
-3. Store the notification in a slot keyed by `(host_uri, virtual_uri)`, retaining
-   the diagnostics in **virtual coordinates** plus the `version` from the params.
+   The push is cached regardless of how its server is classified: a spontaneous
+   push from a pull-driven server is taken too, which is what keeps #380 closed
+   even for those servers.
+2. Map the notification to a `source`. A virtual URI resolves to `(host_uri,
+   region_id)` via the document tracker (discard if it resolves to no live
+   region); a push on the real **host** URI that matches an open `_self`
+   host-bridge document is the host-layer source (host-document-bridge).
+3. Store the notification in a slot keyed by `(host_uri, source, server)` —
+   `source` is the `virtual_uri` for a region or the host URI for the host layer —
+   retaining a region's diagnostics in **virtual coordinates** (the host layer
+   needs no transform, so it stores host coordinates) plus the `version` from the
+   params. A pull-driven server's spontaneous push and its `pullFallback` pull
+   share this slot; the freshest `virtual_version` wins.
 4. Re-merge **all** slots for that `host_uri` and publish the merge to the
    client.
 
 An empty push clears only that slot; the re-merge still carries every sibling
-region. Push-driven servers feed this path natively; pull-driven servers feed it
-via the `pullFallback` toggle (see Per-server source and fallback).
+source. Push-driven servers feed this path natively; pull-driven servers feed it
+via the `pullFallback` toggle and, opportunistically, via any push they emit (see
+Per-server source and fallback).
 
 ### Path B — Client-initiated pull (retained)
 
@@ -106,6 +116,12 @@ capability so the two mechanisms never double-count the same server:
 - Advertises `diagnosticProvider` → **pull-driven** (kakehashi pulls it).
 - Otherwise → **push-driven** (kakehashi relies on its `publishDiagnostics`).
 
+LSP has no capability flag for *push* diagnostics, so push-classification is an
+inference from the absence of `diagnosticProvider`, not a declared fact — the
+`pullFallback` / `pushFallback` toggles exist precisely to recover the other
+channel when a server defies the inference (a pull-driven server that also pushes,
+or vice versa).
+
 Native source alone would make the two paths asymmetric — Path B already
 back-fills push-driven servers from the cache, but Path A would leave pull-driven
 servers with no *proactive* diagnostics. Two config toggles close the gap
@@ -114,7 +130,7 @@ paths regardless of which single mechanism it supports:
 
 | Method block (`bridge.<lang>.aggregation.<method>`) | Key | Effect when `true` (default) |
 | --- | --- | --- |
-| `textDocument/publishDiagnostics` (Path A) | `pullFallback` | Pull-driven servers are pulled on host events and merged into the same cache, so they too publish proactively. |
+| `textDocument/publishDiagnostics` (Path A) | `pullFallback` | Pull-driven servers are pulled on host events and merged into the same cache, so they too publish proactively. A pulled result has no `publishDiagnostics.version`, so its slot is stamped with the current synced virtual document version (the null-version rule below). |
 | `textDocument/diagnostic` (Path B) | `pushFallback` | Push-driven servers' cached pushes are folded into the client-pull response. |
 
 Setting a toggle to `false` restricts that path to its native servers only.
@@ -128,21 +144,25 @@ reads unambiguously out of context.
 ### Cache model
 
 ```
-host_uri ──► { (virtual_uri, server) ──► SlotEntry { diagnostics(virtual coords), virtual_version } }
+host_uri ──► { (source, server) ──► SlotEntry { diagnostics(source-local coords), virtual_version } }
 ```
 
-The slot key includes the **server**: several servers can attach to one virtual
-document (e.g. two Lua linters on one region) and each pushes independently.
-Producing the host publish is therefore two levels, mirroring the existing
-two-stage pull aggregation:
+`source` is a virtual region's URI or the host URI for the `_self` host layer;
+the key also includes the **server**, since several servers can attach to one
+source (e.g. two Lua linters on one region) and each pushes independently.
+Producing the host publish mirrors the existing staged pull aggregation:
 
-1. **Per-region fan-in** — for each virtual document, combine its servers' slots
-   per the method's `strategy`: `concatenated` appends all, `preferred` elects one
-   (see `preferred` as a push stream).
-2. **Cross-region merge** — concatenate every region's fan-in result for the host,
-   lazily transforming each slot's virtual coordinates to **current** host
+1. **Per-source fan-in** — for each source, combine its servers' slots per the
+   method's `strategy`: `concatenated` appends all, `preferred` elects one (see
+   `preferred` as a push stream).
+2. **Cross-region merge** — concatenate the per-source fan-ins of the virt layer's
+   regions, ordered by region start position (so arrival order never leaks),
+   lazily transforming each region slot's virtual coordinates to **current** host
    coordinates via the region's current offset (recovered from the stable region
-   id). Host-layer participation follows host-document-bridge.
+   id). The host layer's diagnostics are already host-local and skip the
+   transform.
+3. **Cross-layer combine** — combine the virt-layer and host-layer results per
+   cross-layer-aggregation (host-document-bridge governs host participation).
 
 The cross-region level is what republishes the cumulative host set on every push:
 when region A publishes, then the host layer, then region C, each event re-merges
@@ -182,8 +202,15 @@ document:
     `Veff`); otherwise fall through to the next entry.
   - `Rest("*")` group — the **incumbent** keeps the position while it stays
     eligible (sticky); when it loses eligibility, re-elect the earliest-arrived
-    eligible member, and **the new winner becomes the incumbent** (never snap back
-    to the original — that ping-pongs the display).
+    eligible member **measured by first arrival at the current `Veff`** (a version
+    bump restarts arrival ordering, so a stale incumbent does not retain seniority
+    from an old version), and **the new winner becomes the incumbent** (never snap
+    back to the original — that ping-pongs the display). The walk reaches the
+    group only when every higher named entry is ineligible; a named server
+    becoming eligible later preempts the group and the group's incumbency resumes
+    if the named server drops out again.
+- The first eligible source has no incumbent yet, so the bootstrap winner is
+  simply the first server to publish non-empty at `Veff`.
 - The region's fan-in result is the winner's latest diagnostics; a push that does
   not change the elected winner's content emits nothing.
 
@@ -306,13 +333,17 @@ Virtual (UTF-16) → position_to_byte → + content_start_byte → byte_to_posit
 This re-incurs the state pull-first was created to avoid; the decision accepts it
 because the #380 benefit now outweighs it:
 
-- A per-`(host, region)` diagnostic cache with lifecycle handling (host close,
-  region invalidation, server crash).
+- A per-`(host, source, server)` diagnostic cache with lifecycle handling (host
+  close, region invalidation, server crash).
 - Version/staleness logic returns (version gate + lazy re-anchor); a brief
   hold/wrong-position window remains right after an edit, self-healing on the next
   push.
 - The reader must transform and route pushes, interleaved with edits, relying on
   the per-URI ordering guarantee.
+- Re-publish is unthrottled by design (the `didChange` debounce is gone): a no-op
+  push is suppressed (winner content unchanged), but a chatty linter emitting
+  distinct results in quick succession re-publishes each time. A coalescing window
+  could be added later if it proves noisy; it is deliberately out of scope here.
 - `pullFallback` (default on) keeps a *scoped* host-event pull trigger alive for
   pull-driven servers — the per-event re-pull is removed only for push-driven
   ones, not universally. Setting it `false` drops those servers from the proactive
