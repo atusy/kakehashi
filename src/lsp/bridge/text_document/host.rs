@@ -171,6 +171,52 @@ impl LanguageServerPool {
         docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
     }
 
+    /// Forward a `textDocument/willSave` notification (#357) to every host
+    /// bridge server that **already has this host document open** and that
+    /// advertises `willSave`.
+    ///
+    /// willSave concerns the host document the editor is about to save, so it
+    /// is a verbatim passthrough (real URI, real `reason`) — no per-virtual-doc
+    /// fan-out and no coordinate translation. Restricting to servers with the
+    /// document already open mirrors the lazy host-document lifecycle: a server
+    /// that never received a request never opened the document, so a willSave
+    /// referencing an unknown document would be a protocol nuisance — and as a
+    /// fire-and-forget notification it must not lazily spawn a connection just
+    /// to announce a save (issue Q3, latency).
+    ///
+    /// Lock discipline matches [`Self::close_host_bridge_document`]: connection
+    /// handles are pre-fetched before the `host_documents` lock (consistent
+    /// `connections` → `host_documents` ordering with the respawn purge), and
+    /// the notifications are queued while the lock is held so a concurrent
+    /// open/close cannot interleave inconsistently.
+    pub(crate) async fn notify_host_will_save(
+        &self,
+        uri: &Url,
+        params: &tower_lsp_server::ls_types::WillSaveTextDocumentParams,
+    ) {
+        let uri_string = uri.to_string();
+
+        let handles: Vec<(ConnectionKey, Arc<ConnectionHandle>)> = {
+            let connections = self.connections().await;
+            connections
+                .iter()
+                .map(|(key, handle)| (key.clone(), Arc::clone(handle)))
+                .collect()
+        };
+
+        let docs = self.host_documents().await;
+        for (connection_key, handle) in &handles {
+            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
+                continue;
+            }
+            if !handle.has_capability("textDocument/willSave") {
+                continue;
+            }
+            let notification = JsonRpcNotification::new("textDocument/willSave", params);
+            handle.send_notification(notification);
+        }
+    }
+
     /// Send a host bridge request with the upstream params forwarded
     /// **verbatim** (host-document-bridge): the params already reference the
     /// real URI and real coordinates, so no per-method request shaping is

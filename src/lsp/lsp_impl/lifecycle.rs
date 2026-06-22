@@ -198,6 +198,13 @@ impl Kakehashi {
         // capability not advertised, matching previous behavior.
         let on_type_formatting_triggers =
             crate::config::settings::on_type_formatting_trigger_union(&settings.language_servers);
+        // Gate the willSave capability on host bridging being configured (#357):
+        // willSave forwards only to host-bridge servers, so advertising it when
+        // no language opts in would make the editor send a notification nothing
+        // consumes. Computed before `settings` moves into apply_raw_settings,
+        // like the trigger union above. willSaveWaitUntil shares this gate but
+        // is wired in a later change.
+        let host_bridging_enabled = settings.any_host_bridging_enabled();
         self.apply_raw_settings(raw_settings, settings).await;
 
         self.notifier().log_info("server initialized!").await;
@@ -212,7 +219,9 @@ impl Kakehashi {
                     TextDocumentSyncOptions {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::INCREMENTAL),
-                        will_save: None,
+                        // Advertised only when a host bridge is configured (#357);
+                        // forwarded verbatim to host-bridge servers.
+                        will_save: host_bridging_enabled.then_some(true),
                         will_save_wait_until: None,
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                             include_text: Some(false),
