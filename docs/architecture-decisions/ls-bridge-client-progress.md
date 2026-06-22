@@ -100,8 +100,8 @@ once data is delivered, the lifecycle is committed.
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
   path (which assumes a single final blob today and must accept incremental
-  input). *Preferred* streams the winner's translated chunks; *concatenated*
-  concatenates all contributors' translated chunks.
+  input). Under *preferred* the bridge streams the winner's translated chunks;
+  under *concatenated* it concatenates all contributors' translated chunks.
 
 The terminal `End` the bridge emits on failure is the same primitive
 ls-bridge-progress-disconnect-cleanup uses for server-declared tokens — the
@@ -179,5 +179,5 @@ are stripped before fan-out. Specific points to settle during implementation:
   while `workDoneToken` is bridged — a valid intermediate phase. Without
   partial-result accumulation a failed winner always looks empty and falls
   through to the next candidate, which is acceptable.
-- Percentage composition under `concatenated` (`n/m`) is a display heuristic, not
+- Percentage composition under *concatenated* (`n/m`) is a display heuristic, not
   a contract.
