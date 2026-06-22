@@ -111,6 +111,23 @@ impl VirtualDocumentUri {
                 .is_some_and(|(_name, ext)| !ext.is_empty())
     }
 
+    /// Extract the `region_id` from a virtual-document URI string, or `None` if
+    /// it isn't one. Parses the same `{prefix}{region_id}.{ext}` filename shape
+    /// as [`Self::is_virtual_uri`] (the `region_id` is a dot-free ULID, so the
+    /// last `.` separates it from the extension). Used as a cheap pre-filter when
+    /// scanning open virtual documents (`DocumentTracker::resolve_virtual_uri`).
+    pub(crate) fn region_id_of(uri: &str) -> Option<String> {
+        let url = url::Url::parse(uri).ok()?;
+        let filename = url.path_segments().and_then(|mut s| s.next_back())?;
+        let (region_id, ext) = filename
+            .strip_prefix(VIRTUAL_URI_PREFIX)?
+            .rsplit_once('.')?;
+        if ext.is_empty() {
+            return None;
+        }
+        Some(region_id.to_string())
+    }
+
     /// Marker embedded in the `region_id` of throwaway scratch documents the
     /// concatenated formatting pipeline opens per step
     /// (concatenated-formatting-pipeline Decision point 7). Shared here so the
@@ -750,6 +767,27 @@ mod tests {
             VirtualDocumentUri::is_virtual_uri(&uri_string),
             "Fallback URI should be detected as virtual: {}",
             uri_string
+        );
+    }
+
+    #[test]
+    fn region_id_of_round_trips_to_uri_string() {
+        // Standard (file://) form and the cannot-be-a-base fallback form both
+        // recover the region_id.
+        for host in ["file:///project/doc.md", "untitled:Untitled-1"] {
+            let host_uri: Uri = host.parse().unwrap();
+            let uri = VirtualDocumentUri::new(&host_uri, "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            assert_eq!(
+                VirtualDocumentUri::region_id_of(&uri.to_uri_string()).as_deref(),
+                Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+                "round-trip region_id for host {host}"
+            );
+        }
+
+        // Non-virtual URIs yield None.
+        assert_eq!(
+            VirtualDocumentUri::region_id_of("file:///project/main.rs"),
+            None
         );
     }
 }
