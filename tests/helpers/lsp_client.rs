@@ -255,17 +255,22 @@ fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
             };
         }
 
-        let Some(rest) = header.strip_prefix("Content-Length:") else {
-            // Some other header (e.g. Content-Type); ignore and keep reading.
+        // LSP header names are case-insensitive (HTTP-style framing), so match
+        // the field name accordingly. Lines without a colon, or other headers
+        // (e.g. Content-Type), are ignored.
+        let Some((name, value)) = header.split_once(':') else {
             continue;
         };
+        if !name.trim().eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
 
-        let len: usize = match rest.trim().parse() {
+        let len: usize = match value.trim().parse() {
             Ok(n) => n,
             Err(_) => {
                 return ReadOutcome::Error(format!(
                     "Invalid Content-Length value: {:?}",
-                    rest.trim()
+                    value.trim()
                 ));
             }
         };
@@ -691,6 +696,16 @@ mod tests {
             Content-Length: 13\r\n\
             \r\n\
             {\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// LSP header names are case-insensitive, so `content-length` must parse.
+    #[test]
+    fn read_framed_message_matches_content_length_case_insensitively() {
+        let mut input = &b"content-length: 13\r\n\r\n{\"jsonrpc\":1}"[..];
         match read_framed_message(&mut input) {
             ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
             other => panic!("expected Message, got {:?}", outcome_label(&other)),
