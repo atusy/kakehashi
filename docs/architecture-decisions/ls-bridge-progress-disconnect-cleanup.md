@@ -63,7 +63,8 @@ ls-bridge-client-progress relies on for client-provided tokens.
   in flight. Rejected in favor of ending on every reader exit.
 - **Synthesize a `window/workDoneProgress/cancel` instead.** Cancel is an
   editor→server signal; the terminal the editor expects for a progress it created
-  is an `End` report, not a cancel it would route back to a now-dead connection.
+  is an `end`-kind `$/progress` notification, not a cancel it would route back to
+  a now-dead connection.
   Rejected.
 
 ## Consequences
