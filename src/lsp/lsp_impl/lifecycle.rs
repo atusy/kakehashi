@@ -321,11 +321,13 @@ impl Kakehashi {
                 Arc::clone(&self.language),
                 Arc::clone(&self.bridge),
             )));
+            let inbound_request_registry = self.bridge.pool().inbound_request_registry();
             tokio::spawn(upstream_forwarding_loop(
                 upstream_rx,
                 window_rx,
                 upstream_request_rx,
                 show_document_translator,
+                inbound_request_registry,
                 client,
                 token,
             ));
@@ -437,6 +439,7 @@ async fn upstream_forwarding_loop(
         crate::lsp::bridge::UpstreamRequest,
     >,
     show_document_translator: Option<Arc<ShowDocumentTranslator>>,
+    inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     client: Client,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
@@ -483,7 +486,12 @@ async fn upstream_forwarding_loop(
                     // requests are user-paced/low-volume, so this can't starve
                     // `window_rx` in turn.
                     Some(request) => {
-                        spawn_upstream_request(show_document_translator.clone(), &client, request)
+                        spawn_upstream_request(
+                            inbound_request_registry.clone(),
+                            show_document_translator.clone(),
+                            &client,
+                            request,
+                        )
                     }
                     None => break, // Channel closed
                 }
@@ -574,7 +582,39 @@ async fn send_editor_request(
     }
 }
 
+/// Forward a request to the editor, racing it against the downstream's cancel
+/// signal (#404). If the cancel fires first, send a correlated `$/cancelRequest`
+/// to the editor with the id we minted — so a `showMessageRequest` dialog is
+/// dismissed — and return `None`, so the downstream gets the protocol default.
+/// The editor's eventual (cancelled) response is dropped.
+async fn forward_with_cancel(
+    client: &Client,
+    editor_id: tower_lsp_server::jsonrpc::Id,
+    method: &'static str,
+    params: serde_json::Value,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> Option<serde_json::Value> {
+    tokio::select! {
+        result = send_editor_request(client, editor_id.clone(), method, params) => result,
+        () = cancel_token.cancelled() => {
+            use tower_lsp_server::ls_types::notification::Cancel;
+            use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
+            // The id we minted is always numeric (next_request_id); map it to the
+            // notification's NumberOrString. Values are a small monotonic counter,
+            // so the i32 narrowing is lossless in practice.
+            let id = match editor_id {
+                tower_lsp_server::jsonrpc::Id::Number(n) => NumberOrString::Number(n as i32),
+                tower_lsp_server::jsonrpc::Id::String(s) => NumberOrString::String(s),
+                tower_lsp_server::jsonrpc::Id::Null => return None,
+            };
+            client.send_notification::<Cancel>(CancelParams { id }).await;
+            None
+        }
+    }
+}
+
 fn spawn_upstream_request(
+    inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     show_document_translator: Option<Arc<ShowDocumentTranslator>>,
     client: &Client,
     request: crate::lsp::bridge::UpstreamRequest,
@@ -591,6 +631,7 @@ fn spawn_upstream_request(
                 message,
                 actions,
                 reply,
+                cancel,
             } => {
                 let id = client.next_request_id();
                 let params = serde_json::to_value(ShowMessageRequestParams {
@@ -599,13 +640,24 @@ fn spawn_upstream_request(
                     actions,
                 })
                 .unwrap_or(serde_json::Value::Null);
-                let action = send_editor_request(&client, id, "window/showMessageRequest", params)
-                    .await
-                    .and_then(|v| serde_json::from_value::<Option<MessageActionItem>>(v).ok())
-                    .flatten();
+                let action = forward_with_cancel(
+                    &client,
+                    id,
+                    "window/showMessageRequest",
+                    params,
+                    &cancel.token,
+                )
+                .await
+                .and_then(|v| serde_json::from_value::<Option<MessageActionItem>>(v).ok())
+                .flatten();
+                inbound_request_registry.unregister(cancel.connection_id, &cancel.request_id);
                 let _ = reply.send(action);
             }
-            UpstreamRequest::ShowDocument { params, reply } => {
+            UpstreamRequest::ShowDocument {
+                params,
+                reply,
+                cancel,
+            } => {
                 // Translate a virtual-document URI + selection back to the host
                 // document before forwarding, so the editor opens the real file
                 // (#403). For a resolvable virtual URI the host URI is always
@@ -618,11 +670,13 @@ fn spawn_upstream_request(
                 };
                 let id = client.next_request_id();
                 let value = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
-                let success = send_editor_request(&client, id, "window/showDocument", value)
-                    .await
-                    .and_then(|v| serde_json::from_value::<ShowDocumentResult>(v).ok())
-                    .map(|r| r.success)
-                    .unwrap_or(false);
+                let success =
+                    forward_with_cancel(&client, id, "window/showDocument", value, &cancel.token)
+                        .await
+                        .and_then(|v| serde_json::from_value::<ShowDocumentResult>(v).ok())
+                        .map(|r| r.success)
+                        .unwrap_or(false);
+                inbound_request_registry.unregister(cancel.connection_id, &cancel.request_id);
                 let _ = reply.send(success);
             }
         }
@@ -766,6 +820,15 @@ async fn upstream_forwarding_loop_with_cancel(
 mod tests {
     use super::*;
 
+    /// A throwaway cancel context for tests that don't exercise cancellation.
+    fn test_forwarded_cancel() -> crate::lsp::bridge::ForwardedRequestCancel {
+        crate::lsp::bridge::ForwardedRequestCancel {
+            connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            request_id: tower_lsp_server::jsonrpc::Id::Number(1),
+            token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     /// Regression guard for the create-before-progress ordering the feature
     /// depends on: the forwarding loop must deliver `window/workDoneProgress/create`
     /// to the editor (and receive its reply) BEFORE the corresponding `$/progress`.
@@ -830,6 +893,7 @@ mod tests {
             window_rx,
             request_rx,
             None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
             cancel.clone(),
         ));
@@ -938,6 +1002,7 @@ mod tests {
             window_rx,
             request_rx,
             None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
             cancel.clone(),
         ));
@@ -1049,6 +1114,7 @@ mod tests {
             window_rx,
             request_rx,
             None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
             cancel.clone(),
         ));
@@ -1222,6 +1288,7 @@ mod tests {
             window_rx,
             request_rx,
             None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
             cancel.clone(),
         ));
@@ -1235,6 +1302,7 @@ mod tests {
                     serde_json::from_value(serde_json::json!({ "title": "Retry" })).unwrap(),
                 ]),
                 reply: reply_tx,
+                cancel: test_forwarded_cancel(),
             })
             .unwrap();
 
@@ -1275,6 +1343,7 @@ mod tests {
             window_rx,
             request_rx,
             None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
             cancel.clone(),
         ));
@@ -1285,6 +1354,7 @@ mod tests {
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
                 reply: reply_tx,
+                cancel: test_forwarded_cancel(),
             })
             .unwrap();
 
@@ -1304,6 +1374,87 @@ mod tests {
         let _ = loop_handle.await;
     }
 
+    /// #404: when a downstream's in-flight forwarded request is cancelled, the
+    /// loop must forward a correlated `$/cancelRequest` to the editor (same id it
+    /// minted) so the dialog is dismissed, and answer the downstream with the
+    /// protocol default.
+    #[tokio::test]
+    async fn forwarding_loop_forwards_cancel_to_editor() {
+        use crate::lsp::bridge::{ForwardedRequestCancel, InboundRequestRegistry, UpstreamRequest};
+        use futures::StreamExt;
+        use std::time::Duration;
+        use tokio::time::timeout;
+        use tower_lsp_server::ls_types::MessageType;
+
+        let (client, mut requests, mut _responses) = init_client_and_socket().await;
+        let (_upstream_tx, upstream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_cancel = tokio_util::sync::CancellationToken::new();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            upstream_rx,
+            window_rx,
+            request_rx,
+            None,
+            InboundRequestRegistry::default(),
+            client,
+            loop_cancel.clone(),
+        ));
+
+        // The per-request cancel token the reader would have registered.
+        let request_token = tokio_util::sync::CancellationToken::new();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        request_tx
+            .send(UpstreamRequest::ShowMessageRequest {
+                typ: MessageType::INFO,
+                message: "pick one".to_string(),
+                actions: None,
+                reply: reply_tx,
+                cancel: ForwardedRequestCancel {
+                    connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+                    request_id: tower_lsp_server::jsonrpc::Id::Number(1),
+                    token: request_token.clone(),
+                },
+            })
+            .unwrap();
+
+        // The editor receives the forwarded request; we deliberately never answer.
+        let req = timeout(Duration::from_secs(5), requests.next())
+            .await
+            .expect("timed out awaiting showMessageRequest")
+            .expect("showMessageRequest emitted");
+        assert_eq!(req.method(), "window/showMessageRequest");
+        let editor_id = req.id().expect("request has an id").clone();
+
+        // Downstream cancels → the loop forwards `$/cancelRequest` to the editor
+        // with the same id, then answers the downstream with the default.
+        request_token.cancel();
+
+        let cancel_msg = timeout(Duration::from_secs(5), requests.next())
+            .await
+            .expect("timed out awaiting forwarded $/cancelRequest")
+            .expect("cancel forwarded to editor");
+        let wire = serde_json::to_value(&cancel_msg).expect("serialize cancel request");
+        assert_eq!(wire["method"], "$/cancelRequest");
+        assert_eq!(
+            wire["params"]["id"],
+            serde_json::to_value(&editor_id).unwrap(),
+            "cancel targets the id the editor saw"
+        );
+
+        let action = timeout(Duration::from_secs(5), reply_rx)
+            .await
+            .expect("timed out awaiting downstream reply")
+            .expect("reply delivered");
+        assert!(
+            action.is_none(),
+            "a cancelled request answers with no selection"
+        );
+
+        loop_cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
     #[tokio::test]
     async fn forwarding_loop_delivers_telemetry_event() {
         use crate::lsp::bridge::UpstreamNotification;
@@ -1320,6 +1471,7 @@ mod tests {
             window_rx,
             request_rx,
             None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
             cancel.clone(),
         ));

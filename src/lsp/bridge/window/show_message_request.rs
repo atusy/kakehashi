@@ -23,7 +23,9 @@ use tokio::sync::oneshot;
 use tower_lsp_server::jsonrpc;
 use tower_lsp_server::ls_types::ShowMessageRequestParams;
 
-use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamRequest, send_server_response};
+use crate::lsp::bridge::actor::{
+    ForwardedRequestCancel, ServerRequestDeps, UpstreamRequest, send_server_response,
+};
 
 const METHOD: &str = "window/showMessageRequest";
 
@@ -57,16 +59,31 @@ pub(in crate::lsp::bridge) fn handle(
         }
     };
 
+    // Register the in-flight request BEFORE enqueueing it, so a downstream
+    // `$/cancelRequest` racing in right after can't miss it (#404). The reader
+    // fires this token on cancel / connection death; the forwarding loop awaits
+    // it and, if fired, sends a correlated `$/cancelRequest` to the editor.
+    let connection_id = deps.progress_connection_id;
+    let token = deps
+        .inbound_request_registry
+        .register(connection_id, id.clone());
+    let cancel = ForwardedRequestCancel {
+        connection_id,
+        request_id: id.clone(),
+        token,
+    };
+
     let (reply_tx, reply_rx) = oneshot::channel();
 
     // Spawn the responder first; it owns `reply_rx`. If the request below fails
     // to enqueue (forwarding loop gone), `reply_tx` drops and `reply_rx` resolves
     // to `Err`, which maps to `None` (no selection) — so the downstream always
     // gets a response without a special-cased "loop gone" reply path.
+    let response_id = id.clone();
     tokio::spawn(async move {
         let action = reply_rx.await.unwrap_or(None);
         let result = serde_json::to_value(action).unwrap_or(serde_json::Value::Null);
-        let response = jsonrpc::Response::from_ok(id, result);
+        let response = jsonrpc::Response::from_ok(response_id, result);
         send_server_response(&response_tx, response, &server_prefix_owned, METHOD).await;
     });
 
@@ -77,9 +94,13 @@ pub(in crate::lsp::bridge) fn handle(
             message: params.message,
             actions: params.actions,
             reply: reply_tx,
+            cancel,
         })
         .is_err()
     {
+        // Forwarding loop gone (shutdown): drop the registry entry we just made.
+        // The responder still answers `null` via the dropped `reply_tx`.
+        deps.inbound_request_registry.unregister(connection_id, &id);
         debug!(
             target: "kakehashi::bridge::reader",
             "{}Forwarding loop gone; answering {} with null",
