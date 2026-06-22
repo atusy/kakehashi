@@ -71,9 +71,13 @@ Partially implemented:
   `save.includeText = true`**: kakehashi advertises `includeText = false`
   upstream and so never receives the editor's saved bytes, so rather than send a
   contract-violating textless didSave it declines (the server still has current
-  content from didChange). Both are fire-and-forget (no lazy spawn). `willSave`
-  is advertised whenever a runnable bridge server (host or virt) is configured;
-  `didSave` is always advertised to the editor (`save.includeText = false`).
+  content from didChange). That gate reads **static** capabilities only — a
+  *dynamic* didSave registration is not honored for forwarding, since the
+  method-name-only dynamic registry cannot carry `includeText` and could
+  otherwise smuggle an `includeText = true` server past the filter. Both are
+  fire-and-forget (no lazy spawn). `willSave` is advertised whenever a runnable
+  bridge server (host or virt) is configured; `didSave` is always advertised to
+  the editor (`save.includeText = false`).
 
   **`willSaveWaitUntil` (the request) remains host-only** and bypasses the
   layer walk: it forwards verbatim and returns the host servers' `TextEdit[]`

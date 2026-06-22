@@ -16,7 +16,7 @@
 use tower_lsp_server::ls_types::TextDocumentSaveReason;
 use url::Url;
 
-use super::super::pool::{ConnectionState, LanguageServerPool};
+use super::super::pool::{ConnectionHandle, ConnectionState, LanguageServerPool};
 use super::super::protocol::JsonRpcNotification;
 
 impl LanguageServerPool {
@@ -32,7 +32,7 @@ impl LanguageServerPool {
         self.forward_save_notification_to_virtual_docs(
             host_uri,
             "textDocument/willSave",
-            "textDocument/willSave",
+            |handle| handle.has_capability("textDocument/willSave"),
             |virtual_uri| {
                 serde_json::json!({ "textDocument": { "uri": virtual_uri }, "reason": reason })
             },
@@ -41,46 +41,50 @@ impl LanguageServerPool {
     }
 
     /// Forward `textDocument/didSave` to every open virtual document of
-    /// `host_uri`, on each live server that advertises `save` (#357).
+    /// `host_uri`, on each live server that accepts a textless didSave (#357).
     ///
     /// The notification carries no `text`. Servers that demand
-    /// `save.includeText = true` are filtered out by the capability gate
-    /// (`has_capability("textDocument/didSave")`) rather than served a textless
-    /// didSave: kakehashi advertises `includeText = false` upstream and so never
-    /// receives the editor's saved bytes to forward. Servers that accept
+    /// `save.includeText = true` are filtered out by
+    /// [`ConnectionHandle::accepts_textless_did_save`] rather than served a
+    /// textless didSave: kakehashi advertises `includeText = false` upstream and
+    /// so never receives the editor's saved bytes to forward. Servers that accept
     /// textless didSave already have current content from the didChange stream.
+    /// That gate reads STATIC capabilities only, so a dynamic didSave
+    /// registration (whose options the method-name-only dynamic registry can't
+    /// carry) cannot smuggle an `includeText = true` server past the filter.
     pub(crate) async fn forward_did_save_to_virtual_docs(&self, host_uri: &Url) {
         self.forward_save_notification_to_virtual_docs(
             host_uri,
             "textDocument/didSave",
-            "textDocument/didSave",
+            ConnectionHandle::accepts_textless_did_save,
             |virtual_uri| serde_json::json!({ "textDocument": { "uri": virtual_uri } }),
         )
         .await;
     }
 
     /// Shared fan-out: snapshot the host's open virtual docs and send `method`
-    /// to each live/Ready connection that advertises `capability`, with the
-    /// params built per virtual document by `build_params` (the virtual URI is
-    /// the document the downstream server actually knows).
+    /// to each live/Ready connection accepted by `supports`, with the params
+    /// built per virtual document by `build_params` (the virtual URI is the
+    /// document the downstream server actually knows).
     ///
-    /// The `host_to_virtual` list is necessarily snapshotted lock-free, so each
-    /// send is guarded against a stale target by holding `connections` across
-    /// the liveness recheck AND the send (order `connections` → tracker,
-    /// matching the respawn purge in `pool.rs`):
+    /// The `host_to_virtual` list is snapshotted under its own lock, which is
+    /// released before `connections` is taken — so each send is guarded against
+    /// a stale target by holding `connections` across the liveness recheck AND
+    /// the send (order `connections` → tracker, matching the respawn purge in
+    /// `pool.rs`):
     /// - `connections` is taken once after the snapshot and held across the
     ///   whole loop — no `.await` happens inside it. While it is held a respawn
     ///   purge cannot interleave, so a replacement process can never be installed
     ///   between the recheck and the send (a reverse-index check alone would NOT
     ///   close this — the purge could swap in a fresh Ready handle that never
     ///   opened the doc);
-    /// - the handle must be the current `Ready` one and advertise the capability
-    ///   (cheap checks, done first);
+    /// - the handle must be the current `Ready` one and pass `supports` (cheap
+    ///   checks, done first);
     /// - the `(virtual_uri, connection)` pair must STILL be in the **live**
     ///   reverse index ([`Self::is_virtual_doc_open_on_connection`]) — dropping a
     ///   doc a concurrent `didClose` removed (best-effort, the same accepted
     ///   TOCTOU `forward_didchange_to_opened_docs` has). This (cheap, but a
-    ///   tracker lookup) runs last so it is skipped for un-Ready/incapable docs.
+    ///   tracker lookup) runs last so it is skipped for un-Ready/unsupported docs.
     ///
     /// `send_notification` is a non-blocking queue write (FIFO single-writer
     /// loop, ls-bridge-message-ordering), so holding `connections` across the
@@ -89,18 +93,23 @@ impl LanguageServerPool {
         &self,
         host_uri: &Url,
         method: &'static str,
-        capability: &'static str,
+        supports: impl Fn(&ConnectionHandle) -> bool,
         build_params: impl Fn(&str) -> serde_json::Value,
     ) {
         let docs = self.host_virtual_docs(host_uri).await;
+        // Common path (saving a file with no open injections): skip the
+        // `connections` lock entirely.
+        if docs.is_empty() {
+            return;
+        }
         let connections = self.connections().await;
         for doc in docs {
-            // Cheap checks first: the current Ready handle that advertises the
-            // capability (all under the held `connections` lock, purge excluded).
+            // Cheap checks first: the current Ready handle that supports this
+            // notification (all under the held `connections` lock, purge excluded).
             let Some(handle) = connections.get(&doc.connection_key) else {
                 continue;
             };
-            if handle.state() != ConnectionState::Ready || !handle.has_capability(capability) {
+            if handle.state() != ConnectionState::Ready || !supports(handle) {
                 continue;
             }
             // Compute the virtual URI string once and reuse it for both the
