@@ -109,3 +109,56 @@ impl ShowDocumentTranslator {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use tower_lsp_server::ls_types::{Position, Range, Uri};
+
+    fn translator() -> ShowDocumentTranslator {
+        ShowDocumentTranslator::new(
+            Arc::new(DocumentStore::new()),
+            Arc::new(LanguageCoordinator::new()),
+            Arc::new(BridgeCoordinator::new()),
+        )
+    }
+
+    fn params(uri: &str) -> ShowDocumentParams {
+        ShowDocumentParams {
+            uri: Uri::from_str(uri).unwrap(),
+            external: None,
+            take_focus: None,
+            selection: Some(Range::new(Position::new(1, 2), Position::new(3, 4))),
+        }
+    }
+
+    #[tokio::test]
+    async fn passes_through_non_virtual_uri_unchanged() {
+        let original = params("file:///project/main.rs");
+        let out = translator().translate(original.clone()).await;
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn passes_through_external_resource_unchanged() {
+        let mut original = params("https://example.com/");
+        original.external = Some(true);
+        let out = translator().translate(original.clone()).await;
+        assert_eq!(out, original);
+    }
+
+    #[tokio::test]
+    async fn passes_through_unknown_virtual_uri_unchanged() {
+        // A well-formed virtual URI that no open document maps to: the tracker
+        // miss must fall back to verbatim forwarding (no host translation).
+        let host = Uri::from_str("file:///project/doc.md").unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&host, "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV").to_uri_string();
+        assert!(VirtualDocumentUri::is_virtual_uri(&virtual_uri));
+
+        let original = params(&virtual_uri);
+        let out = translator().translate(original.clone()).await;
+        assert_eq!(out, original);
+    }
+}
