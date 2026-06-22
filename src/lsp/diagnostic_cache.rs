@@ -12,20 +12,34 @@
 //! / server later.
 //!
 //! ## Staging
-//! This commit unifies the existing host-event pull feed onto the cache without
-//! behavior change: the pull's already cross-layer-combined result is stored as
-//! the single [`DiagnosticSource::PullLayer`] blob (host coordinates) and the
-//! publisher emits it. A follow-up adds [downstream pushes] as per-`(region,
-//! server)` slots in virtual coordinates (transformed at publish time), the
-//! `_self` host-layer source, and the `content_epoch` version gate.
+//! Two source kinds are populated:
+//! - [`DiagnosticSource::PullLayer`] — the host-event pull's already
+//!   cross-layer-combined result, in host coordinates, as one blob.
+//! - [`DiagnosticSource::Region`] — a downstream push for an injection region, in
+//!   virtual coordinates, transformed to host coordinates at publish time.
+//!
+//! **Known interim overlap (deferred capability gate).** The pull feed fans out
+//! to *every* configured region server with no capability classification, so a
+//! server that both answers `textDocument/diagnostic` (landing in `PullLayer`)
+//! *and* spontaneously pushes `publishDiagnostics` (landing in a `Region` slot) is
+//! counted twice. In practice the two channels are disjoint — a pull-capable
+//! server should not also push (LSP) — so this only *duplicates*, never *hides*,
+//! and only for a misbehaving server. The deferred `pullFallback` / capability
+//! classification removes the overlap by giving each server one native source.
+//!
+//! Also deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
+//! visible-walk; cross-source order is HashMap-nondeterministic until then), the
+//! `_self` host-layer push source, the `content_epoch` version gate, and
+//! region-invalidation/crash eviction.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 
 use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
 
-use crate::lsp::bridge::{RegionOffset, translate_virtual_range_to_host};
+use crate::error::LockResultExt;
+use crate::lsp::bridge::{RegionOffset, VirtualDocumentUri, translate_virtual_range_to_host};
 
 /// Which contributor a slot belongs to under a host document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,9 +90,11 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// strategy). Per-source strategy fan-in (`preferred` sticky / `concatenated`
 /// visible-walk) and `relatedInformation` range translation are follow-ups.
 pub(crate) fn merge_cached_diagnostics(
+    host: &Url,
     snapshot: &SourceSlots,
     region_offsets: &HashMap<String, RegionOffset>,
 ) -> Vec<Diagnostic> {
+    let host_str = host.as_str();
     let mut merged = Vec::new();
     for (source, servers) in snapshot {
         match source {
@@ -90,7 +106,7 @@ pub(crate) fn merge_cached_diagnostics(
                 for slot in servers.values() {
                     for diagnostic in &slot.diagnostics {
                         let mut diagnostic = diagnostic.clone();
-                        translate_virtual_range_to_host(&mut diagnostic.range, offset);
+                        transform_region_diagnostic(&mut diagnostic, offset, host_str);
                         merged.push(diagnostic);
                     }
                 }
@@ -105,15 +121,51 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
+/// Transform a pushed region diagnostic from virtual to host coordinates.
+///
+/// Mirrors the pull path's `transform_diagnostic`
+/// (`bridge::text_document::diagnostic`): the main range is shifted by the
+/// region offset, and `relatedInformation` entries referencing **virtual** URIs
+/// are dropped (clients cannot resolve them — without this they would leak to the
+/// editor); entries on the same host document are translated, others kept as-is.
+fn transform_region_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, host_uri: &str) {
+    translate_virtual_range_to_host(&mut diag.range, offset);
+    if let Some(related) = &mut diag.related_information {
+        related.retain_mut(|info| {
+            let uri_str = info.location.uri.as_str();
+            if VirtualDocumentUri::is_virtual_uri(uri_str) {
+                return false;
+            }
+            if uri_str == host_uri {
+                translate_virtual_range_to_host(&mut info.location.range, offset);
+            }
+            true
+        });
+    }
+}
+
 /// The per-host diagnostic slot cache (see module docs).
 #[derive(Default)]
 pub(crate) struct DiagnosticAggregator {
     cache: Mutex<HashMap<Url, SourceSlots>>,
+    /// Serializes the publisher's snapshot→merge→publish so two concurrent
+    /// republishes (a region push vs a host-event pull, on different tasks)
+    /// cannot interleave and emit out of order — which would let a stale snapshot
+    /// publish *after* a fresh one and permanently hide diagnostics on a quiescent
+    /// file. Global (not per-host) for simplicity; republishes are per diagnostic
+    /// event, not hot. A per-host lock is a possible follow-up.
+    republish_lock: tokio::sync::Mutex<()>,
 }
 
 impl DiagnosticAggregator {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Acquire the global republish lock; held by the publisher across
+    /// snapshot→merge→publish so emissions stay ordered (see field docs).
+    pub(crate) async fn lock_republish(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.republish_lock.lock().await
     }
 
     /// Record (replacing) one server's diagnostics for a `(host, source)`.
@@ -164,7 +216,9 @@ impl DiagnosticAggregator {
         // Recover from a poisoned lock rather than propagating a panic: a
         // diagnostic cache is best-effort state, never a correctness invariant
         // worth crashing the server over.
-        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+        self.cache
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache")
     }
 }
 
@@ -241,7 +295,7 @@ mod tests {
     fn merge_concatenates_pull_layer() {
         let agg = DiagnosticAggregator::new();
         agg.set_pull_layer(&host(), vec![diag("a"), diag("b")]);
-        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &HashMap::new());
+        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &HashMap::new());
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["a", "b"]);
@@ -249,7 +303,7 @@ mod tests {
 
     #[test]
     fn merge_of_empty_snapshot_is_empty() {
-        assert!(merge_cached_diagnostics(&SourceSlots::new(), &HashMap::new()).is_empty());
+        assert!(merge_cached_diagnostics(&host(), &SourceSlots::new(), &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -264,10 +318,63 @@ mod tests {
         let mut offsets = HashMap::new();
         // Region r1 sits at host line 5, column offset 4 on its first line.
         offsets.insert("r1".to_string(), RegionOffset::new(5, 4));
-        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &offsets);
         assert_eq!(merged.len(), 1);
         // line 0 -> 0+5, character 2 -> 2+4
         assert_eq!(merged[0].range.start, Position::new(5, 6));
+    }
+
+    #[test]
+    fn merge_drops_virtual_related_information_and_translates_host() {
+        use std::str::FromStr;
+        use tower_lsp_server::ls_types::{DiagnosticRelatedInformation, Location, Uri as LsUri};
+
+        let host_uri = "file:///doc.md";
+        let related = |uri: &str, line: u32| DiagnosticRelatedInformation {
+            location: Location {
+                uri: LsUri::from_str(uri).unwrap(),
+                range: Range::new(Position::new(line, 0), Position::new(line, 1)),
+            },
+            message: uri.to_string(),
+        };
+        let mut d = diag_at("err", 0, 0);
+        d.related_information = Some(vec![
+            related("file:///doc.md/kakehashi-virtual-uri-R.lua", 0), // virtual -> dropped
+            related(host_uri, 0),                                     // host -> translated
+            related("file:///other.lua", 3),                          // other -> kept as-is
+        ]);
+
+        let agg = DiagnosticAggregator::new();
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r1".into()),
+            "luals".into(),
+            vec![d],
+        );
+        let mut offsets = HashMap::new();
+        offsets.insert("r1".to_string(), RegionOffset::new(5, 0));
+        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &offsets);
+
+        let related = merged[0].related_information.as_ref().unwrap();
+        assert_eq!(related.len(), 2, "virtual-URI related info is dropped");
+        let host_entry = related
+            .iter()
+            .find(|r| r.location.uri.as_str() == host_uri)
+            .unwrap();
+        assert_eq!(
+            host_entry.location.range.start,
+            Position::new(5, 0),
+            "host-document related info is translated by the offset"
+        );
+        let other = related
+            .iter()
+            .find(|r| r.location.uri.as_str() == "file:///other.lua")
+            .unwrap();
+        assert_eq!(
+            other.location.range.start,
+            Position::new(3, 0),
+            "other-document related info keeps its coordinates"
+        );
     }
 
     #[test]
@@ -280,7 +387,7 @@ mod tests {
             vec![diag("stale")],
         );
         // No offset for "gone" -> region is stale -> skipped.
-        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &HashMap::new());
+        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &HashMap::new());
         assert!(merged.is_empty());
     }
 
@@ -296,7 +403,7 @@ mod tests {
         agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(2, 0));
-        let merged = merge_cached_diagnostics(&agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &offsets);
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["pull", "push"]);

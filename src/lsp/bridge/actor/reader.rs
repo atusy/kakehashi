@@ -2359,6 +2359,60 @@ mod tests {
         );
     }
 
+    /// A malformed `diagnostics` array must be dropped, not routed as an empty
+    /// (clearing) push — otherwise a parse error would silently wipe the region.
+    /// An empty array, by contrast, is a legitimate clear and is routed.
+    #[tokio::test]
+    async fn handle_message_drops_malformed_but_routes_empty_publish_diagnostics() {
+        let make_deps = || {
+            let (response_tx, _response_rx) = mpsc::channel(16);
+            let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
+            let (window_tx, _window_rx) = mpsc::channel(16);
+            let deps = ServerRequestDeps {
+                server_name: Some("luals".to_string()),
+                response_tx,
+                dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+                upstream_tx,
+                workspace_folders: WorkspaceFolderSet::new(None),
+                window_tx,
+                upstream_request_tx: mpsc::unbounded_channel().0,
+                inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+                progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+                progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            };
+            (deps, upstream_rx)
+        };
+        let uri = "file:///project/kakehashi-virtual-uri-REGION.lua";
+
+        // Malformed: `diagnostics` is not an array of Diagnostic -> dropped.
+        let (deps, mut upstream_rx) = make_deps();
+        let malformed = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": [{"range": "not-a-range"}]}
+        });
+        handle_message(malformed, &ResponseRouter::new(), "", &deps).await;
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "malformed diagnostics must be dropped, not routed"
+        );
+
+        // Empty array: a legitimate clear -> routed with an empty Vec.
+        let (deps, mut upstream_rx) = make_deps();
+        let empty = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": []}
+        });
+        handle_message(empty, &ResponseRouter::new(), "", &deps).await;
+        match upstream_rx.try_recv().expect("empty array should be routed") {
+            UpstreamNotification::PublishDiagnostics { diagnostics, .. } => {
+                assert!(diagnostics.is_empty(), "empty array clears");
+            }
+            _ => panic!("expected PublishDiagnostics"),
+        }
+    }
+
     #[tokio::test]
     async fn handle_message_unknown_server_request_sends_method_not_found() {
         let router = ResponseRouter::new();

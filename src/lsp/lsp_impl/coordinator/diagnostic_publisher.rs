@@ -96,9 +96,14 @@ impl DiagnosticPublisher {
     /// slots are transformed against the host document's *current* injection
     /// offsets; an empty merge clears the editor's diagnostics for the host.
     pub(crate) async fn republish(&self, host: &Url) {
+        // Serialize the whole snapshot→merge→publish so concurrent republishes
+        // (region push vs host-event pull) emit in order and a stale snapshot can
+        // never publish after a fresh one (push-propagation-diagnostic-forwarding).
+        let _guard = self.aggregator.lock_republish().await;
+
         let snapshot = self.aggregator.snapshot(host);
         let region_offsets = self.current_region_offsets(host);
-        let diagnostics = merge_cached_diagnostics(&snapshot, &region_offsets);
+        let diagnostics = merge_cached_diagnostics(host, &snapshot, &region_offsets);
 
         let lsp_uri = match crate::lsp::lsp_impl::url_to_uri(host) {
             Ok(uri) => uri,

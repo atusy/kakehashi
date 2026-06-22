@@ -46,12 +46,22 @@ pub(in crate::lsp::bridge) fn forward_push(
         return;
     }
     // Deserialize the diagnostics array straight from the borrowed value (no
-    // clone of the message); a malformed array yields an empty (clearing) push.
+    // clone of the message). A parse failure is *dropped* (not treated as an
+    // empty/clearing push, which would silently wipe the region's diagnostics) —
+    // an empty array still deserializes to an empty Vec and clears legitimately.
     let diagnostics =
-        <Vec<tower_lsp_server::ls_types::Diagnostic> as serde::Deserialize>::deserialize(
+        match <Vec<tower_lsp_server::ls_types::Diagnostic> as serde::Deserialize>::deserialize(
             &message["params"]["diagnostics"],
-        )
-        .unwrap_or_default();
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(e) => {
+                log::debug!(
+                    target: "kakehashi::bridge::reader",
+                    "dropping malformed publishDiagnostics for {uri}: {e}"
+                );
+                return;
+            }
+        };
 
     let _ = deps.upstream_tx.send(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {

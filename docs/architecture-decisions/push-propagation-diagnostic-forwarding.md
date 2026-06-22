@@ -478,19 +478,29 @@ because the #380 benefit now outweighs it:
 
 ## Decision–Implementation Gap
 
-Not yet implemented — this decision runs ahead of the code, which still
-implements the prior pull-first synthetic push:
+**Implemented** (the core push propagation):
 
-- `src/lsp/lsp_impl/coordinator/diagnostic.rs`
-  (`spawn_synthetic_diagnostic_task`, `schedule_debounced_diagnostic`),
-  `src/lsp/debounced_diagnostics.rs`, `src/lsp/synthetic_diagnostics.rs`, and the
-  pull in `src/lsp/bridge/text_document/diagnostic.rs`.
-- `src/lsp/bridge/actor/reader.rs` still discards non-scratch
-  `publishDiagnostics` at `forward_notification`'s `_ => {}` arm (#380).
+- The per-host merge cache (`src/lsp/diagnostic_cache.rs`, `DiagnosticAggregator`)
+  and the single `DiagnosticPublisher`
+  (`src/lsp/lsp_impl/coordinator/diagnostic_publisher.rs`).
+- The host-event pull is unified onto the cache as the `PullLayer` blob (the
+  synthetic/debounced feed in `coordinator/diagnostic.rs` /
+  `debounced_diagnostics.rs` now republishes through the publisher rather than
+  publishing directly).
+- Non-scratch `publishDiagnostics` are routed from `reader.rs` into the cache as
+  `Region` slots (virtual coordinates, transformed at publish via lazy re-anchor),
+  closing #380 for region pushes.
 
-Migration outline: route non-scratch pushes into a new aggregator backed by the
-per-host merge cache; reduce the synthetic/debounced *proactive* pull to the
-`pullFallback` scope (pull-driven servers only) instead of retiring it outright;
-keep the *client* pull handler (augmented with the push cache for push-driven
-servers); update the bare-slug code references that currently name
-the prior pull-first decision.
+**Deferred** (staged follow-ups; the code documents each at its site):
+
+- The `content_epoch` version gate and the wire-version↔epoch mapping. Until then
+  there is no stale-overwrite guard and a brief wrong-content window after edits
+  (lazy re-anchor still keeps *positions* current via the retained pull trigger).
+- Per-source strategy fan-in (`preferred` sticky / `concatenated` visible-walk);
+  the staged merge concatenates, with HashMap-nondeterministic cross-source order.
+- The `_self` host-layer push source (the host layer is still served by the pull
+  feed for now).
+- Region-invalidation and crash cache eviction.
+- The `pullFallback` / `pushFallback` config toggles and the capability
+  classification — without the latter the pull feed and a server's spontaneous
+  push can double-count that server (documented in `diagnostic_cache.rs`).
