@@ -120,7 +120,10 @@ Classification is **live, not an initialize-time snapshot**:
 `has_capability("textDocument/diagnostic")` (`connection_handle.rs`) consults the
 static initialize result *and* dynamic `client/registerCapability` registrations,
 so a server that registers or unregisters pull support mid-session is reclassified
-and its fallback channel follows.
+and its fallback channel follows. (Unregister only removes *dynamic* registrations,
+so the pull-driven → push-driven transition applies only to dynamic-only
+diagnostic providers; a statically-advertised `diagnosticProvider` stays
+pull-driven for the session.)
 
 LSP has no capability flag for *push* diagnostics, so push-classification is an
 inference from the absence of `diagnosticProvider`, not a declared fact — the
@@ -186,28 +189,37 @@ source's latest push, never accumulated.
 Storing virtual coordinates rather than pre-baked host coordinates makes the
 policy clean:
 
+- **Content epoch vs wire version**: gate and elect on a per-source
+  **`content_epoch`** — a monotonic counter (or content fingerprint) that advances
+  **only when the source's extracted content changes**, shared across all servers
+  on that source. This is *not* the per-connection LSP wire version the bridge
+  already tracks (`document_tracker` keys version by `(connection, virtual_uri)`
+  and bumps per connection), which is not comparable across servers — a restart or
+  late open desyncs it. A server's `publishDiagnostics.version` is mapped back to
+  the `content_epoch` kakehashi last synced to *that* server; eligibility is then
+  "slot's epoch == source's current epoch", never a raw cross-server version
+  compare.
 - **Lazy re-anchor**: transforming at publish time against the region's *current*
-  offset means an edit *above* an unchanged region re-positions its diagnostics
-  correctly with no re-push and no flicker — this is what the stable region
-  identity buys. It holds only if the version gate keys on *content*, not geometry
-  (next bullet).
-- **Version gate**: a slot whose `virtual_version` lags the region's current
-  version is held (not published) until a matching push arrives, bounding the
-  wrong-position window to the re-parse gap and self-healing as the downstream
-  re-emits. Crucially, `virtual_version` must advance **only when the region's
-  extracted content changes** — a host edit that merely shifts a region's position
-  (content byte-identical) must *not* bump it, or every region would be held and
-  re-published on every keystroke, defeating lazy re-anchor. The host path already
-  guards its sync with a content fingerprint (`host.rs`); the virt path currently
-  bumps the version and re-sends `didChange` for *every* opened region on *every*
-  host `didChange` (`did_change.rs::forward_didchange_to_opened_docs`), so this
-  decision requires adding the same content-fingerprint guard to the virt sync.
-  The null-version stamp (below) then records this content version.
-- **Re-merge on version bump**: when a source's content version advances,
-  kakehashi re-merges and republishes that `host_uri` *immediately*, with the
-  now-stale slots held — otherwise nothing would clear the old diagnostics until a
-  current-version push happens to arrive. The bump itself is the trigger, not just
-  incoming pushes.
+  offset re-positions an unchanged region's diagnostics after an edit *above* it
+  with no re-push and no flicker — provided the epoch keys on content, not geometry
+  (above), so a position-only edit does not advance it.
+- **Version gate**: a slot whose epoch lags the source's current `content_epoch`
+  is held (not published) until that server re-publishes at the current epoch,
+  bounding the wrong-position window to the re-parse gap and self-healing. The virt
+  path currently bumps the wire version and re-sends `didChange` for *every* opened
+  region on *every* host `didChange` (`did_change.rs::forward_didchange_to_opened_docs`),
+  with no content guard; the host path already fingerprints before syncing
+  (`host.rs`). This decision requires the virt sync to gain that content guard so
+  the epoch advances only on a real content change.
+- **Re-merge on epoch bump**: when a source's `content_epoch` advances, kakehashi
+  re-merges and republishes that `host_uri` *immediately*, with the now-stale slots
+  held — otherwise nothing would clear the old diagnostics until a current-epoch
+  push happens to arrive. The bump itself is the trigger, not just incoming pushes.
+- **Host layer**: the `_self` host source uses the identical model keyed on the
+  *host document's* content epoch — push-driven `_self` servers are eagerly opened
+  (see Lifecycle) and eagerly re-synced on a content-changing host `didChange`
+  (the host path's fingerprint already gates this), so the gate and re-merge rules
+  above apply unchanged.
 
 ### `preferred` as a push stream
 
@@ -221,13 +233,12 @@ priority — a higher named server preempts whenever it becomes eligible;
 sticky-first applies only *within* the `"*"` first-win group**, where there is no
 static order to fall back on. Per virtual document:
 
-- **Effective version** `Veff` = the source's **current extracted-content
-  version** (the version kakehashi has synced for it), *not* merely the highest
-  version seen in arrived pushes — a content bump advances `Veff` at once, before
-  any push at the new version exists. Slots older than `Veff` are held (treated as
-  absent) until they re-publish at `Veff`. This is the version gate, and it is
-  what makes a
-  document-version bump re-open the election.
+- **Effective epoch** `Veff` = the source's current `content_epoch` (see
+  Versioning), *not* the highest version seen in arrived pushes — a content change
+  advances `Veff` at once, before any push at the new epoch exists. Slots at an
+  older epoch are held (treated as absent) until that server re-publishes at
+  `Veff`. This is the version gate, and it is what makes a content bump re-open the
+  election.
 - **Winner walk** over the expanded `priorities`:
   - `Server(name)` — wins if its slot is eligible (present, **non-empty**, at
     `Veff`); otherwise fall through to the next entry.
@@ -243,7 +254,10 @@ static order to fall back on. Per virtual document:
 - The first eligible source has no incumbent yet, so the bootstrap winner is
   simply the first server to publish non-empty at `Veff`.
 - The region's fan-in result is the winner's latest diagnostics; a push that does
-  not change the elected winner's content emits nothing.
+  not change the elected winner's emitted set emits nothing. Equality is compared
+  on the slot's **transformed host-coordinate** diagnostics (implementers may
+  normalize unstable fields such as `data`), so the suppression survives lazy
+  re-anchor only when the host positions are genuinely unchanged.
 
 **Empty falls through (matches pull's "first *non-empty*").** A preferred server
 publishing `[]` (clean) does not win — the walk continues, so a unique finding
@@ -253,12 +267,16 @@ current-version problem. The alternative (empty-wins, where the preferred server
 clean silences everyone below) was rejected — it diverges from pull and hides real
 findings; stale-error flicker is prevented by the version gate, not by empty-wins.
 
-**Null `version`.** `publishDiagnostics.version` is optional. kakehashi generates
-and syncs the virtual document version itself, so a null-version push is taken as
-"for the currently synced virtual version" and gated against that — a known value,
-not a guess.
+**Null `version`.** `publishDiagnostics.version` is optional. A null-version push
+is **best-effort**: it is attributed to the `content_epoch` kakehashi most recently
+synced to that server. Because the outbound `didChange` increments and queues
+asynchronously, a null-version push can race an in-flight content change and
+actually describe the *previous* content — so it is gated like any slot (held if
+its attributed epoch is now stale), accepting a documented small stale-window risk
+rather than treating it as authoritative.
 
-Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<ver,nth>`):
+Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<epoch,nth>`, where
+`epoch` is the source `content_epoch` and `nth` the per-server publish count):
 
 - Same version — raw `a2<1,1>, a3<1,1>, a1<1,1>, a3<1,2>, a3<1,3>, a1<1,2>`
   publishes `a2<1,1>` **once**. `a2` is elected on first arrival and stays
@@ -266,9 +284,11 @@ Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<ver,nth>`):
   unchanged. (Contrast: keying the winner on `nth` would let the chattiest server
   win — loudest ≠ best — so `nth` governs only *within* a server, as slot
   replacement, never *across* servers.)
-- Version bump — raw `a2<1,1>, a1<2,1>, a2<2,1>` publishes `a2<1,1>` then
-  `a1<2,1>`. `a1`'s v2 lifts `Veff` to 2, holding `a2`'s v1 slot; `a1` is
-  re-elected at v2, and `a2<2,1>` then leaves the incumbent unchanged.
+- Version bump — events `a2<1,1>`, **content-bump→v2**, `a1<2,1>`, `a2<2,1>`.
+  Publishes `a2<1,1>`; then the bump advances `Veff` to 2 and re-merges with every
+  v1 slot held → publishes **empty** (clears `a2<1,1>`); then `a1<2,1>` is the
+  first eligible at v2 → publishes `a1<2,1>`; then `a2<2,1>` arrives but the
+  incumbent `a1` is unchanged → no publish.
 - Named preemption (`priorities = [a1, "*"]`, all v1) — raw `a2<1,1>, a1<1,1>,
   a2<1,2>` publishes `a2<1,1>` (group bootstrap), then **`a1<1,1>`** (the named
   higher entry becomes eligible and preempts the group), then nothing for
@@ -299,14 +319,16 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
 - Same version — `a1<1,1>=[X]`, `a2<1,1>=[Y]`, `a1<1,2>=[X']` → publishes `[X]`,
   then `[X, Y]`, then `[X', Y]`. `a1`'s repeat replaces `X` with `X'`; `a2` is
   untouched; order is fixed by `priorities`, not by who published last.
-- Version bump — then `a2<2,1>=[Y2]` lifts `Veff` to 2 and holds `a1`'s v1 slot,
-  so the region shows `[Y2]` alone until `a1` re-publishes at v2.
+- Version bump — a **content-bump→v2**, then `a2<2,1>=[Y2]`. The bump advances
+  `Veff` to 2 and holds both v1 slots → re-merge publishes **empty** (clears
+  `[X', Y]`); then `a2<2,1>` makes the v2 concat `[Y2]` alone (`a1`'s v1 slot still
+  held); it refills once `a1` re-publishes at v2.
 
 ### Lifecycle
 
 - Host `didClose` → drop the `host_uri` cache entry.
-- Region invalidated by an edit (`close_invalidated_docs`) → evict its slot, then
-  re-merge.
+- Region invalidated by an edit (`close_invalidated_docs`) → evict **all** slots
+  for that source across servers, then re-merge.
 - Downstream crash/restart → drop that server's slots, then re-merge
   (publish-empty-to-clear falls out naturally).
 - **Host-layer eager open**: a push-driven `_self` server only pushes once its
