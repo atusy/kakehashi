@@ -16,7 +16,7 @@ use super::ranges::{
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
 use crate::language::query_predicates::check_predicate;
-use crate::text::{clamped_slice, floor_char_boundary, fnv1a_hash};
+use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
 
 /// Iterates over `@injection.content` captures that pass general predicate filtering.
 ///
@@ -200,8 +200,15 @@ impl CacheableInjectionRegion {
             None => (node.start_byte(), node.end_byte()),
         };
 
-        // Guard against a stale node whose byte range no longer fits `text`.
-        let content = clamped_slice(text, start_byte..end_byte);
+        // Snap the range to valid in-bounds char boundaries (ceil start / floor
+        // end) so the `byte_range` stored below is always safe to slice — a stale
+        // node can't leave an out-of-bounds range for downstream consumers, and
+        // the direct `content` slice here can't panic. Valid ranges are
+        // unchanged; a stale node also stops matching `node.start_byte()` below,
+        // routing through the safe `position_of_byte` path.
+        let start_byte = ceil_char_boundary(text, start_byte);
+        let end_byte = floor_char_boundary(text, end_byte).max(start_byte);
+        let content = &text[start_byte..end_byte];
 
         // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
         // Tree-sitter reports columns as byte offsets, but LSP positions use UTF-16.
@@ -1463,9 +1470,16 @@ local y = "duplicate"
         let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
         assert!(!regions.is_empty());
 
-        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "id", "x");
+        let short_text = "x";
+        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "id", short_text);
         // Completed without panicking; metadata is still populated.
         assert_eq!(cacheable.language, "md");
         assert_eq!(cacheable.region_id, "id");
+        // byte_range is snapped in-bounds, so a downstream `&text[byte_range]`
+        // can't panic either.
+        assert!(cacheable.byte_range.start <= short_text.len());
+        assert!(cacheable.byte_range.end <= short_text.len());
+        assert!(cacheable.byte_range.start <= cacheable.byte_range.end);
+        assert_eq!(&short_text[cacheable.byte_range.clone()], "");
     }
 }
