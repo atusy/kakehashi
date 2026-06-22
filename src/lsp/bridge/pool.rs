@@ -266,6 +266,13 @@ pub struct LanguageServerPool {
     /// reader task (to register/translate) and the cancel path (to route a
     /// client `window/workDoneProgress/cancel` to the owning downstream).
     progress_registry: Arc<super::ProgressRegistry>,
+    /// Tracks downstream-initiated requests forwarded to the editor so a
+    /// downstream `$/cancelRequest` (or connection death) can cancel the
+    /// editor-bound request (#404). Shared with every reader task (to register /
+    /// fire) and the forwarding loop (to await / drop). Distinct from
+    /// `upstream_request_registry`, which is the *outbound* (editor → downstream)
+    /// cancel direction.
+    inbound_request_registry: super::InboundRequestRegistry,
 }
 
 impl Default for LanguageServerPool {
@@ -302,7 +309,15 @@ impl LanguageServerPool {
             upstream_request_tx,
             upstream_request_rx: std::sync::Mutex::new(Some(upstream_request_rx)),
             progress_registry: Arc::new(super::ProgressRegistry::new()),
+            inbound_request_registry: super::InboundRequestRegistry::default(),
         }
+    }
+
+    /// Shared registry of in-flight forwarded requests, handed to the forwarding
+    /// loop so it can await each request's cancel token and drop settled entries
+    /// (#404).
+    pub(crate) fn inbound_request_registry(&self) -> super::InboundRequestRegistry {
+        self.inbound_request_registry.clone()
     }
 
     /// Shared work-done progress token registry (for seam tests that need to
@@ -1203,6 +1218,7 @@ impl LanguageServerPool {
                 upstream_tx: self.upstream_tx.clone(),
                 window_tx: self.window_tx.clone(),
                 upstream_request_tx: self.upstream_request_tx.clone(),
+                inbound_request_registry: self.inbound_request_registry.clone(),
                 // #391: share the per-connection mutable folder set with the
                 // reader (it answers workspace/workspaceFolders pulls).
                 workspace_folders: workspace_folders.clone(),
