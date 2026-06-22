@@ -12,6 +12,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Project-local persistent data directory used by every spawned
@@ -54,12 +56,56 @@ fn test_data_dir() -> &'static Path {
 ///
 /// Handles JSON-RPC 2.0 message framing with Content-Length headers,
 /// request/response matching, and server-initiated notifications.
+///
+/// Server stdout is drained by a dedicated background thread that frames
+/// messages and pushes them onto an `mpsc` channel. Reads therefore become
+/// `recv_timeout`, so waits honor their deadline (modulo scheduler jitter)
+/// instead of blocking indefinitely — a notification-wait against an
+/// alive-but-silent server returns at its timeout rather than hanging on a
+/// quiet pipe (see issue #385).
 pub struct LspClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    /// Framed messages from the background reader thread, in arrival order.
+    /// A `Disconnected` recv means the reader thread ended (clean EOF).
+    rx: Receiver<ReaderEvent>,
+    /// Handle to the background reader thread, joined on drop after the child
+    /// is killed (which closes stdout and unblocks the thread).
+    reader: Option<JoinHandle<()>>,
     stderr: Option<std::process::ChildStderr>,
     request_id: i64,
+}
+
+/// Message pushed from the background reader thread to the client.
+///
+/// A clean EOF is signaled out-of-band by the thread dropping its [`Sender`],
+/// which surfaces to the client as a `Disconnected` recv.
+enum ReaderEvent {
+    /// A complete, parsed JSON-RPC message.
+    Message(Value),
+    /// A framing/parse failure with a precise diagnostic. The reader thread
+    /// terminates after sending this.
+    Error(String),
+}
+
+/// Background reader thread body: frame messages off `reader` and forward them
+/// over `tx` until EOF, a framing error, or the consumer goes away.
+fn reader_loop(mut reader: BufReader<ChildStdout>, tx: Sender<ReaderEvent>) {
+    loop {
+        match read_framed_message(&mut reader) {
+            ReadOutcome::Message(value) => {
+                if tx.send(ReaderEvent::Message(value)).is_err() {
+                    return; // consumer dropped the receiver
+                }
+            }
+            // Clean EOF: drop tx so the consumer observes `Disconnected`.
+            ReadOutcome::Eof => return,
+            ReadOutcome::Error(e) => {
+                let _ = tx.send(ReaderEvent::Error(e));
+                return;
+            }
+        }
+    }
 }
 
 /// Builder for creating LspClient instances with custom configuration.
@@ -123,19 +169,124 @@ impl LspClientBuilder {
             cmd.env(key, value);
         }
 
-        let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        LspClient::from_child(child)
+    }
+}
 
-        let stdin = child.stdin.take().expect("Failed to get stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
-        let stderr = child.stderr.take();
+/// Outcome of reading one Content-Length-framed message from the server.
+enum ReadOutcome {
+    /// A complete, parsed JSON-RPC message.
+    Message(Value),
+    /// Clean end-of-stream at a message boundary (server closed stdout).
+    Eof,
+    /// Protocol/framing failure carrying a precise, human-readable diagnostic.
+    Error(String),
+}
 
-        LspClient {
-            child,
-            stdin: Some(stdin),
-            stdout,
-            stderr,
-            request_id: 0,
+/// Read a single Content-Length-framed JSON-RPC message from `reader`.
+///
+/// Reads every header line until the blank separator line, capturing
+/// `Content-Length` wherever it appears — so the order of headers and the
+/// presence of others (e.g. `Content-Type`) does not matter — then reads
+/// exactly that many body bytes. Both `\r\n` and bare `\n` line endings are
+/// accepted.
+///
+/// Blocks until a full message is available. Returns [`ReadOutcome::Eof`] only
+/// for a clean stream end at a message boundary (EOF before any header of the
+/// next message); a stream that ends mid-message, a malformed/missing
+/// `Content-Length`, an oversized/zero length, a truncated body, or invalid
+/// JSON all become [`ReadOutcome::Error`] so the caller — or the background
+/// reader thread — can surface the exact failure rather than a generic
+/// disconnect.
+fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
+    const MAX_HEADERS: u32 = 100;
+    const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100MB limit
+
+    let mut header = String::new();
+    let mut header_count = 0u32;
+    let mut content_length: Option<usize> = None;
+
+    loop {
+        if header_count >= MAX_HEADERS {
+            return ReadOutcome::Error(format!(
+                "Exceeded maximum header count ({MAX_HEADERS}) - server may be sending malformed headers"
+            ));
         }
+
+        header.clear();
+        let bytes_read = match reader.read_line(&mut header) {
+            Ok(n) => n,
+            Err(e) => return ReadOutcome::Error(format!("Failed to read header line: {e}")),
+        };
+
+        if bytes_read == 0 {
+            // EOF. Clean only at a true message boundary — i.e. before any
+            // header line of the next message. If we have already consumed one
+            // or more header lines (whether or not Content-Length was among
+            // them), the stream was truncated mid-message.
+            return if header_count == 0 {
+                ReadOutcome::Eof
+            } else {
+                ReadOutcome::Error(
+                    "Server closed connection prematurely mid-message (incomplete header block)"
+                        .to_string(),
+                )
+            };
+        }
+        header_count += 1;
+
+        // Blank line: headers are done, the body follows.
+        if header == "\r\n" || header == "\n" {
+            let Some(len) = content_length else {
+                return ReadOutcome::Error(
+                    "Missing Content-Length header before message body".to_string(),
+                );
+            };
+
+            let mut body = vec![0u8; len];
+            if let Err(e) = std::io::Read::read_exact(reader, &mut body) {
+                return ReadOutcome::Error(format!("Failed to read body: {e}"));
+            }
+
+            return match serde_json::from_slice(&body) {
+                Ok(value) => ReadOutcome::Message(value),
+                Err(e) => ReadOutcome::Error(format!("Failed to parse JSON-RPC message body: {e}")),
+            };
+        }
+
+        // LSP header names are case-insensitive (HTTP-style framing), so match
+        // the field name accordingly. Lines without a colon, or other headers
+        // (e.g. Content-Type), are ignored.
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
+
+        let len: usize = match value.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                return ReadOutcome::Error(format!(
+                    "Invalid Content-Length value: {:?}",
+                    value.trim()
+                ));
+            }
+        };
+
+        // Validate Content-Length to prevent excessive allocations.
+        if len > MAX_MESSAGE_SIZE {
+            return ReadOutcome::Error(format!(
+                "Content-Length {len} exceeds maximum allowed size {MAX_MESSAGE_SIZE}"
+            ));
+        }
+        if len == 0 {
+            return ReadOutcome::Error(
+                "Invalid Content-Length: 0 - message body cannot be empty".to_string(),
+            );
+        }
+        content_length = Some(len);
     }
 }
 
@@ -164,16 +315,25 @@ impl LspClient {
             cmd.env("RUST_LOG", "debug");
         }
 
-        let mut child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        let child = cmd.spawn().expect("Failed to spawn kakehashi binary");
+        Self::from_child(child)
+    }
 
+    /// Wire up a spawned child: take its stdio handles and start the background
+    /// reader thread that drains stdout into the message channel.
+    fn from_child(mut child: Child) -> Self {
         let stdin = child.stdin.take().expect("Failed to get stdin");
         let stdout = BufReader::new(child.stdout.take().expect("Failed to get stdout"));
         let stderr = child.stderr.take();
 
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || reader_loop(stdout, tx));
+
         Self {
             child,
             stdin: Some(stdin),
-            stdout,
+            rx,
+            reader: Some(reader),
             stderr,
             request_id: 0,
         }
@@ -258,24 +418,36 @@ impl LspClient {
         let mut message_count = 0u32;
 
         loop {
-            // Check timeout
-            if start_time.elapsed() > TIMEOUT {
+            // Check message count threshold
+            if message_count >= MAX_MESSAGES {
                 panic!(
-                    "Timeout waiting for response with id {}. Elapsed: {:?}",
-                    expected_id,
+                    "Exceeded maximum message threshold ({MAX_MESSAGES}) waiting for response with id {expected_id}"
+                );
+            }
+
+            // Bound each wait by the *remaining* overall budget so the
+            // documented 30s timeout stays accurate even across many
+            // intervening notifications — without this, a single blocking read
+            // could itself wait a full 30s and overshoot the budget.
+            let remaining = TIMEOUT.saturating_sub(start_time.elapsed());
+            if remaining.is_zero() {
+                panic!(
+                    "Timeout waiting for response with id {expected_id}. Elapsed: {:?}",
                     start_time.elapsed()
                 );
             }
 
-            // Check message count threshold
-            if message_count >= MAX_MESSAGES {
-                panic!(
-                    "Exceeded maximum message threshold ({}) waiting for response with id {}",
-                    MAX_MESSAGES, expected_id
-                );
-            }
-
-            let message = self.receive_message();
+            let message = match self.rx.recv_timeout(remaining) {
+                Ok(ReaderEvent::Message(value)) => value,
+                Ok(ReaderEvent::Error(e)) => panic!("{e}"),
+                Err(RecvTimeoutError::Timeout) => panic!(
+                    "Timeout waiting for response with id {expected_id}. Elapsed: {:?}",
+                    start_time.elapsed()
+                ),
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "Server closed connection prematurely while waiting for response with id {expected_id}"
+                ),
+            };
             message_count += 1;
 
             // Check if this is a response to our request
@@ -290,93 +462,6 @@ impl LspClient {
                 }
             }
             // Otherwise it's a notification like window/logMessage, skip it
-        }
-    }
-
-    /// Receive a single LSP message with Content-Length framing.
-    /// Times out after 30 seconds to prevent indefinite blocking on unresponsive servers.
-    /// Validates Content-Length to prevent excessive memory allocation.
-    fn receive_message(&mut self) -> Value {
-        const MAX_HEADERS: u32 = 100;
-        const TIMEOUT: Duration = Duration::from_secs(30);
-        const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100MB limit
-
-        let start_time = Instant::now();
-        let mut header_count = 0u32;
-
-        // Read Content-Length header
-        let mut header = String::new();
-        loop {
-            // Check timeout
-            if start_time.elapsed() > TIMEOUT {
-                panic!(
-                    "Timeout reading LSP message header. Elapsed: {:?}",
-                    start_time.elapsed()
-                );
-            }
-
-            // Check header count threshold
-            if header_count >= MAX_HEADERS {
-                panic!(
-                    "Exceeded maximum header count ({}) - server may be sending malformed headers",
-                    MAX_HEADERS
-                );
-            }
-
-            header.clear();
-            let bytes_read = self
-                .stdout
-                .read_line(&mut header)
-                .expect("Failed to read header line");
-
-            // EOF detection: if read_line returns 0 bytes, the connection closed
-            if bytes_read == 0 {
-                panic!("Server closed connection prematurely while reading header");
-            }
-
-            header_count += 1;
-
-            if header == "\r\n" {
-                continue;
-            }
-
-            if header.starts_with("Content-Length:") {
-                let len: usize = header
-                    .trim_start_matches("Content-Length:")
-                    .trim()
-                    .parse()
-                    .expect("Invalid Content-Length value");
-
-                // Validate Content-Length to prevent excessive allocations
-                if len > MAX_MESSAGE_SIZE {
-                    panic!(
-                        "Content-Length {} exceeds maximum allowed size {}",
-                        len, MAX_MESSAGE_SIZE
-                    );
-                }
-
-                if len == 0 {
-                    panic!("Invalid Content-Length: 0 - message body cannot be empty");
-                }
-
-                // Read empty line
-                let mut empty = String::new();
-                let bytes_read = self
-                    .stdout
-                    .read_line(&mut empty)
-                    .expect("Failed to read empty line");
-
-                if bytes_read == 0 {
-                    panic!("Server closed connection prematurely after header");
-                }
-
-                // Read body
-                let mut body = vec![0u8; len];
-                std::io::Read::read_exact(&mut self.stdout, &mut body)
-                    .expect("Failed to read body");
-
-                return serde_json::from_slice(&body).expect("Failed to parse response");
-            }
         }
     }
 
@@ -437,9 +522,11 @@ impl LspClient {
 
     /// Wait for a notification with a specific method name.
     ///
-    /// Returns the notification params if received within the timeout,
-    /// or None if timeout occurs without receiving the expected notification.
-    /// Skips other notifications and server-to-client requests while waiting.
+    /// Returns the notification params if received within the timeout, or None
+    /// if the timeout elapses (or the server disconnects) without it. Skips
+    /// other notifications and server-to-client requests while waiting. Panics
+    /// if the stream is malformed (a framing/parse error is surfaced, not
+    /// hidden behind the `Option`).
     pub(crate) fn wait_for_notification(
         &mut self,
         expected_method: &str,
@@ -448,40 +535,35 @@ impl LspClient {
         let start_time = Instant::now();
 
         loop {
-            // Check timeout
-            if start_time.elapsed() > timeout {
-                return None;
-            }
-
-            // Use a short poll timeout to check the overall timeout frequently
             let remaining = timeout.saturating_sub(start_time.elapsed());
             if remaining.is_zero() {
                 return None;
             }
 
-            // Try to read a message with remaining timeout
-            if let Some(message) =
-                self.try_receive_message(remaining.min(Duration::from_millis(100)))
+            // Block up to the *remaining* deadline. None means the deadline
+            // elapsed or the server disconnected — either way, give up.
+            let message = self.try_receive_message(remaining)?;
+
+            // Notifications have no "id" field and must match the expected method.
+            if message.get("id").is_none()
+                && message.get("method").and_then(|m| m.as_str()) == Some(expected_method)
             {
-                // Check if this is the notification we're waiting for
-                // Notifications have no "id" field and must match the expected method
-                if message.get("id").is_none()
-                    && message.get("method").and_then(|m| m.as_str()) == Some(expected_method)
-                {
-                    return message.get("params").cloned();
-                }
-                // Otherwise it's a response or server-to-client request, skip it
+                return message.get("params").cloned();
             }
+            // Otherwise it's a response or server-to-client request; skip it
+            // and keep waiting within the deadline.
         }
     }
 
     /// Wait for the first notification whose method is in `methods` AND whose
     /// params satisfy `predicate`, preserving arrival order across methods.
     ///
-    /// Returns `(method, params)` for the first match, or None on timeout.
-    /// Unlike `wait_for_notification`, this can observe the ORDER of several
-    /// notification methods (e.g. prove showMessage arrives before a later
-    /// logMessage). Non-matching messages are skipped.
+    /// Returns `(method, params)` for the first match, or None on timeout (or
+    /// server disconnect). Unlike `wait_for_notification`, this can observe the
+    /// ORDER of several notification methods (e.g. prove showMessage arrives
+    /// before a later logMessage). Non-matching messages are skipped. Panics if
+    /// the stream is malformed (a framing/parse error is surfaced, not hidden
+    /// behind the `Option`).
     pub(crate) fn wait_for_notification_where(
         &mut self,
         methods: &[&str],
@@ -496,9 +578,11 @@ impl LspClient {
                 return None;
             }
 
-            if let Some(message) =
-                self.try_receive_message(remaining.min(Duration::from_millis(100)))
-                && message.get("id").is_none()
+            // Block up to the *remaining* deadline. None means the deadline
+            // elapsed or the server disconnected — either way, give up.
+            let message = self.try_receive_message(remaining)?;
+
+            if message.get("id").is_none()
                 && let Some(method) = message.get("method").and_then(|m| m.as_str())
                 && methods.contains(&method)
             {
@@ -510,44 +594,21 @@ impl LspClient {
         }
     }
 
-    /// Try to receive a message with a timeout, returning None if no message available.
+    /// Try to receive a message within `timeout`, returning None if none arrives.
     ///
-    /// # Known Limitation
-    ///
-    /// The `fill_buf()` call can potentially block on pipes if no data is available,
-    /// which may cause the timeout to be approximate rather than exact. In practice,
-    /// this works well for test scenarios where:
-    /// 1. The server is expected to respond (tests wait after sending requests)
-    /// 2. The server process eventually terminates (EOF triggers return)
-    ///
-    /// For truly non-blocking behavior, platform-specific non-blocking I/O or async
-    /// would be required, but this adds significant complexity for test helper code.
+    /// Backed by the background reader thread's channel, so the deadline is
+    /// honored (modulo scheduler jitter): against an alive-but-silent server
+    /// this blocks for about `timeout` and then returns None, rather than
+    /// hanging on a quiet pipe. A disconnect (reader thread ended at EOF) also
+    /// returns None — no further messages can arrive. A framing/parse error
+    /// panics with its diagnostic.
     fn try_receive_message(&mut self, timeout: Duration) -> Option<Value> {
-        let start_time = Instant::now();
-
-        // Polling loop with short sleeps between buffer checks.
-        // Note: fill_buf() may block briefly if the pipe has no data, making
-        // the timeout approximate. This is acceptable for test code where we
-        // expect the server to respond or terminate.
-        while start_time.elapsed() < timeout {
-            // Check if data is already available in the buffer
-            if !self.stdout.buffer().is_empty() {
-                return Some(self.receive_message());
-            }
-
-            // Try to fill the buffer with available data.
-            // This may block briefly on pipes, but typically returns quickly
-            // if data is being sent or the server has terminated.
-            let _ = self.stdout.fill_buf();
-            if !self.stdout.buffer().is_empty() {
-                return Some(self.receive_message());
-            }
-
-            // No data yet, sleep briefly and retry
-            std::thread::sleep(Duration::from_millis(10));
+        match self.rx.recv_timeout(timeout) {
+            Ok(ReaderEvent::Message(value)) => Some(value),
+            Ok(ReaderEvent::Error(e)) => panic!("{e}"),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => None,
         }
-
-        None
     }
 
     /// Check if the server process is still running.
@@ -579,7 +640,12 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        // Kill first: closing the child's stdout unblocks the reader thread's
+        // pending read, so the subsequent join returns promptly.
         self.kill();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -602,5 +668,103 @@ mod tests {
 
         assert!(response.get("result").is_some());
         assert!(response["result"].get("capabilities").is_some());
+    }
+
+    /// The canonical framing: a single `Content-Length` header followed by the
+    /// blank line and body.
+    #[test]
+    fn read_framed_message_parses_basic_frame() {
+        let mut input = &b"Content-Length: 13\r\n\r\n{\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// Header order is irrelevant and unrelated headers (e.g. `Content-Type`)
+    /// must not be mistaken for the blank separator line. This is the case
+    /// Gemini flagged: a header after `Content-Length` previously got consumed
+    /// as the blank line and corrupted the body read.
+    #[test]
+    fn read_framed_message_handles_reordered_and_extra_headers() {
+        let mut input = &b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\
+            Content-Length: 13\r\n\
+            \r\n\
+            {\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// LSP header names are case-insensitive, so `content-length` must parse.
+    #[test]
+    fn read_framed_message_matches_content_length_case_insensitively() {
+        let mut input = &b"content-length: 13\r\n\r\n{\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// Bare `\n` line endings (no `\r`) are accepted as header terminators.
+    #[test]
+    fn read_framed_message_accepts_lf_only_line_endings() {
+        let mut input = &b"Content-Length: 13\n\n{\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// Two messages back to back are framed independently, so the reader thread
+    /// can loop over a continuous stream.
+    #[test]
+    fn read_framed_message_reads_consecutive_frames() {
+        let mut input =
+            &b"Content-Length: 7\r\n\r\n{\"a\":1}Content-Length: 7\r\n\r\n{\"b\":2}"[..];
+        assert!(
+            matches!(read_framed_message(&mut input), ReadOutcome::Message(v) if v == json!({"a": 1}))
+        );
+        assert!(
+            matches!(read_framed_message(&mut input), ReadOutcome::Message(v) if v == json!({"b": 2}))
+        );
+    }
+
+    /// A clean EOF at a message boundary is `Eof`, not an error.
+    #[test]
+    fn read_framed_message_clean_eof_at_boundary() {
+        let mut input = &b""[..];
+        assert!(matches!(read_framed_message(&mut input), ReadOutcome::Eof));
+    }
+
+    /// EOF after a header but before the body is a truncated stream, not a
+    /// clean boundary.
+    #[test]
+    fn read_framed_message_premature_eof_is_error() {
+        let mut input = &b"Content-Length: 99\r\n\r\n"[..];
+        assert!(matches!(
+            read_framed_message(&mut input),
+            ReadOutcome::Error(_)
+        ));
+    }
+
+    /// EOF after a partial header block that has NOT yet included
+    /// Content-Length is still a mid-message truncation, not a clean boundary.
+    #[test]
+    fn read_framed_message_eof_after_partial_headers_is_error() {
+        let mut input = &b"Content-Type: application/vscode-jsonrpc\r\n"[..];
+        assert!(matches!(
+            read_framed_message(&mut input),
+            ReadOutcome::Error(_)
+        ));
+    }
+
+    fn outcome_label(o: &ReadOutcome) -> &'static str {
+        match o {
+            ReadOutcome::Message(_) => "Message",
+            ReadOutcome::Eof => "Eof",
+            ReadOutcome::Error(_) => "Error",
+        }
     }
 }
