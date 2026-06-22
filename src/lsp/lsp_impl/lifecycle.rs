@@ -802,21 +802,11 @@ async fn deliver_upstream_notification(
             server,
             diagnostics,
         } => {
-            // The server name keys the cache slot; production always sets it
-            // (pool.rs spawns readers with `Some(server_name)`). Drop a push that
-            // lacks one rather than collapse it to an empty-string key that could
-            // collide with another unnamed pusher.
-            let Some(server) = server else {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "dropping region push without a server name for {uri}"
-                );
-                return;
-            };
             // Cache the downstream region push and republish the merged host set
             // (push-propagation-diagnostic-forwarding). The publisher resolves the
             // virtual URI to its host + region; a `None` publisher (test loop)
-            // drops it.
+            // drops it. (Pushes without a server name were already dropped at the
+            // reader, so `server` is always set here.)
             if let Some(publisher) = diagnostic_publisher {
                 publisher
                     .publish_region_push(&uri, server, diagnostics)

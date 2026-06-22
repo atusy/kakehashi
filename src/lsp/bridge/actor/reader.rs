@@ -63,8 +63,9 @@ pub(crate) enum UpstreamNotification {
     PublishDiagnostics {
         /// The virtual document URI the downstream published for.
         uri: String,
-        /// The originating downstream server's config name (`deps.server_name`).
-        server: Option<String>,
+        /// The originating downstream server's config name (`deps.server_name`);
+        /// pushes without a name are dropped at the reader, so this is always set.
+        server: String,
         /// The pushed diagnostics, in the virtual document's coordinates.
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
     },
@@ -2315,7 +2316,7 @@ mod tests {
                 diagnostics,
             } => {
                 assert!(uri.contains("kakehashi-virtual-uri-REGION"));
-                assert_eq!(server.as_deref(), Some("luals"));
+                assert_eq!(server, "luals");
                 assert_eq!(diagnostics.len(), 1);
                 assert_eq!(diagnostics[0].message, "boom");
             }

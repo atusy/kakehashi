@@ -180,9 +180,14 @@ impl DiagnosticAggregator {
         diagnostics: Vec<Diagnostic>,
     ) {
         let mut cache = self.lock();
-        cache
-            .entry(host.clone())
-            .or_default()
+        // Look up by `&Url` first and clone the host key only when inserting a new
+        // host entry, rather than `entry(host.clone())` cloning on every call.
+        let source_slots = if let Some(source_slots) = cache.get_mut(host) {
+            source_slots
+        } else {
+            cache.entry(host.clone()).or_default()
+        };
+        source_slots
             .entry(source)
             .or_default()
             .insert(server, SlotEntry { diagnostics });
