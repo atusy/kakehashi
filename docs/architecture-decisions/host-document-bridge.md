@@ -53,6 +53,18 @@ Partially implemented:
   matches the virt path's full-content `didChange` forwarding and avoids
   hooking the concurrent upstream `didChange` stream; verbatim forwarding
   remains the target if eager sync proves necessary.
+- **Save methods are host-bridge-only** (#357): `willSave` (notification) and
+  `willSaveWaitUntil` (request) concern the document being saved — the *host*
+  document — so they bypass the layer walk and forward only to host servers,
+  never to virt bridges. `willSave` is fan-out to host servers that already
+  have the document open and advertise it (no lazy spawn for a fire-and-forget
+  notification); `willSaveWaitUntil` forwards verbatim and returns the host
+  servers' `TextEdit[]` via the `preferred` host aggregation, bounded by a 5s
+  budget so a slow server cannot hang the editor's save. Both capabilities are
+  advertised at initialize only when some language enables host bridging.
+  Virt fan-out (one save per open virtual doc) is deliberately deferred: it
+  overlaps with format-on-save semantics the concatenated formatting pipeline
+  owns, and is left for a follow-up should a concrete need appear.
 - **Not implemented**: `publishDiagnostics` pass-through from host servers
   (downstream notifications are not forwarded upstream today on either
   path).

@@ -26,7 +26,8 @@ use tower_lsp_server::ls_types::{
     PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
     SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
-    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
+    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WillSaveTextDocumentParams,
+    WorkspaceEdit,
 };
 #[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::{
@@ -342,6 +343,17 @@ impl LanguageServer for Kakehashi {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         self.did_change_impl(params).await
+    }
+
+    async fn will_save(&self, params: WillSaveTextDocumentParams) {
+        self.will_save_impl(params).await
+    }
+
+    async fn will_save_wait_until(
+        &self,
+        params: WillSaveTextDocumentParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.will_save_wait_until_impl(params).await
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {

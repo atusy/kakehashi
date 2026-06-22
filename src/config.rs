@@ -295,6 +295,22 @@ impl WorkspaceSettings {
             .get(host_language)
             .or_else(|| self.languages.get(WILDCARD_KEY))
     }
+
+    /// True if any configured language opts into host bridging
+    /// (`bridge._self.enabled = true`), including the `"_"` wildcard entry —
+    /// an unconfigured document falls back to it wholesale via
+    /// [`Self::resolve_host_language_settings`], so a wildcard opt-in really
+    /// does enable host forwarding for those documents.
+    ///
+    /// Gates the willSave/willSaveWaitUntil capabilities at initialize (#357):
+    /// those methods forward only to host-bridge servers, so advertising them
+    /// when no language enables host bridging would make every save block on a
+    /// no-op round trip that can only ever return "no edits".
+    pub(crate) fn any_host_bridging_enabled(&self) -> bool {
+        self.languages
+            .values()
+            .any(LanguageSettings::is_host_bridging_enabled)
+    }
 }
 
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {
@@ -337,6 +353,51 @@ impl From<WorkspaceSettings> for RawWorkspaceSettings {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    /// Build a [`WorkspaceSettings`] whose `languages` map binds `key` to a
+    /// language whose host bridging is `enabled`.
+    fn settings_with_host_bridge(key: &str, enabled: bool) -> WorkspaceSettings {
+        use crate::config::settings::{BridgeLanguageConfig, HOST_BRIDGE_KEY};
+        let lang = LanguageSettings {
+            bridge: Some(HashMap::from([(
+                HOST_BRIDGE_KEY.to_string(),
+                BridgeLanguageConfig {
+                    enabled: Some(enabled),
+                    aggregation: None,
+                },
+            )])),
+            ..Default::default()
+        };
+        WorkspaceSettings {
+            languages: HashMap::from([(key.to_string(), lang)]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn any_host_bridging_enabled_is_false_for_default_settings() {
+        assert!(!WorkspaceSettings::default().any_host_bridging_enabled());
+    }
+
+    #[test]
+    fn any_host_bridging_enabled_true_for_explicit_language() {
+        let settings = settings_with_host_bridge("markdown", true);
+        assert!(settings.any_host_bridging_enabled());
+    }
+
+    #[test]
+    fn any_host_bridging_enabled_false_when_explicitly_disabled() {
+        let settings = settings_with_host_bridge("markdown", false);
+        assert!(!settings.any_host_bridging_enabled());
+    }
+
+    #[test]
+    fn any_host_bridging_enabled_true_for_wildcard_language() {
+        // An unconfigured document falls back wholesale to the `"_"` entry via
+        // `resolve_host_language_settings`, so a wildcard opt-in must count.
+        let settings = settings_with_host_bridge(WILDCARD_KEY, true);
+        assert!(settings.any_host_bridging_enabled());
+    }
 
     #[test]
     fn test_capture_mapping_handles_at_prefix() {

@@ -412,6 +412,272 @@ strategy = "concatenated"
     shutdown(&mut client);
 }
 
+// ==========================================================================
+// Host-bridge willSave / willSaveWaitUntil (host-document-bridge, #357)
+// ==========================================================================
+
+const SAVE_URI: &str = "file:///test_host_will_save.md";
+
+/// Initialize a client whose markdown host server runs the mock's `will-save`
+/// mode, opening [`SAVE_URI`]. Returns the raw `initialize` response so the
+/// capability-gate tests can inspect the advertised `textDocumentSync`.
+fn init_will_save_client(config_toml: &str) -> (LspClient, tempfile::TempDir, Value) {
+    init_will_save_client_with_mode(config_toml, "will-save")
+}
+
+/// As [`init_will_save_client`] but selects the mock server `mode` — used by
+/// the timeout test to run the `will-save-slow` mock.
+fn init_will_save_client_with_mode(
+    config_toml: &str,
+    mode: &str,
+) -> (LspClient, tempfile::TempDir, Value) {
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("will_save.toml");
+    std::fs::write(&config_path, config_toml).expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host": {
+                        "cmd": [mock_bin(), mode],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": SAVE_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+    (client, config_dir, init)
+}
+
+/// Hover the host document, returning the `will-save` mock's `contents`
+/// (`willsave-count:<n>:reason:<r>`) once the host bridge is warm, else `None`.
+fn host_save_hover(client: &mut LspClient) -> Option<String> {
+    let response = client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": SAVE_URI },
+            "position": { "line": 0, "character": 0 },
+        }),
+    );
+    assert!(response.get("error").is_none(), "hover must not error");
+    response
+        .pointer("/result/contents")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+fn e2e_host_bridge_advertises_save_capabilities_when_enabled() {
+    let (mut client, _config_dir, init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    let sync = init
+        .pointer("/result/capabilities/textDocumentSync")
+        .expect("textDocumentSync must be present");
+    assert_eq!(
+        sync.get("willSave").and_then(Value::as_bool),
+        Some(true),
+        "willSave must be advertised when a host bridge is configured; got {sync}"
+    );
+    assert_eq!(
+        sync.get("willSaveWaitUntil").and_then(Value::as_bool),
+        Some(true),
+        "willSaveWaitUntil must be advertised when a host bridge is configured; got {sync}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_bridge_hides_save_capabilities_when_disabled() {
+    // No `bridge._self.enabled` anywhere: the save methods forward only to host
+    // bridges, so kakehashi must keep advertising neither (today's behavior).
+    let (mut client, _config_dir, init) = init_will_save_client("");
+
+    let sync = init
+        .pointer("/result/capabilities/textDocumentSync")
+        .expect("textDocumentSync must be present");
+    assert!(
+        sync.get("willSave").is_none_or(Value::is_null),
+        "willSave must NOT be advertised without a host bridge; got {sync}"
+    );
+    assert!(
+        sync.get("willSaveWaitUntil").is_none_or(Value::is_null),
+        "willSaveWaitUntil must NOT be advertised without a host bridge; got {sync}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_will_save_wait_until_returns_host_edits() {
+    let (mut client, _config_dir, _init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    let mut hit = None;
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/willSaveWaitUntil",
+            json!({
+                "textDocument": { "uri": SAVE_URI },
+                "reason": 1
+            }),
+        );
+        assert!(
+            response.get("error").is_none(),
+            "willSaveWaitUntil must not surface a top-level error; got: {:?}",
+            response.get("error")
+        );
+        let result = response["result"].clone();
+        if !result.is_null() {
+            hit = Some(result);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let result = hit.expect("host willSaveWaitUntil must produce edits");
+
+    let new_text = result[0]["newText"].as_str().expect("edit newText");
+    assert_eq!(
+        new_text,
+        format!("willsave-edit:{SAVE_URI}\n"),
+        "willSaveWaitUntil edit must echo the real host URI and return verbatim"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_will_save_notification_reaches_host() {
+    let (mut client, _config_dir, _init) =
+        init_will_save_client("[languages.markdown.bridge._self]\nenabled = true\n");
+
+    // Warm up: a hover opens the host document downstream (the host bridge syncs
+    // lazily on the first request) and reports the willSave count — zero before
+    // any willSave is forwarded.
+    let mut warmed = false;
+    for _ in 0..300 {
+        if let Some(contents) = host_save_hover(&mut client) {
+            assert!(
+                contents.starts_with("willsave-count:0:"),
+                "before any willSave the host server must report zero; got {contents}"
+            );
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        warmed,
+        "host hover must answer (document synced) before the willSave"
+    );
+
+    // Forward one willSave (reason 2 = AfterDelay).
+    client.send_notification(
+        "textDocument/willSave",
+        json!({ "textDocument": { "uri": SAVE_URI }, "reason": 2 }),
+    );
+
+    // Subsequent hovers must reflect the recorded willSave: count 1, reason 2.
+    let mut seen = None;
+    for _ in 0..300 {
+        if let Some(contents) = host_save_hover(&mut client)
+            && !contents.starts_with("willsave-count:0:")
+        {
+            seen = Some(contents);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let contents = seen.expect("the forwarded willSave must reach the host server");
+    assert_eq!(
+        contents, "willsave-count:1:reason:2",
+        "the host server must record the forwarded willSave and its reason"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_will_save_wait_until_times_out_without_hanging_save() {
+    // The host server stalls 8s on willSaveWaitUntil; kakehashi's 5s save budget
+    // must abandon the request and return null near 5s — NOT wait the 30s
+    // request timeout (#357 Q3). Without the budget this test would block ~30s.
+    let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+        "will-save-slow",
+    );
+
+    // Warm up so the connection is Ready before the timed request: a cold
+    // FailFast request returns null instantly (no wait), which would not
+    // exercise the timeout path.
+    let mut warmed = false;
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "host bridge must be warm before the timed request");
+
+    let start = std::time::Instant::now();
+    let response = client.send_request(
+        "textDocument/willSaveWaitUntil",
+        json!({
+            "textDocument": { "uri": SAVE_URI },
+            "reason": 1
+        }),
+    );
+    let elapsed = start.elapsed();
+
+    assert!(
+        response.get("error").is_none(),
+        "a timed-out willSaveWaitUntil must return a result, not an error; got: {:?}",
+        response.get("error")
+    );
+    assert!(
+        response["result"].is_null(),
+        "a timed-out willSaveWaitUntil must return null (save proceeds editless); got: {}",
+        response["result"]
+    );
+    // The 5s budget — not an instant cold null (< 1s) and not the 30s request
+    // timeout. Generous bounds keep this robust under CI load.
+    assert!(
+        elapsed >= std::time::Duration::from_secs(3),
+        "must wait for the budget, not return an instant cold null; elapsed {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "must time out on the 5s budget, not the 30s request timeout; elapsed {elapsed:?}"
+    );
+
+    shutdown(&mut client);
+}
+
 /// The generic raw-forward path serves the other methods too: hover on the
 /// host document round-trips verbatim (the mock echoes the requested URI in
 /// its hover contents — a virtual URI would betray a translation).

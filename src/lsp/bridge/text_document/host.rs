@@ -171,6 +171,52 @@ impl LanguageServerPool {
         docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
     }
 
+    /// Forward a `textDocument/willSave` notification (#357) to every host
+    /// bridge server that **already has this host document open** and that
+    /// advertises `willSave`.
+    ///
+    /// willSave concerns the host document the editor is about to save, so it
+    /// is a verbatim passthrough (real URI, real `reason`) — no per-virtual-doc
+    /// fan-out and no coordinate translation. Restricting to servers with the
+    /// document already open mirrors the lazy host-document lifecycle: a server
+    /// that never received a request never opened the document, so a willSave
+    /// referencing an unknown document would be a protocol nuisance — and as a
+    /// fire-and-forget notification it must not lazily spawn a connection just
+    /// to announce a save (issue Q3, latency).
+    ///
+    /// Lock discipline follows the host **request** path
+    /// ([`Self::execute_host_request`]), stricter than the pre-snapshot in
+    /// [`Self::close_host_bridge_document`]: `connections` is held across the
+    /// `host_documents` iteration (consistent `connections` → `host_documents`
+    /// ordering with the respawn purge in `pool.rs`), and willSave is queued
+    /// only onto the **live** handle for each key. A pre-snapshot would leave a
+    /// window where a respawn between the snapshot and the send could queue
+    /// willSave onto a replaced/dead connection; holding `connections`
+    /// excludes the purge from interleaving, closing it (#357 review). The
+    /// sends are non-yielding queue writes, so holding both locks is cheap.
+    pub(crate) async fn notify_host_will_save(
+        &self,
+        uri: &Url,
+        params: &tower_lsp_server::ls_types::WillSaveTextDocumentParams,
+    ) {
+        // `as_str()` is the already-serialized form; `.to_owned()` clones it in
+        // one allocation, skipping the `Display`/`to_string` formatting path.
+        let uri_string = uri.as_str().to_owned();
+
+        let connections = self.connections().await;
+        let docs = self.host_documents().await;
+        for (connection_key, handle) in connections.iter() {
+            if !docs.contains_key(&(uri_string.clone(), connection_key.clone())) {
+                continue;
+            }
+            if !handle.has_capability("textDocument/willSave") {
+                continue;
+            }
+            let notification = JsonRpcNotification::new("textDocument/willSave", params);
+            handle.send_notification(notification);
+        }
+    }
+
     /// Send a host bridge request with the upstream params forwarded
     /// **verbatim** (host-document-bridge): the params already reference the
     /// real URI and real coordinates, so no per-method request shaping is

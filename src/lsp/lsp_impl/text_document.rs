@@ -34,5 +34,7 @@ mod selection_range;
 mod semantic_tokens;
 mod signature_help;
 mod type_definition;
+mod will_save;
+mod will_save_wait_until;
 
 // Re-export the methods (they are implemented as impl blocks on Kakehashi)
