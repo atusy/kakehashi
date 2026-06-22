@@ -82,8 +82,9 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// - [`DiagnosticSource::Region`] slots hold virtual coordinates and are
 ///   transformed via `region_offsets[region_id]` (lazy re-anchor against the
 ///   region's *current* offset). A region with no current offset (it no longer
-///   resolves, e.g. it was edited away) is skipped — its slot is stale and gets
-///   evicted by the lifecycle.
+///   resolves, e.g. it was edited away) is skipped here; its now-stale slot
+///   lingers in the cache until the whole host is dropped on `didClose`
+///   (per-region / crash eviction is a deferred follow-up).
 /// - [`DiagnosticSource::PullLayer`] slots are already host-local and pass through.
 ///
 /// Staged: results are concatenated (the default `textDocument/publishDiagnostics`
