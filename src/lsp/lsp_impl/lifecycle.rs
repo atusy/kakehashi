@@ -574,7 +574,10 @@ fn spawn_upstream_request(
             UpstreamRequest::ShowDocument { params, reply } => {
                 // Translate a virtual-document URI + selection back to the host
                 // document before forwarding, so the editor opens the real file
-                // (#403). Falls back to the original params on any miss.
+                // (#403). For a resolvable virtual URI the host URI is always
+                // used (selection translated, or dropped if the offset can't be
+                // rebuilt); only a non-virtual/unresolvable URI is forwarded
+                // unchanged. See `ShowDocumentTranslator::translate`.
                 let params = match &show_document_translator {
                     Some(translator) => translator.translate(params).await,
                     None => params,

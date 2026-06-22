@@ -139,8 +139,10 @@ impl ShowDocumentTranslator {
         // in between, `start_byte` could fall inside a *different* live region —
         // `resolve_at_byte_offset` returns whichever region contains the byte. A
         // mismatched `region_id` means we'd translate the selection against the
-        // wrong region, so bail to verbatim pass-through instead (the goto path
-        // can't hit this: there `resolved` and `region_id` come from one call).
+        // wrong region, so return `None` (no offset); the caller then opens the
+        // host document without a selection rather than risk a wrong one. (The
+        // goto path can't hit this: there `resolved` and `region_id` come from
+        // one call.)
         if resolved.region.region_id != region_id {
             return None;
         }
