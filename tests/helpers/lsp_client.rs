@@ -418,24 +418,36 @@ impl LspClient {
         let mut message_count = 0u32;
 
         loop {
-            // Check timeout
-            if start_time.elapsed() > TIMEOUT {
+            // Check message count threshold
+            if message_count >= MAX_MESSAGES {
                 panic!(
-                    "Timeout waiting for response with id {}. Elapsed: {:?}",
-                    expected_id,
+                    "Exceeded maximum message threshold ({MAX_MESSAGES}) waiting for response with id {expected_id}"
+                );
+            }
+
+            // Bound each wait by the *remaining* overall budget so the
+            // documented 30s timeout stays accurate even across many
+            // intervening notifications — without this, a single blocking read
+            // could itself wait a full 30s and overshoot the budget.
+            let remaining = TIMEOUT.saturating_sub(start_time.elapsed());
+            if remaining.is_zero() {
+                panic!(
+                    "Timeout waiting for response with id {expected_id}. Elapsed: {:?}",
                     start_time.elapsed()
                 );
             }
 
-            // Check message count threshold
-            if message_count >= MAX_MESSAGES {
-                panic!(
-                    "Exceeded maximum message threshold ({}) waiting for response with id {}",
-                    MAX_MESSAGES, expected_id
-                );
-            }
-
-            let message = self.receive_message();
+            let message = match self.rx.recv_timeout(remaining) {
+                Ok(ReaderEvent::Message(value)) => value,
+                Ok(ReaderEvent::Error(e)) => panic!("{e}"),
+                Err(RecvTimeoutError::Timeout) => panic!(
+                    "Timeout waiting for response with id {expected_id}. Elapsed: {:?}",
+                    start_time.elapsed()
+                ),
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "Server closed connection prematurely while waiting for response with id {expected_id}"
+                ),
+            };
             message_count += 1;
 
             // Check if this is a response to our request
@@ -450,23 +462,6 @@ impl LspClient {
                 }
             }
             // Otherwise it's a notification like window/logMessage, skip it
-        }
-    }
-
-    /// Receive a single LSP message from the background reader thread.
-    /// Times out after 30 seconds to prevent indefinite blocking on an
-    /// unresponsive (alive but silent) server.
-    fn receive_message(&mut self) -> Value {
-        const TIMEOUT: Duration = Duration::from_secs(30);
-        match self.rx.recv_timeout(TIMEOUT) {
-            Ok(ReaderEvent::Message(value)) => value,
-            Ok(ReaderEvent::Error(e)) => panic!("{e}"),
-            Err(RecvTimeoutError::Timeout) => {
-                panic!("Timeout reading LSP message after {TIMEOUT:?}")
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                panic!("Server closed connection prematurely (reader thread ended at EOF)")
-            }
         }
     }
 
