@@ -49,13 +49,16 @@
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
 //!   trigger filtering is what `tests/e2e_on_type_formatting.rs` proves).
 //! - `will-save` — advertises `hoverProvider` + a `textDocumentSync` Options
-//!   block with `willSave` and `willSaveWaitUntil` true. Records every
-//!   `textDocument/willSave` notification (count + last reason) and answers
+//!   block with `willSave`, `willSaveWaitUntil`, and `save` true. Records every
+//!   `textDocument/willSave` (count + last reason + last URI) and
+//!   `textDocument/didSave` (count + last URI), and answers
 //!   `textDocument/willSaveWaitUntil` with a save-time edit echoing the
-//!   requested URI (only for documents synced via `didOpen`). `hover` reports
-//!   the recorded willSave count and last reason, so the test can prove the
-//!   notification reached the host server. Used by `tests/e2e_host_bridge.rs`
-//!   to prove host-bridge willSave/willSaveWaitUntil forwarding (#357).
+//!   requested URI (only for documents synced via `didOpen`). `hover` returns
+//!   the recorded state as a JSON string (`{will,reason,willUri,did,didUri}`),
+//!   so a test can prove the notifications reached this server carrying the URI
+//!   it knows — the host URI for a host server, the *virtual* URI for a virt
+//!   server. Used by `tests/e2e_host_bridge.rs` to prove host- AND virt-bridge
+//!   willSave/didSave forwarding (#357).
 //! - `will-save-slow` — like `will-save`, but sleeps 8s before answering
 //!   `willSaveWaitUntil`, past kakehashi's 5s save budget. Lets the test prove
 //!   the bridge times out and returns null near 5s instead of hanging the save
@@ -95,10 +98,15 @@ fn main() {
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
-    // `will-save` mode: how many `textDocument/willSave` notifications arrived
-    // and the reason carried by the most recent one (#357).
+    // `will-save` mode: counts + last-seen URI for the willSave/didSave
+    // notifications, reported back via hover so the test can prove they arrived
+    // and carried the right document URI (the virtual URI for a virt server,
+    // the host URI for a host server) (#357).
     let mut will_save_count: usize = 0;
     let mut last_will_save_reason: i64 = 0;
+    let mut last_will_save_uri: Option<String> = None;
+    let mut did_save_count: usize = 0;
+    let mut last_did_save_uri: Option<String> = None;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -143,7 +151,8 @@ fn main() {
                             "openClose": true,
                             "change": 1,
                             "willSave": true,
-                            "willSaveWaitUntil": true
+                            "willSaveWaitUntil": true,
+                            "save": { "includeText": false }
                         }
                     }),
                     "workspace-folders" => json!({
@@ -255,12 +264,27 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             "textDocument/willSave" => {
-                // Notification (no id): record receipt + reason so a later
-                // hover can prove the host bridge forwarded it (#357).
+                // Notification (no id): record receipt + reason + URI so a later
+                // hover can prove the bridge forwarded it carrying the document
+                // URI this server knows (host or virtual) (#357).
                 will_save_count += 1;
                 if let Some(reason) = message.pointer("/params/reason").and_then(Value::as_i64) {
                     last_will_save_reason = reason;
                 }
+                last_will_save_uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "textDocument/didSave" => {
+                // Notification (no id): record receipt + URI for the hover probe
+                // (#357). didSave carries no text (includeText:false), so just
+                // accepting it is the property under test.
+                did_save_count += 1;
+                last_did_save_uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             "textDocument/willSaveWaitUntil" => {
                 // `will-save-slow` stalls past kakehashi's 5s save budget so the
@@ -305,13 +329,17 @@ fn main() {
             }
             "textDocument/hover" => {
                 let result = if mode.starts_with("will-save") {
-                    // Report the recorded willSave count + last reason so the
-                    // test can prove the notification reached this server (#357).
-                    json!({
-                        "contents": format!(
-                            "willsave-count:{will_save_count}:reason:{last_will_save_reason}"
-                        )
-                    })
+                    // Report the recorded willSave/didSave state as a JSON string
+                    // so the test can prove the notifications reached this server
+                    // and carried the document URI it knows (#357).
+                    let state = json!({
+                        "will": will_save_count,
+                        "reason": last_will_save_reason,
+                        "willUri": last_will_save_uri,
+                        "did": did_save_count,
+                        "didUri": last_did_save_uri,
+                    });
+                    json!({ "contents": state.to_string() })
                 } else if mode.starts_with("workspace-folders") {
                     // Echo the sorted, de-duplicated set of folder URIs this
                     // single process currently knows. Not gated on didOpen: the
