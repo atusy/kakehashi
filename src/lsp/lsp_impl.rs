@@ -1,6 +1,6 @@
 pub(crate) mod bridge_context;
 mod cli_format;
-mod coordinator;
+pub(crate) mod coordinator;
 mod kakehashi;
 mod lifecycle;
 mod show_document_translation;
@@ -146,6 +146,11 @@ pub struct Kakehashi {
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
     /// Manager for debounced didChange diagnostic triggers (pull-first-diagnostic-forwarding Phase 3)
     debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
+    /// Per-host proactive diagnostic cache — the single source of truth for
+    /// `textDocument/publishDiagnostics` (push-propagation-diagnostic-forwarding).
+    /// Both the host-event pull feed and downstream pushes write slots here; one
+    /// publisher merges and emits per host.
+    diagnostics: std::sync::Arc<crate::lsp::diagnostic_cache::DiagnosticAggregator>,
     /// Token for cancelling the upstream forwarding task on shutdown.
     ///
     /// Without this, the forwarding task only exits when all channel senders are
@@ -231,6 +236,9 @@ impl Kakehashi {
             bridge: std::sync::Arc::new(bridge),
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             debounced_diagnostics: std::sync::Arc::new(DebouncedDiagnosticsManager::new()),
+            diagnostics: std::sync::Arc::new(
+                crate::lsp::diagnostic_cache::DiagnosticAggregator::new(),
+            ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),

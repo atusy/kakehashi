@@ -51,6 +51,13 @@ impl Kakehashi {
         // Cancel any pending debounced diagnostic for this document (pull-first-diagnostic-forwarding Phase 3)
         self.debounced_diagnostics.cancel(&uri);
 
+        // Drop the proactive diagnostic cache for this host and clear the editor's
+        // diagnostics (push-propagation-diagnostic-forwarding). Runs after the
+        // synthetic/debounced tasks are aborted above, so no late task re-fills it.
+        super::super::coordinator::DiagnosticPublisher::new(self)
+            .clear_host(&uri)
+            .await;
+
         // Cancel any eager-open tasks for this document (prevents orphaned didOpen)
         self.bridge.cancel_eager_open(&uri);
 

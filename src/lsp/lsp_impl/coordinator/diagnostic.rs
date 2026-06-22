@@ -14,28 +14,31 @@ use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
 };
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
-use tower_lsp_server::Client;
 
 pub(crate) struct DiagnosticScheduler {
-    client: Client,
     language: std::sync::Arc<LanguageCoordinator>,
     documents: std::sync::Arc<DocumentStore>,
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
     debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
+    /// The single proactive publisher: the host-event pull below feeds its
+    /// result into the cache and republishes (push-propagation-diagnostic-forwarding),
+    /// rather than calling `client.publish_diagnostics` directly, so it can never
+    /// clobber a sibling region's push.
+    publisher: std::sync::Arc<super::DiagnosticPublisher>,
 }
 
 impl DiagnosticScheduler {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
-            client: server.client.clone(),
             language: std::sync::Arc::clone(&server.language),
             documents: std::sync::Arc::clone(&server.documents),
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             debounced_diagnostics: std::sync::Arc::clone(&server.debounced_diagnostics),
             synthetic_diagnostics: std::sync::Arc::clone(&server.synthetic_diagnostics),
+            publisher: std::sync::Arc::new(super::DiagnosticPublisher::new(server)),
         }
     }
 
@@ -44,16 +47,15 @@ impl DiagnosticScheduler {
     /// A later change cancels and replaces the pending timer. The snapshot is
     /// captured now, at schedule time, so diagnostics stay consistent with the
     /// document state that triggered the change.
-    pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url, lsp_uri: Uri) {
+    pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url, _lsp_uri: Uri) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
         self.debounced_diagnostics.schedule(
             uri,
-            lsp_uri,
-            self.client.clone(),
             snapshot_data,
             self.bridge.pool_arc(),
             std::sync::Arc::clone(&self.synthetic_diagnostics),
+            std::sync::Arc::clone(&self.publisher),
         );
     }
 
@@ -63,10 +65,10 @@ impl DiagnosticScheduler {
     /// with `SyntheticDiagnosticsManager` (superseding any previous task), then
     /// fans out to downstream servers and publishes via
     /// `textDocument/publishDiagnostics`.
-    pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url, lsp_uri: Uri) {
-        let client = self.client.clone();
+    pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url, _lsp_uri: Uri) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
         let bridge_pool = self.bridge.pool_arc();
+        let publisher = std::sync::Arc::clone(&self.publisher);
         let uri_clone = uri.clone();
 
         let task = tokio::spawn(async move {
@@ -79,12 +81,15 @@ impl DiagnosticScheduler {
 
             log::debug!(
                 target: LOG_TARGET,
-                "Collected {} diagnostics for {}",
+                "Collected {} pull-layer diagnostics for {}",
                 diagnostics.len(),
                 uri_clone
             );
 
-            client.publish_diagnostics(lsp_uri, diagnostics, None).await;
+            // Feed the host-event pull result into the cache and republish the
+            // merged set (push-propagation-diagnostic-forwarding) instead of
+            // publishing directly — push slots for the same host survive.
+            publisher.publish_pull_layer(&uri_clone, diagnostics).await;
         });
 
         self.synthetic_diagnostics
