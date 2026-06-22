@@ -204,9 +204,10 @@ policy clean:
   `(source, connection, wire_version) → content_epoch` entry **when each
   `didOpen`/`didChange` is successfully enqueued to that connection's writer**
   (enqueued, not merely counter-incremented). A non-null `publishDiagnostics.version`
-  is then an exact lookup in that map; an unknown version is held/dropped as stale
-  with a log line (a late server publishing for `N` after `N+1` was synced). Null
-  versions fall back to the best-effort rule below. Eligibility is "slot's epoch ==
+  is then an exact lookup in that map; since the map is populated at enqueue time,
+  an unknown version is a protocol mismatch or a very stale push and is **dropped
+  with a log line** (e.g. a late server publishing for `N` after `N+1` was synced).
+  Null versions fall back to the best-effort rule below. Eligibility is "slot's epoch ==
   source's current epoch", never a raw cross-server version compare.
 - **Lazy re-anchor**: transforming at publish time against the region's *current*
   offset re-positions an unchanged region's diagnostics after an edit *above* it
@@ -316,11 +317,13 @@ Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<epoch,nth>`, where
 `concatenated` keeps every server, so the fan-in needs no election — but the slot
 model and version gate carry over unchanged. Per virtual document:
 
-- Each server's slot holds its **latest** push; a repeat publish for the same
-  version replaces the previous one (the within-server rule, same as `preferred`).
-- The region's result is the **concatenation of all eligible slots in
-  expanded-`priorities` order** (named servers in list order, then the `"*"` group
-  in config order) — the order pull already uses, so the output stays stable no
+- Each server's slot holds its **latest** push; a repeat publish at the same
+  epoch replaces the previous one (the within-server rule, same as `preferred`).
+- The region's result is the **concatenation of all eligible slots in the
+  flattened expanded-`priorities` walk** — `Server` entries and the `Rest("*")`
+  group each keep their *configured position* (so `["*", "a1"]` puts the group
+  first), and the group's members are in server config order excluding names listed
+  elsewhere — the order pull already uses, so the output stays stable no
   matter which server pushed last. Arrival order must not leak into the result.
 - The version gate applies: only slots at `Veff` are concatenated; a slot lagging
   `Veff` is held until it re-publishes at `Veff`. During a content-epoch bump
@@ -357,11 +360,14 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   `textDocument/diagnostic` mid-session (pull-driven → push-driven) has already
   missed the host `didOpen`, so the transition into push-driven must itself
   eagerly open any currently-open host docs where that `_self` server is enabled.
-- **Re-merge on classification/config change**: a capability transition (a server's
-  pull/push reclassification), a `pullFallback` / `pushFallback` toggle change, or a
-  `priorities` change alters which slots are visible. Each must trigger a host
-  re-merge so the new visibility takes effect immediately, not at the next
-  diagnostic event.
+- **Re-merge on classification/config change**: a change that alters which slots
+  are visible takes effect differently per path. Path A (proactive publish) must
+  trigger an immediate host re-merge on a capability reclassification, a
+  `pullFallback` change, or a `publishDiagnostics` `priorities`/strategy change —
+  otherwise the new visibility waits for the next diagnostic event. Path B (client
+  pull) needs no proactive re-merge: it is recomputed per request, so a
+  `pushFallback` change or a `textDocument/diagnostic` `priorities`/strategy change
+  simply applies on the next client pull.
 - **Held-but-silent slot**: a slot held by the version gate whose push-driven
   server never re-publishes at the new content epoch stays hidden until it does.
   A conforming server re-emits after the `didChange`, so it self-heals; a dead
