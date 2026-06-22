@@ -212,6 +212,33 @@ Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<ver,nth>`):
   `a1<2,1>`. `a1`'s v2 lifts `Veff` to 2, holding `a2`'s v1 slot; `a1` is
   re-elected at v2, and `a2<2,1>` then leaves the incumbent unchanged.
 
+### `concatenated` as a push stream
+
+`concatenated` keeps every server, so the fan-in needs no election — but the slot
+model and version gate carry over unchanged. Per virtual document:
+
+- Each server's slot holds its **latest** push; a repeat publish for the same
+  version replaces the previous one (the within-server rule, same as `preferred`).
+- The region's result is the **concatenation of all eligible slots in
+  expanded-`priorities` order** (named servers in list order, then the `"*"` group
+  in config order) — the order pull already uses, so the output stays stable no
+  matter which server pushed last. Arrival order must not leak into the result.
+- The version gate applies: only slots at `Veff` are concatenated; a slot lagging
+  `Veff` is held until it re-publishes at `Veff`. During a document-version bump
+  the concat shrinks to the caught-up servers and refills as the slower ones catch
+  up — the same self-healing window as elsewhere, not a special case.
+
+`empty` and `absent` coincide here: an empty slot contributes nothing, so the
+`preferred` empty-vs-absent question never arises.
+
+Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
+
+- Same version — `a1<1,1>=[X]`, `a2<1,1>=[Y]`, `a1<1,2>=[X']` → publishes `[X]`,
+  then `[X, Y]`, then `[X', Y]`. `a1`'s repeat replaces `X` with `X'`; `a2` is
+  untouched; order is fixed by `priorities`, not by who published last.
+- Version bump — then `a2<2,1>=[Y2]` lifts `Veff` to 2 and holds `a1`'s v1 slot,
+  so the region shows `[Y2]` alone until `a1` re-publishes at v2.
+
 ### Lifecycle
 
 - Host `didClose` → drop the `host_uri` cache entry.
