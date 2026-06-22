@@ -194,7 +194,9 @@ impl LanguageServerPool {
         uri: &Url,
         params: &tower_lsp_server::ls_types::WillSaveTextDocumentParams,
     ) {
-        let uri_string = uri.to_string();
+        // `as_str()` is the already-serialized form; `.to_owned()` clones it in
+        // one allocation, skipping the `Display`/`to_string` formatting path.
+        let uri_string = uri.as_str().to_owned();
 
         let handles: Vec<(ConnectionKey, Arc<ConnectionHandle>)> = {
             let connections = self.connections().await;
