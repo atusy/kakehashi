@@ -28,11 +28,13 @@ use tower_lsp_server::jsonrpc;
 use super::ProgressConnectionId;
 use crate::error::LockResultExt;
 
-/// Shared (cheaply cloneable) map of in-flight forwarded requests to their
-/// cancellation tokens, keyed by `(connection, downstream request id)`.
+/// Shared (cheaply cloneable) registry of in-flight forwarded requests and their
+/// cancellation tokens. Nested `connection → (request id → token)` so per-id
+/// lookups don't clone the id and a connection's requests can be cancelled and
+/// dropped together in one O(its-entries) step.
 #[derive(Clone, Default)]
 pub(crate) struct InboundRequestRegistry {
-    inner: Arc<Mutex<HashMap<(ProgressConnectionId, jsonrpc::Id), CancellationToken>>>,
+    inner: Arc<Mutex<HashMap<ProgressConnectionId, HashMap<jsonrpc::Id, CancellationToken>>>>,
 }
 
 impl InboundRequestRegistry {
@@ -48,7 +50,9 @@ impl InboundRequestRegistry {
         self.inner
             .lock()
             .recover_poison("InboundRequestRegistry::register")
-            .insert((connection_id, request_id), token.clone());
+            .entry(connection_id)
+            .or_default()
+            .insert(request_id, token.clone());
         token
     }
 
@@ -59,7 +63,8 @@ impl InboundRequestRegistry {
             .inner
             .lock()
             .recover_poison("InboundRequestRegistry::cancel")
-            .get(&(connection_id, request_id.clone()))
+            .get(&connection_id)
+            .and_then(|requests| requests.get(request_id))
         {
             token.cancel();
         }
@@ -68,27 +73,32 @@ impl InboundRequestRegistry {
     /// Drop a settled request's entry (called by the forwarding loop once the
     /// editor responded or the cancel was forwarded).
     pub(crate) fn unregister(&self, connection_id: ProgressConnectionId, request_id: &jsonrpc::Id) {
-        self.inner
+        let mut guard = self
+            .inner
             .lock()
-            .recover_poison("InboundRequestRegistry::unregister")
-            .remove(&(connection_id, request_id.clone()));
+            .recover_poison("InboundRequestRegistry::unregister");
+        if let Some(requests) = guard.get_mut(&connection_id) {
+            requests.remove(request_id);
+            if requests.is_empty() {
+                guard.remove(&connection_id);
+            }
+        }
     }
 
     /// Cancel and drop every in-flight request for a connection — used when a
     /// downstream connection's reader exits, so its forwarded requests don't
     /// linger as open editor dialogs.
     pub(crate) fn cancel_connection(&self, connection_id: ProgressConnectionId) {
-        self.inner
+        if let Some(requests) = self
+            .inner
             .lock()
             .recover_poison("InboundRequestRegistry::cancel_connection")
-            .retain(|(conn, _), token| {
-                if *conn == connection_id {
-                    token.cancel();
-                    false
-                } else {
-                    true
-                }
-            });
+            .remove(&connection_id)
+        {
+            for token in requests.into_values() {
+                token.cancel();
+            }
+        }
     }
 }
 

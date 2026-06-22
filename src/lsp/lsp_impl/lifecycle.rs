@@ -601,7 +601,11 @@ async fn forward_with_cancel(
     cancel_token: &tokio_util::sync::CancellationToken,
 ) -> Option<serde_json::Value> {
     tokio::select! {
-        result = send_editor_request(client, editor_id.clone(), method, params) => result,
+        // `biased`: poll the cancel branch first so an already-cancelled request
+        // (cancelled while it sat in the channel) is never sent to the editor at
+        // all — `send_editor_request` isn't polled, so no request is written and
+        // no pending slot is registered.
+        biased;
         () = cancel_token.cancelled() => {
             use tower_lsp_server::ls_types::notification::Cancel;
             use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
@@ -622,6 +626,7 @@ async fn forward_with_cancel(
             client.send_notification::<Cancel>(CancelParams { id }).await;
             None
         }
+        result = send_editor_request(client, editor_id.clone(), method, params) => result,
     }
 }
 
