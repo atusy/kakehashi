@@ -42,9 +42,10 @@ pub(in crate::lsp::bridge) fn forward_push(
     deps: &crate::lsp::bridge::actor::ServerRequestDeps,
 ) {
     // The server name keys the cache slot; production always sets it (readers are
-    // spawned with `Some(server_name)`). Drop a push that lacks one *before* any
-    // parse/enqueue work — it would be dropped downstream anyway.
-    let Some(server) = deps.server_name.clone() else {
+    // spawned with `Some(server_name)`). Check it by reference up front so a push
+    // that lacks one is dropped before any parse/enqueue work; the actual clone is
+    // deferred to the send below, past every early-return guard.
+    let Some(server_name) = deps.server_name.as_deref() else {
         log::debug!(
             target: "kakehashi::bridge::reader",
             "dropping region push without a server name"
@@ -79,7 +80,7 @@ pub(in crate::lsp::bridge) fn forward_push(
     let _ = deps.upstream_tx.send(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
             uri,
-            server,
+            server: server_name.to_owned(),
             diagnostics,
         },
     );
