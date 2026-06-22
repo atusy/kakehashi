@@ -685,7 +685,11 @@ fn spawn_upstream_request(
                 .await
                 .and_then(|v| serde_json::from_value::<Option<MessageActionItem>>(v).ok())
                 .flatten();
-                inbound_request_registry.unregister(cancel.connection_id, &cancel.request_id);
+                inbound_request_registry.unregister(
+                    cancel.connection_id,
+                    &cancel.request_id,
+                    cancel.generation,
+                );
                 let _ = reply.send(action);
             }
             UpstreamRequest::ShowDocument {
@@ -711,7 +715,11 @@ fn spawn_upstream_request(
                         .and_then(|v| serde_json::from_value::<ShowDocumentResult>(v).ok())
                         .map(|r| r.success)
                         .unwrap_or(false);
-                inbound_request_registry.unregister(cancel.connection_id, &cancel.request_id);
+                inbound_request_registry.unregister(
+                    cancel.connection_id,
+                    &cancel.request_id,
+                    cancel.generation,
+                );
                 let _ = reply.send(success);
             }
         }
@@ -861,6 +869,7 @@ mod tests {
             connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             request_id: tower_lsp_server::jsonrpc::Id::Number(1),
             token: tokio_util::sync::CancellationToken::new(),
+            generation: 0,
         }
     }
 
@@ -1449,6 +1458,7 @@ mod tests {
                     connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
                     request_id: tower_lsp_server::jsonrpc::Id::Number(1),
                     token: request_token.clone(),
+                    generation: 0,
                 },
             })
             .unwrap();

@@ -139,6 +139,12 @@ pub(crate) struct ForwardedRequestCancel {
     pub(crate) connection_id: crate::lsp::bridge::ProgressConnectionId,
     pub(crate) request_id: jsonrpc::Id,
     pub(crate) token: CancellationToken,
+    /// The registration generation, passed back to
+    /// [`InboundRequestRegistry::unregister`] so a request whose id was reused
+    /// only drops its own entry.
+    ///
+    /// [`InboundRequestRegistry::unregister`]: crate::lsp::bridge::InboundRequestRegistry
+    pub(crate) generation: u64,
 }
 
 /// Capacity of the bounded `window/*` forwarding queue. Sized like the
@@ -1036,10 +1042,10 @@ mod tests {
         let (deps, _keep) = dummy_server_request_deps();
 
         // The handler would have registered these before enqueueing each request.
-        let token = deps
+        let (token, _g7) = deps
             .inbound_request_registry
             .register(deps.progress_connection_id, jsonrpc::Id::Number(7));
-        let other = deps
+        let (other, _g8) = deps
             .inbound_request_registry
             .register(deps.progress_connection_id, jsonrpc::Id::Number(8));
         assert!(!token.is_cancelled());

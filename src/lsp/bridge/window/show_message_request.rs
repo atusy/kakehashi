@@ -64,13 +64,14 @@ pub(in crate::lsp::bridge) fn handle(
     // fires this token on cancel / connection death; the forwarding loop awaits
     // it and, if fired, sends a correlated `$/cancelRequest` to the editor.
     let connection_id = deps.progress_connection_id;
-    let token = deps
+    let (token, generation) = deps
         .inbound_request_registry
         .register(connection_id, id.clone());
     let cancel = ForwardedRequestCancel {
         connection_id,
         request_id: id.clone(),
         token,
+        generation,
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -100,7 +101,8 @@ pub(in crate::lsp::bridge) fn handle(
     {
         // Forwarding loop gone (shutdown): drop the registry entry we just made.
         // The responder still answers `null` via the dropped `reply_tx`.
-        deps.inbound_request_registry.unregister(connection_id, &id);
+        deps.inbound_request_registry
+            .unregister(connection_id, &id, generation);
         debug!(
             target: "kakehashi::bridge::reader",
             "{}Forwarding loop gone; answering {} with null",

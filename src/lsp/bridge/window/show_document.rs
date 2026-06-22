@@ -62,13 +62,14 @@ pub(in crate::lsp::bridge) fn handle(
     // Register the in-flight request BEFORE enqueueing it so a racing downstream
     // `$/cancelRequest` can't miss it (#404). See `show_message_request`.
     let connection_id = deps.progress_connection_id;
-    let token = deps
+    let (token, generation) = deps
         .inbound_request_registry
         .register(connection_id, id.clone());
     let cancel = ForwardedRequestCancel {
         connection_id,
         request_id: id.clone(),
         token,
+        generation,
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -98,7 +99,8 @@ pub(in crate::lsp::bridge) fn handle(
         .is_err()
     {
         // Forwarding loop gone (shutdown): drop the registry entry we just made.
-        deps.inbound_request_registry.unregister(connection_id, &id);
+        deps.inbound_request_registry
+            .unregister(connection_id, &id, generation);
         debug!(
             target: "kakehashi::bridge::reader",
             "{}Forwarding loop gone; answering {} with success:false",
