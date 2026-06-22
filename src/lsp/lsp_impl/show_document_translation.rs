@@ -11,13 +11,20 @@
 //!
 //! The offset is rebuilt from the live parse exactly as the goto path does
 //! (`region_id → node byte range → resolve injection → RegionOffset`), so a
-//! showDocument-to-a-region can't disagree with goto on the same region. Any
-//! miss falls back to forwarding the params unchanged (the pre-translation
-//! behavior): not a virtual URI, `external: true`, an unmappable host URI, a
-//! `region_id` that isn't a ULID, no host mapping for the URI, a region
-//! invalidated by edits (`lookup_node` returns `None`), a missing
-//! document/snapshot/language/injection-query, or a `region_id` that no longer
-//! matches the region the live parse resolves at that byte (edit race).
+//! showDocument-to-a-region can't disagree with goto on the same region.
+//!
+//! Once the URI resolves to a currently-open virtual document, the editor always
+//! gets the **host** document URI. The selection is translated when the region
+//! offset can be rebuilt; when it can't — region invalidated by edits
+//! (`lookup_node` returns `None`), a `region_id` that no longer matches the live
+//! parse at that byte (edit race), or a missing document/snapshot/language/query
+//! — the selection is **dropped** (a stale virtual-coordinate selection would
+//! point at the wrong place) but the host document still opens.
+//!
+//! Forwarding the params **unchanged** (the pre-translation behavior) only
+//! happens when the URI isn't a resolvable virtual document at all: not a
+//! virtual URI / `external: true` / a `region_id` that isn't a valid id / no
+//! host mapping for the URI / an unmappable host URI.
 //!
 //! [`transform_goto_response_to_host`]: crate::lsp::bridge::protocol::transform_goto_response_to_host
 
@@ -53,8 +60,10 @@ impl ShowDocumentTranslator {
         }
     }
 
-    /// Translate a virtual-document `showDocument` to host coordinates, or return
-    /// `params` unchanged on any miss (see module docs for the fallback cases).
+    /// Translate a virtual-document `showDocument` to the host document (and host
+    /// coordinates when the offset resolves); forward `params` unchanged only when
+    /// the URI isn't a resolvable virtual document. See the module docs for the
+    /// exact behavior.
     pub(super) async fn translate(&self, mut params: ShowDocumentParams) -> ShowDocumentParams {
         // `external: true` is a browser/OS resource, never a virtual document.
         if params.external == Some(true) {
@@ -72,20 +81,20 @@ impl ShowDocumentTranslator {
             return params;
         };
 
-        match self.region_offset(&host_url, &region_id) {
-            // Offset resolved: rewrite the URI and translate the selection (if any).
-            Some(offset) => Self::apply_host_translation(params, host_uri, &offset),
-            // Offset unavailable (region invalidated by edits, or unresolvable):
-            // still open the host document, but drop a selection we can't
-            // translate — a virtual-coordinate selection on the host URI would
-            // point at the wrong place, and keeping the virtual URI would leave
-            // the editor unable to open it at all.
-            None => {
-                params.uri = host_uri;
-                params.selection = None;
-                params
+        // Only a selection needs the (live-parse) region offset, so skip
+        // resolving it when there's nothing to translate.
+        if params.selection.is_some() {
+            match self.region_offset(&host_url, &region_id) {
+                Some(offset) => return Self::apply_host_translation(params, host_uri, &offset),
+                // Offset unavailable (region invalidated by edits, or otherwise
+                // unresolvable): drop the selection we can't translate — a
+                // virtual-coordinate selection on the host URI would point at the
+                // wrong place — but still open the host document below.
+                None => params.selection = None,
             }
         }
+        params.uri = host_uri;
+        params
     }
 
     /// Rewrite `params` to the host document: set `uri`, and translate the
