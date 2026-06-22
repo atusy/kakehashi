@@ -569,7 +569,20 @@ async fn send_editor_request(
         .params(params)
         .finish();
     match client.clone().call(request).await {
-        Ok(Some(response)) => response.into_parts().1.ok(),
+        Ok(Some(response)) => match response.into_parts().1 {
+            Ok(value) => Some(value),
+            // An error response from the editor (e.g. method unsupported) — log
+            // for observability, then fall back to the protocol default like the
+            // replaced client.show_message_request/show_document path did.
+            Err(e) => {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "{} returned an error from the editor: {}",
+                    method, e
+                );
+                None
+            }
+        },
         Ok(None) => None,
         Err(e) => {
             log::debug!(
