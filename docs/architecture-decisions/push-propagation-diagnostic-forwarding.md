@@ -173,8 +173,12 @@ source (e.g. two Lua linters on one region) and each pushes independently.
 Producing the host publish mirrors the existing staged pull aggregation:
 
 1. **Per-source fan-in** — for each source, combine its servers' slots per the
-   method's `strategy`: `concatenated` appends all, `preferred` elects one (see
-   `preferred` as a push stream).
+   method's `strategy` over the **visible walk**: resolve it exactly as pull does —
+   expand `priorities`, then truncate by `maxFanOut` (`dispatch.rs`) — and use that
+   truncated walk for eligibility and ordering. Cached slots for servers outside
+   the visible walk are retained but ignored until a config change re-resolves it.
+   Then `concatenated` appends all visible slots, `preferred` elects one (see the
+   strategy sections).
 2. **Cross-region merge** — concatenate the per-source fan-ins of the virt layer's
    regions, ordered by region start position (so arrival order never leaks),
    lazily transforming each region slot's virtual coordinates to **current** host
@@ -259,7 +263,8 @@ static order to fall back on. Per virtual document:
   older epoch are held (treated as absent) until that server re-publishes at
   `Veff`. This is the version gate, and it is what makes a content bump re-open the
   election.
-- **Winner walk** over the expanded `priorities`:
+- **Winner walk** over the visible walk (expanded-and-truncated `priorities`,
+  above):
   - `Server(name)` — wins if its slot is eligible (present, **non-empty**, at
     `Veff`); otherwise fall through to the next entry.
   - `Rest("*")` group — the **incumbent** keeps the position while it stays
@@ -323,10 +328,11 @@ model and version gate carry over unchanged. Per virtual document:
 - Each server's slot holds its **latest** push; a repeat publish at the same
   epoch replaces the previous one (the within-server rule, same as `preferred`).
 - The region's result is the **concatenation of all eligible slots in the
-  flattened expanded-`priorities` walk** — `Server` entries and the `Rest("*")`
-  group each keep their *configured position* (so `["*", "a1"]` puts the group
-  first), and the group's members are in server config order excluding names listed
-  elsewhere — the order pull already uses, so the output stays stable no
+  flattened visible walk** (expanded-and-truncated `priorities`, above) — `Server`
+  entries and the `Rest("*")` group each keep their *configured position* (so
+  `["*", "a1"]` puts the group first), and the group's members are in server config
+  order excluding names listed elsewhere — the order pull already uses, so the
+  output stays stable no
   matter which server pushed last. Arrival order must not leak into the result.
 - The version gate applies: only slots at `Veff` are concatenated; a slot lagging
   `Veff` is held until it re-publishes at `Veff`. During a content-epoch bump
