@@ -542,8 +542,9 @@ fn e2e_host_bridge_save_capabilities_decouple_willsave_from_waituntil() {
 
 #[test]
 fn e2e_host_bridge_hides_save_capabilities_without_any_server() {
-    // With no language servers configured at all, neither save method has a
-    // possible consumer, so kakehashi advertises neither (today's behavior).
+    // With no RUNNABLE bridge servers configured (only the built-in `_`
+    // wildcard defaults entry, which has an empty cmd), neither save method has
+    // a possible consumer, so kakehashi advertises neither (today's behavior).
     // Use an explicit empty config file and omit initializationOptions so no
     // default/user config can leak servers or host bridging in.
     let config_dir = tempfile::TempDir::new().expect("config dir");

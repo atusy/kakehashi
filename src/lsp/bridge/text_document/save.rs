@@ -103,12 +103,14 @@ impl LanguageServerPool {
             if handle.state() != ConnectionState::Ready || !handle.has_capability(capability) {
                 continue;
             }
+            // Compute the virtual URI string once and reuse it for both the
+            // liveness recheck and the notification params.
+            let virtual_uri = doc.virtual_uri.to_uri_string();
             // Then the liveness recheck: only send if this connection STILL has
             // this virtual doc open (membership test, no reverse-index Vec clone).
-            if !self.is_virtual_doc_open_on_connection(&doc.virtual_uri, &doc.connection_key) {
+            if !self.is_virtual_doc_open_on_connection(&virtual_uri, &doc.connection_key) {
                 continue;
             }
-            let virtual_uri = doc.virtual_uri.to_uri_string();
             let notification = JsonRpcNotification::new(method, build_params(&virtual_uri));
             handle.send_notification(notification);
         }

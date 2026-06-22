@@ -543,11 +543,11 @@ impl LanguageServerPool {
     }
 
     /// Membership check for the save fan-out liveness recheck (avoids the
-    /// reverse-index `Vec<ConnectionKey>` clone): is `virtual_uri` open on
-    /// `connection_key`?
+    /// reverse-index `Vec<ConnectionKey>` clone): is the virtual document at
+    /// `virtual_uri` (its URI string) open on `connection_key`?
     pub(super) fn is_virtual_doc_open_on_connection(
         &self,
-        virtual_uri: &VirtualDocumentUri,
+        virtual_uri: &str,
         connection_key: &ConnectionKey,
     ) -> bool {
         self.document_tracker

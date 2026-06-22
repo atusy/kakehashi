@@ -439,18 +439,20 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    /// Membership check: is `virtual_uri` open on `connection_key`? Reads the
-    /// same `virtual_to_servers` reverse index as
-    /// [`Self::get_all_connections_for_virtual_uri`] but only tests membership,
-    /// avoiding that method's `Vec<ConnectionKey>` clone (the `to_uri_string()`
-    /// key allocation remains) — used by the per-doc save fan-out liveness recheck.
+    /// Membership check: is the virtual document at `virtual_uri` (its URI
+    /// string) open on `connection_key`? Reads the same `virtual_to_servers`
+    /// reverse index as [`Self::get_all_connections_for_virtual_uri`] but only
+    /// tests membership, avoiding that method's `Vec<ConnectionKey>` clone — and
+    /// takes `&str` so the caller (which already has the URI string for the
+    /// notification params) need not allocate it twice. Used by the per-doc save
+    /// fan-out liveness recheck.
     pub(super) fn is_virtual_doc_open_on_connection(
         &self,
-        virtual_uri: &VirtualDocumentUri,
+        virtual_uri: &str,
         connection_key: &ConnectionKey,
     ) -> bool {
         self.virtual_to_servers
-            .get(&virtual_uri.to_uri_string())
+            .get(virtual_uri)
             .is_some_and(|entry| entry.value().contains(connection_key))
     }
 
