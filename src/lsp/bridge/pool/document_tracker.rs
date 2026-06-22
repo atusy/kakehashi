@@ -439,20 +439,18 @@ impl DocumentTracker {
     /// derived without a scan). `window/showDocument` is rare, so the scan is
     /// acceptable.
     pub(super) async fn resolve_virtual_uri(&self, virtual_uri: &str) -> Option<(Url, String)> {
-        // Pre-filter on `region_id` (parsed once): it's a globally-unique
-        // per-position ULID, so a cheap `&str` compare skips the per-entry
-        // `to_uri_string()` allocation for every non-matching doc. The full URI
-        // compare still confirms the match (and is the only check if the target's
-        // region_id can't be parsed).
-        let target_region_id = VirtualDocumentUri::region_id_of(virtual_uri);
+        // A non-virtual URI can't match any open virtual document, so bail before
+        // taking the lock. The parsed `region_id` is then a cheap `&str` pre-filter
+        // (globally-unique per-position ULID), skipping the per-entry
+        // `to_uri_string()` allocation for non-matching docs; the full URI compare
+        // still confirms the match.
+        let target_region_id = VirtualDocumentUri::region_id_of(virtual_uri)?;
         let host_map = self.host_to_virtual.lock().await;
         for (host, docs) in host_map.iter() {
             for doc in docs {
-                let region_id_matches = match &target_region_id {
-                    Some(id) => doc.virtual_uri.region_id() == id.as_str(),
-                    None => true,
-                };
-                if region_id_matches && doc.virtual_uri.to_uri_string() == virtual_uri {
+                if doc.virtual_uri.region_id() == target_region_id.as_str()
+                    && doc.virtual_uri.to_uri_string() == virtual_uri
+                {
                     return Some((host.clone(), doc.virtual_uri.region_id().to_string()));
                 }
             }

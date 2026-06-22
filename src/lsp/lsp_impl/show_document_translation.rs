@@ -28,9 +28,7 @@ use url::Url;
 
 use crate::document::DocumentStore;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{
-    BridgeCoordinator, RegionOffset, VirtualDocumentUri, translate_virtual_range_to_host,
-};
+use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, translate_virtual_range_to_host};
 
 /// Translates `window/showDocument` params whose URI is a virtual document back
 /// to the host document + host coordinates. Holds shared (cheaply cloneable)
@@ -62,9 +60,9 @@ impl ShowDocumentTranslator {
         if params.external == Some(true) {
             return params;
         }
-        if !VirtualDocumentUri::is_virtual_uri(params.uri.as_str()) {
-            return params;
-        }
+        // `resolve_virtual_uri` returns `None` for any non-virtual URI (it parses
+        // the region_id first), so a separate `is_virtual_uri` check would just
+        // parse the URL twice.
         let Some((host_url, region_id)) =
             self.bridge.resolve_virtual_uri(params.uri.as_str()).await
         else {
@@ -139,6 +137,7 @@ impl ShowDocumentTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::VirtualDocumentUri;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{Position, Range, Uri};
 
