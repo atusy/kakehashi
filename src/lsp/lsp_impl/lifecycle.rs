@@ -586,7 +586,11 @@ async fn send_editor_request(
 /// signal (#404). If the cancel fires first, send a correlated `$/cancelRequest`
 /// to the editor with the id we minted — so a `showMessageRequest` dialog is
 /// dismissed — and return `None`, so the downstream gets the protocol default.
-/// The editor's eventual (cancelled) response is dropped.
+///
+/// On cancel the in-flight `send_editor_request` future is dropped. tower-lsp's
+/// client keeps that request's slot in its pending map (no cancel/remove API),
+/// but a conformant editor's eventual (cancelled) response reclaims it, so the
+/// leak is bounded to requests the editor never answers at all.
 async fn forward_with_cancel(
     client: &Client,
     editor_id: tower_lsp_server::jsonrpc::Id,
@@ -599,9 +603,10 @@ async fn forward_with_cancel(
         () = cancel_token.cancelled() => {
             use tower_lsp_server::ls_types::notification::Cancel;
             use tower_lsp_server::ls_types::{CancelParams, NumberOrString};
-            // The id we minted is always numeric (next_request_id); map it to the
-            // notification's NumberOrString. Values are a small monotonic counter,
-            // so the i32 narrowing is lossless in practice.
+            // The id we minted is always numeric (next_request_id, an AtomicU32
+            // counter); map it to the notification's NumberOrString. The i32
+            // narrowing is lossless until ~2.1B server→client requests in one
+            // session, far beyond any real session.
             let id = match editor_id {
                 tower_lsp_server::jsonrpc::Id::Number(n) => NumberOrString::Number(n as i32),
                 tower_lsp_server::jsonrpc::Id::String(s) => NumberOrString::String(s),
