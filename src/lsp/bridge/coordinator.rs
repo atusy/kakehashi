@@ -135,6 +135,12 @@ impl BridgeCoordinator {
     /// Access the underlying node tracker.
     ///
     /// Used by handlers for `InjectionResolver::resolve_at_byte_offset()`.
+    /// Resolve a virtual-document URI string to its `(host_url, region_id)`
+    /// (used by `window/showDocument` translation). Delegates to the pool.
+    pub(crate) async fn resolve_virtual_uri(&self, virtual_uri: &str) -> Option<(Url, String)> {
+        self.pool.resolve_virtual_uri(virtual_uri).await
+    }
+
     pub(crate) fn node_tracker(&self) -> &NodeTracker {
         &self.node_tracker
     }
