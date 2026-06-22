@@ -46,9 +46,25 @@ fn wait_for_notification_honors_deadline_against_silent_server() {
         result.is_none(),
         "no notification should arrive for a method the server never sends"
     );
+    // Upper bound: the wait must not hang past its deadline (the pre-fix
+    // fill_buf implementation blocks forever here).
     assert!(
         elapsed < Duration::from_secs(3),
         "wait must return at its deadline against an alive-but-silent server, \
          took {elapsed:?} (would hang on the pre-fix fill_buf implementation)"
+    );
+    // Lower bound + liveness: the wait must have actually blocked until ~the
+    // deadline against a *live* server — not returned early because the server
+    // exited (a disconnect also yields None). This is what pins the
+    // "alive but silent" guarantee rather than merely "returns None".
+    assert!(
+        elapsed >= timeout.saturating_sub(Duration::from_millis(100)),
+        "wait returned before its deadline ({elapsed:?}); the server must stay \
+         silent for the full timeout, not disconnect early"
+    );
+    assert!(
+        client.is_running(),
+        "server must still be alive after the wait — the deadline guarantee is \
+         only meaningful against a live, silent server"
     );
 }
