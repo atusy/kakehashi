@@ -55,7 +55,7 @@ impl ShowDocumentTranslator {
 
     /// Translate a virtual-document `showDocument` to host coordinates, or return
     /// `params` unchanged on any miss (see module docs for the fallback cases).
-    pub(super) async fn translate(&self, params: ShowDocumentParams) -> ShowDocumentParams {
+    pub(super) async fn translate(&self, mut params: ShowDocumentParams) -> ShowDocumentParams {
         // `external: true` is a browser/OS resource, never a virtual document.
         if params.external == Some(true) {
             return params;
@@ -68,14 +68,25 @@ impl ShowDocumentTranslator {
         else {
             return params; // not a currently-open virtual document
         };
-        let Some(offset) = self.region_offset(&host_url, &region_id) else {
-            return params; // region invalidated by edits, or unresolvable
-        };
         let Ok(host_uri) = super::url_to_uri(&host_url) else {
             return params;
         };
 
-        Self::apply_host_translation(params, host_uri, &offset)
+        match &params.selection {
+            // Only a selection needs the region offset. If it can't be resolved
+            // (region invalidated by edits), pass through rather than send a
+            // selection in stale/virtual coordinates.
+            Some(_) => match self.region_offset(&host_url, &region_id) {
+                Some(offset) => Self::apply_host_translation(params, host_uri, &offset),
+                None => params,
+            },
+            // No selection: just point the editor at the host document — this
+            // works even when the region offset is unavailable.
+            None => {
+                params.uri = host_uri;
+                params
+            }
+        }
     }
 
     /// Rewrite `params` to the host document: set `uri`, and translate the
@@ -94,7 +105,8 @@ impl ShowDocumentTranslator {
     }
 
     /// Rebuild the region's current host offset from the live parse, keyed by its
-    /// `region_id` (a ULID). Mirrors the goto request path's offset construction.
+    /// `region_id` (a ULID in production). Mirrors the goto request path's offset
+    /// construction.
     fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
         let ulid = ulid::Ulid::from_string(region_id).ok()?;
         let (start_byte, _end, _kind, _layer) =

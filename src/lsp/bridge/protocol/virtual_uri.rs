@@ -113,9 +113,10 @@ impl VirtualDocumentUri {
 
     /// Extract the `region_id` from a virtual-document URI string, or `None` if
     /// it isn't one. Parses the same `{prefix}{region_id}.{ext}` filename shape
-    /// as [`Self::is_virtual_uri`] (the `region_id` is a dot-free ULID, so the
-    /// last `.` separates it from the extension). Used as a cheap pre-filter when
-    /// scanning open virtual documents (`DocumentTracker::resolve_virtual_uri`).
+    /// as [`Self::is_virtual_uri`]; `region_id`s are dot-free (a ULID in
+    /// production, also scratch/test ids), so the last `.` separates the id from
+    /// the extension. Used as a cheap pre-filter when scanning open virtual
+    /// documents (`DocumentTracker::resolve_virtual_uri`).
     pub(crate) fn region_id_of(uri: &str) -> Option<String> {
         let url = url::Url::parse(uri).ok()?;
         let filename = url.path_segments().and_then(|mut s| s.next_back())?;
