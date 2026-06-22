@@ -451,7 +451,9 @@ impl DocumentTracker {
                 if doc.virtual_uri.region_id() == target_region_id.as_str()
                     && doc.virtual_uri.to_uri_string() == virtual_uri
                 {
-                    return Some((host.clone(), doc.virtual_uri.region_id().to_string()));
+                    // region_id == target_region_id here, so reuse the already-
+                    // owned String instead of allocating it again.
+                    return Some((host.clone(), target_region_id));
                 }
             }
         }
