@@ -34,13 +34,19 @@ reaches the editor.
 
 Stop stripping client-provided tokens (selectively), route the resulting
 downstream→upstream `$/progress` and partial-result notifications, and aggregate
-them so the editor sees **one coherent lifecycle** whose data-bearing signals
-(`report`, the result, the terminal `End`) all come from the delivered server.
+them so the editor sees **one coherent lifecycle** that stays consistent with the
+result actually delivered.
 
-**Core principle.** Every *data-bearing* signal the editor sees — each `report`,
-the delivered result, and the terminal `End` — must come from the *same server
-whose result is actually delivered*, so progress and data never diverge. The
-opening `Begin` is exempt: the winner is not yet known when it must be sent, so
+**Core principle.** The data-bearing signals the editor sees — each `report`, the
+delivered result, and the terminal `End` — must stay consistent with the result
+actually delivered, so progress and data never diverge: the `End` coincides with
+the result being complete, and no `report` reflects data the editor will not
+receive. How that resolves is strategy-specific: under *preferred* the result is
+a single winner, so those signals track that one server; under *concatenated* the
+result is the merge of *all* contributors, so the bridge composes the lifecycle
+over the whole set (progress is `n/m`, the `End` fires only when the last
+contributor finishes). The opening `Begin` is exempt: the winner is not yet known
+when it must be sent, so
 it is forwarded opportunistically from whichever contributor reports first,
 purely to light the indicator promptly. `Begin` is not content-free — it carries
 a `title` (and optional `message`) — so that opening text may originate from a
@@ -124,8 +130,10 @@ bridge composes the terminal rather than relaying a downstream's.
 
 - Client-requested progress (`workDoneToken`) reaches the editor for the first
   time.
-- The data-bearing progress signals (`report`/`End`) and the delivered result
-  always share one source — no jarring swap and no freeze of shown data.
+- The data-bearing progress signals (`report`/`End`) stay consistent with the
+  delivered result — no jarring swap and no freeze of shown data (under
+  *preferred* both track the one winner; under *concatenated* both span the same
+  contributor set).
 - partialResult streaming becomes possible without mis-translated locations.
 - Failure degrades gracefully: if data was shown the editor keeps it and the
   lifecycle terminates cleanly; if not, the request falls through to the next
