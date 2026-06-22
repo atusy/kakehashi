@@ -41,7 +41,7 @@ can only occur before any data has been shown; once data is delivered, the
 lifecycle is committed.
 
 - **Selector — priority-based.** The tracked and delivered server is the
-  *priority winner* of the preferred (`l`) fan-in, not the first responder.
+  *priority winner* of the preferred fan-in, not the first responder.
   Latency-based selection is rejected because it can make progress (the fastest
   server) and delivered data (the priority winner) come from different servers.
 - **Begin — opportunistic.** The winner is unknown when `Begin` arrives (`Begin`
@@ -49,11 +49,11 @@ lifecycle is committed.
   light the indicator immediately; gate only `report`/`End` on the
   currently-chosen server.
 - **report / End — per aggregation strategy.**
-  - *preferred (`l`)*: forward only the winner's `report`; emit `End` when the
+  - *preferred*: forward only the winner's `report`; emit `End` when the
     winner's final response is aggregated; discard other servers' progress and
     results. If the winner's first response is already complete (not partial),
     do not track other servers at all.
-  - *concatenated (`led`)*: keep progress alive until *all* contributors finish
+  - *concatenated*: keep progress alive until *all* contributors finish
     (no premature `End`); `report` may reflect `n/m` contributors done as a
     percentage; `End` on the last contributor.
 - **Graceful degradation on committed-server failure.** The branch turns on
@@ -65,8 +65,9 @@ lifecycle is committed.
     as graceful degradation.
   - *preferred, winner produced nothing* (died before any partial result): its
     result is empty, which — exactly as for any empty or absent winner result
-    under `l` — falls through to the next-priority candidate. Nothing was shown
-    yet, so this is ordinary request latency, not a freeze and not a swap. The
+    under the preferred strategy — falls through to the next-priority candidate.
+    Nothing was shown yet, so this is ordinary request latency, not a freeze and
+    not a swap. The
     opportunistic `Begin` stays open and `report`/`End` re-gate onto the new
     candidate (no new `Begin`); this recurses down the priority order.
   - *concatenated*: a failed contributor donates its accumulated partials
@@ -140,9 +141,9 @@ Not yet implemented (tracked in issue #414); today both client-provided tokens
 are stripped before fan-out. Specific points to settle during implementation:
 
 - The empty-vs-non-empty threshold that triggers fall-through must **match the
-  existing `l` empty-result behaviour**, which may be method-specific (e.g.
+  existing preferred-strategy empty-result behaviour**, which may be method-specific (e.g.
   `host.rs` treats an empty `vec![]` as a usable result that must not read as "no
-  result"). Align with `l`; do not invent a new threshold.
+  result"). Align with the preferred strategy; do not invent a new threshold.
 - `partialResultToken` support depends on the aggregation layer accepting
   incremental input. Until that lands, `partialResultToken` may stay stripped
   while `workDoneToken` is bridged — a valid intermediate phase. Without
