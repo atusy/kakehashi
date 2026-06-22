@@ -45,27 +45,28 @@ receive. How that resolves is strategy-specific: under *preferred* the result is
 a single winner, so those signals track that one server; under *concatenated* the
 result is the merge of *all* contributors, so the bridge composes the lifecycle
 over the whole set (progress is `n/m`, the `End` fires only when the last
-contributor finishes). The opening `Begin` is exempt: the winner is not yet known
-when it must be sent, so
-it is forwarded opportunistically from whichever contributor reports first,
-purely to light the indicator promptly. `Begin` is not content-free — it carries
-a `title` (and optional `message`) — so that opening text may originate from a
-non-winner. LSP does not allow amending a `title` after `Begin`, so this is
+contributor finishes). The opening `Begin` is exempt: the eventual source is not
+yet known when it must be sent, so it is forwarded opportunistically from
+whichever contributor reports first, purely to light the indicator promptly.
+`Begin` is not content-free — it carries a `title` (and optional `message`) — so
+that opening text may originate from a contributor that does not end up sourcing
+the result. LSP does not allow amending a `title` after `Begin`, so this is
 accepted as a transient cosmetic detail: the data-bearing `report`/result/`End`
-that follow all come from the winner. (A bridge-owned neutral `title` could avoid
-surfacing a non-winner's; either way the data-bearing guarantee holds.) A swap of
-*delivered data* can only occur before any data has been shown; once data is
-delivered, the lifecycle is committed.
+that follow are sourced per the strategy rules below. (A bridge-owned neutral
+`title` could avoid surfacing a stray one; either way the data-bearing guarantee
+holds.) A swap of *delivered data* can only occur before any data has been shown;
+once data is delivered, the lifecycle is committed.
 
 - **Selector — priority-based.** The tracked and delivered server is the
   *priority winner* of the preferred fan-in, not the first responder.
   Latency-based selection is rejected because it can make the data-bearing
   progress (`report`/`End`, the fastest server) and the delivered result (the
   priority winner) come from different servers.
-- **Begin — opportunistic.** The winner is unknown when `Begin` arrives (`Begin`
-  precedes any result), so forward the *first* `Begin` from any contributor to
-  light the indicator immediately; gate only `report`/`End` on the
-  currently-chosen server.
+- **Begin — opportunistic.** The eventual source is unknown when `Begin` arrives
+  (`Begin` precedes any result), so forward the *first* `Begin` from any
+  contributor to light the indicator immediately; gate `report`/`End` per the
+  strategy rules below (the winner under *preferred*; the contributor set under
+  *concatenated*).
 - **report / End — per aggregation strategy.**
   - *preferred*: forward only the winner's `report`; emit `End` when the
     winner's final response is aggregated; discard other servers' progress and
@@ -114,10 +115,10 @@ bridge composes the terminal rather than relaying a downstream's.
   paint, but the data-bearing progress and the delivered result can come from
   different servers — the jarring swap this decision avoids. Rejected in favour
   of priority.
-- **Delay `Begin` until the winner is known.** Keeps progress source-consistent
-  from the first frame, but defeats the point of progress (no early "something is
-  happening" signal). Rejected in favour of an opportunistic first `Begin` with
-  source-gated `report`/`End`.
+- **Delay `Begin` until the source is known.** Keeps the opening title
+  source-consistent from the first frame, but defeats the point of progress (no
+  early "something is happening" signal). Rejected in favour of an opportunistic
+  first `Begin` with `report`/`End` gated per strategy.
 - **Wait for the next-priority candidate after partial data was shown.**
   Avoids delivering incomplete data, but freezes the already-shown
   results until the slower candidate finishes and risks a late swap. Rejected in
