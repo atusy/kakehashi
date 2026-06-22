@@ -1036,10 +1036,13 @@ mod tests {
         let router = ResponseRouter::new();
         let (deps, _keep) = dummy_server_request_deps();
 
-        // The handler would have registered this before enqueueing the request.
+        // The handler would have registered these before enqueueing each request.
         let token = deps
             .inbound_request_registry
             .register(deps.progress_connection_id, jsonrpc::Id::Number(7));
+        let other = deps
+            .inbound_request_registry
+            .register(deps.progress_connection_id, jsonrpc::Id::Number(8));
         assert!(!token.is_cancelled());
 
         handle_message(
@@ -1053,8 +1056,9 @@ mod tests {
             token.is_cancelled(),
             "inbound $/cancelRequest should fire the registered token"
         );
+        assert!(!other.is_cancelled(), "only the targeted id is cancelled");
 
-        // A cancel for an unknown id must not panic.
+        // A cancel for an unknown id is a no-op: no panic, and no other token fires.
         handle_message(
             json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 999 } }),
             &router,
@@ -1062,6 +1066,7 @@ mod tests {
             &deps,
         )
         .await;
+        assert!(!other.is_cancelled(), "unknown id must not cancel anything");
     }
 
     /// Deps wired with a server name, exposing the bounded window receiver so
