@@ -38,36 +38,36 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
 /// URI) has no region mapping and is dropped — the host layer is still served by
 /// the pull feed for now.
 pub(in crate::lsp::bridge) fn forward_push(
-    message: &serde_json::Value,
+    mut message: serde_json::Value,
     deps: &crate::lsp::bridge::actor::ServerRequestDeps,
 ) {
-    let Some(uri) = message["params"]["uri"].as_str() else {
+    let Some(uri) = message["params"]["uri"].as_str().map(String::from) else {
         return;
     };
-    if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(uri) {
+    if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(&uri) {
         return;
     }
-    // Deserialize the diagnostics array straight from the borrowed value (no
-    // clone of the message). A parse failure is *dropped* (not treated as an
-    // empty/clearing push, which would silently wipe the region's diagnostics) —
-    // an empty array still deserializes to an empty Vec and clears legitimately.
-    let diagnostics =
-        match <Vec<tower_lsp_server::ls_types::Diagnostic> as serde::Deserialize>::deserialize(
-            &message["params"]["diagnostics"],
-        ) {
-            Ok(diagnostics) => diagnostics,
-            Err(e) => {
-                log::debug!(
-                    target: "kakehashi::bridge::reader",
-                    "dropping malformed publishDiagnostics for {uri}: {e}"
-                );
-                return;
-            }
-        };
+    // Deserialize by value (move) out of the owned, soon-discarded message —
+    // `from_value` moves the diagnostics' owned strings instead of cloning them
+    // (which `deserialize(&value)` would). A parse failure is *dropped* (not
+    // treated as an empty/clearing push, which would silently wipe the region's
+    // diagnostics); an empty array still yields an empty Vec and clears legitimately.
+    let diagnostics = match serde_json::from_value::<Vec<tower_lsp_server::ls_types::Diagnostic>>(
+        message["params"]["diagnostics"].take(),
+    ) {
+        Ok(diagnostics) => diagnostics,
+        Err(e) => {
+            log::debug!(
+                target: "kakehashi::bridge::reader",
+                "dropping malformed publishDiagnostics for {uri}: {e}"
+            );
+            return;
+        }
+    };
 
     let _ = deps.upstream_tx.send(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
-            uri: uri.to_string(),
+            uri,
             server: deps.server_name.clone(),
             diagnostics,
         },

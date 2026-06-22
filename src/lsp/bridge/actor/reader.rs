@@ -754,7 +754,9 @@ async fn handle_message(
             } else if message["method"].as_str() == Some("textDocument/publishDiagnostics") {
                 // Non-scratch region push: route into the diagnostics cache
                 // (push-propagation-diagnostic-forwarding) instead of dropping (#380).
-                text_document::publish_diagnostics::forward_push(&message, deps);
+                // `message` is owned and discarded after this arm, so move it in and
+                // deserialize the diagnostics by value (no string clones).
+                text_document::publish_diagnostics::forward_push(message, deps);
             } else if message["method"].as_str() == Some("$/progress") {
                 window::progress::forward(&message, server_prefix, deps);
             } else if message["method"].as_str() == Some("$/cancelRequest") {
