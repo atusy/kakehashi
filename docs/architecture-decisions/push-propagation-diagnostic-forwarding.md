@@ -116,6 +116,12 @@ capability so the two mechanisms never double-count the same server:
 - Advertises `diagnosticProvider` → **pull-driven** (kakehashi pulls it).
 - Otherwise → **push-driven** (kakehashi relies on its `publishDiagnostics`).
 
+Classification is **live, not an initialize-time snapshot**:
+`has_capability("textDocument/diagnostic")` (`connection_handle.rs`) consults the
+static initialize result *and* dynamic `client/registerCapability` registrations,
+so a server that registers or unregisters pull support mid-session is reclassified
+and its fallback channel follows.
+
 LSP has no capability flag for *push* diagnostics, so push-classification is an
 inference from the absence of `diagnosticProvider`, not a declared fact — the
 `pullFallback` / `pushFallback` toggles exist precisely to recover the other
@@ -134,6 +140,11 @@ paths regardless of which single mechanism it supports:
 | `textDocument/diagnostic` (Path B) | `pushFallback` | Push-driven servers' cached pushes are folded into the client-pull response. |
 
 Setting a toggle to `false` restricts that path to its native servers only.
+
+Both are `Option<bool>` raw fields on `AggregationConfig` (`settings.rs`, which is
+already `#[serde(rename_all = "camelCase")]`), resolving to the default `true`
+when unset, merged field-by-field through the config merge (`merge.rs`), and
+serialized as `pullFallback` / `pushFallback`.
 
 Naming note (the prompt's `pullFallbackEnabled` / `pushFallbackEnabled`): the
 `Enabled` suffix is dropped to match the existing bare-boolean `enabled` on
@@ -178,11 +189,20 @@ policy clean:
 - **Lazy re-anchor**: transforming at publish time against the region's *current*
   offset means an edit *above* an unchanged region re-positions its diagnostics
   correctly with no re-push and no flicker — this is what the stable region
-  identity buys.
-- **Version gate**: a slot whose `virtual_version` lags the current virtual
-  document version is held (not published) until a matching push arrives. This
-  bounds the wrong-position window to the re-parse gap and self-heals as the
-  downstream re-emits against the new content.
+  identity buys. It holds only if the version gate keys on *content*, not geometry
+  (next bullet).
+- **Version gate**: a slot whose `virtual_version` lags the region's current
+  version is held (not published) until a matching push arrives, bounding the
+  wrong-position window to the re-parse gap and self-healing as the downstream
+  re-emits. Crucially, `virtual_version` must advance **only when the region's
+  extracted content changes** — a host edit that merely shifts a region's position
+  (content byte-identical) must *not* bump it, or every region would be held and
+  re-published on every keystroke, defeating lazy re-anchor. The host path already
+  guards its sync with a content fingerprint (`host.rs`); the virt path currently
+  bumps the version and re-sends `didChange` for *every* opened region on *every*
+  host `didChange` (`did_change.rs::forward_didchange_to_opened_docs`), so this
+  decision requires adding the same content-fingerprint guard to the virt sync.
+  The null-version stamp (below) then records this content version.
 
 ### `preferred` as a push stream
 
@@ -191,8 +211,10 @@ response in priority order, abort the rest. `fan_in/preferred.rs` shows the exac
 rule: a named server holds a strict position and is waited for even if a lower one
 answers first, while the `"*"` group is decided by **earliest non-empty arrival**
 and then `abort_all`. A push stream never ends, so "abort the rest" becomes "stop
-switching away from the elected server" — i.e. **sticky-first**. Per virtual
-document:
+switching away from the elected server". **Named servers keep pull's strict
+priority — a higher named server preempts whenever it becomes eligible;
+sticky-first applies only *within* the `"*"` first-win group**, where there is no
+static order to fall back on. Per virtual document:
 
 - **Effective version** `Veff` = the highest `virtual_version` seen for that
   virtual document. Slots older than `Veff` are held (treated as absent) until
@@ -239,6 +261,11 @@ Worked traces (servers `a1,a2,a3` in one `"*"` group; `aN<ver,nth>`):
 - Version bump — raw `a2<1,1>, a1<2,1>, a2<2,1>` publishes `a2<1,1>` then
   `a1<2,1>`. `a1`'s v2 lifts `Veff` to 2, holding `a2`'s v1 slot; `a1` is
   re-elected at v2, and `a2<2,1>` then leaves the incumbent unchanged.
+- Named preemption (`priorities = [a1, "*"]`, all v1) — raw `a2<1,1>, a1<1,1>,
+  a2<1,2>` publishes `a2<1,1>` (group bootstrap), then **`a1<1,1>`** (the named
+  higher entry becomes eligible and preempts the group), then nothing for
+  `a2<1,2>` (a1 still wins). Were `a1` to clear (`[]`), the walk falls back to the
+  `"*"` group and its incumbency resumes at `a2`.
 
 ### `concatenated` as a push stream
 
@@ -274,6 +301,17 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   re-merge.
 - Downstream crash/restart → drop that server's slots, then re-merge
   (publish-empty-to-clear falls out naturally).
+- **Host-layer eager open**: a push-driven `_self` server only pushes once its
+  host document is open, but host sync is otherwise lazy — the host doc opens on
+  the first client host request (`host.rs`), not on host `didOpen`. So Path A must
+  eagerly open the real host document on host `didOpen` for push-driven `_self`
+  servers — the host-layer analogue of `eager_open_virtual_documents`. (Pull-only
+  `_self` servers do not need this; their `pullFallback` pull opens on demand.)
+- **Held-but-silent slot**: a slot held by the version gate whose push-driven
+  server never re-publishes at the new content version stays hidden until it does.
+  A conforming server re-emits after the `didChange`, so it self-heals; a dead
+  server is caught by crash/close above; a live-but-silent server is an accepted
+  risk (a timeout or clear-on-change could be added later).
 
 Per-URI ordering between incoming pushes and edits is the ordering already relied
 on by ls-bridge-message-ordering.
