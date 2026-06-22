@@ -104,11 +104,9 @@ pub(crate) enum UpstreamNotification {
 /// are user-interactive and can pend indefinitely, so awaiting one inline would
 /// freeze forwarding for every bridged server.
 ///
-/// Each variant carries a [`ForwardedRequestCancel`] so the forwarding loop can
-/// observe a downstream `$/cancelRequest` (or connection death) and forward the
-/// cancel to the editor — see [`InboundRequestRegistry`].
-///
-/// [`InboundRequestRegistry`]: crate::lsp::bridge::InboundRequestRegistry
+/// `$/cancelRequest` propagation for an in-flight forwarded request is out of
+/// scope for now: if the downstream cancels or dies, the reader-side oneshot is
+/// dropped and the spawned waiter resolves to the protocol's default answer.
 pub(crate) enum UpstreamRequest {
     /// Forward a `window/showMessageRequest`; the editor's selected action (or
     /// `None`) is relayed back to the downstream.
@@ -117,28 +115,13 @@ pub(crate) enum UpstreamRequest {
         message: String,
         actions: Option<Vec<tower_lsp_server::ls_types::MessageActionItem>>,
         reply: oneshot::Sender<Option<tower_lsp_server::ls_types::MessageActionItem>>,
-        cancel: ForwardedRequestCancel,
     },
     /// Forward a `window/showDocument` (URI passed through verbatim, including
     /// virtual-document URIs); the editor's success flag is relayed back.
     ShowDocument {
         params: tower_lsp_server::ls_types::ShowDocumentParams,
         reply: oneshot::Sender<bool>,
-        cancel: ForwardedRequestCancel,
     },
-}
-
-/// Cancellation context for a forwarded request: the originating connection and
-/// downstream request id (used to drop the registry entry once settled) plus the
-/// [`CancellationToken`] the forwarding loop awaits. Registered on the reader via
-/// [`InboundRequestRegistry`] *before* the request is enqueued, so a racing
-/// downstream `$/cancelRequest` can't miss it.
-///
-/// [`InboundRequestRegistry`]: crate::lsp::bridge::InboundRequestRegistry
-pub(crate) struct ForwardedRequestCancel {
-    pub(crate) connection_id: crate::lsp::bridge::ProgressConnectionId,
-    pub(crate) request_id: jsonrpc::Id,
-    pub(crate) token: CancellationToken,
 }
 
 /// Capacity of the bounded `window/*` forwarding queue. Sized like the
@@ -182,9 +165,6 @@ pub(crate) struct ServerRequestDeps {
     /// Unbounded: a dropped request would hang the downstream. See
     /// [`UpstreamRequest`].
     pub(crate) upstream_request_tx: mpsc::UnboundedSender<UpstreamRequest>,
-    /// Tracks in-flight forwarded requests so a downstream `$/cancelRequest`
-    /// (or connection death) can cancel the editor-bound request (#404).
-    pub(crate) inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     /// The folders this connection currently serves, used to answer downstream
     /// `workspace/workspaceFolders` pulls. Mutable: a `preferSharedInstance`
     /// connection grows it as new marker roots join (#391).
@@ -208,15 +188,10 @@ struct ProgressPurgeGuard {
     registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     connection_id: crate::lsp::bridge::ProgressConnectionId,
     upstream_tx: mpsc::UnboundedSender<UpstreamNotification>,
-    /// Cancel any forwarded requests still in flight when this connection's
-    /// reader exits, so their editor dialogs don't linger (#404).
-    inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
 }
 
 impl Drop for ProgressPurgeGuard {
     fn drop(&mut self) {
-        self.inbound_request_registry
-            .cancel_connection(self.connection_id);
         let tokens = self.registry.purge_connection(self.connection_id);
         if !tokens.is_empty() {
             let _ = self
@@ -441,7 +416,6 @@ pub(crate) fn spawn_reader_task_with_liveness(
             upstream_tx,
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
@@ -531,7 +505,6 @@ async fn reader_loop(
         workspace_folders: WorkspaceFolderSet::new(None),
         window_tx,
         upstream_request_tx: mpsc::unbounded_channel().0,
-        inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
         progress_registry,
         progress_connection_id,
     };
@@ -571,7 +544,6 @@ async fn reader_loop_with_liveness(
         registry: Arc::clone(&server_request_deps.progress_registry),
         connection_id: server_request_deps.progress_connection_id,
         upstream_tx: server_request_deps.upstream_tx.clone(),
-        inbound_request_registry: server_request_deps.inbound_request_registry.clone(),
     };
 
     // Consolidated liveness timer state (ls-bridge-async-connection)
@@ -735,8 +707,6 @@ async fn handle_message(
                 );
             } else if message["method"].as_str() == Some("$/progress") {
                 window::progress::forward(&message, server_prefix, deps);
-            } else if message["method"].as_str() == Some("$/cancelRequest") {
-                handle_cancel_request(&message, deps);
             } else {
                 forward_notification(&message, server_prefix, deps);
             }
@@ -752,25 +722,6 @@ async fn handle_message(
     }
 }
 
-/// Handle an inbound downstream `$/cancelRequest`: if it targets a forwarded
-/// request still in flight (`window/showMessageRequest` / `window/showDocument`),
-/// cancel the editor-bound request so its dialog is dismissed (#404). The id is
-/// parsed as a [`jsonrpc::Id`] exactly as the original request's id was, so the
-/// registry key matches. Ids that aren't tracked (e.g. the bridge's own outbound
-/// requests *to* the downstream, which the downstream can't cancel this way) are
-/// a no-op.
-fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) {
-    // Deserialize the id straight from the borrowed value (no clone). A missing
-    // params/id indexes to `Value::Null`, which deserializes to `Id::Null` and
-    // matches nothing registered (harmless no-op).
-    let Ok(request_id) = <jsonrpc::Id as serde::Deserialize>::deserialize(&message["params"]["id"])
-    else {
-        return;
-    };
-    deps.inbound_request_registry
-        .cancel(deps.progress_connection_id, &request_id);
-}
-
 /// Forward supported downstream notifications to the upstream editor.
 ///
 /// Routes `window/logMessage`, `window/showMessage`, and `telemetry/event` to
@@ -778,9 +729,9 @@ fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) 
 /// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
 /// transparent.
 ///
-/// `$/progress` and `$/cancelRequest` are handled earlier in `handle_message`,
-/// so they never reach here. Everything else is still silently ignored
-/// (push-based publishDiagnostics: #380).
+/// `$/progress` is handled earlier in `handle_message` (translated and forwarded
+/// via [`window::progress::forward`]), so it never reaches here. Everything else
+/// is still silently ignored (push-based publishDiagnostics: #380).
 fn forward_notification(
     message: &serde_json::Value,
     server_prefix: &str,
@@ -979,7 +930,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             progress_connection_id,
         };
@@ -1028,46 +978,6 @@ mod tests {
         assert_eq!(router.pending_count(), 1);
     }
 
-    /// #404: an inbound downstream `$/cancelRequest` fires the registered
-    /// in-flight request's token; an unknown id is a no-op.
-    #[tokio::test]
-    async fn handle_message_cancel_request_fires_registered_token() {
-        let router = ResponseRouter::new();
-        let (deps, _keep) = dummy_server_request_deps();
-
-        // The handler would have registered these before enqueueing each request.
-        let token = deps
-            .inbound_request_registry
-            .register(deps.progress_connection_id, jsonrpc::Id::Number(7));
-        let other = deps
-            .inbound_request_registry
-            .register(deps.progress_connection_id, jsonrpc::Id::Number(8));
-        assert!(!token.is_cancelled());
-
-        handle_message(
-            json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 7 } }),
-            &router,
-            "",
-            &deps,
-        )
-        .await;
-        assert!(
-            token.is_cancelled(),
-            "inbound $/cancelRequest should fire the registered token"
-        );
-        assert!(!other.is_cancelled(), "only the targeted id is cancelled");
-
-        // A cancel for an unknown id is a no-op: no panic, and no other token fires.
-        handle_message(
-            json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": 999 } }),
-            &router,
-            "",
-            &deps,
-        )
-        .await;
-        assert!(!other.is_cancelled(), "unknown id must not cancel anything");
-    }
-
     /// Deps wired with a server name, exposing the bounded window receiver so
     /// tests can assert what was (not) forwarded to the editor.
     fn server_request_deps_for(
@@ -1091,7 +1001,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             progress_connection_id,
         };
@@ -1186,7 +1095,6 @@ mod tests {
             upstream_tx,
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
@@ -1261,7 +1169,6 @@ mod tests {
                 upstream_tx,
                 window_tx,
                 upstream_request_tx: mpsc::unbounded_channel().0,
-                inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
                 workspace_folders: WorkspaceFolderSet::new(None),
                 progress_registry: Arc::clone(&progress_registry),
                 progress_connection_id: conn,
@@ -1686,7 +1593,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -1746,7 +1652,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -1805,7 +1710,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             progress_connection_id,
         };
@@ -1864,7 +1768,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             progress_connection_id,
         };
@@ -1922,7 +1825,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             progress_connection_id,
         };
@@ -1977,7 +1879,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
             progress_connection_id,
         };
@@ -2033,7 +1934,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
             progress_connection_id,
         };
@@ -2071,7 +1971,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2125,7 +2024,6 @@ mod tests {
             upstream_tx,
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(Some(folders)),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2168,7 +2066,6 @@ mod tests {
             upstream_tx,
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
@@ -2212,7 +2109,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2259,7 +2155,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2298,7 +2193,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2352,7 +2246,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2417,7 +2310,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2477,7 +2369,6 @@ mod tests {
             workspace_folders: WorkspaceFolderSet::new(None),
             window_tx,
             upstream_request_tx: mpsc::unbounded_channel().0,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
@@ -2778,7 +2669,6 @@ mod tests {
             upstream_tx,
             window_tx,
             upstream_request_tx,
-            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
             progress_connection_id,
@@ -2904,7 +2794,7 @@ mod tests {
         });
         handle_message(request, &router, "", &deps).await;
 
-        let UpstreamRequest::ShowDocument { params, reply, .. } = request_rx
+        let UpstreamRequest::ShowDocument { params, reply } = request_rx
             .recv()
             .await
             .expect("should forward an UpstreamRequest")
