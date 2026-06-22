@@ -84,9 +84,10 @@ diagnostics:
 3. Store the notification in a slot keyed by `(host_uri, source, server)` —
    `source` is the `virtual_uri` for a region or the host URI for the host layer —
    retaining a region's diagnostics in **virtual coordinates** (the host layer
-   needs no transform, so it stores host coordinates) plus the `version` from the
-   params. A pull-driven server's spontaneous push and its `pullFallback` pull
-   share this slot; the freshest `virtual_version` wins.
+   needs no transform, so it stores host coordinates) plus the `content_epoch` the
+   push maps to (see Versioning). A pull-driven server's spontaneous push and its
+   `pullFallback` pull share this slot; the latest update for that `(source,
+   server)` replaces it, and eligibility/election uses `content_epoch`.
 4. Re-merge **all** slots for that `host_uri` and publish the merge to the
    client.
 
@@ -139,10 +140,14 @@ paths regardless of which single mechanism it supports:
 
 | Method block (`bridge.<lang>.aggregation.<method>`) | Key | Effect when `true` (default) |
 | --- | --- | --- |
-| `textDocument/publishDiagnostics` (Path A) | `pullFallback` | Pull-driven servers are pulled on host events and merged into the same cache, so they too publish proactively. A pulled result has no `publishDiagnostics.version`, so its slot is stamped with the current synced virtual document version (the null-version rule below). |
+| `textDocument/publishDiagnostics` (Path A) | `pullFallback` | Pull-driven servers are pulled on host events and merged into the same cache, so they too publish proactively. A pulled result has no `publishDiagnostics.version`, so its slot is stamped with the `content_epoch` that was pulled (the null-version rule below). |
 | `textDocument/diagnostic` (Path B) | `pushFallback` | Push-driven servers' cached pushes are folded into the client-pull response. |
 
-Setting a toggle to `false` restricts that path to its native servers only.
+Setting a toggle to `false` disables only the **fallback** work for that path —
+Path A's fallback pull of pull-driven servers, or Path B's reading of cached
+pushes. Spontaneous non-scratch pushes are still cached regardless (step 1), so
+disabling `pullFallback` does not re-open the #380 blindness for a pull-driven
+server that happens to push on its own; it only stops kakehashi from *pulling* it.
 
 Both are `Option<bool>` raw fields on `AggregationConfig` (`settings.rs`, which is
 already `#[serde(rename_all = "camelCase")]`), resolving to the default `true`
@@ -158,7 +163,7 @@ reads unambiguously out of context.
 ### Cache model
 
 ```
-host_uri ──► { (source, server) ──► SlotEntry { diagnostics(source-local coords), virtual_version } }
+host_uri ──► { (source, server) ──► SlotEntry { diagnostics(source-local coords), content_epoch } }
 ```
 
 `source` is a virtual region's URI or the host URI for the `_self` host layer;
@@ -195,10 +200,14 @@ policy clean:
   on that source. This is *not* the per-connection LSP wire version the bridge
   already tracks (`document_tracker` keys version by `(connection, virtual_uri)`
   and bumps per connection), which is not comparable across servers — a restart or
-  late open desyncs it. A server's `publishDiagnostics.version` is mapped back to
-  the `content_epoch` kakehashi last synced to *that* server; eligibility is then
-  "slot's epoch == source's current epoch", never a raw cross-server version
-  compare.
+  late open desyncs it. To map a push back to an epoch, kakehashi records a per
+  `(source, connection, wire_version) → content_epoch` entry **when each
+  `didOpen`/`didChange` is successfully enqueued to that connection's writer**
+  (enqueued, not merely counter-incremented). A non-null `publishDiagnostics.version`
+  is then an exact lookup in that map; an unknown version is held/dropped as stale
+  with a log line (a late server publishing for `N` after `N+1` was synced). Null
+  versions fall back to the best-effort rule below. Eligibility is "slot's epoch ==
+  source's current epoch", never a raw cross-server version compare.
 - **Lazy re-anchor**: transforming at publish time against the region's *current*
   offset re-positions an unchanged region's diagnostics after an edit *above* it
   with no re-push and no flicker — provided the epoch keys on content, not geometry
@@ -215,6 +224,13 @@ policy clean:
   re-merges and republishes that `host_uri` *immediately*, with the now-stale slots
   held — otherwise nothing would clear the old diagnostics until a current-epoch
   push happens to arrive. The bump itself is the trigger, not just incoming pushes.
+- **Re-merge on geometry change**: a host edit that shifts a region's position
+  without changing its content does *not* advance `content_epoch`, so lazy
+  re-anchor alone would leave the previously-published (now mis-placed) host
+  coordinates on screen until an unrelated push. The region-offset update (the
+  re-parse that moves the region) must itself trigger a re-merge, republishing only
+  if the re-anchored host coordinates actually changed. Lazy re-anchor supplies the
+  correct positions; this supplies the missing trigger.
 - **Host layer**: the `_self` host source uses the identical model keyed on the
   *host document's* content epoch — push-driven `_self` servers are eagerly opened
   (see Lifecycle) and eagerly re-synced on a content-changing host `didChange`
@@ -307,7 +323,7 @@ model and version gate carry over unchanged. Per virtual document:
   in config order) — the order pull already uses, so the output stays stable no
   matter which server pushed last. Arrival order must not leak into the result.
 - The version gate applies: only slots at `Veff` are concatenated; a slot lagging
-  `Veff` is held until it re-publishes at `Veff`. During a document-version bump
+  `Veff` is held until it re-publishes at `Veff`. During a content-epoch bump
   the concat shrinks to the caught-up servers and refills as the slower ones catch
   up — the same self-healing window as elsewhere, not a special case.
 
@@ -341,8 +357,13 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   `textDocument/diagnostic` mid-session (pull-driven → push-driven) has already
   missed the host `didOpen`, so the transition into push-driven must itself
   eagerly open any currently-open host docs where that `_self` server is enabled.
+- **Re-merge on classification/config change**: a capability transition (a server's
+  pull/push reclassification), a `pullFallback` / `pushFallback` toggle change, or a
+  `priorities` change alters which slots are visible. Each must trigger a host
+  re-merge so the new visibility takes effect immediately, not at the next
+  diagnostic event.
 - **Held-but-silent slot**: a slot held by the version gate whose push-driven
-  server never re-publishes at the new content version stays hidden until it does.
+  server never re-publishes at the new content epoch stays hidden until it does.
   A conforming server re-emits after the `didChange`, so it self-heals; a dead
   server is caught by crash/close above; a live-but-silent server is an accepted
   risk (a timeout or clear-on-change could be added later).
