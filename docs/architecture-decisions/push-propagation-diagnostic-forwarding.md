@@ -82,21 +82,48 @@ diagnostics:
    client.
 
 An empty push clears only that slot; the re-merge still carries every sibling
-region. Only push-capable downstream servers contribute here — a pull-only
-server produces no proactive diagnostics (see Considered Options).
+region. Push-driven servers feed this path natively; pull-driven servers feed it
+via the `pullFallback` toggle (see Per-server source and fallback).
 
 ### Path B — Client-initiated pull (retained)
 
 kakehashi keeps answering `textDocument/diagnostic` from the client:
 
-- Fan out a live `textDocument/diagnostic` to every **pull-capable** downstream
-  (advertised `diagnosticProvider`), transform and aggregate as today.
-- For **pull-incapable** (push-only) downstream, serve their cached push slots
-  from Path A.
+- Fan out a live `textDocument/diagnostic` to every pull-driven downstream,
+  transform and aggregate as today.
+- For push-driven downstream, serve their cached push slots from Path A via the
+  `pushFallback` toggle.
 - Merge and respond. The advertised `diagnosticProvider` capability is unchanged.
 
-Path A writes the cache; Path B reads it for pull-incapable servers — one cache,
+Path A writes the cache; Path B reads it for push-driven servers — one cache,
 two readers.
+
+### Per-server source and fallback
+
+Each downstream server has exactly one *native* diagnostic source, decided by
+capability so the two mechanisms never double-count the same server:
+
+- Advertises `diagnosticProvider` → **pull-driven** (kakehashi pulls it).
+- Otherwise → **push-driven** (kakehashi relies on its `publishDiagnostics`).
+
+Native source alone would make the two paths asymmetric — Path B already
+back-fills push-driven servers from the cache, but Path A would leave pull-driven
+servers with no *proactive* diagnostics. Two config toggles close the gap
+symmetrically, **both defaulting to `true`** so every server contributes to both
+paths regardless of which single mechanism it supports:
+
+| Method block (`bridge.<lang>.aggregation.<method>`) | Key | Effect when `true` (default) |
+| --- | --- | --- |
+| `textDocument/publishDiagnostics` (Path A) | `pullFallback` | Pull-driven servers are pulled on host events and merged into the same cache, so they too publish proactively. |
+| `textDocument/diagnostic` (Path B) | `pushFallback` | Push-driven servers' cached pushes are folded into the client-pull response. |
+
+Setting a toggle to `false` restricts that path to its native servers only.
+
+Naming note (the prompt's `pullFallbackEnabled` / `pushFallbackEnabled`): the
+`Enabled` suffix is dropped to match the existing bare-boolean `enabled` on
+`BridgeLanguageConfig` — the field *is* the toggle. The mechanism stays in the
+key (rather than a method-disambiguated bare `fallback`) so a single config line
+reads unambiguously out of context.
 
 ### Cache model
 
@@ -154,10 +181,13 @@ Virtual (UTF-16) → position_to_byte → + content_start_byte → byte_to_posit
 4. **Cache, hold stale host coordinates until a re-push (no re-anchor).**
    Rejected as default: shows visibly wrong positions after edits above a region;
    re-anchoring is cheap given stable region identity.
-5. **Push-only, drop the client-pull handler.** Rejected: abandons pull-capable
-   clients and pull-only downstream; the client pull path is retained and simply
-   augmented with the push cache for pull-incapable servers.
-6. **Client-side aggregation (forward virtual URIs raw).** Rejected (as in the
+5. **Push-only, drop the client-pull handler.** Rejected: abandons pull-driven
+   clients and servers; the client pull path is retained.
+6. **Asymmetric paths — push-only Path A, no pull fallback.** Rejected: leaves
+   pull-driven servers with no proactive diagnostics while Path B back-fills
+   push-driven ones, an unjustified asymmetry. The `pullFallback` / `pushFallback`
+   toggles (default `true`) make both paths cover every server.
+7. **Client-side aggregation (forward virtual URIs raw).** Rejected (as in the
    superseded decision): leaks internal virtual URIs and breaks the
    host-as-single-entity abstraction.
 
@@ -186,14 +216,16 @@ because the #380 benefit now outweighs it:
   push.
 - The reader must transform and route pushes, interleaved with edits, relying on
   the per-URI ordering guarantee.
-- Pull-only downstream contribute no *proactive* diagnostics — they surface only
-  when the client explicitly pulls.
+- `pullFallback` (default on) keeps a *scoped* host-event pull trigger alive for
+  pull-driven servers — the per-event re-pull is removed only for push-driven
+  ones, not universally. Setting it `false` drops those servers from the proactive
+  path entirely.
 
 ### Neutral
 
 - Position transformation and the aggregation strategy are unchanged.
 - The client-pull handler is largely unchanged; it now additionally reads the
-  push cache for pull-incapable servers.
+  push cache for push-driven servers (`pushFallback`).
 
 ## Decision–Implementation Gap
 
@@ -208,7 +240,8 @@ implements the superseded pull-first synthetic push:
   `publishDiagnostics` at `forward_notification`'s `_ => {}` arm (#380).
 
 Migration outline: route non-scratch pushes into a new aggregator backed by the
-per-host merge cache; retire the synthetic/debounced *proactive* pull while
-keeping the *client* pull handler (augmented with the push cache for
-pull-incapable servers); update the bare-slug code references that currently name
+per-host merge cache; reduce the synthetic/debounced *proactive* pull to the
+`pullFallback` scope (pull-driven servers only) instead of retiring it outright;
+keep the *client* pull handler (augmented with the push cache for push-driven
+servers); update the bare-slug code references that currently name
 the superseded decision.
