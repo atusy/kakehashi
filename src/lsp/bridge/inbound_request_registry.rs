@@ -47,12 +47,19 @@ impl InboundRequestRegistry {
         request_id: jsonrpc::Id,
     ) -> CancellationToken {
         let token = CancellationToken::new();
-        self.inner
+        let replaced = self
+            .inner
             .lock()
             .recover_poison("InboundRequestRegistry::register")
             .entry(connection_id)
             .or_default()
             .insert(request_id, token.clone());
+        // A well-behaved downstream never reuses a request id while one is in
+        // flight, but if it does, cancel the orphaned request so its forwarded
+        // editor request (and dialog) doesn't dangle unreachable.
+        if let Some(old) = replaced {
+            old.cancel();
+        }
         token
     }
 
@@ -119,6 +126,20 @@ mod tests {
 
         registry.cancel(conn(1), &jsonrpc::Id::Number(7));
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn reusing_an_in_flight_id_cancels_the_orphaned_token() {
+        let registry = InboundRequestRegistry::default();
+        let first = registry.register(conn(1), jsonrpc::Id::Number(7));
+        // A misbehaving downstream reuses the id while the first is in flight.
+        let second = registry.register(conn(1), jsonrpc::Id::Number(7));
+        assert!(first.is_cancelled(), "the orphaned request is cancelled");
+        assert!(!second.is_cancelled());
+
+        // A later cancel reaches the live (second) token, not the orphan.
+        registry.cancel(conn(1), &jsonrpc::Id::Number(7));
+        assert!(second.is_cancelled());
     }
 
     #[test]
