@@ -60,7 +60,7 @@ ls-bridge-client-progress relies on for client-provided tokens.
   cleanup. Rejected.
 - **Send the synthetic `End` only on graceful shutdown.** Misses crash and
   respawn — precisely the cases where a downstream is most likely to abandon work
-  in flight. Rejected in favour of ending on every reader exit.
+  in flight. Rejected in favor of ending on every reader exit.
 - **Synthesize a `window/workDoneProgress/cancel` instead.** Cancel is an
   editor→server signal; the terminal the editor expects for a progress it created
   is an `End` report, not a cancel it would route back to a now-dead connection.

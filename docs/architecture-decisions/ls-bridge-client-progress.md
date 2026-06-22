@@ -17,15 +17,16 @@ languages, fanned out per language-server-bridge-request-strategies). Each
 downstream may emit `$/progress` and partial results against the same
 client-provided token. Forwarding them verbatim duplicates the lifecycle (N
 `Begin`, N `End`) and corrupts the indicator; concatenating result chunks
-verbatim mis-orders data. Because of fan-out,
-**the bridge always composes the upstream terminal itself** — it aggregates N
-downstreams and never simply relays one downstream's `End` or final response.
+verbatim mis-orders data. So
+**under fan-out the bridge composes the upstream terminal itself** — it
+aggregates N downstreams and does not simply relay one downstream's `End` or
+final response (as it could for a request that reaches a single server).
 
 Today the bridge does not forward client-provided tokens to downstreams at all.
 The host raw-request path strips them (`strip_progress_tokens`,
 `src/lsp/bridge/text_document/host.rs`), and the per-method virtual request
 builders construct fresh params with default (empty) progress fields, so no
-token is carried either way. A downstream honouring them would stream into the
+token is carried either way. A downstream honoring them would stream into the
 void, since the bridge discards downstream notifications, and could legally
 return an empty final result. The cost is that client-requested progress never
 reaches the editor.
@@ -113,16 +114,16 @@ bridge composes the terminal rather than relaying a downstream's.
   Rejected.
 - **Latency-based selector (track the first responder).** Lower time-to-first
   paint, but the data-bearing progress and the delivered result can come from
-  different servers — the jarring swap this decision avoids. Rejected in favour
+  different servers — the jarring swap this decision avoids. Rejected in favor
   of priority.
 - **Delay `Begin` until the source is known.** Keeps the opening title
   source-consistent from the first frame, but defeats the point of progress (no
-  early "something is happening" signal). Rejected in favour of an opportunistic
+  early "something is happening" signal). Rejected in favor of an opportunistic
   first `Begin` with `report`/`End` gated per strategy.
 - **Wait for the next-priority candidate after partial data was shown.**
   Avoids delivering incomplete data, but freezes the already-shown
   results until the slower candidate finishes and risks a late swap. Rejected in
-  favour of promoting the streamed partials. (An empty winner that showed
+  favor of promoting the streamed partials. (An empty winner that showed
   *nothing* still falls through normally — that is plain latency, not a freeze.)
 
 ## Consequences
@@ -160,9 +161,9 @@ bridge composes the terminal rather than relaying a downstream's.
 - Namespacing is unnecessary here (client tokens are already unique), so the
   `ProgressRegistry` of ls-bridge-work-done-progress is not involved; this path
   is distinct from server-declared progress.
-- The bridge always composes the upstream terminal `End` and response (it
-  aggregates fan-out), so failure handling changes only that payload, not the
-  mechanism.
+- Under fan-out the bridge composes the upstream terminal `End` and response (it
+  aggregates the downstreams), so failure handling changes only that payload, not
+  the mechanism.
 
 ## Decision–Implementation Gap
 
@@ -170,7 +171,7 @@ Not yet implemented (tracked in issue #414); today both client-provided tokens
 are stripped before fan-out. Specific points to settle during implementation:
 
 - The empty-vs-non-empty threshold that triggers fall-through must
-  **match the existing preferred-strategy empty-result behaviour** — a uniform
+  **match the existing preferred-strategy empty-result behavior** — a uniform
   fall-through-on-empty across the priority walk, not a per-method exception.
   Align with the preferred strategy; do not invent a new threshold.
 - `partialResultToken` support depends on the aggregation layer accepting
