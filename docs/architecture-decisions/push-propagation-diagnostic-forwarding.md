@@ -81,7 +81,7 @@ diagnostics:
    region_id)` via the document tracker (discard if it resolves to no live
    region); a push on the real **host** URI that matches an open `_self`
    host-bridge document is the host-layer source (host-document-bridge).
-3. Store the notification in a slot keyed by `(host_uri, source, server)` —
+3. Store the notification in the nested slot at `host_uri → source → server` —
    `source` is the `virtual_uri` for a region or the host URI for the host layer —
    retaining a region's diagnostics in **virtual coordinates** (the host layer
    needs no transform, so it stores host coordinates) plus the `content_epoch` the
@@ -164,12 +164,14 @@ reads unambiguously out of context.
 ### Cache model
 
 ```
-host_uri ──► { (source, server) ──► SlotEntry { diagnostics(source-local coords), content_epoch } }
+host_uri ──► source ──► server ──► SlotEntry { diagnostics(source-local coords), content_epoch }
 ```
 
-`source` is a virtual region's URI or the host URI for the `_self` host layer;
-the key also includes the **server**, since several servers can attach to one
-source (e.g. two Lua linters on one region) and each pushes independently.
+`source` is a virtual region's URI or the host URI for the `_self` host layer.
+The cache is **nested** (`host_uri → source → server`) rather than keyed by a flat
+tuple, so the lifecycle's evictions are O(1): a whole `host_uri` on close, a
+`source` on region invalidation, a `server` on crash. Several servers can attach
+to one source (e.g. two Lua linters on one region) and each pushes independently.
 Producing the host publish mirrors the existing staged pull aggregation:
 
 1. **Per-source fan-in** — for each source, combine its servers' slots per the
@@ -206,7 +208,8 @@ policy clean:
   already tracks (`document_tracker` keys version by `(connection, virtual_uri)`
   and bumps per connection), which is not comparable across servers — a restart or
   late open desyncs it. To map a push back to an epoch, kakehashi records a per
-  `(source, connection, wire_version) → content_epoch` entry **when each
+  nested `connection → source → wire_version → content_epoch` entry (so a
+  connection purge drops its subtree in O(1)) **when each
   `didOpen`/`didChange` is successfully enqueued to that connection's writer**
   (enqueued, not merely counter-incremented). A non-null `publishDiagnostics.version`
   is an exact lookup, with three outcomes: maps to the **current** epoch → the push
@@ -451,7 +454,7 @@ transform. Lazy re-anchor (Versioning) simply re-applies it against the region's
 This re-incurs the state pull-first was created to avoid; the decision accepts it
 because the #380 benefit now outweighs it:
 
-- A per-`(host, source, server)` diagnostic cache with lifecycle handling (host
+- A nested `host_uri → source → server` diagnostic cache with lifecycle handling (host
   close, region invalidation, server crash).
 - Version/staleness logic returns (version gate + lazy re-anchor); a brief
   hold/wrong-position window remains right after an edit, self-healing on the next

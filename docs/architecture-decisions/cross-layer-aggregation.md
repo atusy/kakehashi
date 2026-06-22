@@ -59,8 +59,8 @@ Phased roadmap:
    applies the resolved strategy — `concatenated` (the default) appends
    items in `priorities` order, `preferred` returns the first non-empty
    layer. The host layer is a `textDocument/diagnostic` pull with the real
-   URI (push-propagation-diagnostic-forwarding extends to the host role),
-   combined within the layer per
+   URI — push-propagation-diagnostic-forwarding plans to drive host diagnostics by
+   push too, but that is not yet implemented — combined within the layer per
    `bridge._self.aggregation` via `dispatch_host_concatenated` /
    `dispatch_host_preferred`. Diagnostics are joined rather than raced:
    they are not latency-interactive and `concatenated` needs every layer
