@@ -12,12 +12,14 @@
 //! The offset is rebuilt from the live parse exactly as the goto path does
 //! (`region_id → node byte range → resolve injection → RegionOffset`), so a
 //! showDocument-to-a-region can't disagree with goto on the same region. Any
-//! miss — not a virtual URI, `external: true`, no host mapping, or a region
-//! invalidated by edits (`lookup_node` returns `None`) — falls back to
-//! forwarding the params unchanged, which is the pre-translation behavior.
+//! miss falls back to forwarding the params unchanged (the pre-translation
+//! behavior): not a virtual URI, `external: true`, an unmappable host URI, a
+//! `region_id` that isn't a ULID, no host mapping for the URI, a region
+//! invalidated by edits (`lookup_node` returns `None`), a missing
+//! document/snapshot/language/injection-query, or a `region_id` that no longer
+//! matches the region the live parse resolves at that byte (edit race).
 //!
-//! [`transform_goto_response_to_host`]: crate::lsp::bridge
-//! (response translation lives in the bridge protocol layer)
+//! [`transform_goto_response_to_host`]: crate::lsp::bridge::protocol::transform_goto_response_to_host
 
 use std::sync::Arc;
 
@@ -34,14 +36,14 @@ use crate::lsp::bridge::{
 /// to the host document + host coordinates. Holds shared (cheaply cloneable)
 /// handles to the document store, language coordinator, and bridge so it can run
 /// off the forwarding loop without the `Kakehashi` receiver.
-pub(crate) struct ShowDocumentTranslator {
+pub(super) struct ShowDocumentTranslator {
     documents: Arc<DocumentStore>,
     language: Arc<LanguageCoordinator>,
     bridge: Arc<BridgeCoordinator>,
 }
 
 impl ShowDocumentTranslator {
-    pub(crate) fn new(
+    pub(super) fn new(
         documents: Arc<DocumentStore>,
         language: Arc<LanguageCoordinator>,
         bridge: Arc<BridgeCoordinator>,
@@ -55,7 +57,7 @@ impl ShowDocumentTranslator {
 
     /// Translate a virtual-document `showDocument` to host coordinates, or return
     /// `params` unchanged on any miss (see module docs for the fallback cases).
-    pub(crate) async fn translate(&self, mut params: ShowDocumentParams) -> ShowDocumentParams {
+    pub(super) async fn translate(&self, params: ShowDocumentParams) -> ShowDocumentParams {
         // `external: true` is a browser/OS resource, never a virtual document.
         if params.external == Some(true) {
             return params;
@@ -75,8 +77,19 @@ impl ShowDocumentTranslator {
             return params;
         };
 
+        Self::apply_host_translation(params, host_uri, &offset)
+    }
+
+    /// Rewrite `params` to the host document: set `uri`, and translate the
+    /// `selection` (if any) from virtual to host coordinates. Pure mutation,
+    /// split out so it can be unit-tested without a live parse.
+    fn apply_host_translation(
+        mut params: ShowDocumentParams,
+        host_uri: tower_lsp_server::ls_types::Uri,
+        offset: &RegionOffset,
+    ) -> ShowDocumentParams {
         if let Some(range) = params.selection.as_mut() {
-            translate_virtual_range_to_host(range, &offset);
+            translate_virtual_range_to_host(range, offset);
         }
         params.uri = host_uri;
         params
@@ -103,6 +116,16 @@ impl ShowDocumentTranslator {
             injection_query.as_ref(),
             start_byte,
         )?;
+        // `region_id`/`start_byte` came from the tracker + node map, but
+        // `resolved` came from a separately-fetched snapshot. If an edit landed
+        // in between, `start_byte` could fall inside a *different* live region —
+        // `resolve_at_byte_offset` returns whichever region contains the byte. A
+        // mismatched `region_id` means we'd translate the selection against the
+        // wrong region, so bail to verbatim pass-through instead (the goto path
+        // can't hit this: there `resolved` and `region_id` come from one call).
+        if resolved.region.region_id != region_id {
+            return None;
+        }
         Some(RegionOffset::with_per_line_offsets(
             resolved.region.line_range.start,
             resolved.line_column_offsets.clone(),
@@ -160,5 +183,45 @@ mod tests {
         let original = params(&virtual_uri);
         let out = translator().translate(original.clone()).await;
         assert_eq!(out, original);
+    }
+
+    #[test]
+    fn apply_host_translation_rewrites_uri_and_translates_selection() {
+        let host = Uri::from_str("file:///project/doc.md").unwrap();
+        let virtual_uri =
+            VirtualDocumentUri::new(&host, "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV").to_uri_string();
+        let mut original = params(&virtual_uri);
+        // Selection on virtual line 0 so both the line and column offsets apply.
+        original.selection = Some(Range::new(Position::new(0, 2), Position::new(0, 6)));
+
+        // Region starts at host line 10, column 5.
+        let out = ShowDocumentTranslator::apply_host_translation(
+            original,
+            host.clone(),
+            &RegionOffset::new(10, 5),
+        );
+
+        assert_eq!(out.uri, host);
+        assert_eq!(
+            out.selection,
+            Some(Range::new(Position::new(10, 7), Position::new(10, 11))),
+            "line 0 selection shifts by the region's (line, column) offset"
+        );
+    }
+
+    #[test]
+    fn apply_host_translation_without_selection_only_rewrites_uri() {
+        let host = Uri::from_str("file:///project/doc.md").unwrap();
+        let mut original = params("file:///ignored.lua");
+        original.selection = None;
+
+        let out = ShowDocumentTranslator::apply_host_translation(
+            original,
+            host.clone(),
+            &RegionOffset::new(3, 0),
+        );
+
+        assert_eq!(out.uri, host);
+        assert_eq!(out.selection, None);
     }
 }

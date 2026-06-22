@@ -438,7 +438,7 @@ impl DocumentTracker {
     /// *directory* + region id, not the host filename, so the host can't be
     /// derived without a scan). `window/showDocument` is rare, so the scan is
     /// acceptable.
-    pub(crate) async fn resolve_virtual_uri(&self, virtual_uri: &str) -> Option<(Url, String)> {
+    pub(super) async fn resolve_virtual_uri(&self, virtual_uri: &str) -> Option<(Url, String)> {
         let host_map = self.host_to_virtual.lock().await;
         for (host, docs) in host_map.iter() {
             for doc in docs {
