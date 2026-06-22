@@ -16,14 +16,18 @@ pub(crate) fn extract_clean_content(
 ) -> String {
     // `clamped_slice` guards against byte offsets from a stale tree that no
     // longer matches `host_text` (out of bounds or mid-codepoint).
-    let content = clamped_slice(host_text, byte_range.clone());
+    let content = clamped_slice(host_text, byte_range);
     match included_ranges {
         None => content.to_string(),
         Some(ranges) => {
+            // The output is a concatenation of sub-slices of `content`, so it
+            // can't exceed `content.len()`. Cap the preallocation there (and sum
+            // saturating) so stale, oversized ranges can't request a huge buffer.
             let capacity: usize = ranges
                 .iter()
                 .map(|r| r.end_byte.saturating_sub(r.start_byte))
-                .sum();
+                .fold(0usize, usize::saturating_add)
+                .min(content.len());
             let mut result = String::with_capacity(capacity);
             for range in ranges {
                 result.push_str(clamped_slice(content, range.start_byte..range.end_byte));
