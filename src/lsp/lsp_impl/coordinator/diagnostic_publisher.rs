@@ -111,7 +111,7 @@ impl DiagnosticPublisher {
 
         let snapshot = self.aggregator.snapshot(host);
         let region_offsets = self.current_region_offsets(host);
-        let diagnostics = merge_cached_diagnostics(host, &snapshot, &region_offsets);
+        let diagnostics = merge_cached_diagnostics(host, snapshot, &region_offsets);
 
         let lsp_uri = match crate::lsp::lsp_impl::url_to_uri(host) {
             Ok(uri) => uri,

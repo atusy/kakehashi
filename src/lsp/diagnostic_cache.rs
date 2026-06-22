@@ -91,29 +91,30 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// visible-walk) is a follow-up.
 pub(crate) fn merge_cached_diagnostics(
     host: &Url,
-    snapshot: &SourceSlots,
+    snapshot: SourceSlots,
     region_offsets: &HashMap<String, RegionOffset>,
 ) -> Vec<Diagnostic> {
     let host_str = host.as_str();
     let mut merged = Vec::new();
+    // Consume the (already-cloned-from-cache) snapshot so diagnostics move into
+    // the result instead of being cloned again.
     for (source, servers) in snapshot {
         match source {
             DiagnosticSource::Region(region_id) => {
-                let Some(offset) = region_offsets.get(region_id) else {
+                let Some(offset) = region_offsets.get(&region_id) else {
                     // Stale region: no current offset to anchor against.
                     continue;
                 };
-                for slot in servers.values() {
-                    for diagnostic in &slot.diagnostics {
-                        let mut diagnostic = diagnostic.clone();
+                for slot in servers.into_values() {
+                    for mut diagnostic in slot.diagnostics {
                         transform_region_diagnostic(&mut diagnostic, offset, host_str);
                         merged.push(diagnostic);
                     }
                 }
             }
             DiagnosticSource::PullLayer => {
-                for slot in servers.values() {
-                    merged.extend(slot.diagnostics.iter().cloned());
+                for slot in servers.into_values() {
+                    merged.extend(slot.diagnostics);
                 }
             }
         }
@@ -300,7 +301,7 @@ mod tests {
     fn merge_concatenates_pull_layer() {
         let agg = DiagnosticAggregator::new();
         agg.set_pull_layer(&host(), vec![diag("a"), diag("b")]);
-        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &HashMap::new());
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["a", "b"]);
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     fn merge_of_empty_snapshot_is_empty() {
-        assert!(merge_cached_diagnostics(&host(), &SourceSlots::new(), &HashMap::new()).is_empty());
+        assert!(merge_cached_diagnostics(&host(), SourceSlots::new(), &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -323,7 +324,7 @@ mod tests {
         let mut offsets = HashMap::new();
         // Region r1 sits at host line 5, column offset 4 on its first line.
         offsets.insert("r1".to_string(), RegionOffset::new(5, 4));
-        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets);
         assert_eq!(merged.len(), 1);
         // line 0 -> 0+5, character 2 -> 2+4
         assert_eq!(merged[0].range.start, Position::new(5, 6));
@@ -358,7 +359,7 @@ mod tests {
         );
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(5, 0));
-        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets);
 
         let related = merged[0].related_information.as_ref().unwrap();
         assert_eq!(related.len(), 2, "virtual-URI related info is dropped");
@@ -392,7 +393,7 @@ mod tests {
             vec![diag("stale")],
         );
         // No offset for "gone" -> region is stale -> skipped.
-        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &HashMap::new());
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
         assert!(merged.is_empty());
     }
 
@@ -408,7 +409,7 @@ mod tests {
         agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
         let mut offsets = HashMap::new();
         offsets.insert("r1".to_string(), RegionOffset::new(2, 0));
-        let merged = merge_cached_diagnostics(&host(), &agg.snapshot(&host()), &offsets);
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &offsets);
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["pull", "push"]);

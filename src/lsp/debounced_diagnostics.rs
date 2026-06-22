@@ -17,7 +17,7 @@ use url::Url;
 
 use super::bridge::LanguageServerPool;
 
-use super::lsp_impl::coordinator::DiagnosticPublisher;
+use super::lsp_impl::DiagnosticPublisher;
 use super::lsp_impl::text_document::publish_diagnostic::{
     DiagnosticSnapshot, collect_push_diagnostics,
 };

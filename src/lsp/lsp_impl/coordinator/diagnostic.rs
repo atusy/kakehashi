@@ -5,7 +5,6 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
 use crate::lsp::lsp_impl::bridge_context::resolve_aggregation_config_from_settings;
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
-use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
@@ -47,7 +46,7 @@ impl DiagnosticScheduler {
     /// A later change cancels and replaces the pending timer. The snapshot is
     /// captured now, at schedule time, so diagnostics stay consistent with the
     /// document state that triggered the change.
-    pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url, _lsp_uri: Uri) {
+    pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
 
         self.debounced_diagnostics.schedule(
@@ -65,7 +64,7 @@ impl DiagnosticScheduler {
     /// with `SyntheticDiagnosticsManager` (superseding any previous task), then
     /// fans out to downstream servers and publishes via
     /// `textDocument/publishDiagnostics`.
-    pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url, _lsp_uri: Uri) {
+    pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
         let bridge_pool = self.bridge.pool_arc();
         let publisher = std::sync::Arc::clone(&self.publisher);

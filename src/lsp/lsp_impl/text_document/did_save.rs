@@ -35,7 +35,7 @@ impl Kakehashi {
 
         // Spawn background task for synthetic diagnostic collection
         self.diagnostic_scheduler()
-            .spawn_synthetic_diagnostic_task(uri, lsp_uri);
+            .spawn_synthetic_diagnostic_task(uri);
 
         self.notifier().log_info("file saved!").await;
     }

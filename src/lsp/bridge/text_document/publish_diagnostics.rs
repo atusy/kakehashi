@@ -51,7 +51,8 @@ pub(in crate::lsp::bridge) fn forward_push(
         );
         return;
     };
-    let Some(uri) = message["params"]["uri"].as_str().map(String::from) else {
+    // Take the owned URI string out of the message (no clone).
+    let serde_json::Value::String(uri) = message["params"]["uri"].take() else {
         return;
     };
     if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(&uri) {

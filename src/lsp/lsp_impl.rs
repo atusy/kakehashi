@@ -1,6 +1,7 @@
 pub(crate) mod bridge_context;
 mod cli_format;
-pub(crate) mod coordinator;
+mod coordinator;
+pub(crate) use coordinator::DiagnosticPublisher;
 mod kakehashi;
 mod lifecycle;
 mod show_document_translation;
