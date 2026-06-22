@@ -15,12 +15,33 @@
 
 use std::sync::Arc;
 
+use tower_lsp_server::ls_types::TextDocumentSaveReason;
 use url::Url;
 
 use super::super::pool::{ConnectionState, LanguageServerPool};
 use super::super::protocol::JsonRpcNotification;
 
 impl LanguageServerPool {
+    /// Forward `textDocument/willSave` to every open virtual document of
+    /// `host_uri`, on each live server that advertises `willSave` (#357). The
+    /// host `reason` is forwarded verbatim; only the URI is rewritten to the
+    /// virtual document the downstream server knows.
+    pub(crate) async fn forward_will_save_to_virtual_docs(
+        &self,
+        host_uri: &Url,
+        reason: TextDocumentSaveReason,
+    ) {
+        self.forward_save_notification_to_virtual_docs(
+            host_uri,
+            "textDocument/willSave",
+            "textDocument/willSave",
+            |virtual_uri| {
+                serde_json::json!({ "textDocument": { "uri": virtual_uri }, "reason": reason })
+            },
+        )
+        .await;
+    }
+
     /// Forward `textDocument/didSave` to every open virtual document of
     /// `host_uri`, on each live server that advertises `save` (#357).
     ///

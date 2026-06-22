@@ -512,21 +512,60 @@ fn e2e_host_bridge_advertises_save_capabilities_when_enabled() {
 }
 
 #[test]
-fn e2e_host_bridge_hides_save_capabilities_when_disabled() {
-    // No `bridge._self.enabled` anywhere: the save methods forward only to host
-    // bridges, so kakehashi must keep advertising neither (today's behavior).
+fn e2e_host_bridge_save_capabilities_decouple_willsave_from_waituntil() {
+    // A server IS configured (so virt bridging can consume willSave) but host
+    // bridging is OFF. willSave now fans out to virt too, so it must be
+    // advertised; willSaveWaitUntil is host-only, so it must stay hidden (#357).
     let (mut client, _config_dir, init) = init_will_save_client("");
+
+    let sync = init
+        .pointer("/result/capabilities/textDocumentSync")
+        .expect("textDocumentSync must be present");
+    assert_eq!(
+        sync.get("willSave").and_then(Value::as_bool),
+        Some(true),
+        "willSave must be advertised when any bridge server is configured; got {sync}"
+    );
+    assert!(
+        sync.get("willSaveWaitUntil").is_none_or(Value::is_null),
+        "willSaveWaitUntil must stay host-only (hidden without host bridging); got {sync}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_bridge_hides_save_capabilities_without_any_server() {
+    // With no language servers configured at all, neither save method has a
+    // possible consumer, so kakehashi advertises neither (today's behavior).
+    // Use an explicit empty config file and omit initializationOptions so no
+    // default/user config can leak servers or host bridging in.
+    let config_dir = tempfile::TempDir::new().expect("config dir");
+    let config_path = config_dir.path().join("empty.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+        }),
+    );
 
     let sync = init
         .pointer("/result/capabilities/textDocumentSync")
         .expect("textDocumentSync must be present");
     assert!(
         sync.get("willSave").is_none_or(Value::is_null),
-        "willSave must NOT be advertised without a host bridge; got {sync}"
+        "willSave must NOT be advertised with no servers configured; got {sync}"
     );
     assert!(
         sync.get("willSaveWaitUntil").is_none_or(Value::is_null),
-        "willSaveWaitUntil must NOT be advertised without a host bridge; got {sync}"
+        "willSaveWaitUntil must NOT be advertised with no servers configured; got {sync}"
     );
 
     shutdown(&mut client);

@@ -198,13 +198,18 @@ impl Kakehashi {
         // capability not advertised, matching previous behavior.
         let on_type_formatting_triggers =
             crate::config::settings::on_type_formatting_trigger_union(&settings.language_servers);
-        // Gate the willSave/willSaveWaitUntil capabilities on host bridging
-        // being configured (#357): both forward only to host-bridge servers, so
-        // advertising them when no language opts in would make the editor send a
-        // willSave nothing consumes and block every save on a willSaveWaitUntil
-        // round trip that can only ever return "no edits". Computed before
-        // `settings` moves into apply_raw_settings, like the trigger union above.
+        // Gate the save capabilities (#357), computed before `settings` moves
+        // into apply_raw_settings (like the trigger union above):
+        // - willSave now fans out to BOTH host AND virt bridges, so advertise it
+        //   whenever any runnable bridge server is configured (the built-in `_`
+        //   defaults entry has an empty cmd and doesn't count) — otherwise the
+        //   editor never sends a willSave for virt servers to react to.
+        // - willSaveWaitUntil stays host-only (its edits would need virtual→host
+        //   translation + cross-region aggregation), so it keeps the stricter
+        //   host-bridging gate; advertising it without a host bridge would block
+        //   every save on a round trip that can only return "no edits".
         let host_bridging_enabled = settings.any_host_bridging_enabled();
+        let will_save_advertised = host_bridging_enabled || settings.any_bridge_server_runnable();
         self.apply_raw_settings(raw_settings, settings).await;
 
         self.notifier().log_info("server initialized!").await;
@@ -219,9 +224,9 @@ impl Kakehashi {
                     TextDocumentSyncOptions {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::INCREMENTAL),
-                        // Advertised only when a host bridge is configured (#357);
-                        // forwarded verbatim to host-bridge servers.
-                        will_save: host_bridging_enabled.then_some(true),
+                        // willSave: any bridge (host or virt) may consume it.
+                        // willSaveWaitUntil: host-only (#357).
+                        will_save: will_save_advertised.then_some(true),
                         will_save_wait_until: host_bridging_enabled.then_some(true),
                         save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                             include_text: Some(false),
