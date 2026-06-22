@@ -126,9 +126,12 @@ impl ShowDocumentTranslator {
         if resolved.region.region_id != region_id {
             return None;
         }
+        // `start` is `Copy`; move `line_column_offsets` out (no clone — `resolved`
+        // is dropped after this).
+        let start_line = resolved.region.line_range.start;
         Some(RegionOffset::with_per_line_offsets(
-            resolved.region.line_range.start,
-            resolved.line_column_offsets.clone(),
+            start_line,
+            resolved.line_column_offsets,
         ))
     }
 }
