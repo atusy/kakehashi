@@ -360,14 +360,17 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   `textDocument/diagnostic` mid-session (pull-driven → push-driven) has already
   missed the host `didOpen`, so the transition into push-driven must itself
   eagerly open any currently-open host docs where that `_self` server is enabled.
+  A config change that newly makes a push-driven `_self` server eligible (e.g.
+  enabling it, or adding it to `priorities`) must eagerly open in the same way.
 - **Re-merge on classification/config change**: a change that alters which slots
   are visible takes effect differently per path. Path A (proactive publish) must
-  trigger an immediate host re-merge on a capability reclassification, a
-  `pullFallback` change, or a `publishDiagnostics` `priorities`/strategy change —
-  otherwise the new visibility waits for the next diagnostic event. Path B (client
-  pull) needs no proactive re-merge: it is recomputed per request, so a
-  `pushFallback` change or a `textDocument/diagnostic` `priorities`/strategy change
-  simply applies on the next client pull.
+  trigger an immediate host re-merge on any `textDocument/publishDiagnostics`
+  contributor/election change — capability reclassification, `pullFallback`, server
+  `priorities`/`strategy`/`maxFanOut`, layer priorities/strategy, or bridge/candidate
+  enablement — otherwise the new visibility waits for the next diagnostic event.
+  Path B (client pull) needs no proactive re-merge: it is recomputed per request,
+  so the analogous `textDocument/diagnostic` and `pushFallback` changes simply
+  apply on the next client pull.
 - **Held-but-silent slot**: a slot held by the version gate whose push-driven
   server never re-publishes at the new content epoch stays hidden until it does.
   A conforming server re-emits after the `didChange`, so it self-heals; a dead
