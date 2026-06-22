@@ -15,7 +15,7 @@ use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability,
     LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
-    TypeDefinitionProviderCapability,
+    TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -570,6 +570,28 @@ impl ConnectionHandle {
                 )
             }
             "textDocument/onTypeFormatting" => caps.document_on_type_formatting_provider.is_some(),
+            // willSave/willSaveWaitUntil live in `textDocumentSync`, and only its
+            // `Options` form carries the flags — the bare `Kind` number form
+            // advertises neither, so it correctly falls through to false. These
+            // gate host-bridge save forwarding (#357).
+            "textDocument/willSave" => matches!(
+                caps.text_document_sync,
+                Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        will_save: Some(true),
+                        ..
+                    }
+                ))
+            ),
+            "textDocument/willSaveWaitUntil" => matches!(
+                caps.text_document_sync,
+                Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        will_save_wait_until: Some(true),
+                        ..
+                    }
+                ))
+            ),
             "textDocument/documentSymbol" => {
                 matches!(
                     caps.document_symbol_provider,
@@ -1750,7 +1772,8 @@ mod tests {
             DeclarationCapability, DeclarationOptions, DeclarationRegistrationOptions,
             DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability, OneOf,
             SignatureHelpOptions, StaticTextDocumentColorProviderOptions,
-            TextDocumentRegistrationOptions, TypeDefinitionProviderCapability,
+            TextDocumentRegistrationOptions, TextDocumentSyncCapability, TextDocumentSyncOptions,
+            TypeDefinitionProviderCapability,
         };
 
         type CapCase = (&'static str, Box<dyn Fn(&mut ServerCapabilities)>);
@@ -1931,6 +1954,28 @@ mod tests {
                     );
                 }),
             ),
+            (
+                "textDocument/willSave",
+                Box::new(|c| {
+                    c.text_document_sync = Some(TextDocumentSyncCapability::Options(
+                        TextDocumentSyncOptions {
+                            will_save: Some(true),
+                            ..Default::default()
+                        },
+                    ));
+                }),
+            ),
+            (
+                "textDocument/willSaveWaitUntil",
+                Box::new(|c| {
+                    c.text_document_sync = Some(TextDocumentSyncCapability::Options(
+                        TextDocumentSyncOptions {
+                            will_save_wait_until: Some(true),
+                            ..Default::default()
+                        },
+                    ));
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -2082,6 +2127,8 @@ mod tests {
             "textDocument/codeLens",
             "codeLens/resolve",
             "textDocument/onTypeFormatting",
+            "textDocument/willSave",
+            "textDocument/willSaveWaitUntil",
         ];
         for method in methods {
             assert!(
@@ -2090,6 +2137,46 @@ mod tests {
                 method
             );
         }
+    }
+
+    /// The bare `Kind` form of `textDocumentSync` (a sync-kind number) carries
+    /// no willSave/willSaveWaitUntil flags, so a server advertising only it must
+    /// not be treated as save-capable (#357).
+    #[tokio::test]
+    async fn has_capability_will_save_false_for_kind_only_sync() {
+        use tower_lsp_server::ls_types::{TextDocumentSyncCapability, TextDocumentSyncKind};
+
+        let handle = spawn_sink_handle().await;
+        let caps = ServerCapabilities {
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+            ..Default::default()
+        };
+        handle.set_server_capabilities(caps);
+
+        assert!(!handle.has_capability("textDocument/willSave"));
+        assert!(!handle.has_capability("textDocument/willSaveWaitUntil"));
+    }
+
+    /// The two save flags are independent: advertising `willSave` alone must not
+    /// imply `willSaveWaitUntil` (the request half), and vice versa (#357).
+    #[tokio::test]
+    async fn has_capability_will_save_flags_are_independent() {
+        use tower_lsp_server::ls_types::{TextDocumentSyncCapability, TextDocumentSyncOptions};
+
+        let handle = spawn_sink_handle().await;
+        let caps = ServerCapabilities {
+            text_document_sync: Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    will_save: Some(true),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        handle.set_server_capabilities(caps);
+
+        assert!(handle.has_capability("textDocument/willSave"));
+        assert!(!handle.has_capability("textDocument/willSaveWaitUntil"));
     }
 
     // ========================================
