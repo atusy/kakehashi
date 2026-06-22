@@ -251,7 +251,7 @@ fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
 
             return match serde_json::from_slice(&body) {
                 Ok(value) => ReadOutcome::Message(value),
-                Err(e) => ReadOutcome::Error(format!("Failed to parse response: {e}")),
+                Err(e) => ReadOutcome::Error(format!("Failed to parse JSON-RPC message body: {e}")),
             };
         }
 
