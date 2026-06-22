@@ -9,6 +9,6 @@ pub(crate) mod edit;
 mod hash;
 pub(crate) mod position;
 
-pub(crate) use char_boundary::{ceil_char_boundary, floor_char_boundary};
+pub(crate) use char_boundary::{ceil_char_boundary, clamped_slice, floor_char_boundary};
 pub(crate) use hash::fnv1a_hash;
 pub(crate) use position::PositionMapper;

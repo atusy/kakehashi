@@ -16,7 +16,7 @@ use super::ranges::{
 use crate::language::LanguageCoordinator;
 use crate::language::node_tracker::NodeTracker;
 use crate::language::query_predicates::check_predicate;
-use crate::text::fnv1a_hash;
+use crate::text::{ceil_char_boundary, clamped_slice, floor_char_boundary, fnv1a_hash};
 
 /// Iterates over `@injection.content` captures that pass general predicate filtering.
 ///
@@ -103,6 +103,10 @@ fn position_of_byte(
     anchor_byte: usize,
     anchor_row: usize,
 ) -> (u32, u32) {
+    // Snap both offsets to in-bounds char boundaries: on a stale tree they can
+    // be out of range or mid-codepoint, which would panic the slices below.
+    let byte_pos = floor_char_boundary(text, byte_pos);
+    let anchor_byte = floor_char_boundary(text, anchor_byte);
     let (lo, hi) = (byte_pos.min(anchor_byte), byte_pos.max(anchor_byte));
     let newlines = text[lo..hi].bytes().filter(|&b| b == b'\n').count();
     let row = if byte_pos >= anchor_byte {
@@ -196,6 +200,14 @@ impl CacheableInjectionRegion {
             None => (node.start_byte(), node.end_byte()),
         };
 
+        // Snap the range to valid in-bounds char boundaries (ceil start / floor
+        // end) so the `byte_range` stored below is always safe to slice — a stale
+        // node can't leave an out-of-bounds range for downstream consumers, and
+        // the direct `content` slice here can't panic. Valid ranges are
+        // unchanged; a stale node also stops matching `node.start_byte()` below,
+        // routing through the safe `position_of_byte` path.
+        let start_byte = ceil_char_boundary(text, start_byte);
+        let end_byte = floor_char_boundary(text, end_byte).max(start_byte);
         let content = &text[start_byte..end_byte];
 
         // Convert tree-sitter byte column to UTF-16 code units for LSP compatibility.
@@ -206,8 +218,8 @@ impl CacheableInjectionRegion {
         // when the line contains multi-byte UTF-8 characters before the node.
         let (start_line, start_column) = if start_byte == node.start_byte() {
             let byte_column = node.start_position().column;
-            let line_start_byte = node.start_byte() - byte_column;
-            let line_prefix = &text[line_start_byte..node.start_byte()];
+            let line_start_byte = node.start_byte().saturating_sub(byte_column);
+            let line_prefix = clamped_slice(text, line_start_byte..node.start_byte());
             (
                 node.start_position().row as u32,
                 line_prefix.encode_utf16().count() as u32,
@@ -1431,5 +1443,43 @@ local y = "duplicate"
         assert!(unique_languages.contains("lua"));
         assert!(unique_languages.contains("python"));
         assert_eq!(injections.len(), 3, "2 lua + 1 python");
+    }
+
+    // --- stale-tree hardening (#401): byte offsets that no longer match `text`
+    // must degrade gracefully instead of panicking. ---
+
+    #[test]
+    fn position_of_byte_out_of_bounds_does_not_panic() {
+        // Offsets past the end, and an anchor landing mid-codepoint (byte 1 of あ).
+        let _ = position_of_byte("あ", 99, 50, 0);
+        let (row, col) = position_of_byte("あ", 1, 0, 0);
+        assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn from_region_info_stale_node_does_not_panic() {
+        // A node parsed from `text` but resolved against a much shorter text
+        // (as if the document shrank before the tree was refreshed).
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let s = "a fairly long string literal"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let root = tree.root_node();
+        let query_str = r#"((string_literal) @injection.content (#set! injection.language "md"))"#;
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let query = Query::new(&language, query_str).expect("valid query");
+        let regions = collect_all_injections(&root, text, Some(&query)).expect("injections");
+        assert!(!regions.is_empty());
+
+        let short_text = "x";
+        let cacheable = CacheableInjectionRegion::from_region_info(&regions[0], "id", short_text);
+        // Completed without panicking; metadata is still populated.
+        assert_eq!(cacheable.language, "md");
+        assert_eq!(cacheable.region_id, "id");
+        // byte_range is snapped in-bounds, so a downstream `&text[byte_range]`
+        // can't panic either.
+        assert!(cacheable.byte_range.start <= short_text.len());
+        assert!(cacheable.byte_range.end <= short_text.len());
+        assert!(cacheable.byte_range.start <= cacheable.byte_range.end);
+        assert_eq!(&short_text[cacheable.byte_range.clone()], "");
     }
 }
