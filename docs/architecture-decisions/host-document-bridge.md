@@ -5,7 +5,7 @@
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model (virt bridges)
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md) — Per-method bridge strategies
 - [wildcard-config-inheritance](wildcard-config-inheritance.md) — Wildcard config inheritance (foundation for `_self` resolution)
-- [pull-first-diagnostic-forwarding](pull-first-diagnostic-forwarding.md) — Diagnostic forwarding
+- [push-propagation-diagnostic-forwarding](push-propagation-diagnostic-forwarding.md) — Diagnostic forwarding
 - [cross-layer-aggregation](cross-layer-aggregation.md) — Cross-layer (native/host/virt) result aggregation; covers what this decision scopes out
 
 ## Implementation Status
