@@ -50,8 +50,14 @@ fn extract_dynamic_language(query: &Query, match_: &QueryMatch, text: &str) -> O
             && *capture_name == "injection.language"
         {
             // `clamped_slice` guards a stale capture node whose range no longer
-            // fits `text` (out of bounds / mid-codepoint).
+            // fits `text` (out of bounds / mid-codepoint). An empty result means
+            // the capture didn't resolve to real text — treat it as "no language"
+            // rather than emitting an empty language id (which would create a
+            // bogus injection region downstream), mirroring the info-string path.
             let lang_text = clamped_slice(text, capture.node.byte_range());
+            if lang_text.is_empty() {
+                return None;
+            }
             return Some(lang_text.to_string());
         }
     }
@@ -117,9 +123,10 @@ mod tests {
         let m = matches.next().expect("one match");
 
         // Resolve against a much shorter text, as if the document shrank before
-        // the tree was refreshed: the capture's byte range no longer fits.
+        // the tree was refreshed: the capture's byte range no longer fits, so the
+        // slice clamps to "" — reported as "no language" (None), without panicking.
         let lang = extract_dynamic_language(&query, m, "x");
-        assert_eq!(lang.as_deref(), Some(""));
+        assert_eq!(lang, None);
     }
 
     #[test]

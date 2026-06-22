@@ -153,13 +153,15 @@ pub(crate) fn byte_to_point_anchored(
     anchor_point: tree_sitter::Point,
 ) -> tree_sitter::Point {
     let clamped = floor_char_boundary(text, byte);
-    // Snap the anchor too: on a stale tree it may be out of bounds or land
-    // mid-codepoint, which would panic the `text[anchor_byte..clamped]` slice.
-    let anchor_byte = floor_char_boundary(text, anchor_byte);
+    // Compare against the raw anchor so a stale anchor past `clamped` still takes
+    // the full-scan fallback (rather than reusing a stale `anchor_point`).
     if clamped < anchor_byte {
         return byte_to_point(text, clamped);
     }
-    let segment = clamped_slice(text, anchor_byte..clamped);
+    // Here `anchor_byte <= clamped <= text.len()`, so snapping it to a char
+    // boundary (a stale tree may land it mid-codepoint) makes the slice safe.
+    let anchor_byte = floor_char_boundary(text, anchor_byte);
+    let segment = &text[anchor_byte..clamped];
     match segment.rfind('\n') {
         Some(last_nl) => tree_sitter::Point {
             row: anchor_point.row + segment.bytes().filter(|b| *b == b'\n').count(),
