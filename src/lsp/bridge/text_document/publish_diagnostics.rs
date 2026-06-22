@@ -56,7 +56,10 @@ pub(in crate::lsp::bridge) fn forward_push(
     // than `IndexMut` (`message["params"]["uri"]`) avoids a panic on adversarial
     // input where `params` exists but is a string/number/array; `Map::remove`
     // still moves the owned values out (no clone).
-    let Some(params) = message.get_mut("params").and_then(serde_json::Value::as_object_mut) else {
+    let Some(params) = message
+        .get_mut("params")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
         return;
     };
     let Some(serde_json::Value::String(uri)) = params.remove("uri") else {
@@ -70,7 +73,9 @@ pub(in crate::lsp::bridge) fn forward_push(
     // non-array `diagnostics`) is *dropped* (not treated as an empty/clearing push,
     // which would silently wipe the region's diagnostics); an empty `[]` array
     // yields an empty Vec and clears legitimately.
-    let diagnostics_value = params.remove("diagnostics").unwrap_or(serde_json::Value::Null);
+    let diagnostics_value = params
+        .remove("diagnostics")
+        .unwrap_or(serde_json::Value::Null);
     let diagnostics = match serde_json::from_value::<Vec<tower_lsp_server::ls_types::Diagnostic>>(
         diagnostics_value,
     ) {
