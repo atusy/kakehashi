@@ -203,6 +203,11 @@ policy clean:
   host `didChange` (`did_change.rs::forward_didchange_to_opened_docs`), so this
   decision requires adding the same content-fingerprint guard to the virt sync.
   The null-version stamp (below) then records this content version.
+- **Re-merge on version bump**: when a source's content version advances,
+  kakehashi re-merges and republishes that `host_uri` *immediately*, with the
+  now-stale slots held — otherwise nothing would clear the old diagnostics until a
+  current-version push happens to arrive. The bump itself is the trigger, not just
+  incoming pushes.
 
 ### `preferred` as a push stream
 
@@ -216,9 +221,12 @@ priority — a higher named server preempts whenever it becomes eligible;
 sticky-first applies only *within* the `"*"` first-win group**, where there is no
 static order to fall back on. Per virtual document:
 
-- **Effective version** `Veff` = the highest `virtual_version` seen for that
-  virtual document. Slots older than `Veff` are held (treated as absent) until
-  they re-publish at `Veff`. This is the version gate, and it is what makes a
+- **Effective version** `Veff` = the source's **current extracted-content
+  version** (the version kakehashi has synced for it), *not* merely the highest
+  version seen in arrived pushes — a content bump advances `Veff` at once, before
+  any push at the new version exists. Slots older than `Veff` are held (treated as
+  absent) until they re-publish at `Veff`. This is the version gate, and it is
+  what makes a
   document-version bump re-open the election.
 - **Winner walk** over the expanded `priorities`:
   - `Server(name)` — wins if its slot is eligible (present, **non-empty**, at
@@ -307,6 +315,10 @@ Worked traces (servers `a1,a2` in one region, `priorities = [a1, a2]`):
   eagerly open the real host document on host `didOpen` for push-driven `_self`
   servers — the host-layer analogue of `eager_open_virtual_documents`. (Pull-only
   `_self` servers do not need this; their `pullFallback` pull opens on demand.)
+  Because classification is live, a `_self` server that *unregisters*
+  `textDocument/diagnostic` mid-session (pull-driven → push-driven) has already
+  missed the host `didOpen`, so the transition into push-driven must itself
+  eagerly open any currently-open host docs where that `_self` server is enabled.
 - **Held-but-silent slot**: a slot held by the version gate whose push-driven
   server never re-publishes at the new content version stays hidden until it does.
   A conforming server re-emits after the `didChange`, so it self-heals; a dead
