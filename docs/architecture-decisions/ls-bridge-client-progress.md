@@ -17,9 +17,9 @@ languages, fanned out per language-server-bridge-request-strategies). Each
 downstream may emit `$/progress` and partial results against the same
 client-provided token. Forwarding them verbatim duplicates the lifecycle (N
 `Begin`, N `End`) and corrupts the indicator; concatenating result chunks
-verbatim mis-orders data. Because of fan-out the bridge is **always the party
-that composes the upstream terminal `End` and the final response** — it
-aggregates N downstreams and never simply relays one downstream's terminal.
+verbatim mis-orders data. Because of fan-out,
+**the bridge always composes the upstream terminal itself** — it aggregates N
+downstreams and never simply relays one downstream's `End` or final response.
 
 Today the bridge sidesteps all of this by **stripping both tokens** before
 sending a downstream request (`strip_progress_tokens`,
@@ -32,8 +32,8 @@ never reaches the editor.
 
 Stop stripping client-provided tokens (selectively), route the resulting
 downstream→upstream `$/progress` and partial-result notifications, and aggregate
-them so the editor sees **one coherent lifecycle whose source matches the
-delivered result**.
+them so the editor sees **one coherent lifecycle** whose source matches the
+delivered result.
 
 **Core principle.** The progress the editor sees must track the *same server
 whose result is actually delivered*, so progress and data never diverge. A swap
@@ -59,17 +59,20 @@ lifecycle is committed.
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
   - *preferred, winner already streamed partials*: data is on screen, so promote
-    the accumulated partials into the winner's result and `End` immediately — do
-    not wait for another candidate (that would freeze the shown data) and do not
-    swap in a different server's result. The result may be incomplete; accepted
-    as graceful degradation.
+    the accumulated partials into the winner's result and immediately emit a
+    *synthetic* `End` — the downstream is gone and cannot send a real one, so the
+    bridge composes the terminal itself (the same primitive
+    ls-bridge-progress-disconnect-cleanup uses). Do not wait for another
+    candidate (that would freeze the shown data) and do not swap in a different
+    server's result. The result may be incomplete; accepted as graceful
+    degradation.
   - *preferred, winner produced nothing* (died before any partial result): its
     result is empty, which — exactly as for any empty or absent winner result
     under the preferred strategy — falls through to the next-priority candidate.
     Nothing was shown yet, so this is ordinary request latency, not a freeze and
-    not a swap. The
-    opportunistic `Begin` stays open and `report`/`End` re-gate onto the new
-    candidate (no new `Begin`); this recurses down the priority order.
+    not a swap. The opportunistic `Begin` stays open and `report`/`End` re-gate
+    onto the new candidate (no new `Begin`); this recurses down the priority
+    order.
   - *concatenated*: a failed contributor donates its accumulated partials
     (possibly empty) and the others concatenate as usual; nothing special is
     needed.
@@ -96,8 +99,8 @@ bridge composes the terminal rather than relaying a downstream's.
   from the first frame, but defeats the point of progress (no early "something is
   happening" signal). Rejected in favour of an opportunistic first `Begin` with
   source-gated `report`/`End`.
-- **On failure after partial data was shown, wait for the next-priority
-  candidate.** Avoids delivering incomplete data, but freezes the already-shown
+- **Wait for the next-priority candidate after partial data was shown.**
+  Avoids delivering incomplete data, but freezes the already-shown
   results until the slower candidate finishes and risks a late swap. Rejected in
   favour of promoting the streamed partials. (An empty winner that showed
   *nothing* still falls through normally — that is plain latency, not a freeze.)
@@ -140,10 +143,10 @@ bridge composes the terminal rather than relaying a downstream's.
 Not yet implemented (tracked in issue #414); today both client-provided tokens
 are stripped before fan-out. Specific points to settle during implementation:
 
-- The empty-vs-non-empty threshold that triggers fall-through must **match the
-  existing preferred-strategy empty-result behaviour**, which may be method-specific (e.g.
-  `host.rs` treats an empty `vec![]` as a usable result that must not read as "no
-  result"). Align with the preferred strategy; do not invent a new threshold.
+- The empty-vs-non-empty threshold that triggers fall-through must
+  **match the existing preferred-strategy empty-result behaviour** — a uniform
+  fall-through-on-empty across the priority walk, not a per-method exception.
+  Align with the preferred strategy; do not invent a new threshold.
 - `partialResultToken` support depends on the aggregation layer accepting
   incremental input. Until that lands, `partialResultToken` may stay stripped
   while `workDoneToken` is bridged — a valid intermediate phase. Without

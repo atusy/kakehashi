@@ -26,10 +26,10 @@ bridge currently breaks it on the disconnect path.
 
 ## Decision
 
-When a connection's reader task exits, the bridge **synthesizes a terminating
-`$/progress` `End` for every still-open upstream token that connection owned**
-and forwards it to the editor, in addition to the existing mapping purge and
-admission cleanup.
+When a connection's reader task exits, the bridge
+**synthesizes a terminating `$/progress` `End`** for every still-open upstream
+token that connection owned and forwards it to the editor, in addition to the
+existing mapping purge and admission cleanup.
 
 - The set of tokens is exactly the live upstream tokens the registry already
   returns when purging the connection — the same list that drives the
@@ -79,8 +79,11 @@ ls-bridge-client-progress relies on for client-provided tokens.
   because the server died). Accepted: a clean terminal is strictly better than a
   stuck spinner, and the editor has no way to distinguish "finished" from
   "abandoned" regardless.
-- Couples the connection-purge path to the upstream forwarding loop slightly more
-  tightly: the purge must now feed synthetic `End`s, not just forget admissions.
+- Adds an upstream synthesis step to the forwarding loop: when it processes the
+  forgotten tokens it must now emit synthetic `End`s, not just drop admissions.
+  The reader's purge path stays decoupled — it already hands the live-token list
+  to the loop (via `ForgetWorkDoneProgress`), so no new cross-task coupling is
+  introduced; only the loop's existing handler grows.
 
 ### Neutral
 
