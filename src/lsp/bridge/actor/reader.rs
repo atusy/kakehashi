@@ -770,11 +770,10 @@ async fn handle_message(
 /// requests *to* the downstream, which the downstream can't cancel this way) are
 /// a no-op.
 fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) {
-    let Some(request_id) = message
-        .get("params")
-        .and_then(|p| p.get("id"))
-        .cloned()
-        .and_then(|v| serde_json::from_value::<jsonrpc::Id>(v).ok())
+    // Deserialize the id straight from the borrowed value (no clone). A missing
+    // params/id indexes to `Value::Null`, which deserializes to `Id::Null` and
+    // matches nothing registered (harmless no-op).
+    let Ok(request_id) = <jsonrpc::Id as serde::Deserialize>::deserialize(&message["params"]["id"])
     else {
         return;
     };
