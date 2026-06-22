@@ -40,16 +40,22 @@ them so the editor sees **one coherent lifecycle** whose data-bearing signals
 **Core principle.** Every *data-bearing* signal the editor sees — each `report`,
 the delivered result, and the terminal `End` — must come from the *same server
 whose result is actually delivered*, so progress and data never diverge. The
-opening `Begin` is exempt: it is a content-free "work has started" signal
-forwarded opportunistically from whichever contributor reports first (the winner
-is not yet known then) and carries no server-identifying data. A swap can only
-occur before any data has been shown; once data is delivered, the lifecycle is
-committed.
+opening `Begin` is exempt: the winner is not yet known when it must be sent, so
+it is forwarded opportunistically from whichever contributor reports first,
+purely to light the indicator promptly. `Begin` is not content-free — it carries
+a `title` (and optional `message`) — so that opening text may originate from a
+non-winner. LSP does not allow amending a `title` after `Begin`, so this is
+accepted as a transient cosmetic detail: the data-bearing `report`/result/`End`
+that follow all come from the winner. (A bridge-owned neutral `title` could avoid
+surfacing a non-winner's; either way the data-bearing guarantee holds.) A swap of
+*delivered data* can only occur before any data has been shown; once data is
+delivered, the lifecycle is committed.
 
 - **Selector — priority-based.** The tracked and delivered server is the
   *priority winner* of the preferred fan-in, not the first responder.
-  Latency-based selection is rejected because it can make progress (the fastest
-  server) and delivered data (the priority winner) come from different servers.
+  Latency-based selection is rejected because it can make the data-bearing
+  progress (`report`/`End`, the fastest server) and the delivered result (the
+  priority winner) come from different servers.
 - **Begin — opportunistic.** The winner is unknown when `Begin` arrives (`Begin`
   precedes any result), so forward the *first* `Begin` from any contributor to
   light the indicator immediately; gate only `report`/`End` on the
@@ -99,8 +105,9 @@ bridge composes the terminal rather than relaying a downstream's.
   client-requested progress never surfaces — the gap this decision closes.
   Rejected.
 - **Latency-based selector (track the first responder).** Lower time-to-first
-  paint, but progress and delivered data can come from different servers — the
-  jarring swap this decision avoids. Rejected in favour of priority.
+  paint, but the data-bearing progress and the delivered result can come from
+  different servers — the jarring swap this decision avoids. Rejected in favour
+  of priority.
 - **Delay `Begin` until the winner is known.** Keeps progress source-consistent
   from the first frame, but defeats the point of progress (no early "something is
   happening" signal). Rejected in favour of an opportunistic first `Begin` with
@@ -134,6 +141,10 @@ bridge composes the terminal rather than relaying a downstream's.
 - When a winner fails *after* streaming, the delivered result may be incomplete
   (only the streamed prefix); accepted as graceful degradation over freezing or
   swapping.
+- The opening `Begin`'s `title`/`message` may briefly reflect a non-winner
+  contributor (the winner is unknown when `Begin` must fire, and LSP forbids
+  amending a `title` afterwards). Accepted as transient and cosmetic, or avoided
+  by emitting a bridge-owned neutral `title`.
 
 ### Neutral
 
