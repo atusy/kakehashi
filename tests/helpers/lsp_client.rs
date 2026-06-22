@@ -186,18 +186,26 @@ enum ReadOutcome {
 
 /// Read a single Content-Length-framed JSON-RPC message from `reader`.
 ///
+/// Reads every header line until the blank separator line, capturing
+/// `Content-Length` wherever it appears — so the order of headers and the
+/// presence of others (e.g. `Content-Type`) does not matter — then reads
+/// exactly that many body bytes. Both `\r\n` and bare `\n` line endings are
+/// accepted.
+///
 /// Blocks until a full message is available. Returns [`ReadOutcome::Eof`] only
-/// for a clean stream end at a message boundary (the next header read yields 0
-/// bytes); every malformed header, oversized/zero `Content-Length`, truncated
-/// body, or invalid JSON becomes [`ReadOutcome::Error`] so the caller — or the
-/// background reader thread — can surface the exact failure rather than a
-/// generic disconnect.
-fn read_framed_message(reader: &mut BufReader<ChildStdout>) -> ReadOutcome {
+/// for a clean stream end at a message boundary (EOF before any header of the
+/// next message); a stream that ends mid-message, a malformed/missing
+/// `Content-Length`, an oversized/zero length, a truncated body, or invalid
+/// JSON all become [`ReadOutcome::Error`] so the caller — or the background
+/// reader thread — can surface the exact failure rather than a generic
+/// disconnect.
+fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
     const MAX_HEADERS: u32 = 100;
     const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024; // 100MB limit
 
     let mut header = String::new();
     let mut header_count = 0u32;
+    let mut content_length: Option<usize> = None;
 
     loop {
         if header_count >= MAX_HEADERS {
@@ -212,19 +220,38 @@ fn read_framed_message(reader: &mut BufReader<ChildStdout>) -> ReadOutcome {
             Err(e) => return ReadOutcome::Error(format!("Failed to read header line: {e}")),
         };
 
-        // EOF while awaiting the next header is a clean shutdown at a message
-        // boundary.
         if bytes_read == 0 {
-            return ReadOutcome::Eof;
+            // EOF. Clean only at a message boundary (no Content-Length seen yet
+            // for an in-progress message); otherwise the stream was truncated.
+            return if content_length.is_some() {
+                ReadOutcome::Error("Server closed connection prematurely after header".to_string())
+            } else {
+                ReadOutcome::Eof
+            };
         }
         header_count += 1;
 
-        if header == "\r\n" {
-            continue;
+        // Blank line: headers are done, the body follows.
+        if header == "\r\n" || header == "\n" {
+            let Some(len) = content_length else {
+                return ReadOutcome::Error(
+                    "Missing Content-Length header before message body".to_string(),
+                );
+            };
+
+            let mut body = vec![0u8; len];
+            if let Err(e) = std::io::Read::read_exact(reader, &mut body) {
+                return ReadOutcome::Error(format!("Failed to read body: {e}"));
+            }
+
+            return match serde_json::from_slice(&body) {
+                Ok(value) => ReadOutcome::Message(value),
+                Err(e) => ReadOutcome::Error(format!("Failed to parse response: {e}")),
+            };
         }
 
         let Some(rest) = header.strip_prefix("Content-Length:") else {
-            // Unknown header line; ignore and keep reading (mirrors prior behavior).
+            // Some other header (e.g. Content-Type); ignore and keep reading.
             continue;
         };
 
@@ -249,28 +276,7 @@ fn read_framed_message(reader: &mut BufReader<ChildStdout>) -> ReadOutcome {
                 "Invalid Content-Length: 0 - message body cannot be empty".to_string(),
             );
         }
-
-        // Read the blank line separating headers from the body.
-        let mut empty = String::new();
-        let bytes_read = match reader.read_line(&mut empty) {
-            Ok(n) => n,
-            Err(e) => return ReadOutcome::Error(format!("Failed to read empty line: {e}")),
-        };
-        if bytes_read == 0 {
-            return ReadOutcome::Error(
-                "Server closed connection prematurely after header".to_string(),
-            );
-        }
-
-        let mut body = vec![0u8; len];
-        if let Err(e) = std::io::Read::read_exact(reader, &mut body) {
-            return ReadOutcome::Error(format!("Failed to read body: {e}"));
-        }
-
-        return match serde_json::from_slice(&body) {
-            Ok(value) => ReadOutcome::Message(value),
-            Err(e) => ReadOutcome::Error(format!("Failed to parse response: {e}")),
-        };
+        content_length = Some(len);
     }
 }
 
@@ -657,5 +663,82 @@ mod tests {
 
         assert!(response.get("result").is_some());
         assert!(response["result"].get("capabilities").is_some());
+    }
+
+    /// The canonical framing: a single `Content-Length` header followed by the
+    /// blank line and body.
+    #[test]
+    fn read_framed_message_parses_basic_frame() {
+        let mut input = &b"Content-Length: 13\r\n\r\n{\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// Header order is irrelevant and unrelated headers (e.g. `Content-Type`)
+    /// must not be mistaken for the blank separator line. This is the case
+    /// Gemini flagged: a header after `Content-Length` previously got consumed
+    /// as the blank line and corrupted the body read.
+    #[test]
+    fn read_framed_message_handles_reordered_and_extra_headers() {
+        let mut input = &b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n\
+            Content-Length: 13\r\n\
+            \r\n\
+            {\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// Bare `\n` line endings (no `\r`) are accepted as header terminators.
+    #[test]
+    fn read_framed_message_accepts_lf_only_line_endings() {
+        let mut input = &b"Content-Length: 13\n\n{\"jsonrpc\":1}"[..];
+        match read_framed_message(&mut input) {
+            ReadOutcome::Message(v) => assert_eq!(v, json!({"jsonrpc": 1})),
+            other => panic!("expected Message, got {:?}", outcome_label(&other)),
+        }
+    }
+
+    /// Two messages back to back are framed independently, so the reader thread
+    /// can loop over a continuous stream.
+    #[test]
+    fn read_framed_message_reads_consecutive_frames() {
+        let mut input =
+            &b"Content-Length: 7\r\n\r\n{\"a\":1}Content-Length: 7\r\n\r\n{\"b\":2}"[..];
+        assert!(
+            matches!(read_framed_message(&mut input), ReadOutcome::Message(v) if v == json!({"a": 1}))
+        );
+        assert!(
+            matches!(read_framed_message(&mut input), ReadOutcome::Message(v) if v == json!({"b": 2}))
+        );
+    }
+
+    /// A clean EOF at a message boundary is `Eof`, not an error.
+    #[test]
+    fn read_framed_message_clean_eof_at_boundary() {
+        let mut input = &b""[..];
+        assert!(matches!(read_framed_message(&mut input), ReadOutcome::Eof));
+    }
+
+    /// EOF after a header but before the body is a truncated stream, not a
+    /// clean boundary.
+    #[test]
+    fn read_framed_message_premature_eof_is_error() {
+        let mut input = &b"Content-Length: 99\r\n\r\n"[..];
+        assert!(matches!(
+            read_framed_message(&mut input),
+            ReadOutcome::Error(_)
+        ));
+    }
+
+    fn outcome_label(o: &ReadOutcome) -> &'static str {
+        match o {
+            ReadOutcome::Message(_) => "Message",
+            ReadOutcome::Eof => "Eof",
+            ReadOutcome::Error(_) => "Error",
+        }
     }
 }
