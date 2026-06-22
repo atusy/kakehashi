@@ -13,8 +13,6 @@
 //! Fire-and-forget: only servers that already have the virtual document open and
 //! that advertise the capability are notified; no lazy spawn.
 
-use std::sync::Arc;
-
 use tower_lsp_server::ls_types::TextDocumentSaveReason;
 use url::Url;
 
@@ -65,20 +63,23 @@ impl LanguageServerPool {
     /// params built per virtual document by `build_params` (the virtual URI is
     /// the document the downstream server actually knows).
     ///
-    /// Mirrors [`Self::forward_didchange_to_opened_docs`]'s two-stage liveness
-    /// guard so the (necessarily lock-free) snapshot can't send to a stale
-    /// target:
-    /// 1. the `(virtual_uri, connection)` pair is re-checked against the **live**
-    ///    reverse index ([`Self::get_all_connections_for_virtual_uri`]) — a
-    ///    concurrent `didClose`/respawn that closed or purged the doc drops it
-    ///    here (didChange gets the same gate from `increment_document_version`
-    ///    returning `None`);
-    /// 2. the handle is re-fetched per iteration under the `connections` lock
-    ///    and must be `Ready`, so a respawned connection is never sent to via a
-    ///    stale handle.
+    /// The `host_to_virtual` list is necessarily snapshotted lock-free, so each
+    /// send is guarded against a stale target by holding `connections` across
+    /// the liveness recheck AND the send (order `connections` → tracker,
+    /// matching the respawn purge in `pool.rs`):
+    /// - while `connections` is held a respawn purge cannot interleave, so a
+    ///   replacement process can never be installed between the recheck and the
+    ///   send (a pre-handle reverse-index check alone would NOT close this — the
+    ///   purge could swap in a fresh Ready handle that never opened the doc);
+    /// - the `(virtual_uri, connection)` pair is then re-checked against the
+    ///   **live** reverse index ([`Self::get_all_connections_for_virtual_uri`]),
+    ///   dropping a doc a concurrent `didClose` removed (best-effort, the same
+    ///   accepted TOCTOU `forward_didchange_to_opened_docs` has);
+    /// - the handle must be the current `Ready` one.
     ///
     /// `send_notification` is a non-blocking queue write (FIFO single-writer
-    /// loop, ls-bridge-message-ordering).
+    /// loop, ls-bridge-message-ordering), so holding `connections` across it is
+    /// cheap — the same discipline as `notify_host_will_save`.
     async fn forward_save_notification_to_virtual_docs(
         &self,
         host_uri: &Url,
@@ -88,23 +89,20 @@ impl LanguageServerPool {
     ) {
         let docs = self.host_virtual_docs(host_uri).await;
         for doc in docs {
-            // Stage 1: the snapshot can go stale — only send if this connection
-            // STILL has this virtual document open per the live reverse index.
+            let connections = self.connections().await;
+            // Under the `connections` lock (purge excluded): only send if this
+            // connection STILL has this virtual doc open and is the current
+            // Ready handle.
             if !self
                 .get_all_connections_for_virtual_uri(&doc.virtual_uri)
                 .contains(&doc.connection_key)
             {
                 continue;
             }
-            // Stage 2: re-fetch the live handle and require Ready.
-            let handle = {
-                let connections = self.connections().await;
-                match connections.get(&doc.connection_key) {
-                    Some(handle) if handle.state() == ConnectionState::Ready => Arc::clone(handle),
-                    _ => continue,
-                }
+            let Some(handle) = connections.get(&doc.connection_key) else {
+                continue;
             };
-            if !handle.has_capability(capability) {
+            if handle.state() != ConnectionState::Ready || !handle.has_capability(capability) {
                 continue;
             }
             let virtual_uri = doc.virtual_uri.to_uri_string();
