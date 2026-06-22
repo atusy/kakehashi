@@ -104,7 +104,7 @@ impl LanguageServerPool {
                 continue;
             }
             // Then the liveness recheck: only send if this connection STILL has
-            // this virtual doc open (zero-alloc membership check).
+            // this virtual doc open (membership test, no reverse-index Vec clone).
             if !self.is_virtual_doc_open_on_connection(&doc.virtual_uri, &doc.connection_key) {
                 continue;
             }

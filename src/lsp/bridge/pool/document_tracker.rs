@@ -439,10 +439,11 @@ impl DocumentTracker {
             .unwrap_or_default()
     }
 
-    /// Zero-allocation membership check: is `virtual_uri` open on
-    /// `connection_key`? Reads the same `virtual_to_servers` reverse index as
-    /// [`Self::get_all_connections_for_virtual_uri`] but avoids cloning the
-    /// `Vec<ConnectionKey>` — used by the per-doc save fan-out liveness recheck.
+    /// Membership check: is `virtual_uri` open on `connection_key`? Reads the
+    /// same `virtual_to_servers` reverse index as
+    /// [`Self::get_all_connections_for_virtual_uri`] but only tests membership,
+    /// avoiding that method's `Vec<ConnectionKey>` clone (the `to_uri_string()`
+    /// key allocation remains) — used by the per-doc save fan-out liveness recheck.
     pub(super) fn is_virtual_doc_open_on_connection(
         &self,
         virtual_uri: &VirtualDocumentUri,

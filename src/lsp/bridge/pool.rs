@@ -542,8 +542,9 @@ impl LanguageServerPool {
             .get_all_connections_for_virtual_uri(virtual_uri)
     }
 
-    /// Zero-allocation membership check for the save fan-out liveness recheck:
-    /// is `virtual_uri` open on `connection_key`?
+    /// Membership check for the save fan-out liveness recheck (avoids the
+    /// reverse-index `Vec<ConnectionKey>` clone): is `virtual_uri` open on
+    /// `connection_key`?
     pub(super) fn is_virtual_doc_open_on_connection(
         &self,
         virtual_uri: &VirtualDocumentUri,
