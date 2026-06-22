@@ -71,14 +71,16 @@ impl LanguageServerPool {
     /// - `connections` is taken once after the snapshot and held across the
     ///   whole loop — no `.await` happens inside it. While it is held a respawn
     ///   purge cannot interleave, so a replacement process can never be installed
-    ///   between the recheck and the send (a pre-handle reverse-index check
-    ///   alone would NOT close this — the purge could swap in a fresh Ready
-    ///   handle that never opened the doc);
-    /// - the `(virtual_uri, connection)` pair is then re-checked against the
-    ///   **live** reverse index ([`Self::get_all_connections_for_virtual_uri`]),
-    ///   dropping a doc a concurrent `didClose` removed (best-effort, the same
-    ///   accepted TOCTOU `forward_didchange_to_opened_docs` has);
-    /// - the handle must be the current `Ready` one.
+    ///   between the recheck and the send (a reverse-index check alone would NOT
+    ///   close this — the purge could swap in a fresh Ready handle that never
+    ///   opened the doc);
+    /// - the handle must be the current `Ready` one and advertise the capability
+    ///   (cheap checks, done first);
+    /// - the `(virtual_uri, connection)` pair must STILL be in the **live**
+    ///   reverse index ([`Self::is_virtual_doc_open_on_connection`]) — dropping a
+    ///   doc a concurrent `didClose` removed (best-effort, the same accepted
+    ///   TOCTOU `forward_didchange_to_opened_docs` has). This (cheap, but a
+    ///   tracker lookup) runs last so it is skipped for un-Ready/incapable docs.
     ///
     /// `send_notification` is a non-blocking queue write (FIFO single-writer
     /// loop, ls-bridge-message-ordering), so holding `connections` across the
@@ -93,19 +95,17 @@ impl LanguageServerPool {
         let docs = self.host_virtual_docs(host_uri).await;
         let connections = self.connections().await;
         for doc in docs {
-            // Under the `connections` lock (purge excluded): only send if this
-            // connection STILL has this virtual doc open and is the current
-            // Ready handle.
-            if !self
-                .get_all_connections_for_virtual_uri(&doc.virtual_uri)
-                .contains(&doc.connection_key)
-            {
-                continue;
-            }
+            // Cheap checks first: the current Ready handle that advertises the
+            // capability (all under the held `connections` lock, purge excluded).
             let Some(handle) = connections.get(&doc.connection_key) else {
                 continue;
             };
             if handle.state() != ConnectionState::Ready || !handle.has_capability(capability) {
+                continue;
+            }
+            // Then the liveness recheck: only send if this connection STILL has
+            // this virtual doc open (zero-alloc membership check).
+            if !self.is_virtual_doc_open_on_connection(&doc.virtual_uri, &doc.connection_key) {
                 continue;
             }
             let virtual_uri = doc.virtual_uri.to_uri_string();

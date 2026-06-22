@@ -542,6 +542,17 @@ impl LanguageServerPool {
             .get_all_connections_for_virtual_uri(virtual_uri)
     }
 
+    /// Zero-allocation membership check for the save fan-out liveness recheck:
+    /// is `virtual_uri` open on `connection_key`?
+    pub(super) fn is_virtual_doc_open_on_connection(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        self.document_tracker
+            .is_virtual_doc_open_on_connection(virtual_uri, connection_key)
+    }
+
     /// Register a document as successfully opened (test helper).
     ///
     /// Delegates to `DocumentTracker::register_opened_document()`.
