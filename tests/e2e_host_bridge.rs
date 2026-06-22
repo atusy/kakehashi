@@ -422,6 +422,15 @@ const SAVE_URI: &str = "file:///test_host_will_save.md";
 /// mode, opening [`SAVE_URI`]. Returns the raw `initialize` response so the
 /// capability-gate tests can inspect the advertised `textDocumentSync`.
 fn init_will_save_client(config_toml: &str) -> (LspClient, tempfile::TempDir, Value) {
+    init_will_save_client_with_mode(config_toml, "will-save")
+}
+
+/// As [`init_will_save_client`] but selects the mock server `mode` — used by
+/// the timeout test to run the `will-save-slow` mock.
+fn init_will_save_client_with_mode(
+    config_toml: &str,
+    mode: &str,
+) -> (LspClient, tempfile::TempDir, Value) {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("will_save.toml");
     std::fs::write(&config_path, config_toml).expect("write config");
@@ -441,7 +450,7 @@ fn init_will_save_client(config_toml: &str) -> (LspClient, tempfile::TempDir, Va
             "initializationOptions": {
                 "languageServers": {
                     "mock-host": {
-                        "cmd": [mock_bin(), "will-save"],
+                        "cmd": [mock_bin(), mode],
                         "languages": ["markdown"]
                     }
                 }
@@ -607,6 +616,63 @@ fn e2e_host_will_save_notification_reaches_host() {
     assert_eq!(
         contents, "willsave-count:1:reason:2",
         "the host server must record the forwarded willSave and its reason"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_will_save_wait_until_times_out_without_hanging_save() {
+    // The host server stalls 8s on willSaveWaitUntil; kakehashi's 5s save budget
+    // must abandon the request and return null near 5s — NOT wait the 30s
+    // request timeout (#357 Q3). Without the budget this test would block ~30s.
+    let (mut client, _config_dir, _init) = init_will_save_client_with_mode(
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+        "will-save-slow",
+    );
+
+    // Warm up so the connection is Ready before the timed request: a cold
+    // FailFast request returns null instantly (no wait), which would not
+    // exercise the timeout path.
+    let mut warmed = false;
+    for _ in 0..300 {
+        if host_save_hover(&mut client).is_some() {
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "host bridge must be warm before the timed request");
+
+    let start = std::time::Instant::now();
+    let response = client.send_request(
+        "textDocument/willSaveWaitUntil",
+        json!({
+            "textDocument": { "uri": SAVE_URI },
+            "reason": 1
+        }),
+    );
+    let elapsed = start.elapsed();
+
+    assert!(
+        response.get("error").is_none(),
+        "a timed-out willSaveWaitUntil must return a result, not an error; got: {:?}",
+        response.get("error")
+    );
+    assert!(
+        response["result"].is_null(),
+        "a timed-out willSaveWaitUntil must return null (save proceeds editless); got: {}",
+        response["result"]
+    );
+    // The 5s budget — not an instant cold null (< 1s) and not the 30s request
+    // timeout. Generous bounds keep this robust under CI load.
+    assert!(
+        elapsed >= std::time::Duration::from_secs(3),
+        "must wait for the budget, not return an instant cold null; elapsed {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "must time out on the 5s budget, not the 30s request timeout; elapsed {elapsed:?}"
     );
 
     shutdown(&mut client);

@@ -56,6 +56,10 @@
 //!   the recorded willSave count and last reason, so the test can prove the
 //!   notification reached the host server. Used by `tests/e2e_host_bridge.rs`
 //!   to prove host-bridge willSave/willSaveWaitUntil forwarding (#357).
+//! - `will-save-slow` — like `will-save`, but sleeps 8s before answering
+//!   `willSaveWaitUntil`, past kakehashi's 5s save budget. Lets the test prove
+//!   the bridge times out and returns null near 5s instead of hanging the save
+//!   on the 30s request timeout (#357 Q3).
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
 //!   Used by `tests/e2e_window_notifications.rs` to prove the bridge forwards
@@ -133,7 +137,7 @@ fn main() {
                         },
                         "textDocumentSync": 1
                     }),
-                    "will-save" => json!({
+                    "will-save" | "will-save-slow" => json!({
                         "hoverProvider": true,
                         "textDocumentSync": {
                             "openClose": true,
@@ -259,6 +263,12 @@ fn main() {
                 }
             }
             "textDocument/willSaveWaitUntil" => {
+                // `will-save-slow` stalls past kakehashi's 5s save budget so the
+                // test can exercise the bridge's timeout-drop path: kakehashi
+                // must return null near 5s (not wait the 30s request timeout).
+                if mode == "will-save-slow" {
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                }
                 // Answer with a save-time edit echoing the requested URI — but
                 // only for documents synced via didOpen, so a successful edit
                 // proves the host document was opened and the REAL URI was
@@ -294,7 +304,7 @@ fn main() {
                 }
             }
             "textDocument/hover" => {
-                let result = if mode == "will-save" {
+                let result = if mode.starts_with("will-save") {
                     // Report the recorded willSave count + last reason so the
                     // test can prove the notification reached this server (#357).
                     json!({

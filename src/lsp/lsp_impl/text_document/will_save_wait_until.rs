@@ -59,8 +59,12 @@ impl Kakehashi {
             Err(_) => {
                 // Bounded save latency (#357 Q3): abandon the in-flight host
                 // request and let the editor save without save-time edits.
-                // Dropping `fut` skips its trailing upstream-registry sweep, so
-                // run it here to avoid leaking the cancel mapping.
+                // The per-server requests run as spawned tasks; dropping `fut`
+                // aborts them, and an aborted task may not reach its own
+                // upstream-registry unregister, so sweep the id here to avoid
+                // leaking the cancel mapping. (The abort does not send a
+                // downstream $/cancelRequest — the host server keeps computing,
+                // which the 5s budget accepts in exchange for a fast save.)
                 log::warn!(
                     "willSaveWaitUntil timed out after {WILL_SAVE_WAIT_UNTIL_BUDGET:?}; \
                      saving without host save-time edits"
