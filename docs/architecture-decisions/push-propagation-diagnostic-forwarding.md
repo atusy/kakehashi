@@ -155,7 +155,7 @@ already `#[serde(rename_all = "camelCase")]`), resolving to the default `true`
 when unset, merged field-by-field through the config merge (`merge.rs`), and
 serialized as `pullFallback` / `pushFallback`.
 
-Naming note (the prompt's `pullFallbackEnabled` / `pushFallbackEnabled`): the
+Naming note (vs the alternative `pullFallbackEnabled` / `pushFallbackEnabled`): the
 `Enabled` suffix is dropped to match the existing bare-boolean `enabled` on
 `BridgeLanguageConfig` — the field *is* the toggle. The mechanism stays in the
 key (rather than a method-disambiguated bare `fallback`) so a single config line
@@ -207,7 +207,7 @@ policy clean:
   on that source. This is *not* the per-connection LSP wire version the bridge
   already tracks (`document_tracker` keys version by `(connection, virtual_uri)`
   and bumps per connection), which is not comparable across servers — a restart or
-  late open desyncs it. To map a push back to an epoch, kakehashi records a per
+  late open desyncs it. To map a push back to an epoch, kakehashi records a
   nested `connection → source → wire_version → content_epoch` entry (so a
   connection purge drops its subtree in O(1)) **when each
   `didOpen`/`didChange` is successfully enqueued to that connection's writer**
