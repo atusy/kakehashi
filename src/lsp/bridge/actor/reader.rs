@@ -2405,7 +2405,10 @@ mod tests {
             "params": {"uri": uri, "diagnostics": []}
         });
         handle_message(empty, &ResponseRouter::new(), "", &deps).await;
-        match upstream_rx.try_recv().expect("empty array should be routed") {
+        match upstream_rx
+            .try_recv()
+            .expect("empty array should be routed")
+        {
             UpstreamNotification::PublishDiagnostics { diagnostics, .. } => {
                 assert!(diagnostics.is_empty(), "empty array clears");
             }

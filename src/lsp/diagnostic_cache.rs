@@ -88,7 +88,7 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 ///
 /// Staged: results are concatenated (the default `textDocument/publishDiagnostics`
 /// strategy). Per-source strategy fan-in (`preferred` sticky / `concatenated`
-/// visible-walk) and `relatedInformation` range translation are follow-ups.
+/// visible-walk) is a follow-up.
 pub(crate) fn merge_cached_diagnostics(
     host: &Url,
     snapshot: &SourceSlots,

@@ -81,6 +81,14 @@ impl DiagnosticPublisher {
     /// The pull blob is already host-local; it replaces the
     /// [`DiagnosticSource::PullLayer`] slot, then the merge folds in region push
     /// slots.
+    ///
+    /// Staged limitation: `SyntheticDiagnosticsManager` aborts a superseded pull
+    /// task, but the abort cannot preempt the synchronous `set_pull_layer` write
+    /// below — so a superseded task can leave a slightly stale `PullLayer` that a
+    /// later republish includes until the next pull completes. This is the same
+    /// staleness class the deferred `content_epoch` version gate
+    /// (push-propagation-diagnostic-forwarding) handles generally; until then it
+    /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.aggregator.set_pull_layer(host, diagnostics);
         self.republish(host).await;

@@ -2,10 +2,12 @@
 //!
 //! Unlike the other `text_document/*` files (outbound request senders), this one
 //! is **inbound** (downstream → bridge): a downstream server pushes diagnostics.
-//! The bridge does not forward push diagnostics in general (#380); the one case
-//! it must act on is a push targeting a concatenated-formatting *scratch*
-//! virtual document, which is discarded structurally by the dispatcher in
-//! [`actor::reader`](crate::lsp::bridge::actor) using [`is_scratch_publish_diagnostics`].
+//! A non-scratch push for an injection region's virtual document is **routed**
+//! into the proactive diagnostics cache ([`forward_push`],
+//! push-propagation-diagnostic-forwarding, closing #380); a push targeting a
+//! concatenated-formatting *scratch* virtual document is discarded structurally
+//! by the dispatcher in [`actor::reader`](crate::lsp::bridge::actor) using
+//! [`is_scratch_publish_diagnostics`].
 
 /// Whether `message` is a `textDocument/publishDiagnostics` notification
 /// targeting a concatenated-formatting *scratch* virtual document
