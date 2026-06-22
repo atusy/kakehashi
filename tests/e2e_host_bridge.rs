@@ -738,6 +738,10 @@ const VIRT_SAVE_MARKDOWN: &str = "# Title\n\n```lua\nprint(1)\n```\n";
 /// `will-save` mode (a virt bridge, no host bridging), and open a markdown host
 /// with a lua fence.
 fn init_virt_save_client() -> (LspClient, tempfile::TempDir) {
+    init_virt_save_client_with_mode("will-save")
+}
+
+fn init_virt_save_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("config dir");
     let config_path = config_dir.path().join("virt_save.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -755,7 +759,7 @@ fn init_virt_save_client() -> (LspClient, tempfile::TempDir) {
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
-                    "lua-save": { "cmd": [mock_bin(), "will-save"], "languages": ["lua"] }
+                    "lua-save": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
                 }
             }
         }),
@@ -838,6 +842,54 @@ fn e2e_virt_will_save_and_did_save_reach_virtual_doc() {
             "{key} must be the VIRTUAL document URI; got {uri}"
         );
         assert_ne!(uri, VIRT_SAVE_URI, "{key} must NOT be the host URI");
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_virt_save_skips_server_without_save_capability() {
+    // The per-server capability gate is the phantom-save mitigation: a virt
+    // server that advertises neither `willSave` nor `save` must NOT be told
+    // about the host save, even with its virtual doc open (#357).
+    let (mut client, _config_dir) = init_virt_save_client_with_mode("will-save-incapable");
+
+    // Warm up: open the virtual doc (hover still works — the mode advertises it)
+    // and confirm zero saves recorded.
+    let mut warmed = false;
+    for _ in 0..300 {
+        if let Some(state) = virt_save_hover(&mut client) {
+            assert_eq!(state["will"], 0);
+            assert_eq!(state["did"], 0);
+            warmed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(warmed, "incapable virt server must still answer hover");
+
+    client.send_notification(
+        "textDocument/willSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI }, "reason": 1 }),
+    );
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": VIRT_SAVE_URI } }),
+    );
+
+    // Give the (incorrect) fan-out time to land, then confirm the gate held:
+    // counts stay zero. Poll a handful of times so a late delivery would fail.
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let state = virt_save_hover(&mut client).expect("hover must answer");
+        assert_eq!(
+            state["will"], 0,
+            "willSave must NOT reach a server lacking the willSave capability; got {state}"
+        );
+        assert_eq!(
+            state["did"], 0,
+            "didSave must NOT reach a server lacking the save capability; got {state}"
+        );
     }
 
     shutdown(&mut client);

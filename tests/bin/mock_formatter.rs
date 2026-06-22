@@ -63,6 +63,9 @@
 //!   `willSaveWaitUntil`, past kakehashi's 5s save budget. Lets the test prove
 //!   the bridge times out and returns null near 5s instead of hanging the save
 //!   on the 30s request timeout (#357 Q3).
+//! - `will-save-incapable` — like `will-save` (records + reports save state via
+//!   hover) but advertises NEITHER `willSave` nor `save`, so the bridge's
+//!   per-server capability gate must skip it and its counts stay zero (#357).
 //! - `notify` — right after answering `initialize`, emits a
 //!   `window/showMessage` followed by a `window/logMessage` notification.
 //!   Used by `tests/e2e_window_notifications.rs` to prove the bridge forwards
@@ -154,6 +157,13 @@ fn main() {
                             "willSaveWaitUntil": true,
                             "save": { "includeText": false }
                         }
+                    }),
+                    // Records willSave/didSave like `will-save`, but advertises
+                    // NEITHER save flag — so the bridge's per-server capability
+                    // gate must skip it (its hover state stays at zero) (#357).
+                    "will-save-incapable" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": 1
                     }),
                     "workspace-folders" => json!({
                         "hoverProvider": true,

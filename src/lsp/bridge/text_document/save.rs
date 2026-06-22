@@ -45,9 +45,11 @@ impl LanguageServerPool {
     /// Forward `textDocument/didSave` to every open virtual document of
     /// `host_uri`, on each live server that advertises `save` (#357).
     ///
-    /// The notification carries no `text`: kakehashi advertises
-    /// `save.includeText = false`, and the virt server's document is already
-    /// current from the didChange stream, so the bare identifier is enough.
+    /// The notification carries no `text` even if the downstream server
+    /// requested `save.includeText = true`: the virtual document is already
+    /// current from the didChange stream, so the saved text would be redundant.
+    /// `text` is optional in `DidSaveTextDocumentParams`, and re-deriving each
+    /// region's content here is not worth it for a fire-and-forget save hook.
     pub(crate) async fn forward_did_save_to_virtual_docs(&self, host_uri: &Url) {
         self.forward_save_notification_to_virtual_docs(
             host_uri,
@@ -63,12 +65,20 @@ impl LanguageServerPool {
     /// params built per virtual document by `build_params` (the virtual URI is
     /// the document the downstream server actually knows).
     ///
-    /// Locking mirrors [`Self::forward_didchange_to_opened_docs`]: the doc list
-    /// is snapshotted once, then the live handle is re-fetched per iteration
-    /// under the `connections` lock and checked for `Ready` — so a connection
-    /// that respawned after the snapshot can never be sent to via a stale
-    /// handle. `send_notification` is a non-blocking queue write (FIFO
-    /// single-writer loop, ls-bridge-message-ordering).
+    /// Mirrors [`Self::forward_didchange_to_opened_docs`]'s two-stage liveness
+    /// guard so the (necessarily lock-free) snapshot can't send to a stale
+    /// target:
+    /// 1. the `(virtual_uri, connection)` pair is re-checked against the **live**
+    ///    reverse index ([`Self::get_all_connections_for_virtual_uri`]) — a
+    ///    concurrent `didClose`/respawn that closed or purged the doc drops it
+    ///    here (didChange gets the same gate from `increment_document_version`
+    ///    returning `None`);
+    /// 2. the handle is re-fetched per iteration under the `connections` lock
+    ///    and must be `Ready`, so a respawned connection is never sent to via a
+    ///    stale handle.
+    ///
+    /// `send_notification` is a non-blocking queue write (FIFO single-writer
+    /// loop, ls-bridge-message-ordering).
     async fn forward_save_notification_to_virtual_docs(
         &self,
         host_uri: &Url,
@@ -78,6 +88,15 @@ impl LanguageServerPool {
     ) {
         let docs = self.host_virtual_docs(host_uri).await;
         for doc in docs {
+            // Stage 1: the snapshot can go stale — only send if this connection
+            // STILL has this virtual document open per the live reverse index.
+            if !self
+                .get_all_connections_for_virtual_uri(&doc.virtual_uri)
+                .contains(&doc.connection_key)
+            {
+                continue;
+            }
+            // Stage 2: re-fetch the live handle and require Ready.
             let handle = {
                 let connections = self.connections().await;
                 match connections.get(&doc.connection_key) {
