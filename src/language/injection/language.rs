@@ -121,4 +121,29 @@ mod tests {
         let lang = extract_dynamic_language(&query, m, "x");
         assert_eq!(lang.as_deref(), Some(""));
     }
+
+    #[test]
+    fn extract_language_from_info_string_stale_capture_does_not_panic() {
+        // Same stale-tree guard as above, via the #set-lang-from-info-string!
+        // path (language.rs:81), which slices a capture node identically.
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&md).expect("load markdown");
+        let text = "```rust\nfn main() {}\n```\n";
+        let tree = parser.parse(text, None).expect("parse markdown");
+        let query = Query::new(
+            &md,
+            r#"(fenced_code_block (info_string) @_info (#set-lang-from-info-string! @_info))"#,
+        )
+        .expect("valid query");
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+        let m = matches.next().expect("one match");
+
+        // Out-of-bounds capture range against the shorter text → empty after
+        // normalization → None, but crucially no panic.
+        let lang = extract_language_from_info_string(&query, m, "x");
+        assert_eq!(lang, None);
+    }
 }

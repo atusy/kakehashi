@@ -29,10 +29,10 @@ pub(crate) fn floor_char_boundary(text: &str, mut index: usize) -> usize {
 /// Byte offsets that come from a tree-sitter node are only guaranteed valid for
 /// the exact text the tree was parsed from; if the tree and text desync (a stale
 /// tree after a concurrent edit), an offset can be out of bounds or land
-/// mid-codepoint, and `&text[range]` would panic and crash the LSP server. Both
-/// ends are clamped to the length and floored to char boundaries, and a
-/// degenerate (start > end) range yields `""`. For a range that is already valid
-/// this returns exactly `&text[range]`.
+/// mid-codepoint, and `&text[range]` would panic and crash the LSP server. The
+/// start is floored and the end is ceiled to UTF-8 char boundaries (both clamped
+/// to `text.len()`), and a degenerate (start > end) range yields `""`. For a
+/// range that is already valid this returns exactly `&text[range]`.
 pub(crate) fn clamped_slice(text: &str, range: std::ops::Range<usize>) -> &str {
     let start = floor_char_boundary(text, range.start);
     let end = ceil_char_boundary(text, range.end);
@@ -60,7 +60,7 @@ mod tests {
     fn clamped_slice_mid_codepoint_floors_to_boundary() {
         // "あ" is 3 bytes (0..3); slicing at 1 or 2 would panic with `&text[..]`.
         let s = "あい";
-        assert_eq!(clamped_slice(s, 0..2), "あ"); // end floored 2 -> 3
+        assert_eq!(clamped_slice(s, 0..2), "あ"); // end ceiled 2 -> 3
         assert_eq!(clamped_slice(s, 1..6), "あい"); // start floored 1 -> 0
     }
 
