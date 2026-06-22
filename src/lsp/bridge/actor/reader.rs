@@ -60,6 +60,12 @@ pub(crate) enum UpstreamNotification {
     /// region's virtual document (push-propagation-diagnostic-forwarding). The
     /// forwarding loop resolves `uri` to its host document + region, caches the
     /// diagnostics under `server`, and republishes the merged host set.
+    ///
+    /// This carries an arbitrary-size `Vec<Diagnostic>` over the **unbounded**
+    /// upstream channel, so a push-happy or misbehaving downstream paired with a
+    /// slow upstream loop could grow memory. Re-publish is unthrottled by design
+    /// (push-propagation-diagnostic-forwarding § Consequences); a bounded /
+    /// coalescing diagnostics channel is the deferred mitigation if it proves noisy.
     PublishDiagnostics {
         /// The virtual document URI the downstream published for.
         uri: String,

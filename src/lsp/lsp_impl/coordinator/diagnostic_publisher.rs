@@ -107,6 +107,14 @@ impl DiagnosticPublisher {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
         // never publish after a fresh one (push-propagation-diagnostic-forwarding).
+        //
+        // The lock is held across the editor `publish_diagnostics` await below
+        // because the ordering guarantee requires it (releasing before the send
+        // would let two publishes reorder on the wire). The cost is that a slow
+        // editor stalls *all* hosts' republishes — an accepted staging tradeoff of
+        // the global lock; the deferred per-host lock shrinks the blast radius to
+        // one host. publish_diagnostics is a fire-and-forget notification, so the
+        // stall window is the client's outbound-channel send, not a round-trip.
         let _guard = self.aggregator.lock_republish().await;
 
         let snapshot = self.aggregator.snapshot(host);
