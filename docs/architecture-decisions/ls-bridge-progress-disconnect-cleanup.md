@@ -36,10 +36,12 @@ existing mapping purge and admission cleanup.
   `ForgetWorkDoneProgress` admission cleanup. The synthetic `End` is emitted for
   each before (or as) that admission is forgotten, so the editor sees one clean
   terminal per token.
-- Only tokens the bridge actually minted and forwarded a create for are ended,
-  so the editor never receives an `End` for a progress it was never asked to
-  create. The existing capability gate (the bridge only forwards a create when
-  the editor advertised `window.workDoneProgress`) already guarantees this.
+- The synthetic `End` passes through the same `created_tokens` admission gate the
+  forwarding loop already applies to real progress: a token is ended only if the
+  editor *accepted* its `window/workDoneProgress/create` (the create was
+  admitted, not merely forwarded). A create the editor rejected or that timed out
+  is not admitted, so it never receives a spurious terminal — and the editor
+  never sees an `End` for a progress it was never asked to create.
 - The synthetic `End` carries no message; the editor needs only the terminal to
   clear the indicator.
 

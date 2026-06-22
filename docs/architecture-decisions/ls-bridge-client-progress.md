@@ -21,12 +21,14 @@ verbatim mis-orders data. Because of fan-out,
 **the bridge always composes the upstream terminal itself** — it aggregates N
 downstreams and never simply relays one downstream's `End` or final response.
 
-Today the bridge sidesteps all of this by **stripping both tokens** before
-sending a downstream request (`strip_progress_tokens`,
-`src/lsp/bridge/text_document/host.rs`): a downstream honouring them would stream
-into the void, since the bridge discards downstream notifications, and could
-legally return an empty final result. The cost is that client-requested progress
-never reaches the editor.
+Today the bridge does not forward client-provided tokens to downstreams at all.
+The host raw-request path strips them (`strip_progress_tokens`,
+`src/lsp/bridge/text_document/host.rs`), and the per-method virtual request
+builders construct fresh params with default (empty) progress fields, so no
+token is carried either way. A downstream honouring them would stream into the
+void, since the bridge discards downstream notifications, and could legally
+return an empty final result. The cost is that client-requested progress never
+reaches the editor.
 
 ## Decision
 
@@ -35,10 +37,14 @@ downstream→upstream `$/progress` and partial-result notifications, and aggrega
 them so the editor sees **one coherent lifecycle** whose source matches the
 delivered result.
 
-**Core principle.** The progress the editor sees must track the *same server
-whose result is actually delivered*, so progress and data never diverge. A swap
-can only occur before any data has been shown; once data is delivered, the
-lifecycle is committed.
+**Core principle.** Every *data-bearing* signal the editor sees — each `report`,
+the delivered result, and the terminal `End` — must come from the *same server
+whose result is actually delivered*, so progress and data never diverge. The
+opening `Begin` is exempt: it is a content-free "work has started" signal
+forwarded opportunistically from whichever contributor reports first (the winner
+is not yet known then) and carries no server-identifying data. A swap can only
+occur before any data has been shown; once data is delivered, the lifecycle is
+committed.
 
 - **Selector — priority-based.** The tracked and delivered server is the
   *priority winner* of the preferred fan-in, not the first responder.
