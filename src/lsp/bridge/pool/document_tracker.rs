@@ -328,6 +328,18 @@ impl DocumentTracker {
         }
     }
 
+    /// Snapshot (without removing) every virtual document currently open for a
+    /// host URI. Used by the save-notification fan-out (#357), which forwards
+    /// willSave/didSave to the host's open virtual docs but must keep them open.
+    pub(super) async fn host_virtual_docs(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
+        self.host_to_virtual
+            .lock()
+            .await
+            .get(host_uri)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.

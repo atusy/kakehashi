@@ -24,6 +24,15 @@ impl Kakehashi {
             uri
         );
 
+        // Forward didSave to virt-bridge servers that have a virtual document
+        // open for this host and advertise `save` (#357). A save hook on a
+        // fenced language (e.g. a server caching dirty state) reacts here;
+        // willSaveWaitUntil stays host-only.
+        self.bridge
+            .pool_arc()
+            .forward_did_save_to_virtual_docs(&uri)
+            .await;
+
         // Spawn background task for synthetic diagnostic collection
         self.diagnostic_scheduler()
             .spawn_synthetic_diagnostic_task(uri, lsp_uri);

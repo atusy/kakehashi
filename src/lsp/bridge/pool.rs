@@ -455,6 +455,12 @@ impl LanguageServerPool {
     // DocumentTracker delegation methods
     // ========================================
 
+    /// Snapshot (without removing) every virtual document currently open for a
+    /// host URI. Used by the save-notification fan-out (#357).
+    pub(crate) async fn host_virtual_docs(&self, host_uri: &Url) -> Vec<OpenedVirtualDoc> {
+        self.document_tracker.host_virtual_docs(host_uri).await
+    }
+
     /// Remove and return all virtual documents for a host URI.
     ///
     /// Used by did_close module for cleanup.

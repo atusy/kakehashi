@@ -15,7 +15,8 @@ use tower_lsp_server::ls_types::{
     ColorProviderCapability, DeclarationCapability, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability,
     LinkedEditingRangeServerCapabilities, OneOf, RenameOptions, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncOptions, TypeDefinitionProviderCapability,
+    TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
+    TypeDefinitionProviderCapability,
 };
 
 use super::connection_action::BridgeError;
@@ -588,6 +589,22 @@ impl ConnectionHandle {
                 Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         will_save_wait_until: Some(true),
+                        ..
+                    }
+                ))
+            ),
+            // didSave is opt-in via `textDocumentSync.save` (a server declares
+            // it reacts to saves). Only the `Options` form carries it;
+            // `Supported(false)` and the bare `Kind` number form correctly fall
+            // through to false. Gates save-hook forwarding to virt servers (#357).
+            "textDocument/didSave" => matches!(
+                caps.text_document_sync,
+                Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        save: Some(
+                            TextDocumentSyncSaveOptions::Supported(true)
+                                | TextDocumentSyncSaveOptions::SaveOptions(_)
+                        ),
                         ..
                     }
                 ))
@@ -1976,6 +1993,36 @@ mod tests {
                     ));
                 }),
             ),
+            (
+                "textDocument/didSave",
+                Box::new(|c| {
+                    c.text_document_sync = Some(TextDocumentSyncCapability::Options(
+                        TextDocumentSyncOptions {
+                            save: Some(tower_lsp_server::ls_types::TextDocumentSyncSaveOptions::SaveOptions(
+                                tower_lsp_server::ls_types::SaveOptions {
+                                    include_text: Some(false),
+                                },
+                            )),
+                            ..Default::default()
+                        },
+                    ));
+                }),
+            ),
+            (
+                "textDocument/didSave",
+                Box::new(|c| {
+                    c.text_document_sync = Some(TextDocumentSyncCapability::Options(
+                        TextDocumentSyncOptions {
+                            save: Some(
+                                tower_lsp_server::ls_types::TextDocumentSyncSaveOptions::Supported(
+                                    true,
+                                ),
+                            ),
+                            ..Default::default()
+                        },
+                    ));
+                }),
+            ),
         ];
 
         for (method, set_cap) in &cases {
@@ -2129,6 +2176,7 @@ mod tests {
             "textDocument/onTypeFormatting",
             "textDocument/willSave",
             "textDocument/willSaveWaitUntil",
+            "textDocument/didSave",
         ];
         for method in methods {
             assert!(
@@ -2137,6 +2185,29 @@ mod tests {
                 method
             );
         }
+    }
+
+    /// `textDocumentSync.save = Supported(false)` is an explicit opt-out, so
+    /// didSave must not be forwarded to that server (#357).
+    #[tokio::test]
+    async fn has_capability_did_save_false_for_save_supported_false() {
+        use tower_lsp_server::ls_types::{
+            TextDocumentSyncCapability, TextDocumentSyncOptions, TextDocumentSyncSaveOptions,
+        };
+
+        let handle = spawn_sink_handle().await;
+        let caps = ServerCapabilities {
+            text_document_sync: Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    save: Some(TextDocumentSyncSaveOptions::Supported(false)),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        handle.set_server_capabilities(caps);
+
+        assert!(!handle.has_capability("textDocument/didSave"));
     }
 
     /// The bare `Kind` form of `textDocumentSync` (a sync-kind number) carries
