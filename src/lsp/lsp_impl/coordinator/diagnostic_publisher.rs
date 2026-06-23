@@ -114,6 +114,37 @@ impl DiagnosticPublisher {
             .detect_language(uri.path(), doc.text(), None, doc.language_id())
     }
 
+    /// Remove `Host` push slots from `snapshot` whose server is no longer a
+    /// configured `_self` host server for `host`'s current language, so stale host
+    /// diagnostics are filtered out of the publish after a config change. Operates
+    /// on the snapshot clone only; the cache is untouched.
+    fn filter_stale_host_slots(
+        &self,
+        host: &Url,
+        snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
+    ) {
+        let Some(host_slots) = snapshot.get_mut(&DiagnosticSource::Host) else {
+            return; // no host push slots — nothing to filter
+        };
+        // If the doc is gone or its language no longer opts into `_self`, no server
+        // is valid — drop the whole Host source.
+        let still_valid: Vec<String> = match self.open_document_language(host) {
+            Some(language_name) => {
+                let settings = self.settings_manager.load_settings();
+                self.bridge
+                    .get_host_configs_for_language(&settings, &language_name)
+                    .into_iter()
+                    .map(|config| config.server_name)
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        host_slots.retain(|server, _| still_valid.iter().any(|s| s == server));
+        if host_slots.is_empty() {
+            snapshot.remove(&DiagnosticSource::Host);
+        }
+    }
+
     /// Record a downstream region push and republish the host (Path A).
     ///
     /// `virtual_uri` is the URI the downstream published for; it is resolved to
@@ -183,7 +214,14 @@ impl DiagnosticPublisher {
         // stall window is the client's outbound-channel send, not a round-trip.
         let _guard = self.aggregator.lock_republish().await;
 
-        let snapshot = self.aggregator.snapshot(host);
+        let mut snapshot = self.aggregator.snapshot(host);
+        // Drop Host push slots whose server is no longer a configured `_self` host
+        // server for the document's current language — so a host server's pushed
+        // diagnostics don't linger in the editor after the user disables `_self`
+        // (or unconfigures the server) via `workspace/didChangeConfiguration`. The
+        // slots stay cached (cleared on `didClose`); they're just filtered out of
+        // this publish. (The analogous Region/config-change re-merge is deferred.)
+        self.filter_stale_host_slots(host, &mut snapshot);
         // Recompute injection offsets only when there are region push slots to
         // transform. A PullLayer-only snapshot (the common pull-driven case) needs
         // none, so skip the whole-document injection resolution — and shorten the
@@ -431,6 +469,50 @@ mod tests {
         assert!(
             server.diagnostics.snapshot(&uri).is_empty(),
             "a push from a server that is not a host server for the language must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_slots_filtered_from_publish_after_self_disabled() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        publisher
+            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("e")])
+            .await;
+        assert!(
+            server
+                .diagnostics
+                .snapshot(&uri)
+                .contains_key(&DiagnosticSource::Host),
+            "host slot is recorded while _self is enabled"
+        );
+
+        // Disable _self for rust; the publish-time filter should now exclude the
+        // stale host slot, while the cache itself keeps it (cleared on didClose).
+        server.settings_manager.apply_settings(rust_settings(false));
+        let mut snapshot = server.diagnostics.snapshot(&uri);
+        publisher.filter_stale_host_slots(&uri, &mut snapshot);
+        assert!(
+            !snapshot.contains_key(&DiagnosticSource::Host),
+            "stale host slots are filtered out of the publish after _self is disabled"
+        );
+        assert!(
+            server
+                .diagnostics
+                .snapshot(&uri)
+                .contains_key(&DiagnosticSource::Host),
+            "the cache still holds the slot; only the publish snapshot is filtered"
         );
     }
 }
