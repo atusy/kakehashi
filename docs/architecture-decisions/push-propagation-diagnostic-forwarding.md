@@ -243,10 +243,13 @@ policy clean:
   if the re-anchored host coordinates actually changed. Lazy re-anchor supplies the
   correct positions; this supplies the missing trigger.
 - **Host layer**: the `_self` host source uses the identical model keyed on the
-  *host document's* content epoch — push-driven `_self` servers are eagerly opened
-  (see Lifecycle) and eagerly re-synced on a content-changing host `didChange`
-  (the host path's fingerprint already gates this), so the gate and re-merge rules
-  above apply unchanged.
+  *host document's* content epoch. Push-driven `_self` servers are eagerly opened
+  on host `didOpen` (#429, implemented; see Lifecycle). Eager **re-sync** on a
+  content-changing host `didChange` — so a push-only host server re-analyzes
+  as-you-type without a host request — is deferred (#431); until then it sees
+  edits only via the lazy request-path sync (save / hover). When that lands (the
+  host path's fingerprint already gates the didChange), the gate and re-merge
+  rules above apply unchanged.
 
 ### `preferred` as a push stream
 
