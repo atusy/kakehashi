@@ -49,6 +49,11 @@ pub(crate) enum DiagnosticSource {
     /// coordinates and transformed to host coordinates at publish time against
     /// the region's *current* offset (lazy re-anchor).
     Region(String),
+    /// A downstream **push** from a `_self` host-layer server for the real host
+    /// document (host-document-bridge). Held in **host** coordinates (the host
+    /// path applies no translation), so it passes through the merge unchanged.
+    /// Keyed per server, so several host servers on one host document coexist.
+    Host,
     /// The host-event pull's cross-layer-combined result, in host coordinates.
     /// A single blob (one synthetic server slot) for now — a follow-up replaces
     /// it with per-`(region, server)` slots gated by `pullFallback`.
@@ -85,7 +90,8 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 ///   resolves, e.g. it was edited away) is skipped here; its now-stale slot
 ///   lingers in the cache until the whole host is dropped on `didClose`
 ///   (per-region / crash eviction is a deferred follow-up).
-/// - [`DiagnosticSource::PullLayer`] slots are already host-local and pass through.
+/// - [`DiagnosticSource::Host`] and [`DiagnosticSource::PullLayer`] slots are
+///   already host-local and pass through unchanged.
 ///
 /// Staged: results are concatenated (the default `textDocument/publishDiagnostics`
 /// strategy). Per-source strategy fan-in (`preferred` sticky / `concatenated`
@@ -113,7 +119,8 @@ pub(crate) fn merge_cached_diagnostics(
                     }
                 }
             }
-            DiagnosticSource::PullLayer => {
+            DiagnosticSource::Host | DiagnosticSource::PullLayer => {
+                // Already host-local: pass through unchanged.
                 for slot in servers.into_values() {
                     merged.extend(slot.diagnostics);
                 }
@@ -414,6 +421,39 @@ mod tests {
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["pull", "push"]);
+    }
+
+    #[test]
+    fn merge_passes_host_push_slots_through_unchanged() {
+        let agg = DiagnosticAggregator::new();
+        // Two host servers push for the same host doc; both pass through in host
+        // coords (no transform), keyed per server.
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "lua_ls".into(),
+            vec![diag_at("hostA", 7, 3)],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "selene".into(),
+            vec![diag_at("hostB", 8, 0)],
+        );
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let mut by_msg: Vec<(&str, Position)> = merged
+            .iter()
+            .map(|d| (d.message.as_str(), d.range.start))
+            .collect();
+        by_msg.sort();
+        assert_eq!(
+            by_msg,
+            vec![
+                ("hostA", Position::new(7, 3)),
+                ("hostB", Position::new(8, 0))
+            ],
+            "host push slots pass through in host coordinates, per server"
+        );
     }
 
     #[test]

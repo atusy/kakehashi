@@ -15,11 +15,12 @@ use url::Url;
 
 use crate::document::DocumentStore;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{BridgeCoordinator, RegionOffset};
+use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, VirtualDocumentUri};
 use crate::lsp::diagnostic_cache::{
     DiagnosticAggregator, DiagnosticSource, merge_cached_diagnostics,
 };
 use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Diagnostic;
 
@@ -34,6 +35,7 @@ pub(crate) struct DiagnosticPublisher {
     language: Arc<LanguageCoordinator>,
     documents: Arc<DocumentStore>,
     bridge: Arc<BridgeCoordinator>,
+    settings_manager: Arc<SettingsManager>,
     aggregator: Arc<DiagnosticAggregator>,
 }
 
@@ -44,8 +46,67 @@ impl DiagnosticPublisher {
             language: Arc::clone(&server.language),
             documents: Arc::clone(&server.documents),
             bridge: Arc::clone(&server.bridge),
+            settings_manager: Arc::clone(&server.settings_manager),
             aggregator: Arc::clone(&server.diagnostics),
         }
+    }
+
+    /// Route a downstream `publishDiagnostics` push into the cache, classifying by
+    /// its URI: a virtual injection URI becomes a region push; anything else is
+    /// treated as a candidate `_self` host-layer push for the real host document.
+    pub(crate) async fn publish_push(
+        &self,
+        uri: String,
+        server: String,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        if VirtualDocumentUri::is_virtual_uri(&uri) {
+            self.publish_region_push(&uri, server, diagnostics).await;
+        } else {
+            self.publish_host_push(&uri, server, diagnostics).await;
+        }
+    }
+
+    /// Record a `_self` host-layer push and republish the host (host-document-bridge).
+    ///
+    /// A host server pushes for the **real** host URI in host coordinates. Accept
+    /// it only when that URI is an **open** document whose language has `_self`
+    /// host bridging enabled — otherwise it is a stray push for the server's own
+    /// workspace file (not a host-bridged doc the editor has open) and is dropped.
+    /// Host diagnostics need no coordinate transform.
+    pub(crate) async fn publish_host_push(
+        &self,
+        host_uri: &str,
+        server: String,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        let Ok(host) = Url::parse(host_uri) else {
+            return;
+        };
+        let Some(language_name) = self.open_document_language(&host) else {
+            return; // not an open document
+        };
+        let settings = self.settings_manager.load_settings();
+        if self
+            .bridge
+            .get_host_configs_for_language(&settings, &language_name)
+            .is_empty()
+        {
+            // `_self` host bridging is off for this language, or no host server is
+            // configured — this real-URI push is not a host-layer contribution.
+            return;
+        }
+        self.aggregator
+            .record(&host, DiagnosticSource::Host, server, diagnostics);
+        self.republish(&host).await;
+    }
+
+    /// Detect the language of an *open* document, or `None` if it isn't open.
+    fn open_document_language(&self, uri: &Url) -> Option<String> {
+        let doc = self.documents.get(uri)?;
+        let snapshot = doc.snapshot()?;
+        self.language
+            .detect_language(uri.path(), snapshot.text(), None, doc.language_id())
     }
 
     /// Record a downstream region push and republish the host (Path A).

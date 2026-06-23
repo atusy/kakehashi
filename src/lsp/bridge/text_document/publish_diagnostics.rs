@@ -29,14 +29,12 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
             .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
 }
 
-/// Route a non-scratch downstream `textDocument/publishDiagnostics` for an
-/// injection region's virtual document into the proactive diagnostics cache
-/// (push-propagation-diagnostic-forwarding). The forwarding loop resolves the
-/// virtual URI to its host + region and republishes the merged host set.
-///
-/// A push for a non-virtual URI (the downstream's own files, or the real host
-/// URI) has no region mapping and is dropped — the host layer is still served by
-/// the pull feed for now.
+/// Route a non-scratch downstream `textDocument/publishDiagnostics` into the
+/// proactive diagnostics cache (push-propagation-diagnostic-forwarding). The
+/// forwarding loop classifies the URI: a virtual injection URI becomes a region
+/// push; a real URI is a candidate `_self` host-layer push, accepted only if it
+/// names an open host-bridged document (the publisher filters the server's own
+/// workspace pushes). Either way the merged host set is republished.
 pub(in crate::lsp::bridge) fn forward_push(
     mut message: serde_json::Value,
     deps: &crate::lsp::bridge::actor::ServerRequestDeps,
@@ -65,9 +63,6 @@ pub(in crate::lsp::bridge) fn forward_push(
     let Some(serde_json::Value::String(uri)) = params.remove("uri") else {
         return;
     };
-    if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(&uri) {
-        return;
-    }
     // Deserialize the moved-out diagnostics value (no clone) — `from_value` moves
     // the diagnostics' owned strings. A parse failure (including an absent or
     // non-array `diagnostics`) is *dropped* (not treated as an empty/clearing push,

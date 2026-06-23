@@ -802,15 +802,13 @@ async fn deliver_upstream_notification(
             server,
             diagnostics,
         } => {
-            // Cache the downstream region push and republish the merged host set
-            // (push-propagation-diagnostic-forwarding). The publisher resolves the
-            // virtual URI to its host + region; a `None` publisher (test loop)
-            // drops it. (Pushes without a server name were already dropped at the
-            // reader, so `server` is always set here.)
+            // Cache the downstream push and republish the merged host set
+            // (push-propagation-diagnostic-forwarding). The publisher classifies the
+            // URI (virtual → region, real → `_self` host layer); a `None` publisher
+            // (test loop) drops it. (Pushes without a server name were already
+            // dropped at the reader, so `server` is always set here.)
             if let Some(publisher) = diagnostic_publisher {
-                publisher
-                    .publish_region_push(&uri, server, diagnostics)
-                    .await;
+                publisher.publish_push(uri, server, diagnostics).await;
             }
         }
         UpstreamNotification::LogMessage { typ, message } => {
