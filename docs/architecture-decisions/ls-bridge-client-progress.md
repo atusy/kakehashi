@@ -39,29 +39,30 @@ downstream→upstream `$/progress` and partial-result notifications, and aggrega
 them so the editor sees **one coherent lifecycle** that stays consistent with the
 result actually delivered.
 
-**Core principle.** The progress narrative is **anchored on the priority anchor**
-— the highest-priority *named* candidate currently tracked (a `Rest`/wildcard
-member is never an anchor) — and the data the editor
-receives stays consistent with the result actually delivered: the `End` coincides
-with the result being complete, and no `report` carries data the editor will not
-receive. The anchor follows the **priority walk** (honoring explicit
-`priorities`, with the wildcard `Rest` resolved first-win by earliest non-empty
-arrival), not a pure latency race that could put the title and progress on one
-server while the delivered result comes from another. A candidate that returns
-empty — or fails before producing any data — is no **winner** (reserved for the
-source whose result, possibly a promoted partial prefix, is delivered), so the
-anchor falls through to the next candidate. Within the unordered `Rest` (wildcard)
-group no member is the a priori anchor — which one wins is a latency race, not
-knowable in advance — so the bridge never forwards a `Rest` member's own `Begin`
-as the title; that group's progress is handled as a silent anchor (a synthetic
-neutral `Begin` under *concatenated*, nothing under *preferred*).
+**Core principle.** Whatever the editor sees stays consistent with the result
+actually delivered: the `End` coincides with the result being complete, and no
+`report` carries data the editor will not receive. How the title-bearing `Begin`
+is produced then depends on the strategy, because the two deliver differently:
 
-**Only the anchor's own progress is ever tracked**; other contributors influence
-the lifecycle solely by *completing* (their result arriving), never through their
-own `$/progress`. So the `Begin` title comes from the current anchor — normally
-the delivered winner, or (under *concatenated*) a bridge-owned synthetic when the
-anchor is silent — never an arbitrary non-anchor. (One documented edge: after a
-fall-through, an earlier anchor's title can linger; see Consequences.)
+- *preferred* delivers a single **winner**, so progress is **anchored** on that
+  source: the title is the winner's own `Begin`, and only the anchor's own
+  progress is tracked. The winner is found by the **priority walk** — explicit
+  `priorities` in order, the wildcard `Rest` resolved first-win by earliest
+  non-empty arrival. A candidate that returns empty, or fails before producing
+  any data, is no winner (reserved for the delivered source, possibly a promoted
+  partial prefix), so the **anchor** (the highest-priority *named* candidate)
+  falls through to the next. The bridge never forwards a non-anchor's `Begin` as
+  the title — including a `Rest` member's, since which `Rest` member wins is a
+  latency race, not knowable in advance. (One documented edge: after a
+  fall-through, an earlier anchor's title can linger; see Consequences.)
+- *concatenated* merges **all** contributors, so no single source owns the title:
+  the bridge **always composes a synthetic neutral `Begin`** (e.g. a
+  request-derived title) and reports collection progress,
+  **ignoring every downstream's own `$/progress`**. This trades per-server
+  granularity for a title
+  that stays accurate across the whole aggregate — borrowing one contributor's
+  title would go stale the moment that contributor finishes while others are
+  still pending (see Consequences).
 
 The lifecycle engages only when there is progress worth showing; otherwise the
 request just returns its result (today's behavior, minus the strip).
@@ -72,39 +73,31 @@ request just returns its result (today's behavior, minus the strip).
   the sole server was selected via the wildcard: the `Rest`-never-anchor rule
   disambiguates among *racing* contenders, and a single downstream has none — so
   its real `Begin` is safe to forward.
-- **preferred, N > 1.** The delivered result is a single winner, and preferred
-  short-circuits (it does not wait for the losers), so there is no collection
-  count to report. If the anchor emits its own progress, forward its
-  `Begin`/`report`/`End` (real title) and suppress every other candidate's
-  progress; if the anchor returns a complete result with no progress phase, show
-  nothing.
-- **concatenated, N > 1.** The delivered result merges *all* contributors, so the
-  bridge waits for every one and reports collection progress:
-  - if the anchor emits its own `Begin`, forward it (real title) and track the
-    anchor's `report`s — but **suppress the anchor's own `End`**, since the
-    aggregate is not done until every contributor is collected; *interleave* the
-    other contributors' **result arrivals** as `report`s (`n/m` collected);
-  - if the anchor emits no `Begin`, the bridge synthesizes one (neutral title,
-    e.g. request-derived) once the anchor is **known to be silent** — it returned
-    its result with no `Begin`. Contributors that completed earlier are counted
-    into the first `n/m` report, and the rest advance it as they arrive. (Waiting
-    for the anchor to resolve, rather than firing on the first arbitrary result,
-    keeps a real anchor `Begin` from being pre-empted by a non-anchor.)
-  - either way the `End` fires once **every** contributor's result is collected,
-    and non-anchor contributors' own `$/progress` is ignored.
-
-  Accumulated `report`s may be coalesced into one notification
-  (`Begin → report → report (2, 3) → End`) to bound notification volume.
+- **preferred, N > 1.** Preferred short-circuits (it does not wait for the
+  losers), so there is no collection count to report. If the anchor emits its own
+  progress, forward its `Begin`/`report`/`End` (real title) and suppress every
+  other candidate's progress; if the anchor returns a complete result with no
+  progress phase, show nothing.
+- **concatenated, N > 1.** The bridge waits for every contributor and
+  **drives the whole lifecycle itself**: synthesize a neutral `Begin` once
+  collection is known
+  to be staggered (a result is in while others are still pending), report `n/m` as
+  each result arrives, and fire one `End` when **every** contributor is collected.
+  Downstreams' own `Begin`/`report`/`End` are **ignored entirely** — there is no
+  anchor `Begin` to forward, suppress, or wait for. If all results are already in
+  at first observation, no progress is shown. Accumulated `report`s may be
+  coalesced into one notification (`Begin → report → report (2, 3) → End`) to
+  bound notification volume.
 - **Begin/End pairing invariant.** An open work-done `Begin` is closed by exactly
   one `End`, fired when the *request* terminates — normal completion, anchor
   failure, fall-through exhaustion, or client cancellation (the fan-in returns
-  `Cancelled`). When the lifecycle tracks a single source to completion (N = 1, or
-  *preferred*), that `End` is the source's real one; under *concatenated* the
-  bridge emits a single aggregate-timed `End` and suppresses the anchor's own
-  (which fires before collection finishes). If the source cannot send one — it
-  died, or the request was cancelled (the fan-in aborts the downstreams) — the
-  bridge synthesizes it. A request that opened no `Begin` emits no `End`. (The
-  per-branch rules below are instances of this invariant.)
+  `Cancelled`). Under *preferred* (and N = 1) the lifecycle tracks a single
+  source, so that `End` is the source's real one — or a bridge-synthesized one if
+  the source died or was cancelled before sending it. Under *concatenated* the
+  bridge composes the whole lifecycle, so the terminal is always its own
+  aggregate-timed `End` (fired when all results are collected, or synthesized on
+  cancellation). A request that opened no `Begin` emits no `End`. (The per-branch
+  rules above are instances of this invariant.)
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
   - *preferred, anchor already streamed partials*: data is on screen, so promote
@@ -132,12 +125,10 @@ request just returns its result (today's behavior, minus the strip).
     otherwise emit none.
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing) and is **dropped from the expected set** (the `n/m`
-    denominator shrinks); the others proceed, and `End` fires once the remaining
-    expected results are collected. If the *anchor* (highest-priority named
-    contributor) is the one that fails before opening a `Begin`, the anchor role
-    moves to the next named-priority survivor — its `Begin` if it has one; if only
-    `Rest`-group members remain, the group stays silent and the synthetic
-    neutral `Begin` applies.
+    denominator shrinks); the others proceed, and the aggregate `End` fires once
+    the remaining expected results are collected. Because the bridge owns the
+    synthetic title and terminal here, a failed contributor never affects the
+    `Begin` — there is no anchor handoff.
 - **partialResultToken — translate, then merge.** Partial-result chunks carry
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
@@ -169,8 +160,16 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 - **Track every contributor's progress and merge it.** Most information, but
   collapsing N independent `Begin`/`report`/`End` streams (distinct titles,
   percentages) into one coherent indicator is messy and rarely meaningful.
-  Rejected in favor of tracking only the anchor's progress and folding the rest
-  in as result-arrival counts.
+  Rejected in favor of one source's progress under *preferred* and a
+  bridge-composed aggregate under *concatenated*.
+- **Borrow the anchor's `Begin` under concatenated.** Reuses a real, specific
+  title for free, but the concatenated lifecycle outlives the anchor's own work
+  (it runs until every contributor is collected), so that title goes stale the
+  moment the anchor finishes while others are still pending — and LSP forbids
+  retitling after `Begin`. Rejected in favor of a synthetic neutral title that
+  stays accurate for the whole aggregate; the cost is losing the anchor's
+  per-server granularity, accepted because collection `n/m` is the meaningful
+  metric for a merge and *preferred* still relays granular single-source progress.
 - **Wait for the next-priority candidate after partial data was shown.**
   Avoids delivering incomplete data, but freezes the already-shown
   results until the slower candidate finishes and risks a late swap. Rejected in
@@ -183,10 +182,10 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 
 - Client-requested progress (`workDoneToken`) reaches the editor for the first
   time.
-- The progress signals (`report`/`End`) stay consistent with the delivered
-  result's source — no jarring swap and no freeze of shown data (under *preferred*
-  both track the one winner; under *concatenated* both span the same contributor
-  set).
+- The progress signals stay consistent with the delivered result — no jarring
+  swap and no freeze of shown data. Under *preferred* the title and `report`/`End`
+  track the one winner; under *concatenated* the bridge composes a neutral title
+  and `n/m` that describe the aggregate, so the title never goes stale mid-flight.
 - partialResult streaming becomes possible without mis-translated locations.
 - Progress engages only when meaningful: a fast or single-server request with no
   downstream progress shows nothing, so there is no spurious spinner. The `Begin`
@@ -210,7 +209,13 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 - If the anchor emits a `Begin` and then loses (returns empty) or dies, its
   `title` lingers on the already-open progress until `End`, since LSP forbids
   retitling. Rare (the anchor both reported progress and failed) and cosmetic;
-  accepted.
+  accepted. (This is a *preferred*-only edge — *concatenated* never adopts a
+  downstream title.)
+- Under *concatenated* a downstream's own granular progress (e.g. "indexing
+  45%") is discarded in favor of the aggregate `n/m`; a long, dominant
+  contributor surrounded by fast ones shows a coarser, possibly stalled count
+  instead of its real percentage. Accepted: `n/m` is the honest metric for a
+  merge, and a stale borrowed title would be worse.
 
 ### Neutral
 
@@ -239,8 +244,12 @@ are stripped before fan-out. Specific points to settle during implementation:
   through to the next candidate, which is acceptable.
 - Percentage composition under *concatenated* (`n/m`) is a display heuristic, not
   a contract.
-- The synthetic `Begin` title used when a *concatenated* anchor is silent is a
+- The synthetic `Begin` title the bridge always composes under *concatenated* is a
   presentation choice (e.g. derived from the request method); not specified here.
+- The exact "collection is staggered" trigger for the *concatenated* synthetic
+  `Begin` (e.g. first result while ≥1 contributor is still pending, or a small
+  delay threshold) is an implementation tuning choice; the requirement is only
+  that an all-instant fan-out show nothing.
 - Ordering `partialResultToken` chunks to match the *concatenated* priority order
   means holding a lower-priority contributor's chunks until the higher-priority
   ones are in — trading streaming latency for ordering fidelity. An
