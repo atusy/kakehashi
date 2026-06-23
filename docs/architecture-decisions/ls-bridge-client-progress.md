@@ -46,8 +46,9 @@ stays consistent with the result actually delivered: the `End` coincides with th
 result being complete, and no `report` carries data the editor will not receive.
 **Only the winner's own progress is ever tracked**; other contributors influence
 the lifecycle solely by *completing* (their result arriving), never through their
-own `$/progress`. So the `Begin` title comes from the winner — or, when the winner
-emits none, from a bridge-owned synthetic — never from an arbitrary non-winner.
+own `$/progress`. So the `Begin` title comes from the winner, or (under
+*concatenated*) from a bridge-owned synthetic when the winner emits none — never
+from an arbitrary non-winner.
 The winner is chosen by **priority, not latency**: a latency anchor could put the
 title and progress on one server while the delivered result comes from another.
 

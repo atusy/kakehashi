@@ -75,8 +75,9 @@ ls-bridge-client-progress relies on for client-provided tokens.
 
 - Every forwarded `Begin` reaches a matching `End`; no dangling progress
   indicators when a downstream disconnects mid-work.
-- Cleanup is driven by the live-token list the purge already produces, so it adds
-  no new tracking state.
+- Cleanup hangs off the existing connection-teardown hook; the only added state
+  is a per-token begun-not-ended flag the forwarding loop maintains as it already
+  relays each `Begin`/`End`.
 
 ### Negative
 
