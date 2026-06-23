@@ -19,9 +19,88 @@
 //! single-downstream (`N = 1`) relay is implemented; multi-server fan-out
 //! (`preferred`/`concatenated`) is dropped until those stages land.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tower_lsp_server::ls_types::{
     NumberOrString, ProgressParams, ProgressParamsValue, WorkDoneProgress,
 };
+
+use crate::error::LockResultExt;
+
+/// Routing table from a bridge-minted per-server progress token to the
+/// aggregator that owns it. The reader looks up an incoming `$/progress` token
+/// here to feed the right aggregator; `dispatch_*` registers the tokens when it
+/// fans out and deregisters them when the request completes.
+///
+/// Shared (`Arc`) between every reader task and the dispatch path.
+#[derive(Default)]
+pub(crate) struct ClientProgressRegistry {
+    inner: Mutex<HashMap<NumberOrString, ClientProgressRoute>>,
+    /// Monotonic source of unique per-server bridge tokens.
+    counter: AtomicU64,
+}
+
+struct ClientProgressRoute {
+    aggregator: std::sync::Arc<Mutex<ClientProgressAggregator>>,
+    server: String,
+}
+
+impl ClientProgressRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a unique bridge token for `(aggregator, server)`, register the route,
+    /// and return the token to hand to that downstream as its `workDoneToken`.
+    pub(crate) fn register(
+        &self,
+        aggregator: std::sync::Arc<Mutex<ClientProgressAggregator>>,
+        server: &str,
+    ) -> NumberOrString {
+        let suffix = self.counter.fetch_add(1, Ordering::Relaxed);
+        let token = NumberOrString::String(format!("kakehashi/bridge/cprog/{suffix}"));
+        self.inner
+            .lock()
+            .recover_poison("ClientProgressRegistry::register")
+            .insert(
+                token.clone(),
+                ClientProgressRoute {
+                    aggregator,
+                    server: server.to_string(),
+                },
+            );
+        token
+    }
+
+    /// Resolve an incoming `$/progress` token to its aggregator and originating
+    /// server name. `None` for tokens this registry never minted (e.g. a
+    /// server-declared token, handled elsewhere).
+    pub(crate) fn route(
+        &self,
+        token: &NumberOrString,
+    ) -> Option<(std::sync::Arc<Mutex<ClientProgressAggregator>>, String)> {
+        let guard = self
+            .inner
+            .lock()
+            .recover_poison("ClientProgressRegistry::route");
+        guard
+            .get(token)
+            .map(|r| (r.aggregator.clone(), r.server.clone()))
+    }
+
+    /// Drop the routes for a finished request's bridge tokens.
+    pub(crate) fn deregister(&self, tokens: &[NumberOrString]) {
+        let mut guard = self
+            .inner
+            .lock()
+            .recover_poison("ClientProgressRegistry::deregister");
+        for token in tokens {
+            guard.remove(token);
+        }
+    }
+}
 
 /// Aggregation shape for the fanned-out request, mirroring the server-level
 /// fan-in strategy (language-server-bridge-request-strategies).
@@ -166,6 +245,34 @@ mod tests {
         assert!(agg.needs_terminal_end(), "begun, not ended");
         agg.on_downstream_progress("s", end());
         assert!(!agg.needs_terminal_end(), "ended normally");
+    }
+
+    fn agg() -> std::sync::Arc<Mutex<ClientProgressAggregator>> {
+        std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(
+            client_token(),
+            ClientProgressStrategy::Preferred { anchor: None },
+            1,
+        )))
+    }
+
+    #[test]
+    fn registry_routes_minted_tokens_and_forgets_deregistered_ones() {
+        let reg = ClientProgressRegistry::new();
+        let a = agg();
+        let t1 = reg.register(a.clone(), "rust-analyzer");
+        let t2 = reg.register(a.clone(), "pyright");
+        assert_ne!(t1, t2, "each (request, server) gets a unique bridge token");
+
+        let (_routed, server) = reg.route(&t1).expect("registered token routes");
+        assert_eq!(server, "rust-analyzer");
+        assert!(
+            reg.route(&NumberOrString::Number(99)).is_none(),
+            "unknown token does not route"
+        );
+
+        reg.deregister(&[t1.clone(), t2.clone()]);
+        assert!(reg.route(&t1).is_none(), "deregistered token is forgotten");
+        assert!(reg.route(&t2).is_none());
     }
 
     #[test]
