@@ -80,6 +80,12 @@ request just returns its result (today's behavior, minus the strip).
 
   Accumulated `report`s may be coalesced into one notification
   (`Begin → report → report (2, 3) → End`) to bound notification volume.
+- **Begin/End pairing invariant.** An open work-done `Begin` is closed exactly
+  once, whenever the request terminates — normal completion, winner failure,
+  fall-through exhaustion, or client cancellation (the fan-in returns
+  `Cancelled`) — with the real `End` if the source sent one, otherwise a
+  bridge-synthesized `End`. A request that opened no `Begin` emits no `End`. (The
+  per-branch rules below are instances of this invariant.)
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
   - *preferred, winner already streamed partials*: data is on screen, so promote
@@ -116,8 +122,11 @@ request just returns its result (today's behavior, minus the strip).
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
   path (which assumes a single final blob today and must accept incremental
-  input). Under *preferred* the bridge streams the winner's translated chunks;
-  under *concatenated* it concatenates all contributors' translated chunks.
+  input). Under *preferred* the bridge streams the winner's translated chunks.
+  Under *concatenated* the final result is priority-ordered, so chunks must be
+  released in that same order (buffer per contributor, flush in priority order) —
+  otherwise the streamed prefix would diverge from the delivered ordering. This
+  costs some streaming latency; see the gap.
 
 The terminal `End` the bridge emits on failure is the same primitive
 ls-bridge-progress-disconnect-cleanup uses for server-declared tokens — the
@@ -211,3 +220,8 @@ are stripped before fan-out. Specific points to settle during implementation:
   a contract.
 - The synthetic `Begin` title used when a *concatenated* winner is silent is a
   presentation choice (e.g. derived from the request method); not specified here.
+- Ordering `partialResultToken` chunks to match the *concatenated* priority order
+  means holding a lower-priority contributor's chunks until the higher-priority
+  ones are in — trading streaming latency for ordering fidelity. An
+  implementation may relax this if a method's partial results are
+  order-insensitive.
