@@ -96,6 +96,17 @@ impl Kakehashi {
             .process_injections(&uri, false)
             .await;
 
+        // Host-layer eager-open (#429): open the real host document on any `_self`
+        // host-bridge server so a push-only host server (e.g. lua-language-server)
+        // starts analyzing and pushing diagnostics on open, instead of only after
+        // the first host-bridged request lazily opens it. No-op when host bridging
+        // is off for the language; spawns fire-and-forget tasks (non-blocking).
+        if let Some(ref lang) = language_name {
+            let settings = self.settings_manager.load_settings();
+            self.bridge
+                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
+        }
+
         // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
         // This provides proactive diagnostics for clients that don't support pull diagnostics.
         self.diagnostic_scheduler()
@@ -116,7 +127,9 @@ mod tests {
 
     use super::*;
     use crate::config::WorkspaceSettings;
-    use crate::config::settings::BridgeServerConfig;
+    use crate::config::settings::{
+        BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY, LanguageSettings,
+    };
     use crate::lsp::bridge::VirtualDocumentUri;
     use tokio::time::{Duration, timeout};
     use tower_lsp_server::LspService;
@@ -239,5 +252,84 @@ print("hello")
             server.bridge.pool().is_document_opened(&virtual_uri),
             "did_open should eagerly open the parsed injection as a virtual document"
         );
+    }
+
+    /// Host-layer eager-open (#429): the host document is opened (didOpen sent) on
+    /// a `_self` host server directly by the eager-open path. Exercised in
+    /// isolation via `eager_open_host_document_on_servers` (not `did_open_impl`)
+    /// so the host-event synthetic diagnostic pull — which would also open the doc
+    /// — can't mask whether eager-open itself works.
+    #[tokio::test]
+    async fn eager_open_sends_didopen_to_self_host_server() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+
+        let mut language_servers = HashMap::new();
+        language_servers.insert(
+            "rust_ls".to_string(),
+            BridgeServerConfig {
+                // Inert: `insert_ready_test_connection` below pre-inserts a Ready
+                // handle, so this cmd is never actually spawned.
+                cmd: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "cat > /dev/null".to_string(),
+                ],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                root_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        aggregation: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            languages,
+            ..Default::default()
+        });
+
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_eager.rs").unwrap();
+        let settings = server.settings_manager.load_settings();
+        server
+            .bridge
+            .eager_open_host_document_on_servers(&settings, "rust", &uri, "fn main() {}");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .is_host_document_opened(&uri, "rust_ls")
+                    .await
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("eager-open should send didOpen for the host document to the _self host server");
     }
 }

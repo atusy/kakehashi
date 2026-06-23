@@ -100,6 +100,77 @@ impl LanguageServerPool {
             }
         }
     }
+
+    /// Fire `didOpen` for the real host document on a `_self` host-bridge server
+    /// (host-document-bridge), so a push-only host server (no `textDocument/diagnostic`
+    /// support) starts analyzing and pushing diagnostics immediately, instead of
+    /// only after the first host-bridged request lazily opens it. Fire-and-forget:
+    /// failures are logged at debug and never propagated.
+    pub(crate) async fn eager_open_host_document(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        host_uri: &url::Url,
+        language_id: &str,
+        text: &str,
+    ) {
+        let handle = match self
+            .get_or_create_connection_wait_ready(
+                server_name,
+                server_config,
+                Some(host_uri),
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Eager host open: server {} not ready for {}: {}",
+                    server_name,
+                    host_uri,
+                    e
+                );
+                return;
+            }
+        };
+
+        // Borrow the key (no clone) — both `connections.get` and `sync_host_document`
+        // take it by reference, like `execute_host_request`.
+        let connection_key = handle.key();
+        // Sync (sends didOpen) under the `connections` + `host_documents` locks in
+        // that order, with the live-handle `Arc::ptr_eq` check — identical to
+        // `execute_host_request`, so a concurrent respawn purge cannot interleave
+        // and leave sync state the replacement never saw.
+        let connections = self.connections().await;
+        if !connections
+            .get(connection_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        {
+            // Replaced by a respawn between wait-ready and here; the new connection
+            // will sync lazily on its first request.
+            return;
+        }
+        let mut docs = self.host_documents().await;
+        let mut sender = ConnectionHandleSender(&handle);
+        let doc = super::host::HostDocument {
+            uri: host_uri,
+            language_id,
+            text,
+        };
+        if let Err(e) =
+            super::host::sync_host_document(&mut sender, &mut docs, &doc, connection_key).await
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager host open: didOpen failed for {} on {}: {}",
+                host_uri,
+                server_name,
+                e
+            );
+        }
+    }
 }
 
 #[cfg(test)]

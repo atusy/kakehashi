@@ -69,7 +69,7 @@ fn fingerprint(text: &str) -> u64 {
 /// (ls-bridge-message-ordering) guarantees wire order matches enqueue order.
 /// Generic over [`MessageSender`] so tests can observe the notifications via
 /// a channel.
-async fn sync_host_document<S: MessageSender>(
+pub(super) async fn sync_host_document<S: MessageSender>(
     sender: &mut S,
     docs: &mut std::collections::HashMap<(String, ConnectionKey), HostDocSyncState>,
     doc: &HostDocument<'_>,
