@@ -56,10 +56,13 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
-    /// A downstream-initiated `textDocument/publishDiagnostics` for an injection
-    /// region's virtual document (push-propagation-diagnostic-forwarding). The
-    /// forwarding loop resolves `uri` to its host document + region, caches the
-    /// diagnostics under `server`, and republishes the merged host set.
+    /// A downstream-initiated `textDocument/publishDiagnostics`
+    /// (push-propagation-diagnostic-forwarding). The forwarding loop classifies
+    /// `uri`: a virtual injection URI resolves to its host document + region (a
+    /// region push, virtual coordinates); a real URI is a candidate `_self`
+    /// host-layer push (host coordinates) accepted only for an open host-bridged
+    /// document. Either way the diagnostics are cached under `server` and the
+    /// merged host set is republished.
     ///
     /// This carries an arbitrary-size `Vec<Diagnostic>` over the **unbounded**
     /// upstream channel, so a push-happy or misbehaving downstream paired with a
@@ -67,12 +70,14 @@ pub(crate) enum UpstreamNotification {
     /// (push-propagation-diagnostic-forwarding § Consequences); a bounded /
     /// coalescing diagnostics channel is the deferred mitigation if it proves noisy.
     PublishDiagnostics {
-        /// The virtual document URI the downstream published for.
+        /// The URI the downstream published for — a virtual injection URI (region
+        /// push) or a real host URI (`_self` host-layer push).
         uri: String,
         /// The originating downstream server's config name (`deps.server_name`);
         /// pushes without a name are dropped at the reader, so this is always set.
         server: String,
-        /// The pushed diagnostics, in the virtual document's coordinates.
+        /// The pushed diagnostics, in the published document's own coordinates
+        /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
     },
     /// Forward a downstream `window/logMessage` to the editor.

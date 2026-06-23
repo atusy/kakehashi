@@ -421,7 +421,11 @@ mod tests {
 
         // The push comes from a server that is NOT a configured host server for rust.
         DiagnosticPublisher::new(server)
-            .publish_host_push(uri.as_str(), "some_other_server".to_string(), vec![diag("z")])
+            .publish_host_push(
+                uri.as_str(),
+                "some_other_server".to_string(),
+                vec![diag("z")],
+            )
             .await;
 
         assert!(
