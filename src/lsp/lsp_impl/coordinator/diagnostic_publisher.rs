@@ -138,6 +138,12 @@ impl DiagnosticPublisher {
         let configs = self
             .bridge
             .get_host_configs_for_language(&settings, &language_name);
+        if configs.is_empty() {
+            // No host servers for this language (or `_self` disabled) — every host
+            // slot is stale. Drop the whole source without scanning the slots.
+            entry.remove();
+            return;
+        }
         let slots = entry.get_mut();
         // A language has only a handful of host servers (usually 1–2), so a linear
         // scan over `configs` is cheaper than allocating a lookup set on every
