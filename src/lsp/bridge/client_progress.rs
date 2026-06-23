@@ -187,10 +187,15 @@ impl ClientProgressAggregator {
             &value,
             ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_))
         );
-        if self.ended || self.server_count != 1 || (!self.begun && !is_begin) {
-            // Drop: N > 1 is not yet aggregated (never forward raw); anything after
-            // the terminal End; and any out-of-order `report`/`End` before a
-            // `Begin` — the editor must see a coherent Begin → … → End lifecycle.
+        if self.ended
+            || self.server_count != 1
+            || (is_begin && self.begun)
+            || (!is_begin && !self.begun)
+        {
+            // Drop, so the editor sees one coherent Begin → … → End lifecycle:
+            // N > 1 is not yet aggregated (never forward raw); anything after the
+            // terminal End; a duplicate `Begin`; and any out-of-order `report`/
+            // `End` before the first `Begin`.
             return None;
         }
         // N = 1: relay verbatim under the client token, tracking the lifecycle so
@@ -322,6 +327,24 @@ mod tests {
         assert!(
             agg.on_downstream_progress(end()).is_some(),
             "then End relays"
+        );
+    }
+
+    #[test]
+    fn duplicate_begin_is_dropped() {
+        let mut agg = ClientProgressAggregator::new(client_token(), 1);
+        assert!(
+            agg.on_downstream_progress(begin()).is_some(),
+            "first Begin relays"
+        );
+        // A second Begin must be dropped — the editor must see exactly one Begin.
+        assert!(
+            agg.on_downstream_progress(begin()).is_none(),
+            "duplicate Begin is dropped"
+        );
+        assert!(
+            agg.on_downstream_progress(end()).is_some(),
+            "End still relays"
         );
     }
 
