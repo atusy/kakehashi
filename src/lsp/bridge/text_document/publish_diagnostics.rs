@@ -32,9 +32,10 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
 /// Route a non-scratch downstream `textDocument/publishDiagnostics` into the
 /// proactive diagnostics cache (push-propagation-diagnostic-forwarding). The
 /// forwarding loop classifies the URI: a virtual injection URI becomes a region
-/// push; a real URI is a candidate `_self` host-layer push, accepted only if it
-/// names an open host-bridged document (the publisher filters the server's own
-/// workspace pushes). Either way the merged host set is republished.
+/// push; a real URI is a candidate `_self` host-layer push. When the push
+/// classifies to a live target the merged host set is republished; otherwise it
+/// is dropped — an unresolved virtual URI, or a real URI for a non-open or
+/// non-`_self` document, or a push from a server that isn't a host server for it.
 pub(in crate::lsp::bridge) fn forward_push(
     mut message: serde_json::Value,
     deps: &crate::lsp::bridge::actor::ServerRequestDeps,
