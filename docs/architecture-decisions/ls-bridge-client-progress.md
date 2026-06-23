@@ -69,7 +69,10 @@ request just returns its result (today's behavior, minus the strip).
 
 - **Single downstream (N = 1).** Relay that server's own `Begin`/`report`/`End`
   against the client's original token (client tokens are already unique, so no
-  remapping). If it emits none, the editor sees no progress.
+  remapping). If it emits none, the editor sees no progress. This holds even when
+  the sole server was selected via the wildcard: the `Rest`-never-anchor rule
+  disambiguates among *racing* contenders, and a single downstream has none — so
+  its real `Begin` is safe to forward.
 - **preferred, N > 1.** The delivered result is a single winner, and preferred
   short-circuits (it does not wait for the losers), so there is no collection
   count to report. If the anchor emits its own progress, forward its
