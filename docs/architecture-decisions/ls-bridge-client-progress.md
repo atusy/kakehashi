@@ -49,7 +49,9 @@ because the two deliver differently:
   **anchor** — the highest-priority *named* candidate — whose own `Begin` is the
   title; only the anchor's own progress is tracked. The winner (the delivered
   source) is usually that anchor, but the priority walk resolves the wildcard
-  `Rest` group first-win by earliest non-empty arrival, so a `Rest` member can be
+  `Rest` group — the `"*"` element of `priorities` (aggregation-priorities-wildcard),
+  i.e. every server not named explicitly — first-win by earliest non-empty
+  arrival, so a `Rest` member can be
   the winner without being an anchor: its own progress is **not** shown (no safe
   a priori title for a latency race), unless it is the sole server (N = 1). A
   candidate that returns empty, or fails before producing any data, is no winner
