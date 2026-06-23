@@ -1,7 +1,10 @@
-//! Shared fan-out/aggregation for proactive `textDocument/publishDiagnostics`
-//! pushes (pull-first-diagnostic-forwarding Phase 2). `DiagnosticScheduler` schedules and handles
-//! superseding (via `SyntheticDiagnosticsManager` / `DebouncedDiagnosticsManager`);
-//! this module just collects per-layer diagnostics from a prepared snapshot.
+//! Shared fan-out/aggregation for the host-event diagnostic pull
+//! (push-propagation-diagnostic-forwarding): on `didOpen`/`didSave`/`didChange`,
+//! `DiagnosticScheduler` pulls every layer's diagnostics from a prepared snapshot
+//! and the result is fed into the cache as the `PullLayer` blob, then republished.
+//! `DiagnosticScheduler` handles superseding (via `SyntheticDiagnosticsManager` /
+//! `DebouncedDiagnosticsManager`); this module just collects the per-layer
+//! diagnostics.
 
 use std::sync::Arc;
 

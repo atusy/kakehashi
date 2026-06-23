@@ -336,6 +336,12 @@ impl Kakehashi {
                 Arc::clone(&self.bridge),
             )));
             let inbound_request_registry = self.bridge.pool().inbound_request_registry();
+            // The single proactive diagnostics publisher: region pushes routed up
+            // by the reader resolve to a host + region and republish the merged
+            // host set (push-propagation-diagnostic-forwarding).
+            let diagnostic_publisher = Some(Arc::new(
+                crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self),
+            ));
             tokio::spawn(upstream_forwarding_loop(
                 upstream_rx,
                 window_rx,
@@ -343,6 +349,7 @@ impl Kakehashi {
                 show_document_translator,
                 inbound_request_registry,
                 client,
+                diagnostic_publisher,
                 token,
             ));
         }
@@ -446,6 +453,9 @@ async fn forward_upstream_request(
 /// - Either channel is closed (all senders dropped — both senders live in the
 ///   pool, so they close together at shutdown), OR
 /// - The `cancel_token` is cancelled (deterministic shutdown)
+// Heterogeneous channels + collaborators threaded into one long-lived loop task;
+// bundling them into a struct would just move the list, not shorten it.
+#[allow(clippy::too_many_arguments)]
 async fn upstream_forwarding_loop(
     mut upstream_rx: tokio::sync::mpsc::UnboundedReceiver<crate::lsp::bridge::UpstreamNotification>,
     mut window_rx: tokio::sync::mpsc::Receiver<crate::lsp::bridge::UpstreamNotification>,
@@ -455,6 +465,7 @@ async fn upstream_forwarding_loop(
     show_document_translator: Option<Arc<ShowDocumentTranslator>>,
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     client: Client,
+    diagnostic_publisher: Option<Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
     // Tokens the editor successfully created. `$/progress` is forwarded only for
@@ -480,8 +491,13 @@ async fn upstream_forwarding_loop(
             notification = upstream_rx.recv() => {
                 match notification {
                     Some(notification) => {
-                        deliver_upstream_notification(&client, notification, &mut created_tokens)
-                            .await
+                        deliver_upstream_notification(
+                            &client,
+                            notification,
+                            &mut created_tokens,
+                            diagnostic_publisher.as_deref(),
+                        )
+                        .await
                     }
                     None => break, // Channel closed
                 }
@@ -514,8 +530,13 @@ async fn upstream_forwarding_loop(
             notification = window_rx.recv() => {
                 match notification {
                     Some(notification) => {
-                        deliver_upstream_notification(&client, notification, &mut created_tokens)
-                            .await
+                        deliver_upstream_notification(
+                            &client,
+                            notification,
+                            &mut created_tokens,
+                            diagnostic_publisher.as_deref(),
+                        )
+                        .await
                     }
                     None => break, // Channel closed
                 }
@@ -762,6 +783,7 @@ async fn deliver_upstream_notification(
     client: &Client,
     notification: crate::lsp::bridge::UpstreamNotification,
     created_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
+    diagnostic_publisher: Option<&crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
 ) {
     use crate::lsp::bridge::UpstreamNotification;
     use tower_lsp_server::ls_types::{ProgressParamsValue, WorkDoneProgress};
@@ -773,6 +795,22 @@ async fn deliver_upstream_notification(
                     "workspace/diagnostic/refresh forwarding failed: {}",
                     e
                 );
+            }
+        }
+        UpstreamNotification::PublishDiagnostics {
+            uri,
+            server,
+            diagnostics,
+        } => {
+            // Cache the downstream region push and republish the merged host set
+            // (push-propagation-diagnostic-forwarding). The publisher resolves the
+            // virtual URI to its host + region; a `None` publisher (test loop)
+            // drops it. (Pushes without a server name were already dropped at the
+            // reader, so `server` is always set here.)
+            if let Some(publisher) = diagnostic_publisher {
+                publisher
+                    .publish_region_push(&uri, server, diagnostics)
+                    .await;
             }
         }
         UpstreamNotification::LogMessage { typ, message } => {
@@ -953,6 +991,7 @@ mod tests {
             None,
             crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
+            None,
             cancel.clone(),
         ));
 
@@ -1062,6 +1101,7 @@ mod tests {
             None,
             crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
+            None,
             cancel.clone(),
         ));
 
@@ -1174,6 +1214,7 @@ mod tests {
             None,
             crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
+            None,
             cancel.clone(),
         ));
 
@@ -1348,6 +1389,7 @@ mod tests {
             None,
             crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
+            None,
             cancel.clone(),
         ));
 
@@ -1403,6 +1445,7 @@ mod tests {
             None,
             crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
+            None,
             cancel.clone(),
         ));
 
@@ -1456,6 +1499,7 @@ mod tests {
             None,
             InboundRequestRegistry::default(),
             client,
+            None,
             loop_cancel.clone(),
         ));
 
@@ -1532,6 +1576,7 @@ mod tests {
             None,
             crate::lsp::bridge::InboundRequestRegistry::default(),
             client,
+            None,
             cancel.clone(),
         ));
 

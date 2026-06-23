@@ -13,12 +13,11 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::task::AbortHandle;
-use tower_lsp_server::Client;
-use tower_lsp_server::ls_types::Uri;
 use url::Url;
 
 use super::bridge::LanguageServerPool;
 
+use super::lsp_impl::DiagnosticPublisher;
 use super::lsp_impl::text_document::publish_diagnostic::{
     DiagnosticSnapshot, collect_push_diagnostics,
 };
@@ -40,16 +39,15 @@ const LOG_TARGET: &str = "kakehashi::debounced_diag";
 struct DebouncedDiagnosticData {
     /// The document URI (url::Url for internal use)
     uri: Url,
-    /// The document URI (ls_types::Uri for LSP notification)
-    lsp_uri: Uri,
-    /// LSP client for publishing diagnostics
-    client: Client,
     /// Pre-captured per-region contexts (None if document has no injections)
     snapshot_data: Option<DiagnosticSnapshot>,
     /// Bridge pool for sending diagnostic requests
     bridge_pool: Arc<LanguageServerPool>,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
+    /// The single proactive publisher: feeds the pull result into the cache and
+    /// republishes the merged set (push-propagation-diagnostic-forwarding).
+    publisher: Arc<DiagnosticPublisher>,
 }
 
 /// Manager for debounced diagnostic triggers.
@@ -94,11 +92,10 @@ impl DebouncedDiagnosticsManager {
     pub(crate) fn schedule(
         &self,
         uri: Url,
-        lsp_uri: Uri,
-        client: Client,
         snapshot_data: Option<DiagnosticSnapshot>,
         bridge_pool: Arc<LanguageServerPool>,
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
+        publisher: Arc<DiagnosticPublisher>,
     ) {
         // Opportunistic cleanup: remove finished timers to prevent unbounded growth.
         // This is O(n) but runs infrequently and keeps the map from accumulating
@@ -120,11 +117,10 @@ impl DebouncedDiagnosticsManager {
 
         let data = DebouncedDiagnosticData {
             uri: uri.clone(),
-            lsp_uri,
-            client,
             snapshot_data,
             bridge_pool,
             synthetic_diagnostics,
+            publisher,
         };
 
         let duration = self.debounce_duration;
@@ -201,11 +197,10 @@ impl DebouncedDiagnosticsManager {
 async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     let DebouncedDiagnosticData {
         uri,
-        lsp_uri,
-        client,
         snapshot_data,
         bridge_pool,
         synthetic_diagnostics,
+        publisher,
     } = data;
 
     // Spawn the actual diagnostic task (similar to DiagnosticScheduler::spawn_synthetic_diagnostic_task)
@@ -226,13 +221,14 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
 
         log::debug!(
             target: LOG_TARGET,
-            "Collected {} diagnostics for {} (debounced)",
+            "Collected {} pull-layer diagnostics for {} (debounced)",
             diagnostics.len(),
             uri_clone
         );
 
-        // Publish diagnostics
-        client.publish_diagnostics(lsp_uri, diagnostics, None).await;
+        // Feed the host-event pull result into the cache and republish the merged
+        // set (push-propagation-diagnostic-forwarding) — push slots survive.
+        publisher.publish_pull_layer(&uri_clone, diagnostics).await;
     });
 
     // Register with SyntheticDiagnosticsManager for superseding

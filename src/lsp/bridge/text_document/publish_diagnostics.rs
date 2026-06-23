@@ -2,10 +2,12 @@
 //!
 //! Unlike the other `text_document/*` files (outbound request senders), this one
 //! is **inbound** (downstream → bridge): a downstream server pushes diagnostics.
-//! The bridge does not forward push diagnostics in general (#380); the one case
-//! it must act on is a push targeting a concatenated-formatting *scratch*
-//! virtual document, which is discarded structurally by the dispatcher in
-//! [`actor::reader`](crate::lsp::bridge::actor) using [`is_scratch_publish_diagnostics`].
+//! A non-scratch push for an injection region's virtual document is **routed**
+//! into the proactive diagnostics cache ([`forward_push`],
+//! push-propagation-diagnostic-forwarding, closing #380); a push targeting a
+//! concatenated-formatting *scratch* virtual document is discarded structurally
+//! by the dispatcher in [`actor::reader`](crate::lsp::bridge::actor) using
+//! [`is_scratch_publish_diagnostics`].
 
 /// Whether `message` is a `textDocument/publishDiagnostics` notification
 /// targeting a concatenated-formatting *scratch* virtual document
@@ -25,6 +27,75 @@ pub(in crate::lsp::bridge) fn is_scratch_publish_diagnostics(message: &serde_jso
         && message["params"]["uri"]
             .as_str()
             .is_some_and(crate::lsp::bridge::VirtualDocumentUri::is_scratch_uri)
+}
+
+/// Route a non-scratch downstream `textDocument/publishDiagnostics` for an
+/// injection region's virtual document into the proactive diagnostics cache
+/// (push-propagation-diagnostic-forwarding). The forwarding loop resolves the
+/// virtual URI to its host + region and republishes the merged host set.
+///
+/// A push for a non-virtual URI (the downstream's own files, or the real host
+/// URI) has no region mapping and is dropped — the host layer is still served by
+/// the pull feed for now.
+pub(in crate::lsp::bridge) fn forward_push(
+    mut message: serde_json::Value,
+    deps: &crate::lsp::bridge::actor::ServerRequestDeps,
+) {
+    // The server name keys the cache slot; production always sets it (readers are
+    // spawned with `Some(server_name)`). Check it by reference up front so a push
+    // that lacks one is dropped before any parse/enqueue work; the actual clone is
+    // deferred to the send below, past every early-return guard.
+    let Some(server_name) = deps.server_name.as_deref() else {
+        log::debug!(
+            target: "kakehashi::bridge::reader",
+            "dropping region push without a server name"
+        );
+        return;
+    };
+    // `params` must be a JSON object. Using `get_mut(...).as_object_mut()` rather
+    // than `IndexMut` (`message["params"]["uri"]`) avoids a panic on adversarial
+    // input where `params` exists but is a string/number/array; `Map::remove`
+    // still moves the owned values out (no clone).
+    let Some(params) = message
+        .get_mut("params")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(serde_json::Value::String(uri)) = params.remove("uri") else {
+        return;
+    };
+    if !crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(&uri) {
+        return;
+    }
+    // Deserialize the moved-out diagnostics value (no clone) — `from_value` moves
+    // the diagnostics' owned strings. A parse failure (including an absent or
+    // non-array `diagnostics`) is *dropped* (not treated as an empty/clearing push,
+    // which would silently wipe the region's diagnostics); an empty `[]` array
+    // yields an empty Vec and clears legitimately.
+    let diagnostics_value = params
+        .remove("diagnostics")
+        .unwrap_or(serde_json::Value::Null);
+    let diagnostics = match serde_json::from_value::<Vec<tower_lsp_server::ls_types::Diagnostic>>(
+        diagnostics_value,
+    ) {
+        Ok(diagnostics) => diagnostics,
+        Err(e) => {
+            log::debug!(
+                target: "kakehashi::bridge::reader",
+                "dropping malformed publishDiagnostics for {uri}: {e}"
+            );
+            return;
+        }
+    };
+
+    let _ = deps.upstream_tx.send(
+        crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
+            uri,
+            server: server_name.to_owned(),
+            diagnostics,
+        },
+    );
 }
 
 #[cfg(test)]

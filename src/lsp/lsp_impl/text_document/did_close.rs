@@ -66,6 +66,17 @@ impl Kakehashi {
             );
         }
 
+        // Drop the proactive diagnostic cache for this host and clear the editor's
+        // diagnostics (push-propagation-diagnostic-forwarding). MUST run AFTER
+        // close_host_document tears down host_to_virtual: a region push dequeued
+        // before that teardown can still resolve its virtual URI and re-create the
+        // cache entry, so clearing first would leave a resurrected, never-cleared
+        // host. (A residual resolve→suspend→record micro-window remains, closed
+        // only by the deferred tombstone/epoch gate.)
+        super::super::coordinator::DiagnosticPublisher::new(self)
+            .clear_host(&uri)
+            .await;
+
         // Close the host document itself on any servers it was opened on via
         // the host bridge (host-document-bridge).
         self.bridge
