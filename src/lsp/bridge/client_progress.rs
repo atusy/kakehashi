@@ -260,10 +260,7 @@ mod tests {
                 .on_downstream_progress(value.clone())
                 .expect("N=1 relays the downstream progress");
             assert_eq!(out.token, client_token(), "retargeted to the client token");
-            assert!(
-                matches!((&out.value, &value), (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b)),
-                "value forwarded verbatim"
-            );
+            assert_eq!(out.value, value, "value forwarded verbatim");
         }
         // After the terminal End, further progress is dropped.
         assert!(

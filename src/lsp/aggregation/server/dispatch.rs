@@ -37,13 +37,12 @@ use super::priority::{PriorityEntry, entry_names, expand_priorities, truncate_en
 fn setup_client_progress(
     ctx: &DocumentRequestContext,
     pool: &LanguageServerPool,
-    entries: &[PriorityEntry],
+    selected: &[ResolvedServerConfig],
 ) -> Option<(
     HashMap<String, NumberOrString>,
     ClientProgressDeregisterGuard,
 )> {
     let client_token = ctx.client_progress_token.clone()?;
-    let selected = select_servers(&ctx.configs, entries);
     // Stage 1 bridges client progress only for the single-downstream case. With
     // more than one server we mint nothing — those downstreams get no
     // `workDoneToken` and emit no `$/progress` — so multi-server fan-out stays
@@ -62,7 +61,7 @@ fn setup_client_progress(
     for config in selected {
         let token = registry.register(Arc::clone(&aggregator));
         minted.push(token.clone());
-        map.insert(config.server_name, token);
+        map.insert(config.server_name.clone(), token);
     }
     let guard =
         ClientProgressDeregisterGuard::new(registry, minted, aggregator, pool.upstream_tx());
@@ -121,12 +120,15 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let entries = expanded_entries(ctx);
+    // Compute the selected servers once and share it with both client-progress
+    // setup and fan-out (avoids a second `select_servers` on the dispatch path).
+    let selected = select_servers(&ctx.configs, &entries);
     // Stage 1: `setup_client_progress` bridges client progress only for the
     // single-downstream case (it returns `None` for N>1, keeping fan-out
     // non-regressing) and only when the request carries a `workDoneToken`.
-    let client_progress = setup_client_progress(ctx, &pool, &entries);
+    let client_progress = setup_client_progress(ctx, &pool, &selected);
     let cp_tokens = client_progress.as_ref().map(|(m, _guard)| m);
-    let mut join_set = fan_out(ctx, pool, f, &entries, cp_tokens);
+    let mut join_set = fan_out(ctx, pool, f, &selected, cp_tokens);
     let result = preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await;
     // Hold the client-progress guard across the await above (it owns the routing
     // and the synthetic-terminal-End-on-teardown); tear it down only now, after
@@ -158,8 +160,9 @@ where
 {
     let entries = expanded_entries(ctx);
     let ordering = entry_names(&entries);
+    let selected = select_servers(&ctx.configs, &entries);
     // Client progress under concatenated is a later stage; pass no tokens so
     // downstream `$/progress` is dropped (non-regressing).
-    let mut join_set = fan_out(ctx, pool, f, &entries, None);
+    let mut join_set = fan_out(ctx, pool, f, &selected, None);
     concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target).await
 }

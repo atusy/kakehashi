@@ -89,7 +89,7 @@ pub(crate) fn fan_out<T, F, Fut>(
     ctx: &DocumentRequestContext,
     pool: Arc<LanguageServerPool>,
     f: F,
-    entries: &[PriorityEntry],
+    selected: &[ResolvedServerConfig],
     client_progress_tokens: Option<
         &std::collections::HashMap<String, tower_lsp_server::ls_types::NumberOrString>,
     >,
@@ -100,8 +100,7 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut join_set = JoinSet::new();
-    let selected = select_servers(&ctx.configs, entries);
-    for config in &selected {
+    for config in selected {
         let server_name = config.server_name.clone();
         let task = FanOutTask {
             pool: Arc::clone(&pool),
