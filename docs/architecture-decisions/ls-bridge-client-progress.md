@@ -38,8 +38,9 @@ downstream→upstream `$/progress` and partial-result notifications, and aggrega
 them so the editor sees **one coherent lifecycle** that stays consistent with the
 result actually delivered.
 
-**Core principle.** The progress narrative is **anchored on the priority
-winner** — the highest-priority contributor — and the data the editor receives
+**Core principle.** The progress narrative is
+**anchored on the priority winner** (the highest-priority contributor), and the
+data the editor receives
 stays consistent with the result actually delivered: the `End` coincides with the
 result being complete, and no `report` carries data the editor will not receive.
 **Only the winner's own progress is ever tracked**; other contributors influence
