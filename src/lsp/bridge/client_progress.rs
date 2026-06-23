@@ -136,8 +136,11 @@ impl ClientProgressDeregisterGuard {
 
 impl Drop for ClientProgressDeregisterGuard {
     fn drop(&mut self) {
-        // Deregister first: after this no reader can feed the aggregator, so the
-        // terminal decision below cannot race a concurrent real `End`.
+        // Deregister first so a late *real* `End` cannot flip `ended` after the
+        // decision below (no double-`End`). The `Begin`-before-synthetic-`End`
+        // ordering rests on the reader loop processing the downstream's `Begin`
+        // notification before its response — and the response is what completes
+        // fan-in and drops this guard (ls-bridge-message-ordering).
         self.registry.deregister(&self.tokens);
         let terminal = self
             .aggregator
