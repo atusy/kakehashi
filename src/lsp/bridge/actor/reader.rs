@@ -61,8 +61,9 @@ pub(crate) enum UpstreamNotification {
     /// `uri`: a virtual injection URI resolves to its host document + region (a
     /// region push, virtual coordinates); a real URI is a candidate `_self`
     /// host-layer push (host coordinates) accepted only for an open host-bridged
-    /// document. Either way the diagnostics are cached under `server` and the
-    /// merged host set is republished.
+    /// document. When the push classifies to a live target it is cached under
+    /// `server` and the merged host set is republished; otherwise it is dropped
+    /// (unresolved virtual URI; real URI not open / not `_self` / wrong server).
     ///
     /// This carries an arbitrary-size `Vec<Diagnostic>` over the **unbounded**
     /// upstream channel, so a push-happy or misbehaving downstream paired with a
