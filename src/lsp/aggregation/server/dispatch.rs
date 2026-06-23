@@ -56,7 +56,7 @@ fn setup_client_progress(
     let registry = Arc::clone(pool.client_progress_registry());
     let token = registry.register(Arc::clone(&aggregator));
     let mut map = HashMap::new();
-    map.insert(tracked, token.clone());
+    map.insert(tracked.to_string(), token.clone());
     let guard =
         ClientProgressDeregisterGuard::new(registry, vec![token], aggregator, pool.upstream_tx());
     Some((map, guard))
@@ -79,12 +79,12 @@ fn setup_client_progress(
 /// fixed anchor**; dynamic fall-through re-anchoring (re-tracking the next named
 /// candidate when this one returns empty) is a later stage — on fall-through the
 /// open `Begin` is instead closed by the synthetic terminal `End`.
-fn tracked_progress_source(
-    selected: &[ResolvedServerConfig],
-    entries: &[PriorityEntry],
-) -> Option<String> {
+fn tracked_progress_source<'a>(
+    selected: &'a [ResolvedServerConfig],
+    entries: &'a [PriorityEntry],
+) -> Option<&'a str> {
     if let [only] = selected {
-        return Some(only.server_name.clone());
+        return Some(&only.server_name);
     }
     let participates = |name: &str| selected.iter().any(|c| c.server_name == name);
     // Walk in priority order to the first *participating* entry: if it is a named
@@ -94,7 +94,7 @@ fn tracked_progress_source(
     // skipped.)
     for entry in entries {
         match entry {
-            PriorityEntry::Server(name) if participates(name) => return Some(name.clone()),
+            PriorityEntry::Server(name) if participates(name) => return Some(name),
             PriorityEntry::Rest(names) if names.iter().any(|n| participates(n)) => return None,
             _ => {}
         }
@@ -128,7 +128,7 @@ mod tests {
         let entries = [PriorityEntry::Rest(vec!["rust-analyzer".to_string()])];
         assert_eq!(
             tracked_progress_source(&selected, &entries),
-            Some("rust-analyzer".to_string())
+            Some("rust-analyzer")
         );
     }
 
@@ -139,10 +139,7 @@ mod tests {
             PriorityEntry::Server("ra".to_string()),
             PriorityEntry::Rest(vec!["typos".to_string()]),
         ];
-        assert_eq!(
-            tracked_progress_source(&selected, &entries),
-            Some("ra".to_string())
-        );
+        assert_eq!(tracked_progress_source(&selected, &entries), Some("ra"));
     }
 
     #[test]
@@ -152,10 +149,7 @@ mod tests {
             PriorityEntry::Server("ra".to_string()),
             PriorityEntry::Server("clangd".to_string()),
         ];
-        assert_eq!(
-            tracked_progress_source(&selected, &entries),
-            Some("ra".to_string())
-        );
+        assert_eq!(tracked_progress_source(&selected, &entries), Some("ra"));
     }
 
     #[test]
