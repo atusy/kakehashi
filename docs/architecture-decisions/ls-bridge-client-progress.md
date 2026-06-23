@@ -40,9 +40,10 @@ them so the editor sees **one coherent lifecycle** that stays consistent with th
 result actually delivered.
 
 **Core principle.** Whatever the editor sees stays consistent with the result
-actually delivered: the `End` coincides with the result being complete, and no
-`report` carries data the editor will not receive. How the title-bearing `Begin`
-is produced then depends on the strategy, because the two deliver differently:
+actually delivered: the work-done `End` coincides with the result being complete,
+and no `partialResultToken` chunk is streamed that the delivered result will not
+contain. How the title-bearing `Begin` is produced then depends on the strategy,
+because the two deliver differently:
 
 - *preferred* delivers a single **winner**, and progress is **anchored** on the
   **anchor** — the highest-priority *named* candidate — whose own `Begin` is the
