@@ -112,7 +112,7 @@ request just returns its result (today's behavior, minus the strip).
     `partialResultToken` data and `workDoneToken` progress are separate tokens, so
     any open work-done `Begin` is closed by a synthetic `End`; a winner that
     streamed only partial-result data opened none and needs no `End`.)
-  - *preferred, winner produced nothing* (empty or failed before any partial
+  - *preferred, candidate produced nothing* (empty or failed before any partial
     result): it falls through to the next-priority candidate — down to a `Rest`
     winner, or to no result at all — exactly as any empty result does under
     preferred. Nothing was committed, so this is ordinary latency, not a freeze or
