@@ -42,11 +42,17 @@ jobs:
 
   # kakehashi downloads and unpacks archives from the network; audit catches
   # advisories in that supply chain (e.g. the tar extraction RUSTSECs).
+  #
+  # We run `cargo audit` directly instead of rustsec/audit-check: that action
+  # publishes results via the GitHub Check API, which the read-only default
+  # GITHUB_TOKEN cannot access (it fails on fork PRs and degrades to warnings
+  # otherwise), and it is still pinned to the now-deprecated Node 20 runtime.
+  # `cargo audit` exits nonzero only on vulnerabilities, so unmaintained-crate
+  # advisories stay non-blocking — matching the previous behavior.
   audit:
     name: Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
