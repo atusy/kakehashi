@@ -90,4 +90,8 @@ client-initiated request) is not remapped — those tokens are already unique
 because the client mints them — and such `$/progress` is currently **dropped**,
 not passed through, to avoid duplicates under request fan-out (one client
 request → multiple downstreams). Passing them through (deduplicated across
-fan-out) is possible future work.
+fan-out) is decided separately in ls-bridge-client-progress.
+
+Terminating a still-open server-declared progress when its downstream
+disconnects mid-work (so the editor's indicator does not dangle) is decided in
+ls-bridge-progress-disconnect-cleanup.
