@@ -1271,6 +1271,127 @@ mod tests {
         let _ = loop_handle.await;
     }
 
+    /// On connection teardown, a token that was **begun but not yet ended** gets a
+    /// synthetic `$/progress` `End` forwarded to the editor, so its progress
+    /// indicator does not dangle (ls-bridge-progress-disconnect-cleanup). (A token
+    /// created but never begun gets none — see the sibling test above, where the
+    /// `Begin` arrives after the forget and is dropped.)
+    #[tokio::test]
+    async fn forwarding_loop_synthesizes_end_for_begun_token_on_purge() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        let token = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
+        // Editor accepts the create (admits the token).
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: token.clone(),
+        })
+        .unwrap();
+        let first = requests.next().await.expect("create request emitted");
+        assert_eq!(first.method(), "window/workDoneProgress/create");
+        let id = first.id().expect("create request has an id").clone();
+        responses
+            .send(Response::from_ok(id, serde_json::Value::Null))
+            .await
+            .unwrap();
+
+        // Downstream begins the work; the `Begin` is forwarded to the editor,
+        // marking the token begun-not-ended.
+        tx.send(UpstreamNotification::Progress {
+            params: ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        })
+        .unwrap();
+        let begin = requests.next().await.expect("begin progress forwarded");
+        assert_eq!(begin.method(), "$/progress");
+
+        // Connection dies mid-progress: the loop must synthesize an `End` for the
+        // begun-not-ended token so the editor's indicator clears.
+        tx.send(UpstreamNotification::ForgetWorkDoneProgress(vec![
+            token.clone(),
+        ]))
+        .unwrap();
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), requests.next())
+            .await
+            .expect("a synthetic End must be forwarded on purge of a begun token")
+            .expect("stream yielded a message");
+        assert_eq!(end.method(), "$/progress");
+        let params: ProgressParams =
+            serde_json::from_value(end.params().expect("progress has params").clone())
+                .expect("valid ProgressParams");
+        assert_eq!(params.token, token, "synthetic End targets the begun token");
+        assert!(
+            matches!(
+                params.value,
+                ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+            ),
+            "synthetic notification must be an End"
+        );
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
     /// Test that upstream_forwarding_loop exits when its CancellationToken is cancelled,
     /// even if the channel is still open.
     #[tokio::test]
