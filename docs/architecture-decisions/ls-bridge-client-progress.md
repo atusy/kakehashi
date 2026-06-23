@@ -85,9 +85,12 @@ request just returns its result (today's behavior, minus the strip).
     degradation.
   - *preferred, winner produced nothing* (died before any partial result): its
     empty result falls through to the next-priority candidate, exactly as any
-    empty result does under preferred. Nothing was shown yet, so this is ordinary
-    latency, not a freeze or swap; the progress re-anchors on the new winner (its
-    own `Begin`, if any), recursing down the priority order.
+    empty result does under preferred. If the dead winner had opened no `Begin`,
+    nothing was shown — ordinary latency, not a freeze or swap — and the new
+    winner's own `Begin` opens the lifecycle. If it had already opened a `Begin`,
+    LSP permits only one per token, so that `Begin` stays open (its title lingers
+    — see Consequences) and only `report`/`End` re-anchor onto the new winner.
+    This recurses down the priority order.
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing); the collection count adjusts and the others proceed, with
     `End` once the rest are collected.
