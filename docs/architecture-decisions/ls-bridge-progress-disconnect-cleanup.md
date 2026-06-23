@@ -98,7 +98,7 @@ ls-bridge-client-progress relies on for client-provided tokens.
   ls-bridge-client-progress.
 - Shares the synthetic-terminal-`End` primitive with ls-bridge-client-progress:
   when the source cannot send its own terminal (here a disconnected downstream;
-  there a failed winner), the bridge composes one.
+  there a failed anchor), the bridge composes one.
 
 ## Decision–Implementation Gap
 

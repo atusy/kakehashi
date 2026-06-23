@@ -48,9 +48,9 @@ receive. The anchor follows the **priority walk** (honoring explicit
 `priorities`, with the wildcard `Rest` resolved first-win by earliest non-empty
 arrival), not a pure latency race that could put the title and progress on one
 server while the delivered result comes from another. A candidate that returns
-empty or fails is no **winner** (the term is reserved for the server whose
-non-empty result is delivered), so the anchor falls through to the next
-candidate.
+empty — or fails before producing any data — is no **winner** (reserved for the
+source whose result, possibly a promoted partial prefix, is delivered), so the
+anchor falls through to the next candidate.
 
 **Only the anchor's own progress is ever tracked**; other contributors influence
 the lifecycle solely by *completing* (their result arriving), never through their
