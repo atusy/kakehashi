@@ -50,7 +50,11 @@ arrival), not a pure latency race that could put the title and progress on one
 server while the delivered result comes from another. A candidate that returns
 empty — or fails before producing any data — is no **winner** (reserved for the
 source whose result, possibly a promoted partial prefix, is delivered), so the
-anchor falls through to the next candidate.
+anchor falls through to the next candidate. Within the unordered `Rest` (wildcard)
+group no member is the a-priori anchor — which one wins is a latency race, not
+knowable in advance — so the bridge never forwards a `Rest` member's own `Begin`
+as the title; that group's progress is handled as a silent anchor (a synthetic
+neutral `Begin` under *concatenated*, nothing under *preferred*).
 
 **Only the anchor's own progress is ever tracked**; other contributors influence
 the lifecycle solely by *completing* (their result arriving), never through their
