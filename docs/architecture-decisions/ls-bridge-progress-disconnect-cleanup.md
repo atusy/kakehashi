@@ -20,9 +20,10 @@ editor.
 
 The consequence is a **dangling progress indicator**: the editor created the
 progress token on `window/workDoneProgress/create`, the downstream started it
-with `Begin`, but no `End` ever arrives, so the spinner stays up indefinitely. Some editors offer no way to dismiss a progress they believe is
-still running. Work-done progress is a strict begin/end lifecycle, and the
-bridge currently breaks it on the disconnect path.
+with `Begin`, but no `End` ever arrives, so the spinner stays up indefinitely.
+Some editors offer no way to dismiss a progress indicator they believe is still
+running. Work-done progress is a strict begin/end lifecycle, and the bridge
+currently breaks it on the disconnect path.
 
 ## Decision
 
@@ -36,8 +37,9 @@ existing mapping purge and admission cleanup.
   whose `window/workDoneProgress/create` the editor accepted but whose `Begin`
   was never forwarded (the downstream died between create and begin) has no
   visible progress to terminate, so it gets no synthetic `End` — its mapping is
-  simply purged. This keeps every emitted `End` paired with a real `Begin`, and a
-  create the editor rejected likewise never receives a terminal.
+  simply purged. This keeps every emitted `End` paired with a real `Begin`; a
+  `window/workDoneProgress/create` request the editor rejected likewise never
+  receives a terminal.
 - Tracking the begun-not-ended set is cheap: the forwarding loop already relays
   each token's `Begin` and `End`, so it marks a token in-progress when it forwards
   the `Begin` and clears it on the `End`. On connection teardown the bridge

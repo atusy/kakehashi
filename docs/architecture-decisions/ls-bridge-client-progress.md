@@ -16,13 +16,12 @@ several downstream servers (e.g. a references request spanning several injected
 languages, fanned out per language-server-bridge-request-strategies). Each
 downstream may emit work-done progress (`$/progress` against the `workDoneToken`)
 and partial results (against the `partialResultToken`). Forwarding the work-done
-stream verbatim duplicates the lifecycle (N
-`Begin`, N `End`) and corrupts the indicator; concatenating result chunks
-verbatim mis-orders data. So, under fan-out,
-**the bridge must own the upstream terminal**: it cannot blindly relay all N
-downstreams' `End`s/responses (they collide); it forwards exactly one or composes
-one, as the Decision details. (A request that reaches a single server is just
-relayed.)
+stream verbatim duplicates the lifecycle (N `Begin`, N `End`) and corrupts the
+indicator; concatenating result chunks verbatim mis-orders data. So, under
+fan-out, **the bridge must own the upstream terminal**: it cannot blindly relay
+all N downstreams' `End`s/responses (they collide); it forwards exactly one or
+composes one, as the Decision details. (A request that reaches a single server is
+just relayed.)
 
 Today the bridge does not forward client-provided tokens to downstreams at all.
 The host raw-request path strips them (`strip_progress_tokens`,
@@ -52,7 +51,7 @@ server while the delivered result comes from another. A candidate that returns
 empty — or fails before producing any data — is no **winner** (reserved for the
 source whose result, possibly a promoted partial prefix, is delivered), so the
 anchor falls through to the next candidate. Within the unordered `Rest` (wildcard)
-group no member is the a-priori anchor — which one wins is a latency race, not
+group no member is the a priori anchor — which one wins is a latency race, not
 knowable in advance — so the bridge never forwards a `Rest` member's own `Begin`
 as the title; that group's progress is handled as a silent anchor (a synthetic
 neutral `Begin` under *concatenated*, nothing under *preferred*).
@@ -151,7 +150,7 @@ request just returns its result (today's behavior, minus the strip).
 
 The terminal `End` the bridge emits on failure is the same primitive
 ls-bridge-progress-disconnect-cleanup uses for server-declared tokens — the
-bridge composes the terminal rather than relaying a downstream's.
+bridge composes the terminal rather than relaying a downstream's `End`.
 
 ## Considered Options
 
@@ -218,7 +217,7 @@ bridge composes the terminal rather than relaying a downstream's.
 - Namespacing is unnecessary here (client tokens are already unique), so the
   `ProgressRegistry` of ls-bridge-work-done-progress is not involved; this path
   is distinct from server-declared progress.
-- Under fan-out the bridge owns the upstream terminal — relaying the winner's
+- Under fan-out the bridge owns the upstream terminal — relaying the winner's `End`
   under *preferred*, composing one under *concatenated* and on failure — so
   failure handling changes only that payload, not the mechanism.
 - A fast *concatenated* fan-out can briefly flash `Begin`→`End`; editors
@@ -249,6 +248,6 @@ are stripped before fan-out. Specific points to settle during implementation:
   order-insensitive.
 - Treating `Rest`-group members as never-anchors trades progress visibility for
   title correctness: under *preferred*, if the delivered winner is an unnamed
-  `Rest` member doing long work, its own progress is not shown (no safe a-priori
+  `Rest` member doing long work, its own progress is not shown (no safe a priori
   title). A future refinement could surface it once it is the sole active `Rest`
   member.
