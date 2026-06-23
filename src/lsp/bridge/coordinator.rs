@@ -98,10 +98,16 @@ pub(crate) struct BridgeCoordinator {
     /// Host-layer eager-open tasks, keyed by host document URI (#429). Separate
     /// from `eager_open_tasks` because the host path fires on `didOpen` for the
     /// real host doc (no injections). Uses the same generation/placeholder shape
-    /// as the virt path so the spawn→register window is closed: a concurrent
-    /// `cancel_host_eager_open` (didClose) or `abort_all_eager_open` (shutdown)
-    /// removes the entry, and any handle registered afterwards is aborted on the
-    /// spot instead of leaking a task that could open a connection post-cancel.
+    /// as the virt path: `supersede` resets to an empty placeholder before
+    /// spawning, so a handle *registered* after a concurrent
+    /// `cancel_host_eager_open` (didClose) / `abort_all_eager_open` (shutdown) is
+    /// aborted on the spot (the registration leak is closed). It does NOT stop a
+    /// task whose body already started on another worker thread before its handle
+    /// registers from sending its didOpen — identical to the region path, bounded
+    /// and benign (the #421 push-accept guard reads the editor `DocumentStore`, so
+    /// no phantom diagnostics; an orphan connection / `host_documents` entry clears
+    /// on reopen / respawn). Left open deliberately to stay parallel with the
+    /// region eager-open rather than diverging (tracked cross-path follow-up).
     host_eager_open_tasks: DashMap<Url, EagerOpenBatch>,
 }
 
@@ -560,11 +566,12 @@ impl BridgeCoordinator {
 
         // Supersede the previous batch (abort + reset to an empty placeholder)
         // BEFORE spawning, then register each handle against this generation. This
-        // closes the spawn→register window: a concurrent `cancel_host_eager_open`
-        // (didClose) or `abort_all_eager_open` (shutdown) removes the entry, so a
-        // handle registered afterwards is aborted on the spot rather than leaking a
-        // task that could open a connection post-cancel — the same shape the region
-        // path uses.
+        // closes the *registration* leak: if a concurrent `cancel_host_eager_open`
+        // (didClose) or `abort_all_eager_open` (shutdown) removed the entry, a
+        // handle registered afterwards is aborted on the spot. It does NOT prevent
+        // a task whose body already started on another worker before registration
+        // from sending its didOpen — that residual is identical to the region path
+        // (see the field doc), bounded and benign; left open for parity.
         let generation = self.supersede_host_eager_open(host_uri);
 
         for config in configs {
