@@ -44,17 +44,18 @@ actually delivered: the `End` coincides with the result being complete, and no
 `report` carries data the editor will not receive. How the title-bearing `Begin`
 is produced then depends on the strategy, because the two deliver differently:
 
-- *preferred* delivers a single **winner**, so progress is **anchored** on that
-  source: the title is the winner's own `Begin`, and only the anchor's own
-  progress is tracked. The winner is found by the **priority walk** — explicit
-  `priorities` in order, the wildcard `Rest` resolved first-win by earliest
-  non-empty arrival. A candidate that returns empty, or fails before producing
-  any data, is no winner (reserved for the delivered source, possibly a promoted
-  partial prefix), so the **anchor** (the highest-priority *named* candidate)
-  falls through to the next. The bridge never forwards a non-anchor's `Begin` as
-  the title — including a `Rest` member's, since which `Rest` member wins is a
-  latency race, not knowable in advance. (One documented edge: after a
-  fall-through, an earlier anchor's title can linger; see Consequences.)
+- *preferred* delivers a single **winner**, and progress is **anchored** on the
+  **anchor** — the highest-priority *named* candidate — whose own `Begin` is the
+  title; only the anchor's own progress is tracked. The winner (the delivered
+  source) is usually that anchor, but the priority walk resolves the wildcard
+  `Rest` group first-win by earliest non-empty arrival, so a `Rest` member can be
+  the winner without being an anchor: its own progress is **not** shown (no safe a
+  priori title for a latency race), unless it is the sole server (N = 1). A
+  candidate that returns empty, or fails before producing any data, is no winner
+  (reserved for the delivered source, possibly a promoted partial prefix), so the
+  anchor falls through to the next *named* candidate. The bridge never forwards a
+  non-anchor's `Begin` as the title. (One documented edge: after a fall-through,
+  an earlier anchor's title can linger; see Consequences.)
 - *concatenated* merges **all** contributors, so no single source owns the title:
   the bridge **always composes its own synthetic neutral `Begin`** (never
   borrowing a downstream's title; e.g. a request-derived one) and reports
@@ -92,9 +93,11 @@ request just returns its result (today's behavior, minus the strip).
 - **Begin/End pairing invariant.** An open work-done `Begin` is closed by exactly
   one `End`, fired when the *request* terminates — normal completion, anchor
   failure, fall-through exhaustion, or client cancellation (the fan-in returns
-  `Cancelled`). Under *preferred* (and N = 1) the lifecycle tracks a single
-  source, so that `End` is the source's real one — or a bridge-synthesized one if
-  the source died or was cancelled before sending it. Under *concatenated* the
+  `Cancelled`). Under *preferred* (and N = 1) there is one open lifecycle per
+  token, normally closed by the tracked source's real `End`; after a fall-through
+  the open `Begin` may be an earlier anchor's while the new anchor supplies the
+  `End`, and the bridge synthesizes the `End` if the source died, was cancelled,
+  or completes with no progress phase. Under *concatenated* the
   bridge composes the whole lifecycle, so the terminal is always its own
   aggregate-timed `End` (fired when all results are collected, or synthesized on
   cancellation). A request that opened no `Begin` emits no `End`. (The per-branch
@@ -184,9 +187,11 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 - Client-requested progress (`workDoneToken`) reaches the editor for the first
   time.
 - The progress signals stay consistent with the delivered result — no jarring
-  swap and no freeze of shown data. Under *preferred* the title and `report`/`End`
-  track the one winner; under *concatenated* the bridge composes a neutral title
-  and `n/m` that describe the aggregate, so the title never goes stale mid-flight.
+  swap and no freeze of shown data. Under *preferred* the `report`/`End` track the
+  current anchor (normally the winner; after a fall-through the title may be an
+  earlier anchor's — see below); under *concatenated* the bridge composes a
+  neutral title and `n/m` that describe the aggregate, so the title never goes
+  stale mid-flight.
 - partialResult streaming becomes possible without mis-translated locations.
 - Progress engages only when meaningful: a fast or single-server request with no
   downstream progress shows nothing, so there is no spurious spinner. The `Begin`
