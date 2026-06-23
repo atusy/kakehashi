@@ -80,12 +80,15 @@ request just returns its result (today's behavior, minus the strip).
 
   Accumulated `report`s may be coalesced into one notification
   (`Begin → report → report (2, 3) → End`) to bound notification volume.
-- **Begin/End pairing invariant.** An open work-done `Begin` is closed exactly
-  once, whenever the request terminates — normal completion, winner failure,
-  fall-through exhaustion, or client cancellation (the fan-in returns
-  `Cancelled`) — with the real `End` if the source sent one, otherwise a
-  bridge-synthesized `End`. A request that opened no `Begin` emits no `End`. (The
-  per-branch rules below are instances of this invariant.)
+- **Begin/End pairing invariant.** An open work-done `Begin` is closed by exactly
+  one `End`, fired when the *request* terminates — normal completion, winner
+  failure, fall-through exhaustion, or client cancellation (the fan-in returns
+  `Cancelled`). When the lifecycle tracks a single source to completion (N = 1, or
+  *preferred*), that `End` is the source's real one; under *concatenated* the
+  bridge emits a single aggregate-timed `End` and suppresses the winner's own
+  (which fires before collection finishes). If the source cannot send one (it
+  died), the bridge synthesizes it. A request that opened no `Begin` emits no
+  `End`. (The per-branch rules below are instances of this invariant.)
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
   - *preferred, winner already streamed partials*: data is on screen, so promote
