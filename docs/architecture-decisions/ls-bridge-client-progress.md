@@ -14,8 +14,9 @@ motivated the `ProgressRegistry` — does not apply here.
 The problem is **fan-out**. The bridge multiplexes one editor request onto
 several downstream servers (e.g. a references request spanning several injected
 languages, fanned out per language-server-bridge-request-strategies). Each
-downstream may emit `$/progress` and partial results against the same
-client-provided token. Forwarding them verbatim duplicates the lifecycle (N
+downstream may emit work-done progress (`$/progress` against the `workDoneToken`)
+and partial results (against the `partialResultToken`). Forwarding the work-done
+stream verbatim duplicates the lifecycle (N
 `Begin`, N `End`) and corrupts the indicator; concatenating result chunks
 verbatim mis-orders data. So, under fan-out,
 **the bridge must own the upstream terminal**: it cannot blindly relay all N
@@ -100,7 +101,10 @@ request just returns its result (today's behavior, minus the strip).
     — see Consequences) and the new winner's `report`/`End` re-anchor under it;
     should the new winner provide no real `End` (it completes with no progress
     phase), the bridge synthesizes one at request completion so the lingering
-    `Begin` is always closed. This recurses down the priority order.
+    `Begin` is always closed. This recurses down the priority order; if every
+    candidate is exhausted and preferred returns no result at all, the same rule
+    applies at request completion — synthesize an `End` if a `Begin` is open,
+    otherwise emit none.
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing) and is **dropped from the expected set** (the `n/m`
     denominator shrinks); the others proceed, and `End` fires once the remaining
@@ -125,9 +129,9 @@ bridge composes the terminal rather than relaying a downstream's.
   client-requested progress never surfaces — the gap this decision closes.
   Rejected.
 - **Latency-based selector (track the first responder).** Lower time-to-first
-  paint, but the data-bearing progress and the delivered result can come from
-  different servers — the jarring swap this decision avoids. Rejected in favor
-  of priority.
+  paint, but the tracked progress (`report`/`End`) and the delivered result can
+  come from different servers — the jarring swap this decision avoids. Rejected
+  in favor of priority.
 - **Forward the first contributor's `Begin` opportunistically.** Lights the
   indicator a few milliseconds sooner, but `Begin` carries a required `title`, so
   it can surface a non-winner's label that LSP will not let the bridge amend
@@ -150,10 +154,10 @@ bridge composes the terminal rather than relaying a downstream's.
 
 - Client-requested progress (`workDoneToken`) reaches the editor for the first
   time.
-- The data-bearing progress signals (`report`/`End`) stay consistent with the
-  delivered result — no jarring swap and no freeze of shown data (under
-  *preferred* both track the one winner; under *concatenated* both span the same
-  contributor set).
+- The progress signals (`report`/`End`) stay consistent with the delivered
+  result's source — no jarring swap and no freeze of shown data (under *preferred*
+  both track the one winner; under *concatenated* both span the same contributor
+  set).
 - partialResult streaming becomes possible without mis-translated locations.
 - Progress engages only when meaningful: a fast or single-server request with no
   downstream progress shows nothing, so there is no spurious spinner. The `Begin`
