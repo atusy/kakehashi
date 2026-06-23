@@ -63,8 +63,9 @@ request just returns its result (today's behavior, minus the strip).
 - **concatenated, N > 1.** The delivered result merges *all* contributors, so the
   bridge waits for every one and reports collection progress:
   - if the winner emits its own `Begin`, forward it (real title) and track the
-    winner's `report`s, *interleaving* the other contributors' **result arrivals**
-    as `report`s (`n/m` collected);
+    winner's `report`s — but **suppress the winner's own `End`**, since the
+    aggregate is not done until every contributor is collected; *interleave* the
+    other contributors' **result arrivals** as `report`s (`n/m` collected);
   - if the winner emits no `Begin`, synthesize a bridge-owned `Begin` (neutral,
     e.g. a request-derived title) on the first result and report `n/m` as the
     rest arrive;
