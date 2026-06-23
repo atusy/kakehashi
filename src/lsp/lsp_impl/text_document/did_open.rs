@@ -104,7 +104,7 @@ impl Kakehashi {
         if let Some(ref lang) = language_name {
             let settings = self.settings_manager.load_settings();
             self.bridge
-                .eager_open_host_document_on_servers(&settings, lang, &uri, lang, &text);
+                .eager_open_host_document_on_servers(&settings, lang, &uri, &text);
         }
 
         // pull-first-diagnostic-forwarding Phase 2: Trigger synthetic diagnostic push on didOpen
@@ -273,6 +273,8 @@ print("hello")
         language_servers.insert(
             "rust_ls".to_string(),
             BridgeServerConfig {
+                // Inert: `insert_ready_test_connection` below pre-inserts a Ready
+                // handle, so this cmd is never actually spawned.
                 cmd: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -306,20 +308,13 @@ print("hello")
             ..Default::default()
         });
 
-        server
-            .bridge
-            .insert_ready_test_connection("rust_ls")
-            .await;
+        server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_eager.rs").unwrap();
         let settings = server.settings_manager.load_settings();
-        server.bridge.eager_open_host_document_on_servers(
-            &settings,
-            "rust",
-            &uri,
-            "rust",
-            "fn main() {}",
-        );
+        server
+            .bridge
+            .eager_open_host_document_on_servers(&settings, "rust", &uri, "fn main() {}");
 
         timeout(Duration::from_secs(1), async {
             loop {

@@ -541,7 +541,6 @@ impl BridgeCoordinator {
         settings: &WorkspaceSettings,
         host_language: &str,
         host_uri: &Url,
-        language_id: &str,
         text: &str,
     ) {
         let configs = self.get_host_configs_for_language(settings, host_language);
@@ -556,7 +555,11 @@ impl BridgeCoordinator {
         for config in configs {
             let pool = self.pool_arc();
             let host_uri_owned = host_uri.clone();
-            let language_id = language_id.to_string();
+            // For a `_self` bridge the downstream `languageId` is the host language
+            // itself (consistent with the lazy request path's
+            // `HostRequestContext.language_id`), so derive it rather than taking a
+            // separate arg that a caller could transpose with `text`.
+            let language_id = host_language.to_string();
             let text = text.to_string();
             let server_name = config.server_name.clone();
             let server_config = config.config.clone();
@@ -573,11 +576,16 @@ impl BridgeCoordinator {
             handles.push(task.abort_handle());
         }
 
-        // Replace the previous batch (rare: a second didOpen without a didClose)
-        // and abort it. There's a residual window between the spawns above and this
-        // insert in which a concurrent didClose's cancel sees no entry — the same
-        // documented micro-window class as the region path, closed only by the
-        // deferred tombstone/epoch gate.
+        // Replace + abort the previous batch (rare: a second didOpen without a
+        // didClose). NOTE: unlike the region path — which inserts a placeholder
+        // under `supersede_eager_open_tasks` BEFORE spawning to close it — the host
+        // path leaves the spawn→insert window open: a concurrent didClose's
+        // `cancel_host_eager_open` between the spawns above and this insert finds no
+        // entry, so those tasks aren't aborted and one may `didOpen` after the doc's
+        // didClose. That residue is benign: the #421 push-accept guard checks the
+        // editor `DocumentStore` (not `host_documents`), so a closed doc can't show
+        // phantom diagnostics; the stale `host_documents` entry self-heals on
+        // reopen (same-fingerprint no-op) or on connection respawn (retain purge).
         if let Some(previous) = self.host_eager_open_tasks.insert(host_uri.clone(), handles) {
             for handle in previous {
                 if !handle.is_finished() {
