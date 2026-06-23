@@ -144,6 +144,7 @@ impl Kakehashi {
                     priorities: agg.priorities,
                     strategy: agg.strategy,
                     max_fan_out: agg.max_fan_out,
+                    client_progress_token: None,
                 };
                 let pool = Arc::clone(&pool);
                 let send = send.clone();

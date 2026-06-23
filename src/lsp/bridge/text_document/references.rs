@@ -40,6 +40,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         include_declaration: bool,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
     ) -> io::Result<Option<Vec<Location>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -67,7 +68,12 @@ impl LanguageServerPool {
                     context: ReferenceContext {
                         include_declaration,
                     },
-                    work_done_progress_params: Default::default(),
+                    // Hand the downstream the bridge-minted token so its
+                    // `$/progress` routes to this request's aggregator
+                    // (ls-bridge-client-progress).
+                    work_done_progress_params: tower_lsp_server::ls_types::WorkDoneProgressParams {
+                        work_done_token: client_progress_token,
+                    },
                     partial_result_params: Default::default(),
                 };
                 JsonRpcRequest::new(request_id.as_i64(), "textDocument/references", params)

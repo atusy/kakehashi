@@ -15,14 +15,52 @@ use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
-use crate::lsp::bridge::{LanguageServerPool, ResolvedServerConfig};
+use std::collections::HashMap;
+use std::sync::{Arc as StdArc, Mutex};
+
+use tower_lsp_server::ls_types::NumberOrString;
+
+use crate::lsp::bridge::{
+    ClientProgressAggregator, ClientProgressDeregisterGuard, LanguageServerPool,
+    ResolvedServerConfig,
+};
 use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
 use crate::lsp::request_id::CancelReceiver;
 
 use super::fan_in::FanInResult;
 use super::fan_in::{concatenated, preferred};
-use super::fan_out::{FanOutTask, fan_out};
+use super::fan_out::{FanOutTask, fan_out, select_servers};
 use super::priority::{PriorityEntry, entry_names, expand_priorities, truncate_entries};
+
+/// Set up client-progress aggregation for a fanned-out request that carries a
+/// `workDoneToken`: create the aggregator, mint+register a bridge token per
+/// selected server, and return the `server → token` map (handed to `fan_out`)
+/// plus a guard that deregisters the tokens when the dispatch returns
+/// (ls-bridge-client-progress). Returns `None` when there is no client token.
+fn setup_client_progress(
+    ctx: &DocumentRequestContext,
+    pool: &LanguageServerPool,
+    entries: &[PriorityEntry],
+) -> Option<(
+    HashMap<String, NumberOrString>,
+    ClientProgressDeregisterGuard,
+)> {
+    let client_token = ctx.client_progress_token.clone()?;
+    let selected = select_servers(&ctx.configs, entries);
+    let aggregator = StdArc::new(Mutex::new(ClientProgressAggregator::new(
+        client_token,
+        selected.len(),
+    )));
+    let registry = StdArc::clone(pool.client_progress_registry());
+    let mut map = HashMap::new();
+    let mut minted = Vec::new();
+    for config in &selected {
+        let token = registry.register(StdArc::clone(&aggregator), &config.server_name);
+        minted.push(token.clone());
+        map.insert(config.server_name.clone(), token);
+    }
+    Some((map, ClientProgressDeregisterGuard::new(registry, minted)))
+}
 
 /// Expand `ctx.priorities` into the priority walk for this request:
 /// allowlist + `"*"` expansion against the configured servers, then the
@@ -76,7 +114,11 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let entries = expanded_entries(ctx);
-    let mut join_set = fan_out(ctx, pool, f, &entries);
+    // Stage 1: aggregate only the single-downstream (N=1) case; the aggregator
+    // drops N>1 progress until the preferred/concatenated stages land.
+    let client_progress = setup_client_progress(ctx, &pool, &entries);
+    let cp_tokens = client_progress.as_ref().map(|(m, _guard)| m);
+    let mut join_set = fan_out(ctx, pool, f, &entries, cp_tokens);
     preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await
 }
 
@@ -101,6 +143,8 @@ where
 {
     let entries = expanded_entries(ctx);
     let ordering = entry_names(&entries);
-    let mut join_set = fan_out(ctx, pool, f, &entries);
+    // Client progress under concatenated is a later stage; pass no tokens so
+    // downstream `$/progress` is dropped (non-regressing).
+    let mut join_set = fan_out(ctx, pool, f, &entries, None);
     concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target).await
 }

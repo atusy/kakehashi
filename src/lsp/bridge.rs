@@ -47,7 +47,7 @@ pub(crate) use actor::OutboundMessage;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use actor::UpstreamRequest;
 pub(crate) use client_progress::{
-    ClientProgressAggregator, ClientProgressRegistry, ClientProgressStrategy,
+    ClientProgressAggregator, ClientProgressDeregisterGuard, ClientProgressRegistry,
 };
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;

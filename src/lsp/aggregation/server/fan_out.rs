@@ -33,6 +33,10 @@ pub(crate) struct FanOutTask {
     pub(crate) offset: RegionOffset,
     pub(crate) virtual_content: String,
     pub(crate) upstream_id: Option<UpstreamId>,
+    /// Bridge-minted `workDoneToken` to hand this downstream so its `$/progress`
+    /// routes to the request's aggregator (ls-bridge-client-progress); `None`
+    /// when the request carries no client `workDoneToken`.
+    pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
 }
 
 /// Result tagged with the originating server name.
@@ -86,6 +90,9 @@ pub(crate) fn fan_out<T, F, Fut>(
     pool: Arc<LanguageServerPool>,
     f: F,
     entries: &[PriorityEntry],
+    client_progress_tokens: Option<
+        &std::collections::HashMap<String, tower_lsp_server::ls_types::NumberOrString>,
+    >,
 ) -> JoinSet<TaggedResult<T>>
 where
     T: Send + 'static,
@@ -109,6 +116,8 @@ where
             ),
             virtual_content: ctx.resolved.virtual_content.clone(),
             upstream_id: ctx.upstream_request_id.clone(),
+            client_progress_token: client_progress_tokens
+                .and_then(|m| m.get(&server_name).cloned()),
         };
         let fut = f(task);
         join_set.spawn(async move {

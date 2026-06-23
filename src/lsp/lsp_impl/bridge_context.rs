@@ -51,6 +51,10 @@ pub(crate) struct DocumentRequestContext {
     /// Maximum number of servers to fan out to.
     /// `None` = no limit, `Some(0)` = disable fan-out.
     pub(crate) max_fan_out: Option<usize>,
+    /// The editor's `workDoneToken` for this request, if any. When set, dispatch
+    /// aggregates the fanned-out downstreams' `$/progress` onto it
+    /// (ls-bridge-client-progress); `None` disables client-progress aggregation.
+    pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
 }
 
 /// All resolved context needed to send a **host** bridge request
@@ -627,6 +631,7 @@ impl Kakehashi {
             priorities: agg.priorities,
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
+            client_progress_token: None,
         })
     }
 

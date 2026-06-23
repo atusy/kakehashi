@@ -102,43 +102,51 @@ impl ClientProgressRegistry {
     }
 }
 
-/// Aggregation shape for the fanned-out request, mirroring the server-level
-/// fan-in strategy (language-server-bridge-request-strategies).
-#[derive(Debug, Clone)]
-pub(crate) enum ClientProgressStrategy {
-    /// One winner is delivered; progress is anchored on the highest-priority
-    /// *named* candidate (`None` when only `Rest`/wildcard members participate).
-    Preferred { anchor: Option<String> },
-    /// All contributors are merged; the bridge composes a synthetic aggregate.
-    Concatenated,
+/// Deregisters a request's bridge tokens from the registry when dropped — i.e.
+/// when the dispatch call returns. After this, a late downstream `$/progress`
+/// for the finished request no longer routes (it is dropped).
+pub(crate) struct ClientProgressDeregisterGuard {
+    registry: std::sync::Arc<ClientProgressRegistry>,
+    tokens: Vec<NumberOrString>,
+}
+
+impl ClientProgressDeregisterGuard {
+    pub(crate) fn new(
+        registry: std::sync::Arc<ClientProgressRegistry>,
+        tokens: Vec<NumberOrString>,
+    ) -> Self {
+        Self { registry, tokens }
+    }
+}
+
+impl Drop for ClientProgressDeregisterGuard {
+    fn drop(&mut self) {
+        self.registry.deregister(&self.tokens);
+    }
 }
 
 /// Translates a fanned-out request's downstream `$/progress` into a single
 /// lifecycle on the client's `workDoneToken`.
+///
+/// Stage 1 implements the single-downstream (`N = 1`) relay only; multi-server
+/// aggregation (`preferred`/`concatenated`) and failure-path terminal synthesis
+/// arrive in later stages, where the strategy and begun-not-ended tracking are
+/// reintroduced.
 #[derive(Debug)]
 pub(crate) struct ClientProgressAggregator {
     /// The editor-minted token every emitted `$/progress` is reported against.
     client_token: NumberOrString,
-    strategy: ClientProgressStrategy,
     /// Number of downstream servers the request fanned out to.
     server_count: usize,
-    /// Whether a `Begin` has been emitted upstream (pairing invariant).
-    begun: bool,
-    /// Whether the terminal `End` has been emitted (idempotency guard).
+    /// Whether the terminal `End` has been relayed (drop anything after it).
     ended: bool,
 }
 
 impl ClientProgressAggregator {
-    pub(crate) fn new(
-        client_token: NumberOrString,
-        strategy: ClientProgressStrategy,
-        server_count: usize,
-    ) -> Self {
+    pub(crate) fn new(client_token: NumberOrString, server_count: usize) -> Self {
         Self {
             client_token,
-            strategy,
             server_count,
-            begun: false,
             ended: false,
         }
     }
@@ -158,37 +166,26 @@ impl ClientProgressAggregator {
         if self.ended || self.server_count != 1 {
             // N > 1 is not yet aggregated; never forward raw. Anything after the
             // terminal End is also dropped.
-            let _ = &self.strategy;
             return None;
         }
-
-        // N = 1: relay verbatim under the client token, tracking the lifecycle so
-        // the pairing invariant holds.
-        match &value {
-            ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_)) => self.begun = true,
-            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) => self.ended = true,
-            _ => {}
+        // N = 1: relay verbatim under the client token.
+        if matches!(
+            &value,
+            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+        ) {
+            self.ended = true;
         }
         Some(ProgressParams {
             token: self.client_token.clone(),
             value,
         })
     }
-
-    /// Whether a `Begin` was emitted upstream but no `End` yet — i.e. a terminal
-    /// `End` must be synthesized if the request ends without one (failure /
-    /// cancellation / disconnect; ls-bridge-progress-disconnect-cleanup).
-    pub(crate) fn needs_terminal_end(&self) -> bool {
-        self.begun && !self.ended
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::{
-        WorkDoneProgressBegin, WorkDoneProgressEnd, WorkDoneProgressReport,
-    };
+    use tower_lsp_server::ls_types::{WorkDoneProgressBegin, WorkDoneProgressEnd};
 
     fn client_token() -> NumberOrString {
         NumberOrString::String("editor-wd-1".to_string())
@@ -202,26 +199,15 @@ mod tests {
             percentage: None,
         }))
     }
-    fn report() -> ProgressParamsValue {
-        ProgressParamsValue::WorkDone(WorkDoneProgress::Report(WorkDoneProgressReport {
-            cancellable: None,
-            message: Some("50%".to_string()),
-            percentage: Some(50),
-        }))
-    }
     fn end() -> ProgressParamsValue {
         ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd { message: None }))
     }
 
     #[test]
-    fn n1_relays_begin_report_end_under_the_client_token() {
-        let mut agg = ClientProgressAggregator::new(
-            client_token(),
-            ClientProgressStrategy::Preferred { anchor: None },
-            1,
-        );
+    fn n1_relays_begin_then_end_under_the_client_token_then_drops() {
+        let mut agg = ClientProgressAggregator::new(client_token(), 1);
 
-        for value in [begin(), report(), end()] {
+        for value in [begin(), end()] {
             let out = agg
                 .on_downstream_progress("rust-analyzer", value.clone())
                 .expect("N=1 relays the downstream progress");
@@ -231,28 +217,16 @@ mod tests {
                 "value forwarded verbatim"
             );
         }
-    }
-
-    #[test]
-    fn n1_tracks_begin_then_end_for_the_pairing_invariant() {
-        let mut agg = ClientProgressAggregator::new(
-            client_token(),
-            ClientProgressStrategy::Preferred { anchor: None },
-            1,
+        // After the terminal End, further progress is dropped.
+        assert!(
+            agg.on_downstream_progress("rust-analyzer", begin())
+                .is_none(),
+            "no progress is relayed after the End"
         );
-        assert!(!agg.needs_terminal_end(), "nothing begun yet");
-        agg.on_downstream_progress("s", begin());
-        assert!(agg.needs_terminal_end(), "begun, not ended");
-        agg.on_downstream_progress("s", end());
-        assert!(!agg.needs_terminal_end(), "ended normally");
     }
 
     fn agg() -> std::sync::Arc<Mutex<ClientProgressAggregator>> {
-        std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(
-            client_token(),
-            ClientProgressStrategy::Preferred { anchor: None },
-            1,
-        )))
+        std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)))
     }
 
     #[test]
@@ -277,21 +251,11 @@ mod tests {
 
     #[test]
     fn multi_server_progress_is_dropped_until_aggregation_lands() {
-        let mut agg = ClientProgressAggregator::new(
-            client_token(),
-            ClientProgressStrategy::Preferred {
-                anchor: Some("rust-analyzer".to_string()),
-            },
-            2,
-        );
+        let mut agg = ClientProgressAggregator::new(client_token(), 2);
         assert!(
             agg.on_downstream_progress("rust-analyzer", begin())
                 .is_none(),
             "N>1 must not forward raw downstream progress (would duplicate Begins)"
-        );
-        assert!(
-            !agg.needs_terminal_end(),
-            "nothing emitted, nothing to terminate"
         );
     }
 }
