@@ -82,13 +82,15 @@ request just returns its result (today's behavior, minus the strip).
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
   - *preferred, winner already streamed partials*: data is on screen, so promote
-    the accumulated partials into the winner's result and immediately emit a
-    *synthetic* `End` — the downstream is gone and cannot send a real one, so the
-    bridge composes the terminal itself (the same primitive
-    ls-bridge-progress-disconnect-cleanup uses). Do not wait for another
-    candidate (that would freeze the shown data) and do not swap in a different
-    server's result. The result may be incomplete; accepted as graceful
-    degradation.
+    the accumulated partials into the winner's result and complete the request.
+    `partialResultToken` (data) and `workDoneToken` (progress) are separate
+    tokens, so close the *progress* only if a work-done `Begin` is actually
+    open — then emit a *synthetic* `End` (the downstream is gone and cannot send a
+    real one, the same primitive ls-bridge-progress-disconnect-cleanup uses); a
+    winner that streamed only partial-result data without opening work-done
+    progress needs no `End`. Do not wait for another candidate (that would freeze
+    the shown data) and do not swap in a different server's result. The result may
+    be incomplete; accepted as graceful degradation.
   - *preferred, winner produced nothing* (died before any partial result): its
     empty result falls through to the next-priority candidate, exactly as any
     empty result does under preferred. If the dead winner had opened no `Begin`,
@@ -102,7 +104,10 @@ request just returns its result (today's behavior, minus the strip).
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing) and is **dropped from the expected set** (the `n/m`
     denominator shrinks); the others proceed, and `End` fires once the remaining
-    expected results are collected.
+    expected results are collected. If the *anchor* (highest-priority contributor)
+    is the one that fails before opening a `Begin`, the anchor role moves to the
+    next-priority survivor — its `Begin` if it has one, else the silent-anchor
+    synthesis above.
 - **partialResultToken — translate, then merge.** Partial-result chunks carry
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
