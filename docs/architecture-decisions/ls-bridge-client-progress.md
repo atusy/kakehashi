@@ -50,8 +50,8 @@ because the two deliver differently:
   title; only the anchor's own progress is tracked. The winner (the delivered
   source) is usually that anchor, but the priority walk resolves the wildcard
   `Rest` group first-win by earliest non-empty arrival, so a `Rest` member can be
-  the winner without being an anchor: its own progress is **not** shown (no safe a
-  priori title for a latency race), unless it is the sole server (N = 1). A
+  the winner without being an anchor: its own progress is **not** shown (no safe
+  a priori title for a latency race), unless it is the sole server (N = 1). A
   candidate that returns empty, or fails before producing any data, is no winner
   (reserved for the delivered source, possibly a promoted partial prefix), so the
   anchor falls through to the next *named* candidate. The bridge never forwards a
@@ -76,7 +76,7 @@ request just returns its result (today's behavior, minus the strip).
   the sole server was selected via the wildcard: the `Rest`-never-anchor rule
   disambiguates among *racing* contenders, and a single downstream has none — so
   its real `Begin` is safe to forward.
-- **preferred, N > 1.** Preferred short-circuits (it does not wait for the
+- **preferred, N > 1.** This strategy short-circuits (it does not wait for the
   losers), so there is no collection count to report. If the anchor emits its own
   progress, forward its `Begin`/`report`/`End` (real title) and suppress every
   other candidate's progress; if the anchor returns a complete result with no
@@ -162,7 +162,7 @@ bridge composes the terminal rather than relaying a downstream's `End`.
   percentages) into one coherent indicator is messy and rarely meaningful.
   Rejected in favor of one source's progress under *preferred* and a
   bridge-composed aggregate under *concatenated*.
-- **Borrow the anchor's `Begin` under concatenated.** Reuses a real, specific
+- **Borrow the anchor's `Begin` under *concatenated*.** Reuses a real, specific
   title for free, but the concatenated lifecycle outlives the anchor's own work
   (it runs until every contributor is collected), so that title goes stale the
   moment the anchor finishes while others are still pending — and LSP forbids

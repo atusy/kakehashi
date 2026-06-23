@@ -4,7 +4,7 @@
 
 ## Context
 
-Under ls-bridge-work-done-progress the bridge forwards a downstream's
+Under ls-bridge-work-done-progress, the bridge forwards a downstream's
 server-declared progress to the editor: a downstream requests a token with
 `window/workDoneProgress/create`, the bridge mints a unique upstream token,
 forwards the create, and then relays each `$/progress` (begin → report → end)
