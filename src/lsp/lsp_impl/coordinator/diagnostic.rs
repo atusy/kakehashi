@@ -53,6 +53,7 @@ impl DiagnosticScheduler {
             uri,
             snapshot_data,
             self.bridge.pool_arc(),
+            std::sync::Arc::clone(&self.bridge),
             std::sync::Arc::clone(&self.synthetic_diagnostics),
             std::sync::Arc::clone(&self.publisher),
         );

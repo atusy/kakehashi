@@ -244,12 +244,12 @@ policy clean:
   correct positions; this supplies the missing trigger.
 - **Host layer**: the `_self` host source uses the identical model keyed on the
   *host document's* content epoch. Push-driven `_self` servers are eagerly opened
-  on host `didOpen` (#429, implemented; see Lifecycle). Eager **re-sync** on a
-  content-changing host `didChange` — so a push-only host server re-analyzes
-  as-you-type without a host request — is deferred (#431); until then it sees
-  edits only via the lazy request-path sync (save / hover). When that lands (the
-  host path's fingerprint already gates the didChange), the gate and re-merge
-  rules above apply unchanged.
+  on host `didOpen` (#429) and eagerly **re-synced** on edit at the debounced
+  diagnostic cadence (#431) — `eager_sync_host_document_on_servers` runs when the
+  debounce fires, so a push-only host server (skipped by the capability-gated
+  pull) re-analyzes current text rather than stale text. The host path's
+  fingerprint gates the actual didChange; the gate and re-merge rules above apply
+  unchanged.
 
 ### `preferred` as a push stream
 
@@ -499,9 +499,12 @@ because the #380 benefit now outweighs it:
 - Host-layer eager-open (#429): on host `didOpen`, the host document is opened
   eagerly on each `_self` host server (`eager_open_host_document_on_servers`), so
   a push-only host server analyzes + pushes on open rather than only after the
-  first host-bridged request lazily opens it. On-edit re-sync to push-only host
-  servers (as-you-type, without a host request) is still deferred — they see
-  edits via the lazy request-path sync (save / hover), not per-keystroke.
+  first host-bridged request lazily opens it.
+- Host-layer on-edit re-sync (#431): when the debounced diagnostic fires after an
+  edit, `eager_sync_host_document_on_servers` re-syncs the host doc to its `_self`
+  servers, so a push-only host server (skipped by the capability-gated pull)
+  re-analyzes current text. Runs at the debounce cadence (after typing settles),
+  not per-keystroke; pull-capable servers fingerprint-dedup the extra sync.
 
 **Deferred** (staged follow-ups; the code documents each at its site):
 
@@ -510,9 +513,6 @@ because the #380 benefit now outweighs it:
   (lazy re-anchor still keeps *positions* current via the retained pull trigger).
 - Per-source strategy fan-in (`preferred` sticky / `concatenated` visible-walk);
   the staged merge concatenates, with HashMap-nondeterministic cross-source order.
-- On-edit eager re-sync of the host doc to push-only `_self` servers (so they
-  re-analyze as-you-type without a host request); gated on capability
-  classification so pull-capable host servers aren't sent redundant didChanges.
 - Region-invalidation and crash cache eviction.
 - The `pullFallback` / `pushFallback` config toggles and the capability
   classification — without the latter the pull feed and a server's spontaneous

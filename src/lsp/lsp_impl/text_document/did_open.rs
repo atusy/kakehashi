@@ -254,16 +254,10 @@ print("hello")
         );
     }
 
-    /// Host-layer eager-open (#429): the host document is opened (didOpen sent) on
-    /// a `_self` host server directly by the eager-open path. Exercised in
-    /// isolation via `eager_open_host_document_on_servers` (not `did_open_impl`)
-    /// so the host-event synthetic diagnostic pull — which would also open the doc
-    /// — can't mask whether eager-open itself works.
-    #[tokio::test]
-    async fn eager_open_sends_didopen_to_self_host_server() {
-        let (service, _socket) = LspService::new(Kakehashi::new);
-        let server = service.inner();
-
+    /// Register the rust grammar and apply settings with a single `rust_ls` `_self`
+    /// host server (host bridging on for rust). Caller then inserts a ready test
+    /// connection for `rust_ls`.
+    fn configure_rust_self_host(server: &Kakehashi) {
         server
             .language
             .language_registry_for_parallel()
@@ -273,8 +267,8 @@ print("hello")
         language_servers.insert(
             "rust_ls".to_string(),
             BridgeServerConfig {
-                // Inert: `insert_ready_test_connection` below pre-inserts a Ready
-                // handle, so this cmd is never actually spawned.
+                // Inert: the caller pre-inserts a Ready handle via
+                // `insert_ready_test_connection`, so this cmd is never spawned.
                 cmd: vec![
                     "sh".to_string(),
                     "-c".to_string(),
@@ -307,7 +301,19 @@ print("hello")
             languages,
             ..Default::default()
         });
+    }
 
+    /// Host-layer eager-open (#429): the host document is opened (didOpen sent) on
+    /// a `_self` host server directly by the eager-open path. Exercised in
+    /// isolation via `eager_open_host_document_on_servers` (not `did_open_impl`)
+    /// so the host-event synthetic diagnostic pull — which would also open the doc
+    /// — can't mask whether eager-open itself works.
+    #[tokio::test]
+    async fn eager_open_sends_didopen_to_self_host_server() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
         server.bridge.insert_ready_test_connection("rust_ls").await;
 
         let uri = Url::parse("file:///test/host_eager.rs").unwrap();
@@ -331,5 +337,69 @@ print("hello")
         })
         .await
         .expect("eager-open should send didOpen for the host document to the _self host server");
+    }
+
+    /// On-edit host re-sync (#431): a second `eager_sync_host_document_on_servers`
+    /// with changed text sends a versioned `didChange` (version advances to 2), so
+    /// a push-only host server re-analyzes current text instead of stale text. The
+    /// debounced diagnostic path routes through the same method at its cadence.
+    #[tokio::test]
+    async fn eager_sync_resyncs_host_document_on_changed_text() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_resync.rs").unwrap();
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+
+        // First sync opens the doc at version 1.
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            "fn main() {}",
+            configs.clone(),
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first eager-sync should didOpen the host document at version 1");
+
+        // A re-sync with changed text must send a didChange, advancing to version 2.
+        server
+            .bridge
+            .eager_sync_host_document_on_servers(&uri, "rust", "fn other() {}", configs);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    == Some(2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("re-sync with changed text should send a didChange advancing to version 2");
     }
 }
