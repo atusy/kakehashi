@@ -60,7 +60,7 @@ fn setup_client_progress(
     let mut map = HashMap::new();
     let mut minted = Vec::new();
     for config in selected {
-        let token = registry.register(Arc::clone(&aggregator), &config.server_name);
+        let token = registry.register(Arc::clone(&aggregator));
         minted.push(token.clone());
         map.insert(config.server_name, token);
     }
@@ -127,7 +127,14 @@ where
     let client_progress = setup_client_progress(ctx, &pool, &entries);
     let cp_tokens = client_progress.as_ref().map(|(m, _guard)| m);
     let mut join_set = fan_out(ctx, pool, f, &entries, cp_tokens);
-    preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await
+    let result = preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await;
+    // Hold the client-progress guard across the await above (it owns the routing
+    // and the synthetic-terminal-End-on-teardown); tear it down only now, after
+    // the request has settled. The explicit drop documents that the guard must
+    // outlive the fan-in — otherwise a downstream `$/progress` during the request
+    // would have nowhere to route.
+    drop(client_progress);
+    result
 }
 
 /// Server-level aggregation entry point using the concatenated strategy.

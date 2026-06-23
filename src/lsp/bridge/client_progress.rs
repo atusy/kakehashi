@@ -37,14 +37,9 @@ use crate::error::LockResultExt;
 /// Shared (`Arc`) between every reader task and the dispatch path.
 #[derive(Default)]
 pub(crate) struct ClientProgressRegistry {
-    inner: Mutex<HashMap<NumberOrString, ClientProgressRoute>>,
+    inner: Mutex<HashMap<NumberOrString, std::sync::Arc<Mutex<ClientProgressAggregator>>>>,
     /// Monotonic source of unique per-server bridge tokens.
     counter: AtomicU64,
-}
-
-struct ClientProgressRoute {
-    aggregator: std::sync::Arc<Mutex<ClientProgressAggregator>>,
-    server: String,
 }
 
 impl ClientProgressRegistry {
@@ -52,42 +47,34 @@ impl ClientProgressRegistry {
         Self::default()
     }
 
-    /// Mint a unique bridge token for `(aggregator, server)`, register the route,
-    /// and return the token to hand to that downstream as its `workDoneToken`.
+    /// Mint a unique bridge token for one downstream of `aggregator`'s request,
+    /// register the route, and return the token to hand to that downstream as its
+    /// `workDoneToken`.
     pub(crate) fn register(
         &self,
         aggregator: std::sync::Arc<Mutex<ClientProgressAggregator>>,
-        server: &str,
     ) -> NumberOrString {
         let suffix = self.counter.fetch_add(1, Ordering::Relaxed);
         let token = NumberOrString::String(format!("kakehashi/bridge/cprog/{suffix}"));
         self.inner
             .lock()
             .recover_poison("ClientProgressRegistry::register")
-            .insert(
-                token.clone(),
-                ClientProgressRoute {
-                    aggregator,
-                    server: server.to_string(),
-                },
-            );
+            .insert(token.clone(), aggregator);
         token
     }
 
-    /// Resolve an incoming `$/progress` token to its aggregator and originating
-    /// server name. `None` for tokens this registry never minted (e.g. a
-    /// server-declared token, handled elsewhere).
+    /// Resolve an incoming `$/progress` token to its aggregator. `None` for tokens
+    /// this registry never minted (e.g. a server-declared token, handled
+    /// elsewhere).
     pub(crate) fn route(
         &self,
         token: &NumberOrString,
-    ) -> Option<(std::sync::Arc<Mutex<ClientProgressAggregator>>, String)> {
-        let guard = self
-            .inner
+    ) -> Option<std::sync::Arc<Mutex<ClientProgressAggregator>>> {
+        self.inner
             .lock()
-            .recover_poison("ClientProgressRegistry::route");
-        guard
+            .recover_poison("ClientProgressRegistry::route")
             .get(token)
-            .map(|r| (r.aggregator.clone(), r.server.clone()))
+            .cloned()
     }
 
     /// Drop the routes for a finished request's bridge tokens.
@@ -186,30 +173,36 @@ impl ClientProgressAggregator {
         }
     }
 
-    /// Feed one downstream `$/progress` value (from `server`). Returns the
-    /// upstream `$/progress` to forward against the client token, or `None` to
-    /// drop it.
+    /// Feed one downstream `$/progress` value. Returns the upstream `$/progress`
+    /// to forward against the client token, or `None` to drop it.
     ///
     /// Stage 1 handles only the single-downstream case; with more than one
     /// server the progress is dropped (never forwarded raw) until the
     /// `preferred`/`concatenated` stages land.
     pub(crate) fn on_downstream_progress(
         &mut self,
-        _server: &str,
         value: ProgressParamsValue,
     ) -> Option<ProgressParams> {
-        if self.ended || self.server_count != 1 {
-            // N > 1 is not yet aggregated; never forward raw. Anything after the
-            // terminal End is also dropped.
+        let is_begin = matches!(
+            &value,
+            ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_))
+        );
+        if self.ended || self.server_count != 1 || (!self.begun && !is_begin) {
+            // Drop: N > 1 is not yet aggregated (never forward raw); anything after
+            // the terminal End; and any out-of-order `report`/`End` before a
+            // `Begin` — the editor must see a coherent Begin → … → End lifecycle.
             return None;
         }
         // N = 1: relay verbatim under the client token, tracking the lifecycle so
         // a terminal End is guaranteed even if the downstream's own End never
         // arrives (or arrives after teardown).
-        match &value {
-            ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_)) => self.begun = true,
-            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) => self.ended = true,
-            _ => {}
+        if is_begin {
+            self.begun = true;
+        } else if matches!(
+            &value,
+            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+        ) {
+            self.ended = true;
         }
         Some(ProgressParams {
             token: self.client_token.clone(),
@@ -264,7 +257,7 @@ mod tests {
 
         for value in [begin(), end()] {
             let out = agg
-                .on_downstream_progress("rust-analyzer", value.clone())
+                .on_downstream_progress(value.clone())
                 .expect("N=1 relays the downstream progress");
             assert_eq!(out.token, client_token(), "retargeted to the client token");
             assert!(
@@ -274,8 +267,7 @@ mod tests {
         }
         // After the terminal End, further progress is dropped.
         assert!(
-            agg.on_downstream_progress("rust-analyzer", begin())
-                .is_none(),
+            agg.on_downstream_progress(begin()).is_none(),
             "no progress is relayed after the End"
         );
     }
@@ -288,12 +280,15 @@ mod tests {
     fn registry_routes_minted_tokens_and_forgets_deregistered_ones() {
         let reg = ClientProgressRegistry::new();
         let a = agg();
-        let t1 = reg.register(a.clone(), "rust-analyzer");
-        let t2 = reg.register(a.clone(), "pyright");
+        let t1 = reg.register(a.clone());
+        let t2 = reg.register(a.clone());
         assert_ne!(t1, t2, "each (request, server) gets a unique bridge token");
 
-        let (_routed, server) = reg.route(&t1).expect("registered token routes");
-        assert_eq!(server, "rust-analyzer");
+        let routed = reg.route(&t1).expect("registered token routes");
+        assert!(
+            std::sync::Arc::ptr_eq(&routed, &a),
+            "routes to the exact aggregator registered"
+        );
         assert!(
             reg.route(&NumberOrString::Number(99)).is_none(),
             "unknown token does not route"
@@ -308,9 +303,28 @@ mod tests {
     fn multi_server_progress_is_dropped_until_aggregation_lands() {
         let mut agg = ClientProgressAggregator::new(client_token(), 2);
         assert!(
-            agg.on_downstream_progress("rust-analyzer", begin())
-                .is_none(),
+            agg.on_downstream_progress(begin()).is_none(),
             "N>1 must not forward raw downstream progress (would duplicate Begins)"
+        );
+    }
+
+    #[test]
+    fn out_of_order_end_before_begin_is_dropped() {
+        let mut agg = ClientProgressAggregator::new(client_token(), 1);
+        // An `End` before any `Begin` must be dropped — the editor must never see
+        // a terminal for a lifecycle that never began.
+        assert!(
+            agg.on_downstream_progress(end()).is_none(),
+            "End before Begin is dropped"
+        );
+        // A subsequent normal Begin → End still relays.
+        assert!(
+            agg.on_downstream_progress(begin()).is_some(),
+            "Begin relays"
+        );
+        assert!(
+            agg.on_downstream_progress(end()).is_some(),
+            "then End relays"
         );
     }
 
@@ -325,12 +339,9 @@ mod tests {
         let registry = std::sync::Arc::new(ClientProgressRegistry::new());
         let aggregator =
             std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
-        let token = registry.register(aggregator.clone(), "rust-analyzer");
+        let token = registry.register(aggregator.clone());
         // Downstream begins (relayed) but never ends.
-        aggregator
-            .lock()
-            .unwrap()
-            .on_downstream_progress("rust-analyzer", begin());
+        aggregator.lock().unwrap().on_downstream_progress(begin());
 
         drop(ClientProgressDeregisterGuard::new(
             registry.clone(),
@@ -365,11 +376,11 @@ mod tests {
         let registry = std::sync::Arc::new(ClientProgressRegistry::new());
         let aggregator =
             std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
-        let token = registry.register(aggregator.clone(), "rust-analyzer");
+        let token = registry.register(aggregator.clone());
         {
             let mut guard = aggregator.lock().unwrap();
-            guard.on_downstream_progress("rust-analyzer", begin());
-            guard.on_downstream_progress("rust-analyzer", end());
+            guard.on_downstream_progress(begin());
+            guard.on_downstream_progress(end());
         }
 
         drop(ClientProgressDeregisterGuard::new(
@@ -393,7 +404,7 @@ mod tests {
         let registry = std::sync::Arc::new(ClientProgressRegistry::new());
         let aggregator =
             std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
-        let token = registry.register(aggregator.clone(), "rust-analyzer");
+        let token = registry.register(aggregator.clone());
 
         drop(ClientProgressDeregisterGuard::new(
             registry,

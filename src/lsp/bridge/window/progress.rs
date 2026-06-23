@@ -46,11 +46,11 @@ pub(in crate::lsp::bridge) fn forward(
     // fanned-out request, route it to that request's aggregator, which composes a
     // single lifecycle on the editor's own `workDoneToken` and emits it ungated
     // (ls-bridge-client-progress).
-    if let Some((aggregator, server)) = deps.client_progress_registry.route(&params.token) {
+    if let Some(aggregator) = deps.client_progress_registry.route(&params.token) {
         let emitted = aggregator
             .lock()
             .recover_poison("ClientProgressAggregator")
-            .on_downstream_progress(&server, params.value);
+            .on_downstream_progress(params.value);
         if let Some(out) = emitted {
             let _ = deps
                 .upstream_tx
