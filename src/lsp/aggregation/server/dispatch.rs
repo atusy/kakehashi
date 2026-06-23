@@ -64,9 +64,14 @@ fn setup_client_progress(
 /// (ls-bridge-client-progress):
 /// - **N = 1**: the sole selected server — its real `Begin` is safe to forward
 ///   even if wildcard-selected (a single downstream has no racing contender).
-/// - **N > 1**: the **anchor** — the highest-priority *named* candidate in the
-///   priority walk. `Rest`/wildcard members are never anchors (no safe a-priori
-///   title for a latency race), so an all-`Rest` fan-out has no tracked source.
+/// - **N > 1**: the **anchor** — but only when the **top-priority participating
+///   candidate is a *named* server**. `Rest`/wildcard members are never anchors
+///   (no safe a-priori title for a latency race), and the winner is *usually* the
+///   anchor — so a named server that a `Rest` group **outranks** (e.g. priorities
+///   `["*", "zzz"]`, where the wildcard wins first) is not a valid anchor:
+///   tracking it would show its progress while a wildcard member delivers the
+///   result. In that case, and for an all-`Rest` fan-out, there is no tracked
+///   source.
 ///
 /// `None` means no progress is shown for the request. This picks a **single
 /// fixed anchor**; dynamic fall-through re-anchoring (re-tracking the next named
@@ -79,17 +84,20 @@ fn tracked_progress_source(
     if let [only] = selected {
         return Some(only.server_name.clone());
     }
-    // The first *named* entry that actually participates (is selected). Rest
-    // entries are skipped; if no named server is selected the fan-out is
-    // all-wildcard and has no anchor.
-    entries.iter().find_map(|entry| match entry {
-        PriorityEntry::Server(name)
-            if selected.iter().any(|config| &config.server_name == name) =>
-        {
-            Some(name.clone())
+    let participates = |name: &str| selected.iter().any(|c| c.server_name == name);
+    // Walk in priority order to the first *participating* entry: if it is a named
+    // server, it outranks any wildcard and is the anchor; if it is a `Rest` group
+    // with a participating member, the top contender is a wildcard, so there is no
+    // a-priori anchor. (Non-participating entries — e.g. an empty `Rest` — are
+    // skipped.)
+    for entry in entries {
+        match entry {
+            PriorityEntry::Server(name) if participates(name) => return Some(name.clone()),
+            PriorityEntry::Rest(names) if names.iter().any(|n| participates(n)) => return None,
+            _ => {}
         }
-        _ => None,
-    })
+    }
+    None
 }
 
 #[cfg(test)]
@@ -149,18 +157,17 @@ mod tests {
     }
 
     #[test]
-    fn named_anchor_wins_even_when_a_rest_group_precedes_it() {
-        // Walk order `[Rest, Server]` (the `["*", "zzz"]` config shape): the Rest
-        // group is skipped, and the later named server is the anchor.
+    fn no_anchor_when_a_rest_group_outranks_the_named_candidate() {
+        // Walk order `[Rest, Server]` (the `["*", "zzz"]` config shape): the
+        // wildcard group is the top-priority contender (it wins first), so the
+        // lower-priority named server is NOT a valid anchor — tracking it would
+        // show its progress while a wildcard member delivers the result.
         let selected = [config("a"), config("zzz")];
         let entries = [
             PriorityEntry::Rest(vec!["a".to_string()]),
             PriorityEntry::Server("zzz".to_string()),
         ];
-        assert_eq!(
-            tracked_progress_source(&selected, &entries),
-            Some("zzz".to_string())
-        );
+        assert_eq!(tracked_progress_source(&selected, &entries), None);
     }
 
     #[test]
