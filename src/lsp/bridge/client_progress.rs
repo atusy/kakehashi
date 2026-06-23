@@ -14,12 +14,18 @@
 //!
 //! # Staging
 //!
-//! *preferred* (incl. `N = 1`) is implemented: the dispatch path mints a bridge
-//! token solely for the **tracked source** (the sole server at `N = 1`, or the
-//! highest-priority *named* anchor at `N > 1`) and suppresses every other
-//! candidate by handing it no token, so only the tracked source's progress
-//! routes here. *concatenated* aggregation and `partialResultToken` are later
-//! stages; until then a *concatenated* request shows no client progress.
+//! *preferred* is implemented with a **single fixed anchor**: the dispatch path
+//! mints a bridge token solely for the **tracked source** (the sole server at
+//! `N = 1`, or the highest-priority *named* anchor at `N > 1`) and suppresses
+//! every other candidate by handing it no token, so only the tracked source's
+//! progress routes here. If that anchor returns empty and the request falls
+//! through to a lower-priority candidate, the editor sees no *new* progress for
+//! it; the open `Begin` is closed by the synthetic terminal `End` at request
+//! completion (an ADR-sanctioned branch of the pairing invariant). Deferred to
+//! later stages: **dynamic fall-through re-anchoring** (showing the *next* named
+//! anchor's real progress/`End`), *concatenated* aggregation, and
+//! `partialResultToken`. Until then a *concatenated* request shows no client
+//! progress.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

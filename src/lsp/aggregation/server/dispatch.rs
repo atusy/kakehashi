@@ -68,7 +68,10 @@ fn setup_client_progress(
 ///   priority walk. `Rest`/wildcard members are never anchors (no safe a-priori
 ///   title for a latency race), so an all-`Rest` fan-out has no tracked source.
 ///
-/// `None` means no progress is shown for the request.
+/// `None` means no progress is shown for the request. This picks a **single
+/// fixed anchor**; dynamic fall-through re-anchoring (re-tracking the next named
+/// candidate when this one returns empty) is a later stage — on fall-through the
+/// open `Begin` is instead closed by the synthetic terminal `End`.
 fn tracked_progress_source(
     selected: &[ResolvedServerConfig],
     entries: &[PriorityEntry],
@@ -142,6 +145,21 @@ mod tests {
         assert_eq!(
             tracked_progress_source(&selected, &entries),
             Some("ra".to_string())
+        );
+    }
+
+    #[test]
+    fn named_anchor_wins_even_when_a_rest_group_precedes_it() {
+        // Walk order `[Rest, Server]` (the `["*", "zzz"]` config shape): the Rest
+        // group is skipped, and the later named server is the anchor.
+        let selected = [config("a"), config("zzz")];
+        let entries = [
+            PriorityEntry::Rest(vec!["a".to_string()]),
+            PriorityEntry::Server("zzz".to_string()),
+        ];
+        assert_eq!(
+            tracked_progress_source(&selected, &entries),
+            Some("zzz".to_string())
         );
     }
 
