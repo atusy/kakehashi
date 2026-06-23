@@ -10,13 +10,10 @@
 //! feed the same expansion to fan-out (membership + spawn order) and fan-in
 //! (decision order), so the two sides can never disagree.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
-
-use std::collections::HashMap;
-use std::sync::{Arc as StdArc, Mutex};
+use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::ls_types::NumberOrString;
 
@@ -47,17 +44,25 @@ fn setup_client_progress(
 )> {
     let client_token = ctx.client_progress_token.clone()?;
     let selected = select_servers(&ctx.configs, entries);
-    let aggregator = StdArc::new(Mutex::new(ClientProgressAggregator::new(
+    // Stage 1 bridges client progress only for the single-downstream case. With
+    // more than one server we mint nothing — those downstreams get no
+    // `workDoneToken` and emit no `$/progress` — so multi-server fan-out stays
+    // exactly as today (no wasted traffic) until the preferred/concatenated
+    // stages land.
+    if selected.len() != 1 {
+        return None;
+    }
+    let aggregator = Arc::new(Mutex::new(ClientProgressAggregator::new(
         client_token,
         selected.len(),
     )));
-    let registry = StdArc::clone(pool.client_progress_registry());
+    let registry = Arc::clone(pool.client_progress_registry());
     let mut map = HashMap::new();
     let mut minted = Vec::new();
-    for config in &selected {
-        let token = registry.register(StdArc::clone(&aggregator), &config.server_name);
+    for config in selected {
+        let token = registry.register(Arc::clone(&aggregator), &config.server_name);
         minted.push(token.clone());
-        map.insert(config.server_name.clone(), token);
+        map.insert(config.server_name, token);
     }
     let guard =
         ClientProgressDeregisterGuard::new(registry, minted, aggregator, pool.upstream_tx());
@@ -116,8 +121,9 @@ where
     Fut: Future<Output = io::Result<T>> + Send + 'static,
 {
     let entries = expanded_entries(ctx);
-    // Stage 1: aggregate only the single-downstream (N=1) case; the aggregator
-    // drops N>1 progress until the preferred/concatenated stages land.
+    // Stage 1: `setup_client_progress` bridges client progress only for the
+    // single-downstream case (it returns `None` for N>1, keeping fan-out
+    // non-regressing) and only when the request carries a `workDoneToken`.
     let client_progress = setup_client_progress(ctx, &pool, &entries);
     let cp_tokens = client_progress.as_ref().map(|(m, _guard)| m);
     let mut join_set = fan_out(ctx, pool, f, &entries, cp_tokens);

@@ -24,7 +24,7 @@ impl Kakehashi {
         let lsp_uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
-        let work_done_token = params.work_done_progress_params.work_done_token.clone();
+        let work_done_token = params.work_done_progress_params.work_done_token;
 
         let virt =
             self.references_virt_layer(&lsp_uri, position, include_declaration, work_done_token);
