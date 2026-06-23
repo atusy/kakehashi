@@ -26,6 +26,7 @@
 
 mod actor;
 mod client;
+mod client_progress;
 mod connection;
 pub(crate) mod coordinator;
 mod inbound_request_registry;
