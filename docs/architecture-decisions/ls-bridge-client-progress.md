@@ -17,10 +17,11 @@ languages, fanned out per language-server-bridge-request-strategies). Each
 downstream may emit `$/progress` and partial results against the same
 client-provided token. Forwarding them verbatim duplicates the lifecycle (N
 `Begin`, N `End`) and corrupts the indicator; concatenating result chunks
-verbatim mis-orders data. So **under fan-out the bridge must own the upstream
-terminal** — it cannot blindly relay all N downstreams' `End`s/responses (they
-collide); it forwards exactly one or composes one, as the Decision details. (A
-request that reaches a single server is just relayed.)
+verbatim mis-orders data. So, under fan-out,
+**the bridge must own the upstream terminal**: it cannot blindly relay all N
+downstreams' `End`s/responses (they collide); it forwards exactly one or composes
+one, as the Decision details. (A request that reaches a single server is just
+relayed.)
 
 Today the bridge does not forward client-provided tokens to downstreams at all.
 The host raw-request path strips them (`strip_progress_tokens`,
