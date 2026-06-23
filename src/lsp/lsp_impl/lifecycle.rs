@@ -1549,6 +1549,174 @@ mod tests {
         let _ = loop_handle.await;
     }
 
+    /// Re-create / stale-eviction edge: when a begun token's upstream id is
+    /// evicted (the downstream re-creates the token), the stale id is forgotten
+    /// — synthesizing its `End` so the stale indicator clears — while the new
+    /// upstream id runs an independent lifecycle, ended normally with no second
+    /// `End`. The two ids stay separate through `begun_tokens`
+    /// (ls-bridge-progress-disconnect-cleanup).
+    #[tokio::test]
+    async fn forwarding_loop_keeps_recreated_token_separate_from_evicted_one() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressEnd,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        let stale = NumberOrString::String("kakehashi/bridge/progress/0".to_string());
+        let fresh = NumberOrString::String("kakehashi/bridge/progress/1".to_string());
+        let begin = |token: &NumberOrString| UpstreamNotification::Progress {
+            params: ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        };
+
+        // Stale token: created (accept) then begun (forwarded).
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: stale.clone(),
+        })
+        .unwrap();
+        let req = requests.next().await.expect("create(stale) emitted");
+        assert_eq!(req.method(), "window/workDoneProgress/create");
+        responses
+            .send(Response::from_ok(
+                req.id().unwrap().clone(),
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        tx.send(begin(&stale)).unwrap();
+        let p = requests.next().await.expect("begin(stale) forwarded");
+        assert_eq!(p.method(), "$/progress");
+
+        // Re-create evicts the stale upstream id: forget(stale). The begun stale
+        // id must be ended so its indicator clears.
+        tx.send(UpstreamNotification::ForgetWorkDoneProgress(vec![
+            stale.clone(),
+        ]))
+        .unwrap();
+        let end = requests
+            .next()
+            .await
+            .expect("synthetic End(stale) forwarded");
+        assert_eq!(end.method(), "$/progress");
+        let end: ProgressParams =
+            serde_json::from_value(end.params().expect("has params").clone()).unwrap();
+        assert_eq!(end.token, stale, "synthetic End targets the evicted id");
+        assert!(matches!(
+            end.value,
+            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+        ));
+
+        // Fresh token: independent lifecycle, ended normally.
+        tx.send(UpstreamNotification::CreateWorkDoneProgress {
+            token: fresh.clone(),
+        })
+        .unwrap();
+        let req = requests.next().await.expect("create(fresh) emitted");
+        assert_eq!(req.method(), "window/workDoneProgress/create");
+        responses
+            .send(Response::from_ok(
+                req.id().unwrap().clone(),
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        tx.send(begin(&fresh)).unwrap();
+        let p = requests.next().await.expect("begin(fresh) forwarded");
+        assert_eq!(p.method(), "$/progress");
+        tx.send(UpstreamNotification::Progress {
+            params: ProgressParams {
+                token: fresh.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                    message: None,
+                })),
+            },
+        })
+        .unwrap();
+        let p = requests.next().await.expect("end(fresh) forwarded");
+        assert_eq!(p.method(), "$/progress");
+
+        // The fresh token ended normally, so its later purge synthesizes nothing.
+        tx.send(UpstreamNotification::ForgetWorkDoneProgress(vec![
+            fresh.clone(),
+        ]))
+        .unwrap();
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        let next = requests.next().await.expect("a follow-up request emitted");
+        assert_eq!(
+            next.method(),
+            "workspace/diagnostic/refresh",
+            "fresh token was ended normally; its purge must synthesize no second End"
+        );
+        responses
+            .send(Response::from_ok(
+                next.id().unwrap().clone(),
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
     /// Test that upstream_forwarding_loop exits when its CancellationToken is cancelled,
     /// even if the channel is still open.
     #[tokio::test]
