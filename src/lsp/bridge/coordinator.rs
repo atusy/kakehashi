@@ -92,12 +92,17 @@ pub(crate) struct BridgeCoordinator {
     /// - Host document is closed while tasks wait for server readiness
     /// - Rapid did_change events spawn many overlapping batches
     eager_open_tasks: DashMap<Url, EagerOpenBatch>,
+    /// Generation counter for host-layer eager-open batches (#429); separate from
+    /// `eager_open_generation` so the two paths never alias.
+    host_eager_open_generation: std::sync::atomic::AtomicU64,
     /// Host-layer eager-open tasks, keyed by host document URI (#429). Separate
     /// from `eager_open_tasks` because the host path fires on `didOpen` for the
-    /// real host doc (no injections, no per-`didChange` superseding), so a plain
-    /// abort-old-on-new per URI suffices. Cancelled on `didClose` (before the host
-    /// doc is closed) to avoid orphan-opening a doc whose `didClose` already ran.
-    host_eager_open_tasks: DashMap<Url, Vec<tokio::task::AbortHandle>>,
+    /// real host doc (no injections). Uses the same generation/placeholder shape
+    /// as the virt path so the spawn→register window is closed: a concurrent
+    /// `cancel_host_eager_open` (didClose) or `abort_all_eager_open` (shutdown)
+    /// removes the entry, and any handle registered afterwards is aborted on the
+    /// spot instead of leaking a task that could open a connection post-cancel.
+    host_eager_open_tasks: DashMap<Url, EagerOpenBatch>,
 }
 
 impl BridgeCoordinator {
@@ -111,6 +116,7 @@ impl BridgeCoordinator {
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
+            host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
         }
     }
@@ -132,6 +138,7 @@ impl BridgeCoordinator {
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
+            host_eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             host_eager_open_tasks: DashMap::new(),
         }
     }
@@ -551,7 +558,15 @@ impl BridgeCoordinator {
             return;
         }
 
-        let mut handles = Vec::with_capacity(configs.len());
+        // Supersede the previous batch (abort + reset to an empty placeholder)
+        // BEFORE spawning, then register each handle against this generation. This
+        // closes the spawn→register window: a concurrent `cancel_host_eager_open`
+        // (didClose) or `abort_all_eager_open` (shutdown) removes the entry, so a
+        // handle registered afterwards is aborted on the spot rather than leaking a
+        // task that could open a connection post-cancel — the same shape the region
+        // path uses.
+        let generation = self.supersede_host_eager_open(host_uri);
+
         for config in configs {
             let pool = self.pool_arc();
             let host_uri_owned = host_uri.clone();
@@ -573,25 +588,53 @@ impl BridgeCoordinator {
                 )
                 .await;
             });
-            handles.push(task.abort_handle());
+            self.push_or_abort_host_eager_open_handle(host_uri, task.abort_handle(), generation);
         }
+    }
 
-        // Replace + abort the previous batch (rare: a second didOpen without a
-        // didClose). NOTE: unlike the region path — which inserts a placeholder
-        // under `supersede_eager_open_tasks` BEFORE spawning to close it — the host
-        // path leaves the spawn→insert window open: a concurrent didClose's
-        // `cancel_host_eager_open` between the spawns above and this insert finds no
-        // entry, so those tasks aren't aborted and one may `didOpen` after the doc's
-        // didClose. That residue is benign: the #421 push-accept guard checks the
-        // editor `DocumentStore` (not `host_documents`), so a closed doc can't show
-        // phantom diagnostics; the stale `host_documents` entry self-heals on
-        // reopen (same-fingerprint no-op) or on connection respawn (retain purge).
-        if let Some(previous) = self.host_eager_open_tasks.insert(host_uri.clone(), handles) {
-            for handle in previous {
-                if !handle.is_finished() {
-                    handle.abort();
+    /// Supersede the host eager-open batch for `uri` (abort old handles + reset to
+    /// an empty placeholder under one shard lock), returning the new generation.
+    /// Mirrors `supersede_eager_open_tasks` for the host path.
+    fn supersede_host_eager_open(&self, uri: &Url) -> u64 {
+        let generation = self
+            .host_eager_open_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use dashmap::mapref::entry::Entry;
+        match self.host_eager_open_tasks.entry(uri.clone()) {
+            Entry::Occupied(mut entry) => {
+                let batch = entry.get_mut();
+                let prev = std::mem::take(&mut batch.handles);
+                batch.generation = generation;
+                for handle in prev {
+                    if !handle.is_finished() {
+                        handle.abort();
+                    }
                 }
             }
+            Entry::Vacant(entry) => {
+                entry.insert(EagerOpenBatch {
+                    generation,
+                    handles: Vec::new(),
+                });
+            }
+        }
+        generation
+    }
+
+    /// Push a host eager-open abort handle into its batch, or abort it if the entry
+    /// was removed (cancel/shutdown) or its generation is stale (a newer batch
+    /// superseded it). Mirrors `push_or_abort_eager_open_handle`.
+    fn push_or_abort_host_eager_open_handle(
+        &self,
+        uri: &Url,
+        handle: tokio::task::AbortHandle,
+        expected_generation: u64,
+    ) {
+        match self.host_eager_open_tasks.get_mut(uri) {
+            Some(mut entry) if entry.value().generation == expected_generation => {
+                entry.value_mut().handles.push(handle);
+            }
+            _ => handle.abort(),
         }
     }
 
@@ -600,8 +643,8 @@ impl BridgeCoordinator {
     /// task still waiting for server readiness can't open a doc whose `didClose`
     /// already ran.
     pub(crate) fn cancel_host_eager_open(&self, host_uri: &Url) {
-        if let Some((_, handles)) = self.host_eager_open_tasks.remove(host_uri) {
-            for handle in handles {
+        if let Some((_, batch)) = self.host_eager_open_tasks.remove(host_uri) {
+            for handle in batch.handles {
                 if !handle.is_finished() {
                     handle.abort();
                 }
@@ -759,6 +802,19 @@ impl BridgeCoordinator {
             }
             false // remove entry
         });
+        // Drain the host-layer eager-open batch too (#429): otherwise a host
+        // eager-open still waiting for server readiness could spawn a connection
+        // or queue a didOpen during shutdown. `retain` aborts + removes under the
+        // shard lock, so a handle being registered concurrently (spawn→register
+        // window) either lands before this drain and is aborted here, or finds the
+        // entry already gone and is aborted by `push_or_abort_host_eager_open_handle`.
+        self.host_eager_open_tasks.retain(|_uri, batch| {
+            for handle in batch.handles.iter() {
+                handle.abort();
+                count += 1;
+            }
+            false // remove entry
+        });
         if count > 0 {
             log::debug!(
                 target: "kakehashi::bridge",
@@ -796,6 +852,34 @@ mod tests {
     use super::*;
     use crate::config::LanguageSettings;
     use crate::config::settings::BridgeLanguageConfig;
+
+    /// Shutdown's `abort_all_eager_open` must drain the host-layer eager-open
+    /// batch too (#429), not only the virt `eager_open_tasks`.
+    #[tokio::test]
+    async fn abort_all_eager_open_drains_host_batch() {
+        let coordinator = BridgeCoordinator::new();
+        let uri = Url::parse("file:///host_shutdown.lua").unwrap();
+        // A never-completing task stands in for a host eager-open still waiting on
+        // server readiness at shutdown.
+        let task = tokio::spawn(std::future::pending::<()>());
+        coordinator.host_eager_open_tasks.insert(
+            uri.clone(),
+            EagerOpenBatch {
+                generation: 0,
+                handles: vec![task.abort_handle()],
+            },
+        );
+        assert!(coordinator.host_eager_open_tasks.contains_key(&uri));
+
+        coordinator.abort_all_eager_open();
+
+        assert!(
+            coordinator.host_eager_open_tasks.is_empty(),
+            "host eager-open batch must be drained on shutdown"
+        );
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "the host eager-open task was aborted");
+    }
 
     #[test]
     fn test_get_config_respects_bridge_filter() {
