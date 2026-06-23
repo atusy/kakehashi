@@ -70,12 +70,11 @@ impl DiagnosticPublisher {
     /// Record a `_self` host-layer push and republish the host (host-document-bridge).
     ///
     /// A host server pushes for the **real** host URI in host coordinates. Accept
-    /// it only when that URI names an **open** document whose language opts into
-    /// `_self` host bridging — which drops the common stray case, a push for a
-    /// workspace file the editor doesn't have open. The gate does *not* verify the
-    /// pushing server is one of the configured host servers; that per-server
-    /// classification is deferred (see the cache module's staging note). Host
-    /// diagnostics need no coordinate transform.
+    /// it only when that URI names an **open** document AND the pushing `server` is
+    /// a configured `_self` host server for that document's language. This drops
+    /// both the common stray case (a push for a workspace file the editor doesn't
+    /// have open) and a real-URI push from a server that isn't a host server for
+    /// this language. Host diagnostics need no coordinate transform.
     pub(crate) async fn publish_host_push(
         &self,
         host_uri: &str,
@@ -89,13 +88,14 @@ impl DiagnosticPublisher {
             return; // not an open document
         };
         let settings = self.settings_manager.load_settings();
-        if self
+        let is_host_server = self
             .bridge
             .get_host_configs_for_language(&settings, &language_name)
-            .is_empty()
-        {
-            // `_self` host bridging is off for this language, or no host server is
-            // configured — this real-URI push is not a host-layer contribution.
+            .iter()
+            .any(|config| config.server_name == server);
+        if !is_host_server {
+            // `_self` host bridging is off for this language, or `server` is not a
+            // configured host server for it — not a host-layer contribution.
             return;
         }
         self.aggregator
@@ -400,6 +400,33 @@ mod tests {
         assert!(
             server.diagnostics.snapshot(&uri).is_empty(),
             "a push for a language without _self host bridging must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_push_dropped_for_non_host_server() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        // rust_ls is the configured host server; _self is enabled for rust.
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        // The push comes from a server that is NOT a configured host server for rust.
+        DiagnosticPublisher::new(server)
+            .publish_host_push(uri.as_str(), "some_other_server".to_string(), vec![diag("z")])
+            .await;
+
+        assert!(
+            server.diagnostics.snapshot(&uri).is_empty(),
+            "a push from a server that is not a host server for the language must be dropped"
         );
     }
 }
