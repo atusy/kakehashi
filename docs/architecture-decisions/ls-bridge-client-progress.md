@@ -47,9 +47,10 @@ stays consistent with the result actually delivered: the `End` coincides with th
 result being complete, and no `report` carries data the editor will not receive.
 **Only the winner's own progress is ever tracked**; other contributors influence
 the lifecycle solely by *completing* (their result arriving), never through their
-own `$/progress`. So the `Begin` title comes from the winner, or (under
-*concatenated*) from a bridge-owned synthetic when the winner emits none — never
-from an arbitrary non-winner.
+own `$/progress`. So the `Begin` title comes from the current priority anchor —
+normally the delivered winner, or (under *concatenated*) a bridge-owned synthetic
+when the anchor is silent — never an arbitrary non-anchor. (One documented edge:
+after a fall-through, an earlier anchor's title can linger; see Consequences.)
 The winner is chosen by **priority, not latency**: a latency anchor could put the
 title and progress on one server while the delivered result comes from another.
 
@@ -86,9 +87,10 @@ request just returns its result (today's behavior, minus the strip).
   `Cancelled`). When the lifecycle tracks a single source to completion (N = 1, or
   *preferred*), that `End` is the source's real one; under *concatenated* the
   bridge emits a single aggregate-timed `End` and suppresses the winner's own
-  (which fires before collection finishes). If the source cannot send one (it
-  died), the bridge synthesizes it. A request that opened no `Begin` emits no
-  `End`. (The per-branch rules below are instances of this invariant.)
+  (which fires before collection finishes). If the source cannot send one — it
+  died, or the request was cancelled (the fan-in aborts the downstreams) — the
+  bridge synthesizes it. A request that opened no `Begin` emits no `End`. (The
+  per-branch rules below are instances of this invariant.)
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
   - *preferred, winner already streamed partials*: data is on screen, so promote
@@ -173,8 +175,9 @@ bridge composes the terminal rather than relaying a downstream's.
 - partialResult streaming becomes possible without mis-translated locations.
 - Progress engages only when meaningful: a fast or single-server request with no
   downstream progress shows nothing, so there is no spurious spinner. The `Begin`
-  title always reflects the winner (or a neutral bridge title), never an
-  arbitrary server.
+  title reflects the priority anchor (or a neutral bridge title), never an
+  arbitrary server — apart from the rare lingering-title case after fall-through
+  noted below.
 - Failure degrades gracefully: if data was shown the editor keeps it and the
   lifecycle terminates cleanly; if not, the request falls through to the next
   server like any empty result.
