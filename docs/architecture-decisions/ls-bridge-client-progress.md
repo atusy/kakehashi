@@ -60,13 +60,13 @@ because the two deliver differently:
   non-anchor's `Begin` as the title. (One documented edge: after a fall-through,
   an earlier anchor's title can linger; see Consequences.)
 - *concatenated* merges **all** contributors, so no single source owns the title:
-  the bridge **always composes its own synthetic neutral `Begin`** (never
-  borrowing a downstream's title; e.g. a request-derived one) and reports
-  collection progress,
-  **ignoring every downstream's own `$/progress`**. This trades per-server
-  granularity for a title
-  that stays accurate across the whole aggregate — borrowing one contributor's
-  title would go stale the moment that contributor finishes while others are
+  when progress is shown at all (see the engages-only-when-staggered rule below)
+  the bridge **composes its own synthetic neutral `Begin`** (never borrowing a
+  downstream's title; e.g. a request-derived one) and reports collection
+  progress, **ignoring every downstream's own `$/progress`**. This trades
+  per-server granularity for a title that stays accurate across the whole
+  aggregate — borrowing one contributor's title would go stale the moment that
+  contributor finishes while others are
   still pending (see Consequences).
 
 The lifecycle engages only when there is progress worth showing; otherwise the
