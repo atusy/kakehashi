@@ -17,10 +17,10 @@ languages, fanned out per language-server-bridge-request-strategies). Each
 downstream may emit `$/progress` and partial results against the same
 client-provided token. Forwarding them verbatim duplicates the lifecycle (N
 `Begin`, N `End`) and corrupts the indicator; concatenating result chunks
-verbatim mis-orders data. So
-**under fan-out the bridge composes the upstream terminal itself** — it
-aggregates N downstreams and does not simply relay one downstream's `End` or
-final response (as it could for a request that reaches a single server).
+verbatim mis-orders data. So **under fan-out the bridge must own the upstream
+terminal** — it cannot blindly relay all N downstreams' `End`s/responses (they
+collide); it forwards exactly one or composes one, as the Decision details. (A
+request that reaches a single server is just relayed.)
 
 Today the bridge does not forward client-provided tokens to downstreams at all.
 The host raw-request path strips them (`strip_progress_tokens`,
@@ -93,8 +93,9 @@ request just returns its result (today's behavior, minus the strip).
     — see Consequences) and only `report`/`End` re-anchor onto the new winner.
     This recurses down the priority order.
   - *concatenated*: a failed contributor contributes whatever it already streamed
-    (possibly nothing); the collection count adjusts and the others proceed, with
-    `End` once the rest are collected.
+    (possibly nothing) and is **dropped from the expected set** (the `n/m`
+    denominator shrinks); the others proceed, and `End` fires once the remaining
+    expected results are collected.
 - **partialResultToken — translate, then merge.** Partial-result chunks carry
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
@@ -170,9 +171,9 @@ bridge composes the terminal rather than relaying a downstream's.
 - Namespacing is unnecessary here (client tokens are already unique), so the
   `ProgressRegistry` of ls-bridge-work-done-progress is not involved; this path
   is distinct from server-declared progress.
-- Under fan-out the bridge composes the upstream terminal `End` and response (it
-  aggregates the downstreams), so failure handling changes only that payload, not
-  the mechanism.
+- Under fan-out the bridge owns the upstream terminal — relaying the winner's
+  under *preferred*, composing one under *concatenated* and on failure — so
+  failure handling changes only that payload, not the mechanism.
 - A fast *concatenated* fan-out can briefly flash `Begin`→`End`; editors
   typically debounce short-lived progress, so it is rarely visible.
 

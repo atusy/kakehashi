@@ -1,6 +1,6 @@
 # LS Bridge Progress Disconnect Cleanup
 
-**Related Decisions**: [ls-bridge-work-done-progress](ls-bridge-work-done-progress.md), [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md), [ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)
+**Related Decisions**: [ls-bridge-work-done-progress](ls-bridge-work-done-progress.md), [ls-bridge-client-progress](ls-bridge-client-progress.md), [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md), [ls-bridge-graceful-shutdown](ls-bridge-graceful-shutdown.md)
 
 ## Context
 
@@ -19,8 +19,8 @@ connection's mappings and the forwarding loop drops their admissions (the
 editor.
 
 The consequence is a **dangling progress indicator**: the editor created the
-progress on `Begin`, never receives an `End`, and leaves the spinner up
-indefinitely. Some editors offer no way to dismiss a progress they believe is
+progress token on `window/workDoneProgress/create`, the downstream started it
+with `Begin`, but no `End` ever arrives, so the spinner stays up indefinitely. Some editors offer no way to dismiss a progress they believe is
 still running. Work-done progress is a strict begin/end lifecycle, and the
 bridge currently breaks it on the disconnect path.
 
@@ -31,17 +31,19 @@ When a connection's reader task exits, the bridge
 token that connection owned and forwards it to the editor, in addition to the
 existing mapping purge and admission cleanup.
 
-- The set of tokens is exactly the live upstream tokens the registry already
-  returns when purging the connection — the same list that drives the
-  `ForgetWorkDoneProgress` admission cleanup. The synthetic `End` is emitted for
-  each before (or as) that admission is forgotten, so the editor sees one clean
-  terminal per token.
-- The synthetic `End` passes through the same `created_tokens` admission gate the
-  forwarding loop already applies to real progress: a token is ended only if the
-  editor *accepted* its `window/workDoneProgress/create` (the create was
-  admitted, not merely forwarded). A create the editor rejected or that timed out
-  is not admitted, so it never receives a spurious terminal — and the editor
-  never sees an `End` for a progress it was never asked to create.
+- The bridge ends only tokens that are **begun but not yet ended** — those whose
+  `Begin` was already forwarded to the editor with no matching `End`. A token
+  whose `window/workDoneProgress/create` the editor accepted but whose `Begin`
+  was never forwarded (the downstream died between create and begin) has no
+  visible progress to terminate, so it gets no synthetic `End` — its mapping is
+  simply purged. This keeps every emitted `End` paired with a real `Begin`, and a
+  create the editor rejected likewise never receives a terminal.
+- Tracking the begun-not-ended set is cheap: the forwarding loop already relays
+  each token's `Begin` and `End`, so it marks a token in-progress when it forwards
+  the `Begin` and clears it on the `End`. On connection teardown the bridge
+  synthesizes an `End` for each of that connection's tokens still in this set,
+  alongside the existing registry purge / `ForgetWorkDoneProgress` admission
+  cleanup.
 - The synthetic `End` carries no message; the editor needs only the terminal to
   clear the indicator.
 
@@ -93,9 +95,9 @@ ls-bridge-client-progress relies on for client-provided tokens.
 - Scope is **server-declared** tokens (the ls-bridge-work-done-progress path).
   Client-provided tokens have their own terminal handling under
   ls-bridge-client-progress.
-- Shares the synthetic-terminal-`End` primitive with ls-bridge-client-progress;
-  both rely on the bridge composing the upstream terminal rather than relaying a
-  single downstream's.
+- Shares the synthetic-terminal-`End` primitive with ls-bridge-client-progress:
+  when the source cannot send its own terminal (here a disconnected downstream;
+  there a failed winner), the bridge composes one.
 
 ## Decision–Implementation Gap
 
