@@ -30,42 +30,128 @@ use super::fan_out::{FanOutTask, fan_out, select_servers};
 use super::priority::{PriorityEntry, entry_names, expand_priorities, truncate_entries};
 
 /// Set up client-progress aggregation for a fanned-out request that carries a
-/// `workDoneToken`: create the aggregator, mint+register a bridge token per
-/// selected server, and return the `server → token` map (handed to `fan_out`)
-/// plus a guard that deregisters the tokens when the dispatch returns
-/// (ls-bridge-client-progress). Returns `None` when there is no client token.
+/// `workDoneToken`: create the aggregator, mint+register a bridge token for the
+/// **tracked source** only (the sole server at N=1, or the named anchor at N>1),
+/// and return the `server → token` map (handed to `fan_out`) plus a guard that
+/// deregisters the token when the dispatch returns (ls-bridge-client-progress).
+/// Returns `None` when there is no client token or no tracked source.
 fn setup_client_progress(
     ctx: &DocumentRequestContext,
     pool: &LanguageServerPool,
     selected: &[ResolvedServerConfig],
+    entries: &[PriorityEntry],
 ) -> Option<(
     HashMap<String, NumberOrString>,
     ClientProgressDeregisterGuard,
 )> {
     let client_token = ctx.client_progress_token.clone()?;
-    // Stage 1 bridges client progress only for the single-downstream case. With
-    // more than one server we mint nothing — those downstreams get no
-    // `workDoneToken` and emit no `$/progress` — so multi-server fan-out stays
-    // exactly as today (no wasted traffic) until the preferred/concatenated
-    // stages land.
-    if selected.len() != 1 {
-        return None;
-    }
-    let aggregator = Arc::new(Mutex::new(ClientProgressAggregator::new(
-        client_token,
-        selected.len(),
-    )));
+    // Under *preferred*, only the tracked source's progress is shown; every other
+    // candidate is suppressed by handing it no `workDoneToken` (so it emits no
+    // `$/progress` — no wasted traffic). With no tracked source (an all-`Rest`
+    // N>1 fan-out) nothing is minted and the editor sees no progress.
+    let tracked = tracked_progress_source(selected, entries)?;
+    let aggregator = Arc::new(Mutex::new(ClientProgressAggregator::new(client_token)));
     let registry = Arc::clone(pool.client_progress_registry());
+    let token = registry.register(Arc::clone(&aggregator));
     let mut map = HashMap::new();
-    let mut minted = Vec::new();
-    for config in selected {
-        let token = registry.register(Arc::clone(&aggregator));
-        minted.push(token.clone());
-        map.insert(config.server_name.clone(), token);
-    }
+    map.insert(tracked, token.clone());
     let guard =
-        ClientProgressDeregisterGuard::new(registry, minted, aggregator, pool.upstream_tx());
+        ClientProgressDeregisterGuard::new(registry, vec![token], aggregator, pool.upstream_tx());
     Some((map, guard))
+}
+
+/// The server whose `$/progress` the editor sees under *preferred*
+/// (ls-bridge-client-progress):
+/// - **N = 1**: the sole selected server — its real `Begin` is safe to forward
+///   even if wildcard-selected (a single downstream has no racing contender).
+/// - **N > 1**: the **anchor** — the highest-priority *named* candidate in the
+///   priority walk. `Rest`/wildcard members are never anchors (no safe a-priori
+///   title for a latency race), so an all-`Rest` fan-out has no tracked source.
+///
+/// `None` means no progress is shown for the request.
+fn tracked_progress_source(
+    selected: &[ResolvedServerConfig],
+    entries: &[PriorityEntry],
+) -> Option<String> {
+    if let [only] = selected {
+        return Some(only.server_name.clone());
+    }
+    // The first *named* entry that actually participates (is selected). Rest
+    // entries are skipped; if no named server is selected the fan-out is
+    // all-wildcard and has no anchor.
+    entries.iter().find_map(|entry| match entry {
+        PriorityEntry::Server(name)
+            if selected.iter().any(|config| &config.server_name == name) =>
+        {
+            Some(name.clone())
+        }
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::BridgeServerConfig;
+
+    fn config(name: &str) -> ResolvedServerConfig {
+        ResolvedServerConfig {
+            server_name: name.to_string(),
+            config: Arc::new(BridgeServerConfig {
+                cmd: vec![name.to_string()],
+                languages: vec![],
+                initialization_options: None,
+                root_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn tracked_source_is_the_sole_server_at_n1() {
+        // N=1 relays the sole server even when wildcard-selected.
+        let selected = [config("rust-analyzer")];
+        let entries = [PriorityEntry::Rest(vec!["rust-analyzer".to_string()])];
+        assert_eq!(
+            tracked_progress_source(&selected, &entries),
+            Some("rust-analyzer".to_string())
+        );
+    }
+
+    #[test]
+    fn tracked_source_is_the_named_anchor_at_n_gt_1() {
+        let selected = [config("ra"), config("typos")];
+        let entries = [
+            PriorityEntry::Server("ra".to_string()),
+            PriorityEntry::Rest(vec!["typos".to_string()]),
+        ];
+        assert_eq!(
+            tracked_progress_source(&selected, &entries),
+            Some("ra".to_string())
+        );
+    }
+
+    #[test]
+    fn first_named_anchor_wins_over_a_later_named_one() {
+        let selected = [config("ra"), config("clangd")];
+        let entries = [
+            PriorityEntry::Server("ra".to_string()),
+            PriorityEntry::Server("clangd".to_string()),
+        ];
+        assert_eq!(
+            tracked_progress_source(&selected, &entries),
+            Some("ra".to_string())
+        );
+    }
+
+    #[test]
+    fn no_tracked_source_for_all_rest_at_n_gt_1() {
+        // Rest members are never anchors → no progress shown.
+        let selected = [config("a"), config("b")];
+        let entries = [PriorityEntry::Rest(vec!["a".to_string(), "b".to_string()])];
+        assert_eq!(tracked_progress_source(&selected, &entries), None);
+    }
 }
 
 /// Expand `ctx.priorities` into the priority walk for this request:
@@ -123,10 +209,10 @@ where
     // Compute the selected servers once and share it with both client-progress
     // setup and fan-out (avoids a second `select_servers` on the dispatch path).
     let selected = select_servers(&ctx.configs, &entries);
-    // Stage 1: `setup_client_progress` bridges client progress only for the
-    // single-downstream case (it returns `None` for N>1, keeping fan-out
-    // non-regressing) and only when the request carries a `workDoneToken`.
-    let client_progress = setup_client_progress(ctx, &pool, &selected);
+    // `setup_client_progress` bridges client progress for the tracked source only
+    // (sole server at N=1, named anchor at N>1) when the request carries a
+    // `workDoneToken`; every other candidate is suppressed (handed no token).
+    let client_progress = setup_client_progress(ctx, &pool, &selected, &entries);
     let cp_tokens = client_progress.as_ref().map(|(m, _guard)| m);
     let mut join_set = fan_out(ctx, pool, f, &selected, cp_tokens);
     let result = preferred::preferred(&mut join_set, is_nonempty, &entries, cancel_rx).await;
