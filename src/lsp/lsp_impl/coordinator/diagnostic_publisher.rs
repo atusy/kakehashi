@@ -70,10 +70,12 @@ impl DiagnosticPublisher {
     /// Record a `_self` host-layer push and republish the host (host-document-bridge).
     ///
     /// A host server pushes for the **real** host URI in host coordinates. Accept
-    /// it only when that URI is an **open** document whose language has `_self`
-    /// host bridging enabled — otherwise it is a stray push for the server's own
-    /// workspace file (not a host-bridged doc the editor has open) and is dropped.
-    /// Host diagnostics need no coordinate transform.
+    /// it only when that URI names an **open** document whose language opts into
+    /// `_self` host bridging — which drops the common stray case, a push for a
+    /// workspace file the editor doesn't have open. The gate does *not* verify the
+    /// pushing server is one of the configured host servers; that per-server
+    /// classification is deferred (see the cache module's staging note). Host
+    /// diagnostics need no coordinate transform.
     pub(crate) async fn publish_host_push(
         &self,
         host_uri: &str,
@@ -337,9 +339,12 @@ mod tests {
         server.settings_manager.apply_settings(rust_settings(true));
 
         let uri = Url::parse("file:///test/host.rs").unwrap();
-        server
-            .documents
-            .insert(uri.clone(), "fn main() {}".to_string(), Some("rust".to_string()), None);
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
 
         DiagnosticPublisher::new(server)
             .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("boom")])
@@ -381,9 +386,12 @@ mod tests {
         server.settings_manager.apply_settings(rust_settings(false));
 
         let uri = Url::parse("file:///test/host.rs").unwrap();
-        server
-            .documents
-            .insert(uri.clone(), "fn main() {}".to_string(), Some("rust".to_string()), None);
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
 
         DiagnosticPublisher::new(server)
             .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("y")])
