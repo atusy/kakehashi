@@ -56,8 +56,9 @@ is produced then depends on the strategy, because the two deliver differently:
   latency race, not knowable in advance. (One documented edge: after a
   fall-through, an earlier anchor's title can linger; see Consequences.)
 - *concatenated* merges **all** contributors, so no single source owns the title:
-  the bridge **always composes a synthetic neutral `Begin`** (e.g. a
-  request-derived title) and reports collection progress,
+  the bridge **always composes its own synthetic neutral `Begin`** (never
+  borrowing a downstream's title; e.g. a request-derived one) and reports
+  collection progress,
   **ignoring every downstream's own `$/progress`**. This trades per-server
   granularity for a title
   that stays accurate across the whole aggregate — borrowing one contributor's
@@ -155,8 +156,8 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 - **Forward the first contributor's `Begin` opportunistically.** Lights the
   indicator a few milliseconds sooner, but `Begin` carries a required `title`, so
   it can surface a non-anchor's label that LSP will not let the bridge amend
-  later. Rejected in favor of anchoring `Begin` on the anchor (its real `Begin`,
-  or a bridge-owned synthetic when it has none).
+  later. Rejected in favor of anchoring `Begin` on the anchor's real `Begin` under
+  *preferred*, and a bridge-composed synthetic under *concatenated*.
 - **Track every contributor's progress and merge it.** Most information, but
   collapsing N independent `Begin`/`report`/`End` streams (distinct titles,
   percentages) into one coherent indicator is messy and rarely meaningful.
