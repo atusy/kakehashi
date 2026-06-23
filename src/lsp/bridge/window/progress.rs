@@ -11,6 +11,7 @@ use log::debug;
 use serde::Deserialize;
 use tower_lsp_server::ls_types::{ProgressParams, ProgressParamsValue, WorkDoneProgress};
 
+use crate::error::LockResultExt;
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 
 /// Translate and forward a downstream `$/progress` notification to the editor.
@@ -40,6 +41,23 @@ pub(in crate::lsp::bridge) fn forward(
         );
         return;
     };
+
+    // Client-provided progress: if the token is one the bridge minted for a
+    // fanned-out request, route it to that request's aggregator, which composes a
+    // single lifecycle on the editor's own `workDoneToken` and emits it ungated
+    // (ls-bridge-client-progress).
+    if let Some((aggregator, server)) = deps.client_progress_registry.route(&params.token) {
+        let emitted = aggregator
+            .lock()
+            .recover_poison("ClientProgressAggregator")
+            .on_downstream_progress(&server, params.value);
+        if let Some(out) = emitted {
+            let _ = deps
+                .upstream_tx
+                .send(UpstreamNotification::ClientProgress { params: out });
+        }
+        return;
+    }
 
     let Some(upstream_token) = deps
         .progress_registry

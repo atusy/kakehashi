@@ -233,6 +233,9 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     /// This connection's id, used to scope forward token translation.
     pub(crate) progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
+    /// Routes bridge-minted client-progress tokens (`kakehashi/bridge/cprog/*`)
+    /// to their aggregator (ls-bridge-client-progress).
+    pub(crate) client_progress_registry: Arc<crate::lsp::bridge::ClientProgressRegistry>,
 }
 
 /// RAII guard that purges this connection's progress-token mappings when the
@@ -483,6 +486,7 @@ pub(crate) fn spawn_reader_task_with_liveness(
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         },
     )
@@ -572,6 +576,7 @@ async fn reader_loop(
         upstream_request_tx: mpsc::unbounded_channel().0,
         inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
         progress_registry,
+        client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
         progress_connection_id,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
@@ -1027,6 +1032,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
         (deps, (rx, upstream_rx, window_rx))
@@ -1139,6 +1145,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
         (deps, window_rx, (rx, upstream_rx))
@@ -1235,6 +1242,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
 
@@ -1310,6 +1318,9 @@ mod tests {
                 inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
                 workspace_folders: WorkspaceFolderSet::new(None),
                 progress_registry: Arc::clone(&progress_registry),
+                client_progress_registry: Arc::new(
+                    crate::lsp::bridge::ClientProgressRegistry::new(),
+                ),
                 progress_connection_id: conn,
             },
         );
@@ -1734,6 +1745,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -1794,6 +1806,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -1853,6 +1866,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
 
@@ -1912,6 +1926,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
 
@@ -1970,6 +1985,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
 
@@ -2025,6 +2041,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::clone(&progress_registry),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
 
@@ -2081,6 +2098,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
 
@@ -2119,6 +2137,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2174,6 +2193,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(Some(folders)),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2217,6 +2237,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2260,6 +2281,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2309,6 +2331,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2364,6 +2387,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2414,6 +2438,9 @@ mod tests {
                 upstream_request_tx: mpsc::unbounded_channel().0,
                 inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
                 progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+                client_progress_registry: Arc::new(
+                    crate::lsp::bridge::ClientProgressRegistry::new(),
+                ),
                 progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
             };
             (deps, upstream_rx)
@@ -2492,6 +2519,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2531,6 +2559,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2585,6 +2614,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -2650,6 +2680,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
         let handle = tokio::spawn(async move {
@@ -2710,6 +2741,7 @@ mod tests {
             upstream_request_tx: mpsc::unbounded_channel().0,
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
         };
 
@@ -3012,6 +3044,7 @@ mod tests {
             inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
             workspace_folders: WorkspaceFolderSet::new(None),
             progress_registry,
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
         };
         (deps, response_rx, upstream_request_rx)
