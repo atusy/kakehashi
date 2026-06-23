@@ -104,29 +104,24 @@ request just returns its result (today's behavior, minus the strip).
   rules above are instances of this invariant.)
 - **Graceful degradation on committed-server failure.** The branch turns on
   *whether the editor has already been shown data*:
-  - *preferred, anchor already streamed partials*: data is on screen, so promote
-    the accumulated partials into the delivered result and complete the request.
-    `partialResultToken` (data) and `workDoneToken` (progress) are separate
-    tokens, so close the *progress* only if a work-done `Begin` is actually
-    open — then emit a *synthetic* `End` (the downstream is gone and cannot send a
-    real one, the same primitive ls-bridge-progress-disconnect-cleanup uses); an
-    anchor that streamed only partial-result data without opening work-done
-    progress needs no `End`. Do not wait for another candidate (that would freeze
-    the shown data) and do not swap in a different server's result. The result may
-    be incomplete; accepted as graceful degradation.
-  - *preferred, anchor produced nothing* (empty or failed before any partial
-    result): it falls through to the next-priority candidate, exactly as any empty
-    result does under preferred. If the spent anchor had opened no `Begin`,
-    nothing was shown — ordinary latency, not a freeze or swap — and the new
-    anchor's own `Begin` opens the lifecycle. If it had already opened a `Begin`,
-    LSP permits only one per token, so that `Begin` stays open (its title lingers
-    — see Consequences) and the new anchor's `report`/`End` re-anchor under it;
-    should the new anchor provide no real `End` (it completes with no progress
-    phase), the bridge synthesizes one at request completion so the lingering
-    `Begin` is always closed. This recurses down the priority order; if every
-    candidate is exhausted and preferred returns no result at all, the same rule
-    applies at request completion — synthesize an `End` if a `Begin` is open,
-    otherwise emit none.
+  - *preferred, winner already streamed partials*: data is on screen, so promote
+    the winner's accumulated partials into the delivered result and complete the
+    request. Do not wait for another candidate (that would freeze the shown data)
+    and do not swap in a different server's result. The result may be incomplete;
+    accepted as graceful degradation. (Progress follows the pairing invariant:
+    `partialResultToken` data and `workDoneToken` progress are separate tokens, so
+    any open work-done `Begin` is closed by a synthetic `End`; a winner that
+    streamed only partial-result data opened none and needs no `End`.)
+  - *preferred, winner produced nothing* (empty or failed before any partial
+    result): it falls through to the next-priority candidate — down to a `Rest`
+    winner, or to no result at all — exactly as any empty result does under
+    preferred. Nothing was committed, so this is ordinary latency, not a freeze or
+    swap. Progress follows the pairing invariant: if a prior *named* anchor opened
+    a `Begin`, it stays open (its title can linger — see Consequences) and is
+    closed by the next named anchor's real `End`, or by a synthetic `End` at
+    request completion (when the next winner is a `Rest` member or emits no
+    progress, or no result is returned at all); if no `Begin` was opened, none is
+    emitted.
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing) and is **dropped from the expected set** (the `n/m`
     denominator shrinks); the others proceed, and the aggregate `End` fires once
@@ -209,7 +204,7 @@ bridge composes the terminal rather than relaying a downstream's `End`.
   merge policy.
 - The aggregation path must move from a single final blob to incremental input to
   support partialResult merging.
-- When the anchor fails *after* streaming, the delivered result may be incomplete
+- When the winner fails *after* streaming, the delivered result may be incomplete
   (only the streamed prefix); accepted as graceful degradation over freezing or
   swapping.
 - If the anchor emits a `Begin` and then loses (returns empty) or dies, its
@@ -228,7 +223,7 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 - Namespacing is unnecessary here (client tokens are already unique), so the
   `ProgressRegistry` of ls-bridge-work-done-progress is not involved; this path
   is distinct from server-declared progress.
-- Under fan-out the bridge owns the upstream terminal — relaying the winner's `End`
+- Under fan-out the bridge owns the upstream terminal — relaying the anchor's `End`
   under *preferred*, composing one under *concatenated* and on failure — so
   failure handling changes only that payload, not the mechanism.
 - A fast *concatenated* fan-out can briefly flash `Begin`→`End`; editors
@@ -246,7 +241,7 @@ are stripped before fan-out. Specific points to settle during implementation:
 - `partialResultToken` support depends on the aggregation layer accepting
   incremental input. Until that lands, `partialResultToken` may stay stripped
   while `workDoneToken` is bridged — a valid intermediate phase. Without
-  partial-result accumulation a failed anchor always looks empty and falls
+  partial-result accumulation a failed candidate always looks empty and falls
   through to the next candidate, which is acceptable.
 - Percentage composition under *concatenated* (`n/m`) is a display heuristic, not
   a contract.
