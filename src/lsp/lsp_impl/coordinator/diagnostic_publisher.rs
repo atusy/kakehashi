@@ -123,24 +123,29 @@ impl DiagnosticPublisher {
         host: &Url,
         snapshot: &mut crate::lsp::diagnostic_cache::SourceSlots,
     ) {
-        let Some(host_slots) = snapshot.get_mut(&DiagnosticSource::Host) else {
+        if !snapshot.contains_key(&DiagnosticSource::Host) {
             return; // no host push slots — nothing to filter
-        };
+        }
         // If the doc is gone or its language no longer opts into `_self`, no server
         // is valid — drop the whole Host source.
-        let still_valid: Vec<String> = match self.open_document_language(host) {
-            Some(language_name) => {
-                let settings = self.settings_manager.load_settings();
-                self.bridge
-                    .get_host_configs_for_language(&settings, &language_name)
-                    .into_iter()
-                    .map(|config| config.server_name)
-                    .collect()
-            }
-            None => Vec::new(),
+        let Some(language_name) = self.open_document_language(host) else {
+            snapshot.remove(&DiagnosticSource::Host);
+            return;
         };
-        host_slots.retain(|server, _| still_valid.iter().any(|s| s == server));
-        if host_slots.is_empty() {
+        let settings = self.settings_manager.load_settings();
+        let configs = self
+            .bridge
+            .get_host_configs_for_language(&settings, &language_name);
+        // Borrowed-`&str` set: O(1) membership, no `server_name` clones.
+        let valid: std::collections::HashSet<&str> =
+            configs.iter().map(|c| c.server_name.as_str()).collect();
+        let became_empty = if let Some(host_slots) = snapshot.get_mut(&DiagnosticSource::Host) {
+            host_slots.retain(|server, _| valid.contains(server.as_str()));
+            host_slots.is_empty()
+        } else {
+            false
+        };
+        if became_empty {
             snapshot.remove(&DiagnosticSource::Host);
         }
     }
