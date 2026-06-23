@@ -41,7 +41,8 @@ them so the editor sees **one coherent lifecycle** that stays consistent with th
 result actually delivered.
 
 **Core principle.** The progress narrative is **anchored on the priority anchor**
-— the highest-priority candidate currently tracked — and the data the editor
+— the highest-priority *named* candidate currently tracked (a `Rest`/wildcard
+member is never an anchor) — and the data the editor
 receives stays consistent with the result actually delivered: the `End` coincides
 with the result being complete, and no `report` carries data the editor will not
 receive. The anchor follows the **priority walk** (honoring explicit
@@ -130,10 +131,11 @@ request just returns its result (today's behavior, minus the strip).
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing) and is **dropped from the expected set** (the `n/m`
     denominator shrinks); the others proceed, and `End` fires once the remaining
-    expected results are collected. If the *anchor* (highest-priority contributor)
-    is the one that fails before opening a `Begin`, the anchor role moves to the
-    next-priority survivor — its `Begin` if it has one, else the silent-anchor
-    synthesis above.
+    expected results are collected. If the *anchor* (highest-priority named
+    contributor) is the one that fails before opening a `Begin`, the anchor role
+    moves to the next named-priority survivor — its `Begin` if it has one; if only
+    `Rest`-group members remain, the group stays silent and the synthetic
+    neutral `Begin` applies.
 - **partialResultToken — translate, then merge.** Partial-result chunks carry
   locations needing the *same* injection offset and URI translation as final
   responses, applied incrementally per chunk through the existing aggregation
@@ -242,3 +244,8 @@ are stripped before fan-out. Specific points to settle during implementation:
   ones are in — trading streaming latency for ordering fidelity. An
   implementation may relax this if a method's partial results are
   order-insensitive.
+- Treating `Rest`-group members as never-anchors trades progress visibility for
+  title correctness: under *preferred*, if the delivered winner is an unnamed
+  `Rest` member doing long work, its own progress is not shown (no safe a-priori
+  title). A future refinement could surface it once it is the sole active `Rest`
+  member.
