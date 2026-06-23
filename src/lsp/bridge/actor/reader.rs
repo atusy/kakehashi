@@ -56,10 +56,14 @@ pub(crate) enum UpstreamNotification {
     /// Request upstream to re-pull diagnostics.
     /// Sent when downstream server issues `workspace/diagnostic/refresh`.
     DiagnosticRefresh,
-    /// A downstream-initiated `textDocument/publishDiagnostics` for an injection
-    /// region's virtual document (push-propagation-diagnostic-forwarding). The
-    /// forwarding loop resolves `uri` to its host document + region, caches the
-    /// diagnostics under `server`, and republishes the merged host set.
+    /// A downstream-initiated `textDocument/publishDiagnostics`
+    /// (push-propagation-diagnostic-forwarding). The forwarding loop classifies
+    /// `uri`: a virtual injection URI resolves to its host document + region (a
+    /// region push, virtual coordinates); a real URI is a candidate `_self`
+    /// host-layer push (host coordinates) accepted only for an open host-bridged
+    /// document. When the push classifies to a live target it is cached under
+    /// `server` and the merged host set is republished; otherwise it is dropped
+    /// (unresolved virtual URI; real URI not open / not `_self` / wrong server).
     ///
     /// This carries an arbitrary-size `Vec<Diagnostic>` over the **unbounded**
     /// upstream channel, so a push-happy or misbehaving downstream paired with a
@@ -67,12 +71,14 @@ pub(crate) enum UpstreamNotification {
     /// (push-propagation-diagnostic-forwarding § Consequences); a bounded /
     /// coalescing diagnostics channel is the deferred mitigation if it proves noisy.
     PublishDiagnostics {
-        /// The virtual document URI the downstream published for.
+        /// The URI the downstream published for — a virtual injection URI (region
+        /// push) or a real host URI (`_self` host-layer push).
         uri: String,
         /// The originating downstream server's config name (`deps.server_name`);
         /// pushes without a name are dropped at the reader, so this is always set.
         server: String,
-        /// The pushed diagnostics, in the virtual document's coordinates.
+        /// The pushed diagnostics, in the published document's own coordinates
+        /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
     },
     /// Forward a downstream `window/logMessage` to the editor.
@@ -2330,16 +2336,18 @@ mod tests {
         }
     }
 
-    /// A push for a non-virtual URI (the downstream's own file, or the real host
-    /// URI) has no region mapping and is dropped, not routed.
+    /// A non-virtual (real host URI) push is now routed up too — the publisher
+    /// classifies it as a candidate `_self` host-layer push and decides (using
+    /// document/config state the reader lacks) whether it names an open
+    /// host-bridged doc. The reader only forwards.
     #[tokio::test]
-    async fn handle_message_drops_publish_diagnostics_for_non_virtual_uri() {
+    async fn handle_message_routes_real_uri_push_for_host_classification() {
         let router = ResponseRouter::new();
         let (response_tx, _response_rx) = mpsc::channel(16);
         let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let deps = ServerRequestDeps {
-            server_name: Some("luals".to_string()),
+            server_name: Some("lua_ls".to_string()),
             response_tx,
             dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
             upstream_tx,
@@ -2356,16 +2364,27 @@ mod tests {
             "method": "textDocument/publishDiagnostics",
             "params": {
                 "uri": "file:///project/real_file.lua",
-                "diagnostics": []
+                "diagnostics": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                    "message": "host diag"
+                }]
             }
         });
 
         handle_message(message, &router, "", &deps).await;
 
-        assert!(
-            upstream_rx.try_recv().is_err(),
-            "a non-virtual-uri push must not be routed"
-        );
+        match upstream_rx
+            .try_recv()
+            .expect("real-uri push should be routed for host classification")
+        {
+            UpstreamNotification::PublishDiagnostics {
+                uri, diagnostics, ..
+            } => {
+                assert_eq!(uri, "file:///project/real_file.lua");
+                assert_eq!(diagnostics.len(), 1);
+            }
+            _ => panic!("expected PublishDiagnostics"),
+        }
     }
 
     /// A malformed `diagnostics` array must be dropped, not routed as an empty

@@ -12,25 +12,28 @@
 //! / server later.
 //!
 //! ## Staging
-//! Two source kinds are populated:
+//! Three source kinds are populated:
 //! - [`DiagnosticSource::PullLayer`] — the host-event pull's already
 //!   cross-layer-combined result, in host coordinates, as one blob.
 //! - [`DiagnosticSource::Region`] — a downstream push for an injection region, in
 //!   virtual coordinates, transformed to host coordinates at publish time.
+//! - [`DiagnosticSource::Host`] — a downstream `_self` host-layer push for the
+//!   real host document, in host coordinates (passes through unchanged).
 //!
 //! **Known interim overlap (deferred capability gate).** The pull feed fans out
-//! to *every* configured region server with no capability classification, so a
-//! server that both answers `textDocument/diagnostic` (landing in `PullLayer`)
-//! *and* spontaneously pushes `publishDiagnostics` (landing in a `Region` slot) is
-//! counted twice. In practice the two channels are disjoint — a pull-capable
-//! server should not also push (LSP) — so this only *duplicates*, never *hides*,
-//! and only for a misbehaving server. The deferred `pullFallback` / capability
-//! classification removes the overlap by giving each server one native source.
+//! to *every* configured server (region and host) with no capability
+//! classification, so a server that both answers `textDocument/diagnostic`
+//! (landing in `PullLayer`) *and* spontaneously pushes `publishDiagnostics`
+//! (landing in a `Region` or `Host` slot) is counted twice. In practice the two
+//! channels are disjoint — a pull-capable server should not also push (LSP) — so
+//! this only *duplicates*, never *hides*, and only for a misbehaving server. The
+//! deferred `pullFallback` / capability classification removes the overlap by
+//! giving each server one native source.
 //!
 //! Also deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
 //! visible-walk; cross-source order is HashMap-nondeterministic until then), the
-//! `_self` host-layer push source, the `content_epoch` version gate, and
-//! region-invalidation/crash eviction.
+//! `content_epoch` version gate, region-invalidation/crash eviction, and
+//! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,6 +52,11 @@ pub(crate) enum DiagnosticSource {
     /// coordinates and transformed to host coordinates at publish time against
     /// the region's *current* offset (lazy re-anchor).
     Region(String),
+    /// A downstream **push** from a `_self` host-layer server for the real host
+    /// document (host-document-bridge). Held in **host** coordinates (the host
+    /// path applies no translation), so it passes through the merge unchanged.
+    /// Keyed per server, so several host servers on one host document coexist.
+    Host,
     /// The host-event pull's cross-layer-combined result, in host coordinates.
     /// A single blob (one synthetic server slot) for now — a follow-up replaces
     /// it with per-`(region, server)` slots gated by `pullFallback`.
@@ -85,7 +93,8 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 ///   resolves, e.g. it was edited away) is skipped here; its now-stale slot
 ///   lingers in the cache until the whole host is dropped on `didClose`
 ///   (per-region / crash eviction is a deferred follow-up).
-/// - [`DiagnosticSource::PullLayer`] slots are already host-local and pass through.
+/// - [`DiagnosticSource::Host`] and [`DiagnosticSource::PullLayer`] slots are
+///   already host-local and pass through unchanged.
 ///
 /// Staged: results are concatenated (the default `textDocument/publishDiagnostics`
 /// strategy). Per-source strategy fan-in (`preferred` sticky / `concatenated`
@@ -113,7 +122,8 @@ pub(crate) fn merge_cached_diagnostics(
                     }
                 }
             }
-            DiagnosticSource::PullLayer => {
+            DiagnosticSource::Host | DiagnosticSource::PullLayer => {
+                // Already host-local: pass through unchanged.
                 for slot in servers.into_values() {
                     merged.extend(slot.diagnostics);
                 }
@@ -414,6 +424,39 @@ mod tests {
         let mut msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         msgs.sort();
         assert_eq!(msgs, vec!["pull", "push"]);
+    }
+
+    #[test]
+    fn merge_passes_host_push_slots_through_unchanged() {
+        let agg = DiagnosticAggregator::new();
+        // Two host servers push for the same host doc; both pass through in host
+        // coords (no transform), keyed per server.
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "lua_ls".into(),
+            vec![diag_at("hostA", 7, 3)],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "selene".into(),
+            vec![diag_at("hostB", 8, 0)],
+        );
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let mut by_msg: Vec<(&str, Position)> = merged
+            .iter()
+            .map(|d| (d.message.as_str(), d.range.start))
+            .collect();
+        by_msg.sort();
+        assert_eq!(
+            by_msg,
+            vec![
+                ("hostA", Position::new(7, 3)),
+                ("hostB", Position::new(8, 0))
+            ],
+            "host push slots pass through in host coordinates, per server"
+        );
     }
 
     #[test]

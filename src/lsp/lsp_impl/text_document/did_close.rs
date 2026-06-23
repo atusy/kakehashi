@@ -71,8 +71,10 @@ impl Kakehashi {
         // close_host_document tears down host_to_virtual: a region push dequeued
         // before that teardown can still resolve its virtual URI and re-create the
         // cache entry, so clearing first would leave a resurrected, never-cleared
-        // host. (A residual resolve→suspend→record micro-window remains, closed
-        // only by the deferred tombstone/epoch gate.)
+        // host. (Residual resolve→suspend→record micro-windows remain — both the
+        // region path and the host path, whose `documents.get→record` can race the
+        // `documents.remove()` above — closed only by the deferred tombstone/epoch
+        // gate.)
         super::super::coordinator::DiagnosticPublisher::new(self)
             .clear_host(&uri)
             .await;

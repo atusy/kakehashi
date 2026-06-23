@@ -490,6 +490,10 @@ because the #380 benefit now outweighs it:
 - Non-scratch `publishDiagnostics` are routed from `reader.rs` into the cache as
   `Region` slots (virtual coordinates, transformed at publish via lazy re-anchor),
   closing #380 for region pushes.
+- The `_self` host-layer push source (#421): a push on the real host URI that
+  names an open `_self` host-bridged document is cached as a `Host` slot (host
+  coordinates) and merged through. Classification/routing only — **eager-open**
+  (below) is still deferred.
 
 **Deferred** (staged follow-ups; the code documents each at its site):
 
@@ -498,8 +502,9 @@ because the #380 benefit now outweighs it:
   (lazy re-anchor still keeps *positions* current via the retained pull trigger).
 - Per-source strategy fan-in (`preferred` sticky / `concatenated` visible-walk);
   the staged merge concatenates, with HashMap-nondeterministic cross-source order.
-- The `_self` host-layer push source (the host layer is still served by the pull
-  feed for now).
+- Host-layer eager-open: a push-only `_self` server only pushes after the host
+  doc is opened on it (lazily, on the first host request), so on-open diagnostics
+  rely on the editor's open-time pull opening the doc.
 - Region-invalidation and crash cache eviction.
 - The `pullFallback` / `pushFallback` config toggles and the capability
   classification — without the latter the pull feed and a server's spontaneous
