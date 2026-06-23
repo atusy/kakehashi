@@ -46,9 +46,11 @@ fn setup_client_progress(
 )> {
     let client_token = ctx.client_progress_token.clone()?;
     // Under *preferred*, only the tracked source's progress is shown; every other
-    // candidate is suppressed by handing it no `workDoneToken` (so it emits no
-    // `$/progress` — no wasted traffic). With no tracked source (an all-`Rest`
-    // N>1 fan-out) nothing is minted and the editor sees no progress.
+    // candidate is suppressed by handing it no `workDoneToken`, so it reports no
+    // `$/progress` *for this request* (a downstream may still drive its own
+    // server-declared progress — that path is unaffected). With no tracked source
+    // (an all-`Rest` N>1 fan-out) nothing is minted and the editor sees no
+    // progress for the request.
     let tracked = tracked_progress_source(selected, entries)?;
     let aggregator = Arc::new(Mutex::new(ClientProgressAggregator::new(client_token)));
     let registry = Arc::clone(pool.client_progress_registry());
