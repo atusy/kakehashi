@@ -527,7 +527,9 @@ impl LanguageServerPool {
     /// entry exists for that `(uri, server)`. Used to verify host-layer eager open.
     #[cfg(test)]
     pub(crate) async fn is_host_document_opened(&self, host_uri: &Url, server_name: &str) -> bool {
-        let key = host_uri.as_str().to_owned();
+        // Key exactly as `sync_host_document` does (`doc.uri.to_string()`) so the
+        // lookup can never diverge from the map's key construction.
+        let key = host_uri.to_string();
         self.host_documents()
             .await
             .keys()
