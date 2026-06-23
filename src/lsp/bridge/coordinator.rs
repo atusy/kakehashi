@@ -92,6 +92,12 @@ pub(crate) struct BridgeCoordinator {
     /// - Host document is closed while tasks wait for server readiness
     /// - Rapid did_change events spawn many overlapping batches
     eager_open_tasks: DashMap<Url, EagerOpenBatch>,
+    /// Host-layer eager-open tasks, keyed by host document URI (#429). Separate
+    /// from `eager_open_tasks` because the host path fires on `didOpen` for the
+    /// real host doc (no injections, no per-`didChange` superseding), so a plain
+    /// abort-old-on-new per URI suffices. Cancelled on `didClose` (before the host
+    /// doc is closed) to avoid orphan-opening a doc whose `didClose` already ran.
+    host_eager_open_tasks: DashMap<Url, Vec<tokio::task::AbortHandle>>,
 }
 
 impl BridgeCoordinator {
@@ -105,6 +111,7 @@ impl BridgeCoordinator {
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
+            host_eager_open_tasks: DashMap::new(),
         }
     }
 
@@ -125,6 +132,7 @@ impl BridgeCoordinator {
             cancel_forwarder,
             eager_open_generation: std::sync::atomic::AtomicU64::new(0),
             eager_open_tasks: DashMap::new(),
+            host_eager_open_tasks: DashMap::new(),
         }
     }
 
@@ -518,6 +526,78 @@ impl BridgeCoordinator {
             // Register immediately — if concurrent cancel removed the entry
             // or the generation is stale, the handle is aborted instead of leaked.
             self.push_or_abort_eager_open_handle(host_uri, task.abort_handle(), generation);
+        }
+    }
+
+    /// Eagerly open the real host document on every `_self` host-bridge server for
+    /// `host_language` (host-document-bridge, #429), so a push-only host server
+    /// starts analyzing and pushing diagnostics on `didOpen` instead of only after
+    /// the first host-bridged request. Spawns one fire-and-forget task per server;
+    /// no-op (and cancels any prior batch) when host bridging is off for the
+    /// language. Re-syncing on `didChange` is deferred (push-only servers still see
+    /// edits via the lazy request-path sync — save/hover — not as-you-type).
+    pub(crate) fn eager_open_host_document_on_servers(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+        host_uri: &Url,
+        language_id: &str,
+        text: &str,
+    ) {
+        let configs = self.get_host_configs_for_language(settings, host_language);
+        if configs.is_empty() {
+            // Host bridging off / no host server for this language — drop any
+            // prior batch so a stale open can't fire.
+            self.cancel_host_eager_open(host_uri);
+            return;
+        }
+
+        let mut handles = Vec::with_capacity(configs.len());
+        for config in configs {
+            let pool = self.pool_arc();
+            let host_uri_owned = host_uri.clone();
+            let language_id = language_id.to_string();
+            let text = text.to_string();
+            let server_name = config.server_name.clone();
+            let server_config = config.config.clone();
+            let task = tokio::spawn(async move {
+                pool.eager_open_host_document(
+                    &server_name,
+                    &server_config,
+                    &host_uri_owned,
+                    &language_id,
+                    &text,
+                )
+                .await;
+            });
+            handles.push(task.abort_handle());
+        }
+
+        // Replace the previous batch (rare: a second didOpen without a didClose)
+        // and abort it. There's a residual window between the spawns above and this
+        // insert in which a concurrent didClose's cancel sees no entry — the same
+        // documented micro-window class as the region path, closed only by the
+        // deferred tombstone/epoch gate.
+        if let Some(previous) = self.host_eager_open_tasks.insert(host_uri.clone(), handles) {
+            for handle in previous {
+                if !handle.is_finished() {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    /// Abort and forget the host-layer eager-open tasks for `host_uri` (host
+    /// `didClose`). MUST run before the host document is closed so an in-flight
+    /// task still waiting for server readiness can't open a doc whose `didClose`
+    /// already ran.
+    pub(crate) fn cancel_host_eager_open(&self, host_uri: &Url) {
+        if let Some((_, handles)) = self.host_eager_open_tasks.remove(host_uri) {
+            for handle in handles {
+                if !handle.is_finished() {
+                    handle.abort();
+                }
+            }
         }
     }
 

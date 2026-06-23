@@ -90,8 +90,11 @@ Partially implemented:
 - **Diagnostics**: a `_self` host server's pushed `publishDiagnostics` for the
   real host URI are propagated to the editor via the per-host diagnostic cache
   (push-propagation-diagnostic-forwarding, #421) — accepted when the URI names an
-  open host-bridged document. Host-layer eager-open (on-open diagnostics before
-  the first request) is still deferred.
+  open host-bridged document. The host document is opened eagerly on each `_self`
+  host server at host `didOpen` (#429), so a push-only host server pushes on open
+  rather than only after the first request. On-edit re-sync to push-only host
+  servers without a host request (as-you-type) is still deferred — they see edits
+  via the lazy request-path sync (save / hover).
 
 ## Context
 

@@ -84,6 +84,12 @@ impl ConnectionKey {
     pub(crate) fn for_server(server: impl Into<String>) -> Self {
         Self::new(server, None)
     }
+
+    /// The config server name (the `language_servers` map key).
+    #[cfg(test)]
+    pub(crate) fn server(&self) -> &str {
+        &self.server
+    }
 }
 
 impl fmt::Display for ConnectionKey {

@@ -51,8 +51,12 @@ impl Kakehashi {
         // Cancel any pending debounced diagnostic for this document (pull-first-diagnostic-forwarding Phase 3)
         self.debounced_diagnostics.cancel(&uri);
 
-        // Cancel any eager-open tasks for this document (prevents orphaned didOpen)
+        // Cancel any eager-open tasks for this document (prevents orphaned didOpen).
+        // Host-layer eager-open is cancelled here too — BEFORE close_host_bridge_document
+        // below — so an in-flight host eager-open still waiting for server readiness
+        // can't open a host doc whose didClose already ran (#429).
         self.bridge.cancel_eager_open(&uri);
+        self.bridge.cancel_host_eager_open(&uri);
 
         // Close all virtual documents associated with this host document
         // This sends didClose notifications to downstream language servers
