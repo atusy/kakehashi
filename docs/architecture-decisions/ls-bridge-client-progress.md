@@ -68,9 +68,12 @@ request just returns its result (today's behavior, minus the strip).
     winner's `report`s — but **suppress the winner's own `End`**, since the
     aggregate is not done until every contributor is collected; *interleave* the
     other contributors' **result arrivals** as `report`s (`n/m` collected);
-  - if the winner emits no `Begin`, synthesize a bridge-owned `Begin` (neutral,
-    e.g. a request-derived title) on the first result and report `n/m` as the
-    rest arrive;
+  - if the winner emits no `Begin`, the bridge synthesizes one (neutral title,
+    e.g. request-derived) once the winner is **known to be silent** — it returned
+    its result with no `Begin`. Contributors that completed earlier are counted
+    into the first `n/m` report, and the rest advance it as they arrive. (Waiting
+    for the anchor to resolve, rather than firing on the first arbitrary result,
+    keeps a real winner `Begin` from being pre-empted by a non-anchor.)
   - either way the `End` fires once **every** contributor's result is collected,
     and non-winner contributors' own `$/progress` is ignored.
 
@@ -92,8 +95,10 @@ request just returns its result (today's behavior, minus the strip).
     nothing was shown — ordinary latency, not a freeze or swap — and the new
     winner's own `Begin` opens the lifecycle. If it had already opened a `Begin`,
     LSP permits only one per token, so that `Begin` stays open (its title lingers
-    — see Consequences) and only `report`/`End` re-anchor onto the new winner.
-    This recurses down the priority order.
+    — see Consequences) and the new winner's `report`/`End` re-anchor under it;
+    should the new winner provide no real `End` (it completes with no progress
+    phase), the bridge synthesizes one at request completion so the lingering
+    `Begin` is always closed. This recurses down the priority order.
   - *concatenated*: a failed contributor contributes whatever it already streamed
     (possibly nothing) and is **dropped from the expected set** (the `n/m`
     denominator shrinks); the others proceed, and `End` fires once the remaining
