@@ -136,14 +136,16 @@ impl LanguageServerPool {
             }
         };
 
-        let connection_key = handle.key().clone();
+        // Borrow the key (no clone) — both `connections.get` and `sync_host_document`
+        // take it by reference, like `execute_host_request`.
+        let connection_key = handle.key();
         // Sync (sends didOpen) under the `connections` + `host_documents` locks in
         // that order, with the live-handle `Arc::ptr_eq` check — identical to
         // `execute_host_request`, so a concurrent respawn purge cannot interleave
         // and leave sync state the replacement never saw.
         let connections = self.connections().await;
         if !connections
-            .get(&connection_key)
+            .get(connection_key)
             .is_some_and(|current| Arc::ptr_eq(current, &handle))
         {
             // Replaced by a respawn between wait-ready and here; the new connection
@@ -158,7 +160,7 @@ impl LanguageServerPool {
             text,
         };
         if let Err(e) =
-            super::host::sync_host_document(&mut sender, &mut docs, &doc, &connection_key).await
+            super::host::sync_host_document(&mut sender, &mut docs, &doc, connection_key).await
         {
             log::debug!(
                 target: "kakehashi::bridge",
