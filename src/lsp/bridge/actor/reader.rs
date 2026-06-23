@@ -104,6 +104,14 @@ pub(crate) enum UpstreamNotification {
     Progress {
         params: tower_lsp_server::ls_types::ProgressParams,
     },
+    /// Forward aggregated **client-provided** work-done progress to the editor.
+    /// `params` carries the editor's own `workDoneToken` (the bridge aggregated
+    /// the fanned-out downstreams' progress onto it; ls-bridge-client-progress).
+    /// Unlike [`Progress`](Self::Progress) this is **not** admission-gated: the
+    /// editor minted the token and needs no `window/workDoneProgress/create`.
+    ClientProgress {
+        params: tower_lsp_server::ls_types::ProgressParams,
+    },
     /// Tell the forwarding loop to forget these (upstream) progress tokens
     /// without an `End` — sent when a downstream connection's reader exits with
     /// progress still in flight, so the loop's created-token set can't leak
