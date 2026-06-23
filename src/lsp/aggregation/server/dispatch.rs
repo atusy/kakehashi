@@ -59,7 +59,9 @@ fn setup_client_progress(
         minted.push(token.clone());
         map.insert(config.server_name.clone(), token);
     }
-    Some((map, ClientProgressDeregisterGuard::new(registry, minted)))
+    let guard =
+        ClientProgressDeregisterGuard::new(registry, minted, aggregator, pool.upstream_tx());
+    Some((map, guard))
 }
 
 /// Expand `ctx.priorities` into the priority walk for this request:

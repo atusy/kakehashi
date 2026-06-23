@@ -102,43 +102,74 @@ impl ClientProgressRegistry {
     }
 }
 
-/// Deregisters a request's bridge tokens from the registry when dropped — i.e.
-/// when the dispatch call returns. After this, a late downstream `$/progress`
-/// for the finished request no longer routes (it is dropped).
+/// Tears down a request's client-progress routing when dropped — i.e. when the
+/// dispatch call returns. It first deregisters the bridge tokens (so a late
+/// downstream `$/progress` no longer routes), then **synthesizes the terminal
+/// `End`** if the aggregator relayed a `Begin` but never an `End` — guaranteeing
+/// the editor's indicator is closed even when the downstream's own `End` raced
+/// the response or never came (ls-bridge-client-progress pairing invariant).
 pub(crate) struct ClientProgressDeregisterGuard {
     registry: std::sync::Arc<ClientProgressRegistry>,
     tokens: Vec<NumberOrString>,
+    aggregator: std::sync::Arc<Mutex<ClientProgressAggregator>>,
+    upstream_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::lsp::bridge::actor::UpstreamNotification>,
 }
 
 impl ClientProgressDeregisterGuard {
     pub(crate) fn new(
         registry: std::sync::Arc<ClientProgressRegistry>,
         tokens: Vec<NumberOrString>,
+        aggregator: std::sync::Arc<Mutex<ClientProgressAggregator>>,
+        upstream_tx: tokio::sync::mpsc::UnboundedSender<
+            crate::lsp::bridge::actor::UpstreamNotification,
+        >,
     ) -> Self {
-        Self { registry, tokens }
+        Self {
+            registry,
+            tokens,
+            aggregator,
+            upstream_tx,
+        }
     }
 }
 
 impl Drop for ClientProgressDeregisterGuard {
     fn drop(&mut self) {
+        // Deregister first: after this no reader can feed the aggregator, so the
+        // terminal decision below cannot race a concurrent real `End`.
         self.registry.deregister(&self.tokens);
+        let terminal = self
+            .aggregator
+            .lock()
+            .recover_poison("ClientProgressAggregator teardown")
+            .take_terminal_end();
+        if let Some(params) = terminal {
+            let _ = self
+                .upstream_tx
+                .send(crate::lsp::bridge::actor::UpstreamNotification::ClientProgress { params });
+        }
     }
 }
 
 /// Translates a fanned-out request's downstream `$/progress` into a single
 /// lifecycle on the client's `workDoneToken`.
 ///
-/// Stage 1 implements the single-downstream (`N = 1`) relay only; multi-server
-/// aggregation (`preferred`/`concatenated`) and failure-path terminal synthesis
-/// arrive in later stages, where the strategy and begun-not-ended tracking are
-/// reintroduced.
+/// Stage 1 implements the single-downstream (`N = 1`) relay, including a
+/// synthetic terminal `End` on teardown (so a relayed `Begin` is always closed
+/// even if the downstream's `End` races the response or never arrives).
+/// Multi-server aggregation (`preferred`/`concatenated`), which reintroduces the
+/// per-strategy anchor, arrives in later stages.
 #[derive(Debug)]
 pub(crate) struct ClientProgressAggregator {
     /// The editor-minted token every emitted `$/progress` is reported against.
     client_token: NumberOrString,
     /// Number of downstream servers the request fanned out to.
     server_count: usize,
-    /// Whether the terminal `End` has been relayed (drop anything after it).
+    /// Whether a `Begin` has been relayed upstream (pairing invariant).
+    begun: bool,
+    /// Whether the terminal `End` has been emitted (drop anything after it; emit
+    /// the synthetic teardown `End` at most once).
     ended: bool,
 }
 
@@ -147,6 +178,7 @@ impl ClientProgressAggregator {
         Self {
             client_token,
             server_count,
+            begun: false,
             ended: false,
         }
     }
@@ -168,17 +200,37 @@ impl ClientProgressAggregator {
             // terminal End is also dropped.
             return None;
         }
-        // N = 1: relay verbatim under the client token.
-        if matches!(
-            &value,
-            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
-        ) {
-            self.ended = true;
+        // N = 1: relay verbatim under the client token, tracking the lifecycle so
+        // a terminal End is guaranteed even if the downstream's own End never
+        // arrives (or arrives after teardown).
+        match &value {
+            ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_)) => self.begun = true,
+            ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) => self.ended = true,
+            _ => {}
         }
         Some(ProgressParams {
             token: self.client_token.clone(),
             value,
         })
+    }
+
+    /// On request teardown, return a synthetic terminal `End` for the client token
+    /// **iff** a `Begin` was relayed but no `End` — so the editor's indicator is
+    /// always closed even when the downstream's `End` never arrives or races the
+    /// response (ls-bridge-client-progress pairing invariant). Marks the lifecycle
+    /// ended so it fires at most once and a later real `End` is ignored.
+    pub(crate) fn take_terminal_end(&mut self) -> Option<ProgressParams> {
+        if self.begun && !self.ended {
+            self.ended = true;
+            Some(ProgressParams {
+                token: self.client_token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                    tower_lsp_server::ls_types::WorkDoneProgressEnd { message: None },
+                )),
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -256,6 +308,100 @@ mod tests {
             agg.on_downstream_progress("rust-analyzer", begin())
                 .is_none(),
             "N>1 must not forward raw downstream progress (would duplicate Begins)"
+        );
+    }
+
+    use crate::lsp::bridge::actor::UpstreamNotification;
+
+    /// Teardown after a relayed `Begin` with no `End` (the downstream's `End`
+    /// raced the response or never came) must synthesize a terminal `End` so the
+    /// editor's indicator does not hang.
+    #[test]
+    fn teardown_synthesizes_end_when_begun_but_not_ended() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = std::sync::Arc::new(ClientProgressRegistry::new());
+        let aggregator =
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
+        let token = registry.register(aggregator.clone(), "rust-analyzer");
+        // Downstream begins (relayed) but never ends.
+        aggregator
+            .lock()
+            .unwrap()
+            .on_downstream_progress("rust-analyzer", begin());
+
+        drop(ClientProgressDeregisterGuard::new(
+            registry.clone(),
+            vec![token.clone()],
+            aggregator,
+            tx,
+        ));
+
+        let msg = rx.try_recv().expect("teardown synthesizes a terminal End");
+        match msg {
+            UpstreamNotification::ClientProgress { params } => {
+                assert_eq!(params.token, client_token(), "End on the client token");
+                assert!(matches!(
+                    params.value,
+                    ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
+                ));
+            }
+            _ => panic!("expected a ClientProgress End"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one terminal End");
+        assert!(
+            registry.route(&token).is_none(),
+            "tokens are deregistered on teardown"
+        );
+    }
+
+    /// Teardown after a normal `Begin`→`End` must synthesize nothing (the editor
+    /// already saw the real `End`); no double-`End`.
+    #[test]
+    fn teardown_emits_nothing_when_already_ended() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = std::sync::Arc::new(ClientProgressRegistry::new());
+        let aggregator =
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
+        let token = registry.register(aggregator.clone(), "rust-analyzer");
+        {
+            let mut guard = aggregator.lock().unwrap();
+            guard.on_downstream_progress("rust-analyzer", begin());
+            guard.on_downstream_progress("rust-analyzer", end());
+        }
+
+        drop(ClientProgressDeregisterGuard::new(
+            registry,
+            vec![token],
+            aggregator,
+            tx,
+        ));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an already-ended lifecycle synthesizes no second End"
+        );
+    }
+
+    /// Teardown after no progress at all (the downstream never began) synthesizes
+    /// nothing — no spurious `End` for a token the editor never saw begin.
+    #[test]
+    fn teardown_emits_nothing_when_never_begun() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = std::sync::Arc::new(ClientProgressRegistry::new());
+        let aggregator =
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
+        let token = registry.register(aggregator.clone(), "rust-analyzer");
+
+        drop(ClientProgressDeregisterGuard::new(
+            registry,
+            vec![token],
+            aggregator,
+            tx,
+        ));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no Begin was relayed, so no terminal End is synthesized"
         );
     }
 }

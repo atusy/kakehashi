@@ -340,6 +340,14 @@ impl LanguageServerPool {
         &self.client_progress_registry
     }
 
+    /// A clone of the upstream-notification sender, for emitting aggregated
+    /// client progress (and its synthetic teardown `End`) to the editor.
+    pub(crate) fn upstream_tx(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<super::UpstreamNotification> {
+        self.upstream_tx.clone()
+    }
+
     /// Set the workspace root URI.
     ///
     /// Called once during upstream initialize to forward the root URI to downstream servers.
