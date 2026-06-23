@@ -574,15 +574,19 @@ impl BridgeCoordinator {
         // (see the field doc), bounded and benign; left open for parity.
         let generation = self.supersede_host_eager_open(host_uri);
 
+        // Share the text + languageId across per-server tasks via `Arc<str>` rather
+        // than cloning the (potentially large) document text once per host server.
+        // For a `_self` bridge the downstream `languageId` is the host language
+        // itself (consistent with the lazy request path's
+        // `HostRequestContext.language_id`), so derive it rather than taking a
+        // separate arg that a caller could transpose with `text`.
+        let text: Arc<str> = Arc::from(text);
+        let language_id: Arc<str> = Arc::from(host_language);
         for config in configs {
             let pool = self.pool_arc();
             let host_uri_owned = host_uri.clone();
-            // For a `_self` bridge the downstream `languageId` is the host language
-            // itself (consistent with the lazy request path's
-            // `HostRequestContext.language_id`), so derive it rather than taking a
-            // separate arg that a caller could transpose with `text`.
-            let language_id = host_language.to_string();
-            let text = text.to_string();
+            let language_id = Arc::clone(&language_id);
+            let text = Arc::clone(&text);
             let server_name = config.server_name.clone();
             let server_config = config.config.clone();
             let task = tokio::spawn(async move {
