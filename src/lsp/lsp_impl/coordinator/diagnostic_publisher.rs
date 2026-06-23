@@ -138,11 +138,11 @@ impl DiagnosticPublisher {
         let configs = self
             .bridge
             .get_host_configs_for_language(&settings, &language_name);
-        // Borrowed-`&str` set: O(1) membership, no `server_name` clones.
-        let valid: std::collections::HashSet<&str> =
-            configs.iter().map(|c| c.server_name.as_str()).collect();
         let slots = entry.get_mut();
-        slots.retain(|server, _| valid.contains(server.as_str()));
+        // A language has only a handful of host servers (usually 1–2), so a linear
+        // scan over `configs` is cheaper than allocating a lookup set on every
+        // republish (no `server_name` clones either).
+        slots.retain(|server, _| configs.iter().any(|c| &c.server_name == server));
         if slots.is_empty() {
             entry.remove();
         }
