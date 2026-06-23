@@ -12,25 +12,28 @@
 //! / server later.
 //!
 //! ## Staging
-//! Two source kinds are populated:
+//! Three source kinds are populated:
 //! - [`DiagnosticSource::PullLayer`] — the host-event pull's already
 //!   cross-layer-combined result, in host coordinates, as one blob.
 //! - [`DiagnosticSource::Region`] — a downstream push for an injection region, in
 //!   virtual coordinates, transformed to host coordinates at publish time.
+//! - [`DiagnosticSource::Host`] — a downstream `_self` host-layer push for the
+//!   real host document, in host coordinates (passes through unchanged).
 //!
 //! **Known interim overlap (deferred capability gate).** The pull feed fans out
-//! to *every* configured region server with no capability classification, so a
-//! server that both answers `textDocument/diagnostic` (landing in `PullLayer`)
-//! *and* spontaneously pushes `publishDiagnostics` (landing in a `Region` slot) is
-//! counted twice. In practice the two channels are disjoint — a pull-capable
-//! server should not also push (LSP) — so this only *duplicates*, never *hides*,
-//! and only for a misbehaving server. The deferred `pullFallback` / capability
-//! classification removes the overlap by giving each server one native source.
+//! to *every* configured server (region and host) with no capability
+//! classification, so a server that both answers `textDocument/diagnostic`
+//! (landing in `PullLayer`) *and* spontaneously pushes `publishDiagnostics`
+//! (landing in a `Region` or `Host` slot) is counted twice. In practice the two
+//! channels are disjoint — a pull-capable server should not also push (LSP) — so
+//! this only *duplicates*, never *hides*, and only for a misbehaving server. The
+//! deferred `pullFallback` / capability classification removes the overlap by
+//! giving each server one native source.
 //!
 //! Also deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
 //! visible-walk; cross-source order is HashMap-nondeterministic until then), the
-//! `_self` host-layer push source, the `content_epoch` version gate, and
-//! region-invalidation/crash eviction.
+//! `content_epoch` version gate, region-invalidation/crash eviction, and
+//! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
 use std::sync::Mutex;

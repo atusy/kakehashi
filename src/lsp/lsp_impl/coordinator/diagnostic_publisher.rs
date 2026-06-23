@@ -102,11 +102,14 @@ impl DiagnosticPublisher {
     }
 
     /// Detect the language of an *open* document, or `None` if it isn't open.
+    ///
+    /// Borrows the document text directly (no `snapshot()` clone) — detection
+    /// never touches the tree, so this also avoids spuriously dropping a push for
+    /// an open-but-not-yet-parsed document.
     fn open_document_language(&self, uri: &Url) -> Option<String> {
         let doc = self.documents.get(uri)?;
-        let snapshot = doc.snapshot()?;
         self.language
-            .detect_language(uri.path(), snapshot.text(), None, doc.language_id())
+            .detect_language(uri.path(), doc.text(), None, doc.language_id())
     }
 
     /// Record a downstream region push and republish the host (Path A).
@@ -252,5 +255,143 @@ impl DiagnosticPublisher {
             );
         }
         offsets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::{
+        BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY, LanguageSettings,
+        WorkspaceSettings,
+    };
+    use std::collections::HashMap;
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{Position, Range};
+
+    fn diag(message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn rust_server_config() -> (String, BridgeServerConfig) {
+        (
+            "rust_ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["true".to_string()],
+                languages: vec!["rust".to_string()],
+                initialization_options: None,
+                root_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+            },
+        )
+    }
+
+    /// Settings with a configured rust host server; `_self` host bridging is set
+    /// to `enabled` for the rust language.
+    fn rust_settings(self_enabled: bool) -> WorkspaceSettings {
+        let (name, cfg) = rust_server_config();
+        let mut language_servers = HashMap::new();
+        language_servers.insert(name, cfg);
+        let mut languages = HashMap::new();
+        languages.insert(
+            "rust".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    HOST_BRIDGE_KEY.to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(self_enabled),
+                        aggregation: None,
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+        WorkspaceSettings {
+            auto_install: false,
+            language_servers,
+            languages,
+            ..Default::default()
+        }
+    }
+
+    /// `service.inner()` borrows from `service`, so the harness is set up inline
+    /// per test; this registers the rust grammar so `detect_language` resolves a
+    /// `.rs` document to `"rust"`.
+    fn register_rust(server: &Kakehashi) {
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+    }
+
+    #[tokio::test]
+    async fn host_push_accepted_for_open_self_bridged_doc() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "fn main() {}".to_string(), Some("rust".to_string()), None);
+
+        DiagnosticPublisher::new(server)
+            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("boom")])
+            .await;
+
+        let snap = server.diagnostics.snapshot(&uri);
+        let host_slots = snap
+            .get(&DiagnosticSource::Host)
+            .expect("a Host slot should be recorded for an open _self-bridged doc");
+        assert_eq!(host_slots["rust_ls"].diagnostics.len(), 1);
+        assert_eq!(host_slots["rust_ls"].diagnostics[0].message, "boom");
+    }
+
+    #[tokio::test]
+    async fn host_push_dropped_when_document_not_open() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        // URI is never inserted into the document store.
+        let uri = Url::parse("file:///test/not_open.rs").unwrap();
+        DiagnosticPublisher::new(server)
+            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("x")])
+            .await;
+
+        assert!(
+            server.diagnostics.snapshot(&uri).is_empty(),
+            "a push for a non-open document must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_push_dropped_when_self_bridging_disabled() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        // Same rust server, but `_self` host bridging is explicitly disabled.
+        server.settings_manager.apply_settings(rust_settings(false));
+
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        server
+            .documents
+            .insert(uri.clone(), "fn main() {}".to_string(), Some("rust".to_string()), None);
+
+        DiagnosticPublisher::new(server)
+            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("y")])
+            .await;
+
+        assert!(
+            server.diagnostics.snapshot(&uri).is_empty(),
+            "a push for a language without _self host bridging must be dropped"
+        );
     }
 }

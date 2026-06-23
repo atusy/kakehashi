@@ -87,9 +87,11 @@ Partially implemented:
   virtual→host edit translation and cross-region aggregation that overlap the
   concatenated formatting pipeline (format-on-save), so virt `willSaveWaitUntil`
   stays deferred.
-- **Not implemented**: `publishDiagnostics` pass-through from host servers
-  (downstream notifications are not forwarded upstream today on either
-  path).
+- **Diagnostics**: a `_self` host server's pushed `publishDiagnostics` for the
+  real host URI are propagated to the editor via the per-host diagnostic cache
+  (push-propagation-diagnostic-forwarding, #421) — accepted when the URI names an
+  open host-bridged document. Host-layer eager-open (on-open diagnostics before
+  the first request) is still deferred.
 
 ## Context
 
