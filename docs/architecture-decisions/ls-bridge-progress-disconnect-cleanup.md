@@ -11,7 +11,8 @@ forwards the create, and then relays each `$/progress` (begin → report → end
 against that token until a terminating `End` clears the mapping.
 
 A downstream can exit *between* `Begin` and `End` — it crashes, is shut down, or
-is respawned while work is in flight. Before this change the bridge handled that
+is respawned while work is in flight. Before #413 was implemented the bridge
+handled that
 only *internally*: when the connection's reader task exited, the registry purged
 the connection's mappings and the forwarding loop dropped their admissions (the
 `ForgetWorkDoneProgress` notification removes them from `created_tokens` in

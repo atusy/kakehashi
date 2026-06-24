@@ -81,9 +81,10 @@ request just returns its result (today's behavior, minus the strip).
   already unique, so the server-declared `ProgressRegistry` namespacing is not
   involved; internally the bridge mints a per-server token so the reader can route
   the downstream's `$/progress` to the request's aggregator, which retargets it
-  onto the client token.) If it emits none, the editor sees no progress. This holds even when
-  the sole server was selected via the wildcard: the `Rest`-never-anchor rule
-  disambiguates among *racing* contenders, and a single downstream has none — so
+  onto the client token.) If it emits none, the editor sees no progress. This
+  holds even when the sole server was selected via the wildcard: the
+  `Rest`-never-anchor rule disambiguates among *racing* contenders, and a single
+  downstream has none — so
   its real `Begin` is safe to forward.
 - **preferred, N > 1.** This strategy short-circuits (it does not wait for the
   losers), so there is no collection count to report. If the anchor emits its own
