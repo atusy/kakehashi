@@ -673,6 +673,12 @@ fn coalesce_upstream_batch(
     use crate::lsp::bridge::{ProgressConnectionId, UpstreamNotification};
     use std::collections::HashMap;
 
+    // Common case — a lone notification (no burst queued): nothing to coalesce, so
+    // skip the `output`/`pending` allocations and the tombstone pass entirely.
+    if batch.len() <= 1 {
+        return batch;
+    }
+
     // `None` entries are tombstones: a publish superseded by a later same-key one.
     let mut output: Vec<Option<UpstreamNotification>> = Vec::with_capacity(batch.len());
     // Pending coalesced publishes since the last barrier: connection → uri → its
