@@ -77,10 +77,14 @@ impl LanguageServerPool {
     }
 }
 
-/// Build a JSON-RPC document symbol request for a downstream language server.
+/// Build a JSON-RPC `textDocument/documentSymbol` request for a downstream server.
 ///
-/// Like DocumentLinkParams, DocumentSymbolParams only has a textDocument field -
-/// no position. The request asks for all symbols in the entire document.
+/// The request is whole-document (no position). The bridge serializes only the
+/// `textDocument` field plus — when `client_progress_token` is `Some` — a
+/// `workDoneToken`, so the downstream reports `$/progress` against this request's
+/// shared aggregator (ls-bridge-client-progress). `None` omits the token, yielding
+/// the bare whole-document params. (The editor's other `DocumentSymbolParams`
+/// fields, e.g. `partialResultToken`, are not forwarded.)
 fn build_document_symbol_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
