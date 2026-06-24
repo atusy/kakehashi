@@ -14,10 +14,18 @@
 //!
 //! # Staging
 //!
-//! Per the non-regressing rule, the aggregator **drops any progress it does not
-//! yet handle — it never forwards raw downstream progress**. Currently only the
-//! single-downstream (`N = 1`) relay is implemented; multi-server fan-out
-//! (`preferred`/`concatenated`) is dropped until those stages land.
+//! *preferred* is implemented with a **single fixed anchor**: the dispatch path
+//! mints a bridge token solely for the **tracked source** (the sole server at
+//! `N = 1`, or the highest-priority *named* anchor at `N > 1`) and suppresses
+//! every other candidate by handing it no token, so only the tracked source's
+//! progress routes here. If that anchor returns empty and the request falls
+//! through to a lower-priority candidate, the editor sees no *new* progress for
+//! it; the open `Begin` is closed by the synthetic terminal `End` at request
+//! completion (an ADR-sanctioned branch of the pairing invariant). Deferred to
+//! later stages: **dynamic fall-through re-anchoring** (showing the *next* named
+//! anchor's real progress/`End`), *concatenated* aggregation, and
+//! `partialResultToken`. Until then a *concatenated* request shows no client
+//! progress.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -142,20 +150,19 @@ impl Drop for ClientProgressDeregisterGuard {
     }
 }
 
-/// Translates a fanned-out request's downstream `$/progress` into a single
+/// Translates the **tracked source's** downstream `$/progress` into a single
 /// lifecycle on the client's `workDoneToken`.
 ///
-/// Stage 1 implements the single-downstream (`N = 1`) relay, including a
-/// synthetic terminal `End` on teardown (so a relayed `Begin` is always closed
-/// even if the downstream's `End` races the response or never arrives).
-/// Multi-server aggregation (`preferred`/`concatenated`), which reintroduces the
-/// per-strategy anchor, arrives in later stages.
+/// Only the tracked source's bridge token routes here (under *preferred*/N=1 the
+/// dispatch path mints a token solely for that source — the sole server at N=1,
+/// or the highest-priority *named* anchor at N>1 — and suppresses every other
+/// candidate by handing it no token). So this aggregator just enforces one
+/// coherent `Begin → … → End` and guarantees a terminal `End` on teardown (even
+/// if the source's own `End` races the response or never arrives).
 #[derive(Debug)]
 pub(crate) struct ClientProgressAggregator {
     /// The editor-minted token every emitted `$/progress` is reported against.
     client_token: NumberOrString,
-    /// Number of downstream servers the request fanned out to.
-    server_count: usize,
     /// Whether a `Begin` has been relayed upstream (pairing invariant).
     begun: bool,
     /// Whether the terminal `End` has been emitted (drop anything after it; emit
@@ -164,21 +171,16 @@ pub(crate) struct ClientProgressAggregator {
 }
 
 impl ClientProgressAggregator {
-    pub(crate) fn new(client_token: NumberOrString, server_count: usize) -> Self {
+    pub(crate) fn new(client_token: NumberOrString) -> Self {
         Self {
             client_token,
-            server_count,
             begun: false,
             ended: false,
         }
     }
 
-    /// Feed one downstream `$/progress` value. Returns the upstream `$/progress`
-    /// to forward against the client token, or `None` to drop it.
-    ///
-    /// Stage 1 handles only the single-downstream case; with more than one
-    /// server the progress is dropped (never forwarded raw) until the
-    /// `preferred`/`concatenated` stages land.
+    /// Feed one tracked-source `$/progress` value. Returns the upstream
+    /// `$/progress` to forward against the client token, or `None` to drop it.
     pub(crate) fn on_downstream_progress(
         &mut self,
         value: ProgressParamsValue,
@@ -187,20 +189,15 @@ impl ClientProgressAggregator {
             &value,
             ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_))
         );
-        if self.ended
-            || self.server_count != 1
-            || (is_begin && self.begun)
-            || (!is_begin && !self.begun)
-        {
+        if self.ended || (is_begin && self.begun) || (!is_begin && !self.begun) {
             // Drop, so the editor sees one coherent Begin → … → End lifecycle:
-            // N > 1 is not yet aggregated (never forward raw); anything after the
-            // terminal End; a duplicate `Begin`; and any out-of-order `report`/
-            // `End` before the first `Begin`.
+            // anything after the terminal End; a duplicate `Begin`; and any
+            // out-of-order `report`/`End` before the first `Begin`.
             return None;
         }
-        // N = 1: relay verbatim under the client token, tracking the lifecycle so
-        // a terminal End is guaranteed even if the downstream's own End never
-        // arrives (or arrives after teardown).
+        // Relay verbatim under the client token, tracking the lifecycle so a
+        // terminal End is guaranteed even if the source's own End never arrives
+        // (or arrives after teardown).
         if is_begin {
             self.begun = true;
         } else if matches!(
@@ -258,7 +255,7 @@ mod tests {
 
     #[test]
     fn n1_relays_begin_then_end_under_the_client_token_then_drops() {
-        let mut agg = ClientProgressAggregator::new(client_token(), 1);
+        let mut agg = ClientProgressAggregator::new(client_token());
 
         for value in [begin(), end()] {
             let out = agg
@@ -275,7 +272,7 @@ mod tests {
     }
 
     fn agg() -> std::sync::Arc<Mutex<ClientProgressAggregator>> {
-        std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)))
+        std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token())))
     }
 
     #[test]
@@ -302,17 +299,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_server_progress_is_dropped_until_aggregation_lands() {
-        let mut agg = ClientProgressAggregator::new(client_token(), 2);
-        assert!(
-            agg.on_downstream_progress(begin()).is_none(),
-            "N>1 must not forward raw downstream progress (would duplicate Begins)"
-        );
-    }
-
-    #[test]
     fn out_of_order_end_before_begin_is_dropped() {
-        let mut agg = ClientProgressAggregator::new(client_token(), 1);
+        let mut agg = ClientProgressAggregator::new(client_token());
         // An `End` before any `Begin` must be dropped — the editor must never see
         // a terminal for a lifecycle that never began.
         assert!(
@@ -332,7 +320,7 @@ mod tests {
 
     #[test]
     fn duplicate_begin_is_dropped() {
-        let mut agg = ClientProgressAggregator::new(client_token(), 1);
+        let mut agg = ClientProgressAggregator::new(client_token());
         assert!(
             agg.on_downstream_progress(begin()).is_some(),
             "first Begin relays"
@@ -358,7 +346,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = std::sync::Arc::new(ClientProgressRegistry::new());
         let aggregator =
-            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token())));
         let token = registry.register(aggregator.clone());
         // Downstream begins (relayed) but never ends.
         aggregator.lock().unwrap().on_downstream_progress(begin());
@@ -395,7 +383,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = std::sync::Arc::new(ClientProgressRegistry::new());
         let aggregator =
-            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token())));
         let token = registry.register(aggregator.clone());
         {
             let mut guard = aggregator.lock().unwrap();
@@ -423,7 +411,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let registry = std::sync::Arc::new(ClientProgressRegistry::new());
         let aggregator =
-            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token(), 1)));
+            std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token())));
         let token = registry.register(aggregator.clone());
 
         drop(ClientProgressDeregisterGuard::new(
