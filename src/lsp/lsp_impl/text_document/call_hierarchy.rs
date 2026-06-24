@@ -138,6 +138,13 @@ impl Kakehashi {
 
     /// Whether the envelope's injection region still exists at the position it
     /// had when the item was minted (mirrors `code_lens_region_is_fresh`).
+    ///
+    /// Known limitation (same as `code_lens_region_is_fresh`): for injections whose
+    /// queries apply `#offset!` (today only YAML/TOML frontmatter in the bundled
+    /// markdown queries), the envelope offset is `#offset!`-adjusted while the
+    /// tracker stores the raw content-node position, so this comparison never
+    /// matches and incoming/outgoing always fail soft for those regions. That errs
+    /// in the safe direction (calls stay unexpanded rather than mistranslated).
     fn call_hierarchy_region_is_fresh(&self, envelope: &CallHierarchyEnvelope) -> bool {
         let Ok(uri) = Url::parse(&envelope.host_uri) else {
             return false;
