@@ -9,12 +9,12 @@ use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
     DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentLinkOptions,
-    DocumentOnTypeFormattingOptions, DocumentSymbolOptions, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
-    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
-    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions, DocumentSymbolOptions,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, InlayHintOptions,
+    InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions,
+    RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
@@ -315,7 +315,13 @@ impl Kakehashi {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
-                document_range_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Right(
+                    DocumentRangeFormattingOptions {
+                        work_done_progress_options: WorkDoneProgressOptions {
+                            work_done_progress: Some(true),
+                        },
+                    },
+                )),
                 document_on_type_formatting_provider: on_type_formatting_triggers.map(
                     |(first, more)| DocumentOnTypeFormattingOptions {
                         first_trigger_character: first,

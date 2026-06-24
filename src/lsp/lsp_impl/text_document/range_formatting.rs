@@ -20,16 +20,19 @@
 //! formatting returns no result), it falls back to `rangeFormatting` so
 //! range-only servers still format.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{DocumentRangeFormattingParams, Range, TextEdit};
+use tower_lsp_server::ls_types::{DocumentRangeFormattingParams, NumberOrString, Range, TextEdit};
 
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::FanInResult;
-use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::aggregation::server::{
+    dispatch_preferred, dispatch_preferred_with_tokens, mint_region_progress_source,
+};
+use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_verbatim};
 use crate::text::PositionMapper;
 
@@ -43,6 +46,7 @@ impl Kakehashi {
     ) -> Result<Option<Vec<TextEdit>>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri.clone();
+        let work_done_token = params.work_done_progress_params.work_done_token.clone();
         let virt = async {
             let lsp_uri = params.text_document.uri;
             let options = params.options;
@@ -143,6 +147,20 @@ impl Kakehashi {
 
             let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
 
+            // Shared client progress: a range-formatting request fans out over
+            // several injection regions (one `dispatch_preferred` each), so they
+            // share ONE aggregator + ONE teardown guard. The aggregator's winner
+            // rule shows the first region to begin as one coherent
+            // `Begin → … → End` on the editor's token (ls-bridge-client-progress).
+            // `None` when no `workDoneToken`.
+            let shared_cp = work_done_token.map(|client_token| {
+                (
+                    Arc::new(Mutex::new(ClientProgressAggregator::new(client_token))),
+                    Arc::clone(pool.client_progress_registry()),
+                )
+            });
+            let mut cp_minted: Vec<NumberOrString> = Vec::new();
+
             for resolved in all_regions {
                 // A covering request (its byte span encloses the whole region)
                 // prefers full formatting; a partial request range-formats the
@@ -205,77 +223,123 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+
+                // Mint this region's tracked-source token into the shared
+                // aggregator (the per-region map dispatch hands to its winning
+                // downstream).
+                let region_cp_tokens = shared_cp.as_ref().and_then(|(aggregator, registry)| {
+                    mint_region_progress_source(&region_ctx, registry, aggregator)
+                });
+                if let Some(map) = &region_cp_tokens {
+                    cp_minted.extend(map.values().cloned());
+                }
+
                 let pool = Arc::clone(&pool);
                 let options = options.clone();
                 let region_cancel_rx = cancel_state.derive_receiver();
 
                 outer_join_set.spawn(async move {
-                    let result = dispatch_preferred(
-                        &region_ctx,
-                        pool.clone(),
-                        move |t| {
-                            let options = options.clone();
-                            async move {
-                                // Covering request: prefer full formatting, but fall
-                                // back to rangeFormatting over the whole region when
-                                // the server has no `documentFormattingProvider`
-                                // (`Ok(None)`) — otherwise a range-only server would
-                                // format nothing. Errors propagate (no fallback);
-                                // `Ok(Some(_))` (incl. an empty edit list) is an
-                                // authoritative result.
-                                if is_covering {
-                                    match t
-                                        .pool
-                                        .send_formatting_request(
-                                            &t.server_name,
-                                            &t.server_config,
-                                            &t.uri,
-                                            &t.injection_language,
-                                            &t.region_id,
-                                            t.offset.clone(),
-                                            &t.virtual_content,
-                                            options.clone(),
-                                            t.upstream_id.clone(),
-                                            None,
-                                        )
-                                        .await
-                                    {
-                                        Ok(None) => {} // fall through to rangeFormatting
-                                        other => return other,
-                                    }
-                                }
-                                t.pool
-                                    .send_range_formatting_request(
+                    let send = move |t: crate::lsp::aggregation::server::FanOutTask| {
+                        let options = options.clone();
+                        async move {
+                            // The covering path may issue BOTH a formatting and
+                            // a rangeFormatting request; capture the per-task
+                            // client-progress token once and hand it to whichever
+                            // call actually goes on the wire.
+                            let cp_token = t.client_progress_token;
+                            // Covering request: prefer full formatting, but fall
+                            // back to rangeFormatting over the whole region when
+                            // the server has no `documentFormattingProvider`
+                            // (`Ok(None)`) — otherwise a range-only server would
+                            // format nothing. Errors propagate (no fallback);
+                            // `Ok(Some(_))` (incl. an empty edit list) is an
+                            // authoritative result.
+                            if is_covering {
+                                match t
+                                    .pool
+                                    .send_formatting_request(
                                         &t.server_name,
                                         &t.server_config,
                                         &t.uri,
                                         &t.injection_language,
                                         &t.region_id,
-                                        t.offset,
+                                        t.offset.clone(),
                                         &t.virtual_content,
-                                        clipped_host_range,
-                                        options,
-                                        t.upstream_id,
+                                        options.clone(),
+                                        t.upstream_id.clone(),
+                                        cp_token.clone(),
                                         None,
                                     )
                                     .await
+                                {
+                                    Ok(None) => {} // fall through to rangeFormatting
+                                    other => return other,
+                                }
                             }
-                        },
-                        // Same semantics as full formatting: `Some(vec![])` is
-                        // an authoritative "no edits needed" (e.g., the range is
-                        // already perfectly formatted) — keep it and stop. `None`
-                        // means "no response" and falls through to lower-priority
-                        // servers.
-                        |opt| opt.is_some(),
-                        region_cancel_rx,
-                    )
-                    .await;
+                            t.pool
+                                .send_range_formatting_request(
+                                    &t.server_name,
+                                    &t.server_config,
+                                    &t.uri,
+                                    &t.injection_language,
+                                    &t.region_id,
+                                    t.offset,
+                                    &t.virtual_content,
+                                    clipped_host_range,
+                                    options,
+                                    t.upstream_id,
+                                    cp_token,
+                                    None,
+                                )
+                                .await
+                        }
+                    };
+                    // Same semantics as full formatting: `Some(vec![])` is an
+                    // authoritative "no edits needed" (e.g., the range is already
+                    // perfectly formatted) — keep it and stop. `None` means "no
+                    // response" and falls through to lower-priority servers.
+                    let is_nonempty = |opt: &Option<Vec<TextEdit>>| opt.is_some();
+                    let result = match region_cp_tokens {
+                        Some(tokens) => {
+                            dispatch_preferred_with_tokens(
+                                &region_ctx,
+                                pool.clone(),
+                                send,
+                                is_nonempty,
+                                region_cancel_rx,
+                                tokens,
+                            )
+                            .await
+                        }
+                        None => {
+                            dispatch_preferred(
+                                &region_ctx,
+                                pool.clone(),
+                                send,
+                                is_nonempty,
+                                region_cancel_rx,
+                            )
+                            .await
+                        }
+                    };
                     match result {
                         FanInResult::Done(edits) => edits,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
                     }
                 });
             }
+
+            // One teardown guard for the whole request, held across the edit
+            // collection so the synthetic terminal `End` fires once, after every
+            // region settles (or on cancel). Dropped at the end of this block.
+            let _cp_guard = shared_cp.map(|(aggregator, registry)| {
+                ClientProgressDeregisterGuard::new(
+                    registry,
+                    cp_minted,
+                    aggregator,
+                    pool.upstream_tx(),
+                )
+            });
 
             let response =
                 finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await;

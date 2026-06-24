@@ -44,7 +44,9 @@ expression: capabilities
     "resolveProvider": true
   },
   "documentFormattingProvider": true,
-  "documentRangeFormattingProvider": true,
+  "documentRangeFormattingProvider": {
+    "workDoneProgress": true
+  },
   "renameProvider": {
     "prepareProvider": true
   },
