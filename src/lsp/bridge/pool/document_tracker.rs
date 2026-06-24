@@ -180,6 +180,17 @@ impl DocumentTracker {
                 docs.remove(&uri_string);
             }
         }
+        // Drop any fingerprint symmetrically with the version (#422) — benign today
+        // (unclaim runs right after a failed didOpen, before any didChange recorded a
+        // fingerprint) but keeps the two maps consistent if that ever changes.
+        if let Some(docs) = self
+            .document_fingerprints
+            .lock()
+            .await
+            .get_mut(connection_key)
+        {
+            docs.remove(&uri_string);
+        }
 
         // Then decrement the opened refcount and clean reverse index
         self.decrement_opened(&uri_string);
@@ -279,9 +290,12 @@ impl DocumentTracker {
         let uri_string = virtual_uri.to_uri_string();
         let fp = content_fingerprint(content);
 
-        // Unchanged content for this connection → skip the re-send (and the version
-        // bump). Held briefly and released before the version lock (the two maps are
-        // never locked simultaneously, matching the rest of this type).
+        // Unchanged content (vs the last fingerprint **recorded as sent**) → skip the
+        // re-send and the version bump. The fingerprint is NOT updated here: the caller
+        // records it via `record_sent_content_fingerprint` only after the didChange is
+        // confirmed enqueued, so a dropped send (full/closed writer queue) leaves the
+        // old fingerprint and the next edit re-sends (self-healing). Held briefly and
+        // released before the version lock (the two maps are never locked together).
         {
             let fingerprints = self.document_fingerprints.lock().await;
             if fingerprints
@@ -294,19 +308,28 @@ impl DocumentTracker {
         }
 
         // Content changed (or first didChange / unknown): bump the version. `None`
-        // here means the doc isn't registered for this connection, so don't record a
-        // fingerprint (nothing was sent).
-        let version = self
-            .increment_document_version(virtual_uri, connection_key)
-            .await?;
+        // means the doc isn't registered for this connection.
+        self.increment_document_version(virtual_uri, connection_key)
+            .await
+    }
 
+    /// Record the fingerprint of the content just **successfully enqueued** as a
+    /// `didChange` to this connection, so a later edit leaving the region's content
+    /// identical is skipped (#422). Call this only after the send returns `Queued` —
+    /// recording before the send (or on a dropped send) would mark content the server
+    /// never received, defeating the self-heal on the next edit.
+    pub(super) async fn record_sent_content_fingerprint(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) {
         self.document_fingerprints
             .lock()
             .await
             .entry(connection_key.clone())
             .or_default()
-            .insert(uri_string, fp);
-        Some(version)
+            .insert(virtual_uri.to_uri_string(), content_fingerprint(content));
     }
 
     /// Remove a document from `document_versions` and `opened_documents`.
@@ -928,7 +951,8 @@ mod tests {
             .register_opened_document(&host_uri, &virtual_uri, &conn)
             .await;
 
-        // First call records the fingerprint and bumps (1 -> 2).
+        // First call bumps (1 -> 2). The caller records the fingerprint only after a
+        // confirmed send.
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
@@ -936,13 +960,16 @@ mod tests {
             Some(2),
             "first didChange sends and bumps the version"
         );
-        // Same content → skip (no bump, no re-send).
+        tracker
+            .record_sent_content_fingerprint(&virtual_uri, &conn, "local x = 1")
+            .await;
+        // Same content now recorded-as-sent → skip (no bump, no re-send).
         assert_eq!(
             tracker
                 .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
                 .await,
             None,
-            "unchanged content must skip the re-send"
+            "unchanged content must skip the re-send once recorded as sent"
         );
         // Changed content → bump again (2 -> 3).
         assert_eq!(
@@ -951,6 +978,36 @@ mod tests {
                 .await,
             Some(3),
             "changed content sends and bumps"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_didchange_self_heals_because_the_fingerprint_is_not_recorded() {
+        // The fingerprint is recorded only on a confirmed send. If a send is dropped
+        // (caller skips record_sent_content_fingerprint), the same content must still
+        // re-send on the next edit — otherwise the server keeps stale content (#422).
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+
+        // Send bumps (1 -> 2) but we do NOT record it (the send was dropped).
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            Some(2),
+        );
+        // Same content re-sends (bumps again) because no fingerprint was recorded.
+        assert_eq!(
+            tracker
+                .increment_version_if_content_changed(&virtual_uri, &conn, "local x = 1")
+                .await,
+            Some(3),
+            "a dropped send must self-heal: identical content re-sends, not skips"
         );
     }
 

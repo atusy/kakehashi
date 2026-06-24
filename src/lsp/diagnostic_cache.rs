@@ -152,6 +152,20 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
+/// A stable ordering key for a diagnostic — by range then message — used to compare
+/// two merged sets order-independently for no-op-publish suppression (#422). Two
+/// fully-identical diagnostics tie, so the sort is total enough for an equality
+/// compare; it does not change what is published.
+fn diagnostic_order_key(d: &Diagnostic) -> (u32, u32, u32, u32, &str) {
+    (
+        d.range.start.line,
+        d.range.start.character,
+        d.range.end.line,
+        d.range.end.character,
+        d.message.as_str(),
+    )
+}
+
 /// Transform a pushed region diagnostic from virtual to host coordinates.
 ///
 /// Mirrors the pull path's `transform_diagnostic`
@@ -338,15 +352,24 @@ impl DiagnosticAggregator {
     /// recording it as the new last when it does. Returns `false` when identical,
     /// so the caller skips a redundant `publishDiagnostics` the editor already has
     /// (#422). Called under the host's republish lock, so same-host calls serialize.
+    ///
+    /// The comparison is **order-independent**: `merge_cached_diagnostics` walks
+    /// `HashMap`-keyed sources/servers, so the same logical set can serialize in a
+    /// different order between republishes. Both the incoming set and the stored one
+    /// are sorted by position+message first, so a multi-source/multi-server host is
+    /// not wrongly seen as "changed" merely because the merge order shuffled.
     pub(crate) fn published_set_changed(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
+        let mut sorted = diagnostics.to_vec();
+        sorted.sort_by(|a, b| diagnostic_order_key(a).cmp(&diagnostic_order_key(b)));
+
         let mut last = self
             .last_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_published");
         match last.get(host) {
-            Some(prev) if prev.as_slice() == diagnostics => false,
+            Some(prev) if *prev == sorted => false,
             _ => {
-                last.insert(host.clone(), diagnostics.to_vec());
+                last.insert(host.clone(), sorted);
                 true
             }
         }
@@ -1026,6 +1049,19 @@ mod tests {
         assert!(
             agg.published_set_changed(&host(), &[diag("a")]),
             "a re-opened host must publish its first set even if it matches the pre-close one"
+        );
+    }
+
+    #[test]
+    fn published_set_changed_ignores_merge_order() {
+        let agg = DiagnosticAggregator::new();
+        let a = diag_at("a", 0, 0);
+        let b = diag_at("b", 1, 0);
+        assert!(agg.published_set_changed(&host(), &[a.clone(), b.clone()]));
+        // The same logical set in a different (HashMap-shuffled) order is NOT a change.
+        assert!(
+            !agg.published_set_changed(&host(), &[b, a]),
+            "suppression must be order-independent for multi-source/server hosts"
         );
     }
 

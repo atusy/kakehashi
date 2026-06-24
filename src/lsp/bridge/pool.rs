@@ -705,6 +705,20 @@ impl LanguageServerPool {
             .await
     }
 
+    /// Record `content`'s fingerprint as sent to this connection — call only after a
+    /// confirmed-enqueued didChange (#422). Delegates to
+    /// [`DocumentTracker::record_sent_content_fingerprint`].
+    pub(super) async fn record_sent_content_fingerprint(
+        &self,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: &str,
+    ) {
+        self.document_tracker
+            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
+            .await
+    }
+
     /// Get or create a connection for the specified server, spawning the server
     /// and running the LSP handshake with the default timeout on a miss.
     ///
