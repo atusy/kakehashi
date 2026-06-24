@@ -173,10 +173,13 @@ pub(crate) struct DiagnosticAggregator {
     /// `tokio::sync::Mutex` is the one held across the publish await.
     ///
     /// The value is a [`Weak`] so the per-host `Mutex` allocation is freed as soon
-    /// as its last holder/waiter drops the owning guard — the map then keeps only a
-    /// tiny dangling weak, reclaimed off the hot path by [`Self::reclaim_republish_locks`]
-    /// (#466). A live (upgradeable) weak is never removed, so reclamation cannot
-    /// race a republish into minting a second lock for the same host.
+    /// as its last owner drops its `Arc` — that owner is either an active
+    /// `OwnedMutexGuard` (the holder) or a queued waiter's pending `lock_owned()`
+    /// future, which owns the `Arc` it was about to lock. The map then keeps only a
+    /// tiny dangling weak, reclaimed off the hot path by
+    /// [`Self::reclaim_republish_locks`] (#466). A live (upgradeable) weak is never
+    /// removed, so reclamation cannot race a republish into minting a second lock
+    /// for the same host.
     republish_locks: Mutex<HashMap<Url, Weak<tokio::sync::Mutex<()>>>>,
 }
 
@@ -220,6 +223,13 @@ impl DiagnosticAggregator {
     /// would let a concurrent acquire mint a *second* lock for the same host and
     /// skip serialization — so a live weak is always kept (reclaimed at a later
     /// sweep once it drains). Called off the hot path (host `didClose`).
+    ///
+    /// A push that was already past its open-document / region-resolve guard when
+    /// the host closed can still resume and re-create one entry after this sweep
+    /// (the narrow resurrection window the deferred lifecycle/`content_epoch` gate
+    /// closes generally — #422). That residual is bounded by distinct host URIs in
+    /// the session (the same bound the unreclaimed map had), so it never grows
+    /// without bound; the next `didClose` sweep collects it.
     pub(crate) fn reclaim_republish_locks(&self) {
         let mut locks = self
             .republish_locks
@@ -303,6 +313,18 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::republish_locks")
             .len()
+    }
+
+    /// Strong-ref count of a host's republish lock, or 0 if absent/dangling
+    /// (test-only). Lets a test observe that a queued waiter holds its own `Arc`
+    /// to the lock, independent of the active holder's guard.
+    #[cfg(test)]
+    fn republish_lock_strong_count(&self, host: &Url) -> usize {
+        self.republish_locks
+            .lock()
+            .recover_poison("DiagnosticAggregator::republish_locks")
+            .get(host)
+            .map_or(0, Weak::strong_count)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Url, SourceSlots>> {
@@ -419,14 +441,15 @@ mod tests {
     async fn reclaim_during_contention_preserves_the_waiter_handoff() {
         // The end-to-end shape reclaim must never break: a republish is queued
         // behind an in-flight one for the same host while a sweep runs. A queued
-        // waiter keeps an `Arc` to the lock (lock_owned consumes the Arc by value),
+        // waiter's pending lock_owned() future owns the `Arc` it is about to lock,
         // so the weak still upgrades and the entry survives the sweep — and the
         // waiter then acquires the *same* lock, preserving per-host ordering.
         let agg = Arc::new(DiagnosticAggregator::new());
         let a = Url::parse("file:///a.md").unwrap();
 
-        // In-flight republish holds the lock.
+        // In-flight republish holds the lock: exactly one strong ref (the guard).
         let held = agg.lock_republish(&a).await;
+        assert_eq!(agg.republish_lock_strong_count(&a), 1);
 
         // A second republish for the same host parks as a queued waiter.
         let agg2 = Arc::clone(&agg);
@@ -434,16 +457,25 @@ mod tests {
         let waiter = tokio::spawn(async move {
             let _g = agg2.lock_republish(&a2).await;
         });
-        // Let the waiter reach lock_owned().await and park. (The assertion below is
-        // robust even if it hasn't yet — `held` alone keeps the weak upgradeable —
-        // but parking is the case under test.)
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        // Deterministically wait until the waiter has upgraded its own `Arc` — that
+        // happens synchronously (under the outer mutex) before it parks on
+        // lock_owned(), so strong_count reaching 2 proves the parked waiter, not
+        // `held`, is the second owner. No sleep: yield to let the spawned task run.
+        let mut spins = 0;
+        while agg.republish_lock_strong_count(&a) < 2 {
+            assert!(spins < 10_000, "waiter never upgraded its Arc");
+            spins += 1;
+            tokio::task::yield_now().await;
+        }
+
+        // The waiter alone (independent of `held`) keeps the weak upgradeable, so a
+        // sweep at this instant must not remove the entry.
         agg.reclaim_republish_locks();
         assert_eq!(
             agg.republish_lock_count(),
             1,
-            "a lock under active contention must survive reclamation"
+            "a lock with a queued waiter must survive reclamation"
         );
 
         // Releasing the in-flight guard lets the queued waiter acquire and finish —
