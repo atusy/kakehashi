@@ -38,6 +38,10 @@ const MD_URI: &str = "file:///test_push_diagnostics.md";
 /// `0:"# Test"  1:""  2:"```lua"  3:"local x = 1"  4:"```"`. So the injected
 /// virtual document's line 0 maps to host line 3.
 const MD_TEXT: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
+/// Same shape as `MD_TEXT` but the lua region's *content* differs (`local x = 2`),
+/// so a `didChange` carrying it is NOT skipped by the content-fingerprint guard
+/// (#422) and reaches the downstream mock.
+const MD_TEXT_EDITED: &str = "# Test\n\n```lua\nlocal x = 2\n```\n";
 const HOST_LINE: i64 = 3;
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
@@ -134,13 +138,15 @@ fn e2e_push_diagnostic_reaches_editor_in_host_coords_then_clears() {
         "virtual line 0 must be translated to host line {HOST_LINE} (the lua fence content line)"
     );
 
-    // A follow-up empty push (the mock pushes `[]` on didChange) clears this
+    // A follow-up edit that CHANGES the lua region's content (`local x = 1` →
+    // `local x = 2`) reaches the mock (the content-fingerprint guard only skips
+    // *unchanged* content, #422); the mock pushes `[]` on didChange, clearing this
     // source's contribution for the host doc.
     client.send_notification(
         "textDocument/didChange",
         json!({
             "textDocument": { "uri": MD_URI, "version": 2 },
-            "contentChanges": [{ "text": MD_TEXT }]
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
         }),
     );
 
@@ -219,11 +225,13 @@ fn e2e_position_only_edit_reanchors_pushed_diagnostic_without_a_repush() {
         "a position-only host edit must re-anchor the pushed diagnostic to its new host line without a re-push"
     );
 
-    // A SECOND position-only edit shifts the region to line 5. This proves the
+    // A SECOND position-only edit shifts the region to line 5. This checks the
     // diagnostic *persisted* (was not cleared by the first edit): the content guard
     // must keep the first edit's didChange from reaching the mock — otherwise the
-    // mock's empty-on-didChange push would have cleared the slot, `has_region_slots`
-    // would be false, and no re-anchor to line 5 would ever come.
+    // mock's empty-on-didChange push would empty this region's slot, and the
+    // re-anchor would carry no diagnostic to line 5. (Not a hermetic proof that no
+    // didChange was sent — a late empty push could still race — but a strong guard
+    // that the steady state is the diagnostic re-anchored, not cleared.)
     let shifted_text_2 = format!("\n\n{MD_TEXT}");
     client.send_notification(
         "textDocument/didChange",
@@ -271,15 +279,17 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
         )
         .expect("editor should receive the pushed diagnostic before the crash");
 
-    // didChange drives the mock to exit (crash) while the host stays open. The
-    // bridge's reader sees EOF, evicts that connection's slots, and republishes the
-    // host cleared — a positive assertion (no negative timeout): we wait for the
-    // publish that no longer carries the dead server's diagnostic (#469).
+    // A content-changing edit (`local x = 1` → `local x = 2`) reaches the mock — the
+    // fingerprint guard only skips *unchanged* content (#422) — driving it to exit
+    // (crash) while the host stays open. The bridge's reader sees EOF, evicts that
+    // connection's slots, and republishes the host cleared — a positive assertion (no
+    // negative timeout): we wait for the publish that no longer carries the dead
+    // server's diagnostic (#469).
     client.send_notification(
         "textDocument/didChange",
         json!({
             "textDocument": { "uri": MD_URI, "version": 2 },
-            "contentChanges": [{ "text": MD_TEXT }]
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
         }),
     );
 
