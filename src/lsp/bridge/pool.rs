@@ -266,6 +266,11 @@ pub struct LanguageServerPool {
     /// reader task (to register/translate) and the cancel path (to route a
     /// client `window/workDoneProgress/cancel` to the owning downstream).
     progress_registry: Arc<super::ProgressRegistry>,
+    /// Routes bridge-minted per-server client-progress tokens to their
+    /// aggregator (ls-bridge-client-progress). Shared with every reader task (to
+    /// route an incoming `$/progress`) and the dispatch path (register on
+    /// fan-out / deregister on completion).
+    client_progress_registry: Arc<super::ClientProgressRegistry>,
     /// Tracks downstream-initiated requests forwarded to the editor so a
     /// downstream `$/cancelRequest` (or connection death) can cancel the
     /// editor-bound request (#404). Shared with every reader task (to register /
@@ -309,6 +314,7 @@ impl LanguageServerPool {
             upstream_request_tx,
             upstream_request_rx: std::sync::Mutex::new(Some(upstream_request_rx)),
             progress_registry: Arc::new(super::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
         }
     }
@@ -325,6 +331,21 @@ impl LanguageServerPool {
     #[cfg(test)]
     pub(crate) fn progress_registry(&self) -> &Arc<super::ProgressRegistry> {
         &self.progress_registry
+    }
+
+    /// Routes bridge-minted client-progress tokens to their aggregator
+    /// (ls-bridge-client-progress); shared with reader tasks (route incoming
+    /// `$/progress`) and the dispatch path (register/deregister).
+    pub(crate) fn client_progress_registry(&self) -> &Arc<super::ClientProgressRegistry> {
+        &self.client_progress_registry
+    }
+
+    /// A clone of the upstream-notification sender, for emitting aggregated
+    /// client progress (and its synthetic teardown `End`) to the editor.
+    pub(crate) fn upstream_tx(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<super::UpstreamNotification> {
+        self.upstream_tx.clone()
     }
 
     /// Set the workspace root URI.
@@ -1255,6 +1276,7 @@ impl LanguageServerPool {
                 // reader (it answers workspace/workspaceFolders pulls).
                 workspace_folders: workspace_folders.clone(),
                 progress_registry: Arc::clone(&self.progress_registry),
+                client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id: self.progress_registry.new_connection_id(),
             },
         );

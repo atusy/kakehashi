@@ -26,6 +26,7 @@
 
 mod actor;
 mod client;
+mod client_progress;
 mod connection;
 pub(crate) mod coordinator;
 mod inbound_request_registry;
@@ -45,6 +46,9 @@ pub(crate) use actor::ForwardedRequestCancel;
 pub(crate) use actor::OutboundMessage;
 pub(crate) use actor::UpstreamNotification;
 pub(crate) use actor::UpstreamRequest;
+pub(crate) use client_progress::{
+    ClientProgressAggregator, ClientProgressDeregisterGuard, ClientProgressRegistry,
+};
 pub(crate) use coordinator::BridgeCoordinator;
 pub(crate) use coordinator::ResolvedServerConfig;
 pub(crate) use inbound_request_registry::InboundRequestRegistry;

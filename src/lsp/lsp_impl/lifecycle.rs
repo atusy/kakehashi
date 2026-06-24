@@ -890,6 +890,15 @@ async fn deliver_upstream_notification(
                 .send_notification::<tower_lsp_server::ls_types::notification::Progress>(params)
                 .await;
         }
+        UpstreamNotification::ClientProgress { params } => {
+            // Aggregated client-provided progress: the editor minted the token
+            // and needs no `window/workDoneProgress/create`, so forward it
+            // ungated (ls-bridge-client-progress). The aggregator already
+            // guarantees a single coherent Begin/report/End lifecycle.
+            client
+                .send_notification::<tower_lsp_server::ls_types::notification::Progress>(params)
+                .await;
+        }
         UpstreamNotification::ForgetWorkDoneProgress(tokens) => {
             // A downstream reader exited with progress in flight; drop its
             // admissions so the set can't leak across respawns. For any token that
@@ -1712,6 +1721,98 @@ mod tests {
             ))
             .await
             .unwrap();
+
+        cancel.cancel();
+        let _ = loop_handle.await;
+    }
+
+    /// `ClientProgress` is forwarded to the editor **ungated** — without any
+    /// `window/workDoneProgress/create` admission, because the editor minted the
+    /// client `workDoneToken` itself (ls-bridge-client-progress). Contrast
+    /// `forwarding_loop_drops_progress_when_create_rejected`, where server-declared
+    /// `Progress` for an un-created token is dropped.
+    #[tokio::test]
+    async fn forwarding_loop_forwards_client_progress_ungated() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::Request;
+        use tower_lsp_server::ls_types::{
+            InitializeParams, InitializeResult, NumberOrString, ProgressParams,
+            ProgressParamsValue, WorkDoneProgress, WorkDoneProgressBegin,
+        };
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, _responses) = socket.split();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        // No create was ever sent for this token, yet ClientProgress must be
+        // forwarded (the editor owns the token).
+        let token = NumberOrString::String("editor-wd-1".to_string());
+        tx.send(UpstreamNotification::ClientProgress {
+            params: ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Finding references".to_string(),
+                        cancellable: None,
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            },
+        })
+        .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), requests.next())
+            .await
+            .expect("client progress must be forwarded ungated")
+            .expect("stream yielded a message");
+        assert_eq!(msg.method(), "$/progress");
+        let params: ProgressParams =
+            serde_json::from_value(msg.params().expect("has params").clone()).unwrap();
+        assert_eq!(params.token, token, "forwarded under the client token");
 
         cancel.cancel();
         let _ = loop_handle.await;
