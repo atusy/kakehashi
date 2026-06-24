@@ -9,11 +9,11 @@ use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
     DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentLinkOptions,
-    DocumentOnTypeFormattingOptions, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
-    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    DocumentOnTypeFormattingOptions, DocumentSymbolOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions,
+    RenameOptions, SaveOptions, SelectionRangeProviderCapability, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
@@ -293,7 +293,15 @@ impl Kakehashi {
                     resolve_provider: None,
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
-                document_symbol_provider: Some(OneOf::Left(true)),
+                // Advertise workDoneProgress so spec-compliant clients attach a
+                // `workDoneToken` — the bridge relays the fanned-out regions'
+                // `$/progress` onto it (ls-bridge-client-progress, #450).
+                document_symbol_provider: Some(OneOf::Right(DocumentSymbolOptions {
+                    label: None,
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // codeLens/resolve is routed to the origin downstream server
                 // via the envelope in lens.data (#355, see
