@@ -549,6 +549,16 @@ impl ConnectionHandle {
                 .as_ref()
                 .and_then(|opts| opts.resolve_provider)
                 .unwrap_or(false),
+            // `code_action_provider` is a bool-or-struct enum, so reject the
+            // explicit `Simple(false)` (advertised-but-disabled) like the other
+            // OneOf/bool capabilities.
+            "textDocument/codeAction" => matches!(
+                caps.code_action_provider,
+                Some(
+                    tower_lsp_server::ls_types::CodeActionProviderCapability::Simple(true)
+                        | tower_lsp_server::ls_types::CodeActionProviderCapability::Options(_)
+                )
+            ),
             "textDocument/documentLink" => caps.document_link_provider.is_some(),
             "textDocument/foldingRange" => matches!(
                 caps.folding_range_provider,
@@ -2346,6 +2356,57 @@ mod tests {
         handle.set_server_capabilities(ServerCapabilities::default());
 
         assert!(!handle.has_capability("completionItem/resolve"));
+    }
+
+    // ========================================
+    // codeAction capability tests (#352)
+    // ========================================
+
+    #[tokio::test]
+    async fn code_action_capability_true_for_simple_and_options() {
+        use tower_lsp_server::ls_types::{CodeActionOptions, CodeActionProviderCapability};
+
+        let simple = spawn_sink_handle().await;
+        simple.set_server_capabilities(ServerCapabilities {
+            code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+            ..Default::default()
+        });
+        assert!(
+            simple.has_capability("textDocument/codeAction"),
+            "Simple(true) advertises codeAction"
+        );
+
+        let options = spawn_sink_handle().await;
+        options.set_server_capabilities(ServerCapabilities {
+            code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        assert!(
+            options.has_capability("textDocument/codeAction"),
+            "Options(_) advertises codeAction"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_action_capability_false_when_disabled_or_absent() {
+        use tower_lsp_server::ls_types::CodeActionProviderCapability;
+
+        let disabled = spawn_sink_handle().await;
+        disabled.set_server_capabilities(ServerCapabilities {
+            code_action_provider: Some(CodeActionProviderCapability::Simple(false)),
+            ..Default::default()
+        });
+        assert!(
+            !disabled.has_capability("textDocument/codeAction"),
+            "Simple(false) is advertised-but-disabled"
+        );
+
+        let absent = spawn_sink_handle().await;
+        absent.set_server_capabilities(ServerCapabilities::default());
+        assert!(!absent.has_capability("textDocument/codeAction"));
     }
 
     // ========================================
