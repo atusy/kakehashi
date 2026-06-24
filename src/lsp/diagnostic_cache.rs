@@ -623,7 +623,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("r1".into()),
             "luals".into(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("err", 0, 2)],
         );
         let mut offsets = HashMap::new();
@@ -660,7 +660,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("r1".into()),
             "luals".into(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![d],
         );
         let mut offsets = HashMap::new();
@@ -696,7 +696,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("gone".into()),
             "luals".into(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag("stale")],
         );
         // No offset for "gone" -> region is stale -> skipped.
@@ -711,7 +711,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("r1".into()),
             "luals".into(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("push", 0, 0)],
         );
         agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
@@ -732,14 +732,14 @@ mod tests {
             &host(),
             DiagnosticSource::Host,
             "lua_ls".into(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("hostA", 7, 3)],
         );
         agg.record(
             &host(),
             DiagnosticSource::Host,
             "selene".into(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag_at("hostB", 8, 0)],
         );
         let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
@@ -775,7 +775,7 @@ mod tests {
             &host(),
             region.clone(),
             "srv".to_string(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag("r")],
         );
         agg.set_pull_layer(&host(), vec![diag("p")]);
@@ -801,7 +801,7 @@ mod tests {
             &host(),
             region.clone(),
             "srv".to_string(),
-            None,
+            Some(ProgressConnectionId::for_test(1)),
             vec![diag("r")],
         );
         assert!(agg.evict_source(&host(), &region));
