@@ -13,6 +13,10 @@
 //! No-resurrection-after-close (a late push dropped once the editor closed the doc)
 //! is covered by the `#421` push-accept-guard unit tests; an e2e for it would be a
 //! flaky negative-timeout assertion, so it is intentionally left out here.
+//!
+//! A second test (`diagnostics-push-crash` mode) proves crash eviction (#469): the
+//! downstream pushes a diagnostic, then exits; the bridge evicts that connection's
+//! slots and republishes the host **cleared** — a positive (non-flaky) assertion.
 
 #![cfg(feature = "e2e")]
 
@@ -37,6 +41,10 @@ const MD_TEXT: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const HOST_LINE: i64 = 3;
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
+    init_client_with_mode("diagnostics-push")
+}
+
+fn init_client_with_mode(mode: &str) -> (LspClient, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("temp dir");
     let config_path = config_dir.path().join("push_diagnostics.toml");
     std::fs::write(&config_path, "").expect("write config");
@@ -55,7 +63,7 @@ fn init_client() -> (LspClient, tempfile::TempDir) {
             "workspaceFolders": null,
             "initializationOptions": {
                 "languageServers": {
-                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                    "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
                 }
             }
         }),
@@ -144,6 +152,57 @@ fn e2e_push_diagnostic_reaches_editor_in_host_coords_then_clears() {
     assert!(
         cleared.is_some(),
         "an empty push should clear the source's diagnostic for the host doc"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
+    let (mut client, _config_dir) = init_client_with_mode("diagnostics-push-crash");
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MD_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MD_TEXT
+            }
+        }),
+    );
+
+    // The crash mock pushes one diagnostic on didOpen; the editor receives it.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("editor should receive the pushed diagnostic before the crash");
+
+    // didChange drives the mock to exit (crash) while the host stays open. The
+    // bridge's reader sees EOF, evicts that connection's slots, and republishes the
+    // host cleared — a positive assertion (no negative timeout): we wait for the
+    // publish that no longer carries the dead server's diagnostic (#469).
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT }]
+        }),
+    );
+
+    let cleared = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(15),
+        cleared_host_diag,
+    );
+    assert!(
+        cleared.is_some(),
+        "a crashed downstream's pushed diagnostics must be evicted and the host republished cleared"
     );
 
     client.send_request("shutdown", json!(null));

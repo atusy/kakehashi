@@ -49,6 +49,10 @@
 //!   `didChange`. Used by `tests/e2e_push_diagnostics.rs` to prove a downstream's
 //!   spontaneous push reaches the editor in host coordinates and that an empty push
 //!   clears it (#427).
+//! - `diagnostics-push-crash` — pushes the same diagnostic on `didOpen`, then exits
+//!   the process on the next `didChange` to simulate a downstream crash while the
+//!   host stays open. Used to prove the bridge evicts the dead connection's slots
+//!   and republishes the host cleared (#469).
 //! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
@@ -234,7 +238,9 @@ fn main() {
                     // `diagnostics-push` mode: spontaneously push one diagnostic on
                     // the virtual line 0 (no pull). The bridge translates it to host
                     // coordinates and publishes it to the editor (#427).
-                    if mode == "diagnostics-push" {
+                    // `diagnostics-push-crash` pushes the same diagnostic, then exits
+                    // the process on the next `didChange` to simulate a crash (#469).
+                    if mode == "diagnostics-push" || mode == "diagnostics-push-crash" {
                         notify(
                             &mut writer,
                             "textDocument/publishDiagnostics",
@@ -266,6 +272,13 @@ fn main() {
                             "textDocument/publishDiagnostics",
                             push_diagnostics(uri, false),
                         );
+                    }
+                    // `diagnostics-push-crash`: exit the process now (the diagnostic
+                    // pushed on didOpen is still live in the editor). The bridge's
+                    // reader sees EOF, evicts this connection's slots, and republishes
+                    // the host cleared (#469).
+                    if mode == "diagnostics-push-crash" {
+                        std::process::exit(0);
                     }
                 }
             }
