@@ -36,10 +36,12 @@
 //! edit path that orphans a region — #424) and crash/server eviction too
 //! (`evict_connection`, wired into the reader-exit path — #469; slots are tagged
 //! with the producing connection's id so a restart's slots survive). Still
-//! deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
-//! visible-walk; cross-source order is HashMap-nondeterministic until then), the
-//! `content_epoch` version gate, and host-layer eager-open (diagnostics on open
-//! before the first request).
+//! deferred: the `preferred` sticky-election strategy fan-in (the `concatenated`
+//! strategy — keep every server, in a deterministic position order — ships in #423;
+//! `preferred` needs a per-source version baseline #422 left unbuilt) and host-layer
+//! eager-open (diagnostics on open before the first request). The `content_epoch`
+//! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
+//! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -152,13 +154,17 @@ pub(crate) fn merge_cached_diagnostics(
     // Deterministic published order (#423): the cache walks `HashMap`-keyed sources
     // and servers, so without this the array order varies between republishes for a
     // multi-source/multi-server host. Order by host position (top-to-bottom — "order
-    // cross-region merge by region start position"), then by the other distinguishing
-    // fields (message, source, severity, code) so two genuinely-distinct diagnostics
-    // at the same span never fall back to HashMap order. This is the `concatenated`
-    // strategy (every server's diagnostics are kept); the `preferred` election is
-    // deferred (it needs a per-source version baseline, which #422 left unbuilt).
-    // Diagnostics that are equal on all these fields are indistinguishable, so the
-    // stable `sort_by` leaving their order untouched is immaterial.
+    // cross-region merge by region start position"), then by the cheap distinguishing
+    // fields (message, source, severity). This is the `concatenated` strategy (every
+    // server's diagnostics are kept); the `preferred` election is deferred (it needs a
+    // per-source version baseline, which #422 left unbuilt).
+    //
+    // The final tiebreak is each diagnostic's full serialized form — a **total** order
+    // over every field (code, tags, data, relatedInformation, …), so two genuinely
+    // distinct diagnostics at the same span can never fall back to HashMap order. It is
+    // evaluated **lazily** (`then_with`), only when every cheap field above already
+    // ties, so the serialization is off the hot path. Fully-identical diagnostics
+    // serialize equally and keep their (immaterial) relative order.
     merged.sort_by(|a, b| {
         let key = |d: &Diagnostic| {
             (
@@ -173,9 +179,11 @@ pub(crate) fn merge_cached_diagnostics(
             .then_with(|| a.message.cmp(&b.message))
             .then_with(|| a.source.cmp(&b.source))
             .then_with(|| a.severity.cmp(&b.severity))
-            // `code` (Option<NumberOrString>) is not `Ord`; compare its debug form so
-            // a differing code still yields a deterministic order (rare last resort).
-            .then_with(|| format!("{:?}", a.code).cmp(&format!("{:?}", b.code)))
+            .then_with(|| {
+                serde_json::to_string(a)
+                    .unwrap_or_default()
+                    .cmp(&serde_json::to_string(b).unwrap_or_default())
+            })
     });
     merged
 }
@@ -980,31 +988,58 @@ mod tests {
     }
 
     #[test]
-    fn merge_breaks_position_ties_by_message_then_source() {
+    fn merge_breaks_position_ties_by_message() {
         let agg = DiagnosticAggregator::new();
         // Two diagnostics at the SAME position but different messages → ordered by
         // message, deterministically (not by HashMap iteration).
-        let mut d_zebra = diag_at("zebra", 3, 0);
-        d_zebra.source = Some("s1".into());
-        let mut d_apple = diag_at("apple", 3, 0);
-        d_apple.source = Some("s2".into());
         agg.record(
             &host(),
             DiagnosticSource::Host,
             "srv1".into(),
             Some(ProgressConnectionId::for_test(1)),
-            vec![d_zebra],
+            vec![diag_at("zebra", 3, 0)],
         );
         agg.record(
             &host(),
             DiagnosticSource::Host,
             "srv2".into(),
             Some(ProgressConnectionId::for_test(1)),
-            vec![d_apple],
+            vec![diag_at("apple", 3, 0)],
         );
         let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
         let msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(msgs, vec!["apple", "zebra"], "ties break by message");
+    }
+
+    #[test]
+    fn merge_breaks_position_and_message_ties_by_source() {
+        let agg = DiagnosticAggregator::new();
+        // Same position AND message, differing only in `source` → ordered by source.
+        let mut from_z = diag_at("dup", 3, 0);
+        from_z.source = Some("z_src".into());
+        let mut from_a = diag_at("dup", 3, 0);
+        from_a.source = Some("a_src".into());
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv_z".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![from_z],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv_a".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![from_a],
+        );
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let sources: Vec<_> = merged.iter().map(|d| d.source.clone()).collect();
+        assert_eq!(
+            sources,
+            vec![Some("a_src".to_string()), Some("z_src".to_string())],
+            "same position+message ties break by source"
+        );
     }
 
     #[test]
