@@ -50,7 +50,8 @@ expression: capabilities
     "workDoneProgress": true
   },
   "renameProvider": {
-    "prepareProvider": true
+    "prepareProvider": true,
+    "workDoneProgress": true
   },
   "documentLinkProvider": {},
   "foldingRangeProvider": true,

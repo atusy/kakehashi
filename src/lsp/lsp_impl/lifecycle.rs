@@ -313,7 +313,12 @@ impl Kakehashi {
                 }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
-                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                    // Advertise workDoneProgress so spec-compliant clients attach a
+                    // workDoneToken, which the bridge relays onto downstream rename
+                    // progress (#437, ls-bridge-client-progress).
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
                 })),
                 document_formatting_provider: Some(OneOf::Right(DocumentFormattingOptions {
                     work_done_progress_options: WorkDoneProgressOptions {
