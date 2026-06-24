@@ -182,12 +182,17 @@ impl DiagnosticAggregator {
     /// docs). Different hosts hold different locks and so never block each other.
     pub(crate) async fn lock_republish(&self, host: &Url) -> tokio::sync::OwnedMutexGuard<()> {
         // Brief outer lock to fetch-or-create this host's lock, then await it.
+        // Clone the `Url` key only when inserting a new entry — the steady state
+        // (lock already present) avoids the allocation on this per-republish path.
         let lock = {
             let mut locks = self
                 .republish_locks
                 .lock()
                 .recover_poison("DiagnosticAggregator::republish_locks");
-            Arc::clone(locks.entry(host.clone()).or_default())
+            match locks.get(host) {
+                Some(lock) => Arc::clone(lock),
+                None => Arc::clone(locks.entry(host.clone()).or_default()),
+            }
         };
         lock.lock_owned().await
     }
