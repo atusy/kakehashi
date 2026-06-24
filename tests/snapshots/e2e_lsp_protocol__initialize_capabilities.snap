@@ -100,7 +100,9 @@ expression: capabilities
   },
   "monikerProvider": true,
   "linkedEditingRangeProvider": true,
-  "inlayHintProvider": true,
+  "inlayHintProvider": {
+    "workDoneProgress": true
+  },
   "diagnosticProvider": {
     "interFileDependencies": false,
     "workspaceDiagnostics": false
