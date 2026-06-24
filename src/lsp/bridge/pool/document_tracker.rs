@@ -72,8 +72,12 @@ pub(crate) struct DocumentTracker {
     /// when a host edit didn't change a region's extracted content (mirrors the
     /// host path's fingerprint guard in `text_document/host.rs`), so a position-only
     /// edit doesn't re-analyze every region and flicker (#422). An entry is recorded
-    /// only when a `didChange` is actually sent, keeping "fingerprint set ⟺ content
-    /// sent" — never bumping the gate without a corresponding sync.
+    /// only after a content sync is **confirmed enqueued** — seeded by the initial
+    /// `didOpen` (`LanguageServerPool::ensure_document_opened`) and updated on each
+    /// `didChange` (`record_sent_content_fingerprint`, called only on a `Queued`
+    /// send) — keeping "fingerprint set ⟺ content sent" so the gate is never bumped
+    /// without a corresponding sync (a dropped send leaves the old fingerprint, and
+    /// the next edit re-syncs).
     ///
     /// A `std::sync::Mutex` (not tokio's): only ever held for a brief synchronous map
     /// op, never across an `.await`, so the async mutex's overhead is unwanted (mirrors

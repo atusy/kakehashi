@@ -152,7 +152,7 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
-/// Largest set for which the allocation-free O(n²) match is used; above this, a
+/// Largest set for which the serialization-free O(n²) match is used; above this, a
 /// noisy server's payload would make the quadratic compare a republish bottleneck,
 /// so we switch to the O(n) serialized-count path.
 const MULTISET_QUADRATIC_CAP: usize = 64;
@@ -162,11 +162,11 @@ const MULTISET_QUADRATIC_CAP: usize = 64;
 /// ignore the merge's `HashMap` ordering (#422).
 ///
 /// For the common small set (`<= MULTISET_QUADRATIC_CAP`) an O(n²) greedy match: for
-/// each `a` element, consume the first unused equal `b` element — no allocation or
-/// serialization. For a large set (a noisy server) that would be a republish
-/// bottleneck, so fall back to an O(n) multiset compare keyed by each diagnostic's
-/// serialized form (a total, order-independent key). Neither path collapses distinct
-/// sets.
+/// each `a` element, consume the first unused equal `b` element — no serialization
+/// (just a small `bool` match-mask). For a large set (a noisy server) that would be a
+/// republish bottleneck, so fall back to an O(n) multiset compare keyed by each
+/// diagnostic's serialized form (a total, order-independent key). Neither path
+/// collapses distinct sets.
 fn same_diagnostic_multiset(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
     if a.len() != b.len() {
         return false;
