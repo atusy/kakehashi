@@ -43,7 +43,9 @@ expression: capabilities
   "codeLensProvider": {
     "resolveProvider": true
   },
-  "documentFormattingProvider": true,
+  "documentFormattingProvider": {
+    "workDoneProgress": true
+  },
   "documentRangeFormattingProvider": {
     "workDoneProgress": true
   },
