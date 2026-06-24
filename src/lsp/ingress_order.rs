@@ -26,11 +26,12 @@
 //!   notifications, and the one awaited bridge call, `process_injections`,
 //!   only forwards a didChange on the edit path, not on open), so the handler
 //!   can never block on a client response. A slow auto-install still runs
-//!   inside the handler and so holds the writer ticket — bounded by the
-//!   install timeouts (multi-minute worst case, never infinite), so a heavy
-//!   one-time UI stall on first open of an uninstalled parser, not a wedge.
-//!   Moving that to a spawned task is a deferred liveness follow-up (#480),
-//!   not a correctness gap.
+//!   inside the handler and so holds the writer ticket — its network/git
+//!   stages are timeout-bounded, but parser *compilation* is not, so a
+//!   pathologically hung compiler can hold the ticket indefinitely and wedge
+//!   later same-URI readers/writers. Moving auto-install to a spawned task
+//!   (#480) is therefore a liveness fix, not just a latency one; until then
+//!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename requests, pull
 //!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
