@@ -709,8 +709,13 @@ fn coalesce_upstream_batch(
             // Any non-publish notification is a barrier: the pending publishes are
             // already committed to `output` ahead of it (order preserved); stop
             // coalescing across it so a later same-key push is emitted separately.
+            // Clear the inner maps rather than the outer one, so a batch with several
+            // barriers reuses the per-connection allocations instead of dropping and
+            // re-allocating them each time.
             barrier => {
-                pending.clear();
+                for by_uri in pending.values_mut() {
+                    by_uri.clear();
+                }
                 output.push(Some(barrier));
             }
         }
