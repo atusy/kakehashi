@@ -201,12 +201,22 @@ impl DiagnosticAggregator {
                 .republish_locks
                 .lock()
                 .recover_poison("DiagnosticAggregator::republish_locks");
-            match locks.get(host).and_then(Weak::upgrade) {
-                Some(lock) => lock,
+            // `get_mut` keeps the steady state (a live weak) to a single lookup with
+            // no key clone, and lets the dangling-weak case (a since-dropped lock,
+            // e.g. after reclamation) be refreshed *in place* — no second lookup and
+            // no `Url` clone. The key is cloned only when the host is wholly absent.
+            match locks.get_mut(host) {
+                Some(weak) => match weak.upgrade() {
+                    Some(lock) => lock,
+                    None => {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        *weak = Arc::downgrade(&lock);
+                        lock
+                    }
+                },
                 None => {
-                    // Absent, or a dangling weak left by a since-dropped lock:
-                    // mint a fresh lock and record a weak to it. The returned
-                    // guard keeps the `Arc` alive for as long as it is held.
+                    // First republish for this host: mint a fresh lock and record a
+                    // weak to it. The returned guard keeps the `Arc` alive while held.
                     let lock = Arc::new(tokio::sync::Mutex::new(()));
                     locks.insert(host.clone(), Arc::downgrade(&lock));
                     lock
