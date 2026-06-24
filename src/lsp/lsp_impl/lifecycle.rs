@@ -644,8 +644,9 @@ async fn upstream_forwarding_loop(
 /// instead of draining forever (#426).
 const UPSTREAM_COALESCE_BATCH_CAP: usize = 256;
 
-/// Collapse a drained burst of upstream notifications, coalescing **consecutive**
-/// `PublishDiagnostics` for the same `(connection_id, uri)` down to the latest one
+/// Collapse a drained burst of upstream notifications, coalescing the
+/// `PublishDiagnostics` for each `(connection_id, uri)` within a barrier-delimited
+/// run (not necessarily adjacent — other keys may interleave) down to the latest one
 /// (#426). A push-happy or misbehaving downstream can pile arbitrary-size
 /// `Vec<Diagnostic>` on the unbounded upstream channel faster than the loop
 /// republishes them; since `record` already keeps only the latest per
@@ -674,9 +675,11 @@ fn coalesce_upstream_batch(
 
     // `None` entries are tombstones: a publish superseded by a later same-key one.
     let mut output: Vec<Option<UpstreamNotification>> = Vec::with_capacity(batch.len());
-    // Pending coalesced publishes since the last barrier: `(connection, uri)` key →
-    // its (live, latest) index in `output`.
-    let mut pending: HashMap<(ProgressConnectionId, String), usize> = HashMap::new();
+    // Pending coalesced publishes since the last barrier: connection → uri → its
+    // (live, latest) index in `output`. Nested (rather than a flat `(conn, uri)`
+    // tuple key) so the coalescing-repeat path looks up by `&uri` with `get_mut` and
+    // only clones the `uri` when first inserting it.
+    let mut pending: HashMap<ProgressConnectionId, HashMap<String, usize>> = HashMap::new();
 
     for notification in batch {
         match notification {
@@ -686,12 +689,15 @@ fn coalesce_upstream_batch(
                 connection_id,
                 diagnostics,
             } => {
-                let key = (connection_id, uri.clone());
                 let idx = output.len();
-                // Record this as the key's latest; tombstone the earlier occurrence
-                // (if any) so only the latest survives, at its own later position.
-                if let Some(prev) = pending.insert(key, idx) {
-                    output[prev] = None;
+                let by_uri = pending.entry(connection_id).or_default();
+                if let Some(prev) = by_uri.get_mut(&uri) {
+                    // Tombstone the earlier occurrence so only the latest survives, at
+                    // its own later position (no `uri` clone on this hot repeat path).
+                    output[*prev] = None;
+                    *prev = idx;
+                } else {
+                    by_uri.insert(uri.clone(), idx);
                 }
                 output.push(Some(UpstreamNotification::PublishDiagnostics {
                     uri,
