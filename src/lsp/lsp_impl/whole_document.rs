@@ -37,6 +37,11 @@ impl Kakehashi {
     /// is safe for any item kind). Returns `None` when the document has no
     /// injection regions, no configured servers, or every region came back
     /// empty — mirroring the per-method handlers this was extracted from.
+    ///
+    /// `client_progress_token` is the editor's `workDoneToken`, if any: when
+    /// `Some`, one shared aggregator relays the first region to begin as a single
+    /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
+    /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
     pub(super) async fn whole_document_preferred_fan_out<T, F, Fut>(
         &self,
         lsp_uri: &Uri,
