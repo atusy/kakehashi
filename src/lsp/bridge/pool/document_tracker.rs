@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
+use crate::error::LockResultExt;
+
 use url::Url;
 
 use super::ConnectionKey;
@@ -67,7 +69,12 @@ pub(crate) struct DocumentTracker {
     /// edit doesn't re-analyze every region and flicker (#422). An entry is recorded
     /// only when a `didChange` is actually sent, keeping "fingerprint set ⟺ content
     /// sent" — never bumping the gate without a corresponding sync.
-    document_fingerprints: Mutex<HashMap<ConnectionKey, HashMap<String, u64>>>,
+    ///
+    /// A `std::sync::Mutex` (not tokio's): only ever held for a brief synchronous map
+    /// op, never across an `.await`, so the async mutex's overhead is unwanted (mirrors
+    /// `DiagnosticAggregator::last_published`). Poisoning is recovered via
+    /// `LockResultExt::recover_poison`.
+    document_fingerprints: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, u64>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
     /// Each OpenedVirtualDoc stores its connection key for reverse lookup during didClose.
@@ -93,7 +100,7 @@ impl DocumentTracker {
     pub(crate) fn new() -> Self {
         Self {
             document_versions: Mutex::new(HashMap::new()),
-            document_fingerprints: Mutex::new(HashMap::new()),
+            document_fingerprints: std::sync::Mutex::new(HashMap::new()),
             host_to_virtual: Mutex::new(HashMap::new()),
             opened_documents: DashMap::new(),
             virtual_to_servers: DashMap::new(),
@@ -186,7 +193,7 @@ impl DocumentTracker {
         if let Some(docs) = self
             .document_fingerprints
             .lock()
-            .await
+            .recover_poison("DocumentTracker::document_fingerprints")
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
@@ -303,7 +310,10 @@ impl DocumentTracker {
         // (self-healing). Held briefly and released before the version lock (the two
         // maps are never locked together).
         {
-            let fingerprints = self.document_fingerprints.lock().await;
+            let fingerprints = self
+                .document_fingerprints
+                .lock()
+                .recover_poison("DocumentTracker::document_fingerprints");
             if fingerprints
                 .get(connection_key)
                 .and_then(|docs| docs.get(&uri_string))
@@ -335,7 +345,10 @@ impl DocumentTracker {
     ) {
         let uri_string = virtual_uri.to_uri_string();
         let fp = content_fingerprint(content);
-        let mut fingerprints = self.document_fingerprints.lock().await;
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
         // Clone the connection key only when first inserting it (common path: the
         // connection is already present, so look up by borrow).
         if let Some(docs) = fingerprints.get_mut(connection_key) {
@@ -368,7 +381,7 @@ impl DocumentTracker {
         if let Some(docs) = self
             .document_fingerprints
             .lock()
-            .await
+            .recover_poison("DocumentTracker::document_fingerprints")
             .get_mut(connection_key)
         {
             docs.remove(&uri_string);
@@ -404,7 +417,7 @@ impl DocumentTracker {
         // re-syncs from scratch rather than skipping on a stale fingerprint (#422).
         self.document_fingerprints
             .lock()
-            .await
+            .recover_poison("DocumentTracker::document_fingerprints")
             .remove(connection_key);
         for uri in &uris {
             self.decrement_opened(uri);
