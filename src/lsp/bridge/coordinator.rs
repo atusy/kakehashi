@@ -673,8 +673,8 @@ impl BridgeCoordinator {
                 // Cancel the OLD batch's token first — this bails any task whose
                 // body already started before its handle registered (#435) — then
                 // install a fresh token for the new generation.
-                entry.get().cancel.cancel();
                 let batch = entry.get_mut();
+                batch.cancel.cancel();
                 batch.cancel = CancellationToken::new();
                 let prev = std::mem::take(&mut batch.handles);
                 batch.generation = generation;
@@ -752,8 +752,8 @@ impl BridgeCoordinator {
                 // Cancel the OLD batch's token first — this bails any task whose
                 // body already started before its handle registered (#435) — then
                 // install a fresh token for the new generation.
-                entry.get().cancel.cancel();
                 let batch = entry.get_mut();
+                batch.cancel.cancel();
                 batch.cancel = CancellationToken::new();
                 let prev_handles = std::mem::take(&mut batch.handles);
                 batch.generation = generation;
