@@ -11,19 +11,18 @@ forwards the create, and then relays each `$/progress` (begin → report → end
 against that token until a terminating `End` clears the mapping.
 
 A downstream can exit *between* `Begin` and `End` — it crashes, is shut down, or
-is respawned while work is in flight. Today the bridge handles that only
-*internally*: when the connection's reader task exits, the registry purges the
-connection's mappings and the forwarding loop drops their admissions (the
+is respawned while work is in flight. Before this change the bridge handled that
+only *internally*: when the connection's reader task exited, the registry purged
+the connection's mappings and the forwarding loop dropped their admissions (the
 `ForgetWorkDoneProgress` notification removes them from `created_tokens` in
-`src/lsp/lsp_impl/lifecycle.rs`). It never forwards a terminating `End` to the
-editor.
+`src/lsp/lsp_impl/lifecycle.rs`). It forwarded no terminating `End` to the editor.
 
-The consequence is a **dangling progress indicator**: the editor created the
+The consequence was a **dangling progress indicator**: the editor created the
 progress token on `window/workDoneProgress/create`, the downstream started it
-with `Begin`, but no `End` ever arrives, so the spinner stays up indefinitely.
+with `Begin`, but no `End` ever arrived, so the spinner stayed up indefinitely.
 Some editors offer no way to dismiss a progress indicator they believe is still
-running. Work-done progress is a strict begin/end lifecycle, and the bridge
-currently breaks it on the disconnect path.
+running. Work-done progress is a strict begin/end lifecycle, and the bridge broke
+it on the disconnect path (now fixed — see the Decision–Implementation Gap).
 
 ## Decision
 

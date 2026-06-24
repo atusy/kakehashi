@@ -23,11 +23,14 @@ all N downstreams' `End`s/responses (they collide); it forwards exactly one or
 composes one, as the Decision details. (A request that reaches a single server is
 just relayed.)
 
-Today the bridge does not forward client-provided tokens to downstreams at all.
+Originally the bridge forwarded no client-provided tokens to downstreams at all.
 The host raw-request path strips them (`strip_progress_tokens`,
 `src/lsp/bridge/text_document/host.rs`), and the per-method virtual request
-builders construct fresh params with default (empty) progress fields, so no
-token is carried either way. A downstream honoring them would stream into the
+builders constructed fresh params with default (empty) progress fields, so no
+token was carried either way. (The host path still strips, and
+`partialResultToken` is still dropped; wired methods now carry a bridge-minted
+`workDoneToken` — see the Decision–Implementation Gap.) A downstream honoring
+them would stream into the
 void, since the bridge discards downstream notifications, and could legally
 return an empty final result. The cost is that client-requested progress never
 reaches the editor.
@@ -73,8 +76,11 @@ The lifecycle engages only when there is progress worth showing; otherwise the
 request just returns its result (today's behavior, minus the strip).
 
 - **Single downstream (N = 1).** Relay that server's own `Begin`/`report`/`End`
-  against the client's original token (client tokens are already unique, so no
-  remapping). If it emits none, the editor sees no progress. This holds even when
+  onto the client's original token — what the editor sees. (Client tokens are
+  already unique, so the server-declared `ProgressRegistry` namespacing is not
+  involved; internally the bridge mints a per-server token so the reader can route
+  the downstream's `$/progress` to the request's aggregator, which retargets it
+  onto the client token.) If it emits none, the editor sees no progress. This holds even when
   the sole server was selected via the wildcard: the `Rest`-never-anchor rule
   disambiguates among *racing* contenders, and a single downstream has none — so
   its real `Begin` is safe to forward.
