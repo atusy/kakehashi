@@ -12,16 +12,20 @@
 //! *before* buffering the returned futures, so this middleware can assign
 //! per-URI sequence tickets at `call` time:
 //!
-//! - **Writers** (`didChange` / `didClose`) take the next ticket and run
-//!   only after the previous writer for the same document finished, so edits
-//!   and closes apply in strict wire order. `didOpen` is deliberately NOT a
-//!   writer: its handler can await downstream-server spawn/initialization,
-//!   which in turn can wait on upstream client interaction — ticketing it
-//!   deadlocks a client that blocks on a gated request (e.g. a readiness
-//!   poll via `textDocument/diagnostic`) while the server waits for that
-//!   same client. The residual open/edit and close/reopen first-poll-order
-//!   races are the pre-gate status quo; gating `didOpen` properly (fast
-//!   handler + spawned downstream work) is tracked in #374.
+//! - **Writers** (`didOpen` / `didChange` / `didClose`) take the next ticket
+//!   and run only after the previous writer for the same document finished,
+//!   so opens, edits, and closes apply in strict wire order. Gating `didOpen`
+//!   (#374) closes the two residual first-poll-order races: a `didChange`
+//!   first-polled before `didOpen` no longer misses the document and discards
+//!   its edit (open→edit), and a reopen no longer inserts ahead of a gated
+//!   `didClose` that then evicts it (close→reopen). The historical deadlock
+//!   rationale for leaving `didOpen` ungated — its handler awaiting
+//!   downstream spawn that itself waits on the client — no longer applies:
+//!   downstream spawn is fire-and-forget and every editor-facing await on the
+//!   open path is a one-way notification, so the handler never blocks on the
+//!   client. A slow auto-install still runs inside the handler and so holds
+//!   the writer ticket; moving that to a spawned task is a deferred liveness
+//!   follow-up, not a correctness gap.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename requests, pull
 //!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
@@ -235,7 +239,7 @@ enum Role {
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
-        "textDocument/didChange" | "textDocument/didClose" => {
+        "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
             let uri = text_document_uri(req)?;
             Some(Role::Writer {
                 uri,
