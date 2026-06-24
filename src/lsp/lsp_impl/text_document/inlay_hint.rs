@@ -21,7 +21,8 @@ impl Kakehashi {
         params: InlayHintParams,
     ) -> Result<Option<Vec<InlayHint>>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
-        let work_done_token = params.work_done_progress_params.work_done_token.clone();
+        // Move (not clone) the token out — `params` is consumed below.
+        let work_done_token = params.work_done_progress_params.work_done_token;
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 

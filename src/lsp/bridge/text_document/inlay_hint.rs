@@ -251,6 +251,50 @@ mod tests {
     }
 
     #[test]
+    fn inlay_hint_request_carries_work_done_token_only_when_present() {
+        let host_uri = test_host_uri();
+        let host_range = Range {
+            start: tower_lsp_server::ls_types::Position {
+                line: 1,
+                character: 0,
+            },
+            end: tower_lsp_server::ls_types::Position {
+                line: 2,
+                character: 0,
+            },
+        };
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region-0");
+
+        // With a token: present in params.
+        let with = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            &RegionOffset::new(0, 0),
+            RequestId::new(1),
+            Some(NumberOrString::String("cprog-1".to_string())),
+        );
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["params"]["workDoneToken"],
+            "cprog-1"
+        );
+
+        // Without a token: the field is omitted (non-regressing).
+        let without = build_inlay_hint_request(
+            &virtual_uri,
+            host_range,
+            &RegionOffset::new(0, 0),
+            RequestId::new(1),
+            None,
+        );
+        assert!(
+            serde_json::to_value(&without).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "None omits the token"
+        );
+    }
+
+    #[test]
     fn inlay_hint_request_first_line_applies_column_offset() {
         let host_uri = test_host_uri();
         // Host range starts on first line of region (line 5), region starts at col 4
