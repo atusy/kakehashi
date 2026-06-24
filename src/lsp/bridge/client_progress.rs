@@ -541,12 +541,13 @@ mod tests {
     /// the editor on the client token, exercising the production route+relay+
     /// teardown path rather than mutating the aggregator directly.
     ///
-    /// The relay goes through the **same production helper**
-    /// (`relay_to_aggregator`) that `window::progress::forward` uses, so its
-    /// enqueue-under-lock ordering is real code here, not a stub. Only the trivial
-    /// `route` lookup and the reader's JSON deserialization are not driven; the
-    /// *concurrent* interleaving that the lock ordering guards is out of a
-    /// single-threaded test's reach.
+    /// Both the `route` lookup and the relay go through real code — the latter via
+    /// the **same production helper** (`relay_to_aggregator`) that
+    /// `window::progress::forward` uses, so its enqueue-under-lock ordering is
+    /// exercised, not stubbed. Only the reader's JSON deserialization and
+    /// `forward`'s token-branch selection are bypassed; the *concurrent*
+    /// interleaving that the lock ordering guards is out of a single-threaded
+    /// test's reach.
     #[test]
     fn reader_route_relays_begin_then_teardown_synthesizes_end() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
