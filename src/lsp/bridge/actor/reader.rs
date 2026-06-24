@@ -77,6 +77,10 @@ pub(crate) enum UpstreamNotification {
         /// The originating downstream server's config name (`deps.server_name`);
         /// pushes without a name are dropped at the reader, so this is always set.
         server: String,
+        /// The originating connection's id (`deps.progress_connection_id`). Tags the
+        /// cached slot so a later reader exit can evict only this connection's slots,
+        /// never a restarted connection's (which gets a fresh id) (#469).
+        connection_id: crate::lsp::bridge::ProgressConnectionId,
         /// The pushed diagnostics, in the published document's own coordinates
         /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
@@ -117,6 +121,14 @@ pub(crate) enum UpstreamNotification {
     /// progress still in flight, so the loop's created-token set can't leak
     /// entries across crashes/respawns (window-work-done-progress bridging).
     ForgetWorkDoneProgress(Vec<tower_lsp_server::ls_types::NumberOrString>),
+    /// Evict the diagnostic-cache slots a now-exited connection produced and
+    /// republish the affected hosts — sent when a downstream connection's reader
+    /// exits (crash/respawn), so a dead server's pushed diagnostics don't linger
+    /// until the host's `didClose` (#469). A restart's slots carry a fresh
+    /// connection id and so survive.
+    EvictConnectionDiagnostics {
+        connection_id: crate::lsp::bridge::ProgressConnectionId,
+    },
 }
 
 /// A downstream-initiated **request** the bridge forwards to the editor and
@@ -265,6 +277,16 @@ impl Drop for ProgressPurgeGuard {
                 .upstream_tx
                 .send(UpstreamNotification::ForgetWorkDoneProgress(tokens));
         }
+        // Evict this connection's pushed diagnostics so a dead server's stale
+        // diagnostics don't linger until the host's `didClose` (#469). Sent
+        // unconditionally — when the connection never pushed, the loop's eviction
+        // scans the cache, matches no slot, and republishes nothing (a semantic
+        // no-op on this rare exit path).
+        let _ = self
+            .upstream_tx
+            .send(UpstreamNotification::EvictConnectionDiagnostics {
+                connection_id: self.connection_id,
+            });
     }
 }
 
@@ -1296,7 +1318,7 @@ mod tests {
 
         let router = Arc::new(ResponseRouter::new());
         let (response_tx, _response_rx) = mpsc::channel(16);
-        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let conn = progress_registry.new_connection_id();
@@ -1341,6 +1363,32 @@ mod tests {
             "reader exit must purge the connection's progress mappings"
         );
         assert_eq!(progress_registry.translate(conn, &downstream_token), None);
+
+        // The same guard also asks the forwarding loop to evict this connection's
+        // diagnostic slots, so a dead server's diagnostics don't linger (#469).
+        // `Drop` runs `purge_connection` *then* the sends, so the purge above can be
+        // observed before the eviction send lands — `recv().await` (not a single
+        // `try_recv`) so we wait for it rather than racing the guard's Drop.
+        let saw_eviction = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(notification) = upstream_rx.recv().await {
+                if let UpstreamNotification::EvictConnectionDiagnostics { connection_id } =
+                    notification
+                {
+                    assert_eq!(
+                        connection_id, conn,
+                        "eviction must target the exited connection"
+                    );
+                    return true;
+                }
+            }
+            false // channel closed (all senders dropped) without an eviction
+        })
+        .await
+        .expect("EvictConnectionDiagnostics must arrive after reader exit");
+        assert!(
+            saw_eviction,
+            "reader exit must emit EvictConnectionDiagnostics for its connection"
+        );
     }
 
     #[tokio::test]
@@ -2356,8 +2404,10 @@ mod tests {
             UpstreamNotification::PublishDiagnostics {
                 uri,
                 server,
+                connection_id,
                 diagnostics,
             } => {
+                assert_eq!(connection_id, deps.progress_connection_id);
                 assert!(uri.contains("kakehashi-virtual-uri-REGION"));
                 assert_eq!(server, "luals");
                 assert_eq!(diagnostics.len(), 1);

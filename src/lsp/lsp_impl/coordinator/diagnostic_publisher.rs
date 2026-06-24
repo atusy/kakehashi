@@ -15,7 +15,9 @@ use url::Url;
 
 use crate::document::DocumentStore;
 use crate::language::{InjectionResolver, LanguageCoordinator};
-use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, VirtualDocumentUri};
+use crate::lsp::bridge::{
+    BridgeCoordinator, ProgressConnectionId, RegionOffset, VirtualDocumentUri,
+};
 use crate::lsp::diagnostic_cache::{
     DiagnosticAggregator, DiagnosticSource, merge_cached_diagnostics,
 };
@@ -58,12 +60,15 @@ impl DiagnosticPublisher {
         &self,
         uri: String,
         server: String,
+        connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
         if VirtualDocumentUri::is_virtual_uri(&uri) {
-            self.publish_region_push(&uri, server, diagnostics).await;
+            self.publish_region_push(&uri, server, connection_id, diagnostics)
+                .await;
         } else {
-            self.publish_host_push(&uri, server, diagnostics).await;
+            self.publish_host_push(&uri, server, connection_id, diagnostics)
+                .await;
         }
     }
 
@@ -79,6 +84,7 @@ impl DiagnosticPublisher {
         &self,
         host_uri: &str,
         server: String,
+        connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
         let Ok(host) = Url::parse(host_uri) else {
@@ -98,8 +104,13 @@ impl DiagnosticPublisher {
             // configured host server for it — not a host-layer contribution.
             return;
         }
-        self.aggregator
-            .record(&host, DiagnosticSource::Host, server, diagnostics);
+        self.aggregator.record(
+            &host,
+            DiagnosticSource::Host,
+            server,
+            Some(connection_id),
+            diagnostics,
+        );
         self.republish(&host).await;
     }
 
@@ -164,6 +175,7 @@ impl DiagnosticPublisher {
         &self,
         virtual_uri: &str,
         server: String,
+        connection_id: ProgressConnectionId,
         diagnostics: Vec<Diagnostic>,
     ) {
         let Some((host, region_id)) = self.bridge.resolve_virtual_uri(virtual_uri).await else {
@@ -177,6 +189,7 @@ impl DiagnosticPublisher {
             &host,
             DiagnosticSource::Region(region_id),
             server,
+            Some(connection_id),
             diagnostics,
         );
         self.republish(&host).await;
@@ -198,6 +211,17 @@ impl DiagnosticPublisher {
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.aggregator.set_pull_layer(host, diagnostics);
         self.republish(host).await;
+    }
+
+    /// Evict every diagnostic slot a now-exited downstream connection produced and
+    /// republish the affected hosts (#469). Called when a connection's reader exits
+    /// (crash/respawn); a restart's slots carry a fresh connection id and survive,
+    /// so this clears only the dead server's contribution.
+    pub(crate) async fn evict_connection_diagnostics(&self, connection_id: ProgressConnectionId) {
+        let affected = self.aggregator.evict_connection(connection_id);
+        for host in affected {
+            self.republish(&host).await;
+        }
     }
 
     /// Drop the host's cache entry and publish the now-empty set (host `didClose`).
@@ -398,7 +422,12 @@ mod tests {
         );
 
         DiagnosticPublisher::new(server)
-            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("boom")])
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("boom")],
+            )
             .await;
 
         let snap = server.diagnostics.snapshot(&uri);
@@ -419,7 +448,12 @@ mod tests {
         // URI is never inserted into the document store.
         let uri = Url::parse("file:///test/not_open.rs").unwrap();
         DiagnosticPublisher::new(server)
-            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("x")])
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("x")],
+            )
             .await;
 
         assert!(
@@ -445,7 +479,12 @@ mod tests {
         );
 
         DiagnosticPublisher::new(server)
-            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("y")])
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("y")],
+            )
             .await;
 
         assert!(
@@ -475,6 +514,7 @@ mod tests {
             .publish_host_push(
                 uri.as_str(),
                 "some_other_server".to_string(),
+                ProgressConnectionId::for_test(1),
                 vec![diag("z")],
             )
             .await;
@@ -501,7 +541,12 @@ mod tests {
         );
         let publisher = DiagnosticPublisher::new(server);
         publisher
-            .publish_host_push(uri.as_str(), "rust_ls".to_string(), vec![diag("e")])
+            .publish_host_push(
+                uri.as_str(),
+                "rust_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("e")],
+            )
             .await;
         assert!(
             server
@@ -526,6 +571,49 @@ mod tests {
                 .snapshot(&uri)
                 .contains_key(&DiagnosticSource::Host),
             "the cache still holds the slot; only the publish snapshot is filtered"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_connection_diagnostics_drops_only_the_dead_connection() {
+        // The seam the forwarding loop's EvictConnectionDiagnostics arm invokes:
+        // the publisher evicts the dead connection's slots (and republishes the
+        // affected host) while the live connection's slots survive (#469).
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        let dead = ProgressConnectionId::for_test(1);
+        let live = ProgressConnectionId::for_test(2);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "dead_ls".to_string(),
+            Some(dead),
+            vec![diag("from dead")],
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "live_ls".to_string(),
+            Some(live),
+            vec![diag("from live")],
+        );
+
+        DiagnosticPublisher::new(server)
+            .evict_connection_diagnostics(dead)
+            .await;
+
+        let snap = server.diagnostics.snapshot(&uri);
+        let host = snap
+            .get(&DiagnosticSource::Host)
+            .expect("the surviving host slot keeps the source alive");
+        assert!(
+            !host.contains_key("dead_ls"),
+            "the dead connection's slot is evicted"
+        );
+        assert!(
+            host.contains_key("live_ls"),
+            "the live connection's slot survives the eviction"
         );
     }
 }

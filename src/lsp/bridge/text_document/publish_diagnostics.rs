@@ -89,6 +89,7 @@ pub(in crate::lsp::bridge) fn forward_push(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
             uri,
             server: server_name.to_owned(),
+            connection_id: deps.progress_connection_id,
             diagnostics,
         },
     );
