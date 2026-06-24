@@ -102,79 +102,6 @@ fn tracked_progress_source<'a>(
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::settings::BridgeServerConfig;
-
-    fn config(name: &str) -> ResolvedServerConfig {
-        ResolvedServerConfig {
-            server_name: name.to_string(),
-            config: Arc::new(BridgeServerConfig {
-                cmd: vec![name.to_string()],
-                languages: vec![],
-                initialization_options: None,
-                root_markers: None,
-                on_type_formatting_triggers: None,
-                prefer_shared_instance: None,
-            }),
-        }
-    }
-
-    #[test]
-    fn tracked_source_is_the_sole_server_at_n1() {
-        // N=1 relays the sole server even when wildcard-selected.
-        let selected = [config("rust-analyzer")];
-        let entries = [PriorityEntry::Rest(vec!["rust-analyzer".to_string()])];
-        assert_eq!(
-            tracked_progress_source(&selected, &entries),
-            Some("rust-analyzer")
-        );
-    }
-
-    #[test]
-    fn tracked_source_is_the_named_anchor_at_n_gt_1() {
-        let selected = [config("ra"), config("typos")];
-        let entries = [
-            PriorityEntry::Server("ra".to_string()),
-            PriorityEntry::Rest(vec!["typos".to_string()]),
-        ];
-        assert_eq!(tracked_progress_source(&selected, &entries), Some("ra"));
-    }
-
-    #[test]
-    fn first_named_anchor_wins_over_a_later_named_one() {
-        let selected = [config("ra"), config("clangd")];
-        let entries = [
-            PriorityEntry::Server("ra".to_string()),
-            PriorityEntry::Server("clangd".to_string()),
-        ];
-        assert_eq!(tracked_progress_source(&selected, &entries), Some("ra"));
-    }
-
-    #[test]
-    fn no_anchor_when_a_rest_group_outranks_the_named_candidate() {
-        // Walk order `[Rest, Server]` (the `["*", "zzz"]` config shape): the
-        // wildcard group is the top-priority contender (it wins first), so the
-        // lower-priority named server is NOT a valid anchor — tracking it would
-        // show its progress while a wildcard member delivers the result.
-        let selected = [config("a"), config("zzz")];
-        let entries = [
-            PriorityEntry::Rest(vec!["a".to_string()]),
-            PriorityEntry::Server("zzz".to_string()),
-        ];
-        assert_eq!(tracked_progress_source(&selected, &entries), None);
-    }
-
-    #[test]
-    fn no_tracked_source_for_all_rest_at_n_gt_1() {
-        // Rest members are never anchors → no progress shown.
-        let selected = [config("a"), config("b")];
-        let entries = [PriorityEntry::Rest(vec!["a".to_string(), "b".to_string()])];
-        assert_eq!(tracked_progress_source(&selected, &entries), None);
-    }
-}
-
 /// Expand `ctx.priorities` into the priority walk for this request:
 /// allowlist + `"*"` expansion against the configured servers, then the
 /// `max_fan_out` cap.
@@ -319,4 +246,77 @@ where
     // downstream `$/progress` is dropped (non-regressing).
     let mut join_set = fan_out(ctx, pool, f, &selected, None);
     concatenated::concatenated(&mut join_set, &ordering, cancel_rx, log_target).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::BridgeServerConfig;
+
+    fn config(name: &str) -> ResolvedServerConfig {
+        ResolvedServerConfig {
+            server_name: name.to_string(),
+            config: Arc::new(BridgeServerConfig {
+                cmd: vec![name.to_string()],
+                languages: vec![],
+                initialization_options: None,
+                root_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn tracked_source_is_the_sole_server_at_n1() {
+        // N=1 relays the sole server even when wildcard-selected.
+        let selected = [config("rust-analyzer")];
+        let entries = [PriorityEntry::Rest(vec!["rust-analyzer".to_string()])];
+        assert_eq!(
+            tracked_progress_source(&selected, &entries),
+            Some("rust-analyzer")
+        );
+    }
+
+    #[test]
+    fn tracked_source_is_the_named_anchor_at_n_gt_1() {
+        let selected = [config("ra"), config("typos")];
+        let entries = [
+            PriorityEntry::Server("ra".to_string()),
+            PriorityEntry::Rest(vec!["typos".to_string()]),
+        ];
+        assert_eq!(tracked_progress_source(&selected, &entries), Some("ra"));
+    }
+
+    #[test]
+    fn first_named_anchor_wins_over_a_later_named_one() {
+        let selected = [config("ra"), config("clangd")];
+        let entries = [
+            PriorityEntry::Server("ra".to_string()),
+            PriorityEntry::Server("clangd".to_string()),
+        ];
+        assert_eq!(tracked_progress_source(&selected, &entries), Some("ra"));
+    }
+
+    #[test]
+    fn no_anchor_when_a_rest_group_outranks_the_named_candidate() {
+        // Walk order `[Rest, Server]` (the `["*", "zzz"]` config shape): the
+        // wildcard group is the top-priority contender (it wins first), so the
+        // lower-priority named server is NOT a valid anchor — tracking it would
+        // show its progress while a wildcard member delivers the result.
+        let selected = [config("a"), config("zzz")];
+        let entries = [
+            PriorityEntry::Rest(vec!["a".to_string()]),
+            PriorityEntry::Server("zzz".to_string()),
+        ];
+        assert_eq!(tracked_progress_source(&selected, &entries), None);
+    }
+
+    #[test]
+    fn no_tracked_source_for_all_rest_at_n_gt_1() {
+        // Rest members are never anchors → no progress shown.
+        let selected = [config("a"), config("b")];
+        let entries = [PriorityEntry::Rest(vec!["a".to_string(), "b".to_string()])];
+        assert_eq!(tracked_progress_source(&selected, &entries), None);
+    }
 }
