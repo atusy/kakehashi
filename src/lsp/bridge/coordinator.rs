@@ -591,6 +591,20 @@ impl BridgeCoordinator {
         // a task whose body already started on another worker before registration
         // from sending its didOpen/didChange — that residual is identical to the
         // region path (see the field doc), bounded and benign; left open for parity.
+        //
+        // On-edit re-sync carries *different* text per fire, so a superseded task
+        // emitting after a newer one could in principle roll the host server back to
+        // older text (a higher version with stale content). The supersede above
+        // closes the common case: each task's only blocking point before the sync is
+        // `get_or_create_connection_wait_ready` (an `.await` on `wait_for_ready`), so
+        // `abort()` cancels a parked older task *there*, before it reaches
+        // `sync_host_document`; and debounce fires are ≥500ms apart, far wider than
+        // the µs spawn→register window, so the prior fire's handle is already
+        // registered (hence abortable) when the next fire supersedes. The only
+        // residual is a µs alignment — an older task unblocking from wait-ready at
+        // the exact instant a newer fire's task reaches the (await-free) sync — which
+        // is the deferred `content_epoch` stale-overwrite window (#422), not a new
+        // bug class; it self-heals on the next edit.
         let generation = self.supersede_host_eager_open(host_uri);
 
         // Share the text + languageId across per-server tasks via `Arc<str>` rather
