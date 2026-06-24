@@ -252,13 +252,15 @@ impl DiagnosticAggregator {
     /// The host entry is removed if it becomes empty.
     pub(crate) fn evict_source(&self, host: &Url, source: &DiagnosticSource) -> bool {
         let mut cache = self.lock();
-        let std::collections::hash_map::Entry::Occupied(mut host_entry) = cache.entry(host.clone())
-        else {
+        // Borrow by `&Url` (no key clone) — the common case (host present, other
+        // sources remain) is a single lookup. The host entry is removed only when
+        // this was its last source, which costs a second lookup but is rare.
+        let Some(slots) = cache.get_mut(host) else {
             return false;
         };
-        let removed = host_entry.get_mut().remove(source).is_some();
-        if host_entry.get().is_empty() {
-            host_entry.remove();
+        let removed = slots.remove(source).is_some();
+        if slots.is_empty() {
+            cache.remove(host);
         }
         removed
     }
@@ -554,8 +556,8 @@ mod tests {
         agg.record(&host(), region.clone(), "srv".to_string(), vec![diag("r")]);
         assert!(agg.evict_source(&host(), &region));
         assert!(
-            agg.snapshot(&host()).is_empty(),
-            "the host entry is dropped once its last source is evicted"
+            !agg.lock().contains_key(&host()),
+            "the host entry itself is dropped (not left present-but-empty) once its last source is evicted"
         );
         assert!(
             !agg.evict_source(&host(), &region),
