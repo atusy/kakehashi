@@ -202,34 +202,40 @@ fn transform_changes_map(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) {
-    let keys: Vec<Uri> = changes.keys().cloned().collect();
-
-    for key in keys {
-        let uri_str = key.as_str();
-
-        // Case 1: Real file URI → keep as-is.
+    // Single pass (no key clone): keep real-file edits, drop cross-region virtual
+    // edits, and move the request's own-region edits out (range-translated) to be
+    // re-keyed under the host URI after the walk.
+    let mut host_edits: Vec<TextEdit> = Vec::new();
+    changes.retain(|uri, edits| {
+        let uri_str = uri.as_str();
+        // Case 1: Real (non-virtual) file URI → keep as-is.
         if !VirtualDocumentUri::is_virtual_uri(uri_str) {
-            continue;
+            return true;
         }
-
-        // Case 2: Same virtual URI → translate ranges, re-key to host URI.
+        // Case 2: Same virtual URI → translate ranges and move out to re-key to host.
         if uri_str == request_virtual_uri {
-            if let Some(mut edits) = changes.remove(&key) {
-                for edit in &mut edits {
-                    translate_virtual_range_to_host(&mut edit.range, offset);
-                }
-                changes.entry(host_uri.clone()).or_default().extend(edits);
+            for edit in edits.iter_mut() {
+                translate_virtual_range_to_host(&mut edit.range, offset);
             }
-            continue;
+            host_edits.append(edits);
         }
-
-        // Case 3: Different virtual URI (cross-region) → drop.
-        changes.remove(&key);
+        // Case 2 (moved out) and Case 3 (cross-region virtual) → drop the key.
+        false
+    });
+    if !host_edits.is_empty() {
+        // Merge with any real-file edits already on the host URI (a code action
+        // editing both the region and the host document directly).
+        changes
+            .entry(host_uri.clone())
+            .or_default()
+            .extend(host_edits);
     }
 }
 
-/// Translate a diagnostic's main range to host coordinates and drop
-/// `relatedInformation` entries on virtual URIs (mirrors the diagnostic cache).
+/// Translate a diagnostic's main range to host coordinates. For
+/// `relatedInformation`: entries on the request's own virtual URI are re-keyed to
+/// the host URI with their range translated; cross-region virtual URIs are dropped;
+/// real-file entries are kept as-is (mirrors the diagnostic cache).
 fn transform_diagnostic(
     diag: &mut Diagnostic,
     request_virtual_uri: &str,
