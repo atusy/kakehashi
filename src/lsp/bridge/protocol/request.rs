@@ -213,4 +213,61 @@ mod tests {
         assert_eq!(json["params"]["position"]["line"], 0);
         assert_eq!(json["params"]["position"]["character"], 0); // saturated
     }
+
+    #[test]
+    fn progress_request_includes_work_done_token_only_when_present() {
+        use tower_lsp_server::ls_types::NumberOrString;
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 5,
+            character: 4,
+        };
+
+        // With a token: `workDoneToken` is present alongside the (flattened)
+        // position params.
+        let with = build_position_based_request_with_progress(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+            Some(NumberOrString::String("wd-1".to_string())),
+        );
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["params"]["workDoneToken"], "wd-1");
+        assert!(
+            json["params"]["textDocument"]["uri"].is_string(),
+            "position params still present"
+        );
+        assert!(json["params"]["position"]["line"].is_number());
+
+        // Without a token: the field is omitted entirely, leaving the params
+        // byte-identical to the bare position request (non-regression).
+        let without = build_position_based_request_with_progress(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+            None,
+        );
+        let bare = build_position_based_request(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+        );
+        assert!(
+            serde_json::to_value(&without).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "workDoneToken omitted when None"
+        );
+        assert_eq!(
+            serde_json::to_value(&without).unwrap(),
+            serde_json::to_value(&bare).unwrap(),
+            "None serializes identically to the bare position request"
+        );
+    }
 }
