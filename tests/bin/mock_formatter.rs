@@ -226,6 +226,16 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    // `diagnostics-push` mode: spontaneously push one diagnostic on
+                    // the virtual line 0 (no pull). The bridge translates it to host
+                    // coordinates and publishes it to the editor (#427).
+                    if mode == "diagnostics-push" {
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            push_diagnostics(uri, true),
+                        );
+                    }
                 }
             }
             "textDocument/didChange" => {
@@ -243,6 +253,15 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    // `diagnostics-push`: a follow-up push with an EMPTY list clears
+                    // this source's contribution (#427).
+                    if mode == "diagnostics-push" {
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            push_diagnostics(uri, false),
+                        );
+                    }
                 }
             }
             "textDocument/didClose" => {
@@ -557,6 +576,27 @@ fn notify<W: Write>(writer: &mut W, method: &str, params: Value) {
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
     let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
     let _ = writer.flush();
+}
+
+/// Build `textDocument/publishDiagnostics` params for `uri` (`diagnostics-push`
+/// mode, #427): one diagnostic on virtual line 0 when `present`, or an empty list
+/// (clearing this source's contribution) otherwise. The bridge translates the
+/// virtual range to host coordinates before publishing to the editor.
+fn push_diagnostics(uri: &str, present: bool) -> Value {
+    let diagnostics = if present {
+        json!([{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 7 }
+            },
+            "severity": 1,
+            "source": "mock-push",
+            "message": format!("mock-push-diag:{uri}")
+        }])
+    } else {
+        json!([])
+    };
+    json!({ "uri": uri, "diagnostics": diagnostics })
 }
 
 /// Send a JSON-RPC success response for `id` (no-op for notifications).
