@@ -1,18 +1,30 @@
 //! Code action request handling for bridge connections.
 //!
-//! First increment (#352): a range-based request (like inlay hint). The request
-//! range is translated host->virtual; in the response, each `CodeAction`'s edit
-//! ranges and diagnostic ranges are translated virtual->host.
+//! Bridges `textDocument/codeAction` (#352): a range-based request (like inlay
+//! hint). The request range is translated host->virtual; in the response, each
+//! `CodeAction`'s edit ranges and diagnostic ranges are translated virtual->host.
 //!
-//! Scope / deferred follow-ups:
-//! - Request `context.diagnostics` is empty (the handler does not forward the
-//!   editor's host-coordinate diagnostics yet).
-//! - `WorkspaceEdit` translation handles only the `changes` map. If an action
-//!   carries `documentChanges`, the whole `edit` is dropped (set to `None`) and
-//!   logged at debug — half-translating `documentChanges` would emit virtual
-//!   coordinates to the editor.
-//! - `Command` items pass through unchanged; `codeAction/resolve` is not wired,
-//!   so `data` passes through but a follow-up resolve request is unhandled.
+//! Scope: reliably bridges **eager-edit** code actions in injection regions —
+//! actions that arrive with a `WorkspaceEdit` (`changes` or `documentChanges`
+//! `Edits`), which is the common quick-fix/refactor case. The
+//! following are honest, documented limitations, tracked for a comprehensive
+//! follow-up (#474):
+//! - **Host layer**: only the virtual (injection) layer is bridged; codeAction for
+//!   the host document itself does not yet fan out via `walk_layers` (unlike most
+//!   methods). A range outside an injection region returns nothing.
+//! - **Commands**: `Command` items and `CodeAction.command` pass through, but
+//!   kakehashi has no `workspace/executeCommand` routing, so a command-only action
+//!   is not executable until that lands. (`CodeAction`s that ALSO carry an edit
+//!   still apply that edit.)
+//! - **Lazy actions / `codeAction/resolve`**: not wired (the round-trip transform
+//!   it needs is a follow-up, #474), and the capability advertises `Simple(true)`
+//!   (no `resolveProvider`), so an action that arrives with only `data` (no edit)
+//!   cannot be resolved.
+//! - Request `context.diagnostics` is empty (the editor's host-coordinate
+//!   diagnostics are not yet forwarded back to virtual + filtered to the region).
+//! - `WorkspaceEdit.documentChanges` **`Operations`** form (resource
+//!   create/rename/delete) drops the whole `edit` rather than emit untranslated
+//!   virtual coordinates or a virtual-URI resource op.
 //!
 //! # Single-Writer Loop (ls-bridge-message-ordering)
 //!
@@ -25,8 +37,8 @@ use std::io;
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionResponse, CodeActionTriggerKind, Diagnostic, Range, TextDocumentIdentifier, TextEdit,
-    Uri,
+    CodeActionResponse, CodeActionTriggerKind, Diagnostic, DocumentChanges, OneOf, Range,
+    TextDocumentEdit, TextDocumentIdentifier, TextEdit, Uri,
 };
 use url::Url;
 
@@ -129,8 +141,8 @@ fn build_code_action_request(
 /// Translate a code-action response from virtual to host coordinates.
 ///
 /// `Command` items pass through unchanged. For each `CodeAction`, edit ranges
-/// (`changes` only) and diagnostic ranges are translated; see
-/// [`transform_code_action`].
+/// (`changes` and the `documentChanges` `Edits` form) and diagnostic ranges are
+/// translated; see [`transform_code_action`].
 fn transform_code_action_response_to_host(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
@@ -160,10 +172,10 @@ fn transform_code_action_response_to_host(
 
 /// Translate a single `CodeAction`'s edit and diagnostics from virtual to host.
 ///
-/// - `edit`: if it carries `documentChanges`, the whole edit is dropped (set to
-///   `None`) and logged — documentChanges translation is a follow-up. Otherwise
-///   the `changes` map is translated in place (re-key own virtual URI to host,
-///   drop cross-region virtual URIs, keep real files).
+/// - `edit`: the `changes` map or `documentChanges` (`Edits` form) is translated
+///   in place — re-key the own virtual URI to host (ranges translated), drop
+///   cross-region virtual URIs, keep real files. A `documentChanges` `Operations`
+///   form (resource ops) drops the whole edit (#474 follow-up).
 /// - `diagnostics`: each diagnostic's main range is translated; same-region
 ///   `relatedInformation` is re-keyed to the host URI (range translated),
 ///   cross-region virtual entries dropped, real files kept — mirroring
@@ -175,17 +187,27 @@ fn transform_code_action(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) {
-    if let Some(edit) = &mut action.edit {
-        if edit.document_changes.is_some() {
-            // documentChanges translation is a follow-up; do not half-translate.
-            log::debug!(
-                target: "kakehashi::bridge",
-                "code action edit carries documentChanges; dropping edit (translation is a follow-up)"
-            );
-            action.edit = None;
+    let keep_edit = if let Some(edit) = &mut action.edit {
+        if let Some(document_changes) = &mut edit.document_changes {
+            // A WorkspaceEdit uses EITHER `changes` OR `documentChanges`, and a
+            // client honoring `documentChanges` ignores `changes` — but clear it
+            // anyway so an untranslated (virtual-coordinate) `changes` map can never
+            // leak to the editor. Then translate the `Edits` form; an edit with
+            // nothing translatable left (all cross-region, or the deferred
+            // `Operations`/resource-op form — #474) is dropped wholesale.
+            edit.changes = None;
+            transform_document_changes(document_changes, request_virtual_uri, host_uri, offset)
         } else if let Some(changes) = &mut edit.changes {
             transform_changes_map(changes, request_virtual_uri, host_uri, offset);
+            true
+        } else {
+            true
         }
+    } else {
+        true
+    };
+    if !keep_edit {
+        action.edit = None;
     }
 
     if let Some(diagnostics) = &mut action.diagnostics {
@@ -193,6 +215,63 @@ fn transform_code_action(
             transform_diagnostic(diagnostic, request_virtual_uri, host_uri, offset);
         }
     }
+}
+
+/// Translate a `WorkspaceEdit.documentChanges` in place. Handles the `Edits` form
+/// (`Vec<TextDocumentEdit>`): each edit on the request's own virtual URI is re-keyed
+/// to the host URI with its ranges translated; cross-region virtual edits are
+/// dropped; real-file edits are kept. Returns whether any change remains.
+///
+/// The `Operations` form (resource create/rename/delete mixed with edits) is a
+/// follow-up (#474): it returns `false` so the caller drops the whole edit rather
+/// than emit untranslated virtual coordinates or a virtual-URI resource op.
+fn transform_document_changes(
+    document_changes: &mut DocumentChanges,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> bool {
+    match document_changes {
+        DocumentChanges::Edits(edits) => {
+            edits.retain_mut(|edit| {
+                transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
+            });
+            !edits.is_empty()
+        }
+        DocumentChanges::Operations(_) => false,
+    }
+}
+
+/// Translate one `TextDocumentEdit`. Real-file URIs are kept as-is; the request's
+/// own virtual URI is re-keyed to the host URI with every edit range translated;
+/// a cross-region virtual URI is dropped. Returns whether the edit is kept.
+fn transform_text_document_edit(
+    edit: &mut TextDocumentEdit,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> bool {
+    let uri_str = edit.text_document.uri.as_str();
+    if !VirtualDocumentUri::is_virtual_uri(uri_str) {
+        return true; // real file → keep
+    }
+    if uri_str == request_virtual_uri {
+        edit.text_document.uri = host_uri.clone();
+        // The virtual document's version does not identify the host document — an
+        // editor could reject a versioned edit on a version it never saw. Re-key as
+        // an unversioned edit so it applies against the host's current content.
+        edit.text_document.version = None;
+        for text_edit in &mut edit.edits {
+            // `edits` are `OneOf<TextEdit, AnnotatedTextEdit>`; both carry a range.
+            let range = match text_edit {
+                OneOf::Left(te) => &mut te.range,
+                OneOf::Right(annotated) => &mut annotated.text_edit.range,
+            };
+            translate_virtual_range_to_host(range, offset);
+        }
+        return true;
+    }
+    false // cross-region virtual → drop
 }
 
 /// Translate the `changes` map: re-key the request's own virtual URI to the host
@@ -508,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn code_action_document_changes_drops_whole_edit() {
+    fn code_action_document_changes_edits_translated_to_host() {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
 
@@ -548,17 +627,39 @@ mod tests {
             CodeActionOrCommand::CodeAction(a) => a,
             CodeActionOrCommand::Command(_) => panic!("Expected CodeAction"),
         };
-        assert!(
-            action.edit.is_none(),
-            "edit carrying documentChanges must be dropped entirely"
-        );
-        // Other fields preserved.
+        let edit = action
+            .edit
+            .as_ref()
+            .expect("the Edits form is kept (translated)");
+        match edit
+            .document_changes
+            .as_ref()
+            .expect("documentChanges kept")
+        {
+            DocumentChanges::Edits(tdes) => {
+                assert_eq!(tdes.len(), 1);
+                assert_eq!(
+                    tdes[0].text_document.uri, host_uri,
+                    "the own virtual URI is re-keyed to the host URI"
+                );
+                let range = match &tdes[0].edits[0] {
+                    OneOf::Left(te) => te.range,
+                    OneOf::Right(annotated) => annotated.text_edit.range,
+                };
+                assert_eq!(
+                    range.start.line, 10,
+                    "virtual line 0 → host line 10 (offset 10)"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("expected Edits"),
+        }
         assert_eq!(action.title, "Refactor");
     }
 
     #[test]
-    fn code_action_document_changes_drops_edit_even_with_changes_present() {
-        // If BOTH changes and documentChanges are present, the whole edit drops.
+    fn code_action_document_changes_operations_form_drops_edit() {
+        // The Operations form (resource create/rename/delete) is a follow-up; the
+        // whole edit is dropped rather than emitting a virtual-URI resource op.
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
 
@@ -567,28 +668,10 @@ mod tests {
             "id": 42,
             "result": [
                 {
-                    "title": "Mixed",
+                    "title": "Create",
                     "edit": {
-                        "changes": {
-                            virtual_uri.clone(): [{
-                                "range": {
-                                    "start": { "line": 0, "character": 0 },
-                                    "end": { "line": 0, "character": 1 }
-                                },
-                                "newText": "y"
-                            }]
-                        },
                         "documentChanges": [
-                            {
-                                "textDocument": { "uri": virtual_uri, "version": 1 },
-                                "edits": [{
-                                    "range": {
-                                        "start": { "line": 0, "character": 0 },
-                                        "end": { "line": 0, "character": 5 }
-                                    },
-                                    "newText": "z"
-                                }]
-                            }
+                            { "kind": "create", "uri": "file:///new.lua" }
                         ]
                     }
                 }
@@ -609,8 +692,155 @@ mod tests {
         };
         assert!(
             action.edit.is_none(),
-            "documentChanges present drops the edit"
+            "the Operations form drops the edit (deferred follow-up)"
         );
+        assert_eq!(action.title, "Create");
+    }
+
+    #[test]
+    fn code_action_document_changes_clears_changes_map_and_resets_version() {
+        // Non-standard but defensive: when BOTH `changes` (untranslated, virtual)
+        // and `documentChanges` are present, the changes map is cleared (no virtual
+        // leak) and the re-keyed edit drops the virtual `version`.
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "title": "Both",
+                    "edit": {
+                        "changes": {
+                            virtual_uri.clone(): [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                },
+                                "newText": "y"
+                            }]
+                        },
+                        "documentChanges": [
+                            {
+                                "textDocument": { "uri": virtual_uri, "version": 7 },
+                                "edits": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "newText": "x"
+                                }]
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let actions = transform_code_action_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .unwrap();
+
+        let action = match &actions[0] {
+            CodeActionOrCommand::CodeAction(a) => a,
+            CodeActionOrCommand::Command(_) => panic!("Expected CodeAction"),
+        };
+        let edit = action.edit.as_ref().expect("edit kept");
+        assert!(
+            edit.changes.is_none(),
+            "the untranslated `changes` map is cleared when documentChanges takes precedence"
+        );
+        match edit
+            .document_changes
+            .as_ref()
+            .expect("documentChanges kept")
+        {
+            DocumentChanges::Edits(tdes) => {
+                assert_eq!(tdes[0].text_document.uri, host_uri);
+                assert_eq!(
+                    tdes[0].text_document.version, None,
+                    "the virtual document's version is dropped on re-key to host"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("expected Edits"),
+        }
+    }
+
+    #[test]
+    fn code_action_document_changes_drops_cross_region_edit() {
+        // A documentChanges Edits list with the own region's edit AND a DIFFERENT
+        // region's edit: the cross-region TextDocumentEdit is dropped (we can't
+        // translate another region's virtual coords against this request's offset).
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let cross_region = VirtualDocumentUri::new(&host_uri, "lua", "region-9").to_uri_string();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "title": "Cross",
+                    "edit": {
+                        "documentChanges": [
+                            {
+                                "textDocument": { "uri": virtual_uri, "version": 1 },
+                                "edits": [{
+                                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                                    "newText": "a"
+                                }]
+                            },
+                            {
+                                "textDocument": { "uri": cross_region, "version": 1 },
+                                "edits": [{
+                                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                                    "newText": "b"
+                                }]
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let actions = transform_code_action_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .unwrap();
+
+        let action = match &actions[0] {
+            CodeActionOrCommand::CodeAction(a) => a,
+            CodeActionOrCommand::Command(_) => panic!("Expected CodeAction"),
+        };
+        match action
+            .edit
+            .as_ref()
+            .unwrap()
+            .document_changes
+            .as_ref()
+            .unwrap()
+        {
+            DocumentChanges::Edits(tdes) => {
+                assert_eq!(
+                    tdes.len(),
+                    1,
+                    "the cross-region TextDocumentEdit is dropped"
+                );
+                assert_eq!(
+                    tdes[0].text_document.uri, host_uri,
+                    "the own-region edit is kept and re-keyed to host"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("expected Edits"),
+        }
     }
 
     #[test]
