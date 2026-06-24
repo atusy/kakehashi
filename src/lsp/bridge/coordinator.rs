@@ -113,13 +113,10 @@ pub(crate) struct BridgeCoordinator {
     /// as the virt path: `supersede` resets to an empty placeholder before
     /// spawning, so a handle *registered* after a concurrent
     /// `cancel_host_eager_open` (didClose) / `abort_all_eager_open` (shutdown) is
-    /// aborted on the spot (the registration leak is closed). It does NOT stop a
-    /// task whose body already started on another worker thread before its handle
-    /// registers from sending its didOpen — identical to the region path, bounded
-    /// and benign (the #421 push-accept guard reads the editor `DocumentStore`, so
-    /// no phantom diagnostics; an orphan connection / `host_documents` entry clears
-    /// on reopen / respawn). Left open deliberately to stay parallel with the
-    /// region eager-open rather than diverging (tracked cross-path follow-up).
+    /// aborted on the spot (the registration leak is closed). The
+    /// body-started-before-registration window is closed too (#435): the batch's
+    /// `CancellationToken` is in the map before any task spawns, each task `select!`s
+    /// on it before its first side effect, and cancel/supersede/abort cancel it.
     host_eager_open_tasks: DashMap<Url, EagerOpenBatch>,
 }
 
@@ -610,10 +607,11 @@ impl BridgeCoordinator {
         // BEFORE spawning, then register each handle against this generation. This
         // closes the *registration* leak: if a concurrent `cancel_host_eager_open`
         // (didClose) or `abort_all_eager_open` (shutdown) removed the entry, a
-        // handle registered afterwards is aborted on the spot. It does NOT prevent
-        // a task whose body already started on another worker before registration
-        // from sending its didOpen/didChange — that residual is identical to the
-        // region path (see the field doc), bounded and benign; left open for parity.
+        // handle registered afterwards is aborted on the spot. The
+        // body-started-before-registration window is also closed (#435): the batch's
+        // `CancellationToken` is in the map before any task spawns, each task
+        // `select!`s on it before its first side effect, and cancel/supersede/abort
+        // cancel it.
         //
         // On-edit re-sync carries *different* text per fire, so a superseded task
         // emitting after a newer one could in principle roll the host server back to
