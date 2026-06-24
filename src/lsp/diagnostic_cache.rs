@@ -188,16 +188,23 @@ fn same_diagnostic_multiset(a: &[Diagnostic], b: &[Diagnostic]) -> bool {
     // Large set: O(n) signed-count multiset compare. `+1` for each `a`, `-1` for each
     // `b`; equal multisets net to all-zero (the length check above means a non-empty
     // residual implies a real difference, not just a count imbalance).
+    //
+    // A serialization failure (effectively impossible for `Diagnostic`) must not
+    // collapse distinct diagnostics onto an empty key — that could read two different
+    // sets as equal and wrongly suppress a needed publish. So on any `Err`, bail out
+    // reporting "not equal" (the caller then publishes — safe, never hides).
     let mut counts: HashMap<String, isize> = HashMap::new();
     for d in a {
-        *counts
-            .entry(serde_json::to_string(d).unwrap_or_default())
-            .or_default() += 1;
+        let Ok(key) = serde_json::to_string(d) else {
+            return false;
+        };
+        *counts.entry(key).or_default() += 1;
     }
     for d in b {
-        *counts
-            .entry(serde_json::to_string(d).unwrap_or_default())
-            .or_default() -= 1;
+        let Ok(key) = serde_json::to_string(d) else {
+            return false;
+        };
+        *counts.entry(key).or_default() -= 1;
     }
     counts.values().all(|&c| c == 0)
 }
