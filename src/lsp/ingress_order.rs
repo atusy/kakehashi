@@ -132,7 +132,7 @@ impl DocumentSequencer {
         WriterGate {
             ticket,
             rx,
-            guard: CompletionGuard { ticket, completion },
+            completion,
         }
     }
 
@@ -165,8 +165,7 @@ impl DocumentSequencer {
 pub(crate) struct WriterGate {
     ticket: u64,
     rx: watch::Receiver<u64>,
-    #[allow(dead_code)] // held for its Drop impl
-    guard: CompletionGuard,
+    completion: Arc<DocCompletion>,
 }
 
 impl WriterGate {
@@ -183,13 +182,8 @@ impl WriterGate {
     }
 }
 
-/// Marks a writer ticket complete on drop.
-struct CompletionGuard {
-    ticket: u64,
-    completion: Arc<DocCompletion>,
-}
-
-impl Drop for CompletionGuard {
+/// Marks the writer's ticket complete on drop.
+impl Drop for WriterGate {
     fn drop(&mut self) {
         self.completion.complete(self.ticket);
     }
