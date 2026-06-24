@@ -17,7 +17,7 @@
 //!   is not executable until that lands. (`CodeAction`s that ALSO carry an edit
 //!   still apply that edit.)
 //! - **Lazy actions / `codeAction/resolve`**: not wired (the round-trip transform
-//!   it needs is a follow-up, #471), and the capability advertises `Simple(true)`
+//!   it needs is a follow-up, #474), and the capability advertises `Simple(true)`
 //!   (no `resolveProvider`), so an action that arrives with only `data` (no edit)
 //!   cannot be resolved.
 //! - Request `context.diagnostics` is empty (the editor's host-coordinate
@@ -175,7 +175,7 @@ fn transform_code_action_response_to_host(
 /// - `edit`: the `changes` map or `documentChanges` (`Edits` form) is translated
 ///   in place — re-key the own virtual URI to host (ranges translated), drop
 ///   cross-region virtual URIs, keep real files. A `documentChanges` `Operations`
-///   form (resource ops) drops the whole edit (#471 follow-up).
+///   form (resource ops) drops the whole edit (#474 follow-up).
 /// - `diagnostics`: each diagnostic's main range is translated; same-region
 ///   `relatedInformation` is re-keyed to the host URI (range translated),
 ///   cross-region virtual entries dropped, real files kept — mirroring
@@ -194,7 +194,7 @@ fn transform_code_action(
             // anyway so an untranslated (virtual-coordinate) `changes` map can never
             // leak to the editor. Then translate the `Edits` form; an edit with
             // nothing translatable left (all cross-region, or the deferred
-            // `Operations`/resource-op form — #471) is dropped wholesale.
+            // `Operations`/resource-op form — #474) is dropped wholesale.
             edit.changes = None;
             transform_document_changes(document_changes, request_virtual_uri, host_uri, offset)
         } else if let Some(changes) = &mut edit.changes {
@@ -223,7 +223,7 @@ fn transform_code_action(
 /// dropped; real-file edits are kept. Returns whether any change remains.
 ///
 /// The `Operations` form (resource create/rename/delete mixed with edits) is a
-/// follow-up (#471): it returns `false` so the caller drops the whole edit rather
+/// follow-up (#474): it returns `false` so the caller drops the whole edit rather
 /// than emit untranslated virtual coordinates or a virtual-URI resource op.
 fn transform_document_changes(
     document_changes: &mut DocumentChanges,
