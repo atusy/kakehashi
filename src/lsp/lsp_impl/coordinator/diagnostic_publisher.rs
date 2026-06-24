@@ -573,4 +573,47 @@ mod tests {
             "the cache still holds the slot; only the publish snapshot is filtered"
         );
     }
+
+    #[tokio::test]
+    async fn evict_connection_diagnostics_drops_only_the_dead_connection() {
+        // The seam the forwarding loop's EvictConnectionDiagnostics arm invokes:
+        // the publisher evicts the dead connection's slots (and republishes the
+        // affected host) while the live connection's slots survive (#469).
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host.rs").unwrap();
+        let dead = ProgressConnectionId::for_test(1);
+        let live = ProgressConnectionId::for_test(2);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "dead_ls".to_string(),
+            Some(dead),
+            vec![diag("from dead")],
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "live_ls".to_string(),
+            Some(live),
+            vec![diag("from live")],
+        );
+
+        DiagnosticPublisher::new(server)
+            .evict_connection_diagnostics(dead)
+            .await;
+
+        let snap = server.diagnostics.snapshot(&uri);
+        let host = snap
+            .get(&DiagnosticSource::Host)
+            .expect("the surviving host slot keeps the source alive");
+        assert!(
+            !host.contains_key("dead_ls"),
+            "the dead connection's slot is evicted"
+        );
+        assert!(
+            host.contains_key("live_ls"),
+            "the live connection's slot survives the eviction"
+        );
+    }
 }

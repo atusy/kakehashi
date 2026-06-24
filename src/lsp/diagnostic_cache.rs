@@ -8,8 +8,10 @@
 //! what keeps sibling regions intact against the clobber.
 //!
 //! The cache is **nested** `host_uri → source → server` (not a flat tuple key) so
-//! the lifecycle's evictions are O(1): a whole host on `didClose` today, a source
-//! / server later.
+//! the targeted lifecycle evictions are O(1): a whole host on `didClose`
+//! (`evict_host`) and a single source on an edit (`evict_source`). Per-connection
+//! crash eviction (`evict_connection`) is the exception — it scans every slot to
+//! find the dead connection's, which is fine on that rare path.
 //!
 //! ## Staging
 //! Three source kinds are populated:
@@ -31,11 +33,13 @@
 //! giving each server one native source.
 //!
 //! Region-invalidation eviction is implemented (`evict_source`, wired into the
-//! edit path that orphans a region — #424). Still deferred: per-source strategy
-//! fan-in (`preferred` sticky / `concatenated` visible-walk; cross-source order is
-//! HashMap-nondeterministic until then), the `content_epoch` version gate,
-//! **crash/server** eviction (needs connection-generation identity, #469), and
-//! host-layer eager-open (diagnostics on open before the first request).
+//! edit path that orphans a region — #424) and crash/server eviction too
+//! (`evict_connection`, wired into the reader-exit path — #469; slots are tagged
+//! with the producing connection's id so a restart's slots survive). Still
+//! deferred: per-source strategy fan-in (`preferred` sticky / `concatenated`
+//! visible-walk; cross-source order is HashMap-nondeterministic until then), the
+//! `content_epoch` version gate, and host-layer eager-open (diagnostics on open
+//! before the first request).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -106,7 +110,8 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 ///   region's *current* offset). A region with no current offset (it no longer
 ///   resolves, e.g. it was edited away) is skipped here; the edit that orphaned it
 ///   also evicts its now-stale slot (`evict_source`, #424), so it no longer lingers
-///   until the host's `didClose`. (Crash/server eviction is still deferred — #469.)
+///   until the host's `didClose`. (A crashed connection's slots are likewise
+///   dropped on reader exit — `evict_connection`, #469.)
 /// - [`DiagnosticSource::Host`] and [`DiagnosticSource::PullLayer`] slots are
 ///   already host-local and pass through unchanged.
 ///

@@ -279,8 +279,9 @@ impl Drop for ProgressPurgeGuard {
         }
         // Evict this connection's pushed diagnostics so a dead server's stale
         // diagnostics don't linger until the host's `didClose` (#469). Sent
-        // unconditionally — the loop's eviction is a cheap no-op when the
-        // connection never pushed (no slots match its id).
+        // unconditionally — when the connection never pushed, the loop's eviction
+        // scans the cache, matches no slot, and republishes nothing (a semantic
+        // no-op on this rare exit path).
         let _ = self
             .upstream_tx
             .send(UpstreamNotification::EvictConnectionDiagnostics {
