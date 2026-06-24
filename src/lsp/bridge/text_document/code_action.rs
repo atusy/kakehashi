@@ -1,12 +1,12 @@
 //! Code action request handling for bridge connections.
 //!
-//! First increment (#352): a range-based request (like inlay hint). The request
-//! range is translated host->virtual; in the response, each `CodeAction`'s edit
-//! ranges and diagnostic ranges are translated virtual->host.
+//! Bridges `textDocument/codeAction` (#352): a range-based request (like inlay
+//! hint). The request range is translated host->virtual; in the response, each
+//! `CodeAction`'s edit ranges and diagnostic ranges are translated virtual->host.
 //!
-//! Scope: this first increment reliably bridges **eager-edit** code actions in
-//! injection regions — actions that arrive with a `WorkspaceEdit` (`changes` or
-//! `documentChanges` `Edits`), which is the common quick-fix/refactor case. The
+//! Scope: reliably bridges **eager-edit** code actions in injection regions —
+//! actions that arrive with a `WorkspaceEdit` (`changes` or `documentChanges`
+//! `Edits`), which is the common quick-fix/refactor case. The
 //! following are honest, documented limitations, tracked for a comprehensive
 //! follow-up (#474):
 //! - **Host layer**: only the virtual (injection) layer is bridged; codeAction for
