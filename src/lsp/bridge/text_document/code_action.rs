@@ -164,9 +164,10 @@ fn transform_code_action_response_to_host(
 ///   `None`) and logged — documentChanges translation is a follow-up. Otherwise
 ///   the `changes` map is translated in place (re-key own virtual URI to host,
 ///   drop cross-region virtual URIs, keep real files).
-/// - `diagnostics`: each diagnostic's main range is translated, and any
-///   `relatedInformation` on virtual URIs is dropped (clients cannot resolve
-///   virtual URIs), mirroring `diagnostic_cache::transform_region_diagnostic`.
+/// - `diagnostics`: each diagnostic's main range is translated; same-region
+///   `relatedInformation` is re-keyed to the host URI (range translated),
+///   cross-region virtual entries dropped, real files kept — mirroring
+///   `diagnostic_cache::transform_region_diagnostic`.
 /// - `title`, `kind`, `command`, `is_preferred`, `disabled`, `data` pass through.
 fn transform_code_action(
     action: &mut CodeAction,
