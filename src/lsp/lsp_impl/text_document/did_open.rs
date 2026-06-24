@@ -361,7 +361,7 @@ print("hello")
         server.bridge.eager_sync_host_document_on_servers(
             &uri,
             "rust",
-            "fn main() {}",
+            std::sync::Arc::from("fn main() {}"),
             configs.clone(),
         );
         timeout(Duration::from_secs(1), async {
@@ -382,9 +382,12 @@ print("hello")
         .expect("first eager-sync should didOpen the host document at version 1");
 
         // A re-sync with changed text must send a didChange, advancing to version 2.
-        server
-            .bridge
-            .eager_sync_host_document_on_servers(&uri, "rust", "fn other() {}", configs);
+        server.bridge.eager_sync_host_document_on_servers(
+            &uri,
+            "rust",
+            std::sync::Arc::from("fn other() {}"),
+            configs,
+        );
         timeout(Duration::from_secs(1), async {
             loop {
                 if server

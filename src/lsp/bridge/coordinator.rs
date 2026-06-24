@@ -555,7 +555,7 @@ impl BridgeCoordinator {
         text: &str,
     ) {
         let configs = self.get_host_configs_for_language(settings, host_language);
-        self.eager_sync_host_document_on_servers(host_uri, host_language, text, configs);
+        self.eager_sync_host_document_on_servers(host_uri, host_language, Arc::from(text), configs);
     }
 
     /// Sync the real host document to a resolved set of `_self` host servers
@@ -569,11 +569,14 @@ impl BridgeCoordinator {
     ///
     /// `language_id` is the downstream `languageId` — for a `_self` bridge that is
     /// the host language itself (consistent with `HostRequestContext.language_id`).
+    /// `text` is taken as `Arc<str>` so the debounced re-sync path can hand over its
+    /// existing `HostRequestContext.text` allocation (a cheap clone) rather than
+    /// copying the full document on every fire.
     pub(crate) fn eager_sync_host_document_on_servers(
         &self,
         host_uri: &Url,
         language_id: &str,
-        text: &str,
+        text: Arc<str>,
         configs: Vec<ResolvedServerConfig>,
     ) {
         if configs.is_empty() {
@@ -609,7 +612,8 @@ impl BridgeCoordinator {
 
         // Share the text + languageId across per-server tasks via `Arc<str>` rather
         // than cloning the (potentially large) document text once per host server.
-        let text: Arc<str> = Arc::from(text);
+        // `text` already arrives as `Arc<str>` (the debounce path hands over its
+        // `HostRequestContext.text` without copying).
         let language_id: Arc<str> = Arc::from(language_id);
         for config in configs {
             let pool = self.pool_arc();

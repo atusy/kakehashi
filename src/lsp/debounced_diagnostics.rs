@@ -223,7 +223,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         bridge.eager_sync_host_document_on_servers(
             &host.uri,
             &host.language_id,
-            &host.text,
+            host.text.clone(),
             host.configs.clone(),
         );
     }
