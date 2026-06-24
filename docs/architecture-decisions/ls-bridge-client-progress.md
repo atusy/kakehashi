@@ -29,11 +29,12 @@ The host raw-request path strips them (`strip_progress_tokens`,
 builders constructed fresh params with default (empty) progress fields, so no
 token was carried either way. (The host path still strips, and
 `partialResultToken` is still dropped; wired methods now carry a bridge-minted
-`workDoneToken` — see the Decision–Implementation Gap.) A downstream honoring a
-stripped token would stream into the void, since the bridge discards downstream
-notifications, and could legally return an empty final result — so client-requested
-progress did not reach the editor. (It now does on the wired paths; this motivated
-the decision below.)
+`workDoneToken` — see the Decision–Implementation Gap.) With the token stripped
+the downstream had none to report against, and the bridge discarded downstream
+notifications regardless — so client-requested progress did not reach the editor
+(and a server that did emit `$/progress` could legally still return an empty final
+result). This is what the decision below set out to fix; it now reaches the editor
+on the wired paths.
 
 ## Decision
 
