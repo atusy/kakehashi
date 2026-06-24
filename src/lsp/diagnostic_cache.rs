@@ -314,6 +314,20 @@ impl DiagnosticAggregator {
         cache.get(host).cloned().unwrap_or_default()
     }
 
+    /// Whether `host` has any cached `Region` push slot — i.e. a downstream
+    /// diagnostic held in *virtual* coordinates that re-anchors against the region's
+    /// current offset at publish time. Used to decide whether a host edit that moved
+    /// regions needs a geometry re-merge (#422); `Host`/`PullLayer` slots are already
+    /// host-local and don't move with a region edit.
+    pub(crate) fn has_region_slots(&self, host: &Url) -> bool {
+        let cache = self.lock();
+        cache.get(host).is_some_and(|sources| {
+            sources
+                .keys()
+                .any(|source| matches!(source, DiagnosticSource::Region(_)))
+        })
+    }
+
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
@@ -1013,5 +1027,34 @@ mod tests {
             agg.published_set_changed(&host(), &[diag("a")]),
             "a re-opened host must publish its first set even if it matches the pre-close one"
         );
+    }
+
+    #[test]
+    fn has_region_slots_only_true_for_region_sources() {
+        let agg = DiagnosticAggregator::new();
+        assert!(!agg.has_region_slots(&host()), "empty host has none");
+
+        // A Host push slot is host-local — it does not count as a region slot.
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "selene".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("h")],
+        );
+        assert!(
+            !agg.has_region_slots(&host()),
+            "a Host slot is host-local and does not need geometry re-anchoring"
+        );
+
+        // A Region push slot does.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("r")],
+        );
+        assert!(agg.has_region_slots(&host()));
     }
 }

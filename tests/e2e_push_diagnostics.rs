@@ -158,6 +158,71 @@ fn e2e_push_diagnostic_reaches_editor_in_host_coords_then_clears() {
     client.send_notification("exit", json!(null));
 }
 
+/// True if the host publish carries the mock's pushed diagnostic at host `line`.
+fn pushed_diag_at_line(line: i64) -> impl Fn(&Value) -> bool {
+    move |params: &Value| {
+        params["uri"] == json!(MD_URI)
+            && params["diagnostics"].as_array().is_some_and(|ds| {
+                ds.iter()
+                    .any(|d| is_mock_push(d) && d["range"]["start"]["line"] == json!(line))
+            })
+    }
+}
+
+#[test]
+fn e2e_position_only_edit_reanchors_pushed_diagnostic_without_a_repush() {
+    // The headline #422 flicker case: a host edit that moves a region without
+    // changing its content must re-position the region's pushed diagnostic WITHOUT
+    // re-analyzing it. The content-fingerprint guard skips the didChange to the mock
+    // (so it never re-pushes — and never clears via its didChange "empty" push), and
+    // the geometry re-merge re-anchors the cached slot to the new host line.
+    let (mut client, _config_dir) = init_client_with_mode("diagnostics-push");
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // The mock pushes one diagnostic on virtual line 0 → host line 3.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            pushed_diag_at_line(HOST_LINE),
+        )
+        .expect("editor should receive the pushed diagnostic at the original host line");
+
+    // Insert a blank line ABOVE the fence: the lua region shifts from host line 3 to
+    // 4, but its content (`local x = 1`) is unchanged. The mock is NOT driven (its
+    // empty-on-didChange push never fires) because the region content didn't change.
+    let shifted_text = format!("\n{MD_TEXT}");
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": shifted_text }]
+        }),
+    );
+
+    // The cached diagnostic must reappear at the NEW host line (4) via geometry
+    // re-merge — re-anchored, not re-pushed (a positive assertion; the diagnostic is
+    // never lost, proving the region kept its identity across the position shift).
+    let reanchored = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(15),
+        pushed_diag_at_line(HOST_LINE + 1),
+    );
+    assert!(
+        reanchored.is_some(),
+        "a position-only host edit must re-anchor the pushed diagnostic to its new host line without a re-push"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
 #[test]
 fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
     let (mut client, _config_dir) = init_client_with_mode("diagnostics-push-crash");
