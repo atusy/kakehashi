@@ -38,7 +38,7 @@
 //! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
@@ -171,7 +171,13 @@ pub(crate) struct DiagnosticAggregator {
     /// *every* host's republish, only that host's (#426). The outer `Mutex` is held
     /// only briefly to fetch/insert the per-host lock; the per-host
     /// `tokio::sync::Mutex` is the one held across the publish await.
-    republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
+    ///
+    /// The value is a [`Weak`] so the per-host `Mutex` allocation is freed as soon
+    /// as its last holder/waiter drops the owning guard — the map then keeps only a
+    /// tiny dangling weak, reclaimed off the hot path by [`Self::reclaim_republish_locks`]
+    /// (#466). A live (upgradeable) weak is never removed, so reclamation cannot
+    /// race a republish into minting a second lock for the same host.
+    republish_locks: Mutex<HashMap<Url, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl DiagnosticAggregator {
@@ -185,18 +191,41 @@ impl DiagnosticAggregator {
     pub(crate) async fn lock_republish(&self, host: &Url) -> tokio::sync::OwnedMutexGuard<()> {
         // Brief outer lock to fetch-or-create this host's lock, then await it.
         // Clone the `Url` key only when inserting a new entry — the steady state
-        // (lock already present) avoids the allocation on this per-republish path.
+        // (a live weak that still upgrades) avoids both the allocation and the
+        // key clone on this per-republish path.
         let lock = {
             let mut locks = self
                 .republish_locks
                 .lock()
                 .recover_poison("DiagnosticAggregator::republish_locks");
-            match locks.get(host) {
-                Some(lock) => Arc::clone(lock),
-                None => Arc::clone(locks.entry(host.clone()).or_default()),
+            match locks.get(host).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    // Absent, or a dangling weak left by a since-dropped lock:
+                    // mint a fresh lock and record a weak to it. The returned
+                    // guard keeps the `Arc` alive for as long as it is held.
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(host.clone(), Arc::downgrade(&lock));
+                    lock
+                }
             }
         };
         lock.lock_owned().await
+    }
+
+    /// Drop republish-lock entries whose lock has no live holder, bounding the
+    /// `republish_locks` map so it does not retain one entry per distinct host
+    /// ever republished (#466). Only **dangling** weaks are removed: a weak that
+    /// still upgrades is held by an in-flight or queued republish, and removing it
+    /// would let a concurrent acquire mint a *second* lock for the same host and
+    /// skip serialization — so a live weak is always kept (reclaimed at a later
+    /// sweep once it drains). Called off the hot path (host `didClose`).
+    pub(crate) fn reclaim_republish_locks(&self) {
+        let mut locks = self
+            .republish_locks
+            .lock()
+            .recover_poison("DiagnosticAggregator::republish_locks");
+        locks.retain(|_, weak| weak.strong_count() > 0);
     }
 
     /// Record (replacing) one server's diagnostics for a `(host, source)`.
@@ -267,6 +296,15 @@ impl DiagnosticAggregator {
         removed
     }
 
+    /// Number of entries currently held in the republish-lock map (test-only).
+    #[cfg(test)]
+    fn republish_lock_count(&self) -> usize {
+        self.republish_locks
+            .lock()
+            .recover_poison("DiagnosticAggregator::republish_locks")
+            .len()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Url, SourceSlots>> {
         // Recover from a poisoned lock rather than propagating a panic: a
         // diagnostic cache is best-effort state, never a correctness invariant
@@ -316,6 +354,64 @@ mod tests {
         assert!(
             same.is_err(),
             "the same host's republish lock must serialize (preserving per-host order)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_removes_lock_entries_with_no_live_holder() {
+        let agg = DiagnosticAggregator::new();
+        let a = Url::parse("file:///a.md").unwrap();
+        let b = Url::parse("file:///b.md").unwrap();
+
+        // Two hosts republished, then both guards dropped — their locks dangle.
+        drop(agg.lock_republish(&a).await);
+        drop(agg.lock_republish(&b).await);
+        assert_eq!(
+            agg.republish_lock_count(),
+            2,
+            "an entry is recorded per host republished"
+        );
+
+        agg.reclaim_republish_locks();
+        assert_eq!(
+            agg.republish_lock_count(),
+            0,
+            "entries whose lock has no live holder are reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_keeps_locks_with_a_live_holder() {
+        let agg = DiagnosticAggregator::new();
+        let a = Url::parse("file:///a.md").unwrap();
+
+        // Hold host A's lock across the sweep: its weak still upgrades, so removing
+        // it could let a concurrent acquire mint a second lock — reclaim must keep it.
+        let guard = agg.lock_republish(&a).await;
+        agg.reclaim_republish_locks();
+        assert_eq!(
+            agg.republish_lock_count(),
+            1,
+            "a lock with a live holder is retained"
+        );
+        // The same host re-acquires the *same* lock while the entry survives, so
+        // serialization is preserved (a second acquire would block).
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                agg.lock_republish(&a)
+            )
+            .await
+            .is_err(),
+            "the retained lock still serializes the same host"
+        );
+
+        drop(guard);
+        agg.reclaim_republish_locks();
+        assert_eq!(
+            agg.republish_lock_count(),
+            0,
+            "once the holder drops, the now-dangling entry is reclaimed"
         );
     }
 

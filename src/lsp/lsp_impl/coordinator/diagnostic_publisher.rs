@@ -204,6 +204,10 @@ impl DiagnosticPublisher {
     pub(crate) async fn clear_host(&self, host: &Url) {
         self.aggregator.evict_host(host);
         self.republish(host).await;
+        // didClose is off the hot path: reclaim republish-lock entries whose lock
+        // now has no live holder — this host's, once the clear-republish above
+        // released it, plus any earlier-closed hosts that have since drained (#466).
+        self.aggregator.reclaim_republish_locks();
     }
 
     /// Merge the host's cached slots and publish the cumulative result. Region
