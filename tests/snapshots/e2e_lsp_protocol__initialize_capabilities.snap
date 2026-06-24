@@ -28,14 +28,10 @@ expression: capabilities
       ","
     ]
   },
-  "definitionProvider": {
-    "workDoneProgress": true
-  },
+  "definitionProvider": true,
   "typeDefinitionProvider": true,
   "implementationProvider": true,
-  "referencesProvider": {
-    "workDoneProgress": true
-  },
+  "referencesProvider": true,
   "documentHighlightProvider": true,
   "documentSymbolProvider": true,
   "codeLensProvider": {
@@ -48,9 +44,7 @@ expression: capabilities
   },
   "documentLinkProvider": {},
   "foldingRangeProvider": true,
-  "declarationProvider": {
-    "workDoneProgress": true
-  },
+  "declarationProvider": true,
   "semanticTokensProvider": {
     "legend": {
       "tokenTypes": [

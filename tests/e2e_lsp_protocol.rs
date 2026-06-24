@@ -47,6 +47,45 @@ fn test_initialize_returns_capabilities() {
 }
 
 #[test]
+fn test_initialize_advertises_work_done_progress_when_client_supports_it() {
+    // When the client signals work-done-progress support, the client-progress
+    // providers advertise `workDoneProgress` (so the client attaches a
+    // workDoneToken we can bridge); without it they stay bare `true`
+    // (ls-bridge-client-progress, #445).
+    let mut client = LspClient::new();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "window": { "workDoneProgress": true } }
+        }),
+    );
+
+    let caps = response
+        .get("result")
+        .and_then(|r| r.get("capabilities"))
+        .expect("InitializeResult should have capabilities");
+
+    for provider in [
+        "definitionProvider",
+        "referencesProvider",
+        "declarationProvider",
+    ] {
+        assert_eq!(
+            caps[provider]["workDoneProgress"],
+            json!(true),
+            "{provider} should advertise workDoneProgress when the client supports it"
+        );
+    }
+    // type_definition/implementation cannot advertise it via the current types
+    // crate (#447), so they remain bare `true`.
+    assert_eq!(caps["typeDefinitionProvider"], json!(true));
+    assert_eq!(caps["implementationProvider"], json!(true));
+}
+
+#[test]
 fn test_effective_configuration_returns_settings() {
     let mut client = LspClient::new();
 
