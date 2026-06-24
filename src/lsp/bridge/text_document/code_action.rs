@@ -176,18 +176,27 @@ fn transform_code_action(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) {
-    if let Some(edit) = &mut action.edit {
+    let keep_edit = if let Some(edit) = &mut action.edit {
         if let Some(document_changes) = &mut edit.document_changes {
-            // A WorkspaceEdit uses EITHER `changes` OR `documentChanges`. Translate
-            // the `Edits` form; drop the whole edit if nothing translatable remains
-            // (or it's the deferred `Operations`/resource-op form — #471).
-            if !transform_document_changes(document_changes, request_virtual_uri, host_uri, offset)
-            {
-                action.edit = None;
-            }
+            // A WorkspaceEdit uses EITHER `changes` OR `documentChanges`, and a
+            // client honoring `documentChanges` ignores `changes` — but clear it
+            // anyway so an untranslated (virtual-coordinate) `changes` map can never
+            // leak to the editor. Then translate the `Edits` form; an edit with
+            // nothing translatable left (all cross-region, or the deferred
+            // `Operations`/resource-op form — #471) is dropped wholesale.
+            edit.changes = None;
+            transform_document_changes(document_changes, request_virtual_uri, host_uri, offset)
         } else if let Some(changes) = &mut edit.changes {
             transform_changes_map(changes, request_virtual_uri, host_uri, offset);
+            true
+        } else {
+            true
         }
+    } else {
+        true
+    };
+    if !keep_edit {
+        action.edit = None;
     }
 
     if let Some(diagnostics) = &mut action.diagnostics {
@@ -237,6 +246,10 @@ fn transform_text_document_edit(
     }
     if uri_str == request_virtual_uri {
         edit.text_document.uri = host_uri.clone();
+        // The virtual document's version does not identify the host document — an
+        // editor could reject a versioned edit on a version it never saw. Re-key as
+        // an unversioned edit so it applies against the host's current content.
+        edit.text_document.version = None;
         for text_edit in &mut edit.edits {
             // `edits` are `OneOf<TextEdit, AnnotatedTextEdit>`; both carry a range.
             let range = match text_edit {
@@ -671,6 +684,80 @@ mod tests {
             "the Operations form drops the edit (deferred follow-up)"
         );
         assert_eq!(action.title, "Create");
+    }
+
+    #[test]
+    fn code_action_document_changes_clears_changes_map_and_resets_version() {
+        // Non-standard but defensive: when BOTH `changes` (untranslated, virtual)
+        // and `documentChanges` are present, the changes map is cleared (no virtual
+        // leak) and the re-keyed edit drops the virtual `version`.
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "result": [
+                {
+                    "title": "Both",
+                    "edit": {
+                        "changes": {
+                            virtual_uri.clone(): [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                },
+                                "newText": "y"
+                            }]
+                        },
+                        "documentChanges": [
+                            {
+                                "textDocument": { "uri": virtual_uri, "version": 7 },
+                                "edits": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 5 }
+                                    },
+                                    "newText": "x"
+                                }]
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let actions = transform_code_action_response_to_host(
+            response,
+            &virtual_uri,
+            &host_uri,
+            &RegionOffset::new(10, 0),
+        )
+        .unwrap();
+
+        let action = match &actions[0] {
+            CodeActionOrCommand::CodeAction(a) => a,
+            CodeActionOrCommand::Command(_) => panic!("Expected CodeAction"),
+        };
+        let edit = action.edit.as_ref().expect("edit kept");
+        assert!(
+            edit.changes.is_none(),
+            "the untranslated `changes` map is cleared when documentChanges takes precedence"
+        );
+        match edit
+            .document_changes
+            .as_ref()
+            .expect("documentChanges kept")
+        {
+            DocumentChanges::Edits(tdes) => {
+                assert_eq!(tdes[0].text_document.uri, host_uri);
+                assert_eq!(
+                    tdes[0].text_document.version, None,
+                    "the virtual document's version is dropped on re-key to host"
+                );
+            }
+            DocumentChanges::Operations(_) => panic!("expected Edits"),
+        }
     }
 
     #[test]
