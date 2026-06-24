@@ -5,7 +5,7 @@
 //! document coordinates.
 
 use tower_lsp_server::ls_types::{
-    DidOpenTextDocumentParams, Position, TextDocumentIdentifier, TextDocumentItem,
+    DidOpenTextDocumentParams, NumberOrString, Position, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Uri,
 };
 
@@ -13,6 +13,18 @@ use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
 use super::translation::{RegionOffset, translate_host_position_to_virtual};
 use super::virtual_uri::VirtualDocumentUri;
+
+/// A position-based request's params plus an optional client-provided
+/// `workDoneToken` (ls-bridge-client-progress). `TextDocumentPositionParams` has
+/// no progress field, so we flatten it and add the token alongside; when the
+/// token is `None` this serializes byte-identically to the bare position params.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct PositionRequestParams {
+    #[serde(flatten)]
+    position: TextDocumentPositionParams,
+    #[serde(rename = "workDoneToken", skip_serializing_if = "Option::is_none")]
+    work_done_token: Option<NumberOrString>,
+}
 
 /// Build `TextDocumentPositionParams` with host-to-virtual coordinate translation.
 ///
@@ -51,6 +63,29 @@ pub(crate) fn build_position_based_request(
 ) -> JsonRpcRequest<TextDocumentPositionParams> {
     let params = build_text_document_position_params(virtual_uri, host_position, offset);
     JsonRpcRequest::new(request_id.as_i64(), method, params)
+}
+
+/// Like [`build_position_based_request`], but carries the editor's
+/// `workDoneToken` so the downstream reports `$/progress` against it
+/// (ls-bridge-client-progress). `client_progress_token = None` is equivalent to
+/// [`build_position_based_request`] (the token field is omitted).
+pub(crate) fn build_position_based_request_with_progress(
+    virtual_uri: &VirtualDocumentUri,
+    host_position: Position,
+    offset: &RegionOffset,
+    request_id: RequestId,
+    method: &'static str,
+    client_progress_token: Option<NumberOrString>,
+) -> JsonRpcRequest<PositionRequestParams> {
+    let position = build_text_document_position_params(virtual_uri, host_position, offset);
+    JsonRpcRequest::new(
+        request_id.as_i64(),
+        method,
+        PositionRequestParams {
+            position,
+            work_done_token: client_progress_token,
+        },
+    )
 }
 
 /// Build a whole-document JSON-RPC request (documentLink, documentSymbol,
