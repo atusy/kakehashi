@@ -52,6 +52,31 @@ fn test_data_dir() -> &'static Path {
     dir.as_path()
 }
 
+/// Empty `XDG_CONFIG_HOME` for the spawned server, so it never reads the
+/// developer's real `~/.config/kakehashi`. Inherited user config changes the
+/// server's behavior under test — e.g. a host-bridging entry flips the
+/// willSave/willSaveWaitUntil capability gate and breaks the
+/// `initialize_capabilities` snapshot — so isolation must hold regardless of
+/// how the test is invoked (`make test_e2e`, a bare `cargo test`, or the
+/// pre-commit gate). Doing it here, rather than in the Makefile, is the only
+/// place that covers all three.
+///
+/// The directory is left empty: the server's `$XDG_CONFIG_HOME/kakehashi`
+/// lookup simply finds nothing and falls back to built-in defaults.
+///
+/// Uses a unique per-process [`tempfile::TempDir`] rather than a fixed path so
+/// the isolation is deterministic: a fixed shared path could already hold stale
+/// contents from a prior or concurrent run (re-introducing the very pollution
+/// this guards against) or collide on permissions across users. The `TempDir`
+/// is parked in a `static` so it outlives every spawned server for the whole
+/// test process; it is intentionally never dropped (statics aren't), so no
+/// cleanup can race a still-running server.
+fn isolated_config_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("create temp dir for XDG_CONFIG_HOME isolation"))
+        .path()
+}
+
 /// LSP client for communicating with kakehashi binary.
 ///
 /// Handles JSON-RPC 2.0 message framing with Content-Length headers,
@@ -165,6 +190,7 @@ impl LspClientBuilder {
             cmd.env_remove(key);
         }
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir());
+        cmd.env("XDG_CONFIG_HOME", isolated_config_dir());
         for (key, value) in &self.envs {
             cmd.env(key, value);
         }
@@ -307,6 +333,7 @@ impl LspClient {
         // and points to the built `kakehashi` binary, so we don't hardcode its path here.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir())
+            .env("XDG_CONFIG_HOME", isolated_config_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
