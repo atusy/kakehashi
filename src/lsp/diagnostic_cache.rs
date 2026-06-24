@@ -227,9 +227,10 @@ impl DiagnosticAggregator {
     /// A push that was already past its open-document / region-resolve guard when
     /// the host closed can still resume and re-create one entry after this sweep
     /// (the narrow resurrection window the deferred lifecycle/`content_epoch` gate
-    /// closes generally — #422). That residual is bounded by distinct host URIs in
-    /// the session (the same bound the unreclaimed map had), so it never grows
-    /// without bound; the next `didClose` sweep collects it.
+    /// closes generally — #422). That residual is bounded by the number of distinct
+    /// hosts that hit this race (no worse than the unreclaimed map's distinct-host
+    /// bound); a later sweep collects each such entry once it drains (a sweep keeps
+    /// any still-live lock).
     pub(crate) fn reclaim_republish_locks(&self) {
         let mut locks = self
             .republish_locks
