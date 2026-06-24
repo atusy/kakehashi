@@ -150,21 +150,23 @@ impl Drop for ClientProgressDeregisterGuard {
     }
 }
 
-/// Translates the **tracked source's** downstream `$/progress` into a single
-/// lifecycle on the client's `workDoneToken`.
+/// Translates one fanned-out request's downstream `$/progress` into a single
+/// coherent lifecycle on the client's `workDoneToken`.
 ///
-/// Only the tracked source's bridge token routes here (under *preferred*/N=1 the
-/// dispatch path mints a token solely for that source — the sole server at N=1,
-/// or the highest-priority *named* anchor at N>1 — and suppresses every other
-/// candidate by handing it no token). So this aggregator just enforces one
-/// coherent `Begin → … → End` and guarantees a terminal `End` on teardown (even
-/// if the source's own `End` races the response or never arrives).
+/// Several bridge-minted source tokens may route here — one per tracked source,
+/// and for a multi-region request (e.g. `documentSymbol` over several injection
+/// regions) one per region. The aggregator picks the **first source to relay a
+/// `Begin`** as the winner and shows only its `Begin`/`report`/`End`; every other
+/// source (and any duplicate `Begin`) is dropped, so the editor sees exactly one
+/// `Begin → … → End`. It also guarantees a terminal `End` on teardown (even if the
+/// winner's own `End` races the response or never arrives).
 #[derive(Debug)]
 pub(crate) struct ClientProgressAggregator {
     /// The editor-minted token every emitted `$/progress` is reported against.
     client_token: NumberOrString,
-    /// Whether a `Begin` has been relayed upstream (pairing invariant).
-    begun: bool,
+    /// The source token that won the lifecycle — the first to relay a `Begin`.
+    /// Only its subsequent non-`Begin` progress is relayed; `None` until then.
+    winner: Option<NumberOrString>,
     /// Whether the terminal `End` has been emitted (drop anything after it; emit
     /// the synthetic teardown `End` at most once).
     ended: bool,
@@ -174,33 +176,44 @@ impl ClientProgressAggregator {
     pub(crate) fn new(client_token: NumberOrString) -> Self {
         Self {
             client_token,
-            begun: false,
+            winner: None,
             ended: false,
         }
     }
 
-    /// Feed one tracked-source `$/progress` value. Returns the upstream
-    /// `$/progress` to forward against the client token, or `None` to drop it.
+    /// Feed one downstream `$/progress` value from `source` (its bridge token).
+    /// Returns the upstream `$/progress` to forward against the client token, or
+    /// `None` to drop it.
     pub(crate) fn on_downstream_progress(
         &mut self,
+        source: &NumberOrString,
         value: ProgressParamsValue,
     ) -> Option<ProgressParams> {
+        if self.ended {
+            return None;
+        }
         let is_begin = matches!(
             &value,
             ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(_))
         );
-        if self.ended || (is_begin && self.begun) || (!is_begin && !self.begun) {
-            // Drop, so the editor sees one coherent Begin → … → End lifecycle:
-            // anything after the terminal End; a duplicate `Begin`; and any
-            // out-of-order `report`/`End` before the first `Begin`.
-            return None;
+        match &self.winner {
+            // No lifecycle yet: only a `Begin` starts one (drop out-of-order
+            // `report`/`End` that arrive before any `Begin`).
+            None => {
+                if !is_begin {
+                    return None;
+                }
+                self.winner = Some(source.clone());
+            }
+            // Lifecycle owned by the winner: relay only its non-`Begin` progress;
+            // drop a losing source's progress and the winner's duplicate `Begin`.
+            Some(winner) => {
+                if winner != source || is_begin {
+                    return None;
+                }
+            }
         }
-        // Relay verbatim under the client token, tracking the lifecycle so a
-        // terminal End is guaranteed even if the source's own End never arrives
-        // (or arrives after teardown).
-        if is_begin {
-            self.begun = true;
-        } else if matches!(
+        if matches!(
             &value,
             ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
         ) {
@@ -214,11 +227,11 @@ impl ClientProgressAggregator {
 
     /// On request teardown, return a synthetic terminal `End` for the client token
     /// **iff** a `Begin` was relayed but no `End` — so the editor's indicator is
-    /// always closed even when the downstream's `End` never arrives or races the
+    /// always closed even when the winner's `End` never arrives or races the
     /// response (ls-bridge-client-progress pairing invariant). Marks the lifecycle
     /// ended so it fires at most once and a later real `End` is ignored.
     pub(crate) fn take_terminal_end(&mut self) -> Option<ProgressParams> {
-        if self.begun && !self.ended {
+        if self.winner.is_some() && !self.ended {
             self.ended = true;
             Some(ProgressParams {
                 token: self.client_token.clone(),
@@ -241,6 +254,12 @@ mod tests {
         NumberOrString::String("editor-wd-1".to_string())
     }
 
+    /// A bridge-minted source token (the single-source tests use one consistent
+    /// source; multi-source tests pass distinct ones).
+    fn src() -> NumberOrString {
+        NumberOrString::String("cprog-src".to_string())
+    }
+
     fn begin() -> ProgressParamsValue {
         ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(WorkDoneProgressBegin {
             title: "Indexing".to_string(),
@@ -252,6 +271,15 @@ mod tests {
     fn end() -> ProgressParamsValue {
         ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd { message: None }))
     }
+    fn report() -> ProgressParamsValue {
+        ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+            tower_lsp_server::ls_types::WorkDoneProgressReport {
+                cancellable: None,
+                message: None,
+                percentage: Some(50),
+            },
+        ))
+    }
 
     #[test]
     fn n1_relays_begin_then_end_under_the_client_token_then_drops() {
@@ -259,14 +287,14 @@ mod tests {
 
         for value in [begin(), end()] {
             let out = agg
-                .on_downstream_progress(value.clone())
+                .on_downstream_progress(&src(), value.clone())
                 .expect("N=1 relays the downstream progress");
             assert_eq!(out.token, client_token(), "retargeted to the client token");
             assert_eq!(out.value, value, "value forwarded verbatim");
         }
         // After the terminal End, further progress is dropped.
         assert!(
-            agg.on_downstream_progress(begin()).is_none(),
+            agg.on_downstream_progress(&src(), begin()).is_none(),
             "no progress is relayed after the End"
         );
     }
@@ -304,16 +332,16 @@ mod tests {
         // An `End` before any `Begin` must be dropped — the editor must never see
         // a terminal for a lifecycle that never began.
         assert!(
-            agg.on_downstream_progress(end()).is_none(),
+            agg.on_downstream_progress(&src(), end()).is_none(),
             "End before Begin is dropped"
         );
         // A subsequent normal Begin → End still relays.
         assert!(
-            agg.on_downstream_progress(begin()).is_some(),
+            agg.on_downstream_progress(&src(), begin()).is_some(),
             "Begin relays"
         );
         assert!(
-            agg.on_downstream_progress(end()).is_some(),
+            agg.on_downstream_progress(&src(), end()).is_some(),
             "then End relays"
         );
     }
@@ -322,17 +350,58 @@ mod tests {
     fn duplicate_begin_is_dropped() {
         let mut agg = ClientProgressAggregator::new(client_token());
         assert!(
-            agg.on_downstream_progress(begin()).is_some(),
+            agg.on_downstream_progress(&src(), begin()).is_some(),
             "first Begin relays"
         );
         // A second Begin must be dropped — the editor must see exactly one Begin.
         assert!(
-            agg.on_downstream_progress(begin()).is_none(),
+            agg.on_downstream_progress(&src(), begin()).is_none(),
             "duplicate Begin is dropped"
         );
         assert!(
-            agg.on_downstream_progress(end()).is_some(),
+            agg.on_downstream_progress(&src(), end()).is_some(),
             "End still relays"
+        );
+    }
+
+    #[test]
+    fn first_source_to_begin_wins_others_are_dropped() {
+        // A request fanned out over several sources (e.g. multiple injection
+        // regions) routes each source's progress to one shared aggregator. The
+        // first to `Begin` wins; every other source's progress is dropped, so the
+        // editor sees a single coherent lifecycle.
+        let mut agg = ClientProgressAggregator::new(client_token());
+        let a = NumberOrString::String("src-a".to_string());
+        let b = NumberOrString::String("src-b".to_string());
+
+        assert!(
+            agg.on_downstream_progress(&a, begin()).is_some(),
+            "source A begins first → wins"
+        );
+        assert!(
+            agg.on_downstream_progress(&b, begin()).is_none(),
+            "loser B's Begin is dropped"
+        );
+        assert!(
+            agg.on_downstream_progress(&b, report()).is_none(),
+            "loser B's report is dropped"
+        );
+        assert!(
+            agg.on_downstream_progress(&b, end()).is_none(),
+            "loser B's End is dropped"
+        );
+        // The winner's own report relays.
+        assert!(
+            agg.on_downstream_progress(&a, report()).is_some(),
+            "winner A's report relays"
+        );
+        assert!(
+            agg.on_downstream_progress(&a, end()).is_some(),
+            "winner A's End relays"
+        );
+        assert!(
+            agg.on_downstream_progress(&a, begin()).is_none(),
+            "nothing relays after the winner's End"
         );
     }
 
@@ -349,7 +418,10 @@ mod tests {
             std::sync::Arc::new(Mutex::new(ClientProgressAggregator::new(client_token())));
         let token = registry.register(aggregator.clone());
         // Downstream begins (relayed) but never ends.
-        aggregator.lock().unwrap().on_downstream_progress(begin());
+        aggregator
+            .lock()
+            .unwrap()
+            .on_downstream_progress(&src(), begin());
 
         drop(ClientProgressDeregisterGuard::new(
             registry.clone(),
@@ -387,8 +459,8 @@ mod tests {
         let token = registry.register(aggregator.clone());
         {
             let mut guard = aggregator.lock().unwrap();
-            guard.on_downstream_progress(begin());
-            guard.on_downstream_progress(end());
+            guard.on_downstream_progress(&src(), begin());
+            guard.on_downstream_progress(&src(), end());
         }
 
         drop(ClientProgressDeregisterGuard::new(
