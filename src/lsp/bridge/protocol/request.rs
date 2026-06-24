@@ -241,8 +241,23 @@ mod tests {
         );
         assert!(json["params"]["position"]["line"].is_number());
 
+        // The numeric ProgressToken variant serializes as a bare number, not a
+        // wrapper object (`NumberOrString` is `#[serde(untagged)]`).
+        let numeric = build_position_based_request_with_progress(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+            Some(NumberOrString::Number(7)),
+        );
+        assert_eq!(
+            serde_json::to_value(&numeric).unwrap()["params"]["workDoneToken"],
+            7
+        );
+
         // Without a token: the field is omitted entirely, leaving the params
-        // byte-identical to the bare position request (non-regression).
+        // byte-for-byte identical to the bare position request (non-regression).
         let without = build_position_based_request_with_progress(
             &virtual_uri,
             host_pos,
@@ -264,10 +279,12 @@ mod tests {
                 .is_none(),
             "workDoneToken omitted when None"
         );
+        // Compare the serialized bytes (not just the structural Value) so field
+        // order is included in the non-regression guarantee.
         assert_eq!(
-            serde_json::to_value(&without).unwrap(),
-            serde_json::to_value(&bare).unwrap(),
-            "None serializes identically to the bare position request"
+            serde_json::to_string(&without).unwrap(),
+            serde_json::to_string(&bare).unwrap(),
+            "None serializes byte-for-byte identically to the bare position request"
         );
     }
 }

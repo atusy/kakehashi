@@ -135,6 +135,24 @@ mod tests {
         assert_position_request(&request, "textDocument/definition", 2);
     }
 
+    #[test]
+    fn definition_request_carries_work_done_token() {
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let request = build_definition_request(
+            &virtual_uri,
+            test_position(),
+            &RegionOffset::new(3, 0),
+            test_request_id(),
+            Some(tower_lsp_server::ls_types::NumberOrString::String(
+                "wd-1".to_string(),
+            )),
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["params"]["workDoneToken"],
+            "wd-1"
+        );
+    }
+
     // ==========================================================================
     // Definition response transformation tests
     // ==========================================================================
