@@ -117,9 +117,10 @@ pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 /// - [`DiagnosticSource::Host`] and [`DiagnosticSource::PullLayer`] slots are
 ///   already host-local and pass through unchanged.
 ///
-/// Staged: results are concatenated (the default `textDocument/publishDiagnostics`
-/// strategy). Per-source strategy fan-in (`preferred` sticky / `concatenated`
-/// visible-walk) is a follow-up.
+/// Strategy: the `concatenated` strategy (keep every server's diagnostics) in a
+/// deterministic position order (see the sort below, #423). The `preferred`
+/// sticky-election strategy is a follow-up — it needs a per-source version baseline
+/// (`Veff`), which #422 left unbuilt.
 pub(crate) fn merge_cached_diagnostics(
     host: &Url,
     snapshot: SourceSlots,
@@ -1040,6 +1041,45 @@ mod tests {
             vec![Some("a_src".to_string()), Some("z_src".to_string())],
             "same position+message ties break by source"
         );
+    }
+
+    #[test]
+    fn merge_breaks_ties_by_serialized_form_for_data_only_differences() {
+        let agg = DiagnosticAggregator::new();
+        // Identical on every cheap key (position, message, source=None, severity=None)
+        // but differing only in `data` — the lazy serialized tiebreak must still give a
+        // deterministic order, not fall back to HashMap iteration.
+        let mut d1 = diag_at("same", 3, 0);
+        d1.data = Some(serde_json::json!({"k": 1}));
+        let mut d2 = diag_at("same", 3, 0);
+        d2.data = Some(serde_json::json!({"k": 2}));
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv1".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![d1.clone()],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv2".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![d2.clone()],
+        );
+        let first = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        // Re-merge a few times: a HashMap-order fallback would eventually flip; the
+        // serialized tiebreak must keep the order stable across merges.
+        for _ in 0..5 {
+            let again = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+            assert_eq!(
+                again.iter().map(|d| &d.data).collect::<Vec<_>>(),
+                first.iter().map(|d| &d.data).collect::<Vec<_>>(),
+                "data-only-differing diagnostics keep a deterministic order across merges"
+            );
+        }
+        // And the order matches the serialized form (d1's data `{k:1}` < d2's `{k:2}`).
+        assert_eq!(first[0].data, d1.data);
     }
 
     #[test]
