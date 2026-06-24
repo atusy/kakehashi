@@ -199,6 +199,12 @@ pub(crate) struct DiagnosticAggregator {
     /// removed — reclamation cannot race a republish into minting a second lock for
     /// the same host.
     republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
+    /// The last diagnostic set published to the editor per host, so a republish
+    /// that would re-send an identical set is suppressed — the editor already has
+    /// it, and a redundant `publishDiagnostics` is a needless flicker/noise source
+    /// (#422). Updated under the host's republish lock (same-host republishes are
+    /// serialized), and forgotten on `didClose` ([`Self::forget_published`]).
+    last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
 }
 
 impl DiagnosticAggregator {
@@ -312,6 +318,33 @@ impl DiagnosticAggregator {
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
         cache.remove(host).is_some()
+    }
+
+    /// Whether `diagnostics` differs from the set last published for `host`,
+    /// recording it as the new last when it does. Returns `false` when identical,
+    /// so the caller skips a redundant `publishDiagnostics` the editor already has
+    /// (#422). Called under the host's republish lock, so same-host calls serialize.
+    pub(crate) fn published_set_changed(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
+        let mut last = self
+            .last_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_published");
+        match last.get(host) {
+            Some(prev) if prev.as_slice() == diagnostics => false,
+            _ => {
+                last.insert(host.clone(), diagnostics.to_vec());
+                true
+            }
+        }
+    }
+
+    /// Forget the last-published set for `host` (host `didClose`), so its entry
+    /// does not linger and a later re-open publishes afresh.
+    pub(crate) fn forget_published(&self, host: &Url) {
+        self.last_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_published")
+            .remove(host);
     }
 
     /// Drop one `source`'s slots (every server) under `host` — e.g. a region
@@ -951,6 +984,34 @@ mod tests {
         assert!(
             !agg.lock().contains_key(&host()),
             "the now-empty host entry is removed, not left present-but-empty"
+        );
+    }
+
+    #[test]
+    fn published_set_changed_suppresses_an_identical_republish() {
+        let agg = DiagnosticAggregator::new();
+        // First publish always counts as changed (nothing published before).
+        assert!(agg.published_set_changed(&host(), &[diag("a")]));
+        // An identical set is suppressed.
+        assert!(!agg.published_set_changed(&host(), &[diag("a")]));
+        // A different set publishes again.
+        assert!(agg.published_set_changed(&host(), &[diag("a"), diag("b")]));
+        assert!(!agg.published_set_changed(&host(), &[diag("a"), diag("b")]));
+        // Going back to empty is a change (clears the editor).
+        assert!(agg.published_set_changed(&host(), &[]));
+        assert!(!agg.published_set_changed(&host(), &[]));
+    }
+
+    #[test]
+    fn forget_published_lets_the_next_identical_set_publish_again() {
+        let agg = DiagnosticAggregator::new();
+        assert!(agg.published_set_changed(&host(), &[diag("a")]));
+        assert!(!agg.published_set_changed(&host(), &[diag("a")]));
+        // After didClose forgets the host, a re-open's identical first set publishes.
+        agg.forget_published(&host());
+        assert!(
+            agg.published_set_changed(&host(), &[diag("a")]),
+            "a re-opened host must publish its first set even if it matches the pre-close one"
         );
     }
 }

@@ -228,6 +228,10 @@ impl DiagnosticPublisher {
     pub(crate) async fn clear_host(&self, host: &Url) {
         self.aggregator.evict_host(host);
         self.republish(host).await;
+        // The host is closed: forget its last-published set so the entry does not
+        // linger and a later re-open publishes afresh (#422). Done after the
+        // clear-republish above so that publish still sees the prior set.
+        self.aggregator.forget_published(host);
         // didClose is off the hot path: reclaim republish-lock entries whose lock
         // now has no live holder — this host's, once the clear-republish above
         // released it, plus any earlier-closed hosts that have since drained (#466).
@@ -280,6 +284,19 @@ impl DiagnosticPublisher {
                 return;
             }
         };
+
+        // Suppress a republish that would re-send the exact set the editor already
+        // has — a redundant publishDiagnostics is needless flicker/noise (#422).
+        // Done under the per-host republish lock (held above), so the compare-and-set
+        // is serialized with other republishes for this host.
+        if !self.aggregator.published_set_changed(host, &diagnostics) {
+            log::debug!(
+                target: LOG_TARGET,
+                "skip republish for {host}: merged set unchanged ({} diagnostics)",
+                diagnostics.len()
+            );
+            return;
+        }
 
         log::debug!(
             target: LOG_TARGET,
