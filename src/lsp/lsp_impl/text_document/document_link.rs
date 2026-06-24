@@ -15,6 +15,9 @@ impl Kakehashi {
             &params.text_document.uri,
             "textDocument/documentLink",
             raw_params,
+            // documentLink is fast; not advertised for client progress (#437), so
+            // no token is carried.
+            None,
             |t| async move {
                 t.pool
                     .send_document_link_request(

@@ -15,6 +15,9 @@ impl Kakehashi {
             &params.text_document.uri,
             "textDocument/foldingRange",
             raw_params,
+            // foldingRange is fast; not advertised for client progress (#437), so
+            // no token is carried.
+            None,
             |t| async move {
                 t.pool
                     .send_folding_range_request(
