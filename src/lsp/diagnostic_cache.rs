@@ -152,20 +152,6 @@ pub(crate) fn merge_cached_diagnostics(
     merged
 }
 
-/// A stable ordering key for a diagnostic — by range then message — used to compare
-/// two merged sets order-independently for no-op-publish suppression (#422). Two
-/// fully-identical diagnostics tie, so the sort is total enough for an equality
-/// compare; it does not change what is published.
-fn diagnostic_order_key(d: &Diagnostic) -> (u32, u32, u32, u32, &str) {
-    (
-        d.range.start.line,
-        d.range.start.character,
-        d.range.end.line,
-        d.range.end.character,
-        d.message.as_str(),
-    )
-}
-
 /// Transform a pushed region diagnostic from virtual to host coordinates.
 ///
 /// Mirrors the pull path's `transform_diagnostic`
@@ -356,11 +342,15 @@ impl DiagnosticAggregator {
     /// The comparison is **order-independent**: `merge_cached_diagnostics` walks
     /// `HashMap`-keyed sources/servers, so the same logical set can serialize in a
     /// different order between republishes. Both the incoming set and the stored one
-    /// are sorted by position+message first, so a multi-source/multi-server host is
-    /// not wrongly seen as "changed" merely because the merge order shuffled.
+    /// are sorted by each diagnostic's full serialized form (a total order over every
+    /// field) first, so a multi-source/multi-server host is not wrongly seen as
+    /// "changed" merely because the merge order shuffled — while a genuine change in
+    /// any field is still detected.
     pub(crate) fn published_set_changed(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
         let mut sorted = diagnostics.to_vec();
-        sorted.sort_by(|a, b| diagnostic_order_key(a).cmp(&diagnostic_order_key(b)));
+        // `sort_by_cached_key` serializes each diagnostic once (O(n)), not per
+        // comparison; the small per-host diagnostic count makes this cheap.
+        sorted.sort_by_cached_key(|d| serde_json::to_string(d).unwrap_or_default());
 
         let mut last = self
             .last_published

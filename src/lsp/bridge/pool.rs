@@ -669,6 +669,15 @@ impl LanguageServerPool {
                 .await;
             return Err(e);
         }
+        // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
+        // `Ok`), so seed the content fingerprint with the opened content. Without
+        // this, the FIRST position-only host edit — which leaves this region's
+        // content unchanged — would still re-send a didChange (and, for a server that
+        // clears on didChange, flicker the diagnostics) because no fingerprint existed
+        // to compare against (#422).
+        self.document_tracker
+            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
+            .await;
         Ok(())
     }
 

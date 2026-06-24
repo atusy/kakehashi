@@ -219,6 +219,29 @@ fn e2e_position_only_edit_reanchors_pushed_diagnostic_without_a_repush() {
         "a position-only host edit must re-anchor the pushed diagnostic to its new host line without a re-push"
     );
 
+    // A SECOND position-only edit shifts the region to line 5. This proves the
+    // diagnostic *persisted* (was not cleared by the first edit): the content guard
+    // must keep the first edit's didChange from reaching the mock — otherwise the
+    // mock's empty-on-didChange push would have cleared the slot, `has_region_slots`
+    // would be false, and no re-anchor to line 5 would ever come.
+    let shifted_text_2 = format!("\n\n{MD_TEXT}");
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 3 },
+            "contentChanges": [{ "text": shifted_text_2 }]
+        }),
+    );
+    let reanchored_again = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(15),
+        pushed_diag_at_line(HOST_LINE + 2),
+    );
+    assert!(
+        reanchored_again.is_some(),
+        "the diagnostic must survive the first edit and re-anchor again — proving it was not cleared"
+    );
+
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
