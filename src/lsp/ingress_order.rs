@@ -21,11 +21,16 @@
 //!   `didClose` that then evicts it (close→reopen). The historical deadlock
 //!   rationale for leaving `didOpen` ungated — its handler awaiting
 //!   downstream spawn that itself waits on the client — no longer applies:
-//!   downstream spawn is fire-and-forget and every editor-facing await on the
-//!   open path is a one-way notification, so the handler never blocks on the
-//!   client. A slow auto-install still runs inside the handler and so holds
-//!   the writer ticket; moving that to a spawned task is a deferred liveness
-//!   follow-up (#480), not a correctness gap.
+//!   downstream spawn is fire-and-forget and the open path never *awaits* a
+//!   server→client request (its editor-facing awaits are one-way log/show
+//!   notifications, and the one awaited bridge call, `process_injections`,
+//!   only forwards a didChange on the edit path, not on open), so the handler
+//!   can never block on a client response. A slow auto-install still runs
+//!   inside the handler and so holds the writer ticket — bounded by the
+//!   install timeouts (multi-minute worst case, never infinite), so a heavy
+//!   one-time UI stall on first open of an uninstalled parser, not a wedge.
+//!   Moving that to a spawned task is a deferred liveness follow-up (#480),
+//!   not a correctness gap.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename requests, pull
 //!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
