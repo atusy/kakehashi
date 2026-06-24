@@ -44,7 +44,9 @@ use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
 
 use crate::error::LockResultExt;
-use crate::lsp::bridge::{RegionOffset, VirtualDocumentUri, translate_virtual_range_to_host};
+use crate::lsp::bridge::{
+    ProgressConnectionId, RegionOffset, VirtualDocumentUri, translate_virtual_range_to_host,
+};
 
 /// Which contributor a slot belongs to under a host document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -79,6 +81,13 @@ pub(crate) const PULL_LAYER_SERVER: &str = "<pull-layer>";
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SlotEntry {
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// The downstream connection that produced this slot, or `None` for the
+    /// synthetic pull-layer blob (not tied to one connection's lifetime). A server
+    /// restart mints a *new* connection id, so a later push from the restart
+    /// replaces this slot and re-tags it — letting crash eviction
+    /// ([`DiagnosticAggregator::evict_connection`]) drop only the dead connection's
+    /// slots, never a live restart's (#469).
+    pub(crate) connection_id: Option<ProgressConnectionId>,
 }
 
 /// `server name → slot`. Several servers can attach to one source.
@@ -239,11 +248,17 @@ impl DiagnosticAggregator {
     ///
     /// An empty `diagnostics` keeps an empty slot — the merge skips it, so the
     /// server's prior diagnostics are cleared without dropping the slot key.
+    ///
+    /// `connection_id` tags the slot with the downstream connection that produced
+    /// it (`None` for the synthetic pull-layer), so a later crash can evict only
+    /// that connection's slots (#469). A restart re-pushes with a new id, replacing
+    /// and re-tagging the slot.
     pub(crate) fn record(
         &self,
         host: &Url,
         source: DiagnosticSource,
         server: String,
+        connection_id: Option<ProgressConnectionId>,
         diagnostics: Vec<Diagnostic>,
     ) {
         let mut cache = self.lock();
@@ -254,19 +269,26 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
-        source_slots
-            .entry(source)
-            .or_default()
-            .insert(server, SlotEntry { diagnostics });
+        source_slots.entry(source).or_default().insert(
+            server,
+            SlotEntry {
+                diagnostics,
+                connection_id,
+            },
+        );
     }
 
     /// Replace the cached host-event pull blob for a host
     /// ([`DiagnosticSource::PullLayer`]). Equivalent to a single-server `record`.
+    ///
+    /// The pull-layer is a cross-connection aggregate, not a single connection's
+    /// push, so its slot is tagged `None` and is never touched by crash eviction.
     pub(crate) fn set_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.record(
             host,
             DiagnosticSource::PullLayer,
             PULL_LAYER_SERVER.to_string(),
+            None,
             diagnostics,
         );
     }
@@ -324,6 +346,31 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::republish_locks")
             .get(host)
             .map_or(0, Arc::strong_count)
+    }
+
+    /// Drop every push slot produced by `connection_id` — a downstream connection
+    /// whose reader exited (crash/respawn, #469) — returning the host URIs that
+    /// lost at least one slot, so the caller can re-merge and republish them. The
+    /// synthetic pull-layer (tagged `None`) is never touched, and a restart's
+    /// re-push lands under a *new* connection id, so its slots survive this sweep.
+    /// O(total slots); called only on the rare connection-exit path.
+    pub(crate) fn evict_connection(&self, connection_id: ProgressConnectionId) -> Vec<Url> {
+        let mut cache = self.lock();
+        let mut affected = Vec::new();
+        cache.retain(|host, sources| {
+            let mut host_changed = false;
+            sources.retain(|_source, servers| {
+                let before = servers.len();
+                servers.retain(|_server, slot| slot.connection_id != Some(connection_id));
+                host_changed |= servers.len() != before;
+                !servers.is_empty()
+            });
+            if host_changed {
+                affected.push(host.clone());
+            }
+            !sources.is_empty()
+        });
+        affected
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Url, SourceSlots>> {
@@ -563,6 +610,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("r1".into()),
             "luals".into(),
+            None,
             vec![diag_at("err", 0, 2)],
         );
         let mut offsets = HashMap::new();
@@ -599,6 +647,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("r1".into()),
             "luals".into(),
+            None,
             vec![d],
         );
         let mut offsets = HashMap::new();
@@ -634,6 +683,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("gone".into()),
             "luals".into(),
+            None,
             vec![diag("stale")],
         );
         // No offset for "gone" -> region is stale -> skipped.
@@ -648,6 +698,7 @@ mod tests {
             &host(),
             DiagnosticSource::Region("r1".into()),
             "luals".into(),
+            None,
             vec![diag_at("push", 0, 0)],
         );
         agg.set_pull_layer(&host(), vec![diag_at("pull", 9, 0)]);
@@ -668,12 +719,14 @@ mod tests {
             &host(),
             DiagnosticSource::Host,
             "lua_ls".into(),
+            None,
             vec![diag_at("hostA", 7, 3)],
         );
         agg.record(
             &host(),
             DiagnosticSource::Host,
             "selene".into(),
+            None,
             vec![diag_at("hostB", 8, 0)],
         );
         let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
@@ -705,7 +758,13 @@ mod tests {
     fn evict_source_drops_only_that_source() {
         let agg = DiagnosticAggregator::new();
         let region = DiagnosticSource::Region("R1".to_string());
-        agg.record(&host(), region.clone(), "srv".to_string(), vec![diag("r")]);
+        agg.record(
+            &host(),
+            region.clone(),
+            "srv".to_string(),
+            None,
+            vec![diag("r")],
+        );
         agg.set_pull_layer(&host(), vec![diag("p")]);
 
         assert!(agg.evict_source(&host(), &region));
@@ -725,7 +784,13 @@ mod tests {
     fn evict_source_removes_the_host_when_its_last_source_goes() {
         let agg = DiagnosticAggregator::new();
         let region = DiagnosticSource::Region("R1".to_string());
-        agg.record(&host(), region.clone(), "srv".to_string(), vec![diag("r")]);
+        agg.record(
+            &host(),
+            region.clone(),
+            "srv".to_string(),
+            None,
+            vec![diag("r")],
+        );
         assert!(agg.evict_source(&host(), &region));
         assert!(
             !agg.lock().contains_key(&host()),
@@ -734,6 +799,110 @@ mod tests {
         assert!(
             !agg.evict_source(&host(), &region),
             "evicting a source from an absent host is a no-op"
+        );
+    }
+
+    #[test]
+    fn evict_connection_drops_only_that_connections_slots() {
+        let agg = DiagnosticAggregator::new();
+        let conn_a = ProgressConnectionId::for_test(1);
+        let conn_b = ProgressConnectionId::for_test(2);
+        // conn_a pushed a region slot; conn_b a host slot; plus a pull-layer (None).
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(conn_a),
+            vec![diag("a")],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "selene".into(),
+            Some(conn_b),
+            vec![diag("b")],
+        );
+        agg.set_pull_layer(&host(), vec![diag("pull")]);
+
+        let affected = agg.evict_connection(conn_a);
+        assert_eq!(
+            affected,
+            vec![host()],
+            "the host that lost a slot is reported"
+        );
+        let snap = agg.snapshot(&host());
+        assert!(
+            !snap.contains_key(&DiagnosticSource::Region("r".into())),
+            "conn_a's region slot is evicted"
+        );
+        assert!(
+            snap.contains_key(&DiagnosticSource::Host),
+            "conn_b's host slot survives"
+        );
+        assert!(
+            snap.contains_key(&DiagnosticSource::PullLayer),
+            "the pull-layer (tagged None) is never touched by connection eviction"
+        );
+    }
+
+    #[test]
+    fn evict_connection_spares_a_restarts_replaced_slot() {
+        let agg = DiagnosticAggregator::new();
+        let dead = ProgressConnectionId::for_test(1);
+        let restart = ProgressConnectionId::for_test(2);
+        // The dead connection pushed, then a restart re-pushed for the *same*
+        // (host, source, server) — `record` replaced and re-tagged the slot.
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(dead),
+            vec![diag("old")],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(restart),
+            vec![diag("new")],
+        );
+
+        let affected = agg.evict_connection(dead);
+        assert!(
+            affected.is_empty(),
+            "nothing tagged with the dead id remains, so no host is republished"
+        );
+        let snap = agg.snapshot(&host());
+        let slot = &snap[&DiagnosticSource::Region("r".into())]["luals"];
+        assert_eq!(slot.connection_id, Some(restart));
+        assert_eq!(
+            slot.diagnostics[0].message, "new",
+            "the restart's slot is intact"
+        );
+    }
+
+    #[test]
+    fn evict_connection_removes_emptied_host_and_ignores_unknown() {
+        let agg = DiagnosticAggregator::new();
+        let conn = ProgressConnectionId::for_test(1);
+        agg.record(
+            &host(),
+            DiagnosticSource::Region("r".into()),
+            "luals".into(),
+            Some(conn),
+            vec![diag("x")],
+        );
+        // Unknown connection: no slot matches, so no host is affected.
+        assert!(
+            agg.evict_connection(ProgressConnectionId::for_test(99))
+                .is_empty(),
+            "evicting an unknown connection is a no-op"
+        );
+        // The real connection: its only slot goes, emptying and dropping the host.
+        assert_eq!(agg.evict_connection(conn), vec![host()]);
+        assert!(
+            !agg.lock().contains_key(&host()),
+            "the now-empty host entry is removed, not left present-but-empty"
         );
     }
 }

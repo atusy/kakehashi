@@ -865,15 +865,19 @@ async fn deliver_upstream_notification(
         UpstreamNotification::PublishDiagnostics {
             uri,
             server,
+            connection_id,
             diagnostics,
         } => {
             // Cache the downstream push and republish the merged host set
             // (push-propagation-diagnostic-forwarding). The publisher classifies the
             // URI (virtual → region, real → `_self` host layer); a `None` publisher
             // (test loop) drops it. (Pushes without a server name were already
-            // dropped at the reader, so `server` is always set here.)
+            // dropped at the reader, so `server` is always set here.) The
+            // `connection_id` tags the cached slot so a later crash can evict it (#469).
             if let Some(publisher) = diagnostic_publisher {
-                publisher.publish_push(uri, server, diagnostics).await;
+                publisher
+                    .publish_push(uri, server, connection_id, diagnostics)
+                    .await;
             }
         }
         UpstreamNotification::LogMessage { typ, message } => {
@@ -975,6 +979,15 @@ async fn deliver_upstream_notification(
                         )
                         .await;
                 }
+            }
+        }
+        UpstreamNotification::EvictConnectionDiagnostics { connection_id } => {
+            // A downstream connection's reader exited (crash/respawn): drop the
+            // diagnostic slots it produced and republish the affected hosts so a
+            // dead server's diagnostics don't linger until didClose (#469). A
+            // `None` publisher (test loop) has no cache to evict.
+            if let Some(publisher) = diagnostic_publisher {
+                publisher.evict_connection_diagnostics(connection_id).await;
             }
         }
     }

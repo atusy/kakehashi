@@ -77,6 +77,10 @@ pub(crate) enum UpstreamNotification {
         /// The originating downstream server's config name (`deps.server_name`);
         /// pushes without a name are dropped at the reader, so this is always set.
         server: String,
+        /// The originating connection's id (`deps.progress_connection_id`). Tags the
+        /// cached slot so a later reader exit can evict only this connection's slots,
+        /// never a restarted connection's (which gets a fresh id) (#469).
+        connection_id: crate::lsp::bridge::ProgressConnectionId,
         /// The pushed diagnostics, in the published document's own coordinates
         /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
@@ -117,6 +121,14 @@ pub(crate) enum UpstreamNotification {
     /// progress still in flight, so the loop's created-token set can't leak
     /// entries across crashes/respawns (window-work-done-progress bridging).
     ForgetWorkDoneProgress(Vec<tower_lsp_server::ls_types::NumberOrString>),
+    /// Evict the diagnostic-cache slots a now-exited connection produced and
+    /// republish the affected hosts — sent when a downstream connection's reader
+    /// exits (crash/respawn), so a dead server's pushed diagnostics don't linger
+    /// until the host's `didClose` (#469). A restart's slots carry a fresh
+    /// connection id and so survive.
+    EvictConnectionDiagnostics {
+        connection_id: crate::lsp::bridge::ProgressConnectionId,
+    },
 }
 
 /// A downstream-initiated **request** the bridge forwards to the editor and
@@ -265,6 +277,15 @@ impl Drop for ProgressPurgeGuard {
                 .upstream_tx
                 .send(UpstreamNotification::ForgetWorkDoneProgress(tokens));
         }
+        // Evict this connection's pushed diagnostics so a dead server's stale
+        // diagnostics don't linger until the host's `didClose` (#469). Sent
+        // unconditionally — the loop's eviction is a cheap no-op when the
+        // connection never pushed (no slots match its id).
+        let _ = self
+            .upstream_tx
+            .send(UpstreamNotification::EvictConnectionDiagnostics {
+                connection_id: self.connection_id,
+            });
     }
 }
 
@@ -2356,8 +2377,10 @@ mod tests {
             UpstreamNotification::PublishDiagnostics {
                 uri,
                 server,
+                connection_id,
                 diagnostics,
             } => {
+                assert_eq!(connection_id, deps.progress_connection_id);
                 assert!(uri.contains("kakehashi-virtual-uri-REGION"));
                 assert_eq!(server, "luals");
                 assert_eq!(diagnostics.len(), 1);
