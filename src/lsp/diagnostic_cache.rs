@@ -152,13 +152,15 @@ pub(crate) fn merge_cached_diagnostics(
     // Deterministic published order (#423): the cache walks `HashMap`-keyed sources
     // and servers, so without this the array order varies between republishes for a
     // multi-source/multi-server host. Order by host position (top-to-bottom — "order
-    // cross-region merge by region start position"), with message then source as
-    // stable tiebreaks. This is the `concatenated` strategy (every server's
-    // diagnostics are kept); the `preferred` election is deferred (it needs a
-    // per-source version baseline, which #422 left unbuilt). A `sort_by` is stable,
-    // so any fully-tied diagnostics keep their relative order.
+    // cross-region merge by region start position"), then by the other distinguishing
+    // fields (message, source, severity, code) so two genuinely-distinct diagnostics
+    // at the same span never fall back to HashMap order. This is the `concatenated`
+    // strategy (every server's diagnostics are kept); the `preferred` election is
+    // deferred (it needs a per-source version baseline, which #422 left unbuilt).
+    // Diagnostics that are equal on all these fields are indistinguishable, so the
+    // stable `sort_by` leaving their order untouched is immaterial.
     merged.sort_by(|a, b| {
-        let pos = |d: &Diagnostic| {
+        let key = |d: &Diagnostic| {
             (
                 d.range.start.line,
                 d.range.start.character,
@@ -166,10 +168,14 @@ pub(crate) fn merge_cached_diagnostics(
                 d.range.end.character,
             )
         };
-        pos(a)
-            .cmp(&pos(b))
+        key(a)
+            .cmp(&key(b))
             .then_with(|| a.message.cmp(&b.message))
             .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.severity.cmp(&b.severity))
+            // `code` (Option<NumberOrString>) is not `Ord`; compare its debug form so
+            // a differing code still yields a deterministic order (rare last resort).
+            .then_with(|| format!("{:?}", a.code).cmp(&format!("{:?}", b.code)))
     });
     merged
 }
@@ -934,6 +940,42 @@ mod tests {
             lines,
             vec![2, 5, 9],
             "diagnostics are ordered top-to-bottom by host position, deterministically"
+        );
+    }
+
+    #[test]
+    fn merge_breaks_ties_by_severity_when_position_and_message_match() {
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
+        let agg = DiagnosticAggregator::new();
+        // Same position+message+source, differing only in severity — must still order
+        // deterministically (ERROR=1 before WARNING=2), not by HashMap iteration.
+        let mut warn = diag_at("dup", 3, 0);
+        warn.severity = Some(DiagnosticSeverity::WARNING);
+        let mut err = diag_at("dup", 3, 0);
+        err.severity = Some(DiagnosticSeverity::ERROR);
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv_w".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![warn],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv_e".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![err],
+        );
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let sevs: Vec<_> = merged.iter().map(|d| d.severity).collect();
+        assert_eq!(
+            sevs,
+            vec![
+                Some(DiagnosticSeverity::ERROR),
+                Some(DiagnosticSeverity::WARNING)
+            ],
+            "a severity tie-break gives same-span/message diagnostics a deterministic order"
         );
     }
 
