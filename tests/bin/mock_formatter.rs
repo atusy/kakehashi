@@ -44,6 +44,11 @@
 //!   that echoes the requested URI, but only for documents it received via
 //!   `didOpen`. Used to prove cross-layer diagnostic aggregation merges the
 //!   host layer in (cross-layer-aggregation).
+//! - `diagnostics-push` — spontaneously **pushes** `textDocument/publishDiagnostics`
+//!   on `didOpen` (one diagnostic on virtual line 0, no pull) and an empty list on
+//!   `didChange`. Used by `tests/e2e_push_diagnostics.rs` to prove a downstream's
+//!   spontaneous push reaches the editor in host coordinates and that an empty push
+//!   clears it (#427).
 //! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
