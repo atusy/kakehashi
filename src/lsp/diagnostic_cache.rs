@@ -36,7 +36,7 @@
 //! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
@@ -160,13 +160,16 @@ fn transform_region_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, hos
 #[derive(Default)]
 pub(crate) struct DiagnosticAggregator {
     cache: Mutex<HashMap<Url, SourceSlots>>,
-    /// Serializes the publisher's snapshot→merge→publish so two concurrent
-    /// republishes (a region push vs a host-event pull, on different tasks)
-    /// cannot interleave and emit out of order — which would let a stale snapshot
-    /// publish *after* a fresh one and permanently hide diagnostics on a quiescent
-    /// file. Global (not per-host) for simplicity; republishes are per diagnostic
-    /// event, not hot. A per-host lock is a possible follow-up.
-    republish_lock: tokio::sync::Mutex<()>,
+    /// Per-host republish locks. The publisher holds a host's lock across its
+    /// snapshot→merge→publish so two concurrent republishes for the **same** host
+    /// (a region push vs a host-event pull, on different tasks) cannot interleave
+    /// and emit out of order — which would let a stale snapshot publish *after* a
+    /// fresh one and permanently hide diagnostics on a quiescent file. Keying the
+    /// lock by host means a slow editor publish for one host no longer stalls
+    /// *every* host's republish, only that host's (#426). The outer `Mutex` is held
+    /// only briefly to fetch/insert the per-host lock; the per-host
+    /// `tokio::sync::Mutex` is the one held across the publish await.
+    republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DiagnosticAggregator {
@@ -174,10 +177,24 @@ impl DiagnosticAggregator {
         Self::default()
     }
 
-    /// Acquire the global republish lock; held by the publisher across
-    /// snapshot→merge→publish so emissions stay ordered (see field docs).
-    pub(crate) async fn lock_republish(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.republish_lock.lock().await
+    /// Acquire the republish lock for `host`; held by the publisher across
+    /// snapshot→merge→publish so emissions for that host stay ordered (see field
+    /// docs). Different hosts hold different locks and so never block each other.
+    pub(crate) async fn lock_republish(&self, host: &Url) -> tokio::sync::OwnedMutexGuard<()> {
+        // Brief outer lock to fetch-or-create this host's lock, then await it.
+        // Clone the `Url` key only when inserting a new entry — the steady state
+        // (lock already present) avoids the allocation on this per-republish path.
+        let lock = {
+            let mut locks = self
+                .republish_locks
+                .lock()
+                .recover_poison("DiagnosticAggregator::republish_locks");
+            match locks.get(host) {
+                Some(lock) => Arc::clone(lock),
+                None => Arc::clone(locks.entry(host.clone()).or_default()),
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Record (replacing) one server's diagnostics for a `(host, source)`.
@@ -254,6 +271,31 @@ mod tests {
 
     fn host() -> Url {
         Url::parse("file:///doc.md").unwrap()
+    }
+
+    #[tokio::test]
+    async fn per_host_republish_locks_are_independent_but_serialize_same_host() {
+        use std::time::Duration;
+        let agg = DiagnosticAggregator::new();
+        let a = Url::parse("file:///a.md").unwrap();
+        let b = Url::parse("file:///b.md").unwrap();
+
+        // Hold host A's republish lock.
+        let _guard_a = agg.lock_republish(&a).await;
+
+        // A different host's lock must acquire without blocking on A's (#426) — if
+        // it serialized globally, this would hang and the timeout would fire.
+        let _guard_b = tokio::time::timeout(Duration::from_secs(1), agg.lock_republish(&b))
+            .await
+            .expect("a different host's republish lock must not block on host A's");
+
+        // The SAME host's lock must serialize: a second acquire blocks while A's
+        // guard is held.
+        let same = tokio::time::timeout(Duration::from_millis(100), agg.lock_republish(&a)).await;
+        assert!(
+            same.is_err(),
+            "the same host's republish lock must serialize (preserving per-host order)"
+        );
     }
 
     fn messages(slots: &ServerSlots) -> Vec<String> {
