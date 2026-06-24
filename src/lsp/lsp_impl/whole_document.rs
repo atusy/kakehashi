@@ -13,14 +13,18 @@
 
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::Uri;
+use tower_lsp_server::ls_types::{NumberOrString, Uri};
 
 use crate::language::InjectionResolver;
-use crate::lsp::aggregation::server::{FanInResult, FanOutTask, dispatch_preferred};
+use crate::lsp::aggregation::server::{
+    FanInResult, FanOutTask, dispatch_preferred, dispatch_preferred_with_tokens,
+    mint_region_progress_source,
+};
+use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
 
 use super::bridge_context::{DocumentRequestContext, parse_host_verbatim};
 use super::{Kakehashi, uri_to_url};
@@ -33,11 +37,17 @@ impl Kakehashi {
     /// is safe for any item kind). Returns `None` when the document has no
     /// injection regions, no configured servers, or every region came back
     /// empty — mirroring the per-method handlers this was extracted from.
+    ///
+    /// `client_progress_token` is the editor's `workDoneToken`, if any: when
+    /// `Some`, one shared aggregator relays the first region to begin as a single
+    /// `Begin → … → End` on that token (ls-bridge-client-progress); `None` (the
+    /// fast methods that don't advertise `workDoneProgress`) keeps prior behavior.
     pub(super) async fn whole_document_preferred_fan_out<T, F, Fut>(
         &self,
         lsp_uri: &Uri,
         method_name: &'static str,
         raw_params: serde_json::Value,
+        client_progress_token: Option<NumberOrString>,
         send: F,
     ) -> Result<Option<Vec<T>>>
     where
@@ -121,6 +131,20 @@ impl Kakehashi {
             // Outer JoinSet: one task per injection region, all in parallel
             let mut outer_join_set: JoinSet<Option<Vec<T>>> = JoinSet::new();
 
+            // Shared client progress across all regions: one aggregator + one
+            // teardown guard for the whole request. The winner rule shows the first
+            // region to begin as one coherent Begin → … → End on the editor's token
+            // (ls-bridge-client-progress, #455). `None` (no advertised token) keeps
+            // the prior behavior — used by the fast helper methods that don't
+            // advertise `workDoneProgress`.
+            let shared_cp = client_progress_token.map(|client_token| {
+                (
+                    Arc::new(Mutex::new(ClientProgressAggregator::new(client_token))),
+                    Arc::clone(pool.client_progress_registry()),
+                )
+            });
+            let mut cp_minted: Vec<NumberOrString> = Vec::new();
+
             for resolved in all_regions {
                 // Get ALL bridge server configs for this injection language
                 let configs = self.bridge_configs_for_injection_language(
@@ -146,24 +170,56 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+                // Mint this region's tracked-source token into the shared
+                // aggregator (no-op when there's no client token).
+                let region_cp_tokens = shared_cp.as_ref().and_then(|(aggregator, registry)| {
+                    mint_region_progress_source(&region_ctx, registry, aggregator)
+                });
+                if let Some(map) = &region_cp_tokens {
+                    cp_minted.extend(map.values().cloned());
+                }
+
                 let pool = Arc::clone(&pool);
                 let send = send.clone();
 
                 outer_join_set.spawn(async move {
-                    let result = dispatch_preferred(
-                        &region_ctx,
-                        pool.clone(),
-                        send,
-                        |opt| matches!(opt, Some(v) if !v.is_empty()),
-                        None,
-                    )
-                    .await;
+                    let is_nonempty =
+                        |opt: &Option<Vec<T>>| matches!(opt, Some(v) if !v.is_empty());
+                    let result = match region_cp_tokens {
+                        Some(tokens) => {
+                            dispatch_preferred_with_tokens(
+                                &region_ctx,
+                                pool.clone(),
+                                send,
+                                is_nonempty,
+                                None,
+                                tokens,
+                            )
+                            .await
+                        }
+                        None => {
+                            dispatch_preferred(&region_ctx, pool.clone(), send, is_nonempty, None)
+                                .await
+                        }
+                    };
                     match result {
                         FanInResult::Done(items) => items,
                         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
                     }
                 });
             }
+
+            // One teardown guard for the whole request, held across the region
+            // collection so the synthetic terminal End fires once, after every
+            // region settles (or on cancel).
+            let _cp_guard = shared_cp.map(|(aggregator, registry)| {
+                ClientProgressDeregisterGuard::new(
+                    registry,
+                    cp_minted,
+                    aggregator,
+                    pool.upstream_tx(),
+                )
+            });
 
             // Collect results, aborting early if $/cancelRequest arrives.
             let all_items = crate::lsp::aggregation::region::collect_region_results_with_cancel(

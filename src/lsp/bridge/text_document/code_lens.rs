@@ -25,14 +25,14 @@ use std::sync::Arc;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tower_lsp_server::ls_types::CodeLens;
+use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_whole_document_request, response_has_jsonrpc_error, translate_host_range_to_virtual,
-    translate_virtual_range_to_host,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
+    build_whole_document_request_with_progress, response_has_jsonrpc_error,
+    translate_host_range_to_virtual, translate_virtual_range_to_host,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::settings::{BridgeServerConfig, WorkspaceSettings};
@@ -132,6 +132,7 @@ impl LanguageServerPool {
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<NumberOrString>,
     ) -> io::Result<Option<Vec<CodeLens>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -148,7 +149,9 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
-            build_code_lens_request,
+            |virtual_uri, request_id| {
+                build_code_lens_request(virtual_uri, request_id, client_progress_token)
+            },
             |response, ctx| {
                 let envelope_ctx = CodeLensEnvelopeContext {
                     server_name,
@@ -329,8 +332,14 @@ impl LanguageServerPool {
 fn build_code_lens_request(
     virtual_uri: &VirtualDocumentUri,
     request_id: RequestId,
-) -> JsonRpcRequest<DocumentParams> {
-    build_whole_document_request(virtual_uri, request_id, "textDocument/codeLens")
+    client_progress_token: Option<NumberOrString>,
+) -> JsonRpcRequest<WholeDocumentRequestParams> {
+    build_whole_document_request_with_progress(
+        virtual_uri,
+        request_id,
+        "textDocument/codeLens",
+        client_progress_token,
+    )
 }
 
 /// Build a JSON-RPC `codeLens/resolve` request.
@@ -411,15 +420,38 @@ mod tests {
     #[test]
     fn code_lens_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_code_lens_request(&virtual_uri, RequestId::new(42));
+        let request = build_code_lens_request(&virtual_uri, RequestId::new(42), None);
 
         assert_uses_virtual_uri(&request, "lua");
     }
 
     #[test]
+    fn code_lens_request_carries_work_done_token_only_when_present() {
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+
+        let with = build_code_lens_request(
+            &virtual_uri,
+            RequestId::new(1),
+            Some(NumberOrString::String("cprog-1".to_string())),
+        );
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["params"]["workDoneToken"],
+            "cprog-1"
+        );
+
+        let without = build_code_lens_request(&virtual_uri, RequestId::new(1), None);
+        assert!(
+            serde_json::to_value(&without).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "None omits the token"
+        );
+    }
+
+    #[test]
     fn code_lens_request_has_correct_method_and_no_position() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_code_lens_request(&virtual_uri, RequestId::new(123));
+        let request = build_code_lens_request(&virtual_uri, RequestId::new(123), None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
