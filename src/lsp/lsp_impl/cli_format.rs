@@ -207,18 +207,17 @@ impl Kakehashi {
     /// for this document have finished.
     ///
     /// An eager-open task claims each region's virtual document BEFORE its
-    /// `didOpen` reaches the writer queue, so a formatting request issued in
-    /// that window skips its own `didOpen` (already claimed) and overtakes
-    /// the eager one on the wire — the downstream server then sees an
-    /// unknown URI and answers `null`, which the preferred fan-in accepts as
-    /// authoritative "no edits". Editors retry past this cold-start race; a
-    /// one-shot CLI run must instead wait the tasks out: once finished,
-    /// every `didOpen` is enqueued and the single-writer FIFO keeps the
-    /// formatting request behind them.
+    /// `didOpen` reaches the writer queue, so a request issued in that window
+    /// skips its own `didOpen` (already claimed) and overtakes the eager one
+    /// on the wire — the downstream server then sees an unknown URI and
+    /// answers `null`, which the preferred fan-in accepts as authoritative
+    /// (e.g. "no edits" for formatting, "no diagnostics" for diagnose).
+    /// Editors retry past this cold-start race; a one-shot CLI run must
+    /// instead wait the tasks out: once finished, every `didOpen` is enqueued
+    /// and the single-writer FIFO keeps the request behind them.
     ///
     /// Returns `false` when the deadline expired with tasks still pending —
-    /// the caller reports that as a failure rather than formatting into the
-    /// race.
+    /// the caller reports that as a failure rather than issuing into the race.
     pub(crate) async fn wait_eager_open_finished(&self, uri: &Url, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         while !self.bridge.eager_open_tasks_finished(uri) {
@@ -226,7 +225,7 @@ impl Kakehashi {
                 log::warn!(
                     target: "kakehashi::cli",
                     "eager-open tasks for {uri} did not finish within {timeout:?}; \
-                     formatting may race their didOpen"
+                     the request may race their didOpen"
                 );
                 return false;
             }
