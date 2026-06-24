@@ -284,6 +284,31 @@ mod tests {
     }
 
     #[test]
+    fn formatting_request_carries_work_done_token_only_when_present() {
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+
+        let with = build_formatting_request(
+            &virtual_uri,
+            default_options(),
+            test_request_id(),
+            Some(NumberOrString::String("cprog-1".to_string())),
+        );
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["params"]["workDoneToken"],
+            "cprog-1"
+        );
+
+        let without =
+            build_formatting_request(&virtual_uri, default_options(), test_request_id(), None);
+        assert!(
+            serde_json::to_value(&without).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "None omits the token"
+        );
+    }
+
+    #[test]
     fn formatting_request_has_correct_method_and_no_position() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
         let request =

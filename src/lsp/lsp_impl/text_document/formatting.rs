@@ -730,8 +730,8 @@ async fn dispatch_preferred_formatting(
                         &t.virtual_content,
                         options,
                         t.upstream_id,
-                        // Full-formatting client progress is out of scope for #459
-                        // (range formatting only); pass no token here.
+                        // Full-formatting client progress is out of scope here
+                        // (this PR wires rangeFormatting); tracked in #459.
                         None,
                         None,
                     )
@@ -1078,8 +1078,9 @@ async fn dispatch_concatenated_formatting(
                             &current_text,
                             options,
                             upstream_id,
-                            // OnTypeFormatting pipeline: no client progress here
-                            // (#459 covers rangeFormatting's region fan-out only).
+                            // Concatenated formatting pipeline (serial over scratch
+                            // docs): no client progress here — concatenated progress
+                            // is deferred (#440). Pass no token.
                             None,
                             Some(&step_downstream_id),
                         )
@@ -1104,8 +1105,9 @@ async fn dispatch_concatenated_formatting(
                                     whole_region,
                                     options,
                                     upstream_id,
-                                    // OnTypeFormatting pipeline: no client progress
-                                    // here (#459 covers rangeFormatting only).
+                                    // Concatenated formatting pipeline (serial over
+                                    // scratch docs): no client progress here —
+                                    // concatenated progress is deferred (#440).
                                     None,
                                     Some(&step_downstream_id),
                                 )
