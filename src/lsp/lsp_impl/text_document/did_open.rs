@@ -475,4 +475,40 @@ print("hello")
         .await
         .expect("debounce fire should re-sync the host document to the _self server");
     }
+
+    /// Locks the load-bearing property behind #431: `prepare_diagnostic_snapshot`
+    /// builds the host context for a `_self`-bridged doc WITHOUT gating on the
+    /// server advertising `diagnosticProvider`. A push-only `rust_ls` (no
+    /// diagnosticProvider, like marksman) is therefore in `snapshot.host.configs`,
+    /// so the debounce-fire re-sync reaches it. If the snapshot were
+    /// capability-gated, the whole on-edit re-sync would be a no-op for exactly the
+    /// push-only servers it exists to serve.
+    #[tokio::test]
+    async fn prepare_diagnostic_snapshot_includes_push_only_host_server() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/host_snapshot.rs").unwrap();
+        let text = "fn main() {}".to_string();
+        server
+            .documents
+            .insert(uri.clone(), text.clone(), Some("rust".to_string()), None);
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), text, Some("rust"), vec![])
+            .await;
+
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .expect("a parsed _self-bridged doc yields a diagnostic snapshot");
+        let host = snapshot.host.expect(
+            "host context is built for a _self-bridged doc, not gated on diagnosticProvider",
+        );
+        assert!(
+            host.configs.iter().any(|c| c.server_name == "rust_ls"),
+            "the push-only rust_ls must be in the host context so the debounce re-sync reaches it"
+        );
+    }
 }
