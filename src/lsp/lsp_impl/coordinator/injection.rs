@@ -64,18 +64,20 @@ impl InjectionCoordinator {
         self.cache
             .remove_injection_tokens_for_ulids(host_uri, invalidated_ulids);
 
-        // Evict each invalidated region's diagnostic slots from the cache (#424).
-        // The merge already *skips* a region with no current offset, so the editor
-        // never sees stale diagnostics, but the slot would otherwise linger until
-        // the whole host is closed — this reclaims it on the edit that orphaned it.
+        self.bridge
+            .close_invalidated_docs(host_uri, invalidated_ulids)
+            .await;
+
+        // Evict each invalidated region's diagnostic slots from the cache (#424) —
+        // AFTER `close_invalidated_docs` removed the virtual-doc tracking, so a
+        // racing queued push can no longer resolve the orphaned region's URI and
+        // recreate the slot we just evicted. The merge already *skips* a region with
+        // no current offset, so the editor never sees stale diagnostics; this
+        // reclaims the lingering slot on the edit that orphaned it.
         for ulid in invalidated_ulids {
             self.diagnostics
                 .evict_source(host_uri, &DiagnosticSource::Region(ulid.to_string()));
         }
-
-        self.bridge
-            .close_invalidated_docs(host_uri, invalidated_ulids)
-            .await;
     }
 
     /// Resolve all injection regions for a document, with stable region IDs from
