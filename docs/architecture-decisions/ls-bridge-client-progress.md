@@ -234,8 +234,36 @@ bridge composes the terminal rather than relaying a downstream's `End`.
 
 ## Decision–Implementation Gap
 
-Not yet implemented (tracked in issue #414); today both client-provided tokens
-are stripped before fan-out. Specific points to settle during implementation:
+**Implemented** (issue #414): the `workDoneToken` path for the **N = 1** relay
+and the **`preferred`** strategy with a **single fixed anchor** — the dispatch
+mints a per-server bridge token only for the tracked source (sole server at
+N = 1, highest-priority *named* anchor at N > 1; a wildcard `Rest` group that
+outranks the candidate yields no anchor), routes that downstream's `$/progress`
+onto the editor's token, and guarantees a terminal `End` on teardown. Wired for
+`textDocument/references`; the goto family and the `workDoneProgress` capability
+advertisement (without which spec-compliant clients never send a token) are in
+flight under #437 / #445.
+
+**Deferred** (still stripped or unhandled; tracked):
+
+- **`partialResultToken`** is still stripped — only `workDoneToken` is bridged so
+  far (the intermediate phase this section already anticipated). #439.
+- **`concatenated`** client progress is not built; a concatenated request shows
+  no client progress (cost/benefit go/no-go pending). #440.
+- **Dynamic fall-through re-anchoring** is not built: the single fixed anchor's
+  open `Begin` is closed by the synthetic terminal `End` rather than handed to the
+  next named anchor's real `End`. #438.
+- **Method coverage** beyond references/goto — notably the whole-document,
+  multi-region methods (`documentSymbol`, …), which fan out to several regions per
+  request and so need a request-level shared aggregator, not the per-dispatch one.
+  #437.
+- **Host-layer** client progress: the host path still strips the token. #441.
+
+The remaining notes below are design-tuning points; the empty-vs-non-empty
+fall-through threshold and the `Rest`-never-anchor rule are now **decided** as
+described above.
+
+Specific points to settle during the remaining implementation:
 
 - The empty-vs-non-empty threshold that triggers fall-through must
   **match the existing preferred-strategy empty-result behavior** — a uniform

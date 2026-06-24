@@ -104,7 +104,10 @@ ls-bridge-client-progress relies on for client-provided tokens.
 
 ## Decision–Implementation Gap
 
-Not yet implemented (tracked in issue #413). Today the reader-exit path purges
-the registry mappings and forgets the loop admissions but forwards no terminating
-`End`, so an editor still sees a dangling indicator when a downstream dies
-mid-progress. This record captures the agreed fix ahead of the change.
+**Implemented** (issue #413). On `ForgetWorkDoneProgress` the forwarding loop now
+synthesizes a terminating `$/progress` `End` for every begun-not-ended
+server-declared token, so a downstream that dies mid-progress no longer leaves a
+dangling indicator. A token created but never begun gets no `End`; a token that
+already ended is not ended again (the real `End` and the forget share the FIFO
+upstream channel, so the loop's begun-not-ended set is cleared before any later
+forget).
