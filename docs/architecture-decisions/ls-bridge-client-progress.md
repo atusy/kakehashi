@@ -29,11 +29,11 @@ The host raw-request path strips them (`strip_progress_tokens`,
 builders constructed fresh params with default (empty) progress fields, so no
 token was carried either way. (The host path still strips, and
 `partialResultToken` is still dropped; wired methods now carry a bridge-minted
-`workDoneToken` — see the Decision–Implementation Gap.) A downstream honoring
-them would stream into the
-void, since the bridge discards downstream notifications, and could legally
-return an empty final result. The cost is that client-requested progress never
-reaches the editor.
+`workDoneToken` — see the Decision–Implementation Gap.) A downstream honoring a
+stripped token would stream into the void, since the bridge discards downstream
+notifications, and could legally return an empty final result — so client-requested
+progress did not reach the editor. (It now does on the wired paths; this motivated
+the decision below.)
 
 ## Decision
 
