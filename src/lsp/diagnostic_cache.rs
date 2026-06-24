@@ -172,9 +172,9 @@ pub(crate) struct DiagnosticAggregator {
     /// only briefly to fetch/insert the per-host lock; the per-host
     /// `tokio::sync::Mutex` is the one held across the publish await.
     ///
-    /// The map holds the `Arc` itself, so a host's lock is allocated once and
-    /// reused across its republishes (a quiet file's sequential republishes never
-    /// reallocate it). It is reclaimed off the hot path by
+    /// The map holds the `Arc` itself, so a host's lock is reused across its
+    /// republishes (a quiet file's sequential republishes do not reallocate it
+    /// between reclamation sweeps). It is reclaimed off the hot path by
     /// [`Self::reclaim_republish_locks`] (#466), which removes only entries the map
     /// *solely* owns (`Arc::strong_count == 1`): a live holder's `OwnedMutexGuard`
     /// or a queued waiter's pending `lock_owned()` future each keeps an extra
@@ -195,8 +195,7 @@ impl DiagnosticAggregator {
     pub(crate) async fn lock_republish(&self, host: &Url) -> tokio::sync::OwnedMutexGuard<()> {
         // Brief outer lock to fetch-or-create this host's lock, then await it.
         // Clone the `Url` key only when inserting a new entry — the steady state
-        // (a live weak that still upgrades) avoids both the allocation and the
-        // key clone on this per-republish path.
+        // (lock already present) avoids the allocation on this per-republish path.
         let lock = {
             let mut locks = self
                 .republish_locks
