@@ -5,6 +5,7 @@
 //!
 //! The structure mirrors `lsp_impl/text_document/` for consistency.
 
+mod code_action;
 mod code_lens;
 #[cfg(feature = "experimental")]
 mod color_presentation;

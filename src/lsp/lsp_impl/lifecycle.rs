@@ -7,18 +7,18 @@ use tower_lsp_server::jsonrpc::Result;
 #[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
-    DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
-    DocumentLinkOptions, DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions,
-    DocumentSymbolOptions, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHintOptions, InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf,
-    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
-    WorkDoneProgressOptions,
+    CodeActionProviderCapability, CodeLensOptions, CompletionOptions, DeclarationCapability,
+    DeclarationOptions, DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    DocumentFormattingOptions, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
+    DocumentRangeFormattingOptions, DocumentSymbolOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
 };
 use url::Url;
 
@@ -305,6 +305,11 @@ impl Kakehashi {
                     },
                 })),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                // codeAction bridges the injection region under range.start to the
+                // downstream server (#352). First increment: single-region, empty
+                // request diagnostics, changes-only WorkspaceEdit; codeAction/resolve
+                // and documentChanges translation are follow-ups.
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 // codeLens/resolve is routed to the origin downstream server
                 // via the envelope in lens.data (#355, see
                 // bridge/text_document/code_lens.rs).
