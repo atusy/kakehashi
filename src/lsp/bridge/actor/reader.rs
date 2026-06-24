@@ -1317,7 +1317,7 @@ mod tests {
 
         let router = Arc::new(ResponseRouter::new());
         let (response_tx, _response_rx) = mpsc::channel(16);
-        let (upstream_tx, _upstream_rx) = mpsc::unbounded_channel();
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
         let (window_tx, _window_rx) = mpsc::channel(16);
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let conn = progress_registry.new_connection_id();
@@ -1362,6 +1362,24 @@ mod tests {
             "reader exit must purge the connection's progress mappings"
         );
         assert_eq!(progress_registry.translate(conn, &downstream_token), None);
+
+        // The same guard also asks the forwarding loop to evict this connection's
+        // diagnostic slots, so a dead server's diagnostics don't linger (#469).
+        let mut saw_eviction = false;
+        while let Ok(notification) = upstream_rx.try_recv() {
+            if let UpstreamNotification::EvictConnectionDiagnostics { connection_id } = notification
+            {
+                assert_eq!(
+                    connection_id, conn,
+                    "eviction must target the exited connection"
+                );
+                saw_eviction = true;
+            }
+        }
+        assert!(
+            saw_eviction,
+            "reader exit must emit EvictConnectionDiagnostics for its connection"
+        );
     }
 
     #[tokio::test]

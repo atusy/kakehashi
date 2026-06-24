@@ -78,7 +78,10 @@ pub(crate) const PULL_LAYER_SERVER: &str = "<pull-layer>";
 /// within-server "latest wins" rule). An empty `diagnostics` is a kept-but-empty
 /// slot: it contributes nothing to the merge but still exists, so a server going
 /// from errors to clean clears only its own contribution.
-#[derive(Debug, Clone, Default)]
+// No `Default`: a `SlotEntry` is only ever built by `record` with an explicit
+// `connection_id` tag, and a defaulted (untagged) slot would silently break crash
+// eviction (#469), so the derive is deliberately omitted.
+#[derive(Debug, Clone)]
 pub(crate) struct SlotEntry {
     pub(crate) diagnostics: Vec<Diagnostic>,
     /// The downstream connection that produced this slot, or `None` for the
@@ -354,6 +357,11 @@ impl DiagnosticAggregator {
     /// synthetic pull-layer (tagged `None`) is never touched, and a restart's
     /// re-push lands under a *new* connection id, so its slots survive this sweep.
     /// O(total slots); called only on the rare connection-exit path.
+    ///
+    /// This evicts only **pushed** slots. A pull-driven server that dies leaves its
+    /// contribution in the cross-connection `PullLayer` blob until the next
+    /// host-event pull recomputes it — an intentional asymmetry (#469 targets the
+    /// push path; the pull layer self-refreshes on the next pull).
     pub(crate) fn evict_connection(&self, connection_id: ProgressConnectionId) -> Vec<Url> {
         let mut cache = self.lock();
         let mut affected = Vec::new();
@@ -879,6 +887,41 @@ mod tests {
             slot.diagnostics[0].message, "new",
             "the restart's slot is intact"
         );
+    }
+
+    #[test]
+    fn evict_connection_then_restart_repush_repopulates() {
+        // The reverse ordering: the dead connection is evicted *before* the restart
+        // re-pushes (evict-before-repush). The slot is cleared, then the restart's
+        // push under a new id re-adds it — no slot is ever wrongly retained or lost.
+        let agg = DiagnosticAggregator::new();
+        let dead = ProgressConnectionId::for_test(1);
+        let restart = ProgressConnectionId::for_test(2);
+        let region = DiagnosticSource::Region("r".into());
+        agg.record(
+            &host(),
+            region.clone(),
+            "luals".into(),
+            Some(dead),
+            vec![diag("old")],
+        );
+
+        assert_eq!(agg.evict_connection(dead), vec![host()]);
+        assert!(agg.snapshot(&host()).is_empty(), "the dead slot is cleared");
+
+        agg.record(
+            &host(),
+            region.clone(),
+            "luals".into(),
+            Some(restart),
+            vec![diag("new")],
+        );
+        let snap = agg.snapshot(&host());
+        let slot = &snap[&region]["luals"];
+        assert_eq!(slot.connection_id, Some(restart));
+        assert_eq!(slot.diagnostics[0].message, "new");
+        // A late eviction for the already-dead id now finds nothing.
+        assert!(agg.evict_connection(dead).is_empty());
     }
 
     #[test]
