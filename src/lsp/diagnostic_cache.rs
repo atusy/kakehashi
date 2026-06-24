@@ -149,6 +149,28 @@ pub(crate) fn merge_cached_diagnostics(
             }
         }
     }
+    // Deterministic published order (#423): the cache walks `HashMap`-keyed sources
+    // and servers, so without this the array order varies between republishes for a
+    // multi-source/multi-server host. Order by host position (top-to-bottom — "order
+    // cross-region merge by region start position"), with message then source as
+    // stable tiebreaks. This is the `concatenated` strategy (every server's
+    // diagnostics are kept); the `preferred` election is deferred (it needs a
+    // per-source version baseline, which #422 left unbuilt). A `sort_by` is stable,
+    // so any fully-tied diagnostics keep their relative order.
+    merged.sort_by(|a, b| {
+        let pos = |d: &Diagnostic| {
+            (
+                d.range.start.line,
+                d.range.start.character,
+                d.range.end.line,
+                d.range.end.character,
+            )
+        };
+        pos(a)
+            .cmp(&pos(b))
+            .then_with(|| a.message.cmp(&b.message))
+            .then_with(|| a.source.cmp(&b.source))
+    });
     merged
 }
 
@@ -877,6 +899,70 @@ mod tests {
             ],
             "host push slots pass through in host coordinates, per server"
         );
+    }
+
+    #[test]
+    fn merge_orders_diagnostics_top_to_bottom_by_position() {
+        let agg = DiagnosticAggregator::new();
+        // Record three host-source servers out of position order; the merge must
+        // emit them deterministically top-to-bottom regardless of insertion/HashMap
+        // order (#423).
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "c_srv".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag_at("line9", 9, 0)],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "a_srv".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag_at("line2", 2, 0)],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "b_srv".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag_at("line5", 5, 0)],
+        );
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let lines: Vec<u32> = merged.iter().map(|d| d.range.start.line).collect();
+        assert_eq!(
+            lines,
+            vec![2, 5, 9],
+            "diagnostics are ordered top-to-bottom by host position, deterministically"
+        );
+    }
+
+    #[test]
+    fn merge_breaks_position_ties_by_message_then_source() {
+        let agg = DiagnosticAggregator::new();
+        // Two diagnostics at the SAME position but different messages → ordered by
+        // message, deterministically (not by HashMap iteration).
+        let mut d_zebra = diag_at("zebra", 3, 0);
+        d_zebra.source = Some("s1".into());
+        let mut d_apple = diag_at("apple", 3, 0);
+        d_apple.source = Some("s2".into());
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv1".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![d_zebra],
+        );
+        agg.record(
+            &host(),
+            DiagnosticSource::Host,
+            "srv2".into(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![d_apple],
+        );
+        let merged = merge_cached_diagnostics(&host(), agg.snapshot(&host()), &HashMap::new());
+        let msgs: Vec<&str> = merged.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(msgs, vec!["apple", "zebra"], "ties break by message");
     }
 
     #[test]
