@@ -37,7 +37,9 @@ expression: capabilities
     "workDoneProgress": true
   },
   "documentHighlightProvider": true,
-  "documentSymbolProvider": true,
+  "documentSymbolProvider": {
+    "workDoneProgress": true
+  },
   "codeLensProvider": {
     "resolveProvider": true
   },
