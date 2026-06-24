@@ -651,12 +651,12 @@ mod tests {
                 let release = self.release.take().expect("one stalled call expected");
                 Box::pin(async move {
                     let _ = release.await;
-                    log.lock().unwrap().push(label);
+                    log.lock().recover_poison("MockInner::call").push(label);
                     Ok(None)
                 })
             } else {
                 Box::pin(async move {
-                    log.lock().unwrap().push(label);
+                    log.lock().recover_poison("MockInner::call").push(label);
                     Ok(None)
                 })
             }
@@ -691,7 +691,10 @@ mod tests {
         assert!(reader.is_woken(), "writer completion must wake the reader");
         assert!(reader.poll().is_ready());
 
-        assert_eq!(*log.lock().unwrap(), vec!["change", "reader"]);
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
     }
 
     #[tokio::test]
@@ -724,7 +727,10 @@ mod tests {
         assert!(change.is_woken(), "open completion must wake the change");
         assert!(change.poll().is_ready());
 
-        assert_eq!(*log.lock().unwrap(), vec!["open", "change"]);
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["open", "change"]
+        );
     }
 
     #[tokio::test]
@@ -757,6 +763,9 @@ mod tests {
         assert!(reopen.is_woken(), "close completion must wake the reopen");
         assert!(reopen.poll().is_ready());
 
-        assert_eq!(*log.lock().unwrap(), vec!["close", "open"]);
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["close", "open"]
+        );
     }
 }
