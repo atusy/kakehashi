@@ -63,14 +63,18 @@ fn test_data_dir() -> &'static Path {
 ///
 /// The directory is left empty: the server's `$XDG_CONFIG_HOME/kakehashi`
 /// lookup simply finds nothing and falls back to built-in defaults.
+///
+/// Uses a unique per-process [`tempfile::TempDir`] rather than a fixed path so
+/// the isolation is deterministic: a fixed shared path could already hold stale
+/// contents from a prior or concurrent run (re-introducing the very pollution
+/// this guards against) or collide on permissions across users. The `TempDir`
+/// is parked in a `static` so it outlives every spawned server for the whole
+/// test process; it is intentionally never dropped (statics aren't), so no
+/// cleanup can race a still-running server.
 fn isolated_config_dir() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join("kakehashi-e2e-empty-xdg-config");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    })
-    .as_path()
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("create temp dir for XDG_CONFIG_HOME isolation"))
+        .path()
 }
 
 /// LSP client for communicating with kakehashi binary.
