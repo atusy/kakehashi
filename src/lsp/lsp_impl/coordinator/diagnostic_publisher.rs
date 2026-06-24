@@ -234,7 +234,7 @@ impl DiagnosticPublisher {
         // Recompute injection offsets only when there are region push slots to
         // transform. A PullLayer-only snapshot (the common pull-driven case) needs
         // none, so skip the whole-document injection resolution — and shorten the
-        // time the global republish lock is held.
+        // time this host's republish lock is held.
         let region_offsets = if snapshot
             .keys()
             .any(|source| matches!(source, DiagnosticSource::Region(_)))
