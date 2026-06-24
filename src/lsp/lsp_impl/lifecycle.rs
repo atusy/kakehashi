@@ -505,9 +505,12 @@ async fn forward_upstream_request(
 /// editor stalls the loop — but the `biased` select drains the two loss-intolerant
 /// channels (`upstream_rx`, then `upstream_request_rx`) before the best-effort
 /// `window_rx`, so a `window/*` burst cannot starve `DiagnosticRefresh`, progress,
-/// or request forwarding, and the bounded window queue caps memory. FIFO order is
-/// preserved within each channel (the window-notification e2e relies on
-/// window-channel FIFO; create-before-progress relies on upstream-channel FIFO).
+/// or request forwarding, and the bounded window queue caps memory. The window
+/// channel preserves strict FIFO (the window-notification e2e relies on it). The
+/// upstream channel preserves **barrier** order — every non-publish notification
+/// keeps its position, so create-before-progress holds — while coalescing collapses
+/// superseded same-`(connection, uri)` `PublishDiagnostics` within a drained burst
+/// (`coalesce_upstream_batch`, #426).
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the
@@ -650,25 +653,30 @@ const UPSTREAM_COALESCE_BATCH_CAP: usize = 256;
 /// `(host, source, server)`, the earlier pushes' work is wasted — coalescing skips
 /// it, so the loop does at most one republish per distinct key per batch.
 ///
+/// Coalescing **drops superseded earlier pushes** and keeps every survivor in its
+/// original FIFO order: a same-key push tombstones its earlier occurrence and lands
+/// at its own (later) position. This is required for correctness, not just tidiness —
+/// a restarted server pushes under a *new* `connection_id` for the *same* uri, which
+/// is a distinct coalescing key but the **same** cache slot `(host, source, server)`;
+/// keeping last-occurrence order makes the delivered sequence equivalent to FIFO with
+/// the superseded entries removed, so the slot's final writer (and any later
+/// `Evict(connection)`) behaves exactly as in the un-coalesced FIFO.
+///
 /// **Barrier order is exact**: every non-publish notification — including
 /// [`UpstreamNotification::EvictConnectionDiagnostics`] — is a barrier that the
 /// pending coalesced publishes stay *before*, so a publish can never be reordered
 /// across one (a `Publish(c)` then `Evict(c)` still nets to evicted, and
-/// create-before-progress holds). Within a run of consecutive publishes the order is
-/// *not* exact: a same-key push collapses onto the first occurrence's position, and
-/// distinct keys may be reordered relative to each other. That is benign because each
-/// delivery re-merges and republishes the host's *full* current slot set, so the
-/// editor's end state is independent of intra-run publish order.
+/// create-before-progress holds).
 fn coalesce_upstream_batch(
     batch: Vec<crate::lsp::bridge::UpstreamNotification>,
 ) -> Vec<crate::lsp::bridge::UpstreamNotification> {
     use crate::lsp::bridge::{ProgressConnectionId, UpstreamNotification};
     use std::collections::HashMap;
 
-    let mut output: Vec<UpstreamNotification> = Vec::with_capacity(batch.len());
-    // Pending coalesced publishes since the last barrier: a `(connection, uri)` key
-    // → its index in `output`. The publish already sits in `output` at that index;
-    // a later same-key publish overwrites it there (latest wins, original position).
+    // `None` entries are tombstones: a publish superseded by a later same-key one.
+    let mut output: Vec<Option<UpstreamNotification>> = Vec::with_capacity(batch.len());
+    // Pending coalesced publishes since the last barrier: `(connection, uri)` key →
+    // its (live, latest) index in `output`.
     let mut pending: HashMap<(ProgressConnectionId, String), usize> = HashMap::new();
 
     for notification in batch {
@@ -680,29 +688,29 @@ fn coalesce_upstream_batch(
                 diagnostics,
             } => {
                 let key = (connection_id, uri.clone());
-                let next = UpstreamNotification::PublishDiagnostics {
+                let idx = output.len();
+                // Record this as the key's latest; tombstone the earlier occurrence
+                // (if any) so only the latest survives, at its own later position.
+                if let Some(prev) = pending.insert(key, idx) {
+                    output[prev] = None;
+                }
+                output.push(Some(UpstreamNotification::PublishDiagnostics {
                     uri,
                     server,
                     connection_id,
                     diagnostics,
-                };
-                if let Some(&idx) = pending.get(&key) {
-                    output[idx] = next; // coalesce: replace the superseded push in place
-                } else {
-                    pending.insert(key, output.len());
-                    output.push(next);
-                }
+                }));
             }
             // Any non-publish notification is a barrier: the pending publishes are
-            // already committed to `output` ahead of it (order preserved); just stop
+            // already committed to `output` ahead of it (order preserved); stop
             // coalescing across it so a later same-key push is emitted separately.
             barrier => {
                 pending.clear();
-                output.push(barrier);
+                output.push(Some(barrier));
             }
         }
     }
-    output
+    output.into_iter().flatten().collect()
 }
 
 /// Service a downstream-initiated request by forwarding it to the editor on a
@@ -1296,29 +1304,31 @@ mod tests {
         }
 
         #[test]
-        fn within_a_run_a_later_same_key_push_takes_the_first_position() {
-            // Documents the intra-run reorder: [A1, B, A2] with A1/A2 same key and B a
-            // *different-key publish* (no barrier) coalesces A1←A2 onto A1's position,
-            // so A2's content lands before B. Benign — each delivery re-merges the full
-            // host set — but it is NOT exact FIFO, unlike barrier order.
+        fn survivors_keep_fifo_order_even_when_two_connections_share_a_slot() {
+            // A restarted server pushes for the same uri under a NEW connection id:
+            // [A1(c1,u), B(c2,u), A2(c1,u)]. (c1,u) and (c2,u) are distinct coalescing
+            // keys but the same cache slot (host, source, server). The superseded A1 is
+            // dropped and the survivors keep FIFO order — B then A2 — so the slot's last
+            // writer stays A2, matching the un-coalesced FIFO (NOT A2 then B, which would
+            // make B the last writer and mis-handle a later Evict(c1)).
             let out = coalesce_upstream_batch(vec![
                 publish(1, "u", "a1"),
-                publish(2, "v", "b"),
+                publish(2, "u", "b"),
                 publish(1, "u", "a2"),
             ]);
-            assert_eq!(out.len(), 2);
+            assert_eq!(out.len(), 2, "the superseded a1 is dropped");
             assert_eq!(
                 msg_at(&out, 0),
-                "a2",
-                "same-key latest, at the first position"
+                "b",
+                "survivors keep FIFO order: b precedes a2"
             );
-            assert_eq!(msg_at(&out, 1), "b");
+            assert_eq!(msg_at(&out, 1), "a2", "a2 stays the slot's last writer");
         }
 
         #[test]
         fn coalesces_each_key_independently_around_a_barrier() {
-            // Two keys before a barrier (one coalesced), the barrier, then the first
-            // key again after it (kept separate).
+            // Two keys before a barrier (one coalesced to its latest, last-occurrence
+            // order), the barrier, then the first key again after it (kept separate).
             let out = coalesce_upstream_batch(vec![
                 publish(1, "u", "a1"),
                 publish(2, "v", "b"),
@@ -1327,8 +1337,12 @@ mod tests {
                 publish(1, "u", "a3"),
             ]);
             assert_eq!(out.len(), 4);
-            assert_eq!(msg_at(&out, 0), "a2", "key (1,u) coalesces to its latest");
-            assert_eq!(msg_at(&out, 1), "b", "the distinct key (2,v) is untouched");
+            assert_eq!(
+                msg_at(&out, 0),
+                "b",
+                "the surviving a2 follows b in FIFO order"
+            );
+            assert_eq!(msg_at(&out, 1), "a2", "key (1,u) coalesces to its latest");
             assert!(matches!(out[2], UpstreamNotification::DiagnosticRefresh));
             assert_eq!(
                 msg_at(&out, 3),
