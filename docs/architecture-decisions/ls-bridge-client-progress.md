@@ -262,9 +262,8 @@ spec-compliant clients never send a token).
   next named anchor's real `End`. #438.
 - **Method coverage** beyond references (and the goto family added by #446) —
   notably the whole-document, multi-region methods (`documentSymbol`, …), which
-  fan out to
-  several regions per request and so need a request-level shared aggregator, not
-  the per-dispatch one. #437.
+  fan out to several regions per request and so need a request-level shared
+  aggregator, not the per-dispatch one. #437.
 - **Host-layer** client progress: the host path still strips the token. #441.
 
 The remaining notes below are design-tuning points; the empty-vs-non-empty
