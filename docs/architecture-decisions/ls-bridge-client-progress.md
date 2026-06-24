@@ -271,12 +271,9 @@ The remaining notes below are design-tuning points; the empty-vs-non-empty
 fall-through threshold and the `Rest`-never-anchor rule are now **decided** as
 described above.
 
-Specific points to settle during the remaining implementation:
+Points still open for the deferred work above (`partialResultToken`,
+*concatenated*, and the `Rest`-member refinement):
 
-- The empty-vs-non-empty threshold that triggers fall-through must
-  **match the existing preferred-strategy empty-result behavior** — a uniform
-  fall-through-on-empty across the priority walk, not a per-method exception.
-  Align with the preferred strategy; do not invent a new threshold.
 - `partialResultToken` support depends on the aggregation layer accepting
   incremental input. Until that lands, `partialResultToken` may stay stripped
   while `workDoneToken` is bridged — a valid intermediate phase. Without
@@ -295,8 +292,7 @@ Specific points to settle during the remaining implementation:
   ones are in — trading streaming latency for ordering fidelity. An
   implementation may relax this if a method's partial results are
   order-insensitive.
-- Treating `Rest`-group members as never-anchors trades progress visibility for
-  title correctness: under *preferred*, if the delivered winner is an unnamed
-  `Rest` member doing long work, its own progress is not shown (no safe a priori
-  title). A future refinement could surface it once it is the sole active `Rest`
-  member.
+- The decided `Rest`-never-anchor rule trades progress visibility for title
+  correctness: under *preferred*, if the delivered winner is an unnamed `Rest`
+  member doing long work, its own progress is not shown (no safe a priori title).
+  A future refinement could surface it once it is the sole active `Rest` member.
