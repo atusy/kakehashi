@@ -1366,17 +1366,25 @@ mod tests {
 
         // The same guard also asks the forwarding loop to evict this connection's
         // diagnostic slots, so a dead server's diagnostics don't linger (#469).
-        let mut saw_eviction = false;
-        while let Ok(notification) = upstream_rx.try_recv() {
-            if let UpstreamNotification::EvictConnectionDiagnostics { connection_id } = notification
-            {
-                assert_eq!(
-                    connection_id, conn,
-                    "eviction must target the exited connection"
-                );
-                saw_eviction = true;
+        // `Drop` runs `purge_connection` *then* the sends, so the purge above can be
+        // observed before the eviction send lands — `recv().await` (not a single
+        // `try_recv`) so we wait for it rather than racing the guard's Drop.
+        let saw_eviction = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(notification) = upstream_rx.recv().await {
+                if let UpstreamNotification::EvictConnectionDiagnostics { connection_id } =
+                    notification
+                {
+                    assert_eq!(
+                        connection_id, conn,
+                        "eviction must target the exited connection"
+                    );
+                    return true;
+                }
             }
-        }
+            false // channel closed (all senders dropped) without an eviction
+        })
+        .await
+        .expect("EvictConnectionDiagnostics must arrive after reader exit");
         assert!(
             saw_eviction,
             "reader exit must emit EvictConnectionDiagnostics for its connection"
