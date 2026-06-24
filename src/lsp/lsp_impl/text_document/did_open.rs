@@ -402,4 +402,77 @@ print("hello")
         .await
         .expect("re-sync with changed text should send a didChange advancing to version 2");
     }
+
+    /// On-edit re-sync wiring (#431): when the debounced diagnostic *fires*,
+    /// `execute_debounced_diagnostic` re-syncs the host doc to its `_self` servers
+    /// via the coordinator. Drives `DebouncedDiagnosticsManager::schedule` with a
+    /// zero debounce and a host snapshot, then asserts the host doc gets synced.
+    /// The test `rust_ls` connection advertises no `diagnosticProvider`, so the
+    /// capability-gated pull skips it — only the eager-sync hook can sync it, which
+    /// isolates the wiring (removing the hook would fail this test).
+    #[tokio::test]
+    async fn debounced_fire_resyncs_host_document() {
+        use crate::config::settings::{AggregationStrategy, LayerSource, ResolvedLayerConfig};
+        use crate::lsp::debounced_diagnostics::DebouncedDiagnosticsManager;
+        use crate::lsp::lsp_impl::DiagnosticPublisher;
+        use crate::lsp::lsp_impl::bridge_context::HostRequestContext;
+        use crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshot;
+        use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        server.bridge.insert_ready_test_connection("rust_ls").await;
+
+        let uri = Url::parse("file:///test/host_debounce.rs").unwrap();
+        let settings = server.settings_manager.load_settings();
+        let configs = server
+            .bridge
+            .get_host_configs_for_language(&settings, "rust");
+
+        let snapshot = DiagnosticSnapshot {
+            virt_contexts: vec![],
+            host: Some(HostRequestContext {
+                uri: uri.clone(),
+                language_id: "rust".to_string(),
+                text: std::sync::Arc::from("fn main() {}"),
+                configs,
+                priorities: vec![],
+                strategy: AggregationStrategy::Concatenated,
+                max_fan_out: None,
+                upstream_request_id: None,
+            }),
+            layer_cfg: ResolvedLayerConfig {
+                priorities: vec![LayerSource::Host],
+                strategy: AggregationStrategy::Concatenated,
+            },
+        };
+
+        // Fire immediately (zero debounce) and assert the host doc was synced.
+        DebouncedDiagnosticsManager::with_duration(Duration::ZERO).schedule(
+            uri.clone(),
+            Some(snapshot),
+            server.bridge.pool_arc(),
+            std::sync::Arc::clone(&server.bridge),
+            std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
+            std::sync::Arc::new(DiagnosticPublisher::new(server)),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .bridge
+                    .pool()
+                    .host_document_version(&uri, "rust_ls")
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("debounce fire should re-sync the host document to the _self server");
+    }
 }
