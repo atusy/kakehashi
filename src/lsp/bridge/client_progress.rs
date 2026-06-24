@@ -271,6 +271,15 @@ mod tests {
     fn end() -> ProgressParamsValue {
         ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd { message: None }))
     }
+    fn report() -> ProgressParamsValue {
+        ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+            tower_lsp_server::ls_types::WorkDoneProgressReport {
+                cancellable: None,
+                message: None,
+                percentage: Some(50),
+            },
+        ))
+    }
 
     #[test]
     fn n1_relays_begin_then_end_under_the_client_token_then_drops() {
@@ -374,8 +383,17 @@ mod tests {
             "loser B's Begin is dropped"
         );
         assert!(
+            agg.on_downstream_progress(&b, report()).is_none(),
+            "loser B's report is dropped"
+        );
+        assert!(
             agg.on_downstream_progress(&b, end()).is_none(),
             "loser B's End is dropped"
+        );
+        // The winner's own report relays.
+        assert!(
+            agg.on_downstream_progress(&a, report()).is_some(),
+            "winner A's report relays"
         );
         assert!(
             agg.on_downstream_progress(&a, end()).is_some(),
