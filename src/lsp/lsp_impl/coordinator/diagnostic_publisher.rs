@@ -216,12 +216,12 @@ impl DiagnosticPublisher {
         //
         // The lock is held across the editor `publish_diagnostics` await below
         // because the ordering guarantee requires it (releasing before the send
-        // would let two publishes reorder on the wire). The cost is that a slow
-        // editor stalls *all* hosts' republishes — an accepted staging tradeoff of
-        // the global lock; the deferred per-host lock shrinks the blast radius to
-        // one host. publish_diagnostics is a fire-and-forget notification, so the
-        // stall window is the client's outbound-channel send, not a round-trip.
-        let _guard = self.aggregator.lock_republish().await;
+        // would let two publishes reorder on the wire). The lock is **per host**
+        // (#426), so a slow editor publish for one host stalls only that host's
+        // republishes, not every host's; different hosts proceed concurrently.
+        // publish_diagnostics is a fire-and-forget notification, so the stall window
+        // is the client's outbound-channel send, not a round-trip.
+        let _guard = self.aggregator.lock_republish(host).await;
 
         let mut snapshot = self.aggregator.snapshot(host);
         // Drop Host push slots whose server is no longer a configured `_self` host
