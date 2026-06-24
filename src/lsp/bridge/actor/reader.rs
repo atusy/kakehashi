@@ -66,10 +66,13 @@ pub(crate) enum UpstreamNotification {
     /// (unresolved virtual URI; real URI not open / not `_self` / wrong server).
     ///
     /// This carries an arbitrary-size `Vec<Diagnostic>` over the **unbounded**
-    /// upstream channel, so a push-happy or misbehaving downstream paired with a
-    /// slow upstream loop could grow memory. Re-publish is unthrottled by design
-    /// (push-propagation-diagnostic-forwarding § Consequences); a bounded /
-    /// coalescing diagnostics channel is the deferred mitigation if it proves noisy.
+    /// upstream channel. To keep a chatty downstream re-pushing the *same*
+    /// `(connection, uri)` from making the loop republish every superseded push, the
+    /// forwarding loop coalesces a drained burst by `(connection, uri)` to the latest
+    /// before delivering (`coalesce_upstream_batch`, #426): at most one republish per
+    /// distinct key per batch. This collapses same-key supersession only — a flood of
+    /// *distinct* URIs is not coalesced, and re-publish is otherwise unthrottled by
+    /// design (push-propagation-diagnostic-forwarding § Consequences).
     PublishDiagnostics {
         /// The URI the downstream published for — a virtual injection URI (region
         /// push) or a real host URI (`_self` host-layer push).

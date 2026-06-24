@@ -484,10 +484,14 @@ async fn forward_upstream_request(
 /// Consumes from three channels (loss-tolerance split, #378) and dispatches them
 /// to the LSP client:
 /// - `upstream_rx` (unbounded): `DiagnosticRefresh` — forwarded as
-///   `workspace/diagnostic/refresh` — and the server-declared work-done
-///   progress notifications (`CreateWorkDoneProgress`/`Progress`/
-///   `ForgetWorkDoneProgress`, window-work-done-progress), which must not be
-///   lost or reordered.
+///   `workspace/diagnostic/refresh` — the server-declared work-done progress
+///   notifications (`CreateWorkDoneProgress`/`Progress`/`ForgetWorkDoneProgress`,
+///   window-work-done-progress), and `PublishDiagnostics`/`EvictConnectionDiagnostics`,
+///   which may not be lost. Each wake-up drains a capped burst and coalesces
+///   same-`(connection, uri)` `PublishDiagnostics` to the latest
+///   (`coalesce_upstream_batch`, #426): only superseded earlier pushes are dropped,
+///   and every surviving notification — publishes and barriers alike — keeps its
+///   FIFO order, so `publish`↔`evict` order and create-before-progress hold.
 /// - `upstream_request_rx` (unbounded): downstream-initiated *requests*
 ///   (`window/showMessageRequest`, `window/showDocument`) forwarded with the
 ///   editor's response relayed back; loss-intolerant (a dropped request hangs
@@ -500,9 +504,12 @@ async fn forward_upstream_request(
 /// editor stalls the loop — but the `biased` select drains the two loss-intolerant
 /// channels (`upstream_rx`, then `upstream_request_rx`) before the best-effort
 /// `window_rx`, so a `window/*` burst cannot starve `DiagnosticRefresh`, progress,
-/// or request forwarding, and the bounded window queue caps memory. FIFO order is
-/// preserved within each channel (the window-notification e2e relies on
-/// window-channel FIFO; create-before-progress relies on upstream-channel FIFO).
+/// or request forwarding, and the bounded window queue caps memory. The window
+/// channel preserves strict FIFO (the window-notification e2e relies on it). The
+/// upstream channel preserves **barrier** order — every non-publish notification
+/// keeps its position, so create-before-progress holds — while coalescing collapses
+/// superseded same-`(connection, uri)` `PublishDiagnostics` within a drained burst
+/// (`coalesce_upstream_batch`, #426).
 ///
 /// Exits when:
 /// - Either channel is closed (all senders dropped — both senders live in the
@@ -552,15 +559,37 @@ async fn upstream_forwarding_loop(
 
             notification = upstream_rx.recv() => {
                 match notification {
-                    Some(notification) => {
-                        deliver_upstream_notification(
-                            &client,
-                            notification,
-                            &mut created_tokens,
-                            &mut begun_tokens,
-                            diagnostic_publisher.as_deref(),
-                        )
-                        .await
+                    Some(first) => {
+                        // Drain the rest of the currently-queued burst (capped) and
+                        // coalesce same-(connection,uri) PublishDiagnostics to the
+                        // latest, so a push-happy downstream can't make the loop
+                        // republish every superseded push off the unbounded channel
+                        // (#426). The common case (nothing else queued) is one extra
+                        // non-blocking try_recv and a single-element passthrough.
+                        let mut batch = vec![first];
+                        while batch.len() < UPSTREAM_COALESCE_BATCH_CAP {
+                            match upstream_rx.try_recv() {
+                                Ok(next) => batch.push(next),
+                                Err(_) => break, // empty or disconnected
+                            }
+                        }
+                        for notification in coalesce_upstream_batch(batch) {
+                            // Re-check cancellation between deliveries so a shutdown
+                            // during a large batch isn't delayed by up to 256 republish
+                            // awaits (the outer `select!` only re-checks between batches);
+                            // the biased cancel arm then breaks the loop on the next turn.
+                            if cancel_token.is_cancelled() {
+                                break;
+                            }
+                            deliver_upstream_notification(
+                                &client,
+                                notification,
+                                &mut created_tokens,
+                                &mut begun_tokens,
+                                diagnostic_publisher.as_deref(),
+                            )
+                            .await
+                        }
                     }
                     None => break, // Channel closed
                 }
@@ -607,6 +636,97 @@ async fn upstream_forwarding_loop(
             }
         }
     }
+}
+
+/// Max notifications drained into one coalescing batch per loop wake-up. Bounds the
+/// transient batch while still collapsing a burst; under a continuous flood the loop
+/// processes the channel in capped chunks, so it keeps making publish progress
+/// instead of draining forever (#426).
+const UPSTREAM_COALESCE_BATCH_CAP: usize = 256;
+
+/// Collapse a drained burst of upstream notifications, coalescing the
+/// `PublishDiagnostics` for each `(connection_id, uri)` within a barrier-delimited
+/// run (not necessarily adjacent — other keys may interleave) down to the latest one
+/// (#426). A push-happy or misbehaving downstream can pile arbitrary-size
+/// `Vec<Diagnostic>` on the unbounded upstream channel faster than the loop
+/// republishes them; since `record` already keeps only the latest per
+/// `(host, source, server)`, the earlier pushes' work is wasted — coalescing skips
+/// it, so the loop does at most one republish per distinct key per batch.
+///
+/// Coalescing **drops superseded earlier pushes** and keeps every survivor in its
+/// original FIFO order: a same-key push tombstones its earlier occurrence and lands
+/// at its own (later) position. This is required for correctness, not just tidiness —
+/// a restarted server pushes under a *new* `connection_id` for the *same* uri, which
+/// is a distinct coalescing key but the **same** cache slot `(host, source, server)`;
+/// keeping last-occurrence order makes the delivered sequence equivalent to FIFO with
+/// the superseded entries removed, so the slot's final writer (and any later
+/// `Evict(connection)`) behaves exactly as in the un-coalesced FIFO.
+///
+/// **Barrier order is exact**: every non-publish notification — including
+/// [`UpstreamNotification::EvictConnectionDiagnostics`] — is a barrier that the
+/// pending coalesced publishes stay *before*, so a publish can never be reordered
+/// across one (a `Publish(c)` then `Evict(c)` still nets to evicted, and
+/// create-before-progress holds).
+fn coalesce_upstream_batch(
+    batch: Vec<crate::lsp::bridge::UpstreamNotification>,
+) -> Vec<crate::lsp::bridge::UpstreamNotification> {
+    use crate::lsp::bridge::{ProgressConnectionId, UpstreamNotification};
+    use std::collections::HashMap;
+
+    // Common case — a lone notification (no burst queued): nothing to coalesce, so
+    // skip the `output`/`pending` allocations and the tombstone pass entirely.
+    if batch.len() <= 1 {
+        return batch;
+    }
+
+    // `None` entries are tombstones: a publish superseded by a later same-key one.
+    let mut output: Vec<Option<UpstreamNotification>> = Vec::with_capacity(batch.len());
+    // Pending coalesced publishes since the last barrier: connection → uri → its
+    // (live, latest) index in `output`. Nested (rather than a flat `(conn, uri)`
+    // tuple key) so the coalescing-repeat path looks up by `&uri` with `get_mut` and
+    // only clones the `uri` when first inserting it.
+    let mut pending: HashMap<ProgressConnectionId, HashMap<String, usize>> = HashMap::new();
+
+    for notification in batch {
+        match notification {
+            UpstreamNotification::PublishDiagnostics {
+                uri,
+                server,
+                connection_id,
+                diagnostics,
+            } => {
+                let idx = output.len();
+                let by_uri = pending.entry(connection_id).or_default();
+                if let Some(prev) = by_uri.get_mut(&uri) {
+                    // Tombstone the earlier occurrence so only the latest survives, at
+                    // its own later position (no `uri` clone on this hot repeat path).
+                    output[*prev] = None;
+                    *prev = idx;
+                } else {
+                    by_uri.insert(uri.clone(), idx);
+                }
+                output.push(Some(UpstreamNotification::PublishDiagnostics {
+                    uri,
+                    server,
+                    connection_id,
+                    diagnostics,
+                }));
+            }
+            // Any non-publish notification is a barrier: the pending publishes are
+            // already committed to `output` ahead of it (order preserved); stop
+            // coalescing across it so a later same-key push is emitted separately.
+            // Clear the inner maps rather than the outer one, so a batch with several
+            // barriers reuses the per-connection allocations instead of dropping and
+            // re-allocating them each time.
+            barrier => {
+                for by_uri in pending.values_mut() {
+                    by_uri.clear();
+                }
+                output.push(Some(barrier));
+            }
+        }
+    }
+    output.into_iter().flatten().collect()
 }
 
 /// Service a downstream-initiated request by forwarding it to the editor on a
@@ -1039,6 +1159,215 @@ mod tests {
         }
     }
 
+    mod coalesce {
+        use super::super::coalesce_upstream_batch;
+        use crate::lsp::bridge::{ProgressConnectionId, UpstreamNotification};
+        use tower_lsp_server::ls_types::Diagnostic;
+
+        fn publish(conn: u64, uri: &str, msg: &str) -> UpstreamNotification {
+            UpstreamNotification::PublishDiagnostics {
+                uri: uri.to_string(),
+                server: "srv".to_string(),
+                connection_id: ProgressConnectionId::for_test(conn),
+                diagnostics: vec![Diagnostic {
+                    message: msg.to_string(),
+                    ..Default::default()
+                }],
+            }
+        }
+
+        /// A `PublishDiagnostics` carrying an empty list — a *clearing* push.
+        fn publish_clear(conn: u64, uri: &str) -> UpstreamNotification {
+            UpstreamNotification::PublishDiagnostics {
+                uri: uri.to_string(),
+                server: "srv".to_string(),
+                connection_id: ProgressConnectionId::for_test(conn),
+                diagnostics: vec![],
+            }
+        }
+
+        fn evict(conn: u64) -> UpstreamNotification {
+            UpstreamNotification::EvictConnectionDiagnostics {
+                connection_id: ProgressConnectionId::for_test(conn),
+            }
+        }
+
+        fn is_empty_publish(n: &UpstreamNotification) -> bool {
+            matches!(
+                n,
+                UpstreamNotification::PublishDiagnostics { diagnostics, .. } if diagnostics.is_empty()
+            )
+        }
+
+        /// The latest message of `out[idx]`, which must be a `PublishDiagnostics`.
+        fn msg_at(out: &[UpstreamNotification], idx: usize) -> &str {
+            match &out[idx] {
+                UpstreamNotification::PublishDiagnostics { diagnostics, .. } => {
+                    diagnostics[0].message.as_str()
+                }
+                other => panic!("expected PublishDiagnostics at {idx}, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn collapses_consecutive_same_key_to_latest() {
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a"),
+                publish(1, "u", "b"),
+                publish(1, "u", "c"),
+            ]);
+            assert_eq!(out.len(), 1, "three pushes for one key collapse to one");
+            assert_eq!(msg_at(&out, 0), "c", "the latest push wins");
+        }
+
+        #[test]
+        fn keeps_distinct_keys() {
+            // Different uri, and different connection on the same uri, are distinct.
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a"),
+                publish(1, "v", "b"),
+                publish(2, "u", "c"),
+            ]);
+            assert_eq!(out.len(), 3, "distinct (connection, uri) keys are all kept");
+        }
+
+        #[test]
+        fn does_not_coalesce_across_an_evict_barrier() {
+            // Publish, evict the same connection, publish again: the evict is a
+            // barrier, so the two same-key pushes are NOT collapsed and stay ordered.
+            let out =
+                coalesce_upstream_batch(vec![publish(1, "u", "a"), evict(1), publish(1, "u", "b")]);
+            assert_eq!(out.len(), 3);
+            assert_eq!(msg_at(&out, 0), "a");
+            assert!(matches!(
+                out[1],
+                UpstreamNotification::EvictConnectionDiagnostics { .. }
+            ));
+            assert_eq!(msg_at(&out, 2), "b");
+        }
+
+        #[test]
+        fn publish_then_evict_keeps_publish_first() {
+            // The ordering invariant: a publish for a connection is delivered before
+            // the evict for that connection (publish-then-evict nets to evicted).
+            let out = coalesce_upstream_batch(vec![publish(1, "u", "a"), evict(1)]);
+            assert_eq!(out.len(), 2);
+            assert!(matches!(
+                out[0],
+                UpstreamNotification::PublishDiagnostics { .. }
+            ));
+            assert!(matches!(
+                out[1],
+                UpstreamNotification::EvictConnectionDiagnostics { .. }
+            ));
+        }
+
+        #[test]
+        fn non_publish_notification_is_a_barrier() {
+            // A non-publish notification (DiagnosticRefresh) flushes pending pushes
+            // ahead of it and stops coalescing across it — order is preserved.
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a1"),
+                publish(1, "u", "a2"),
+                UpstreamNotification::DiagnosticRefresh,
+                publish(1, "u", "a3"),
+            ]);
+            assert_eq!(out.len(), 3);
+            assert_eq!(
+                msg_at(&out, 0),
+                "a2",
+                "the run before the barrier coalesces"
+            );
+            assert!(matches!(out[1], UpstreamNotification::DiagnosticRefresh));
+            assert_eq!(
+                msg_at(&out, 2),
+                "a3",
+                "the push after the barrier is separate"
+            );
+        }
+
+        #[test]
+        fn passes_a_lone_non_publish_through_unchanged() {
+            let out = coalesce_upstream_batch(vec![UpstreamNotification::DiagnosticRefresh]);
+            assert_eq!(out.len(), 1);
+            assert!(matches!(out[0], UpstreamNotification::DiagnosticRefresh));
+        }
+
+        #[test]
+        fn coalesces_a_run_then_delivers_the_evict_after_it() {
+            // [P, P, Evict]: the two same-key pushes collapse to the latest, then the
+            // evict (which originally followed both) is delivered after it.
+            let out =
+                coalesce_upstream_batch(vec![publish(1, "u", "a"), publish(1, "u", "b"), evict(1)]);
+            assert_eq!(out.len(), 2);
+            assert_eq!(msg_at(&out, 0), "b");
+            assert!(matches!(
+                out[1],
+                UpstreamNotification::EvictConnectionDiagnostics { .. }
+            ));
+        }
+
+        #[test]
+        fn a_later_clear_supersedes_an_earlier_error_in_a_run() {
+            // The clear must win (latest), so the editor ends cleared — a dropped
+            // clear would leave a stale diagnostic on screen.
+            let out = coalesce_upstream_batch(vec![publish(1, "u", "err"), publish_clear(1, "u")]);
+            assert_eq!(out.len(), 1);
+            assert!(
+                is_empty_publish(&out[0]),
+                "the clearing push supersedes the earlier error"
+            );
+        }
+
+        #[test]
+        fn survivors_keep_fifo_order_even_when_two_connections_share_a_slot() {
+            // A restarted server pushes for the same uri under a NEW connection id:
+            // [A1(c1,u), B(c2,u), A2(c1,u)]. (c1,u) and (c2,u) are distinct coalescing
+            // keys but the same cache slot (host, source, server). The superseded A1 is
+            // dropped and the survivors keep FIFO order — B then A2 — so the slot's last
+            // writer stays A2, matching the un-coalesced FIFO (NOT A2 then B, which would
+            // make B the last writer and mis-handle a later Evict(c1)).
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a1"),
+                publish(2, "u", "b"),
+                publish(1, "u", "a2"),
+            ]);
+            assert_eq!(out.len(), 2, "the superseded a1 is dropped");
+            assert_eq!(
+                msg_at(&out, 0),
+                "b",
+                "survivors keep FIFO order: b precedes a2"
+            );
+            assert_eq!(msg_at(&out, 1), "a2", "a2 stays the slot's last writer");
+        }
+
+        #[test]
+        fn coalesces_each_key_independently_around_a_barrier() {
+            // Two keys before a barrier (one coalesced to its latest, last-occurrence
+            // order), the barrier, then the first key again after it (kept separate).
+            let out = coalesce_upstream_batch(vec![
+                publish(1, "u", "a1"),
+                publish(2, "v", "b"),
+                publish(1, "u", "a2"),
+                UpstreamNotification::DiagnosticRefresh,
+                publish(1, "u", "a3"),
+            ]);
+            assert_eq!(out.len(), 4);
+            assert_eq!(
+                msg_at(&out, 0),
+                "b",
+                "the surviving a2 follows b in FIFO order"
+            );
+            assert_eq!(msg_at(&out, 1), "a2", "key (1,u) coalesces to its latest");
+            assert!(matches!(out[2], UpstreamNotification::DiagnosticRefresh));
+            assert_eq!(
+                msg_at(&out, 3),
+                "a3",
+                "the push after the barrier is separate"
+            );
+        }
+    }
+
     /// Regression guard for the create-before-progress ordering the feature
     /// depends on: the forwarding loop must deliver `window/workDoneProgress/create`
     /// to the editor (and receive its reply) BEFORE the corresponding `$/progress`.
@@ -1153,6 +1482,100 @@ mod tests {
 
         cancel.cancel();
         let _ = loop_handle.await;
+    }
+
+    /// Cancellation is re-checked *between* deliveries of a coalesced batch, so a
+    /// shutdown mid-batch is not delayed by the rest of the batch (#426). Two
+    /// `DiagnosticRefresh` are drained into one batch; cancelling during the first's
+    /// editor round-trip must make the loop skip the second and exit.
+    #[tokio::test]
+    async fn forwarding_loop_rechecks_cancellation_between_batched_deliveries() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::jsonrpc::{Request, Response};
+        use tower_lsp_server::ls_types::{InitializeParams, InitializeResult};
+        use tower_lsp_server::{LanguageServer, LspService};
+
+        struct Dummy;
+        impl LanguageServer for Dummy {
+            async fn initialize(
+                &self,
+                _: InitializeParams,
+            ) -> tower_lsp_server::jsonrpc::Result<InitializeResult> {
+                Ok(InitializeResult::default())
+            }
+            async fn shutdown(&self) -> tower_lsp_server::jsonrpc::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
+        let captured_for_init = Arc::clone(&captured);
+        let (mut service, socket) = LspService::build(move |client| {
+            *captured_for_init.lock().unwrap() = Some(client);
+            Dummy
+        })
+        .finish();
+        let client = captured.lock().unwrap().take().unwrap();
+
+        let init = Request::build("initialize")
+            .params(serde_json::json!({ "capabilities": {} }))
+            .id(1)
+            .finish();
+        let _ = service.ready().await.unwrap().call(init).await;
+
+        let (mut requests, mut responses) = socket.split();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_window_tx, window_rx) = tokio::sync::mpsc::channel(16);
+        let (_request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Two refreshes queued before the loop runs → drained into one batch.
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+        tx.send(UpstreamNotification::DiagnosticRefresh).unwrap();
+
+        let loop_handle = tokio::spawn(upstream_forwarding_loop(
+            rx,
+            window_rx,
+            request_rx,
+            None,
+            crate::lsp::bridge::InboundRequestRegistry::default(),
+            client,
+            None,
+            cancel.clone(),
+        ));
+
+        // The loop delivers the first refresh (a request that awaits the editor).
+        let first = requests
+            .next()
+            .await
+            .expect("first refresh request emitted");
+        assert_eq!(first.method(), "workspace/diagnostic/refresh");
+        // Cancel during the first delivery's round-trip; when it completes the loop
+        // must re-check cancellation and skip the second batched refresh.
+        cancel.cancel();
+        responses
+            .send(Response::from_ok(
+                first.id().expect("refresh request id").clone(),
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+
+        // The loop must skip the second refresh and exit. Were cancellation NOT
+        // re-checked mid-batch, it would deliver the second refresh and block on its
+        // (never-sent) response — so this would hang. The timeout turns that
+        // regression into a failure instead of an infinite hang.
+        tokio::time::timeout(std::time::Duration::from_secs(5), loop_handle)
+            .await
+            .expect("loop must exit after cancellation, not block on the skipped refresh")
+            .unwrap();
+        // `requests`/`responses` intentionally dropped without asserting stream
+        // closure: `service` still holds a Client clone, so the stream stays open.
+        drop((requests, responses));
     }
 
     /// When the editor REJECTS `window/workDoneProgress/create`, the loop must
