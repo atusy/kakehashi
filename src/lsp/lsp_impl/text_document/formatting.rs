@@ -730,6 +730,9 @@ async fn dispatch_preferred_formatting(
                         &t.virtual_content,
                         options,
                         t.upstream_id,
+                        // Full-formatting client progress is out of scope for #459
+                        // (range formatting only); pass no token here.
+                        None,
                         None,
                     )
                     .await;
@@ -1075,6 +1078,9 @@ async fn dispatch_concatenated_formatting(
                             &current_text,
                             options,
                             upstream_id,
+                            // OnTypeFormatting pipeline: no client progress here
+                            // (#459 covers rangeFormatting's region fan-out only).
+                            None,
                             Some(&step_downstream_id),
                         )
                         .await
@@ -1098,6 +1104,9 @@ async fn dispatch_concatenated_formatting(
                                     whole_region,
                                     options,
                                     upstream_id,
+                                    // OnTypeFormatting pipeline: no client progress
+                                    // here (#459 covers rangeFormatting only).
+                                    None,
                                     Some(&step_downstream_id),
                                 )
                                 .await

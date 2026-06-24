@@ -22,7 +22,8 @@ use std::io;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    DocumentRangeFormattingParams, FormattingOptions, Range, TextDocumentIdentifier, TextEdit,
+    DocumentRangeFormattingParams, FormattingOptions, NumberOrString, Range,
+    TextDocumentIdentifier, TextEdit, WorkDoneProgressParams,
 };
 use url::Url;
 
@@ -59,6 +60,7 @@ impl LanguageServerPool {
         host_range: Range,
         options: FormattingOptions,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<NumberOrString>,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
@@ -84,6 +86,7 @@ impl LanguageServerPool {
                     &offset_for_request,
                     options,
                     request_id,
+                    client_progress_token,
                 )
             },
             // The transform promotes error responses, missing results, and
@@ -113,6 +116,7 @@ fn build_range_formatting_request(
     offset: &RegionOffset,
     options: FormattingOptions,
     request_id: RequestId,
+    client_progress_token: Option<NumberOrString>,
 ) -> JsonRpcRequest<DocumentRangeFormattingParams> {
     let mut virtual_range = host_range;
     translate_host_range_to_virtual(&mut virtual_range, offset);
@@ -123,7 +127,11 @@ fn build_range_formatting_request(
         },
         range: virtual_range,
         options,
-        work_done_progress_params: Default::default(),
+        // Forward the bridge-minted token so the downstream reports `$/progress`
+        // against this request's shared aggregator (ls-bridge-client-progress).
+        work_done_progress_params: WorkDoneProgressParams {
+            work_done_token: client_progress_token,
+        },
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/rangeFormatting", params)
 }
@@ -164,9 +172,43 @@ mod tests {
             &RegionOffset::new(5, 0),
             default_options(),
             test_request_id(),
+            None,
         );
 
         assert_uses_virtual_uri(&request, "lua");
+    }
+
+    #[test]
+    fn range_formatting_request_carries_work_done_token_only_when_present() {
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+
+        let with = build_range_formatting_request(
+            &virtual_uri,
+            range(5, 0, 8, 0),
+            &RegionOffset::new(5, 0),
+            default_options(),
+            test_request_id(),
+            Some(NumberOrString::String("cprog-1".to_string())),
+        );
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["params"]["workDoneToken"],
+            "cprog-1"
+        );
+
+        let without = build_range_formatting_request(
+            &virtual_uri,
+            range(5, 0, 8, 0),
+            &RegionOffset::new(5, 0),
+            default_options(),
+            test_request_id(),
+            None,
+        );
+        assert!(
+            serde_json::to_value(&without).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "None omits the token"
+        );
     }
 
     #[test]
@@ -180,6 +222,7 @@ mod tests {
             &RegionOffset::new(8, 0),
             default_options(),
             RequestId::new(42),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -203,6 +246,7 @@ mod tests {
             &RegionOffset::new(5, 4),
             default_options(),
             RequestId::new(1),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -232,6 +276,7 @@ mod tests {
             &RegionOffset::new(0, 0),
             options,
             RequestId::new(1),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();
@@ -253,6 +298,7 @@ mod tests {
             &RegionOffset::new(10, 0),
             default_options(),
             RequestId::new(1),
+            None,
         );
 
         let json = serde_json::to_value(&request).unwrap();

@@ -23,7 +23,8 @@ use log::warn;
 
 use crate::config::settings::BridgeServerConfig;
 use tower_lsp_server::ls_types::{
-    DocumentFormattingParams, FormattingOptions, TextDocumentIdentifier, TextEdit,
+    DocumentFormattingParams, FormattingOptions, NumberOrString, TextDocumentIdentifier, TextEdit,
+    WorkDoneProgressParams,
 };
 use url::Url;
 
@@ -59,6 +60,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         options: FormattingOptions,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<NumberOrString>,
         downstream_id_probe: Option<&std::sync::OnceLock<RequestId>>,
     ) -> io::Result<Option<Vec<TextEdit>>> {
         let handle = self
@@ -76,7 +78,9 @@ impl LanguageServerPool {
             &offset,
             virtual_content,
             upstream_request_id,
-            |virtual_uri, request_id| build_formatting_request(virtual_uri, options, request_id),
+            |virtual_uri, request_id| {
+                build_formatting_request(virtual_uri, options, request_id, client_progress_token)
+            },
             // The transform promotes error responses, missing results, and
             // malformed payloads to `Err` (request failure) — only the
             // no-capability early return above yields `Ok(None)`.
@@ -133,13 +137,18 @@ fn build_formatting_request(
     virtual_uri: &VirtualDocumentUri,
     options: FormattingOptions,
     request_id: RequestId,
+    client_progress_token: Option<NumberOrString>,
 ) -> JsonRpcRequest<DocumentFormattingParams> {
     let params = DocumentFormattingParams {
         text_document: TextDocumentIdentifier {
             uri: virtual_uri.to_lsp_uri(),
         },
         options,
-        work_done_progress_params: Default::default(),
+        // Forward the bridge-minted token so the downstream reports `$/progress`
+        // against this request's shared aggregator (ls-bridge-client-progress).
+        work_done_progress_params: WorkDoneProgressParams {
+            work_done_token: client_progress_token,
+        },
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/formatting", params)
 }
@@ -268,7 +277,8 @@ mod tests {
     #[test]
     fn formatting_request_uses_virtual_uri() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_formatting_request(&virtual_uri, default_options(), test_request_id());
+        let request =
+            build_formatting_request(&virtual_uri, default_options(), test_request_id(), None);
 
         assert_uses_virtual_uri(&request, "lua");
     }
@@ -276,7 +286,8 @@ mod tests {
     #[test]
     fn formatting_request_has_correct_method_and_no_position() {
         let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
-        let request = build_formatting_request(&virtual_uri, default_options(), RequestId::new(7));
+        let request =
+            build_formatting_request(&virtual_uri, default_options(), RequestId::new(7), None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
@@ -300,7 +311,7 @@ mod tests {
             ..Default::default()
         };
 
-        let request = build_formatting_request(&virtual_uri, options, RequestId::new(1));
+        let request = build_formatting_request(&virtual_uri, options, RequestId::new(1), None);
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["params"]["options"]["tabSize"], 2);
