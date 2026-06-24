@@ -660,9 +660,10 @@ impl BridgeCoordinator {
         }
     }
 
-    /// Supersede the host eager-open batch for `uri` (abort old handles + reset to
-    /// an empty placeholder under one shard lock), returning the new generation.
-    /// Mirrors `supersede_eager_open_tasks` for the host path.
+    /// Supersede the host eager-open batch for `uri` (abort old handles + cancel the
+    /// old token + reset to an empty placeholder under one shard lock), returning the
+    /// new generation **and the batch's fresh `CancellationToken`** to hand to each
+    /// task it spawns (#435). Mirrors `supersede_eager_open_tasks` for the host path.
     fn supersede_host_eager_open(&self, uri: &Url) -> (u64, CancellationToken) {
         let generation = self
             .host_eager_open_generation
@@ -736,7 +737,9 @@ impl BridgeCoordinator {
 
     /// Supersede previous eager-open tasks for a URI, returning the new batch's
     /// generation counter (passed to `push_or_abort_eager_open_handle` to detect
-    /// stale pushes).
+    /// stale pushes) **and the batch's fresh `CancellationToken`** to hand to each
+    /// task it spawns — cancelled by a concurrent cancel/supersede/abort so a task
+    /// whose body started before its handle registered still bails (#435).
     ///
     /// Uses `DashMap::entry()` so the abort-and-reset happens under a single shard
     /// lock. Must be called BEFORE spawning new tasks to close the race window
