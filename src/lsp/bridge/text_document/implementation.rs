@@ -16,10 +16,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    transform_goto_response_to_host,
+    JsonRpcRequest, PositionRequestParams, RegionOffset, RequestId, VirtualDocumentUri,
+    build_position_based_request_with_progress, transform_goto_response_to_host,
 };
-use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
     /// Send an implementation request and wait for the response.
@@ -39,6 +38,7 @@ impl LanguageServerPool {
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
+        client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
     ) -> io::Result<Option<Vec<LocationLink>>> {
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(host_uri))
@@ -57,7 +57,13 @@ impl LanguageServerPool {
             host_position,
             "textDocument/implementation",
             |virtual_uri, request_id| {
-                build_implementation_request(virtual_uri, host_position, &offset, request_id)
+                build_implementation_request(
+                    virtual_uri,
+                    host_position,
+                    &offset,
+                    request_id,
+                    client_progress_token,
+                )
             },
             |response, ctx| {
                 transform_goto_response_to_host(
@@ -78,13 +84,15 @@ fn build_implementation_request(
     host_position: tower_lsp_server::ls_types::Position,
     offset: &RegionOffset,
     request_id: RequestId,
-) -> JsonRpcRequest<TextDocumentPositionParams> {
-    build_position_based_request(
+    client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
+) -> JsonRpcRequest<PositionRequestParams> {
+    build_position_based_request_with_progress(
         virtual_uri,
         host_position,
         offset,
         request_id,
         "textDocument/implementation",
+        client_progress_token,
     )
 }
 
@@ -101,6 +109,7 @@ mod tests {
             test_position(),
             &RegionOffset::new(3, 0),
             test_request_id(),
+            None,
         );
 
         assert_uses_virtual_uri(&request, "lua");
@@ -115,6 +124,7 @@ mod tests {
             test_position(),
             &RegionOffset::new(3, 0),
             test_request_id(),
+            None,
         );
 
         assert_position_request(&request, "textDocument/implementation", 2);
