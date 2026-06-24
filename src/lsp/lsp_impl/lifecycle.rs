@@ -7,18 +7,18 @@ use tower_lsp_server::jsonrpc::Result;
 #[cfg(feature = "experimental")]
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
-    CodeLensOptions, CompletionOptions, DeclarationCapability, DeclarationOptions,
-    DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities, DocumentFormattingOptions,
-    DocumentLinkOptions, DocumentOnTypeFormattingOptions, DocumentRangeFormattingOptions,
-    DocumentSymbolOptions, FoldingRangeProviderCapability, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHintOptions, InlayHintServerCapabilities, LinkedEditingRangeServerCapabilities, OneOf,
-    ReferenceOptions, RenameOptions, SaveOptions, SelectionRangeProviderCapability,
-    SemanticTokenModifier, SemanticTokenType, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-    SignatureHelpOptions, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri,
-    WorkDoneProgressOptions,
+    CallHierarchyServerCapability, CodeLensOptions, CompletionOptions, DeclarationCapability,
+    DeclarationOptions, DefinitionOptions, DiagnosticOptions, DiagnosticServerCapabilities,
+    DocumentFormattingOptions, DocumentLinkOptions, DocumentOnTypeFormattingOptions,
+    DocumentRangeFormattingOptions, DocumentSymbolOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHintOptions, InlayHintServerCapabilities,
+    LinkedEditingRangeServerCapabilities, OneOf, ReferenceOptions, RenameOptions, SaveOptions,
+    SelectionRangeProviderCapability, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
 };
 use url::Url;
 
@@ -274,6 +274,10 @@ impl Kakehashi {
                 })),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                // Call hierarchy is bridged to downstream servers (#353). A
+                // simple `true` is sufficient — incoming/outgoing have no
+                // capability of their own (LSP 3.18).
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string(), ":".to_string()]),

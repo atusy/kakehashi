@@ -58,6 +58,7 @@ expression: capabilities
   "declarationProvider": {
     "workDoneProgress": true
   },
+  "callHierarchyProvider": true,
   "semanticTokensProvider": {
     "legend": {
       "tokenTypes": [
