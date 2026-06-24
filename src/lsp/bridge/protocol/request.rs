@@ -5,7 +5,7 @@
 //! document coordinates.
 
 use tower_lsp_server::ls_types::{
-    DidOpenTextDocumentParams, Position, TextDocumentIdentifier, TextDocumentItem,
+    DidOpenTextDocumentParams, NumberOrString, Position, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, Uri,
 };
 
@@ -13,6 +13,18 @@ use super::jsonrpc::{JsonRpcNotification, JsonRpcRequest};
 use super::request_id::RequestId;
 use super::translation::{RegionOffset, translate_host_position_to_virtual};
 use super::virtual_uri::VirtualDocumentUri;
+
+/// A position-based request's params plus an optional client-provided
+/// `workDoneToken` (ls-bridge-client-progress). `TextDocumentPositionParams` has
+/// no progress field, so we flatten it and add the token alongside; when the
+/// token is `None` this serializes byte-identically to the bare position params.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct PositionRequestParams {
+    #[serde(flatten)]
+    position: TextDocumentPositionParams,
+    #[serde(rename = "workDoneToken", skip_serializing_if = "Option::is_none")]
+    work_done_token: Option<NumberOrString>,
+}
 
 /// Build `TextDocumentPositionParams` with host-to-virtual coordinate translation.
 ///
@@ -51,6 +63,29 @@ pub(crate) fn build_position_based_request(
 ) -> JsonRpcRequest<TextDocumentPositionParams> {
     let params = build_text_document_position_params(virtual_uri, host_position, offset);
     JsonRpcRequest::new(request_id.as_i64(), method, params)
+}
+
+/// Like [`build_position_based_request`], but carries the editor's
+/// `workDoneToken` so the downstream reports `$/progress` against it
+/// (ls-bridge-client-progress). `client_progress_token = None` is equivalent to
+/// [`build_position_based_request`] (the token field is omitted).
+pub(crate) fn build_position_based_request_with_progress(
+    virtual_uri: &VirtualDocumentUri,
+    host_position: Position,
+    offset: &RegionOffset,
+    request_id: RequestId,
+    method: &'static str,
+    client_progress_token: Option<NumberOrString>,
+) -> JsonRpcRequest<PositionRequestParams> {
+    let position = build_text_document_position_params(virtual_uri, host_position, offset);
+    JsonRpcRequest::new(
+        request_id.as_i64(),
+        method,
+        PositionRequestParams {
+            position,
+            work_done_token: client_progress_token,
+        },
+    )
 }
 
 /// Build a whole-document JSON-RPC request (documentLink, documentSymbol,
@@ -177,5 +212,79 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["params"]["position"]["line"], 0);
         assert_eq!(json["params"]["position"]["character"], 0); // saturated
+    }
+
+    #[test]
+    fn progress_request_includes_work_done_token_only_when_present() {
+        use tower_lsp_server::ls_types::NumberOrString;
+        let virtual_uri = VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0");
+        let host_pos = Position {
+            line: 5,
+            character: 4,
+        };
+
+        // With a token: `workDoneToken` is present alongside the (flattened)
+        // position params.
+        let with = build_position_based_request_with_progress(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+            Some(NumberOrString::String("wd-1".to_string())),
+        );
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["params"]["workDoneToken"], "wd-1");
+        assert!(
+            json["params"]["textDocument"]["uri"].is_string(),
+            "position params still present"
+        );
+        assert!(json["params"]["position"]["line"].is_number());
+
+        // The numeric ProgressToken variant serializes as a bare number, not a
+        // wrapper object (`NumberOrString` is `#[serde(untagged)]`).
+        let numeric = build_position_based_request_with_progress(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+            Some(NumberOrString::Number(7)),
+        );
+        assert_eq!(
+            serde_json::to_value(&numeric).unwrap()["params"]["workDoneToken"],
+            7
+        );
+
+        // Without a token: the field is omitted entirely, leaving the params
+        // byte-for-byte identical to the bare position request (non-regression).
+        let without = build_position_based_request_with_progress(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+            None,
+        );
+        let bare = build_position_based_request(
+            &virtual_uri,
+            host_pos,
+            &RegionOffset::new(5, 4),
+            RequestId::new(1),
+            "textDocument/definition",
+        );
+        assert!(
+            serde_json::to_value(&without).unwrap()["params"]
+                .get("workDoneToken")
+                .is_none(),
+            "workDoneToken omitted when None"
+        );
+        // Compare the serialized bytes (not just the structural Value) so field
+        // order is included in the non-regression guarantee.
+        assert_eq!(
+            serde_json::to_string(&without).unwrap(),
+            serde_json::to_string(&bare).unwrap(),
+            "None serializes byte-for-byte identically to the bare position request"
+        );
     }
 }

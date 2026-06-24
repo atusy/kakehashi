@@ -25,8 +25,9 @@ impl Kakehashi {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+        let work_done_token = params.work_done_progress_params.work_done_token;
 
-        let virt = self.declaration_virt_layer(&lsp_uri, position);
+        let virt = self.declaration_virt_layer(&lsp_uri, position, work_done_token);
         let links = self
             .walk_layers(
                 &lsp_uri,
@@ -46,10 +47,14 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         position: Position,
+        client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
     ) -> Result<Option<Vec<LocationLink>>> {
-        let Some(ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
+        let Some(mut ctx) = self.resolve_bridge_contexts(lsp_uri, position, METHOD) else {
             return Ok(None);
         };
+        // Aggregate the fanned-out servers' progress onto the editor's token
+        // (ls-bridge-client-progress).
+        ctx.document.client_progress_token = client_progress_token;
 
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
@@ -72,6 +77,7 @@ impl Kakehashi {
                         t.offset,
                         &t.virtual_content,
                         t.upstream_id,
+                        t.client_progress_token,
                     )
                     .await
             },
