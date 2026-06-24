@@ -38,7 +38,7 @@
 //! host-layer eager-open (diagnostics on open before the first request).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use tower_lsp_server::ls_types::Diagnostic;
 use url::Url;
@@ -172,15 +172,16 @@ pub(crate) struct DiagnosticAggregator {
     /// only briefly to fetch/insert the per-host lock; the per-host
     /// `tokio::sync::Mutex` is the one held across the publish await.
     ///
-    /// The value is a [`Weak`] so the per-host `Mutex` allocation is freed as soon
-    /// as its last owner drops its `Arc` — that owner is either an active
-    /// `OwnedMutexGuard` (the holder) or a queued waiter's pending `lock_owned()`
-    /// future, which owns the `Arc` it was about to lock. The map then keeps only a
-    /// tiny dangling weak, reclaimed off the hot path by
-    /// [`Self::reclaim_republish_locks`] (#466). A live (upgradeable) weak is never
-    /// removed, so reclamation cannot race a republish into minting a second lock
-    /// for the same host.
-    republish_locks: Mutex<HashMap<Url, Weak<tokio::sync::Mutex<()>>>>,
+    /// The map holds the `Arc` itself, so a host's lock is allocated once and
+    /// reused across its republishes (a quiet file's sequential republishes never
+    /// reallocate it). It is reclaimed off the hot path by
+    /// [`Self::reclaim_republish_locks`] (#466), which removes only entries the map
+    /// *solely* owns (`Arc::strong_count == 1`): a live holder's `OwnedMutexGuard`
+    /// or a queued waiter's pending `lock_owned()` future each keeps an extra
+    /// strong ref, so an entry with any in-flight or queued republish is never
+    /// removed — reclamation cannot race a republish into minting a second lock for
+    /// the same host.
+    republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DiagnosticAggregator {
@@ -201,52 +202,40 @@ impl DiagnosticAggregator {
                 .republish_locks
                 .lock()
                 .recover_poison("DiagnosticAggregator::republish_locks");
-            // `get_mut` keeps the steady state (a live weak) to a single lookup with
-            // no key clone, and lets the dangling-weak case (a since-dropped lock,
-            // e.g. after reclamation) be refreshed *in place* — no second lookup and
-            // no `Url` clone. The key is cloned only when the host is wholly absent.
-            match locks.get_mut(host) {
-                Some(weak) => match weak.upgrade() {
-                    Some(lock) => lock,
-                    None => {
-                        let lock = Arc::new(tokio::sync::Mutex::new(()));
-                        *weak = Arc::downgrade(&lock);
-                        lock
-                    }
-                },
-                None => {
-                    // First republish for this host: mint a fresh lock and record a
-                    // weak to it. The returned guard keeps the `Arc` alive while held.
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(host.clone(), Arc::downgrade(&lock));
-                    lock
-                }
+            // Clone the `Url` key only when inserting a new entry — the steady state
+            // (lock already present) avoids the allocation on this per-republish path.
+            match locks.get(host) {
+                Some(lock) => Arc::clone(lock),
+                None => Arc::clone(locks.entry(host.clone()).or_default()),
             }
         };
         lock.lock_owned().await
     }
 
-    /// Drop republish-lock entries whose lock has no live holder, bounding the
+    /// Drop republish-lock entries the map *solely* owns, bounding the
     /// `republish_locks` map so it does not retain one entry per distinct host
-    /// ever republished (#466). Only **dangling** weaks are removed: a weak that
-    /// still upgrades is held by an in-flight or queued republish, and removing it
-    /// would let a concurrent acquire mint a *second* lock for the same host and
-    /// skip serialization — so a live weak is always kept (reclaimed at a later
-    /// sweep once it drains). Called off the hot path (host `didClose`).
+    /// ever republished (#466). Only entries with `Arc::strong_count == 1` are
+    /// removed: a live holder's `OwnedMutexGuard` or a queued waiter's pending
+    /// `lock_owned()` future each holds an extra strong ref, so an entry with any
+    /// in-flight or queued republish is kept. This is race-free because the `Arc`
+    /// is only ever cloned inside `lock_republish` under this same outer mutex, so
+    /// while the sweep holds it no count can rise; `strong_count == 1` therefore
+    /// means no holder/waiter exists to strand, and removing it merely lets the
+    /// next republish mint a fresh lock (nothing to serialize against meanwhile).
+    /// Called off the hot path (host `didClose`); a momentarily-idle but still-open
+    /// host is collected too and cheaply re-creates its lock on its next republish.
     ///
-    /// A push that was already past its open-document / region-resolve guard when
-    /// the host closed can still resume and re-create one entry after this sweep
-    /// (the narrow resurrection window the deferred lifecycle/`content_epoch` gate
-    /// closes generally — #422). That residual is bounded by the number of distinct
-    /// hosts that hit this race (no worse than the unreclaimed map's distinct-host
-    /// bound); a later sweep collects each such entry once it drains (a sweep keeps
-    /// any still-live lock).
+    /// A push already past its open-document / region-resolve guard when the host
+    /// closed can resume and re-create one entry after this sweep (the narrow
+    /// resurrection window the deferred lifecycle/`content_epoch` gate closes
+    /// generally — #422); it is bounded by distinct host URIs and self-heals, since
+    /// every later `didClose` sweeps the whole map and collects it once idle.
     pub(crate) fn reclaim_republish_locks(&self) {
         let mut locks = self
             .republish_locks
             .lock()
             .recover_poison("DiagnosticAggregator::republish_locks");
-        locks.retain(|_, weak| weak.strong_count() > 0);
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
     }
 
     /// Record (replacing) one server's diagnostics for a `(host, source)`.
@@ -326,16 +315,18 @@ impl DiagnosticAggregator {
             .len()
     }
 
-    /// Strong-ref count of a host's republish lock, or 0 if absent/dangling
-    /// (test-only). Lets a test observe that a queued waiter holds its own `Arc`
-    /// to the lock, independent of the active holder's guard.
+    /// Strong-ref count of a host's republish lock, or 0 if absent (test-only).
+    /// Includes the map's own ref, so an idle entry reads 1; each holder
+    /// (`OwnedMutexGuard`) or queued waiter's pending `lock_owned()` future adds 1.
+    /// Lets a test observe that a queued waiter holds its own `Arc` to the lock,
+    /// independent of the active holder's guard.
     #[cfg(test)]
     fn republish_lock_strong_count(&self, host: &Url) -> usize {
         self.republish_locks
             .lock()
             .recover_poison("DiagnosticAggregator::republish_locks")
             .get(host)
-            .map_or(0, Weak::strong_count)
+            .map_or(0, Arc::strong_count)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Url, SourceSlots>> {
@@ -396,7 +387,8 @@ mod tests {
         let a = Url::parse("file:///a.md").unwrap();
         let b = Url::parse("file:///b.md").unwrap();
 
-        // Two hosts republished, then both guards dropped — their locks dangle.
+        // Two hosts republished, then both guards dropped — the map is now the sole
+        // owner of each lock.
         drop(agg.lock_republish(&a).await);
         drop(agg.lock_republish(&b).await);
         assert_eq!(
@@ -409,7 +401,7 @@ mod tests {
         assert_eq!(
             agg.republish_lock_count(),
             0,
-            "entries whose lock has no live holder are reclaimed"
+            "entries the map solely owns (no holder/waiter) are reclaimed"
         );
     }
 
@@ -418,9 +410,11 @@ mod tests {
         let agg = DiagnosticAggregator::new();
         let a = Url::parse("file:///a.md").unwrap();
 
-        // Hold host A's lock across the sweep: its weak still upgrades, so removing
-        // it could let a concurrent acquire mint a second lock — reclaim must keep it.
+        // Hold host A's lock across the sweep: the holder adds a strong ref beyond
+        // the map's, so removing it could let a concurrent acquire mint a second
+        // lock — reclaim must keep it.
         let guard = agg.lock_republish(&a).await;
+        assert_eq!(agg.republish_lock_strong_count(&a), 2, "map + holder");
         agg.reclaim_republish_locks();
         assert_eq!(
             agg.republish_lock_count(),
@@ -444,7 +438,7 @@ mod tests {
         assert_eq!(
             agg.republish_lock_count(),
             0,
-            "once the holder drops, the now-dangling entry is reclaimed"
+            "once the holder drops, the map-only entry is reclaimed"
         );
     }
 
@@ -452,15 +446,15 @@ mod tests {
     async fn reclaim_during_contention_preserves_the_waiter_handoff() {
         // The end-to-end shape reclaim must never break: a republish is queued
         // behind an in-flight one for the same host while a sweep runs. A queued
-        // waiter's pending lock_owned() future owns the `Arc` it is about to lock,
-        // so the weak still upgrades and the entry survives the sweep — and the
-        // waiter then acquires the *same* lock, preserving per-host ordering.
+        // waiter's pending lock_owned() future owns an `Arc` to the lock, so the
+        // entry has an owner beyond the map and survives the sweep — and the waiter
+        // then acquires the *same* lock, preserving per-host ordering.
         let agg = Arc::new(DiagnosticAggregator::new());
         let a = Url::parse("file:///a.md").unwrap();
 
-        // In-flight republish holds the lock: exactly one strong ref (the guard).
+        // In-flight republish holds the lock: map (1) + holder (1) = 2 strong refs.
         let held = agg.lock_republish(&a).await;
-        assert_eq!(agg.republish_lock_strong_count(&a), 1);
+        assert_eq!(agg.republish_lock_strong_count(&a), 2, "map + holder");
 
         // A second republish for the same host parks as a queued waiter.
         let agg2 = Arc::clone(&agg);
@@ -469,19 +463,19 @@ mod tests {
             let _g = agg2.lock_republish(&a2).await;
         });
 
-        // Deterministically wait until the waiter has upgraded its own `Arc` — that
+        // Deterministically wait until the waiter has cloned its own `Arc` — that
         // happens synchronously (under the outer mutex) before it parks on
-        // lock_owned(), so strong_count reaching 2 proves the parked waiter, not
-        // `held`, is the second owner. No sleep: yield to let the spawned task run.
+        // lock_owned(), so strong_count reaching 3 (map + holder + waiter) proves the
+        // parked waiter is a distinct owner. No sleep: yield to let the spawned task run.
         let mut spins = 0;
-        while agg.republish_lock_strong_count(&a) < 2 {
-            assert!(spins < 10_000, "waiter never upgraded its Arc");
+        while agg.republish_lock_strong_count(&a) < 3 {
+            assert!(spins < 10_000, "waiter never cloned its Arc");
             spins += 1;
             tokio::task::yield_now().await;
         }
 
-        // The waiter alone (independent of `held`) keeps the weak upgradeable, so a
-        // sweep at this instant must not remove the entry.
+        // The waiter holds a strong ref beyond the map's, so a sweep at this instant
+        // must not remove the entry (doing so would strand the waiter on a stale lock).
         agg.reclaim_republish_locks();
         assert_eq!(
             agg.republish_lock_count(),
