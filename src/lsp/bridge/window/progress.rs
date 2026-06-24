@@ -42,10 +42,9 @@ pub(in crate::lsp::bridge) fn forward(
         return;
     };
 
-    // Client-provided progress: if the token is one the bridge minted for a
-    // fanned-out request, route it to that request's aggregator, which composes a
-    // single lifecycle on the editor's own `workDoneToken` and emits it ungated
-    // (ls-bridge-client-progress).
+    // Client-progress routing: if the token is one the bridge minted for a fanned-out request,
+    // route it to that request's aggregator, which relays a single lifecycle onto the editor's
+    // own `workDoneToken` and emits it ungated (ls-bridge-client-progress).
     if let Some(aggregator) = deps.client_progress_registry.route(&params.token) {
         let emitted = aggregator
             .lock()
