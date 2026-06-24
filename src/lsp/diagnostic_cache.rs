@@ -375,11 +375,14 @@ impl DiagnosticAggregator {
             .last_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_published");
-        if last
-            .get(host)
-            .is_some_and(|prev| same_diagnostic_multiset(prev, diagnostics))
-        {
-            return false;
+        // Single lookup via `get_mut`: update in place when the host is already
+        // present (the common path), cloning the `host` key only on first insert.
+        if let Some(prev) = last.get_mut(host) {
+            if same_diagnostic_multiset(prev, diagnostics) {
+                return false;
+            }
+            *prev = diagnostics.to_vec();
+            return true;
         }
         last.insert(host.clone(), diagnostics.to_vec());
         true
