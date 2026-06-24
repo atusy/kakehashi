@@ -201,8 +201,6 @@ impl DiagnosticAggregator {
                 .republish_locks
                 .lock()
                 .recover_poison("DiagnosticAggregator::republish_locks");
-            // Clone the `Url` key only when inserting a new entry — the steady state
-            // (lock already present) avoids the allocation on this per-republish path.
             match locks.get(host) {
                 Some(lock) => Arc::clone(lock),
                 None => Arc::clone(locks.entry(host.clone()).or_default()),
