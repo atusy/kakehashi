@@ -110,16 +110,6 @@ impl Kakehashi {
         self.bridge
             .pool()
             .set_workspace_folders(workspace_folders_for_bridge);
-        // Only advertise `workDoneProgress` on our providers when the client
-        // signals work-done-progress support — otherwise the bridged `$/progress`
-        // on a client token would have nowhere to land (ls-bridge-client-progress,
-        // #445). Read before `params.capabilities` is moved below.
-        let client_supports_work_done_progress = params
-            .capabilities
-            .window
-            .as_ref()
-            .and_then(|w| w.work_done_progress)
-            .unwrap_or(false);
         self.bridge
             .pool()
             .set_client_capabilities(params.capabilities);
@@ -258,34 +248,28 @@ impl Kakehashi {
                     ),
                 ),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-                // Advertise `workDoneProgress` (so the client attaches a
-                // `workDoneToken` we can bridge, ls-bridge-client-progress #445)
-                // ONLY when the client supports work-done progress — otherwise keep
-                // the bare `true` form. NOTE: `type_definition`/`implementation`
+                // Advertise `workDoneProgress` so clients attach a `workDoneToken`
+                // we can bridge (ls-bridge-client-progress, #445). Per LSP this is
+                // unconditional — client-initiated progress has no client
+                // capability; the provider's advertisement alone prompts the token
+                // (`window.workDoneProgress` governs *server*-initiated progress, a
+                // different mechanism). NOTE: `type_definition`/`implementation`
                 // also have the plumbing, but cannot advertise it via this crate's
                 // typed API — in ls-types 0.0.6 their only `Options` variant wraps
                 // `StaticTextDocumentRegistrationOptions`, which has no
                 // `workDoneProgress` field (the LSP spec *does* define it). They
                 // stay `Simple(true)`, so their client-progress plumbing is inert
                 // for spec-compliant clients until that crate gap is closed (#447).
-                declaration_provider: Some(if client_supports_work_done_progress {
-                    DeclarationCapability::Options(DeclarationOptions {
-                        work_done_progress_options: WorkDoneProgressOptions {
-                            work_done_progress: Some(true),
-                        },
-                    })
-                } else {
-                    DeclarationCapability::Simple(true)
-                }),
-                definition_provider: Some(if client_supports_work_done_progress {
-                    OneOf::Right(DefinitionOptions {
-                        work_done_progress_options: WorkDoneProgressOptions {
-                            work_done_progress: Some(true),
-                        },
-                    })
-                } else {
-                    OneOf::Left(true)
-                }),
+                declaration_provider: Some(DeclarationCapability::Options(DeclarationOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
+                definition_provider: Some(OneOf::Right(DefinitionOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
                 type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -299,15 +283,11 @@ impl Kakehashi {
                     retrigger_characters: Some(vec![",".to_string()]),
                     ..Default::default()
                 }),
-                references_provider: Some(if client_supports_work_done_progress {
-                    OneOf::Right(ReferenceOptions {
-                        work_done_progress_options: WorkDoneProgressOptions {
-                            work_done_progress: Some(true),
-                        },
-                    })
-                } else {
-                    OneOf::Left(true)
-                }),
+                references_provider: Some(OneOf::Right(ReferenceOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
+                })),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 document_link_provider: Some(DocumentLinkOptions {
                     resolve_provider: None,

@@ -47,11 +47,12 @@ fn test_initialize_returns_capabilities() {
 }
 
 #[test]
-fn test_initialize_advertises_work_done_progress_when_client_supports_it() {
-    // When the client signals work-done-progress support, the client-progress
-    // providers advertise `workDoneProgress` (so the client attaches a
-    // workDoneToken we can bridge); without it they stay bare `true`
-    // (ls-bridge-client-progress, #445).
+fn test_advertises_work_done_progress_independent_of_window_capability() {
+    // Client-initiated progress has NO client capability — the provider's
+    // `workDoneProgress` advertisement alone prompts the token. So we advertise it
+    // unconditionally, even when the client explicitly sets `window.workDoneProgress`
+    // to false (that capability governs *server*-initiated progress, a different
+    // mechanism) (ls-bridge-client-progress, #445).
     let mut client = LspClient::new();
 
     let response = client.send_request(
@@ -59,7 +60,7 @@ fn test_initialize_advertises_work_done_progress_when_client_supports_it() {
         json!({
             "processId": std::process::id(),
             "rootUri": null,
-            "capabilities": { "window": { "workDoneProgress": true } }
+            "capabilities": { "window": { "workDoneProgress": false } }
         }),
     );
 
@@ -76,7 +77,7 @@ fn test_initialize_advertises_work_done_progress_when_client_supports_it() {
         assert_eq!(
             caps[provider]["workDoneProgress"],
             json!(true),
-            "{provider} should advertise workDoneProgress when the client supports it"
+            "{provider} must advertise workDoneProgress regardless of window.workDoneProgress"
         );
     }
     // type_definition/implementation cannot advertise it via the current types
