@@ -107,7 +107,7 @@ impl ClientProgressRegistry {
 /// Shared by the reader (`window::progress::forward`) and its integration test so
 /// both drive the exact enqueue-under-lock sequence.
 pub(crate) fn relay_to_aggregator(
-    aggregator: &std::sync::Arc<Mutex<ClientProgressAggregator>>,
+    aggregator: &Mutex<ClientProgressAggregator>,
     upstream_tx: &tokio::sync::mpsc::UnboundedSender<
         crate::lsp::bridge::actor::UpstreamNotification,
     >,
